@@ -33,12 +33,14 @@ class IntraDayScreener:
         symbols: Optional[List[str]] = None,
         freqs: Optional[List[str]] = None,
         max_workers: int = 5,
+        notes: Optional[List] = None,
     ):
         self.symbols: List[str] = list(symbols or WHITELIST)
         self.freqs: List[str] = list(freqs or MONITOR_FREQS)
         self.czsc_freqs: List[Freq] = [config_freq_to_czsc(f) for f in self.freqs]
         self.max_workers = max_workers
         self.ak_source = AKShareSource()
+        self.notes = notes or []
         # Dict[symbol][freq.value] -> SymbolAnalyzer  (Rust Freq 不可哈希，用 str)
         self.analyzers: Dict[str, Dict[str, SymbolAnalyzer]] = {}
 
@@ -127,6 +129,8 @@ class IntraDayScreener:
     # 输出
     # ─────────────────────────────────────────────────────
     def print_results(self, results: List[ScoredSymbol], title: str = "筛选结果"):
+        from signals.research import match_notes_for_symbol, check_resonance
+
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"\n{'='*70}")
         print(f"  {title}  |  {now}")
@@ -142,13 +146,29 @@ class IntraDayScreener:
             if r.signal_count == 0:
                 continue
             marker = ">>>" if r.total_score >= SCORE_THRESHOLD else "   "
-            print(f"\n{marker} {r.symbol}  得分: {r.total_score}  信号数: {r.signal_count}")
+
+            # 双维度展示：技术面 + 研报
+            note_view = match_notes_for_symbol(r.symbol, self.notes)
+            resonance = check_resonance(r.total_score, note_view)
+            note_tag = ""
+            if note_view.has_coverage:
+                note_tag = f"  |  研报: {note_view.label}"
+            if resonance:
+                note_tag += f"  {resonance}"
+
+            print(f"\n{marker} {r.symbol}  技术分: {r.total_score}  信号数: {r.signal_count}{note_tag}")
             print(r.details)
+            if note_view.catalysts:
+                print(f"  [研报催化] {'、'.join(note_view.catalysts)}")
 
         above = [r for r in results if r.total_score >= SCORE_THRESHOLD]
         print(f"\n--- 达到阈值 ({SCORE_THRESHOLD} 分) 的标的: {len(above)} 只 ---")
         if above:
-            print("    " + "  ".join(f"{r.symbol}({r.total_score})" for r in above))
+            for r in above:
+                nv = match_notes_for_symbol(r.symbol, self.notes)
+                res = check_resonance(r.total_score, nv)
+                extra = f"  {nv.label} {res}" if nv.has_coverage else ""
+                print(f"    {r.symbol}  技术分={r.total_score}{extra}")
         print(f"{'='*70}\n")
 
     # ─────────────────────────────────────────────────────

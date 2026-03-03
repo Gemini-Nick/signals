@@ -61,3 +61,7 @@ INDEX_LOOKBACK_DAYS = 180
 # 默认关注板块，可随时修改；命令行 --industries 可临时覆盖
 # 空列表 = 跳过 Layer 2，只跑指数 + 白名单
 WATCH_INDUSTRIES: list = []
+
+# ── 研究笔记（双维度集成）──────────────────────────────────
+# 笔记目录，存放 .md/.pdf/.png/.txt 原始文件及生成的 .meta.yaml
+NOTES_DIR = "notes"
