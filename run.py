@@ -13,6 +13,7 @@ Signals 系统总入口 — 三层联动（指数 → 行业 → 标的）
   python run.py --mode index                       # 仅看指数报告（快速）
   python run.py --mode import --file notes/xxx.pdf # 导入研究笔记
   python run.py --mode import --file notes/xxx.pdf --source 中信证券 --author 张三
+  python run.py --mode bot                         # 启动飞书研报助手
 """
 import sys
 import argparse
@@ -165,6 +166,19 @@ def run_import(args):
 
 
 # ─────────────────────────────────────────────────────────
+# 飞书 Bot 模式：群聊上传文件自动导入研报
+# ─────────────────────────────────────────────────────────
+
+def run_bot(args):
+    """
+    飞书 Bot 模式：在群聊中上传文件/图片/文本，自动导入分析。
+    使用 WebSocket 长连接，不需要公网 IP。
+    """
+    from signals.feishu_bot import start
+    start()
+
+
+# ─────────────────────────────────────────────────────────
 # 仅指数模式：快速查看大市方向
 # ─────────────────────────────────────────────────────────
 
@@ -234,13 +248,14 @@ def main():
   python run.py --mode review --start 2024-09-24  # 盘后复盘（九月行情起）
   python run.py --mode review --start 2025-01-06  # 盘后复盘（DeepSeek行情起）
   python run.py --mode import --file notes/锂电池.pdf --source 中信证券 --author 张三
+  python run.py --mode bot                                   # 飞书研报助手
         """
     )
     parser.add_argument(
         "--mode",
         default="intraday",
-        choices=["intraday", "review", "index", "import"],
-        help="运行模式：intraday / review / index / import（导入研究笔记）"
+        choices=["intraday", "review", "index", "import", "bot"],
+        help="运行模式：intraday / review / index / import / bot（飞书研报助手）"
     )
     parser.add_argument(
         "--start",
@@ -287,6 +302,7 @@ def main():
         "review":   run_review,
         "index":    run_index_only,
         "import":   run_import,
+        "bot":      run_bot,
     }
     dispatch[args.mode](args)
 
