@@ -13,10 +13,11 @@ Signals 系统总入口 — 三层联动（指数 → 行业 → 标的）
   python run.py --mode index                       # 仅看指数报告（快速）
   python run.py --mode import --file 锂电池深度.pdf          # 导入研究笔记（自动归档到 notes/YYYY/MM/）
   python run.py --mode import --file 锂电池深度.pdf --source 中信证券 --author 张三
-  python run.py --mode bot                         # 启动飞书研报助手
 """
 import sys
+import subprocess
 import argparse
+from pathlib import Path
 
 sys.path.insert(0, "/Users/zhangqilong/Desktop/Signals")
 
@@ -26,6 +27,33 @@ import config
 # ─────────────────────────────────────────────────────────
 # 盘中模式：三层联动实时扫描
 # ─────────────────────────────────────────────────────────
+
+def _git_pull_notes():
+    """从 GitHub 拉取最新研报文件"""
+    r = subprocess.run(
+        ["git", "pull", "--ff-only"],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        print(f"  研报同步: {r.stdout.strip() or '已是最新'}")
+    else:
+        print(f"  [!] git pull 失败（本地优先继续）: {r.stderr.strip()}")
+
+
+def _auto_import_new_notes(notes_dir: str):
+    """对没有 .meta.yaml 的原始文件自动运行 import_note()"""
+    from signals.research import import_note
+    exts = {'.md', '.pdf', '.png', '.jpg', '.jpeg', '.txt'}
+    for f in Path(notes_dir).rglob('*'):
+        if f.suffix.lower() in exts:
+            meta = f.parent / (f.stem + '.meta.yaml')
+            if not meta.exists():
+                print(f"  自动导入: {f.name}")
+                try:
+                    import_note(str(f))
+                except Exception as e:
+                    print(f"  [!] {f.name} 导入失败: {e}")
+
 
 def _load_notes(args):
     """
@@ -37,6 +65,11 @@ def _load_notes(args):
     """
     from signals.research import load_all_notes, print_notes_summary
     notes_dir = getattr(args, 'notes', None) or config.NOTES_DIR
+
+    # 启动时同步 + 懒加载新研报
+    _git_pull_notes()
+    _auto_import_new_notes(notes_dir)
+
     all_notes = load_all_notes(notes_dir)
 
     if not all_notes:
@@ -172,6 +205,13 @@ def run_intraday(args):
     else:
         screener_l3.run_whitelist()
 
+    # ── 飞书推送 ─────────────────────────────────────────
+    try:
+        from signals.feishu_notify import send_text
+        send_text(ctx.to_feishu_text())
+    except Exception as e:
+        print(f"  [!] 飞书推送异常: {e}")
+
 
 # ─────────────────────────────────────────────────────────
 # 导入模式：研究笔记 → 结构化元数据
@@ -233,19 +273,6 @@ def run_import(args):
 
 
 # ─────────────────────────────────────────────────────────
-# 飞书 Bot 模式：群聊上传文件自动导入研报
-# ─────────────────────────────────────────────────────────
-
-def run_bot(args):
-    """
-    飞书 Bot 模式：在群聊中上传文件/图片/文本，自动导入分析。
-    使用 WebSocket 长连接，不需要公网 IP。
-    """
-    from signals.feishu_bot import start
-    start()
-
-
-# ─────────────────────────────────────────────────────────
 # 仅指数模式：快速查看大市方向
 # ─────────────────────────────────────────────────────────
 
@@ -253,7 +280,15 @@ def run_index_only(args):
     """仅运行 Layer 1，快速输出指数报告。"""
     from signals.index_screener import IndexScreener
     screener = IndexScreener()
-    screener.run()
+    ctx = screener.run()
+
+    # ── 飞书推送 ─────────────────────────────────────────
+    if ctx:
+        try:
+            from signals.feishu_notify import send_text
+            send_text(ctx.to_feishu_text())
+        except Exception as e:
+            print(f"  [!] 飞书推送异常: {e}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -315,14 +350,13 @@ def main():
   python run.py --mode review --start 2024-09-24  # 盘后复盘（九月行情起）
   python run.py --mode review --start 2025-01-06  # 盘后复盘（DeepSeek行情起）
   python run.py --mode import --file 锂电池.pdf --source 中信证券 --author 张三
-  python run.py --mode bot                                   # 飞书研报助手
         """
     )
     parser.add_argument(
         "--mode",
         default="intraday",
-        choices=["intraday", "review", "index", "import", "bot"],
-        help="运行模式：intraday / review / index / import / bot（飞书研报助手）"
+        choices=["intraday", "review", "index", "import"],
+        help="运行模式：intraday / review / index / import"
     )
     parser.add_argument(
         "--start",
@@ -369,7 +403,6 @@ def main():
         "review":   run_review,
         "index":    run_index_only,
         "import":   run_import,
-        "bot":      run_bot,
     }
     dispatch[args.mode](args)
 

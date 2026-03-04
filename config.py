@@ -12,8 +12,8 @@ FUTU_PORT = 11111
 
 # ── 飞书机器人 ────────────────────────────────────────────
 # 在飞书开放平台创建机器人后填入
-FEISHU_APP_ID = ""
-FEISHU_APP_SECRET = ""
+FEISHU_APP_ID = "cli_a92d3f3ec338dbb5"
+FEISHU_APP_SECRET = "kDD20LUWqXlQnvQonlctrduIYBoCYUOX"
 FEISHU_RECEIVE_ID = ""      # 接收人 open_id 或群 chat_id
 FEISHU_RECEIVE_TYPE = "chat_id"  # "open_id" 或 "chat_id"
 
