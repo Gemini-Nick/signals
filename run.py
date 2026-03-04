@@ -11,8 +11,8 @@ Signals 系统总入口 — 三层联动（指数 → 行业 → 标的）
   python run.py --mode review --start 2024-09-24  # 盘后复盘（九月行情）
   python run.py --mode review --start 2025-01-06  # 盘后复盘（DeepSeek行情）
   python run.py --mode index                       # 仅看指数报告（快速）
-  python run.py --mode import --file notes/xxx.pdf # 导入研究笔记
-  python run.py --mode import --file notes/xxx.pdf --source 中信证券 --author 张三
+  python run.py --mode import --file 锂电池深度.pdf          # 导入研究笔记（自动归档到 notes/YYYY/MM/）
+  python run.py --mode import --file 锂电池深度.pdf --source 中信证券 --author 张三
   python run.py --mode bot                         # 启动飞书研报助手
 """
 import sys
@@ -181,22 +181,40 @@ def run_import(args):
     """
     导入研究笔记：提取文本 → 自动识别 → 生成 .meta.yaml。
     支持 .md / .pdf / .png / .jpg / .txt 格式。
+    文件自动归档到 notes/YYYY/MM/ 子目录（按导入日期）。
     """
     from signals.research import import_note
     import os
+    import shutil
 
     if not args.file:
         print("错误：--mode import 必须指定 --file 参数")
-        print("示例：python run.py --mode import --file notes/锂电池深度.pdf")
+        print("示例：python run.py --mode import --file 锂电池深度.pdf")
         return
 
     if not os.path.exists(args.file):
         print(f"错误：文件不存在: {args.file}")
         return
 
+    # 自动归档：如果文件不在 notes/YYYY/MM/ 下，复制过去
+    src_path = os.path.abspath(args.file)
+    month_dir = config.notes_month_dir()
+    dest_path = os.path.join(month_dir, os.path.basename(args.file))
+
+    if os.path.abspath(os.path.dirname(src_path)) != os.path.abspath(month_dir):
+        if os.path.exists(dest_path):
+            stem, ext = os.path.splitext(os.path.basename(args.file))
+            import time as _time
+            dest_path = os.path.join(month_dir, f"{stem}_{int(_time.time())}{ext}")
+        shutil.copy2(src_path, dest_path)
+        print(f"  已归档到: {dest_path}")
+        file_to_import = dest_path
+    else:
+        file_to_import = src_path
+
     print(f"\n>>> 导入研究笔记")
     note = import_note(
-        file_path=args.file,
+        file_path=file_to_import,
         source=args.source or "",
         author=args.author or "",
     )
@@ -296,7 +314,7 @@ def main():
   python run.py --mode intraday --industries 有色金属,半导体
   python run.py --mode review --start 2024-09-24  # 盘后复盘（九月行情起）
   python run.py --mode review --start 2025-01-06  # 盘后复盘（DeepSeek行情起）
-  python run.py --mode import --file notes/锂电池.pdf --source 中信证券 --author 张三
+  python run.py --mode import --file 锂电池.pdf --source 中信证券 --author 张三
   python run.py --mode bot                                   # 飞书研报助手
         """
     )

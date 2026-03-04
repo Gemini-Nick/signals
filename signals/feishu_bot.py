@@ -36,15 +36,16 @@ _client = None
 # 文件下载
 # ─────────────────────────────────────────────────────────
 
-def _ensure_notes_dir():
-    os.makedirs(config.NOTES_DIR, exist_ok=True)
+def _current_month_dir():
+    """返回当月笔记目录并确保存在"""
+    return config.notes_month_dir()
 
 
 def _download_file(message_id: str, file_key: str, file_name: str) -> str:
-    """下载消息中的文件附件，返回本地保存路径"""
+    """下载消息中的文件附件，存入当月子目录"""
     from lark_oapi.api.im.v1 import GetMessageResourceRequest
 
-    _ensure_notes_dir()
+    month_dir = _current_month_dir()
 
     request = GetMessageResourceRequest.builder() \
         .message_id(message_id) \
@@ -58,11 +59,11 @@ def _download_file(message_id: str, file_key: str, file_name: str) -> str:
         return ""
 
     # 避免覆盖同名文件
-    save_path = os.path.join(config.NOTES_DIR, file_name)
+    save_path = os.path.join(month_dir, file_name)
     if os.path.exists(save_path):
         stem = Path(file_name).stem
         ext = Path(file_name).suffix
-        save_path = os.path.join(config.NOTES_DIR, f"{stem}_{int(time.time())}{ext}")
+        save_path = os.path.join(month_dir, f"{stem}_{int(time.time())}{ext}")
 
     with open(save_path, "wb") as f:
         f.write(response.file.read())
@@ -72,10 +73,10 @@ def _download_file(message_id: str, file_key: str, file_name: str) -> str:
 
 
 def _download_image(message_id: str, image_key: str) -> str:
-    """下载消息中的图片，返回本地保存路径"""
+    """下载消息中的图片，存入当月子目录"""
     from lark_oapi.api.im.v1 import GetMessageResourceRequest
 
-    _ensure_notes_dir()
+    month_dir = _current_month_dir()
 
     request = GetMessageResourceRequest.builder() \
         .message_id(message_id) \
@@ -89,7 +90,7 @@ def _download_image(message_id: str, image_key: str) -> str:
         return ""
 
     file_name = f"feishu_{int(time.time())}.png"
-    save_path = os.path.join(config.NOTES_DIR, file_name)
+    save_path = os.path.join(month_dir, file_name)
 
     with open(save_path, "wb") as f:
         f.write(response.file.read())
@@ -99,10 +100,10 @@ def _download_image(message_id: str, image_key: str) -> str:
 
 
 def _save_text_as_file(text: str) -> str:
-    """将纯文本消息保存为 .txt 文件"""
-    _ensure_notes_dir()
+    """将纯文本消息保存为 .txt 文件，存入当月子目录"""
+    month_dir = _current_month_dir()
     file_name = f"feishu_{int(time.time())}.txt"
-    save_path = os.path.join(config.NOTES_DIR, file_name)
+    save_path = os.path.join(month_dir, file_name)
 
     with open(save_path, "w", encoding="utf-8") as f:
         f.write(text)

@@ -24,4 +24,4 @@ build/
 logs/
 
 # 研究笔记自动生成的元数据（用户本地，不入库）
-notes/*.meta.yaml
+notes/**/*.meta.yaml

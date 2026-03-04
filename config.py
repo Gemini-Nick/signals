@@ -63,5 +63,21 @@ INDEX_LOOKBACK_DAYS = 180
 WATCH_INDUSTRIES: list = []
 
 # ── 研究笔记（双维度集成）──────────────────────────────────
-# 笔记目录，存放 .md/.pdf/.png/.txt 原始文件及生成的 .meta.yaml
+# 笔记根目录，按 年/月 子目录存储：notes/2026/03/xxx.pdf
 NOTES_DIR = "notes"
+
+
+def notes_month_dir(date_str: str = "") -> str:
+    """
+    返回按年月组织的笔记子目录路径，如 notes/2026/03。
+    date_str 格式 YYYY-MM-DD，为空则使用当天日期。
+    """
+    import os
+    from datetime import datetime
+    if date_str:
+        dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+    else:
+        dt = datetime.now()
+    month_dir = os.path.join(NOTES_DIR, dt.strftime("%Y"), dt.strftime("%m"))
+    os.makedirs(month_dir, exist_ok=True)
+    return month_dir

@@ -500,7 +500,7 @@ def import_note(file_path: str, title: str = "", source: str = "", author: str =
 
 def load_all_notes(notes_dir: str) -> List[ResearchNote]:
     """
-    加载 notes/ 目录下所有 .meta.yaml 文件为 ResearchNote。
+    递归加载 notes/ 下所有 .meta.yaml（支持 notes/YYYY/MM/ 子目录结构）。
     过滤掉过期和无效的笔记。
     """
     notes_path = Path(notes_dir)
@@ -508,7 +508,7 @@ def load_all_notes(notes_dir: str) -> List[ResearchNote]:
         return []
 
     notes = []
-    for meta_file in sorted(notes_path.glob("*.meta.yaml")):
+    for meta_file in sorted(notes_path.rglob("*.meta.yaml")):
         try:
             note = load_meta(str(meta_file))
             if note.is_valid and not note.is_expired:
