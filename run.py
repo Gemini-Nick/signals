@@ -19,7 +19,7 @@ import subprocess
 import argparse
 from pathlib import Path
 
-sys.path.insert(0, "/Users/zhangqilong/Desktop/Signals")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config
 
@@ -127,8 +127,8 @@ def run_intraday(args):
     Layer 3 → 标的筛选（白名单 + 行业成分股）
     研报维度 → 独立展示，与技术面分数并列
     """
-    from signals.index_screener import IndexScreener
-    from signals.screener import IntraDayScreener
+    from signals.layers.index_screener import IndexScreener
+    from signals.layers.screener import IntraDayScreener
     from signals.research import (
         get_noted_industries, get_noted_stocks,
         match_notes_for_symbol, check_resonance,
@@ -157,7 +157,7 @@ def run_intraday(args):
         print(f"  研报行业已加入扫描池: {', '.join(noted_industries)}")
 
     if industry_names and ctx.gate_industry_scan:
-        from signals.industry import score_industry
+        from signals.layers.industry import score_industry
         print(f"\n>>> Layer 2 行业研判：{', '.join(industry_names)}")
         ind_scores = []
         for ind in industry_names:
@@ -167,7 +167,7 @@ def run_intraday(args):
             print(f"    {sc.summary}", flush=True)
 
         # 从强势行业取成分股
-        from signals.industry import get_industry_stocks
+        from signals.layers.industry import get_industry_stocks
         for sc in ind_scores:
             if sc.is_strong:
                 stocks = get_industry_stocks(sc.name)
@@ -207,7 +207,7 @@ def run_intraday(args):
 
     # ── 飞书推送 ─────────────────────────────────────────
     try:
-        from signals.feishu_notify import send_text
+        from signals.notify.feishu import send_text
         send_text(ctx.to_feishu_text())
     except Exception as e:
         print(f"  [!] 飞书推送异常: {e}")
@@ -278,14 +278,14 @@ def run_import(args):
 
 def run_index_only(args):
     """仅运行 Layer 1，快速输出指数报告。"""
-    from signals.index_screener import IndexScreener
+    from signals.layers.index_screener import IndexScreener
     screener = IndexScreener()
     ctx = screener.run()
 
     # ── 飞书推送 ─────────────────────────────────────────
     if ctx:
         try:
-            from signals.feishu_notify import send_text
+            from signals.notify.feishu import send_text
             send_text(ctx.to_feishu_text())
         except Exception as e:
             print(f"  [!] 飞书推送异常: {e}")
@@ -302,7 +302,7 @@ def run_review(args):
     Layer 2 → 行业复盘（可选）
     Layer 3 → 个股日线复盘（白名单）
     """
-    from signals.review_screener import ReviewScreener
+    from signals.layers.review_screener import ReviewScreener
 
     industry_names = _parse_industries(args)
 

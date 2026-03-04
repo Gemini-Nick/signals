@@ -3,18 +3,18 @@
 端到端验证脚本
 
 运行方式：
-    cd /Users/zhangqilong/Desktop/Signals
-    python -m signals.validate
+    python validate.py
 """
 import sys
-sys.path.insert(0, "/Users/zhangqilong/Desktop/Signals")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from signals.freq_utils import config_freq_to_czsc, FREQ_MAP
-from signals.analyzer import SymbolAnalyzer
-from signals.detectors import detect_all_signals
-from signals.scorer import score_signals
-from signals.industry import get_industry_list, get_industry_stocks
-from signals.screener import IntraDayScreener
+from signals.core.freq_utils import config_freq_to_czsc, FREQ_MAP
+from signals.core.analyzer import SymbolAnalyzer
+from signals.core.detectors import detect_all_signals
+from signals.core.scorer import score_signals
+from signals.layers.industry import get_industry_list, get_industry_stocks
+from signals.layers.screener import IntraDayScreener
 
 
 TEST_SYMBOLS = ["SH.601958", "SH.600519", "SZ.000001"]

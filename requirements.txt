@@ -1,0 +1,9 @@
+czsc
+pandas
+akshare
+lark-oapi
+pdfplumber
+pytesseract
+Pillow
+PyYAML
+python-dotenv

@@ -1,21 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 全局配置文件
+
+凭证从 .env 文件读取（不入库），参考 .env.example 创建本地 .env。
 """
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
 # ── Tushare ──────────────────────────────────────────────
-TUSHARE_TOKEN = "35671ecb7ef3524dfcb8f352ad8eabbc9c139b26224b7072363da502"
+TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
 
 # ── Futu OpenD ───────────────────────────────────────────
-FUTU_HOST = "127.0.0.1"
-FUTU_PORT = 11111
+FUTU_HOST = os.getenv("FUTU_HOST", "127.0.0.1")
+FUTU_PORT = int(os.getenv("FUTU_PORT", "11111"))
 
 # ── 飞书机器人 ────────────────────────────────────────────
-# 在飞书开放平台创建机器人后填入
-FEISHU_APP_ID = "cli_a92d3f3ec338dbb5"
-FEISHU_APP_SECRET = "kDD20LUWqXlQnvQonlctrduIYBoCYUOX"
-FEISHU_RECEIVE_ID = ""      # 接收人 open_id 或群 chat_id
-FEISHU_RECEIVE_TYPE = "chat_id"  # "open_id" 或 "chat_id"
+FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
+FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
+FEISHU_RECEIVE_ID = os.getenv("FEISHU_RECEIVE_ID", "")
+FEISHU_RECEIVE_TYPE = os.getenv("FEISHU_RECEIVE_TYPE", "chat_id")
 
 # ── 标的池配置 ────────────────────────────────────────────
 MAX_POOL_SIZE = 50          # 标的池上限

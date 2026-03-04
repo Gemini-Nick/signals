@@ -6,22 +6,19 @@
 第 2 轮（行业批扫）：  screener.run_industry("有色金属")  ~5 分钟
 两轮合并：            screener.run_full("有色金属")        ~6 分钟
 """
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Dict, List, Optional
 
-sys.path.insert(0, "/Users/zhangqilong/Desktop/Signals")
-
 from config import WHITELIST, MONITOR_FREQS, SCORE_THRESHOLD
-from monitor.data_fetcher import AKShareSource
+from signals.data.fetcher import AKShareSource
 from czsc import Freq
 
-from .freq_utils import config_freq_to_czsc
-from .analyzer import SymbolAnalyzer
-from .detectors import detect_all_signals
-from .scorer import score_signals, ScoredSymbol
+from signals.core.freq_utils import config_freq_to_czsc
+from signals.core.analyzer import SymbolAnalyzer
+from signals.core.detectors import detect_all_signals
+from signals.core.scorer import score_signals, ScoredSymbol
 from .industry import get_industry_stocks
 
 

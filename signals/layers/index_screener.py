@@ -80,7 +80,7 @@ class IndexScreener:
         - 日线：stock_zh_index_daily（任意历史）
         - 30min/15min：stock_zh_a_minute（近5日，~40/80根）
         """
-        from monitor.data_fetcher import AKShareSource
+        from signals.data.fetcher import AKShareSource
         ak = AKShareSource()
 
         for name, sym in self.ak_codes.items():
@@ -131,7 +131,7 @@ class IndexScreener:
         if not self.futu_codes:
             return
 
-        from monitor.data_fetcher import FutuSource
+        from signals.data.fetcher import FutuSource
         futu = FutuSource(self.futu_host, self.futu_port)
         try:
             futu.connect()
