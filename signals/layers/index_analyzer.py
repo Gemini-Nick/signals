@@ -11,7 +11,7 @@ IndexAnalyzer: 为单个指数维护三级 CZSC 实例，生成 IndexReport。
 from typing import List, Optional
 from czsc import RawBar, Freq, Direction
 
-from .analyzer import SymbolAnalyzer
+from signals.core.analyzer import SymbolAnalyzer
 from .index_report import IndexReport, ZSLevel
 
 

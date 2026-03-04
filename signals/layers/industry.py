@@ -113,7 +113,7 @@ def get_industry_bars(industry: str,
     from datetime import datetime, timedelta
     from czsc import RawBar, Freq
     import pandas as pd
-    from monitor.data_fetcher import _to_raw_bars
+    from signals.data.fetcher import _to_raw_bars
 
     today = datetime.now()
     if start_date:

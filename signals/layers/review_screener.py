@@ -28,15 +28,20 @@ from .industry import score_industry, IndustryScore
 def _load_stock_daily_bars(futu_code: str, start_date: str,
                             end_date: str = None) -> List[RawBar]:
     """
-    加载个股日线（AKShare stock_zh_a_hist），供盘后复盘使用。
-    仅支持 A股（SH/SZ 前缀）。
+    加载个股日线，供盘后复盘使用。
+    支持 A股（SH/SZ 前缀）和 美股（US 前缀）。
     """
-    from monitor.data_fetcher import AKShareSource
+    from signals.data.fetcher import AKShareSource, USDataSource, detect_market
     from datetime import datetime
-    ak = AKShareSource()
     edt = end_date or datetime.now().strftime("%Y-%m-%d")
+    market = detect_market(futu_code)
     try:
-        return ak.get_a_daily(futu_code, sdt=start_date, edt=edt)
+        if market == "US":
+            us = USDataSource()
+            return us.get_us_daily(futu_code)
+        else:
+            ak = AKShareSource()
+            return ak.get_a_daily(futu_code, sdt=start_date, edt=edt)
     except Exception as e:
         print(f"  [✗] {futu_code} 日线加载失败：{e}", flush=True)
         return []
@@ -148,9 +153,9 @@ class ReviewScreener:
         对指定个股做日线级别缠论分析。
         返回 List[ScoredSymbol]（日线级别评分）。
         """
-        from .analyzer import SymbolAnalyzer
-        from .detectors import detect_all_signals
-        from .scorer import score_signals, ScoredSymbol
+        from signals.core.analyzer import SymbolAnalyzer
+        from signals.core.detectors import detect_all_signals
+        from signals.core.scorer import score_signals, ScoredSymbol
 
         target = symbols or self.whitelist
         if not target:
