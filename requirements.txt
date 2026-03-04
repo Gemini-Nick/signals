@@ -7,3 +7,4 @@ pytesseract
 Pillow
 PyYAML
 python-dotenv
+yfinance

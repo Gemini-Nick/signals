@@ -13,7 +13,9 @@ IndexScreener: 指数层入口（Layer 1）
       30min/15min：AKShare stock_zh_a_minute（近5日，免费）
   - 恒生科技（HK.800700）：
       三个周期均由 Futu request_history_kline 提供（消耗历史K线额度 3/run）
-  - Futu 不可用时：恒生科技降级为仅日线（或全部跳过）
+  - 美股指数ETF（US.SPY/QQQ/DIA）：
+      Futu 优先（需美股行情权限），降级 yfinance（免费兜底）
+  - Futu 不可用时：港股/美股指数降级或跳过
 """
 from typing import Dict, List, Optional
 
@@ -32,11 +34,13 @@ class IndexScreener:
     def __init__(self,
                  ak_codes: Optional[Dict[str, str]] = None,
                  futu_codes: Optional[Dict[str, str]] = None,
+                 us_codes: Optional[Dict[str, str]] = None,
                  futu_host: str = "127.0.0.1",
                  futu_port: int = 11111):
         import config
         self.ak_codes   = ak_codes   if ak_codes   is not None else config.INDEX_AK_CODES
         self.futu_codes = futu_codes if futu_codes is not None else config.INDEX_FUTU_CODES
+        self.us_codes   = us_codes   if us_codes   is not None else getattr(config, "INDEX_US_CODES", {})
         self.futu_host  = futu_host
         self.futu_port  = futu_port
         self.analyzers: Dict[str, IndexAnalyzer] = {}
@@ -56,6 +60,7 @@ class IndexScreener:
         lb = lookback_days or getattr(config, "INDEX_LOOKBACK_DAYS", 180)
         self._load_ak_indices(lookback_days=lb)
         self._load_futu_indices(lookback_days=lb)
+        self._load_us_indices(lookback_days=lb)
 
     # ────────────────────────────────
     # 盘后初始化（固定起点）
@@ -69,6 +74,7 @@ class IndexScreener:
         """
         self._load_ak_indices(start_date=start_date)
         self._load_futu_indices(start_date=start_date)
+        self._load_us_indices(start_date=start_date)
 
     # ────────────────────────────────
     # 私有：AKShare 指数加载（三级）
@@ -177,6 +183,72 @@ class IndexScreener:
                     print(f"  [✗] {name} ({sym}): 加载失败 {e}", flush=True)
         finally:
             futu.close()
+
+    # ────────────────────────────────
+    # 私有：美股指数加载（三级）
+    # ────────────────────────────────
+
+    def _load_us_indices(self, lookback_days: int = None, start_date: str = None):
+        """
+        加载美股指数 ETF（SPY/QQQ/DIA）三个周期。
+        Futu 优先（需美股行情权限），降级 yfinance（免费兜底）。
+        """
+        if not self.us_codes:
+            return
+
+        from signals.data.fetcher import USDataSource, FutuSource
+
+        # 尝试复用已验证的 Futu 连接
+        futu = None
+        if self._futu_available:
+            try:
+                futu = FutuSource(self.futu_host, self.futu_port)
+                futu.connect()
+            except Exception:
+                futu = None
+
+        us_source = USDataSource(futu_source=futu)
+        lb = lookback_days or 180
+        data_label = "Futu" if futu else "yfinance"
+
+        try:
+            for name, sym in self.us_codes.items():
+                try:
+                    daily = us_source.get_us_index_kline(
+                        sym, Freq.D, lookback_days=lb, start=start_date)
+                    if not daily:
+                        self.analyzers[name] = IndexAnalyzer(name, sym, [])
+                        print(f"  [✗] {name} ({sym}): 日线数据为空", flush=True)
+                        continue
+
+                    bars_30 = _safe_load(
+                        lambda s=sym: us_source.get_us_index_kline(
+                            s, Freq.F30, lookback_days=lb, start=start_date),
+                        label=f"{name} 30min"
+                    )
+                    bars_15 = _safe_load(
+                        lambda s=sym: us_source.get_us_index_kline(
+                            s, Freq.F15, lookback_days=lb, start=start_date),
+                        label=f"{name} 15min"
+                    )
+
+                    self.analyzers[name] = IndexAnalyzer(
+                        name, sym, daily,
+                        f30_bars=bars_30 or None,
+                        f15_bars=bars_15 or None,
+                    )
+                    parts = [f"{len(daily)}根日线"]
+                    if bars_30: parts.append(f"{len(bars_30)}根30M")
+                    if bars_15: parts.append(f"{len(bars_15)}根15M")
+                    print(f"  [✓] {name} ({sym}): {'  '.join(parts)}  [{data_label}]",
+                          flush=True)
+
+                except Exception as e:
+                    self.analyzers[name] = IndexAnalyzer(name, sym, [])
+                    print(f"  [✗] {name} ({sym}): 加载失败 {e}", flush=True)
+        finally:
+            if futu:
+                futu.close()
 
     # ────────────────────────────────
     # 分析 + 输出

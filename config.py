@@ -51,8 +51,14 @@ INDEX_AK_CODES = {
 INDEX_FUTU_CODES = {
     "恒生科技": "HK.800700",
 }
+# 美股指数 ETF（Futu格式，Layer 1 三级联动）
+INDEX_US_CODES = {
+    "标普500":  "US.SPY",
+    "纳斯达克": "US.QQQ",
+    "道琼斯":   "US.DIA",
+}
 # 合并索引，供统一遍历
-INDEX_CODES = {**INDEX_AK_CODES, **INDEX_FUTU_CODES}
+INDEX_CODES = {**INDEX_AK_CODES, **INDEX_FUTU_CODES, **INDEX_US_CODES}
 
 # 指数分析周期（盘中三级联动：日线背景 + 30min中枢 + 15min买卖点）
 INDEX_FREQS = ["daily", "30min", "15min"]

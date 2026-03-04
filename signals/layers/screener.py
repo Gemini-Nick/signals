@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 from config import WHITELIST, MONITOR_FREQS, SCORE_THRESHOLD
-from signals.data.fetcher import AKShareSource
+from signals.data.fetcher import AKShareSource, USDataSource, detect_market
 from czsc import Freq
 
 from signals.core.freq_utils import config_freq_to_czsc
@@ -37,6 +37,7 @@ class IntraDayScreener:
         self.czsc_freqs: List[Freq] = [config_freq_to_czsc(f) for f in self.freqs]
         self.max_workers = max_workers
         self.ak_source = AKShareSource()
+        self._us_source: Optional[USDataSource] = None
         self.notes = notes or []
         # Dict[symbol][freq.value] -> SymbolAnalyzer  (Rust Freq 不可哈希，用 str)
         self.analyzers: Dict[str, Dict[str, SymbolAnalyzer]] = {}
@@ -44,17 +45,35 @@ class IntraDayScreener:
     # ─────────────────────────────────────────────────────
     # 初始化：并发拉取历史分钟线，创建 CZSC Analyzer
     # ─────────────────────────────────────────────────────
+    def _fetch_minute_bars(self, sym: str, freq: Freq) -> List:
+        """根据市场路由到正确的数据源获取分钟线"""
+        from czsc import RawBar
+        market = detect_market(sym)
+        if market == "A":
+            return self.ak_source.get_a_minute(sym, freq)
+        elif market == "US":
+            if not self._us_source:
+                self._us_source = USDataSource()
+            return self._us_source.get_us_minute(sym, freq)
+        return []
+
     def initialize(self, symbols: Optional[List[str]] = None):
         """并发拉取分钟线，为所有标的 × 所有级别创建 SymbolAnalyzer。"""
         target = symbols or self.symbols
-        tasks = [(sym, freq) for sym in target for freq in self.czsc_freqs]
+        # 按市场分组：A股可并发，US股顺序获取
+        a_tasks = [(sym, freq) for sym in target for freq in self.czsc_freqs
+                   if detect_market(sym) == "A"]
+        us_tasks = [(sym, freq) for sym in target for freq in self.czsc_freqs
+                    if detect_market(sym) == "US"]
 
-        print(f"[{_ts()}] 初始化 {len(target)} 只 × {len(self.czsc_freqs)} 级别 = {len(tasks)} 个 analyzer ...")
+        total = len(a_tasks) + len(us_tasks)
+        print(f"[{_ts()}] 初始化 {len(target)} 只 × {len(self.czsc_freqs)} 级别 = {total} 个 analyzer ...")
+        if a_tasks:
+            print(f"  A股: {len(a_tasks)} 个（并发），美股: {len(us_tasks)} 个（顺序）")
 
-        # 预热：mini_racer (AKShare 内部 JS 引擎) 不支持多线程并发初始化，
-        # 先单线程调用一次，让引擎完成初始化后再并发。
-        if tasks:
-            _warm_sym, _warm_freq = tasks[0]
+        # A股预热 + 并发获取
+        if a_tasks:
+            _warm_sym, _warm_freq = a_tasks[0]
             self.ak_source.get_a_minute(_warm_sym, _warm_freq)
 
         def _fetch_and_build(sym: str, freq: Freq):
@@ -62,23 +81,36 @@ class IntraDayScreener:
             return sym, freq, bars
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            futs = {pool.submit(_fetch_and_build, sym, freq): (sym, freq) for sym, freq in tasks}
+            futs = {pool.submit(_fetch_and_build, sym, freq): (sym, freq)
+                    for sym, freq in a_tasks}
             for fut in as_completed(futs):
                 sym, freq = futs[fut]
                 try:
                     _, _, bars = fut.result()
-                    if sym not in self.analyzers:
-                        self.analyzers[sym] = {}
-                    if bars:
-                        self.analyzers[sym][freq.value] = SymbolAnalyzer(sym, freq, bars)
-                        bi_cnt = len(self.analyzers[sym][freq.value].bi_list)
-                        print(f"  OK  {sym} {freq.value:6s} {len(bars):5d} bars  {bi_cnt:3d} 笔")
-                    else:
-                        print(f"  跳过 {sym} {freq.value} — 无数据")
+                    self._store_analyzer(sym, freq, bars)
                 except Exception as e:
                     print(f"  错误 {sym} {freq.value}: {e}")
 
+        # 美股顺序获取（USDataSource 内部可能用 Futu 连接，非线程安全）
+        for sym, freq in us_tasks:
+            try:
+                bars = self._fetch_minute_bars(sym, freq)
+                self._store_analyzer(sym, freq, bars)
+            except Exception as e:
+                print(f"  错误 {sym} {freq.value}: {e}")
+
         print(f"[{_ts()}] 初始化完成，共 {sum(len(v) for v in self.analyzers.values())} 个 analyzer。\n")
+
+    def _store_analyzer(self, sym: str, freq: Freq, bars):
+        """存储 Analyzer 并打印状态"""
+        if sym not in self.analyzers:
+            self.analyzers[sym] = {}
+        if bars:
+            self.analyzers[sym][freq.value] = SymbolAnalyzer(sym, freq, bars)
+            bi_cnt = len(self.analyzers[sym][freq.value].bi_list)
+            print(f"  OK  {sym} {freq.value:6s} {len(bars):5d} bars  {bi_cnt:3d} 笔")
+        else:
+            print(f"  跳过 {sym} {freq.value} — 无数据")
 
     # ─────────────────────────────────────────────────────
     # 扫描：信号检测 + 评分
@@ -105,22 +137,34 @@ class IntraDayScreener:
         """重新拉取分钟线并增量更新各 Analyzer。"""
         target = symbols or list(self.analyzers.keys())
 
-        def _refresh_one(sym: str, freq: Freq):
+        # A股并发刷新
+        a_targets = [(sym, freq) for sym in target for freq in self.czsc_freqs
+                     if detect_market(sym) == "A"
+                     and sym in self.analyzers and freq.value in self.analyzers[sym]]
+
+        def _refresh_a(sym: str, freq: Freq):
             new_bars = self.ak_source.get_a_minute(sym, freq)
             self.analyzers[sym][freq.value].update_many(new_bars)
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            futs = [
-                pool.submit(_refresh_one, sym, freq)
-                for sym in target
-                for freq in self.czsc_freqs
-                if sym in self.analyzers and freq.value in self.analyzers[sym]
-            ]
+            futs = [pool.submit(_refresh_a, sym, freq) for sym, freq in a_targets]
             for fut in as_completed(futs):
                 try:
                     fut.result()
                 except Exception as e:
                     print(f"  刷新错误: {e}")
+
+        # 美股顺序刷新
+        for sym in target:
+            if detect_market(sym) != "US":
+                continue
+            for freq in self.czsc_freqs:
+                if sym in self.analyzers and freq.value in self.analyzers[sym]:
+                    try:
+                        new_bars = self._fetch_minute_bars(sym, freq)
+                        self.analyzers[sym][freq.value].update_many(new_bars)
+                    except Exception as e:
+                        print(f"  刷新错误 {sym} {freq.value}: {e}")
 
     # ─────────────────────────────────────────────────────
     # 输出
