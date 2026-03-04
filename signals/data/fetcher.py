@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-三数据源统一接口，统一输出 czsc.RawBar 列表
+多数据源统一接口，统一输出 czsc.RawBar 列表
 
-- TushareSource : A股日线盘后分析
-- AKShareSource : A股/港股/美股 历史K线，候选池筛选
-- FutuSource     : 盘中实时 15min/30min K线订阅
+- TushareSource   : A股日线盘后分析
+- AKShareSource   : A股/港股/美股 历史K线，候选池筛选
+- FutuSource      : 盘中实时 K线订阅（A股/港股/美股）
+- YFinanceSource  : 美股免费兜底（日线+分钟线）
+- USDataSource    : 美股数据路由（Futu优先 → yfinance兜底）
 """
 
 import sys
@@ -44,6 +46,21 @@ def _to_raw_bars(df: pd.DataFrame, symbol: str, freq: Freq,
             amount=amount,
         ))
     return bars
+
+
+# ─────────────────────────────────────────────────────────
+# 工具：市场检测
+# ─────────────────────────────────────────────────────────
+def detect_market(futu_code: str) -> str:
+    """根据代码前缀判断市场：'A' / 'HK' / 'US' / 'UNKNOWN'"""
+    prefix = futu_code.split(".")[0]
+    if prefix in ("SH", "SZ", "BJ"):
+        return "A"
+    if prefix == "HK":
+        return "HK"
+    if prefix == "US":
+        return "US"
+    return "UNKNOWN"
 
 
 # ─────────────────────────────────────────────────────────
@@ -310,6 +327,67 @@ class FutuSource:
         return _to_raw_bars(df, futu_code, freq,
                             "dt", "open", "high", "low", "close", "vol", "amount")
 
+    # ── 美股方法 ──────────────────────────────────────────
+
+    def get_us_daily(self, futu_code: str,
+                     lookback_days: int = 365) -> List[RawBar]:
+        """
+        美股日线历史（Futu request_history_kline）。
+        需要已开通美股行情权限。
+        """
+        from futu import KLType, AuType, RET_OK
+        from datetime import datetime, timedelta
+        start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        ret, df, _ = self._ctx.request_history_kline(
+            futu_code, start=start, ktype=KLType.K_DAY,
+            autype=AuType.QFQ, max_count=2000
+        )
+        if ret != RET_OK or df is None or df.empty:
+            return []
+        df = df.rename(columns={"time_key": "dt", "volume": "vol",
+                                 "turnover": "amount"})
+        df["amount"] = df["amount"].fillna(0)
+        return _to_raw_bars(df, futu_code, Freq.D,
+                            "dt", "open", "high", "low", "close", "vol", "amount")
+
+    def get_us_minute(self, futu_code: str, freq: Freq,
+                      lookback_days: int = 30) -> List[RawBar]:
+        """
+        美股分钟线历史（Futu request_history_kline）。
+        freq: Freq.F5 / Freq.F15 / Freq.F30
+        Futu 支持最多 8 年分钟线历史。
+        """
+        from futu import KLType, AuType, RET_OK
+        from datetime import datetime, timedelta
+        start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        ktype_map = {
+            "1分钟": KLType.K_1M, "5分钟": KLType.K_5M,
+            "15分钟": KLType.K_15M, "30分钟": KLType.K_30M,
+            "60分钟": KLType.K_60M,
+        }
+        ktype = ktype_map.get(freq.value, KLType.K_15M)
+        ret, df, _ = self._ctx.request_history_kline(
+            futu_code, start=start, ktype=ktype,
+            autype=AuType.QFQ, max_count=2000
+        )
+        if ret != RET_OK or df is None or df.empty:
+            return []
+        df = df.rename(columns={"time_key": "dt", "volume": "vol",
+                                 "turnover": "amount"})
+        df["amount"] = df["amount"].fillna(0)
+        return _to_raw_bars(df, futu_code, freq,
+                            "dt", "open", "high", "low", "close", "vol", "amount")
+
+    def get_us_index_kline(self, futu_code: str, freq: Freq,
+                           lookback_days: int = 180,
+                           start: str = None) -> List[RawBar]:
+        """
+        美股指数 ETF K线（SPY/QQQ/DIA）。
+        复用 get_index_kline，接口完全一致。
+        """
+        return self.get_index_kline(futu_code, freq,
+                                     lookback_days=lookback_days, start=start)
+
     def get_history_bars(self, futu_code: str, freq: Freq,
                          num: int = 500) -> List[RawBar]:
         """拉取历史K线用于初始化 CZSC 对象"""
@@ -339,3 +417,118 @@ class FutuSource:
             "K_60M": Freq.F60, "K_DAY": Freq.D,
         }
         return mapping.get(k_type, Freq.F15)
+
+
+# ─────────────────────────────────────────────────────────
+# 4. YFinance — 美股免费兜底
+# ─────────────────────────────────────────────────────────
+class YFinanceSource:
+    """
+    yfinance 免费数据源 — 无需连接、无需 API key
+    适合 Futu 不可用时的美股数据兜底。
+    限制：日线最多 1 年，分钟线 15min/30min 最多 60 天。
+    """
+
+    @staticmethod
+    def _ticker(futu_code: str) -> str:
+        """US.AAPL → AAPL"""
+        return futu_code.split(".")[1]
+
+    def get_us_daily(self, futu_code: str, period: str = "1y") -> List[RawBar]:
+        """美股日线（最多 1 年历史）"""
+        import yfinance as yf
+        ticker = self._ticker(futu_code)
+        tk = yf.Ticker(ticker)
+        df = tk.history(period=period)
+        if df is None or df.empty:
+            return []
+        df = df.reset_index()
+        dt_col = "Date" if "Date" in df.columns else "Datetime"
+        df = df.rename(columns={dt_col: "dt", "Open": "open", "High": "high",
+                                 "Low": "low", "Close": "close", "Volume": "vol"})
+        df["amount"] = 0
+        # 去掉时区信息，确保 CZSC 兼容
+        df["dt"] = pd.to_datetime(df["dt"]).dt.tz_localize(None)
+        return _to_raw_bars(df, futu_code, Freq.D,
+                            "dt", "open", "high", "low", "close", "vol", "amount")
+
+    def get_us_minute(self, futu_code: str, freq: Freq) -> List[RawBar]:
+        """
+        美股分钟线。
+        yfinance 支持：1m(7天), 5m/15m/30m/60m(60天)
+        """
+        import yfinance as yf
+        ticker = self._ticker(futu_code)
+        # freq.value → yfinance interval
+        interval_map = {
+            "1分钟": "1m", "5分钟": "5m", "15分钟": "15m",
+            "30分钟": "30m", "60分钟": "60m",
+        }
+        interval = interval_map.get(freq.value, "15m")
+        period = "7d" if interval == "1m" else "60d"
+        tk = yf.Ticker(ticker)
+        df = tk.history(period=period, interval=interval)
+        if df is None or df.empty:
+            return []
+        df = df.reset_index()
+        dt_col = "Datetime" if "Datetime" in df.columns else "Date"
+        df = df.rename(columns={dt_col: "dt", "Open": "open", "High": "high",
+                                 "Low": "low", "Close": "close", "Volume": "vol"})
+        df["amount"] = 0
+        df["dt"] = pd.to_datetime(df["dt"]).dt.tz_localize(None)
+        return _to_raw_bars(df, futu_code, freq,
+                            "dt", "open", "high", "low", "close", "vol", "amount")
+
+
+# ─────────────────────────────────────────────────────────
+# 5. USDataSource — 美股数据路由（Futu优先 → yfinance兜底）
+# ─────────────────────────────────────────────────────────
+class USDataSource:
+    """
+    美股统一数据入口：
+    优先使用 Futu（更深历史、实时订阅），
+    Futu 不可用时自动降级到 yfinance（免费兜底）。
+    """
+
+    def __init__(self, futu_source: Optional[FutuSource] = None):
+        self._futu = futu_source
+        self._yf = YFinanceSource()
+
+    def get_us_daily(self, futu_code: str, **kwargs) -> List[RawBar]:
+        """Futu 优先获取美股日线，失败降级 yfinance"""
+        if self._futu:
+            try:
+                bars = self._futu.get_us_daily(futu_code, **kwargs)
+                if bars:
+                    return bars
+            except Exception as e:
+                print(f"    [!] Futu 美股日线失败（降级 yfinance）: {e}")
+        return self._yf.get_us_daily(futu_code)
+
+    def get_us_minute(self, futu_code: str, freq: Freq, **kwargs) -> List[RawBar]:
+        """Futu 优先获取美股分钟线，失败降级 yfinance"""
+        if self._futu:
+            try:
+                bars = self._futu.get_us_minute(futu_code, freq, **kwargs)
+                if bars:
+                    return bars
+            except Exception as e:
+                print(f"    [!] Futu 美股分钟线失败（降级 yfinance）: {e}")
+        return self._yf.get_us_minute(futu_code, freq)
+
+    def get_us_index_kline(self, futu_code: str, freq: Freq,
+                           lookback_days: int = 180,
+                           start: str = None) -> List[RawBar]:
+        """美股指数 ETF K线，Futu优先 → yfinance兜底"""
+        if self._futu:
+            try:
+                bars = self._futu.get_us_index_kline(
+                    futu_code, freq, lookback_days=lookback_days, start=start)
+                if bars:
+                    return bars
+            except Exception as e:
+                print(f"    [!] Futu 美股指数失败（降级 yfinance）: {e}")
+        # yfinance 兜底
+        if freq == Freq.D:
+            return self._yf.get_us_daily(futu_code, period="1y")
+        return self._yf.get_us_minute(futu_code, freq)

@@ -3,18 +3,18 @@
 端到端验证脚本
 
 运行方式：
-    cd /Users/zhangqilong/Desktop/Signals
-    python -m signals.validate
+    python validate.py
 """
 import sys
-sys.path.insert(0, "/Users/zhangqilong/Desktop/Signals")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from signals.freq_utils import config_freq_to_czsc, FREQ_MAP
-from signals.analyzer import SymbolAnalyzer
-from signals.detectors import detect_all_signals
-from signals.scorer import score_signals
-from signals.industry import get_industry_list, get_industry_stocks
-from signals.screener import IntraDayScreener
+from signals.core.freq_utils import config_freq_to_czsc, FREQ_MAP
+from signals.core.analyzer import SymbolAnalyzer
+from signals.core.detectors import detect_all_signals
+from signals.core.scorer import score_signals
+from signals.layers.industry import get_industry_list, get_industry_stocks
+from signals.layers.screener import IntraDayScreener
 
 
 TEST_SYMBOLS = ["SH.601958", "SH.600519", "SZ.000001"]
@@ -31,7 +31,7 @@ def section(title: str):
 
 def main():
     print(SEP)
-    print("  盘中信号筛选管道 — 端到端验证")
+    print("  🐲 隆小侠 LONG CLAW — 端到端验证")
     print(SEP)
 
     # ── Step 1: 频率映射 ───────────────────────────────────
@@ -96,17 +96,56 @@ def main():
     except Exception as e:
         print(f"  行业接口异常（不影响主管道）: {e}")
 
+    # ── Step 6: 美股数据验证（yfinance 兜底）──────────────
+    section("Step 6 / 美股数据验证（yfinance）")
+    us_ok = False
+    try:
+        from signals.data.fetcher import YFinanceSource, detect_market
+        from czsc import CZSC
+
+        yf_source = YFinanceSource()
+        us_sym = "US.AAPL"
+        print(f"  detect_market('{us_sym}') = {detect_market(us_sym)}")
+
+        # 日线
+        bars_d = yf_source.get_us_daily(us_sym, period="6mo")
+        print(f"  日线: {len(bars_d)} 根  ({bars_d[0].dt.date()} ~ {bars_d[-1].dt.date()})" if bars_d else "  日线: 无数据")
+
+        # 分钟线
+        from czsc import Freq
+        bars_15 = yf_source.get_us_minute(us_sym, Freq.F15)
+        print(f"  15min: {len(bars_15)} 根" if bars_15 else "  15min: 无数据")
+
+        # CZSC 分析
+        if bars_d and len(bars_d) >= 100:
+            c = CZSC(bars_d, max_bi_num=50)
+            print(f"  CZSC 日线: {len(c.bi_list)} 笔  PASS ✓")
+            us_ok = True
+        elif bars_d:
+            print(f"  CZSC 日线: 数据不足（{len(bars_d)} < 100）跳过")
+            us_ok = True
+        else:
+            print("  CZSC 日线: 无数据")
+    except ImportError:
+        print("  [!] yfinance 未安装（pip install yfinance）")
+    except Exception as e:
+        print(f"  [!] 美股验证异常: {e}")
+
     # ── 汇总 ──────────────────────────────────────────────
     section("验证汇总")
     analyzers_ok = sum(len(v) for v in screener.analyzers.values())
     print(f"  Analyzer 数量: {analyzers_ok} / {len(TEST_SYMBOLS) * len(TEST_FREQS)} 期望")
     print(f"  检测到信号总数: {total_signals}")
+    print(f"  美股数据（yfinance）: {'PASS ✓' if us_ok else 'FAIL ✗'}")
     print()
 
     if analyzers_ok > 0:
         print("  ✅ 管道核心功能正常（数据加载、CZSC 分析、信号检测、评分排序）")
     else:
         print("  ❌ 未能创建任何 Analyzer，请检查网络或 AKShare 接口")
+
+    if us_ok:
+        print("  ✅ 美股数据通道正常（yfinance 兜底可用）")
 
     if total_signals == 0:
         print("  ℹ️  当前市场结构未触发买卖点（正常，信号并非随时出现）")
