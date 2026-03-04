@@ -28,10 +28,59 @@ import config
 # ─────────────────────────────────────────────────────────
 
 def _load_notes(args):
-    """加载研究笔记（如果 notes/ 目录存在）"""
+    """
+    加载研究笔记，支持交互式选择。
+    - 默认列出所有可用笔记，用户输入编号选择
+    - 直接回车 = 全部加载
+    - 输入 0 = 不加载任何笔记
+    - 输入 1,3,5 = 只加载指定编号
+    """
     from signals.research import load_all_notes, print_notes_summary
     notes_dir = getattr(args, 'notes', None) or config.NOTES_DIR
-    notes = load_all_notes(notes_dir)
+    all_notes = load_all_notes(notes_dir)
+
+    if not all_notes:
+        print("  研报: 无有效研究笔记")
+        return []
+
+    # 列出可用笔记
+    print(f"\n{'─'*50}")
+    print(f"  可用研究笔记（{len(all_notes)} 篇）")
+    print(f"{'─'*50}")
+    for i, note in enumerate(all_notes, 1):
+        sentiment_mark = {"看多": "+", "看空": "-", "中性": "~"}.get(note.sentiment, "?")
+        sectors = "、".join(note.sectors[:2]) or "未分类"
+        print(f"  [{i}] {note.date}  {note.title}")
+        print(f"      {note.source_label}  |  {sectors}  |  {sentiment_mark}{note.sentiment}")
+    print(f"{'─'*50}")
+
+    # 交互选择
+    try:
+        choice = input("  选择笔记 (回车=全部, 0=跳过, 1,3=指定编号): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        choice = ""
+
+    if choice == "0":
+        print("  → 跳过研究笔记")
+        return []
+    elif choice == "":
+        notes = all_notes
+        print(f"  → 加载全部 {len(notes)} 篇")
+    else:
+        indices = []
+        for part in choice.split(","):
+            part = part.strip()
+            if part.isdigit():
+                idx = int(part)
+                if 1 <= idx <= len(all_notes):
+                    indices.append(idx - 1)
+        if indices:
+            notes = [all_notes[i] for i in indices]
+            print(f"  → 加载 {len(notes)} 篇: {', '.join(n.title for n in notes)}")
+        else:
+            print("  → 输入无效，加载全部")
+            notes = all_notes
+
     if notes:
         print_notes_summary(notes)
     return notes
