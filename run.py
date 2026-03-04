@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Signals 系统总入口 — 三层联动（指数 → 行业 → 标的）
+🐲 隆小侠 LONG CLAW — 实线虚线分析框架
+
+三层联动总入口：指数研判 → 行业研判 → 标的筛选
 
 用法：
   python run.py                                    # 盘中监测（默认）
@@ -338,7 +340,7 @@ def _parse_industries(args) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Signals — 缠论三层联动分析系统",
+        description="🐲 隆小侠 LONG CLAW — 实线虚线分析框架",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例：

@@ -5,7 +5,7 @@ IndexScreener: 指数层入口（Layer 1）
   - 盘中模式 initialize(lookback_days)：滚动窗口，近 N 自然日
   - 盘后模式 initialize_with_start(start_date)：固定起点历史数据
 
-三级联动：日线（趋势背景）+ 30分钟（中枢结构）+ 15分钟（买卖点）
+实线虚线框架三级联动：日线（趋势背景）+ 30分钟（中枢结构）+ 15分钟（买卖点）
 
 数据源分工：
   - A股7只指数：

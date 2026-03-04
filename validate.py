@@ -31,7 +31,7 @@ def section(title: str):
 
 def main():
     print(SEP)
-    print("  盘中信号筛选管道 — 端到端验证")
+    print("  🐲 隆小侠 LONG CLAW — 端到端验证")
     print(SEP)
 
     # ── Step 1: 频率映射 ───────────────────────────────────

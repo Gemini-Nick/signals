@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-全局配置文件
+🐲 隆小侠 LONG CLAW — 全局配置
 
 凭证从 .env 文件读取（不入库），参考 .env.example 创建本地 .env。
 """
@@ -60,7 +60,7 @@ INDEX_US_CODES = {
 # 合并索引，供统一遍历
 INDEX_CODES = {**INDEX_AK_CODES, **INDEX_FUTU_CODES, **INDEX_US_CODES}
 
-# 指数分析周期（盘中三级联动：日线背景 + 30min中枢 + 15min买卖点）
+# 指数分析周期（实线虚线框架三级联动：日线背景 + 30min中枢 + 15min买卖点）
 INDEX_FREQS = ["daily", "30min", "15min"]
 
 # 指数日线滚动窗口（盘中模式，自然日）
