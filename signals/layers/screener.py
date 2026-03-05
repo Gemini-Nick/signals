@@ -74,7 +74,10 @@ class IntraDayScreener:
         # A股预热 + 并发获取
         if a_tasks:
             _warm_sym, _warm_freq = a_tasks[0]
-            self.ak_source.get_a_minute(_warm_sym, _warm_freq)
+            try:
+                self.ak_source.get_a_minute(_warm_sym, _warm_freq)
+            except Exception as e:
+                print(f"  [!] 预热失败（{e}），继续尝试 ...", flush=True)
 
         def _fetch_and_build(sym: str, freq: Freq):
             bars = self.ak_source.get_a_minute(sym, freq)
