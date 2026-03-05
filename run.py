@@ -179,9 +179,8 @@ def run_intraday(args):
     """
     盘中模式：
     Layer 1 → 指数研判（MarketContext）
-    Layer 2 → 行业强度（可选，由 --industries 或 config.WATCH_INDUSTRIES 控制）
-    Layer 3 → 标的筛选（白名单 + 行业成分股）
-    研报维度 → 独立展示，与技术面分数并列
+    Layer 2 → 双榜行业筛选（自动） + --industries 补充
+    Layer 3 → 标的筛选（白名单 + 双榜代表股 + 研报标的）
     """
     from signals.layers.index_screener import IndexScreener
     from signals.layers.screener import IntraDayScreener
@@ -202,62 +201,112 @@ def run_intraday(args):
     if not ctx.gate_industry_scan:
         print("⚠️  市场偏空，建议观望，仅扫描白名单。")
 
-    # ── Layer 2：行业分析（可选）────────────────────────────
-    industry_stocks: list = []
+    # ── Layer 2：双榜行业筛选 + 多维度个股入池 ─────────────
+    ranking_stocks: list = []
+    if config.RANK_TOP_N > 0:
+        from signals.layers.industry import get_industry_representatives
+
+        print(f"\n>>> Layer 2 双榜行业筛选（各取前{config.RANK_TOP_N}名）")
+        print("  " + "─" * 60)
+
+        try:
+            gain_list, composite_list, merged_list = get_industry_representatives(
+                config.RANK_TOP_N)
+        except Exception as e:
+            print(f"  [!] 行业筛选异常（{e}），跳过 Layer 2", flush=True)
+            gain_list, composite_list, merged_list = [], [], []
+
+        # ── Layer 2A：涨幅排行榜 ─────────────────────────
+        if gain_list:
+            print(f"\n  >>> Layer 2A 行业涨幅排行（今日前{len(gain_list)}名）")
+            print(f"  {'排名':<4} {'行业':<12} {'涨幅':>7}  {'净流入(亿)':>10}")
+            print("  " + "─" * 55)
+            for r in gain_list:
+                sign = "+" if r.gain_pct >= 0 else ""
+                print(f"  {r.gain_rank:<4} {r.name:<12} "
+                      f"{sign}{r.gain_pct:.2f}%  {r.net_inflow:>10.2f}")
+                for c in r.candidates:
+                    print(f"       {c.role}: {c.name}({c.code}"
+                          f"{', ' + c.detail if c.detail else ''})")
+                if r.pool_codes:
+                    print(f"       → 入池: {', '.join(r.pool_codes)}")
+
+        # ── Layer 2B：综合强度排行榜 ─────────────────────
+        if composite_list:
+            print(f"\n  >>> Layer 2B 行业综合强度排行（今日前{len(composite_list)}名）")
+            print(f"  {'排名':<4} {'行业':<10} {'综合分':>6} {'涨幅':>7} "
+                  f"{'流入(亿)':>9} {'涨停':>4} {'强势':>4} {'续板':>4}")
+            print("  " + "─" * 60)
+            for r in composite_list:
+                sign = "+" if r.gain_pct >= 0 else ""
+                tag = " ★" if r.source == "both" else ""
+                print(f"  {r.composite_rank:<4} {r.name:<10} "
+                      f"{r.composite_score:>6.1f} {sign}{r.gain_pct:>6.2f}% "
+                      f"{r.net_inflow:>9.2f} {r.zt_count:>4} "
+                      f"{r.strong_count:>4} {r.zbgc_count:>4}{tag}")
+                for c in r.candidates:
+                    already = " [涨幅榜已入池]" if r.source == "both" else ""
+                    print(f"       {c.role}: {c.name}({c.code}"
+                          f"{', ' + c.detail if c.detail else ''}){already}")
+                if r.pool_codes and r.source != "both":
+                    print(f"       → 入池: {', '.join(r.pool_codes)}")
+
+        # ── 汇总 ─────────────────────────────────────────
+        for r in merged_list:
+            ranking_stocks.extend(r.pool_codes)
+        ranking_stocks = list(dict.fromkeys(ranking_stocks))
+
+        if merged_list:
+            gain_only = sum(1 for r in merged_list if r.source == "gain")
+            comp_only = sum(1 for r in merged_list if r.source == "composite")
+            both_cnt = sum(1 for r in merged_list if r.source == "both")
+            print(f"\n  >>> Layer 2 合计: 涨幅榜 {len(gain_list)} 行业 + "
+                  f"综合榜 {comp_only} 新增行业"
+                  f"{f' + {both_cnt} 重叠' if both_cnt else ''}"
+                  f" = {len(merged_list)} 行业")
+            print(f"  >>> Layer 2 共 {len(ranking_stocks)} 只代表股纳入筛选池")
+
+    # ── --industries 补充行业（直接入池，不做CZSC研判）──────
+    named_stocks: list = []
     industry_names = _parse_industries(args)
-    # 研报中涉及的行业自动加入扫描池
+    # 研报中涉及的行业也自动加入补充池
     if noted_industries:
         for ni in noted_industries:
             if ni not in industry_names:
                 industry_names.append(ni)
         print(f"  研报行业已加入扫描池: {', '.join(noted_industries)}")
-
-    if industry_names and ctx.gate_industry_scan:
-        from signals.layers.industry import score_industry
-        print(f"\n>>> Layer 2 行业研判：{', '.join(industry_names)}")
-        ind_scores = []
+    if industry_names:
+        from signals.layers.industry import get_industry_stocks as _get_ind_stocks
+        max_per = getattr(config, "RANK_MAX_STOCKS_PER_IND", 5)
+        print(f"\n>>> Layer 2 补充行业：{', '.join(industry_names)}")
         for ind in industry_names:
-            print(f"  分析：{ind} ...", flush=True)
-            sc = score_industry(ind)
-            ind_scores.append(sc)
-            print(f"    {sc.summary}", flush=True)
-
-        # 从强势行业取成分股
-        from signals.layers.industry import get_industry_stocks
-        for sc in ind_scores:
-            if sc.is_strong:
-                stocks = get_industry_stocks(sc.name)
-                industry_stocks.extend(stocks[:30])  # 每个行业最多取30只
-                print(f"  [{sc.name}] 取 {min(30, len(stocks))} 只成分股进入 Layer 3")
-    elif industry_names and not ctx.gate_industry_scan:
-        print("  市场偏空，跳过行业分析。")
+            stocks = _get_ind_stocks(ind)
+            named_stocks.extend(stocks[:max_per])
+            print(f"  [{ind}] 取 {min(max_per, len(stocks))} 只")
+        named_stocks = list(dict.fromkeys(named_stocks))
 
     # ── Layer 3：标的筛选 ──────────────────────────────────
     print("\n>>> Layer 3 标的筛选 ...")
-    # 研报中的标的也加入候选池
+    extra_stocks = list(dict.fromkeys(ranking_stocks + named_stocks))
     all_symbols = list(dict.fromkeys(
-        config.WHITELIST + noted_stocks + industry_stocks
+        config.WHITELIST + noted_stocks + extra_stocks
     ))  # 去重保序
 
     screener_l3 = IntraDayScreener(
         symbols=all_symbols, freqs=config.MONITOR_FREQS, notes=notes,
     )
-    if industry_stocks:
-        # 两轮分别输出
+    if extra_stocks:
         wl_results = screener_l3.run_whitelist()
-        if industry_stocks:
-            # 直接扫描已合并的标的池
-            screener_l3.initialize(industry_stocks)
-            ind_results = screener_l3.scan_once(industry_stocks)
-            screener_l3.print_results(ind_results, title="行业成分股筛选结果")
+        screener_l3.initialize(extra_stocks)
+        extra_results = screener_l3.scan_once(extra_stocks)
+        screener_l3.print_results(extra_results, title="行业成分股筛选结果")
 
-            # 合并排序
-            combined = {}
-            for r in wl_results + ind_results:
-                if r.symbol not in combined or r.total_score > combined[r.symbol].total_score:
-                    combined[r.symbol] = r
-            merged = sorted(combined.values(), key=lambda x: -x.total_score)
-            screener_l3.print_results(merged, title="综合筛选结果（三层联动）")
+        combined = {}
+        for r in wl_results + extra_results:
+            if r.symbol not in combined or r.total_score > combined[r.symbol].total_score:
+                combined[r.symbol] = r
+        merged = sorted(combined.values(), key=lambda x: -x.total_score)
+        screener_l3.print_results(merged, title="综合筛选结果（三层联动）")
     else:
         screener_l3.run_whitelist()
 
