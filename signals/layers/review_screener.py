@@ -14,10 +14,11 @@ from czsc import Freq, RawBar
 # 个股日线加载工具
 # ─────────────────────────────────────────────────────────
 
-def _futu_to_tushare(futu_code: str) -> str:
-    """SH.601958 → 601958.SH"""
-    mkt, code = futu_code.split(".")
-    return f"{code}.{mkt}"
+# TODO: Tushare 充值后恢复
+# def _futu_to_tushare(futu_code: str) -> str:
+#     """SH.601958 → 601958.SH"""
+#     mkt, code = futu_code.split(".")
+#     return f"{code}.{mkt}"
 
 
 def _load_stock_daily_bars(futu_code: str, start_date: str,
@@ -26,8 +27,8 @@ def _load_stock_daily_bars(futu_code: str, start_date: str,
     加载个股日线，供盘后复盘使用。
     支持 A股（SH/SZ/BJ）和 美股（US）。
 
-    A股路径：AKShare（免费） → SSL故障时自动降级 Tushare。
-    美股路径：USDataSource（Futu优先 → yfinance兜底）。
+    A股路径：AKShare（免费）。
+    美股路径：USDataSource（降级链）。
     """
     from signals.data.fetcher import AKShareSource, USDataSource, detect_market
     from datetime import datetime
@@ -43,36 +44,19 @@ def _load_stock_daily_bars(futu_code: str, start_date: str,
             print(f"  [✗] {futu_code} 美股日线加载失败：{e}", flush=True)
             return []
 
-    # ── A股路径：AKShare → Tushare 降级 ──
+    # ── A股路径：AKShare ──
     ak_src = AKShareSource()
     try:
         bars = ak_src.get_a_daily(futu_code, sdt=start_date, edt=edt)
         if bars:
             return bars
     except Exception as e:
-        err_str = f"{type(e).__name__}: {e}"
-        # SSL故障 / 连接断开 / 超时 → 全部降级 Tushare
-        pass  # fallthrough to Tushare
+        print(f"  [✗] {futu_code} AKShare日线失败：{type(e).__name__}: {e}", flush=True)
 
-    # ── Tushare 降级 ──
-    try:
-        import config
-        if not getattr(config, "TUSHARE_TOKEN", ""):
-            print(f"  [✗] {futu_code} AKShare故障且无Tushare Token", flush=True)
-            return []
-        from signals.data.fetcher import TushareSource
-        ts_src = TushareSource(config.TUSHARE_TOKEN)
-        ts_code = _futu_to_tushare(futu_code)
-        sdt_compact = start_date.replace("-", "")
-        edt_compact = edt.replace("-", "")
-        bars = ts_src.get_daily(ts_code, sdt=sdt_compact, edt=edt_compact)
-        if bars:
-            return bars
-        print(f"  [✗] {futu_code} Tushare也无数据", flush=True)
-        return []
-    except Exception as e2:
-        print(f"  [✗] {futu_code} Tushare降级也失败：{e2}", flush=True)
-        return []
+    # TODO: Tushare 充值后恢复日线降级
+    # 当前 token 等级限制严格，暂时跳过
+    print(f"  [✗] {futu_code} 无可用日线数据", flush=True)
+    return []
 
 
 # ─────────────────────────────────────────────────────────

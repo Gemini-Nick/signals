@@ -82,48 +82,53 @@ class IndexScreener:
 
     def _load_ak_indices(self, lookback_days: int = None, start_date: str = None):
         """
-        加载 A股指数三个周期：
-        - 日线：stock_zh_index_daily（任意历史）
+        加载 A股指数三个周期（并行，IO密集型）：
+        - 日线：stock_zh_index_daily（任意历史，带日级缓存）
         - 30min/15min：stock_zh_a_minute（近5日，~40/80根）
         """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         from signals.data.fetcher import AKShareSource
-        ak = AKShareSource()
 
-        for name, sym in self.ak_codes.items():
+        def _load_one(name, sym):
+            """加载单只指数的三个周期，返回 (name, IndexAnalyzer)。"""
+            src = AKShareSource()
             try:
-                # 日线
-                bars_d = ak.get_index_daily(sym,
-                                             lookback_days=lookback_days or 180,
-                                             start_date=start_date)
+                bars_d = src.get_index_daily(sym,
+                                              lookback_days=lookback_days or 180,
+                                              start_date=start_date)
                 if not bars_d:
-                    self.analyzers[name] = IndexAnalyzer(name, sym, [])
                     print(f"  [✗] {name} ({sym}): 日线数据为空", flush=True)
-                    continue
+                    return name, IndexAnalyzer(name, sym, [])
 
-                # 30min（近5日，~40根）
                 bars_30 = _safe_load(
-                    lambda: ak.get_index_minute(sym, Freq.F30),
+                    lambda: src.get_index_minute(sym, Freq.F30),
                     label=f"{name} 30min"
                 )
-                # 15min（近5日，~80根）
                 bars_15 = _safe_load(
-                    lambda: ak.get_index_minute(sym, Freq.F15),
+                    lambda: src.get_index_minute(sym, Freq.F15),
                     label=f"{name} 15min"
                 )
 
-                self.analyzers[name] = IndexAnalyzer(
-                    name, sym, bars_d,
-                    f30_bars=bars_30 or None,
-                    f15_bars=bars_15 or None,
-                )
                 parts = [f"{len(bars_d)}根日线"]
                 if bars_30: parts.append(f"{len(bars_30)}根30M")
                 if bars_15: parts.append(f"{len(bars_15)}根15M")
                 print(f"  [✓] {name} ({sym}): {'  '.join(parts)}", flush=True)
 
+                return name, IndexAnalyzer(
+                    name, sym, bars_d,
+                    f30_bars=bars_30 or None,
+                    f15_bars=bars_15 or None,
+                )
             except Exception as e:
-                self.analyzers[name] = IndexAnalyzer(name, sym, [])
                 print(f"  [✗] {name} ({sym}): 加载失败 {e}", flush=True)
+                return name, IndexAnalyzer(name, sym, [])
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(_load_one, n, s): n
+                       for n, s in self.ak_codes.items()}
+            for f in as_completed(futures):
+                name, analyzer = f.result()
+                self.analyzers[name] = analyzer
 
     # ────────────────────────────────
     # 私有：Futu 指数加载（三级）

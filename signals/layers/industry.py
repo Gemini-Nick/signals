@@ -9,6 +9,7 @@
 - 多维度个股入池：涨停/异动/领涨/强势/龙头/融资
 """
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pandas as pd
@@ -31,12 +32,36 @@ def _code6_to_futu(code: str) -> str:
 
 
 _NAME_TO_CODE: dict = {}
+_NAME_CACHE_PATH = str(Path(__file__).resolve().parent.parent.parent / ".cache" / "name_to_code.json")
 
 def _build_name_to_code_map() -> dict:
-    """股票名称→6位代码映射（缓存），用于将领涨股名称转换为代码。"""
+    """
+    股票名称→6位代码映射（三级缓存）：
+    1. 内存（_NAME_TO_CODE 非空直接返回）
+    2. 本地 JSON（.cache/name_to_code.json，7天有效）
+    3. AKShare API（兜底，~60s）
+    """
     global _NAME_TO_CODE
     if _NAME_TO_CODE:
         return _NAME_TO_CODE
+
+    import json, os
+    from datetime import datetime, timedelta
+
+    # 尝试本地缓存
+    try:
+        if os.path.exists(_NAME_CACHE_PATH):
+            mtime = datetime.fromtimestamp(os.path.getmtime(_NAME_CACHE_PATH))
+            if datetime.now() - mtime < timedelta(days=7):
+                with open(_NAME_CACHE_PATH, "r", encoding="utf-8") as f:
+                    _NAME_TO_CODE.update(json.load(f))
+                print(f"  [✓] 名称映射从缓存加载（{len(_NAME_TO_CODE)} 只，"
+                      f"缓存日期 {mtime:%m-%d}）", flush=True)
+                return _NAME_TO_CODE
+    except Exception:
+        pass
+
+    # API 拉取
     import akshare as ak
     try:
         df = ak.stock_info_a_code_name()
@@ -46,7 +71,14 @@ def _build_name_to_code_map() -> dict:
                 code = str(row.get("code", "")).strip().zfill(6)
                 if name and code:
                     _NAME_TO_CODE[name] = code
-            print(f"  [✓] 名称映射已加载（{len(_NAME_TO_CODE)} 只）", flush=True)
+            # 写入本地缓存
+            try:
+                os.makedirs(os.path.dirname(_NAME_CACHE_PATH), exist_ok=True)
+                with open(_NAME_CACHE_PATH, "w", encoding="utf-8") as f:
+                    json.dump(_NAME_TO_CODE, f, ensure_ascii=False)
+            except Exception:
+                pass
+            print(f"  [✓] 名称映射已加载（{len(_NAME_TO_CODE)} 只，已缓存）", flush=True)
     except Exception as e:
         print(f"  [!] 股票名称映射加载失败（{e.__class__.__name__}）", flush=True)
     return _NAME_TO_CODE
@@ -141,14 +173,65 @@ _INDUSTRY_LEADERS: dict = {
 
 
 # ─────────────────────────────────────────────────────────
+# 东财 API 熔断器 — SSLError 一次即熔断，后续调用直接走缓存
+# ─────────────────────────────────────────────────────────
+_EM_CIRCUIT_OPEN = False          # True = 东财不可用，跳过网络调用
+_EM_NAME_DF_CACHE: Optional[pd.DataFrame] = None   # 首次成功结果缓存
+
+
+def _fetch_board_industry_name_em(timeout: float = 5.0) -> Optional[pd.DataFrame]:
+    """
+    带熔断的 stock_board_industry_name_em 调用：
+    - 整体超时 5s（用 ThreadPoolExecutor 强制截断）
+    - 首次成功后缓存结果，后续直接返回
+    - 失败后标记熔断，本次运行内不再尝试
+    """
+    global _EM_CIRCUIT_OPEN, _EM_NAME_DF_CACHE
+
+    # 有缓存直接返回
+    if _EM_NAME_DF_CACHE is not None:
+        return _EM_NAME_DF_CACHE
+
+    # 熔断打开 → 跳过
+    if _EM_CIRCUIT_OPEN:
+        return None
+
+    import akshare as ak
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+    def _call():
+        return ak.stock_board_industry_name_em()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_call)
+            df = future.result(timeout=timeout)
+            if df is not None and not df.empty:
+                _EM_NAME_DF_CACHE = df
+                return df
+            return None
+    except FutureTimeout:
+        _EM_CIRCUIT_OPEN = True
+        print(f"  [⚡] 东财行业接口超时（>{timeout}s），熔断", flush=True)
+        return None
+    except Exception as e:
+        _EM_CIRCUIT_OPEN = True
+        print(f"  [⚡] 东财行业接口熔断（{e.__class__.__name__}），本次运行跳过后续调用",
+              flush=True)
+        return None
+
+
+# ─────────────────────────────────────────────────────────
 # 基础接口（已有）
 # ─────────────────────────────────────────────────────────
 
 def get_industry_list() -> pd.DataFrame:
     """返回 A 股所有行业名称列表。"""
-    import akshare as ak
-    df = ak.stock_board_industry_name_em()
-    return df
+    df = _fetch_board_industry_name_em()
+    if df is not None:
+        return df
+    # 熔断时返回空 DataFrame
+    return pd.DataFrame()
 
 
 def get_industry_stocks(industry: str) -> List[str]:
@@ -456,29 +539,26 @@ def get_top_industries_by_gain(top_n: int = 10, period: str = "今日") -> list:
     """
     import akshare as ak
 
-    # ── 方法 A：东财行业板块实时行情 ──────────────────────
-    try:
-        df = ak.stock_board_industry_name_em()
-        if df is not None and not df.empty and "涨跌幅" in df.columns and "板块名称" in df.columns:
-            df = df.sort_values("涨跌幅", ascending=False).head(top_n)
-            result = []
-            for _, row in df.iterrows():
-                leading = str(row.get("领涨股票", ""))
-                leading_gain = 0.0
-                try:
-                    leading_gain = float(row.get("领涨股票-涨跌幅", 0) or 0)
-                except (ValueError, TypeError):
-                    pass
-                result.append({
-                    "name":          str(row["板块名称"]),
-                    "gain_pct":      float(row.get("涨跌幅", 0) or 0),
-                    "net_inflow":    0.0,   # 该接口无资金流向
-                    "leading_stock": leading,
-                    "leading_gain":  leading_gain,
-                })
-            return result
-    except Exception as e:
-        print(f"  [!] 行业板块行情接口失败（{e}），降级到全板块异动", flush=True)
+    # ── 方法 A：东财行业板块实时行情（带熔断）──────────────
+    df = _fetch_board_industry_name_em()
+    if df is not None and not df.empty and "涨跌幅" in df.columns and "板块名称" in df.columns:
+        df = df.sort_values("涨跌幅", ascending=False).head(top_n)
+        result = []
+        for _, row in df.iterrows():
+            leading = str(row.get("领涨股票", ""))
+            leading_gain = 0.0
+            try:
+                leading_gain = float(row.get("领涨股票-涨跌幅", 0) or 0)
+            except (ValueError, TypeError):
+                pass
+            result.append({
+                "name":          str(row["板块名称"]),
+                "gain_pct":      float(row.get("涨跌幅", 0) or 0),
+                "net_inflow":    0.0,   # 该接口无资金流向
+                "leading_stock": leading,
+                "leading_gain":  leading_gain,
+            })
+        return result
 
     # ── 方法 B：全板块异动（过滤行业名）─────────────────
     try:
@@ -515,14 +595,10 @@ def _get_known_industry_names() -> set:
     if _KNOWN_INDUSTRY_NAMES is not None:
         return _KNOWN_INDUSTRY_NAMES
 
-    import akshare as ak
-    try:
-        df = ak.stock_board_industry_name_em()
-        if df is not None and not df.empty and "板块名称" in df.columns:
-            _KNOWN_INDUSTRY_NAMES = set(df["板块名称"].tolist())
-            return _KNOWN_INDUSTRY_NAMES
-    except Exception:
-        pass
+    df = _fetch_board_industry_name_em()
+    if df is not None and not df.empty and "板块名称" in df.columns:
+        _KNOWN_INDUSTRY_NAMES = set(df["板块名称"].tolist())
+        return _KNOWN_INDUSTRY_NAMES
 
     # 内置常用东财行业名（保底）
     _KNOWN_INDUSTRY_NAMES = {
@@ -913,30 +989,54 @@ def get_industry_representatives(top_n: int = None,
 
     change_df = None
     name_df = None
-    if not is_historical:
-        # 盘中模式：加载实时接口
-        try:
-            change_df = ak.stock_board_change_em()
-            if change_df is not None and not change_df.empty:
-                print(f"  [✓] 全板块异动 {len(change_df)} 条", flush=True)
-        except Exception as e:
-            print(f"  [!] 全板块异动接口失败（{e.__class__.__name__}）", flush=True)
 
-        try:
-            name_df = ak.stock_board_industry_name_em()
-            if name_df is not None and not name_df.empty:
-                print(f"  [✓] 行业板块行情 {len(name_df)} 条", flush=True)
-        except Exception as e:
-            print(f"  [!] 行业板块行情接口失败（{e.__class__.__name__}）", flush=True)
+    # 并行加载所有独立数据源（ThreadPool，IO密集型）
+    # 盘中模式：change_em + name_em 也并入并行池
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    _pool_tasks = {
+        "zt_pool":      lambda: _load_zt_pool(target_date),
+        "strong_pool":  lambda: _load_strong_pool(target_date),
+        "margin_map":   lambda: _load_margin_map(target_date),
+        "dt_count":     lambda: _load_dt_pool(target_date),
+        "zbgc_count":   lambda: _load_zbgc_pool(target_date),
+        "name_to_code": lambda: _build_name_to_code_map(),
+    }
+    if not is_historical:
+        def _load_change_em():
+            try:
+                df = ak.stock_board_change_em()
+                if df is not None and not df.empty:
+                    print(f"  [✓] 全板块异动 {len(df)} 条", flush=True)
+                    return df
+            except Exception as e:
+                print(f"  [!] 全板块异动接口失败（{e.__class__.__name__}）", flush=True)
+            return None
+        _pool_tasks["change_df"] = _load_change_em
+        _pool_tasks["name_df"] = lambda: _fetch_board_industry_name_em()
     else:
         print("  [i] 盘后模式：跳过 change_em / name_em（仅实时接口）", flush=True)
-
-    zt_pool = _load_zt_pool(target_date)
-    strong_pool = _load_strong_pool(target_date)
-    margin_map = _load_margin_map(target_date)
-    dt_count = _load_dt_pool(target_date)
-    zbgc_count = _load_zbgc_pool(target_date)
-    name_to_code = _build_name_to_code_map()
+    _pool_results = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(fn): key for key, fn in _pool_tasks.items()}
+        for f in as_completed(futures):
+            key = futures[f]
+            try:
+                _pool_results[key] = f.result()
+            except Exception as e:
+                print(f"  [!] {key} 加载异常（{e.__class__.__name__}）", flush=True)
+                _pool_results[key] = {} if "map" in key or "count" in key else None
+    zt_pool     = _pool_results.get("zt_pool", {})
+    strong_pool = _pool_results.get("strong_pool", {})
+    margin_map  = _pool_results.get("margin_map", {})
+    dt_count    = _pool_results.get("dt_count", {})
+    zbgc_count  = _pool_results.get("zbgc_count", {})
+    name_to_code = _pool_results.get("name_to_code", {})
+    change_df   = _pool_results.get("change_df")
+    name_df     = _pool_results.get("name_df")
+    if name_df is not None and not isinstance(name_df, pd.DataFrame):
+        name_df = None
+    if name_df is not None and not name_df.empty:
+        print(f"  [✓] 行业板块行情 {len(name_df)} 条", flush=True)
 
     # ── 2. 榜单 A：涨幅排行（盘中）/ 涨停密度排行（盘后）──
     gain_industries: list = []   # [(行业名, {gain_pct, net_inflow, leading_name, leading_gain})]

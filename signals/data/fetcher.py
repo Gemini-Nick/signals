@@ -13,6 +13,7 @@ import sys
 import warnings
 import pandas as pd
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional, Callable
 
 warnings.filterwarnings("ignore")
@@ -171,6 +172,40 @@ class AKShareSource:
         return _to_raw_bars(df, futu_code, freq,
                             "dt", "open", "high", "low", "close", "vol", "amount")
 
+    def get_a_minute_em(self, futu_code: str, freq: Freq,
+                        max_retries: int = 3) -> List[RawBar]:
+        """
+        A股分钟线 — 东财接口（push2his.eastmoney.com）。
+        Sina 不可用时的备选源，支持更长历史但 SSL 间歇性超时。
+        内置重试 + 指数退避。
+        """
+        import akshare as ak
+        import time as _time
+        _, pure_code = self._futu_to_ak_a(futu_code)
+        period_map = {"1分钟": "1", "5分钟": "5", "15分钟": "15",
+                      "30分钟": "30", "60分钟": "60"}
+        period = period_map.get(freq.value, "15")
+        for attempt in range(1, max_retries + 1):
+            try:
+                df = ak.stock_zh_a_hist_min_em(
+                    symbol=pure_code, period=period, adjust="")
+                if df is None or df.empty:
+                    return []
+                df = df.rename(columns={
+                    "时间": "dt", "开盘": "open", "最高": "high",
+                    "最低": "low", "收盘": "close",
+                    "成交量": "vol", "成交额": "amount",
+                })
+                return _to_raw_bars(df, futu_code, freq,
+                                    "dt", "open", "high", "low",
+                                    "close", "vol", "amount")
+            except Exception as e:
+                if attempt < max_retries:
+                    wait = 2 ** attempt
+                    _time.sleep(wait)
+                else:
+                    raise
+
     def get_hk_daily(self, futu_code: str, adj: str = "qfq") -> List[RawBar]:
         """港股日线（完整历史），futu_code: HK.00700"""
         import akshare as ak
@@ -195,15 +230,40 @@ class AKShareSource:
         return _to_raw_bars(df, futu_code, Freq.D,
                             "dt", "open", "high", "low", "close", "vol", "amount")
 
+    # 指数日线磁盘缓存目录
+    _INDEX_CACHE_DIR = str(Path(__file__).resolve().parent.parent.parent / ".cache" / "index_daily")
+
     def get_index_daily(self, symbol: str,
                         lookback_days: int = 180,
                         start_date: str = None) -> List[RawBar]:
         """
-        A股指数日线。
+        A股指数日线（带日级磁盘缓存）。
         symbol: AKShare格式，如 'sh000016'（上证50）
         盘中模式：传 lookback_days（滚动窗口，默认180自然日≈120交易日）
         盘后复盘：传 start_date（固定起点，如 '2024-09-24'）
         """
+        import os, json
+
+        # 尝试磁盘缓存（当日有效）
+        today = datetime.now().strftime("%Y%m%d")
+        cache_file = os.path.join(self._INDEX_CACHE_DIR, f"{symbol}_{today}.json")
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    cached = json.load(f)
+                df = pd.DataFrame(cached)
+                df["dt"] = pd.to_datetime(df["dt"])
+                if start_date:
+                    cutoff = pd.to_datetime(start_date)
+                else:
+                    cutoff = pd.Timestamp.now() - pd.Timedelta(days=lookback_days)
+                df = df[df["dt"] >= cutoff]
+                return _to_raw_bars(df, symbol, Freq.D,
+                                    "dt", "open", "high", "low", "close", "vol", "amount")
+            except Exception:
+                pass  # 缓存损坏，走 API
+
+        # API 拉取
         import akshare as ak
         df = ak.stock_zh_index_daily(symbol=symbol)
         if df is None or df.empty:
@@ -211,6 +271,21 @@ class AKShareSource:
         df = df.rename(columns={"date": "dt", "volume": "vol"})
         df["amount"] = 0
         df["dt"] = pd.to_datetime(df["dt"])
+
+        # 写入缓存（保存完整历史，裁剪在读取时做）
+        try:
+            os.makedirs(self._INDEX_CACHE_DIR, exist_ok=True)
+            # 清理过期缓存（非今日的文件）
+            for old in os.listdir(self._INDEX_CACHE_DIR):
+                if old.endswith(".json") and today not in old:
+                    os.remove(os.path.join(self._INDEX_CACHE_DIR, old))
+            cache_df = df[["dt", "open", "high", "low", "close", "vol", "amount"]].copy()
+            cache_df["dt"] = cache_df["dt"].astype(str)
+            with open(cache_file, "w") as f:
+                json.dump(cache_df.to_dict(orient="records"), f)
+        except Exception:
+            pass
+
         if start_date:
             cutoff = pd.to_datetime(start_date)
         else:
