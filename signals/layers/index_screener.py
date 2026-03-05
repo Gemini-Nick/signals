@@ -196,9 +196,10 @@ class IndexScreener:
         if not self.us_codes:
             return
 
-        from signals.data.fetcher import USDataSource, FutuSource
+        from signals.data.fetcher import FutuSource
+        from signals.data.us_factory import create_us_source
 
-        # 尝试复用已验证的 Futu 连接
+        # 尝试复用已验证的 Futu 连接（盘中模式下作为 IB 的备选）
         futu = None
         if self._futu_available:
             try:
@@ -207,9 +208,9 @@ class IndexScreener:
             except Exception:
                 futu = None
 
-        us_source = USDataSource(futu_source=futu)
+        mode = "review" if start_date else "intraday"
+        us_source = create_us_source(mode, futu_source=futu)
         lb = lookback_days or 180
-        data_label = "Futu" if futu else "yfinance"
 
         try:
             for name, sym in self.us_codes.items():
@@ -240,15 +241,14 @@ class IndexScreener:
                     parts = [f"{len(daily)}根日线"]
                     if bars_30: parts.append(f"{len(bars_30)}根30M")
                     if bars_15: parts.append(f"{len(bars_15)}根15M")
-                    print(f"  [✓] {name} ({sym}): {'  '.join(parts)}  [{data_label}]",
+                    print(f"  [✓] {name} ({sym}): {'  '.join(parts)}",
                           flush=True)
 
                 except Exception as e:
                     self.analyzers[name] = IndexAnalyzer(name, sym, [])
                     print(f"  [✗] {name} ({sym}): 加载失败 {e}", flush=True)
         finally:
-            if futu:
-                futu.close()
+            us_source.close()
 
     # ────────────────────────────────
     # 分析 + 输出

@@ -481,54 +481,166 @@ class YFinanceSource:
 
 
 # ─────────────────────────────────────────────────────────
-# 5. USDataSource — 美股数据路由（Futu优先 → yfinance兜底）
+# 5. USDataSource — 美股数据路由（自动降级链 + 3次重试）
 # ─────────────────────────────────────────────────────────
+
+# 不可恢复的异常类型，命中后立即放弃该数据源，不再重试
+_FATAL_ERROR_TYPES = ("ImportError", "ModuleNotFoundError")
+
+
+def _classify_error(e: Exception) -> str:
+    """将异常分类为可读的失败原因，便于溯源"""
+    err_type = type(e).__name__
+    err_msg = str(e)
+    # 网络类
+    if any(k in err_type for k in ("Connection", "Timeout", "Socket", "Network")):
+        return f"网络错误({err_type}): {err_msg}"
+    if any(k in err_msg.lower() for k in ("refused", "timed out", "reset by peer")):
+        return f"网络错误({err_type}): {err_msg}"
+    # 认证/权限
+    if any(k in err_msg.lower() for k in ("auth", "key", "permission",
+                                           "forbidden", "401", "403")):
+        return f"认证/权限错误({err_type}): {err_msg}"
+    # 频率限制
+    if any(k in err_msg.lower() for k in ("rate limit", "throttl", "pacing", "429")):
+        return f"频率限制({err_type}): {err_msg}"
+    # 数据不存在
+    if any(k in err_msg.lower() for k in ("not found", "no data", "404",
+                                           "invalid symbol")):
+        return f"数据不存在({err_type}): {err_msg}"
+    # 配置缺失
+    if any(k in err_msg.lower() for k in ("未配置", "not configured", "empty")):
+        return f"配置缺失({err_type}): {err_msg}"
+    # 依赖缺失
+    if err_type in _FATAL_ERROR_TYPES:
+        return f"依赖未安装({err_type}): {err_msg}"
+    # 其他
+    return f"未知错误({err_type}): {err_msg}"
+
+
 class USDataSource:
     """
-    美股统一数据入口：
-    优先使用 Futu（更深历史、实时订阅），
-    Futu 不可用时自动降级到 yfinance（免费兜底）。
+    美股统一数据入口 — 自动降级链。
+
+    通过 providers 列表按优先级尝试数据源，每个源最多重试 3 次，
+    全部失败后降级到下一个，yfinance 始终作为最终兜底。
+
+    降级策略：
+      盘中: [IBSource, FutuSource] → YFinanceSource
+      盘后: [AlpacaSource]         → YFinanceSource
     """
 
-    def __init__(self, futu_source: Optional[FutuSource] = None):
-        self._futu = futu_source
+    MAX_RETRIES = 3
+
+    def __init__(self, futu_source: Optional[FutuSource] = None,
+                 providers: Optional[list] = None):
+        # 支持新 providers 列表，同时向后兼容旧 futu_source 参数
+        if providers is not None:
+            self._providers = providers
+        elif futu_source is not None:
+            self._providers = [futu_source]
+        else:
+            self._providers = []
         self._yf = YFinanceSource()
 
-    def get_us_daily(self, futu_code: str, **kwargs) -> List[RawBar]:
-        """Futu 优先获取美股日线，失败降级 yfinance"""
-        if self._futu:
-            try:
-                bars = self._futu.get_us_daily(futu_code, **kwargs)
-                if bars:
-                    return bars
-            except Exception as e:
-                print(f"    [!] Futu 美股日线失败（降级 yfinance）: {e}")
-        return self._yf.get_us_daily(futu_code)
+    def _try_source(self, src, method_name: str, label: str,
+                    *args, **kwargs) -> Optional[List[RawBar]]:
+        """
+        对单个数据源尝试最多 MAX_RETRIES 次。
+        每次打印详细失败原因（网络/认证/限流/依赖缺失等）。
+        遇到不可恢复错误（依赖缺失/认证错误）立即放弃。
+        """
+        name = src.__class__.__name__
+        fn = getattr(src, method_name)
 
-    def get_us_minute(self, futu_code: str, freq: Freq, **kwargs) -> List[RawBar]:
-        """Futu 优先获取美股分钟线，失败降级 yfinance"""
-        if self._futu:
+        for attempt in range(1, self.MAX_RETRIES + 1):
             try:
-                bars = self._futu.get_us_minute(futu_code, freq, **kwargs)
+                print(f"  [{name}] 第{attempt}次尝试 {label}...", flush=True)
+                bars = fn(*args, **kwargs)
                 if bars:
+                    print(f"  [{name}] {label} 成功 ({len(bars)}根)", flush=True)
                     return bars
+                print(f"  [{name}] {label} 返回空数据 "
+                      f"({attempt}/{self.MAX_RETRIES})", flush=True)
             except Exception as e:
-                print(f"    [!] Futu 美股分钟线失败（降级 yfinance）: {e}")
-        return self._yf.get_us_minute(futu_code, freq)
+                reason = _classify_error(e)
+                print(f"  [{name}] 第{attempt}次失败: {reason} "
+                      f"({attempt}/{self.MAX_RETRIES})", flush=True)
+                # 依赖未安装 → 不可恢复，立即放弃
+                if type(e).__name__ in _FATAL_ERROR_TYPES:
+                    print(f"  [{name}] 依赖未安装，跳过此数据源", flush=True)
+                    break
+                # 认证/权限错误 → 不可恢复
+                if "认证/权限" in reason or "配置缺失" in reason:
+                    print(f"  [{name}] {reason.split(':')[0]}，跳过此数据源",
+                          flush=True)
+                    break
+
+        print(f"  [{name}] {label} 失败，降级到下一数据源", flush=True)
+        return None
+
+    def _route(self, method_name: str, label: str,
+               yf_method: str, yf_args: tuple, yf_kwargs: dict,
+               *args, **kwargs) -> List[RawBar]:
+        """
+        统一路由逻辑：遍历 providers → yfinance 兜底。
+        每个数据源最多重试 3 次。
+        """
+        # 依次尝试 providers
+        for src in self._providers:
+            bars = self._try_source(src, method_name, label, *args, **kwargs)
+            if bars:
+                return bars
+
+        # 最终兜底 yfinance
+        bars = self._try_source(self._yf, yf_method,
+                                f"{label}(兜底)", *yf_args, **yf_kwargs)
+        return bars or []
+
+    # ── 公开接口（签名不变）─────────────────────────────────
+
+    def get_us_daily(self, futu_code: str, **kwargs) -> List[RawBar]:
+        """美股日线，按降级链自动切换数据源"""
+        return self._route(
+            "get_us_daily", f"{futu_code} 日线",
+            "get_us_daily", (futu_code,), {},
+            futu_code, **kwargs,
+        )
+
+    def get_us_minute(self, futu_code: str, freq: Freq,
+                      **kwargs) -> List[RawBar]:
+        """美股分钟线，按降级链自动切换数据源"""
+        return self._route(
+            "get_us_minute", f"{futu_code} {freq.value}",
+            "get_us_minute", (futu_code, freq), {},
+            futu_code, freq, **kwargs,
+        )
 
     def get_us_index_kline(self, futu_code: str, freq: Freq,
                            lookback_days: int = 180,
                            start: str = None) -> List[RawBar]:
-        """美股指数 ETF K线，Futu优先 → yfinance兜底"""
-        if self._futu:
-            try:
-                bars = self._futu.get_us_index_kline(
-                    futu_code, freq, lookback_days=lookback_days, start=start)
-                if bars:
-                    return bars
-            except Exception as e:
-                print(f"    [!] Futu 美股指数失败（降级 yfinance）: {e}")
-        # yfinance 兜底
+        """美股指数 ETF K线，按降级链自动切换数据源"""
+        # yfinance 兜底根据周期选择方法
         if freq == Freq.D:
-            return self._yf.get_us_daily(futu_code, period="1y")
-        return self._yf.get_us_minute(futu_code, freq)
+            yf_method, yf_args = "get_us_daily", (futu_code,)
+            yf_kwargs = {"period": "1y"}
+        else:
+            yf_method, yf_args = "get_us_minute", (futu_code, freq)
+            yf_kwargs = {}
+
+        return self._route(
+            "get_us_index_kline",
+            f"{futu_code} {freq.value}",
+            yf_method, yf_args, yf_kwargs,
+            futu_code, freq,
+            lookback_days=lookback_days, start=start,
+        )
+
+    def close(self):
+        """清理 provider 连接"""
+        for src in self._providers:
+            if hasattr(src, "close"):
+                try:
+                    src.close()
+                except Exception:
+                    pass

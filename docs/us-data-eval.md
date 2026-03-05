@@ -294,21 +294,46 @@ USDataSource(primary=None, fallback=YFinanceSource)
 
 ---
 
-## 6. 实现影响评估
+## 6. 最终方案：IB 盘中 + Alpaca 盘后（已实现）
 
-无论选择哪个方案，代码改动范围一致：
+采用**方案 D** 并实现完毕：
+
+```
+盘中模式: USDataSource([IBSource, FutuSource]) → YFinanceSource
+盘后模式: USDataSource([AlpacaSource])          → YFinanceSource
+```
+
+### 自动降级策略
+
+每个数据源尝试 **3 次**，全部失败后自动降级到下一个。每次尝试/失败都 print 详细原因：
+- 网络错误（Connection/Timeout/Socket）
+- 认证/权限错误（401/403/key）→ 不可恢复，立即跳过
+- 频率限制（429/rate limit）
+- 数据不存在（404/no data）
+- 依赖未安装（ImportError）→ 不可恢复，立即跳过
+- 配置缺失（API Key 未设置）
+
+### 实际改动文件
 
 | 文件 | 改动 |
 |------|------|
-| `signals/data/fetcher.py` | 新增 `IBSource` 和/或 `AlpacaSource` 类 + 重构 `USDataSource` 构造函数 + 新增 `create_us_source()` 工厂函数 |
-| `config.py` | 新增 `US_DATA_SOURCE` / `IB_HOST` / `IB_PORT` 等配置项 |
+| `signals/data/ib_source.py` | **新建** — IBSource 类（IB Gateway 盘中数据源） |
+| `signals/data/alpaca_source.py` | **新建** — AlpacaSource 类（Alpaca 盘后数据源） |
+| `signals/data/us_factory.py` | **新建** — `create_us_source(mode)` 工厂函数 |
+| `signals/data/fetcher.py` | 重构 USDataSource（providers 列表 + 3 次重试 + 分类日志） |
+| `signals/data/__init__.py` | 新增 `create_us_source` 导出 |
+| `config.py` | 新增 IB_HOST/PORT/CLIENT_ID + ALPACA_API_KEY/SECRET_KEY |
 | `.env.example` | 新增对应环境变量模板 |
 | `signals/layers/index_screener.py` | `_load_us_indices()` 改用 `create_us_source()` |
-| `signals/layers/screener.py` | `_fetch_minute_bars()` 改用 `create_us_source()` |
-| `signals/layers/review_screener.py` | 改用 `create_us_source()` |
-| `requirements.txt` | 按需添加 `ib_async` / `alpaca-py` |
+| `signals/layers/screener.py` | `_fetch_minute_bars()` 改用 `create_us_source("intraday")` |
+| `signals/layers/review_screener.py` | `_load_stock_daily_bars()` 改用 `create_us_source("review")` |
+| `requirements.txt` | 新增 `ib_async` + `alpaca-py` |
 
-现有 `FutuSource` 和 `YFinanceSource` **无需修改**，完全向后兼容。
+### 未改动（A+H 数据流完整保留）
+
+- `fetcher.py` 中 TushareSource / AKShareSource / FutuSource / YFinanceSource — **零改动**
+- `index_screener.py:_load_ak_indices()` / `_load_futu_indices()` — **零改动**
+- `signals/core/` / `signals/notify/` / `signals/research/` — **零改动**
 
 ---
 

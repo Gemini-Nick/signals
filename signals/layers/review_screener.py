@@ -31,13 +31,14 @@ def _load_stock_daily_bars(futu_code: str, start_date: str,
     加载个股日线，供盘后复盘使用。
     支持 A股（SH/SZ 前缀）和 美股（US 前缀）。
     """
-    from signals.data.fetcher import AKShareSource, USDataSource, detect_market
+    from signals.data.fetcher import AKShareSource, detect_market
+    from signals.data.us_factory import create_us_source
     from datetime import datetime
     edt = end_date or datetime.now().strftime("%Y-%m-%d")
     market = detect_market(futu_code)
     try:
         if market == "US":
-            us = USDataSource()
+            us = create_us_source("review")
             return us.get_us_daily(futu_code)
         else:
             ak = AKShareSource()
