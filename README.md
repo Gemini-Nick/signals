@@ -25,10 +25,53 @@ python run.py --mode index                          # 仅指数报告（快速�
 python run.py --mode review --start 2024-09-24      # 盘后复盘（指定日期）
 python run.py --mode review --start 924             # 盘后复盘（日期预设）
 python run.py --mode review --start ytd             # 盘后复盘（今年以来）
+python run.py --mode backtest                       # 信号回测评估
+python run.py --mode backtest --signal-type 三买     # 仅评估三买信号
+python run.py --mode backtest --freq-filter daily   # 仅评估日线级别
 python run.py --list-dates                           # 查看所有日期预设
 python run.py --mode import --file 研报.pdf          # 导入研究笔记
 python run.py --mode intraday --industries 有色金属,半导体   # 指定行业
 ```
+
+### 模式定位
+
+| 模式 | 使用频率 | 定位 | 解决的问题 |
+|------|----------|------|------------|
+| `intraday` | 盘中实时 | 监测 | 盘中信号实时推送，自动路由 A+H / 美股 |
+| `index` | 随时 | 快速 | 只看 11 只指数的缠论结构，不扫个股 |
+| `review` | 每天盘后 | 决策 | 今天有什么机会？检测信号 → 排名 → 自动存档 |
+| `backtest` | 每月/季 | 调优 | 我的信号系统准不准？评估历史信号表现 |
+| `import` | 有研报时 | 归档 | 导入 MD/PDF/图片 研究笔记 |
+
+### 信号闭环：review → backtest
+
+`review` 和 `backtest` 构成数据驱动的信号自我进化闭环：
+
+```
+                            ┌─────────────────────────────────────┐
+                            │         信号自我进化闭环               │
+                            └─────────────────────────────────────┘
+
+review 每天盘后运行 ──→ 检测买卖点 ──→ 评分排名 ──→ 自动存档到 SQLite
+                                                          │
+                          ┌───────────────────────────────┘
+                          ▼
+backtest 每月运行 ──→ 读取已存档信号（≥20天前）──→ 加载前瞻K线
+                          │
+                          ▼
+          计算 T+5/10/20 收益、MFE/MAE、胜率、盈亏比
+                          │
+                          ▼
+              SQS 评分 ──→ 权重建议 ──→ 优化 SIGNAL_WEIGHTS
+                          │
+                          ▼
+              下次 review 使用优化后的权重 ──→ 信号质量提升
+```
+
+- **review 产生数据**：每次运行自动将检测到的信号存入 `backtest.db`
+- **backtest 消费数据**：评估信号在未来 5/10/20 个交易日的实际表现
+- **SQS (Signal Quality Score)**：综合胜率、盈亏比、MFE/MAE 的 0-100 评分
+- **权重建议**：根据 SQS 排名，建议调高/调低各信号类型的权重
 
 ---
 
@@ -108,7 +151,7 @@ python run.py --mode review --start 924   # 盘后复盘（924新政以来）
 
 ```
 🐲 隆小侠 LONG CLAW
-├── run.py                  # 总入口（四种模式调度 + 交易时段路由）
+├── run.py                  # 总入口（五种模式调度 + 交易时段路由）
 ├── config.py               # 全局配置（.env 凭证 + 指数/白名单/行业/日期预设）
 ├── .env.example            # 环境变量模板
 ├── requirements.txt        # Python 依赖
@@ -116,9 +159,11 @@ python run.py --mode review --start 924   # 盘后复盘（924新政以来）
 ├── signals/
 │   ├── core/               # 缠论核心引擎
 │   │   ├── analyzer.py     #   分析器（笔、段、中枢）
+│   │   ├── backtest.py     #   信号回测引擎（存档+前瞻评估+SQS评分）
 │   │   ├── detectors.py    #   买卖点 / 背驰检测
 │   │   ├── freq_utils.py   #   多周期工具
 │   │   ├── market_hours.py #   交易时段判断（A+H / 美股自动路由）
+│   │   ├── risk.py         #   风控模块（缠论止损 + 仓位建议）
 │   │   └── scorer.py       #   评分系统
 │   ├── layers/             # 三层联动分析
 │   │   ├── index_screener.py   # Layer 1 指数筛选调度
@@ -132,6 +177,7 @@ python run.py --mode review --start 924   # 盘后复盘（924新政以来）
 │   │   ├── fetcher.py      #   核心数据源 + USDataSource 降级链
 │   │   ├── ib_source.py    #   IB Gateway 美股盘中数据源（可选）
 │   │   ├── alpaca_source.py#   Alpaca 美股盘后数据源（可选）
+│   │   ├── minute_cache.py #   分钟线 SQLite 缓存（累积扩展5天窗口）
 │   │   └── us_factory.py   #   美股数据源工厂（按模式组装降级链）
 │   ├── research/           # 研报子系统
 │   │   └── research.py     #   多格式导入 + 自动归档 + 双维度展示
