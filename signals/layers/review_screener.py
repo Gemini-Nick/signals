@@ -99,6 +99,14 @@ def review_stock_daily(symbols: List[str], start_date: str) -> list:
 
     scored.sort(key=lambda x: -x.total_score)
     _print_stock_report(scored)
+
+    # 信号存档（回测验证用，异常不影响主流程）
+    try:
+        from signals.core.backtest import archive_signals
+        archive_signals(scored)
+    except Exception:
+        pass
+
     return scored
 
 

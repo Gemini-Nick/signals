@@ -131,6 +131,13 @@ DATE_PRESETS: dict = {
     "jiangwen":  {"date": "2026-01-14", "label": "监管降温 — 融资保证金100%+严防大起大落"},
 }
 
+# ── 回测验证（信号自我进化）──────────────────────────────────
+BACKTEST_DB_PATH = ".data/backtest.db"     # 信号存档 SQLite 路径
+BACKTEST_EVAL_WINDOWS = [5, 10, 20]        # 前瞻评估窗口（交易日）
+BACKTEST_MIN_AGE_DAYS = 20                 # 信号满多少天后才评估
+BACKTEST_NEUTRAL_PCT = 2.0                 # 方向判定中性带 ±%
+BACKTEST_TARGET_PCT = 5.0                  # 目标收益率 %
+
 # ── 研究笔记（双维度集成）──────────────────────────────────
 # 笔记根目录，按 年/月 子目录存储：notes/2026/03/xxx.pdf
 NOTES_DIR = "notes"

@@ -19,6 +19,36 @@ SIGNAL_WEIGHTS = {
 }
 
 
+# 共振加分级别
+# 大级别确认小级别 → 加分更高（日线+30M > 30M+15M > 日线+15M）
+_DAILY_NAMES = {"日线", "D", "daily"}
+_30M_NAMES = {"30分钟", "30min", "F30"}
+_15M_NAMES = {"15分钟", "15min", "F15"}
+
+
+def _resonance_bonus(freqs: set) -> int:
+    """
+    根据共振的级别组合差异化加分。
+    三级共振 > 日线+30M > 30M+15M > 其他双级别
+    """
+    if len(freqs) < 2:
+        return 0
+
+    has_daily = bool(freqs & _DAILY_NAMES)
+    has_30m = bool(freqs & _30M_NAMES)
+    has_15m = bool(freqs & _15M_NAMES)
+
+    if has_daily and has_30m and has_15m:
+        return 25  # 三级共振，最强
+    if has_daily and has_30m:
+        return 20  # 日线+30M，大级别确认
+    if has_daily and has_15m:
+        return 15  # 日线+15M，跨级别
+    if has_30m and has_15m:
+        return 12  # 30M+15M，小级别共振
+    return 10  # 其他组合
+
+
 @dataclass
 class ScoredSymbol:
     symbol: str
@@ -41,22 +71,23 @@ def score_signals(symbol: str, signals: List[SignalEvent]) -> ScoredSymbol:
         base = SIGNAL_WEIGHTS.get(sig.signal_type, 0)
         total += base * sig.confidence
 
-    # 多级别共振加分：同方向信号出现在多个级别
+    # 多级别共振加分：根据共振的级别组合差异化加分
+    # 日线+30M 共振比 30M+15M 更有价值（大级别确认小级别）
     buy_freqs = {s.freq for s in signals if "买" in s.signal_type}
     sell_freqs = {s.freq for s in signals if "卖" in s.signal_type}
-    if len(buy_freqs) > 1:
-        total += 15
-    if len(sell_freqs) > 1:
-        total -= 15
+    buy_bonus = _resonance_bonus(buy_freqs)
+    sell_bonus = _resonance_bonus(sell_freqs)
+    total += buy_bonus
+    total -= sell_bonus
 
     details_lines = [
         f"  [{s.freq}] {s.signal_type} conf={s.confidence:.2f} @ {s.price:.2f}  {s.details}"
         for s in signals
     ]
-    if len(buy_freqs) > 1:
-        details_lines.append(f"  [共振+15] 买信号出现在 {buy_freqs}")
-    if len(sell_freqs) > 1:
-        details_lines.append(f"  [共振-15] 卖信号出现在 {sell_freqs}")
+    if buy_bonus > 0:
+        details_lines.append(f"  [共振+{buy_bonus}] 买信号出现在 {buy_freqs}")
+    if sell_bonus > 0:
+        details_lines.append(f"  [共振-{sell_bonus}] 卖信号出现在 {sell_freqs}")
 
     return ScoredSymbol(
         symbol=symbol,

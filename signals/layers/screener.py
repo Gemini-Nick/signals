@@ -211,7 +211,8 @@ class IntraDayScreener:
     # ─────────────────────────────────────────────────────
     # 扫描：信号检测 + 评分
     # ─────────────────────────────────────────────────────
-    def scan_once(self, symbols: Optional[List[str]] = None) -> List[ScoredSymbol]:
+    def scan_once(self, symbols: Optional[List[str]] = None,
+                  market_direction: str = "分化") -> List[ScoredSymbol]:
         """对所有（或指定）标的运行信号检测，返回按评分降序排列的结果。"""
         target = symbols or list(self.analyzers.keys())
         results = []
@@ -224,6 +225,14 @@ class IntraDayScreener:
             results.append(score_signals(sym, all_signals))
 
         results.sort(key=lambda x: x.total_score, reverse=True)
+
+        # 信号存档（回测验证用，异常不影响主流程）
+        try:
+            from signals.core.backtest import archive_signals
+            archive_signals(results, market_direction=market_direction)
+        except Exception:
+            pass
+
         return results
 
     # ─────────────────────────────────────────────────────
