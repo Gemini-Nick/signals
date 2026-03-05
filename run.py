@@ -18,6 +18,9 @@
   python run.py --list-dates                       # 列出所有日期预设
   python run.py --mode import --file 锂电池深度.pdf          # 导入研究笔记（自动归档到 notes/YYYY/MM/）
   python run.py --mode import --file 锂电池深度.pdf --source 中信证券 --author 张三
+  python run.py --mode intraday --market us              # 强制美股（盘中）
+  python run.py --mode intraday --market a,hk            # 强制 A+H
+  python run.py --mode intraday --market all              # 全市场（不做时段过滤）
 """
 import sys
 import subprocess
@@ -182,11 +185,18 @@ def run_intraday(args):
     Layer 2 → 双榜行业筛选（自动） + --industries 补充
     Layer 3 → 标的筛选（白名单 + 双榜代表股 + 研报标的）
     """
+    from signals.core.market_hours import Market, filter_index_codes, filter_symbols
     from signals.layers.index_screener import IndexScreener
     from signals.layers.screener import IntraDayScreener
     from signals.research import (
         get_noted_industries, get_noted_stocks,
         match_notes_for_symbol, check_resonance,
+    )
+
+    # ── 市场时段路由 ─────────────────────────────────────
+    active = _get_active_markets(args)
+    ak_codes, futu_codes, us_codes = filter_index_codes(
+        active, config.INDEX_AK_CODES, config.INDEX_FUTU_CODES, config.INDEX_US_CODES,
     )
 
     # ── 加载研究笔记 ─────────────────────────────────────
@@ -195,7 +205,9 @@ def run_intraday(args):
     noted_stocks = get_noted_stocks(notes)
 
     # ── Layer 1：指数研判 ──────────────────────────────────
-    screener_l1 = IndexScreener()
+    screener_l1 = IndexScreener(
+        ak_codes=ak_codes, futu_codes=futu_codes, us_codes=us_codes,
+    )
     ctx = screener_l1.run()
 
     if not ctx.gate_industry_scan:
@@ -203,7 +215,9 @@ def run_intraday(args):
 
     # ── Layer 2：双榜行业筛选 + 多维度个股入池 ─────────────
     ranking_stocks: list = []
-    if config.RANK_TOP_N > 0:
+    if Market.A not in active:
+        print(">>> A股未开盘，跳过 Layer 2 行业筛选")
+    elif config.RANK_TOP_N > 0:
         from signals.layers.industry import get_industry_representatives
 
         print(f"\n>>> Layer 2 双榜行业筛选（各取前{config.RANK_TOP_N}名）")
@@ -268,22 +282,23 @@ def run_intraday(args):
 
     # ── --industries 补充行业（直接入池，不做CZSC研判）──────
     named_stocks: list = []
-    industry_names = _parse_industries(args)
-    # 研报中涉及的行业也自动加入补充池
-    if noted_industries:
-        for ni in noted_industries:
-            if ni not in industry_names:
-                industry_names.append(ni)
-        print(f"  研报行业已加入扫描池: {', '.join(noted_industries)}")
-    if industry_names:
-        from signals.layers.industry import get_industry_stocks as _get_ind_stocks
-        max_per = getattr(config, "RANK_MAX_STOCKS_PER_IND", 5)
-        print(f"\n>>> Layer 2 补充行业：{', '.join(industry_names)}")
-        for ind in industry_names:
-            stocks = _get_ind_stocks(ind)
-            named_stocks.extend(stocks[:max_per])
-            print(f"  [{ind}] 取 {min(max_per, len(stocks))} 只")
-        named_stocks = list(dict.fromkeys(named_stocks))
+    if Market.A in active:
+        industry_names = _parse_industries(args)
+        # 研报中涉及的行业也自动加入补充池
+        if noted_industries:
+            for ni in noted_industries:
+                if ni not in industry_names:
+                    industry_names.append(ni)
+            print(f"  研报行业已加入扫描池: {', '.join(noted_industries)}")
+        if industry_names:
+            from signals.layers.industry import get_industry_stocks as _get_ind_stocks
+            max_per = getattr(config, "RANK_MAX_STOCKS_PER_IND", 5)
+            print(f"\n>>> Layer 2 补充行业：{', '.join(industry_names)}")
+            for ind in industry_names:
+                stocks = _get_ind_stocks(ind)
+                named_stocks.extend(stocks[:max_per])
+                print(f"  [{ind}] 取 {min(max_per, len(stocks))} 只")
+            named_stocks = list(dict.fromkeys(named_stocks))
 
     # ── Layer 3：标的筛选 ──────────────────────────────────
     print("\n>>> Layer 3 标的筛选 ...")
@@ -291,6 +306,7 @@ def run_intraday(args):
     all_symbols = list(dict.fromkeys(
         config.WHITELIST + noted_stocks + extra_stocks
     ))  # 去重保序
+    all_symbols = filter_symbols(active, all_symbols)
 
     screener_l3 = IntraDayScreener(
         symbols=all_symbols, freqs=config.MONITOR_FREQS, notes=notes,
@@ -383,8 +399,16 @@ def run_import(args):
 
 def run_index_only(args):
     """仅运行 Layer 1，快速输出指数报告。"""
+    from signals.core.market_hours import filter_index_codes
     from signals.layers.index_screener import IndexScreener
-    screener = IndexScreener()
+
+    active = _get_active_markets(args)
+    ak_codes, futu_codes, us_codes = filter_index_codes(
+        active, config.INDEX_AK_CODES, config.INDEX_FUTU_CODES, config.INDEX_US_CODES,
+    )
+    screener = IndexScreener(
+        ak_codes=ak_codes, futu_codes=futu_codes, us_codes=us_codes,
+    )
     ctx = screener.run()
 
     # ── 飞书推送 ─────────────────────────────────────────
@@ -669,6 +693,35 @@ def _print_industry_date_matrix(per_date_results: list):
 # 工具函数
 # ─────────────────────────────────────────────────────────
 
+def _parse_market_override(raw: str):
+    """解析 --market 参数为 Market 集合。"""
+    from signals.core.market_hours import Market
+    _map = {"a": Market.A, "hk": Market.HK, "us": Market.US}
+    if raw.lower() == "all":
+        return {Market.A, Market.HK, Market.US}
+    return {_map[m.strip().lower()] for m in raw.split(",")
+            if m.strip().lower() in _map}
+
+
+def _get_active_markets(args):
+    """根据 --market 参数或当前时间返回活跃市场集合。"""
+    from signals.core.market_hours import (
+        Market, get_active_markets, describe_sessions,
+    )
+    market_arg = getattr(args, "market", None)
+    if market_arg:
+        active = _parse_market_override(market_arg)
+        print(f">>> 手动指定市场: {', '.join(m.value for m in sorted(active))}")
+    else:
+        active = get_active_markets()
+        print(f">>> 市场时段检测: {describe_sessions()}")
+
+    if not active:
+        print(">>> 当前无市场开盘，运行全量分析")
+        active = {Market.A, Market.HK, Market.US}
+    return active
+
+
 def _parse_industries(args) -> list:
     """
     解析行业列表：
@@ -706,6 +759,8 @@ def main():
   python run.py --mode review --start 924          # 盘后复盘（924新政）
   python run.py --mode review --start deepseek     # 盘后复盘（DeepSeek行情）
   python run.py --mode review --start 924,deepseek # 多日期对比
+  python run.py --mode intraday --market us         # 强制美股
+  python run.py --mode intraday --market all        # 全市场（不做时段过滤）
   python run.py --mode import --file 锂电池.pdf --source 中信证券 --author 张三
   python run.py --list-dates                       # 列出所有日期预设
 
@@ -755,6 +810,13 @@ def main():
         default=None,
         metavar="NAME",
         help="研究笔记作者/分析师"
+    )
+    parser.add_argument(
+        "--market",
+        default=None,
+        metavar="MARKET",
+        help="强制指定市场：a / hk / us / a,hk / all。"
+             "默认自动检测当前开盘市场。仅 intraday/index 模式生效。"
     )
     parser.add_argument(
         "--list-dates",
