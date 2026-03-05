@@ -132,6 +132,14 @@ DATE_PRESETS: dict = {
 }
 
 # ── 回测验证（信号自我进化）──────────────────────────────────
+# ── 分钟线缓存（解决 AKShare 5 天窗口限制）───────────────
+MINUTE_CACHE_DB_PATH = ".data/minute_cache.db"
+MINUTE_CACHE_MAX_DAYS = 60                 # 缓存保留天数
+
+# ── 风控参数（止损 + 仓位建议）──────────────────────────────
+RISK_PER_TRADE_PCT = 2.0                   # 单笔最大亏损占账户 %
+MAX_POSITION_PCT = 25.0                    # 单标的最大仓位 %
+
 BACKTEST_DB_PATH = ".data/backtest.db"     # 信号存档 SQLite 路径
 BACKTEST_EVAL_WINDOWS = [5, 10, 20]        # 前瞻评估窗口（交易日）
 BACKTEST_MIN_AGE_DAYS = 20                 # 信号满多少天后才评估

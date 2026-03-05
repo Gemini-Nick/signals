@@ -120,5 +120,14 @@ def _print_stock_report(scored: list):
     print("─" * 52)
     for i, sc in enumerate(scored, 1):
         sigs = ", ".join(f"{s.signal_type}({s.freq})" for s in sc.signals[:3])
-        print(f"  {i:2d}. {sc.symbol:15s}  分={sc.total_score:+6.1f}  {sigs}")
+        # 风控信息
+        risk_str = ""
+        try:
+            from signals.core.risk import enrich_with_risk
+            risk_line = enrich_with_risk(sc)
+            if risk_line:
+                risk_str = f"\n      {risk_line.strip()}"
+        except Exception:
+            pass
+        print(f"  {i:2d}. {sc.symbol:15s}  分={sc.total_score:+6.1f}  {sigs}{risk_str}")
     print("─" * 52 + "\n")
