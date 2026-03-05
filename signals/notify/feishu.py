@@ -40,3 +40,25 @@ def send_text(text: str, chat_id: str = ""):
         print("  已推送到飞书群聊")
     else:
         print(f"  [!] 飞书推送失败: {resp.code} {resp.msg}")
+
+
+def send_card(card_json: dict, chat_id: str = ""):
+    """发送交互式卡片到飞书群聊（支持 collapsible_panel 折叠）"""
+    chat_id = chat_id or config.FEISHU_RECEIVE_ID
+    if not chat_id:
+        print("  [跳过] 飞书推送：未配置 FEISHU_RECEIVE_ID")
+        return
+    req = CreateMessageRequest.builder() \
+        .receive_id_type("chat_id") \
+        .request_body(
+            CreateMessageRequestBody.builder()
+            .receive_id(chat_id)
+            .content(json.dumps(card_json))
+            .msg_type("interactive")
+            .build()
+        ).build()
+    resp = _get_client().im.v1.message.create(req)
+    if resp.success():
+        print("  已推送飞书卡片")
+    else:
+        print(f"  [!] 飞书卡片推送失败: {resp.code} {resp.msg}")

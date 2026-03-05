@@ -139,21 +139,29 @@ class AKShareSource:
         return self._A_PREFIX.get(mkt, "sh") + code, code
 
     def get_a_daily(self, futu_code: str, sdt: str, edt: str,
-                    adj: str = "qfq") -> List[RawBar]:
-        """A股日线（完整历史）"""
+                    adj: str = "qfq", max_retries: int = 3) -> List[RawBar]:
+        """A股日线（完整历史），内置重试 + 指数退避应对东财 SSL 间歇性故障。"""
         import akshare as ak
+        import time as _time
         ak_sym, pure_code = self._futu_to_ak_a(futu_code)
-        df = ak.stock_zh_a_hist(symbol=pure_code, period="daily",
-                                 start_date=sdt.replace("-", ""),
-                                 end_date=edt.replace("-", ""),
-                                 adjust=adj)
-        if df is None or df.empty:
-            return []
-        df = df.rename(columns={"日期": "dt", "开盘": "open", "最高": "high",
-                                 "最低": "low", "收盘": "close", "成交量": "vol",
-                                 "成交额": "amount"})
-        return _to_raw_bars(df, futu_code, Freq.D,
-                            "dt", "open", "high", "low", "close", "vol", "amount")
+        for attempt in range(1, max_retries + 1):
+            try:
+                df = ak.stock_zh_a_hist(symbol=pure_code, period="daily",
+                                         start_date=sdt.replace("-", ""),
+                                         end_date=edt.replace("-", ""),
+                                         adjust=adj)
+                if df is None or df.empty:
+                    return []
+                df = df.rename(columns={"日期": "dt", "开盘": "open", "最高": "high",
+                                         "最低": "low", "收盘": "close", "成交量": "vol",
+                                         "成交额": "amount"})
+                return _to_raw_bars(df, futu_code, Freq.D,
+                                    "dt", "open", "high", "low", "close", "vol", "amount")
+            except Exception as e:
+                if attempt < max_retries:
+                    _time.sleep(2 ** attempt)
+                else:
+                    raise
 
     def get_a_minute(self, futu_code: str, freq: Freq) -> List[RawBar]:
         """

@@ -326,10 +326,11 @@ def run_intraday(args):
     else:
         screener_l3.run_whitelist()
 
-    # ── 飞书推送 ─────────────────────────────────────────
+    # ── 飞书推送（卡片模式，含折叠面板）────────────────────
     try:
-        from signals.notify.feishu import send_text
-        send_text(ctx.to_feishu_text())
+        from signals.notify.feishu import send_card
+        card = ctx.to_feishu_card()
+        send_card(card)
     except Exception as e:
         print(f"  [!] 飞书推送异常: {e}")
 
@@ -411,11 +412,12 @@ def run_index_only(args):
     )
     ctx = screener.run()
 
-    # ── 飞书推送 ─────────────────────────────────────────
+    # ── 飞书推送（卡片模式）────────────────────────────────
     if ctx:
         try:
-            from signals.notify.feishu import send_text
-            send_text(ctx.to_feishu_text())
+            from signals.notify.feishu import send_card
+            card = ctx.to_feishu_card()
+            send_card(card)
         except Exception as e:
             print(f"  [!] 飞书推送异常: {e}")
 

@@ -243,6 +243,159 @@ class MarketContext:
 
         return "\n".join(lines)
 
+    # ─────────────────────────────────────────────────────
+    # 飞书交互式卡片（支持 collapsible_panel 折叠）
+    # ─────────────────────────────────────────────────────
+
+    def to_feishu_card(self, perf_summary: dict = None,
+                       l2_gain: list = None, l2_composite: list = None) -> dict:
+        """
+        生成飞书 Card JSON (msg_type=interactive)。
+        - 主体：L1 指数研判 + L2 行业排行（始终可见）
+        - 折叠：性能分析 & 数据源健康度（collapsible_panel，默认收起）
+
+        :param perf_summary: build_perf_summary() 返回的 dict，None 则不显示性能面板
+        :param l2_gain: L2 涨幅榜 top 3 IndustryRanking 列表
+        :param l2_composite: L2 综合榜 top 3 IndustryRanking 列表
+        """
+        from datetime import datetime
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        elements = []
+
+        # ── L1 指数研判（lark_md 表格）──
+        l1_lines = []
+        avail = [r for r in self.reports if r.data_available]
+        daily_dts = [r.daily_last_dt for r in avail if r.daily_last_dt]
+        f15_dts = [r.f15_last_dt for r in avail if r.f15_last_dt]
+        daily_cutoff = max(daily_dts).strftime("%Y-%m-%d") if daily_dts else "未知"
+        f15_cutoff = max(f15_dts).strftime("%Y-%m-%d %H:%M") if f15_dts else "未知"
+
+        l1_lines.append(f"日线截至: {daily_cutoff}  |  分钟线截至: {f15_cutoff}")
+        l1_lines.append("")
+        for r in self.reports:
+            if not r.data_available:
+                l1_lines.append(f"**{r.name}**  数据不可用")
+                continue
+            trend = (f"{self._trend_arrow(r.daily_trend)}"
+                     f"{self._trend_arrow(r.f30_trend)}"
+                     f"{self._trend_arrow(r.f15_trend)}")
+            sigs = self._fmt_signals(r)
+            zs = self._fmt_zs(r)
+            price = self._fmt_price(r)
+            star = " **★三级共振**" if r.three_level_aligned else ""
+            l1_lines.append(f"**{r.name}**  {trend}  {sigs}{star}  {zs}  {price}")
+        l1_lines.append("")
+
+        # 综合结论
+        dir_emoji = {"偏多": "📈", "偏空": "📉", "分化": "↔️"}.get(
+            self.overall_direction, "")
+        l1_lines.append(f"{dir_emoji} **综合: {self.overall_direction}**  |  风格: {self.growth_vs_value}")
+
+        aligned = [r.name for r in self.reports
+                   if r.data_available and r.three_level_aligned]
+        if aligned:
+            l1_lines.append(f"⭐ 三级共振: {'  '.join(aligned)}")
+        if self.buy_indices:
+            n = len(self.buy_indices)
+            shown = "、".join(self.buy_indices[:5])
+            suffix = f" 等{n}只" if n > 5 else ""
+            l1_lines.append(f"🔔 买点: {shown}{suffix}")
+        if self.sell_indices:
+            l1_lines.append(f"⚠️ 卖点: {'、'.join(self.sell_indices)}")
+        if self.recommended_industries and self.gate_industry_scan:
+            l1_lines.append(f"📌 推荐关注: {'、'.join(self.recommended_industries[:4])}")
+        if not self.gate_industry_scan:
+            l1_lines.append("⛔ 市场偏空，建议观望")
+
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": "\n".join(l1_lines)}
+        })
+
+        # ── L2 行业排行 ──
+        if l2_gain or l2_composite:
+            elements.append({"tag": "hr"})
+            l2_lines = []
+            if l2_gain:
+                top3 = ", ".join(
+                    f"**{r.name}**({r.gain_pct:+.1f}%)" for r in l2_gain[:3])
+                l2_lines.append(f"📊 涨幅榜: {top3}")
+            if l2_composite:
+                top3 = ", ".join(
+                    f"**{r.name}**({r.composite_score:.0f}分)"
+                    for r in l2_composite[:3])
+                l2_lines.append(f"🏆 综合榜: {top3}")
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": "\n".join(l2_lines)}
+            })
+
+        # ── 性能折叠面板（仅 perf_summary 存在时）──
+        if perf_summary:
+            perf_lines = []
+            ps = perf_summary
+            perf_lines.append(
+                f"⏱ 总计 **{ps['total_s']}s**  |  "
+                f"API {ps['api_count']}次  |  "
+                f"✅{ps['ok_count']} ❌{ps['fail_count']}  |  "
+                f"内存 {ps['mem_mb']}MB"
+            )
+            perf_lines.append(
+                f"L1: {ps['l1_s']}s ({ps['l1_s']/ps['total_s']*100:.0f}%)  |  "
+                f"L2: {ps['l2_s']}s ({ps['l2_s']/ps['total_s']*100:.0f}%)"
+            )
+
+            # 数据源状态
+            for src, d in ps.get("sources", {}).items():
+                fail_rate = d["fail"] / d["total"] if d["total"] else 0
+                if fail_rate > 0.3:
+                    status = "❌"
+                elif fail_rate > 0.1:
+                    status = "⚠️"
+                else:
+                    status = "✅"
+                avg = d["time"] / d["total"] if d["total"] else 0
+                perf_lines.append(
+                    f"{status} {src}: {d['ok']}/{d['total']} "
+                    f"(均 {avg:.1f}s)")
+
+            # 失败明细
+            for f in ps.get("failures", [])[:3]:
+                perf_lines.append(f"  ✗ {f[:80]}")
+
+            elements.append({
+                "tag": "collapsible_panel",
+                "expanded": False,
+                "header": {
+                    "title": {
+                        "tag": "plain_text",
+                        "content": "📊 性能分析 & 数据源健康度"
+                    }
+                },
+                "elements": [{
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": "\n".join(perf_lines)
+                    }
+                }]
+            })
+
+        # ── 组装卡片 ──
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": f"🐲 大盘研判  {now}"
+                },
+                "template": "blue"
+            },
+            "elements": elements
+        }
+        return card
+
 
 # ─────────────────────────────────────────────────────────
 # 强势板块推断
