@@ -186,6 +186,7 @@ def run_intraday(args):
     Layer 3 → 标的筛选（白名单 + 双榜代表股 + 研报标的）
     """
     from signals.core.market_hours import Market, filter_index_codes, filter_symbols
+    from signals.data.fetcher import detect_market
     from signals.layers.index_screener import IndexScreener
     from signals.layers.screener import IntraDayScreener
     from signals.research import (
@@ -301,30 +302,46 @@ def run_intraday(args):
             named_stocks = list(dict.fromkeys(named_stocks))
 
     # ── Layer 3：标的筛选 ──────────────────────────────────
-    print("\n>>> Layer 3 标的筛选 ...")
-    extra_stocks = list(dict.fromkeys(ranking_stocks + named_stocks))
-    all_symbols = list(dict.fromkeys(
-        config.WHITELIST + noted_stocks + extra_stocks
-    ))  # 去重保序
-    all_symbols = filter_symbols(active, all_symbols)
+    # L3 需要分钟线，非交易时段数据源不可用，自动跳过
+    from signals.core.market_hours import get_active_markets as _get_live_markets, Market
+    _live = _get_live_markets()
+    _a_symbols = [s for s in (config.WHITELIST + noted_stocks + ranking_stocks + named_stocks)
+                  if detect_market(s) == "A"]
+    _us_symbols = [s for s in (config.WHITELIST + noted_stocks)
+                   if detect_market(s) == "US"]
+    _need_a = bool(_a_symbols)
+    _need_us = bool(_us_symbols)
+    _skip_l3 = ((_need_a and Market.A not in _live and not _need_us)
+                or (_need_a and Market.A not in _live
+                    and _need_us and Market.US not in _live))
 
-    screener_l3 = IntraDayScreener(
-        symbols=all_symbols, freqs=config.MONITOR_FREQS, notes=notes,
-    )
-    if extra_stocks:
-        wl_results = screener_l3.run_whitelist()
-        screener_l3.initialize(extra_stocks)
-        extra_results = screener_l3.scan_once(extra_stocks)
-        screener_l3.print_results(extra_results, title="行业成分股筛选结果")
-
-        combined = {}
-        for r in wl_results + extra_results:
-            if r.symbol not in combined or r.total_score > combined[r.symbol].total_score:
-                combined[r.symbol] = r
-        merged = sorted(combined.values(), key=lambda x: -x.total_score)
-        screener_l3.print_results(merged, title="综合筛选结果（三层联动）")
+    if _skip_l3:
+        print("\n>>> Layer 3 标的筛选 ... 跳过（非交易时段，分钟线不可用）")
     else:
-        screener_l3.run_whitelist()
+        print("\n>>> Layer 3 标的筛选 ...")
+        extra_stocks = list(dict.fromkeys(ranking_stocks + named_stocks))
+        all_symbols = list(dict.fromkeys(
+            config.WHITELIST + noted_stocks + extra_stocks
+        ))  # 去重保序
+        all_symbols = filter_symbols(active, all_symbols)
+
+        screener_l3 = IntraDayScreener(
+            symbols=all_symbols, freqs=config.MONITOR_FREQS, notes=notes,
+        )
+        if extra_stocks:
+            wl_results = screener_l3.run_whitelist()
+            screener_l3.initialize(extra_stocks)
+            extra_results = screener_l3.scan_once(extra_stocks)
+            screener_l3.print_results(extra_results, title="行业成分股筛选结果")
+
+            combined = {}
+            for r in wl_results + extra_results:
+                if r.symbol not in combined or r.total_score > combined[r.symbol].total_score:
+                    combined[r.symbol] = r
+            merged = sorted(combined.values(), key=lambda x: -x.total_score)
+            screener_l3.print_results(merged, title="综合筛选结果（三层联动）")
+        else:
+            screener_l3.run_whitelist()
 
     # ── 飞书推送（卡片模式，含折叠面板）────────────────────
     try:

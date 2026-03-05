@@ -163,17 +163,33 @@ class AKShareSource:
                 else:
                     raise
 
-    def get_a_minute(self, futu_code: str, freq: Freq) -> List[RawBar]:
+    @staticmethod
+    def _call_with_timeout(fn, timeout: float = 30.0):
+        """在子线程中调用 fn，超时则抛 TimeoutError（防 Sina API 无限挂起）。"""
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(fn)
+            try:
+                return future.result(timeout=timeout)
+            except FutureTimeout:
+                raise TimeoutError(f"API 调用超时（>{timeout}s）")
+
+    def get_a_minute(self, futu_code: str, freq: Freq,
+                     timeout: float = 30.0) -> List[RawBar]:
         """
         A股分钟线（近 5 天，无复权）
         freq: Freq.F15 / Freq.F30
+        带 timeout 保护，防止 Sina API 无限挂起。
         """
         import akshare as ak
         ak_sym, _ = self._futu_to_ak_a(futu_code)
         period_map = {"1分钟": "1", "5分钟": "5", "15分钟": "15",
                       "30分钟": "30", "60分钟": "60"}
         period = period_map.get(freq.value, "15")
-        df = ak.stock_zh_a_minute(symbol=ak_sym, period=period, adjust="")
+        df = self._call_with_timeout(
+            lambda: ak.stock_zh_a_minute(symbol=ak_sym, period=period, adjust=""),
+            timeout=timeout,
+        )
         if df is None or df.empty:
             return []
         df = df.rename(columns={"day": "dt", "volume": "vol"})
@@ -302,18 +318,23 @@ class AKShareSource:
         return _to_raw_bars(df, symbol, Freq.D,
                             "dt", "open", "high", "low", "close", "vol", "amount")
 
-    def get_index_minute(self, symbol: str, freq: Freq) -> List[RawBar]:
+    def get_index_minute(self, symbol: str, freq: Freq,
+                         timeout: float = 30.0) -> List[RawBar]:
         """
         A股指数分钟线（近5日）。
         symbol: AKShare格式，如 'sh000016'
         freq: Freq.F15 / Freq.F30
         实测：stock_zh_a_minute 对指数代码（sh前缀）完全支持，返回1970根。
+        带 timeout 保护，防止 Sina API 无限挂起。
         """
         import akshare as ak
         period_map = {"1分钟": "1", "5分钟": "5", "15分钟": "15",
                       "30分钟": "30", "60分钟": "60"}
         period = period_map.get(freq.value, "15")
-        df = ak.stock_zh_a_minute(symbol=symbol, period=period, adjust="")
+        df = self._call_with_timeout(
+            lambda: ak.stock_zh_a_minute(symbol=symbol, period=period, adjust=""),
+            timeout=timeout,
+        )
         if df is None or df.empty:
             return []
         df = df.rename(columns={"day": "dt", "volume": "vol"})

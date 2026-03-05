@@ -132,7 +132,9 @@ class MarketContext:
         ════════════════════════════════════════
         """
         from datetime import datetime
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        now_dt = datetime.now()
+        now = now_dt.strftime("%Y-%m-%d %H:%M")
+        today_str = now_dt.strftime("%Y-%m-%d")
 
         # 数据截止时间（取可用指数中最新的一根）
         avail = [r for r in self.reports if r.data_available]
@@ -141,11 +143,32 @@ class MarketContext:
         daily_cutoff = max(daily_dts).strftime("%Y-%m-%d") if daily_dts else "未知"
         f15_cutoff   = max(f15_dts).strftime("%Y-%m-%d %H:%M") if f15_dts else "未知"
 
+        # 数据新鲜度检查：盘后(15:30+)日线应已更新到今天
+        daily_stale = False
+        minute_stale = False
+        if daily_dts and daily_cutoff < today_str and now_dt.hour >= 16:
+            daily_stale = True
+        if f15_dts:
+            f15_date = max(f15_dts).strftime("%Y-%m-%d")
+            if f15_date < today_str and now_dt.hour >= 16:
+                minute_stale = True
+
         lines: List[str] = []
         SEP = "═" * 42
         lines.append("\n" + SEP)
         lines.append(f"  📊 大盘研判  {now}")
         lines.append(f"  日线截至: {daily_cutoff}  |  分钟线截至: {f15_cutoff}")
+
+        # 数据滞后警告（日线源：新浪，通常收盘后 17:00~18:00 更新）
+        if daily_stale or minute_stale:
+            stale_parts = []
+            if daily_stale:
+                stale_parts.append(f"日线({daily_cutoff})")
+            if minute_stale:
+                stale_parts.append(f"分钟线({max(f15_dts).strftime('%Y-%m-%d')})")
+            lines.append(f"  ⚠️  数据尚未更新到今日: {', '.join(stale_parts)}")
+            lines.append(f"  ⚠️  以下分析基于滞后数据，仅供参考（日线源通常 17:00~18:00 更新）")
+
         lines.append(f"  日↑↓→  30M↑↓→  15M↑↓→  |  信号(日/30M/15M)")
         lines.append("─" * 42)
         lines.extend(self._index_lines())
@@ -189,7 +212,9 @@ class MarketContext:
         确保在飞书不同客户端上显示一致）。
         """
         from datetime import datetime
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        now_dt = datetime.now()
+        now = now_dt.strftime("%Y-%m-%d %H:%M")
+        today_str = now_dt.strftime("%Y-%m-%d")
 
         avail = [r for r in self.reports if r.data_available]
         daily_dts = [r.daily_last_dt for r in avail if r.daily_last_dt]
@@ -200,6 +225,17 @@ class MarketContext:
         lines: List[str] = []
         lines.append(f"【大盘研判 {now}】")
         lines.append(f"日线截至: {daily_cutoff}  分钟线截至: {f15_cutoff}")
+
+        # 数据滞后警告
+        stale_parts = []
+        if daily_dts and daily_cutoff < today_str and now_dt.hour >= 16:
+            stale_parts.append(f"日线({daily_cutoff})")
+        if f15_dts:
+            f15_date = max(f15_dts).strftime("%Y-%m-%d")
+            if f15_date < today_str and now_dt.hour >= 16:
+                stale_parts.append(f"分钟线({f15_date})")
+        if stale_parts:
+            lines.append(f"[!] 数据尚未更新到今日: {', '.join(stale_parts)}，分析基于滞后数据（日线源通常 17:00~18:00 更新）")
         lines.append(f"综合: {self.overall_direction}  风格: {self.growth_vs_value}")
         lines.append("─" * 36)
         lines.append("指数     趋势   主要信号")
@@ -259,7 +295,9 @@ class MarketContext:
         :param l2_composite: L2 综合榜 top 3 IndustryRanking 列表
         """
         from datetime import datetime
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        now_dt = datetime.now()
+        now = now_dt.strftime("%Y-%m-%d %H:%M")
+        today_str = now_dt.strftime("%Y-%m-%d")
 
         elements = []
 
@@ -272,6 +310,18 @@ class MarketContext:
         f15_cutoff = max(f15_dts).strftime("%Y-%m-%d %H:%M") if f15_dts else "未知"
 
         l1_lines.append(f"日线截至: {daily_cutoff}  |  分钟线截至: {f15_cutoff}")
+
+        # 数据滞后警告
+        stale_parts = []
+        if daily_dts and daily_cutoff < today_str and now_dt.hour >= 16:
+            stale_parts.append(f"日线({daily_cutoff})")
+        if f15_dts:
+            f15_date = max(f15_dts).strftime("%Y-%m-%d")
+            if f15_date < today_str and now_dt.hour >= 16:
+                stale_parts.append(f"分钟线({f15_date})")
+        if stale_parts:
+            l1_lines.append(f"⚠️ 数据尚未更新到今日: {', '.join(stale_parts)}，分析基于滞后数据（日线源通常 17:00~18:00 更新）")
+
         l1_lines.append("")
         for r in self.reports:
             if not r.data_available:

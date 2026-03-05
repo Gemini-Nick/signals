@@ -89,21 +89,21 @@ class IntraDayScreener:
                     if bars:
                         self._ak_consecutive_fails = 0
                         return bars
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"    [Sina] {sym} {freq.value} 失败: {e.__class__.__name__}", flush=True)
                 self._ak_consecutive_fails += 1
                 if self._ak_consecutive_fails >= 3 and not self._ak_sina_degraded:
                     self._ak_sina_degraded = True
                     print("  [!] AKShare(Sina) 连续3次失败，后续直接走东财", flush=True)
-            # 降级1：AKShare 东财（push2his，间歇性SSL超时，内置重试）
+            # 降级1：AKShare 东财（push2his，间歇性SSL超时，快速放弃走 Futu）
             if not self._em_degraded:
                 try:
-                    bars = self.ak_source.get_a_minute_em(sym, freq)
+                    bars = self.ak_source.get_a_minute_em(sym, freq, max_retries=1)
                     if bars:
                         self._em_consecutive_fails = 0
                         return bars
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"    [东财] {sym} {freq.value} 失败: {e.__class__.__name__}", flush=True)
                 self._em_consecutive_fails += 1
                 if self._em_consecutive_fails >= 3:
                     self._em_degraded = True
