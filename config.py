@@ -15,6 +15,15 @@ TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
 FUTU_HOST = os.getenv("FUTU_HOST", "127.0.0.1")
 FUTU_PORT = int(os.getenv("FUTU_PORT", "11111"))
 
+# ── IB Gateway (美股盘中优先) ────────────────────────────
+IB_HOST = os.getenv("IB_HOST", "127.0.0.1")
+IB_PORT = int(os.getenv("IB_PORT", "4001"))       # 4001=live, 4002=paper
+IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "1"))
+
+# ── Alpaca (美股盘后优先) ────────────────────────────────
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+
 # ── 飞书机器人 ────────────────────────────────────────────
 FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
