@@ -10,20 +10,74 @@
   python run.py --mode intraday                    # 盘中监测
   python run.py --mode intraday --industries ""    # 盘中，跳过行业分析
   python run.py --mode intraday --industries 有色金属,半导体  # 盘中，指定行业
-  python run.py --mode review --start 2024-09-24  # 盘后复盘（九月行情）
-  python run.py --mode review --start 2025-01-06  # 盘后复盘（DeepSeek行情）
+  python run.py --mode review                      # 盘后复盘（默认今年以来）
+  python run.py --mode review --start 924          # 盘后复盘（924新政）
+  python run.py --mode review --start deepseek     # 盘后复盘（DeepSeek行情）
+  python run.py --mode review --start 924,deepseek,tariff  # 多日期对比
   python run.py --mode index                       # 仅看指数报告（快速）
+  python run.py --list-dates                       # 列出所有日期预设
   python run.py --mode import --file 锂电池深度.pdf          # 导入研究笔记（自动归档到 notes/YYYY/MM/）
   python run.py --mode import --file 锂电池深度.pdf --source 中信证券 --author 张三
 """
 import sys
 import subprocess
 import argparse
+from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config
+
+
+# ─────────────────────────────────────────────────────────
+# 日期解析工具
+# ─────────────────────────────────────────────────────────
+
+def _resolve_start_date(raw: str) -> str:
+    """
+    将日期别名解析为 'YYYY-MM-DD' 格式。
+    支持：预设别名 / YYYYMMDD / YYYY-MM-DD
+    """
+    preset = config.DATE_PRESETS.get(raw.lower())
+    if preset:
+        if "date" in preset:
+            return preset["date"]
+        offset = preset["offset"]
+        if offset == "ytd":
+            return f"{datetime.now().year}-01-01"
+        return (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
+    # 支持 YYYYMMDD 格式自动转换
+    if len(raw) == 8 and raw.isdigit():
+        return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+    return raw  # 已经是 YYYY-MM-DD
+
+
+def _get_date_label(raw: str) -> str:
+    """获取日期的标签说明。"""
+    preset = config.DATE_PRESETS.get(raw.lower())
+    if preset:
+        return preset["label"]
+    return ""
+
+
+def _print_date_presets():
+    """打印所有可用的日期预设。"""
+    print("\n可用日期预设：")
+    print("─" * 60)
+    print(f"  {'别名':<12} {'日期':<14} {'说明'}")
+    print("─" * 60)
+    for key, info in config.DATE_PRESETS.items():
+        if "date" in info:
+            date_str = info["date"]
+        elif info["offset"] == "ytd":
+            date_str = f"{datetime.now().year}-01-01"
+        else:
+            date_str = f"(T-{info['offset']}天)"
+        print(f"  {key:<12} {date_str:<14} {info['label']}")
+    print("─" * 60)
+    print("\n用法：python run.py --mode review --start <别名>")
+    print("      python run.py --mode review --start 924,deepseek  (多日期)")
 
 
 # ─────────────────────────────────────────────────────────
@@ -300,19 +354,266 @@ def run_index_only(args):
 def run_review(args):
     """
     盘后复盘模式：从指定关键时间节点加载完整历史结构。
-    Layer 1 → 指数历史结构
-    Layer 2 → 行业复盘（可选）
-    Layer 3 → 个股日线复盘（白名单）
+    支持单日期和多日期（逗号分隔）两种模式。
     """
-    from signals.layers.review_screener import ReviewScreener
+    raw_dates = args.start.split(",")
+    dates = [(_resolve_start_date(d.strip()), d.strip()) for d in raw_dates]
 
+    if len(dates) == 1:
+        _run_single_review(dates[0][0], dates[0][1], args)
+    else:
+        _run_multi_review(dates, args)
+
+
+def _run_single_review(start_date: str, raw_alias: str, args):
+    """
+    单日期盘后复盘：
+    Layer 1 → 指数历史结构
+    Layer 2 → 双榜行业筛选（历史模式）
+    Layer 3 → 个股日线复盘（白名单 + 代表股 + 补充行业）
+    """
+    from signals.layers.index_screener import IndexScreener
+    from signals.layers.review_screener import review_stock_daily
+
+    label = _get_date_label(raw_alias)
+    label_str = f"（{label}）" if label else ""
+
+    print(f"\n{'═'*52}")
+    print(f"  盘后复盘模式  起始：{start_date}{label_str}")
+    print(f"{'═'*52}")
+
+    # ── Layer 1：指数复盘 ──────────────────────────────────
+    screener_l1 = IndexScreener()
+    ctx = screener_l1.run_review(start_date)
+
+    # ── Layer 2：双榜行业筛选（使用最近交易日Pool数据）────
+    ranking_stocks: list = []
+    if config.RANK_TOP_N > 0:
+        from signals.layers.industry import get_industry_representatives
+
+        # Pool API仅保留近期数据（~3-4周），始终用最近交易日
+        pool_date = datetime.now().strftime("%Y%m%d")
+        print(f"\n>>> Layer 2 双榜行业筛选（Pool日期：{pool_date}）")
+        print("  " + "─" * 60)
+
+        try:
+            gain_list, composite_list, merged_list = get_industry_representatives(
+                config.RANK_TOP_N, date_str=pool_date)
+        except Exception as e:
+            print(f"  [!] 行业筛选异常（{e}），跳过 Layer 2", flush=True)
+            gain_list, composite_list, merged_list = [], [], []
+
+        # ── Layer 2A：涨停密度排行（盘后替代涨幅排行）─────
+        if gain_list:
+            print(f"\n  >>> Layer 2A 行业涨停密度排行（前{len(gain_list)}名）")
+            print(f"  {'排名':<4} {'行业':<12} {'涨停':>4}")
+            print("  " + "─" * 40)
+            for i, r in enumerate(gain_list, 1):
+                print(f"  {i:<4} {r.name:<12} {r.zt_count:>4}只")
+                for c in r.candidates:
+                    print(f"       {c.role}: {c.name}({c.code}"
+                          f"{', ' + c.detail if c.detail else ''})")
+                if r.pool_codes:
+                    print(f"       → 入池: {', '.join(r.pool_codes)}")
+        else:
+            print("  [!] 涨停池无数据（可能为非交易时段），Layer 2A 跳过")
+
+        # ── Layer 2B：综合强度排行（5维评分）───────────────
+        if composite_list:
+            print(f"\n  >>> Layer 2B 行业综合强度排行（前{len(composite_list)}名）")
+            print(f"  {'排名':<4} {'行业':<10} {'综合分':>6} "
+                  f"{'涨停':>4} {'强势':>4} {'续板':>4}")
+            print("  " + "─" * 50)
+            for r in composite_list:
+                tag = " ★" if r.source == "both" else ""
+                print(f"  {r.composite_rank:<4} {r.name:<10} "
+                      f"{r.composite_score:>6.1f} {r.zt_count:>4} "
+                      f"{r.strong_count:>4} {r.zbgc_count:>4}{tag}")
+                for c in r.candidates:
+                    already = " [密度榜已入池]" if r.source == "both" else ""
+                    print(f"       {c.role}: {c.name}({c.code}"
+                          f"{', ' + c.detail if c.detail else ''}){already}")
+                if r.pool_codes and r.source != "both":
+                    print(f"       → 入池: {', '.join(r.pool_codes)}")
+
+        # ── 汇总 ─────────────────────────────────────────
+        for r in merged_list:
+            ranking_stocks.extend(r.pool_codes)
+        ranking_stocks = list(dict.fromkeys(ranking_stocks))
+
+        if merged_list:
+            gain_only = sum(1 for r in merged_list if r.source == "gain")
+            comp_only = sum(1 for r in merged_list if r.source == "composite")
+            both_cnt = sum(1 for r in merged_list if r.source == "both")
+            print(f"\n  >>> Layer 2 合计: 涨停榜 {len(gain_list)} 行业 + "
+                  f"综合榜 {comp_only} 新增行业"
+                  f"{f' + {both_cnt} 重叠' if both_cnt else ''}"
+                  f" = {len(merged_list)} 行业")
+            print(f"  >>> Layer 2 共 {len(ranking_stocks)} 只代表股纳入复盘池")
+        else:
+            print("\n  >>> Layer 2 无行业数据，仅白名单复盘")
+
+    # ── --industries 补充行业 ──────────────────────────────
+    named_stocks: list = []
     industry_names = _parse_industries(args)
+    if industry_names:
+        from signals.layers.industry import get_industry_stocks as _get_ind_stocks
+        max_per = getattr(config, "RANK_MAX_STOCKS_PER_IND", 5)
+        print(f"\n>>> Layer 2 补充行业：{', '.join(industry_names)}")
+        for ind in industry_names:
+            stocks = _get_ind_stocks(ind)
+            named_stocks.extend(stocks[:max_per])
+            print(f"  [{ind}] 取 {min(max_per, len(stocks))} 只")
+        named_stocks = list(dict.fromkeys(named_stocks))
 
-    reviewer = ReviewScreener(
-        start_date=args.start,
-        industries=industry_names,
+    # ── Layer 3：个股日线复盘 ──────────────────────────────
+    extra_stocks = list(dict.fromkeys(ranking_stocks + named_stocks))
+    all_symbols = list(dict.fromkeys(config.WHITELIST + extra_stocks))
+    review_stock_daily(all_symbols, start_date)
+
+
+def _run_multi_review(dates: list, args):
+    """
+    多日期批量对比模式。
+
+    :param dates: [(resolved_date, raw_alias), ...]
+    """
+    from signals.layers.index_screener import IndexScreener
+    from signals.layers.industry import get_industry_representatives
+    from signals.layers.review_screener import review_stock_daily
+
+    # 日期标签
+    date_labels = []
+    for resolved, raw in dates:
+        label = _get_date_label(raw) or resolved
+        date_labels.append((resolved, raw, label))
+
+    dates_display = ", ".join(f"{d[0]}({d[2]})" for d in date_labels)
+    print(f"\n{'═'*60}")
+    print(f"  盘后复盘模式（多日期对比）")
+    print(f"  日期：{dates_display}")
+    print(f"{'═'*60}")
+
+    # ── Layer 1：指数复盘（共享，取最早日期）──────────────
+    earliest = min(d[0] for d in date_labels)
+    screener_l1 = IndexScreener()
+    ctx = screener_l1.run_review(earliest)
+
+    # ── Layer 2：每日期独立 ────────────────────────────────
+    all_ranking_stocks: list = []
+    per_date_results: list = []  # [(date, label, gain_list, comp_list, merged_list)]
+
+    if config.RANK_TOP_N > 0:
+        for resolved, raw, label in date_labels:
+            date_yyyymmdd = resolved.replace("-", "")
+            print(f"\n>>> Layer 2 行业筛选：{resolved}（{label}）")
+            print("  " + "─" * 50)
+
+            try:
+                gain_list, composite_list, merged_list = get_industry_representatives(
+                    config.RANK_TOP_N, date_str=date_yyyymmdd)
+            except Exception as e:
+                print(f"  [!] {resolved} 行业筛选异常（{e}），跳过", flush=True)
+                gain_list, composite_list, merged_list = [], [], []
+
+            per_date_results.append((resolved, label, gain_list, composite_list, merged_list))
+
+            # 简要输出
+            if gain_list:
+                top3 = ", ".join(f"{r.name}({r.zt_count}只)" for r in gain_list[:3])
+                print(f"  涨停密度 Top 3: {top3}")
+            if composite_list:
+                top3 = ", ".join(f"{r.name}({r.composite_score:.0f}分)" for r in composite_list[:3])
+                print(f"  综合强度 Top 3: {top3}")
+            if not gain_list and not composite_list:
+                print(f"  [!] {resolved} 无Pool数据（东财仅保留近3-4周），跳过")
+
+            for r in merged_list:
+                all_ranking_stocks.extend(r.pool_codes)
+
+        all_ranking_stocks = list(dict.fromkeys(all_ranking_stocks))
+
+        # ── 行业×日期矩阵 ─────────────────────────────────
+        _print_industry_date_matrix(per_date_results)
+
+        print(f"\n  >>> Layer 2 多日期合计: {len(all_ranking_stocks)} 只代表股纳入复盘池")
+
+    # ── --industries 补充行业 ──────────────────────────────
+    named_stocks: list = []
+    industry_names = _parse_industries(args)
+    if industry_names:
+        from signals.layers.industry import get_industry_stocks as _get_ind_stocks
+        max_per = getattr(config, "RANK_MAX_STOCKS_PER_IND", 5)
+        print(f"\n>>> Layer 2 补充行业：{', '.join(industry_names)}")
+        for ind in industry_names:
+            stocks = _get_ind_stocks(ind)
+            named_stocks.extend(stocks[:max_per])
+            print(f"  [{ind}] 取 {min(max_per, len(stocks))} 只")
+        named_stocks = list(dict.fromkeys(named_stocks))
+
+    # ── Layer 3：合并去重，统一复盘 ────────────────────────
+    extra_stocks = list(dict.fromkeys(all_ranking_stocks + named_stocks))
+    all_symbols = list(dict.fromkeys(config.WHITELIST + extra_stocks))
+    review_stock_daily(all_symbols, earliest)
+
+
+def _print_industry_date_matrix(per_date_results: list):
+    """
+    输出行业×日期矩阵。
+    :param per_date_results: [(date, label, gain_list, comp_list, merged_list), ...]
+    """
+    if not per_date_results:
+        return
+
+    # 收集所有出现过的行业
+    industry_dates: dict = {}  # {行业名: {date: (zt_count, is_comp_top)}}
+    for resolved, label, gain_list, comp_list, merged_list in per_date_results:
+        comp_names = {r.name for r in comp_list}
+        for r in merged_list:
+            industry_dates.setdefault(r.name, {})[resolved] = (
+                r.zt_count, r.name in comp_names)
+
+    if not industry_dates:
+        return
+
+    # 按出现次数降序排列
+    dates_list = [r[0] for r in per_date_results]
+    sorted_industries = sorted(
+        industry_dates.items(),
+        key=lambda x: (-len(x[1]), x[0])
     )
-    reviewer.run_all()
+
+    # 短标签
+    short_labels = {}
+    for resolved, label in [(r[0], r[1]) for r in per_date_results]:
+        short = label[:8] if len(label) > 8 else label
+        short_labels[resolved] = short
+
+    print(f"\n>>> Layer 2 多日期行业矩阵（{len(dates_list)}个日期）")
+    header = f"  {'行业':<10}"
+    for d in dates_list:
+        header += f" {short_labels[d]:>10}"
+    header += f"  {'出现':>6}"
+    print(header)
+    print("  " + "─" * (12 + 11 * len(dates_list) + 8))
+
+    for ind_name, date_map in sorted_industries[:20]:
+        row = f"  {ind_name:<10}"
+        count = 0
+        for d in dates_list:
+            if d in date_map:
+                zt_cnt, is_comp = date_map[d]
+                marker = "★" if is_comp else " "
+                row += f" {marker}涨停{zt_cnt:<2}{'':<3}"
+                count += 1
+            else:
+                row += f" {'—':>10}"
+        row += f"  {count}/{len(dates_list)}"
+        if count == len(dates_list):
+            row += " ★"
+        print(row)
+    print("  " + "─" * (12 + 11 * len(dates_list) + 8))
+    print("  ★ = 该日期综合榜 Top 10")
 
 
 # ─────────────────────────────────────────────────────────
@@ -339,19 +640,27 @@ def _parse_industries(args) -> list:
 # ─────────────────────────────────────────────────────────
 
 def main():
+    # 构建预设列表字符串
+    preset_keys = ", ".join(config.DATE_PRESETS.keys())
+
     parser = argparse.ArgumentParser(
         description="🐲 隆小侠 LONG CLAW — 实线虚线分析框架",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 示例：
   python run.py                                    # 盘中监测（默认）
   python run.py --mode intraday                    # 盘中监测
   python run.py --mode index                       # 仅看指数（快速）
   python run.py --mode intraday --industries ""    # 盘中，跳过行业
   python run.py --mode intraday --industries 有色金属,半导体
-  python run.py --mode review --start 2024-09-24  # 盘后复盘（九月行情起）
-  python run.py --mode review --start 2025-01-06  # 盘后复盘（DeepSeek行情起）
+  python run.py --mode review                      # 盘后复盘（今年以来）
+  python run.py --mode review --start 924          # 盘后复盘（924新政）
+  python run.py --mode review --start deepseek     # 盘后复盘（DeepSeek行情）
+  python run.py --mode review --start 924,deepseek # 多日期对比
   python run.py --mode import --file 锂电池.pdf --source 中信证券 --author 张三
+  python run.py --list-dates                       # 列出所有日期预设
+
+可用日期预设：{preset_keys}
         """
     )
     parser.add_argument(
@@ -362,9 +671,10 @@ def main():
     )
     parser.add_argument(
         "--start",
-        default="2024-09-24",
-        metavar="YYYY-MM-DD",
-        help="盘后复盘起始日期（--mode review 时使用），默认 2024-09-24"
+        default="ytd",
+        metavar="日期或别名",
+        help=f"盘后复盘起始日期（--mode review 时使用），默认 ytd（今年以来）。"
+             f"可用预设：{preset_keys}。支持逗号分隔多日期对比。"
     )
     parser.add_argument(
         "--industries",
@@ -397,8 +707,18 @@ def main():
         metavar="NAME",
         help="研究笔记作者/分析师"
     )
+    parser.add_argument(
+        "--list-dates",
+        action="store_true",
+        help="列出所有可用的日期预设并退出"
+    )
 
     args = parser.parse_args()
+
+    # --list-dates 优先处理
+    if args.list_dates:
+        _print_date_presets()
+        return
 
     dispatch = {
         "intraday": run_intraday,

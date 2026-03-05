@@ -72,6 +72,55 @@ INDEX_LOOKBACK_DAYS = 180
 # 空列表 = 跳过 Layer 2，只跑指数 + 白名单
 WATCH_INDUSTRIES: list = []
 
+# ── 行业双榜配置（Layer 2）──────────────────────────────
+# 涨幅榜 + 综合强度榜各取前 N 名行业，取并集
+# 0 = 禁用此功能
+RANK_TOP_N: int = 10
+RANK_MAX_STOCKS_PER_IND: int = 5    # 每个行业最多入池股票数
+
+# 综合强度评分权重（满分100 = 各权重之和，可调）
+RANK_COMPOSITE_WEIGHTS: dict = {
+    "gain": 20,             # 涨幅得分
+    "inflow": 20,           # 资金流入得分
+    "zt_density": 20,       # 涨停密度
+    "lianban": 10,          # 连板高度
+    "strong_density": 15,   # 强势股密度
+    "continue": 10,         # 涨停持续性（昨涨停续板）
+    "dt_penalty": 5,        # 跌停惩罚
+}
+
+# 盘后模式历史评分权重（5维，去掉 gain/inflow，权重重分配）
+RANK_HISTORICAL_WEIGHTS: dict = {
+    "zt_density": 30,       # 涨停密度（权重提升）
+    "lianban": 20,          # 连板高度（权重提升）
+    "strong_density": 25,   # 强势股密度（权重提升）
+    "continue": 15,         # 涨停持续性（权重提升）
+    "dt_penalty": 10,       # 跌停惩罚（权重提升）
+}
+
+# ── 盘后复盘日期预设 ────────────────────────────────────────
+# 用法：python run.py --mode review --start 924
+# 相对日期在运行时计算；历史日期为固定值
+DATE_PRESETS: dict = {
+    # ── 相对日期（运行时计算）──
+    "ytd":       {"offset": "ytd",   "label": "今年以来"},
+    "1w":        {"offset": 7,       "label": "最近一周"},
+    "3d":        {"offset": 3,       "label": "最近三天"},
+    "1m":        {"offset": 30,      "label": "最近一个月"},
+    "3m":        {"offset": 90,      "label": "最近三个月"},
+    # ── 历史关键节点 ──
+    "924":       {"date": "2024-09-24", "label": "924新政 — 央行三箭齐发"},
+    "deepseek":  {"date": "2025-01-23", "label": "DeepSeek行情 — AI新纪元"},
+    "tariff":    {"date": "2025-04-11", "label": "关税冲击 — 对等关税升级"},
+    "1006":      {"date": "2024-10-08", "label": "国庆后高开 — 疯牛顶部"},
+    "1118":      {"date": "2024-11-18", "label": "11月反弹 — 化债行情启动"},
+    "0106":      {"date": "2025-01-06", "label": "年初调整 — 抱团股瓦解"},
+    "spring":    {"date": "2025-02-17", "label": "春季躁动 — 两会预期"},
+    "2022bear":  {"date": "2022-04-27", "label": "2022熊市底 — 上海封城最低点"},
+    "2023ai":    {"date": "2023-01-30", "label": "2023AI行情 — ChatGPT概念启动"},
+    "2024start": {"date": "2024-02-05", "label": "2024年初底 — 雪球敲入后反弹"},
+}
+
 # ── 研究笔记（双维度集成）──────────────────────────────────
 # 笔记根目录，按 年/月 子目录存储：notes/2026/03/xxx.pdf
 NOTES_DIR = "notes"
