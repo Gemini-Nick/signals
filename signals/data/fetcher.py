@@ -74,6 +74,33 @@ class TushareSource:
         ts.set_token(token)
         self._ts = ts
 
+    @staticmethod
+    def _futu_to_ts(futu_code: str) -> str:
+        """SH.601958 → 601958.SH"""
+        mkt, code = futu_code.split(".")
+        return f"{code}.{mkt}"
+
+    def get_minute(self, futu_code: str, freq: Freq,
+                   lookback_days: int = 5) -> List[RawBar]:
+        """
+        A股分钟线（Tushare pro_bar）。
+        限制：2次/分钟（需外部限速）；lookback_days 默认5天。
+        """
+        from datetime import datetime, timedelta
+        ts_code = self._futu_to_ts(futu_code)
+        freq_map = {"1分钟": "1min", "5分钟": "5min", "15分钟": "15min",
+                    "30分钟": "30min", "60分钟": "60min"}
+        ts_freq = freq_map.get(freq.value, "15min")
+        edt = datetime.now().strftime("%Y%m%d")
+        sdt = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y%m%d")
+        df = self._ts.pro_bar(ts_code=ts_code, freq=ts_freq,
+                              start_date=sdt, end_date=edt)
+        if df is None or df.empty:
+            return []
+        df = df.rename(columns={"trade_time": "dt"})
+        return _to_raw_bars(df, futu_code, freq,
+                            "dt", "open", "high", "low", "close", "vol", "amount")
+
     def get_daily(self, symbol: str, sdt: str, edt: str,
                   adj: str = "qfq") -> List[RawBar]:
         """
@@ -323,6 +350,37 @@ class FutuSource:
             return []
         df = df.rename(columns={"time_key": "dt", "volume": "vol",
                                   "turnover": "amount"})
+        df["amount"] = df["amount"].fillna(0)
+        return _to_raw_bars(df, futu_code, freq,
+                            "dt", "open", "high", "low", "close", "vol", "amount")
+
+    # ── A股分钟线（fallback 用）─────────────────────────────
+
+    def get_a_minute(self, futu_code: str, freq: Freq,
+                     lookback_days: int = 10) -> List[RawBar]:
+        """
+        A股分钟线历史（Futu request_history_kline）。
+        futu_code: SH.601958 / SZ.000001
+        freq: Freq.F15 / Freq.F30
+        每次消耗1个历史K线额度（1000/天）。
+        """
+        from futu import KLType, AuType, RET_OK
+        from datetime import datetime, timedelta
+        start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        ktype_map = {
+            "1分钟": KLType.K_1M, "5分钟": KLType.K_5M,
+            "15分钟": KLType.K_15M, "30分钟": KLType.K_30M,
+            "60分钟": KLType.K_60M,
+        }
+        ktype = ktype_map.get(freq.value, KLType.K_15M)
+        ret, df, _ = self._ctx.request_history_kline(
+            futu_code, start=start, ktype=ktype,
+            autype=AuType.QFQ, max_count=2000
+        )
+        if ret != RET_OK or df is None or df.empty:
+            return []
+        df = df.rename(columns={"time_key": "dt", "volume": "vol",
+                                 "turnover": "amount"})
         df["amount"] = df["amount"].fillna(0)
         return _to_raw_bars(df, futu_code, freq,
                             "dt", "open", "high", "low", "close", "vol", "amount")

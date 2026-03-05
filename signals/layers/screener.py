@@ -11,8 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from config import WHITELIST, MONITOR_FREQS, SCORE_THRESHOLD
-from signals.data.fetcher import AKShareSource, USDataSource, detect_market
+from config import WHITELIST, MONITOR_FREQS, SCORE_THRESHOLD, FUTU_HOST, FUTU_PORT, TUSHARE_TOKEN
+from signals.data.fetcher import AKShareSource, TushareSource, FutuSource, USDataSource, detect_market
 from czsc import Freq
 
 from signals.core.freq_utils import config_freq_to_czsc
@@ -37,6 +37,11 @@ class IntraDayScreener:
         self.czsc_freqs: List[Freq] = [config_freq_to_czsc(f) for f in self.freqs]
         self.max_workers = max_workers
         self.ak_source = AKShareSource()
+        self._ts_source: Optional[TushareSource] = None
+        self._ts_failed: bool = False
+        self._ts_call_count: int = 0             # Tushare 限速计数
+        self._futu_source: Optional[FutuSource] = None
+        self._futu_failed: bool = False
         self._us_source: Optional[USDataSource] = None
         self.notes = notes or []
         # Dict[symbol][freq.value] -> SymbolAnalyzer  (Rust Freq 不可哈希，用 str)
@@ -45,12 +50,96 @@ class IntraDayScreener:
     # ─────────────────────────────────────────────────────
     # 初始化：并发拉取历史分钟线，创建 CZSC Analyzer
     # ─────────────────────────────────────────────────────
+    def _get_tushare(self) -> Optional[TushareSource]:
+        """懒初始化 Tushare（限频 2次/分钟）"""
+        if self._ts_failed:
+            return None
+        if self._ts_source is None:
+            if not TUSHARE_TOKEN:
+                print("  [Tushare] 无 Token，跳过")
+                self._ts_failed = True
+                return None
+            try:
+                self._ts_source = TushareSource(TUSHARE_TOKEN)
+                print("  [Tushare] 初始化成功，可用作分钟线降级源（限频 2次/分钟）")
+            except Exception as e:
+                print(f"  [Tushare] 初始化失败（{e}）")
+                self._ts_failed = True
+                return None
+        return self._ts_source
+
+    def _tushare_get_with_throttle(self, sym: str, freq: Freq) -> List:
+        """Tushare 限速获取：每2次调用后 sleep 31s"""
+        ts = self._get_tushare()
+        if not ts:
+            return []
+        # 限速：每 2 次 sleep 31s
+        if self._ts_call_count > 0 and self._ts_call_count % 2 == 0:
+            print(f"    [Tushare限速] 已调用{self._ts_call_count}次，等待31s ...", flush=True)
+            time.sleep(31)
+        try:
+            bars = ts.get_minute(sym, freq)
+            self._ts_call_count += 1
+            return bars
+        except Exception as e:
+            err = str(e)
+            if "每分钟最多" in err:
+                print(f"    [Tushare限速] 触发频率限制，等待31s ...", flush=True)
+                time.sleep(31)
+                try:
+                    bars = ts.get_minute(sym, freq)
+                    self._ts_call_count += 1
+                    return bars
+                except Exception as e2:
+                    print(f"    [Tushare] {sym} {freq.value} 重试失败: {e2}")
+            else:
+                print(f"    [Tushare] {sym} {freq.value} 失败: {e}")
+            return []
+
+    def _get_futu(self) -> Optional[FutuSource]:
+        """懒初始化 Futu 连接"""
+        if self._futu_failed:
+            return None
+        if self._futu_source is None:
+            try:
+                self._futu_source = FutuSource(host=FUTU_HOST, port=FUTU_PORT)
+                self._futu_source.connect()
+                print("  [Futu] 连接成功，可用作分钟线降级源")
+            except Exception as e:
+                print(f"  [Futu] 连接失败（{e}），跳过")
+                self._futu_failed = True
+                return None
+        return self._futu_source
+
     def _fetch_minute_bars(self, sym: str, freq: Freq) -> List:
-        """根据市场路由到正确的数据源获取分钟线"""
-        from czsc import RawBar
+        """
+        根据市场路由到正确的数据源获取分钟线。
+        A股：AKShare(Sina) → Tushare(限速) → Futu(如有A股权限)
+        美股：Futu → yfinance fallback（USDataSource 内部处理）
+        """
         market = detect_market(sym)
         if market == "A":
-            return self.ak_source.get_a_minute(sym, freq)
+            # 主路径：AKShare (Sina, 免费无限制)
+            try:
+                bars = self.ak_source.get_a_minute(sym, freq)
+                if bars:
+                    return bars
+            except Exception:
+                pass
+            # 降级1：Tushare (限频 2次/分钟)
+            bars = self._tushare_get_with_throttle(sym, freq)
+            if bars:
+                return bars
+            # 降级2：Futu (需A股行情权限)
+            futu = self._get_futu()
+            if futu:
+                try:
+                    bars = futu.get_a_minute(sym, freq)
+                    if bars:
+                        return bars
+                except Exception:
+                    pass
+            return []
         elif market == "US":
             if not self._us_source:
                 self._us_source = USDataSource()
@@ -71,19 +160,46 @@ class IntraDayScreener:
         if a_tasks:
             print(f"  A股: {len(a_tasks)} 个（并发），美股: {len(us_tasks)} 个（顺序）")
 
-        # A股预热 + 并发获取
+        # A股预热：测试 AKShare 可用性
+        ak_ok = True
         if a_tasks:
             _warm_sym, _warm_freq = a_tasks[0]
             try:
-                self.ak_source.get_a_minute(_warm_sym, _warm_freq)
+                test_bars = self.ak_source.get_a_minute(_warm_sym, _warm_freq)
+                if not test_bars:
+                    raise ValueError("AKShare 返回空数据")
+                print(f"  AKShare(Sina) 预热成功 ✓")
             except Exception as e:
-                print(f"  [!] 预热失败（{e}），继续尝试 ...", flush=True)
+                ak_ok = False
+                print(f"  [!] AKShare(Sina) 不可用（{e}）", flush=True)
+                # 尝试初始化降级源
+                ts = self._get_tushare()
+                futu = self._get_futu()
+                if ts:
+                    # Tushare 限频 2次/分钟，大批量不现实
+                    max_ts_stocks = 10  # 最多用 Tushare 处理 10 只
+                    unique_syms = list(dict.fromkeys(s for s, _ in a_tasks))
+                    if len(unique_syms) > max_ts_stocks:
+                        print(f"  → Tushare 限频（2次/分钟），{len(unique_syms)}只太多，"
+                              f"仅处理前{max_ts_stocks}只", flush=True)
+                        keep = set(unique_syms[:max_ts_stocks])
+                        a_tasks = [(s, f) for s, f in a_tasks if s in keep]
+                    est_min = len(a_tasks) // 2
+                    print(f"  → 使用 Tushare 降级（{len(a_tasks)}个任务，"
+                          f"预计{est_min}~{est_min+1}分钟）", flush=True)
+                elif futu:
+                    print(f"  → 使用 Futu 降级", flush=True)
+                else:
+                    print(f"  → 无可用降级源，A股分钟线将全部跳过", flush=True)
 
+        # A股获取（统一走 _fetch_minute_bars，内含 fallback）
         def _fetch_and_build(sym: str, freq: Freq):
-            bars = self.ak_source.get_a_minute(sym, freq)
+            bars = self._fetch_minute_bars(sym, freq)
             return sym, freq, bars
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+        # AKShare 可用时并发；Tushare 需限速串行（workers=1）
+        workers = self.max_workers if ak_ok else 1
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(_fetch_and_build, sym, freq): (sym, freq)
                     for sym, freq in a_tasks}
             for fut in as_completed(futs):
@@ -146,7 +262,7 @@ class IntraDayScreener:
                      and sym in self.analyzers and freq.value in self.analyzers[sym]]
 
         def _refresh_a(sym: str, freq: Freq):
-            new_bars = self.ak_source.get_a_minute(sym, freq)
+            new_bars = self._fetch_minute_bars(sym, freq)
             self.analyzers[sym][freq.value].update_many(new_bars)
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
