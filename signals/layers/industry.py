@@ -338,6 +338,8 @@ class IndustryRanking:
     zt_count: int = 0                                  # 涨停家数
     strong_count: int = 0                              # 强势股家数
     zbgc_count: int = 0                                # 昨涨停续板家数
+    sector_type: str = "中性"                           # 防守/进攻/周期/中性
+    concept_tags: List[str] = field(default_factory=list)  # 关联的热门概念名
 
     @property
     def pool_codes(self) -> List[str]:
@@ -624,6 +626,112 @@ def _get_known_industry_names() -> set:
         "教育", "游戏", "影视院线", "广告营销",
     }
     return _KNOWN_INDUSTRY_NAMES
+
+
+# ─────────────────────────────────────────────────────────
+# 概念板块排行
+# ─────────────────────────────────────────────────────────
+
+@dataclass
+class ConceptRanking:
+    """概念板块排名"""
+    name: str
+    gain_pct: float = 0.0
+    leading_stock: str = ""
+    leading_gain: float = 0.0
+    sector_type: str = "中性"      # 自动分类：防守/进攻/周期/中性
+
+
+def _classify_concept(name: str) -> str:
+    """根据概念名中的关键词自动分类。"""
+    import config as _cfg
+    keywords = getattr(_cfg, "CONCEPT_TYPE_KEYWORDS", {})
+    for cat, kws in keywords.items():
+        for kw in kws:
+            if kw in name:
+                return cat
+    return "中性"
+
+
+def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
+    """
+    获取概念板块涨幅 top N。
+    API: ak.stock_board_concept_name_em()（一次调用，返回全量）
+    超时降级：返回空列表，不影响主流程。
+    """
+    import akshare as ak
+    import config as _cfg
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+    if top_n is None:
+        top_n = getattr(_cfg, "CONCEPT_TOP_N", 10)
+
+    def _call():
+        return ak.stock_board_concept_name_em()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_call)
+            df = future.result(timeout=8)
+    except (FutureTimeout, Exception) as e:
+        print(f"  [!] 概念板块接口失败（{e.__class__.__name__}），跳过概念排行",
+              flush=True)
+        return []
+
+    if df is None or df.empty or "涨跌幅" not in df.columns:
+        return []
+
+    df = df.sort_values("涨跌幅", ascending=False).head(top_n)
+    results = []
+    for _, row in df.iterrows():
+        name = str(row.get("板块名称", "")).strip()
+        if not name:
+            continue
+        leading = str(row.get("领涨股票", ""))
+        leading_gain = 0.0
+        try:
+            leading_gain = float(row.get("领涨股票-涨跌幅", 0) or 0)
+        except (ValueError, TypeError):
+            pass
+        results.append(ConceptRanking(
+            name=name,
+            gain_pct=float(row.get("涨跌幅", 0) or 0),
+            leading_stock=leading,
+            leading_gain=leading_gain,
+            sector_type=_classify_concept(name),
+        ))
+
+    print(f"  [✓] 概念板块 top {len(results)} 条", flush=True)
+    return results
+
+
+def _match_concepts_to_industries(
+    concepts: List[ConceptRanking],
+    industry_names: List[str],
+    name_df: "pd.DataFrame | None",
+) -> dict:
+    """
+    轻量关联：概念的领涨股如果同名出现在行业领涨股中，就把概念挂到该行业。
+    返回 {行业名: [概念名, ...]}
+    """
+    if not concepts or name_df is None or name_df.empty:
+        return {}
+
+    # 构建行业→领涨股映射
+    ind_leader_map: dict = {}  # {领涨股名: 行业名}
+    for _, row in name_df.iterrows():
+        ind = str(row.get("板块名称", "")).strip()
+        leader = str(row.get("领涨股票", "")).strip()
+        if ind and leader and ind in industry_names:
+            ind_leader_map[leader] = ind
+
+    result: dict = {}
+    for c in concepts:
+        if c.leading_stock and c.leading_stock in ind_leader_map:
+            ind = ind_leader_map[c.leading_stock]
+            result.setdefault(ind, []).append(c.name)
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────
@@ -955,23 +1063,26 @@ def compute_historical_composite_scores(
 
 def get_industry_representatives(top_n: int = None,
                                   date_str: str = None) -> Tuple[
-        List[IndustryRanking], List[IndustryRanking], List[IndustryRanking]]:
+        List[IndustryRanking], List[IndustryRanking],
+        List[IndustryRanking], List[ConceptRanking]]:
     """
-    双榜合并 + 每行业选出代表股。
+    双榜合并 + 每行业选出代表股 + 概念板块排行。
 
     流程：
-    1. 加载全部数据源（change_em, name_em, 涨停池, 强势池, 融资, 跌停, 续板）
+    1. 加载全部数据源（change_em, name_em, 涨停池, 强势池, 融资, 跌停, 续板, 概念板块）
     2. 涨幅榜 top N（盘后降级为涨停密度排行）
     3. 综合强度榜 top N（盘后用5维评分）
     4. 对并集中每个行业，从 6 维度选出代表股
+    5. 概念板块涨幅 top N（自动分类标签）
 
     :param top_n:    每个榜取前N名行业
     :param date_str: YYYYMMDD格式日期，None=今天（盘中模式）；
                      传入历史日期则进入盘后模式（跳过 change_em/name_em）
-    :return: (gain_list, composite_list, merged_list)
-             gain_list      — 涨幅榜/涨停密度榜 top N（带代表股）
-             composite_list — 综合榜 top N（带代表股）
-             merged_list    — 并集（去重，带代表股）
+    :return: (gain_list, composite_list, merged_list, concepts)
+             gain_list      — 涨幅榜/涨停密度榜 top N（带代表股+标签）
+             composite_list — 综合榜 top N（带代表股+标签）
+             merged_list    — 并集（去重，带代表股+标签）
+             concepts       — 概念板块涨幅排行（带分类标签）
     """
     import akshare as ak
     import config as _cfg
@@ -1001,6 +1112,9 @@ def get_industry_representatives(top_n: int = None,
         "zbgc_count":   lambda: _load_zbgc_pool(target_date),
         "name_to_code": lambda: _build_name_to_code_map(),
     }
+    # 概念板块排行（盘中/盘后均可）
+    _pool_tasks["concepts"] = lambda: get_concept_rankings()
+
     if not is_historical:
         def _load_change_em():
             try:
@@ -1033,6 +1147,7 @@ def get_industry_representatives(top_n: int = None,
     name_to_code = _pool_results.get("name_to_code", {})
     change_df   = _pool_results.get("change_df")
     name_df     = _pool_results.get("name_df")
+    concepts    = _pool_results.get("concepts", [])
     if name_df is not None and not isinstance(name_df, pd.DataFrame):
         name_df = None
     if name_df is not None and not name_df.empty:
@@ -1212,6 +1327,10 @@ def get_industry_representatives(top_n: int = None,
             c_names_list = [x["name"] for x in composite_industries]
             c_rank = c_names_list.index(ind_name) + 1 if ind_name in c_names_list else 0
 
+        # 板块属性标签
+        sector_type_map = getattr(_cfg, "SECTOR_TYPE_MAP", {})
+        stype = sector_type_map.get(ind_name, "中性")
+
         return IndustryRanking(
             name=ind_name,
             gain_rank=g_rank,
@@ -1224,7 +1343,13 @@ def get_industry_representatives(top_n: int = None,
             zt_count=c.get("zt_count", len(zt_pool.get(ind_name, []))),
             strong_count=c.get("strong_count", len(strong_pool.get(ind_name, []))),
             zbgc_count=c.get("zbgc", zbgc_count.get(ind_name, 0)),
+            sector_type=stype,
+            concept_tags=concept_ind_map.get(ind_name, []),
         )
+
+    # 概念→行业关联
+    concept_ind_map = _match_concepts_to_industries(
+        concepts, all_ind_names, name_df)
 
     # 选股（所有上榜行业）
     all_cands_map = {name: _select_candidates(name) for name in all_ind_names}
@@ -1248,4 +1373,4 @@ def get_industry_representatives(top_n: int = None,
             seen_names.add(r.name)
             merged_list.append(r)
 
-    return gain_list, composite_list, merged_list
+    return gain_list, composite_list, merged_list, concepts

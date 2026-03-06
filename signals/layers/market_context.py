@@ -1,13 +1,137 @@
 # -*- coding: utf-8 -*-
 """
-MarketContext: 聚合 8 个指数的 IndexReport，形成大市研判结论。
+MarketContext: 聚合指数的 IndexReport，形成大市研判结论。
 - overall_direction: "偏多" / "偏空" / "分化"
 - growth_vs_value: 成长 vs 价值相对强弱
 - gate_industry_scan: 是否建议进行行业扫描
+- sentiment_phase: 情绪周期（恐慌/修复/亢奋/回落）
+- divergence_score: 大小盘分化度（>0 避险，<0 风险偏好）
 """
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import List, Optional
 from .index_report import IndexReport
+
+
+# ─────────────────────────────────────────────────────
+# 情绪周期
+# ─────────────────────────────────────────────────────
+
+class SentimentPhase(Enum):
+    PANIC    = "恐慌"
+    REPAIR   = "修复"
+    EUPHORIA = "亢奋"
+    COOLING  = "回落"
+    UNKNOWN  = "未知"
+
+
+_SENTIMENT_EMOJI = {
+    SentimentPhase.PANIC:    "🔴",
+    SentimentPhase.REPAIR:   "🟡",
+    SentimentPhase.EUPHORIA: "🟢",
+    SentimentPhase.COOLING:  "🟠",
+    SentimentPhase.UNKNOWN:  "⚪",
+}
+
+# 防守型指数 vs 进攻型指数（A股子集，用于分化度计算）
+_SHIELD_INDICES = {"上证50", "超大盘"}
+_SWORD_INDICES  = {"创业板指", "科创50", "中证1000"}
+
+# 仓位建议映射
+_POSITION_MAP = {
+    ("偏空", "恐慌"):  "半仓防守🛡 + 半仓现金💰 等待恐慌释放后埋伏",
+    ("偏空", "修复"):  "卖出埋伏仓位获利 → 加仓防守🛡（跷跷板切换）",
+    ("偏空", "回落"):  "减持半仓防守 → 半仓防守+半仓现金",
+    ("偏空", "亢奋"):  "减仓进攻⚔（反弹非反转），保留防守🛡底仓",
+    ("偏多", "亢奋"):  "减仓进攻⚔ → 增持防守🛡对冲（防大跌）",
+    ("偏多", "修复"):  "维持进攻⚔为主 + 关注超跌反弹方向",
+    ("偏多", "恐慌"):  "恐慌即机会 → 逢低加仓进攻⚔",
+    ("偏多", "回落"):  "正常回调 → 持仓等待，不追高",
+    ("分化", "恐慌"):  "防守🛡为主 + 少量现金💰，等方向明确",
+    ("分化", "修复"):  "均衡配置 → 关注跷跷板轮动",
+    ("分化", "亢奋"):  "均衡配置 → 适度减仓锁利",
+    ("分化", "回落"):  "均衡配置 → 关注防守⚔进攻跷跷板轮动",
+}
+
+
+def calc_divergence(reports: List[IndexReport]) -> float:
+    """
+    大小盘分化度 = 防守指数得分 - 进攻指数得分。
+    > 0: 资金流向防守（避险模式）
+    < 0: 资金流向进攻（风险偏好上升）
+    ≈ 0: 均衡
+    """
+    def _score_group(names: set) -> float:
+        total = 0.0
+        for r in reports:
+            if r.name in names and r.data_available:
+                if r.daily_trend == "上涨趋势":
+                    total += 2
+                elif r.daily_trend == "下跌趋势":
+                    total -= 2
+                if r.has_buy_signal:
+                    total += 1
+                if r.has_sell_signal:
+                    total -= 1
+        return total
+
+    return _score_group(_SHIELD_INDICES) - _score_group(_SWORD_INDICES)
+
+
+def detect_sentiment_phase(
+    divergence: float,
+    zt_total: int = 0,
+    dt_total: int = 0,
+    lianban_max: int = 0,
+    bank_avg_gain: float = 0.0,
+) -> SentimentPhase:
+    """
+    情绪周期识别（三维融合：分化度 + 涨跌停 + 指标股）。
+
+    :param divergence:     大小盘分化度（>0 避险，<0 风险偏好）
+    :param zt_total:       全市场涨停数
+    :param dt_total:       全市场跌停数
+    :param lianban_max:    最高连板数
+    :param bank_avg_gain:  四大行平均涨幅%
+    """
+    dt_ratio = dt_total / max(zt_total, 1)
+
+    # 恐慌：跌停远多于涨停 + 指数普跌
+    if dt_ratio > 1.5 and divergence < 0:
+        return SentimentPhase.PANIC
+
+    # 亢奋：连板高度高 + 跌停少 + 涨停多
+    if lianban_max >= 5 and dt_ratio < 0.2 and zt_total > 20:
+        return SentimentPhase.EUPHORIA
+
+    # 修复：跌停减少 + 防守资金外流（四大行跌）+ 小盘反弹
+    if divergence < -2 and bank_avg_gain < 0 and zt_total > dt_total:
+        return SentimentPhase.REPAIR
+
+    # 回落：防守强（四大行涨）+ 进攻弱 + 赚钱效应下降
+    if divergence > 2 and bank_avg_gain > 0.5:
+        return SentimentPhase.COOLING
+
+    # 无明确涨跌停数据时，仅靠分化度判断
+    if zt_total == 0 and dt_total == 0:
+        if divergence > 2:
+            return SentimentPhase.COOLING
+        elif divergence < -2:
+            return SentimentPhase.REPAIR
+        return SentimentPhase.UNKNOWN
+
+    # 默认
+    if dt_ratio > 0.8:
+        return SentimentPhase.COOLING
+    return SentimentPhase.REPAIR
+
+
+def get_position_suggestion(direction: str, phase: SentimentPhase) -> str:
+    """根据大市方向+情绪周期返回仓位建议。"""
+    return _POSITION_MAP.get(
+        (direction, phase.value),
+        "均衡配置 → 关注市场变化"
+    )
 
 
 # ─────────────────────────────────────────────────────────
@@ -30,6 +154,46 @@ class MarketContext:
     recommended_industries: List[str] = field(default_factory=list)  # 推断的强势板块
     gate_industry_scan: bool = True        # 偏多或中性才进行行业扫描
     summary: str = ""                      # 2-3 行综合判断
+    # ── 情绪周期（System Insights 新增）──
+    sentiment_phase: str = "未知"           # 恐慌/修复/亢奋/回落
+    position_suggestion: str = ""          # 仓位建议
+    divergence_score: float = 0.0          # 大小盘分化度（>0避险，<0风险偏好）
+    shield_sectors: List[str] = field(default_factory=list)   # 当日强势防守板块
+    sword_sectors: List[str] = field(default_factory=list)    # 当日强势进攻板块
+
+    # ─────────────────────────────────────────────────────
+    # 情绪周期更新（L2 数据可用后调用）
+    # ─────────────────────────────────────────────────────
+
+    def update_sentiment(
+        self,
+        zt_total: int = 0,
+        dt_total: int = 0,
+        lianban_max: int = 0,
+        bank_avg_gain: float = 0.0,
+        shield_sectors: List[str] = None,
+        sword_sectors: List[str] = None,
+    ):
+        """
+        L2 数据加载完成后，用涨跌停/连板/指标股数据更新情绪周期。
+        L1 阶段 build_market_context 已基于分化度做了初步判断，
+        此方法用更丰富的数据重新计算。
+        """
+        self.divergence_score = calc_divergence(self.reports)
+        phase = detect_sentiment_phase(
+            divergence=self.divergence_score,
+            zt_total=zt_total,
+            dt_total=dt_total,
+            lianban_max=lianban_max,
+            bank_avg_gain=bank_avg_gain,
+        )
+        self.sentiment_phase = phase.value
+        self.position_suggestion = get_position_suggestion(
+            self.overall_direction, phase)
+        if shield_sectors is not None:
+            self.shield_sectors = shield_sectors
+        if sword_sectors is not None:
+            self.sword_sectors = sword_sectors
 
     # ─────────────────────────────────────────────────────
     # 格式化工具（内部）
@@ -151,10 +315,27 @@ class MarketContext:
         lines.extend(self._index_lines())
         lines.append("─" * 42)
 
-        # 综合结论
+        # 综合结论 + 情绪周期
         dir_emoji = {"偏多": "📈", "偏空": "📉", "分化": "↔️"}.get(
             self.overall_direction, "")
-        lines.append(f"  {dir_emoji} 综合: {self.overall_direction}  |  风格: {self.growth_vs_value}")
+        phase_emoji = _SENTIMENT_EMOJI.get(
+            SentimentPhase(self.sentiment_phase), "⚪") if self.sentiment_phase != "未知" else ""
+        phase_str = f"  |  {phase_emoji}{self.sentiment_phase}" if self.sentiment_phase != "未知" else ""
+        div_str = f"  |  分化度: {self.divergence_score:+.1f}" if self.divergence_score != 0 else ""
+        lines.append(f"  {dir_emoji} 综合: {self.overall_direction}  |  风格: {self.growth_vs_value}{phase_str}{div_str}")
+
+        # 仓位建议
+        if self.position_suggestion:
+            lines.append(f"  💡 {self.position_suggestion}")
+
+        # 攻防板块
+        if self.shield_sectors or self.sword_sectors:
+            parts = []
+            if self.shield_sectors:
+                parts.append(f"🛡防守: {'、'.join(self.shield_sectors[:3])}")
+            if self.sword_sectors:
+                parts.append(f"⚔进攻: {'、'.join(self.sword_sectors[:3])}")
+            lines.append(f"  {' | '.join(parts)}")
 
         # 三级共振（最强信号）
         aligned = [r.name for r in self.reports
@@ -200,7 +381,8 @@ class MarketContext:
         lines: List[str] = []
         lines.append(f"【大盘研判 {now}】")
         lines.append(f"日线截至: {daily_cutoff}  分钟线截至: {f15_cutoff}")
-        lines.append(f"综合: {self.overall_direction}  风格: {self.growth_vs_value}")
+        phase_str = f"  情绪: {self.sentiment_phase}" if self.sentiment_phase != "未知" else ""
+        lines.append(f"综合: {self.overall_direction}  风格: {self.growth_vs_value}{phase_str}")
         lines.append("─" * 36)
         lines.append("指数     趋势   主要信号")
 
@@ -219,6 +401,10 @@ class MarketContext:
             lines.append(f"{r.name.ljust(5)}  {trend}  {sigs}{star}  {zs}  {price}")
 
         lines.append("─" * 36)
+
+        # 仓位建议
+        if self.position_suggestion:
+            lines.append(f"仓位: {self.position_suggestion}")
 
         # 三级共振
         aligned = [r.name for r in self.reports
@@ -287,10 +473,26 @@ class MarketContext:
             l1_lines.append(f"**{r.name}**  {trend}  {sigs}{star}  {zs}  {price}")
         l1_lines.append("")
 
-        # 综合结论
+        # 综合结论 + 情绪周期
         dir_emoji = {"偏多": "📈", "偏空": "📉", "分化": "↔️"}.get(
             self.overall_direction, "")
-        l1_lines.append(f"{dir_emoji} **综合: {self.overall_direction}**  |  风格: {self.growth_vs_value}")
+        phase_emoji = _SENTIMENT_EMOJI.get(
+            SentimentPhase(self.sentiment_phase), "⚪") if self.sentiment_phase != "未知" else ""
+        phase_str = f"  |  {phase_emoji}**{self.sentiment_phase}**" if self.sentiment_phase != "未知" else ""
+        l1_lines.append(f"{dir_emoji} **综合: {self.overall_direction}**  |  风格: {self.growth_vs_value}{phase_str}")
+
+        # 仓位建议
+        if self.position_suggestion:
+            l1_lines.append(f"💡 {self.position_suggestion}")
+
+        # 攻防板块
+        if self.shield_sectors or self.sword_sectors:
+            parts = []
+            if self.shield_sectors:
+                parts.append(f"🛡防守: {', '.join(self.shield_sectors[:3])}")
+            if self.sword_sectors:
+                parts.append(f"⚔进攻: {', '.join(self.sword_sectors[:3])}")
+            l1_lines.append(" | ".join(parts))
 
         aligned = [r.name for r in self.reports
                    if r.data_available and r.three_level_aligned]
@@ -313,17 +515,19 @@ class MarketContext:
             "text": {"tag": "lark_md", "content": "\n".join(l1_lines)}
         })
 
-        # ── L2 行业排行 ──
+        # ── L2 行业排行（含属性标签）──
+        _STYPE_ICON = {"防守": "🛡", "进攻": "⚔", "周期": "🔄", "中性": ""}
         if l2_gain or l2_composite:
             elements.append({"tag": "hr"})
             l2_lines = []
             if l2_gain:
                 top3 = ", ".join(
-                    f"**{r.name}**({r.gain_pct:+.1f}%)" for r in l2_gain[:3])
+                    f"**{r.name}**{_STYPE_ICON.get(r.sector_type, '')}({r.gain_pct:+.1f}%)"
+                    for r in l2_gain[:3])
                 l2_lines.append(f"📊 涨幅榜: {top3}")
             if l2_composite:
                 top3 = ", ".join(
-                    f"**{r.name}**({r.composite_score:.0f}分)"
+                    f"**{r.name}**{_STYPE_ICON.get(r.sector_type, '')}({r.composite_score:.0f}分)"
                     for r in l2_composite[:3])
                 l2_lines.append(f"🏆 综合榜: {top3}")
             elements.append({
@@ -450,7 +654,15 @@ def infer_strong_sectors(ctx: "MarketContext") -> List[str]:
 # 主聚合函数
 # ─────────────────────────────────────────────────────────
 
-def build_market_context(reports: List[IndexReport]) -> MarketContext:
+def build_market_context(
+    reports: List[IndexReport],
+    zt_total: int = 0,
+    dt_total: int = 0,
+    lianban_max: int = 0,
+    bank_avg_gain: float = 0.0,
+    shield_sectors: List[str] = None,
+    sword_sectors: List[str] = None,
+) -> MarketContext:
     """
     聚合逻辑：
     - 买信号指数数量 ≥ 上涨趋势指数数量的一半 → 偏多
@@ -458,6 +670,15 @@ def build_market_context(reports: List[IndexReport]) -> MarketContext:
     - 否则 → 分化
     - 创业/科创/1000 强 vs 50/300 强 → 成长 vs 价值判断
     - gate_industry_scan: 偏多或分化才进行行业扫描
+    - sentiment_phase: 情绪周期识别（恐慌/修复/亢奋/回落）
+
+    :param reports:       IndexReport 列表
+    :param zt_total:      全市场涨停数（来自 Layer 2，可选）
+    :param dt_total:      全市场跌停数（来自 Layer 2，可选）
+    :param lianban_max:   最高连板数（来自 Layer 2，可选）
+    :param bank_avg_gain: 四大行平均涨幅%（可选）
+    :param shield_sectors: 当日强势防守板块名列表（可选）
+    :param sword_sectors:  当日强势进攻板块名列表（可选）
     """
     available = [r for r in reports if r.data_available]
     n = len(available)
@@ -518,6 +739,17 @@ def build_market_context(reports: List[IndexReport]) -> MarketContext:
     )
     recommended_industries = infer_strong_sectors(ctx_temp)
 
+    # ── 情绪周期检测 ──
+    divergence = calc_divergence(reports)
+    phase = detect_sentiment_phase(
+        divergence=divergence,
+        zt_total=zt_total,
+        dt_total=dt_total,
+        lianban_max=lianban_max,
+        bank_avg_gain=bank_avg_gain,
+    )
+    pos_suggestion = get_position_suggestion(overall_direction, phase)
+
     # 生成综合摘要
     summary_parts = [
         f"大市{overall_direction}，{growth_vs_value}风格占优。",
@@ -534,6 +766,7 @@ def build_market_context(reports: List[IndexReport]) -> MarketContext:
         summary_parts.append(f"建议关注：{', '.join(recommended_industries[:3])}。")
     if not gate_industry_scan:
         summary_parts.append("市场偏空，建议观望。")
+    summary_parts.append(f"情绪: {phase.value}。")
 
     summary = " ".join(summary_parts)
 
@@ -549,4 +782,9 @@ def build_market_context(reports: List[IndexReport]) -> MarketContext:
         recommended_industries=recommended_industries,
         gate_industry_scan=gate_industry_scan,
         summary=summary,
+        sentiment_phase=phase.value,
+        position_suggestion=pos_suggestion,
+        divergence_score=divergence,
+        shield_sectors=shield_sectors or [],
+        sword_sectors=sword_sectors or [],
     )
