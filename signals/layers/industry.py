@@ -14,6 +14,30 @@ from typing import List, Optional, Tuple
 
 import pandas as pd
 
+from signals.data.fetcher import no_proxy as _no_proxy
+from signals.dashboard import get_dashboard as _get_dashboard
+
+
+# ─────────────────────────────────────────────────────────
+# Dashboard 辅助（detail = 细节，log = 重要状态变更）
+# ─────────────────────────────────────────────────────────
+
+def _detail(msg: str):
+    """任务级详情输出（per-task status, 线程池回调等）"""
+    dash = _get_dashboard()
+    if dash:
+        dash.detail(msg)
+    else:
+        print(msg, flush=True)
+
+def _log(msg: str):
+    """重要状态变更输出（熔断、模式切换等）"""
+    dash = _get_dashboard()
+    if dash:
+        dash.log(msg)
+    else:
+        print(msg, flush=True)
+
 
 # ─────────────────────────────────────────────────────────
 # 基础辅助函数
@@ -55,8 +79,8 @@ def _build_name_to_code_map() -> dict:
             if datetime.now() - mtime < timedelta(days=7):
                 with open(_NAME_CACHE_PATH, "r", encoding="utf-8") as f:
                     _NAME_TO_CODE.update(json.load(f))
-                print(f"  [✓] 名称映射从缓存加载（{len(_NAME_TO_CODE)} 只，"
-                      f"缓存日期 {mtime:%m-%d}）", flush=True)
+                _detail(f"  [✓] 名称映射从缓存加载（{len(_NAME_TO_CODE)} 只，"
+                        f"缓存日期 {mtime:%m-%d}）")
                 return _NAME_TO_CODE
     except Exception:
         pass
@@ -78,9 +102,9 @@ def _build_name_to_code_map() -> dict:
                     json.dump(_NAME_TO_CODE, f, ensure_ascii=False)
             except Exception:
                 pass
-            print(f"  [✓] 名称映射已加载（{len(_NAME_TO_CODE)} 只，已缓存）", flush=True)
+            _detail(f"  [✓] 名称映射已加载（{len(_NAME_TO_CODE)} 只，已缓存）")
     except Exception as e:
-        print(f"  [!] 股票名称映射加载失败（{e.__class__.__name__}）", flush=True)
+        _detail(f"  [!] 股票名称映射加载失败（{e.__class__.__name__}）")
     return _NAME_TO_CODE
 
 
@@ -212,12 +236,11 @@ def _fetch_board_industry_name_em(timeout: float = 5.0) -> Optional[pd.DataFrame
             return None
     except FutureTimeout:
         _EM_CIRCUIT_OPEN = True
-        print(f"  [⚡] 东财行业接口超时（>{timeout}s），熔断", flush=True)
+        _log(f"  [⚡] 东财行业接口超时（>{timeout}s），熔断")
         return None
     except Exception as e:
         _EM_CIRCUIT_OPEN = True
-        print(f"  [⚡] 东财行业接口熔断（{e.__class__.__name__}），本次运行跳过后续调用",
-              flush=True)
+        _log(f"  [⚡] 东财行业接口熔断（{e.__class__.__name__}），本次运行跳过后续调用")
         return None
 
 
@@ -244,9 +267,10 @@ def get_industry_stocks(industry: str) -> List[str]:
     import akshare as ak
 
     try:
-        df = ak.stock_board_industry_cons_em(symbol=industry)
+        with _no_proxy():
+            df = ak.stock_board_industry_cons_em(symbol=industry)
     except Exception as e:
-        print(f"  [!] {industry} 成分股接口失败（{e.__class__.__name__}），返回空列表", flush=True)
+        _detail(f"  [!] {industry} 成分股接口失败（{e.__class__.__name__}），返回空列表")
         return []
     if df is None or df.empty:
         return []
@@ -513,7 +537,7 @@ def score_industry(industry: str,
         if result.method == "czsc":
             return result
     except Exception as e:
-        print(f"  [!] {industry} 东财接口失败（{e}），降级到成分股聚合", flush=True)
+        _detail(f"  [!] {industry} 东财接口失败（{e}），降级到成分股聚合")
 
     # 方法 B：成分股聚合评分
     try:
@@ -584,7 +608,7 @@ def get_top_industries_by_gain(top_n: int = 10, period: str = "今日") -> list:
             })
         return result
     except Exception as e:
-        print(f"  [!] 全板块异动接口也失败（{e}）", flush=True)
+        _detail(f"  [!] 全板块异动接口也失败（{e}）")
         return []
 
 
@@ -653,6 +677,13 @@ def _classify_concept(name: str) -> str:
     return "中性"
 
 
+def _classify_industry(name: str) -> str:
+    """根据 SECTOR_TYPE_MAP 分类行业。"""
+    import config as _cfg
+    return getattr(_cfg, "SECTOR_TYPE_MAP", {}).get(name, "中性")
+
+
+
 def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
     """
     获取概念板块涨幅 top N。
@@ -667,15 +698,15 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
         top_n = getattr(_cfg, "CONCEPT_TOP_N", 10)
 
     def _call():
-        return ak.stock_board_concept_name_em()
+        with _no_proxy():
+            return ak.stock_board_concept_name_em()
 
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(_call)
             df = future.result(timeout=8)
     except (FutureTimeout, Exception) as e:
-        print(f"  [!] 概念板块接口失败（{e.__class__.__name__}），跳过概念排行",
-              flush=True)
+        _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}），跳过概念排行")
         return []
 
     if df is None or df.empty or "涨跌幅" not in df.columns:
@@ -701,7 +732,7 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
             sector_type=_classify_concept(name),
         ))
 
-    print(f"  [✓] 概念板块 top {len(results)} 条", flush=True)
+    _detail(f"  [✓] 概念板块 top {len(results)} 条")
     return results
 
 
@@ -763,10 +794,10 @@ def _load_zt_pool(date_str: str) -> dict:
                 pass
             first_time = str(row.get("首次封板时间", ""))
             result.setdefault(ind, []).append((code, name, lianban, first_time))
-        print(f"  [✓] 涨停池 {sum(len(v) for v in result.values())} 只，"
-              f"覆盖 {len(result)} 个行业", flush=True)
+        _detail(f"  [✓] 涨停池 {sum(len(v) for v in result.values())} 只，"
+               f"覆盖 {len(result)} 个行业")
     except Exception as e:
-        print(f"  [!] 涨停池加载失败（{e.__class__.__name__}）", flush=True)
+        _detail(f"  [!] 涨停池加载失败（{e.__class__.__name__}）")
     return result
 
 
@@ -795,10 +826,10 @@ def _load_strong_pool(date_str: str) -> dict:
                 pass
             reason = str(row.get("入选理由", ""))
             result.setdefault(ind, []).append((code, name, liangbi, reason))
-        print(f"  [✓] 强势股池 {sum(len(v) for v in result.values())} 只，"
-              f"覆盖 {len(result)} 个行业", flush=True)
+        _detail(f"  [✓] 强势股池 {sum(len(v) for v in result.values())} 只，"
+               f"覆盖 {len(result)} 个行业")
     except Exception as e:
-        print(f"  [!] 强势股池加载失败（{e.__class__.__name__}）", flush=True)
+        _detail(f"  [!] 强势股池加载失败（{e.__class__.__name__}）")
     return result
 
 
@@ -836,11 +867,11 @@ def _load_margin_map(date_str: str) -> dict:
                             amt = 0.0
                         if amt > 0:
                             result[code] = amt
-                print(f"  [✓] 融资数据（{d}）{len(result)} 只", flush=True)
+                _detail(f"  [✓] 融资数据（{d}）{len(result)} 只")
                 return result
         except Exception:
             continue
-    print("  [!] 融资数据加载失败（最近4天均无数据）", flush=True)
+    _detail("  [!] 融资数据加载失败（最近4天均无数据）")
     return result
 
 
@@ -859,10 +890,10 @@ def _load_dt_pool(date_str: str) -> dict:
             ind = str(row.get("所属行业", "")).strip()
             if ind:
                 result[ind] = result.get(ind, 0) + 1
-        print(f"  [✓] 跌停池 {sum(result.values())} 只，"
-              f"覆盖 {len(result)} 个行业", flush=True)
+        _detail(f"  [✓] 跌停池 {sum(result.values())} 只，"
+               f"覆盖 {len(result)} 个行业")
     except Exception as e:
-        print(f"  [!] 跌停池加载失败（{e.__class__.__name__}）", flush=True)
+        _detail(f"  [!] 跌停池加载失败（{e.__class__.__name__}）")
     return result
 
 
@@ -881,10 +912,10 @@ def _load_zbgc_pool(date_str: str) -> dict:
             ind = str(row.get("所属行业", "")).strip()
             if ind:
                 result[ind] = result.get(ind, 0) + 1
-        print(f"  [✓] 昨涨停跟踪 {sum(result.values())} 只，"
-              f"覆盖 {len(result)} 个行业", flush=True)
+        _detail(f"  [✓] 昨涨停跟踪 {sum(result.values())} 只，"
+               f"覆盖 {len(result)} 个行业")
     except Exception as e:
-        print(f"  [!] 昨涨停跟踪加载失败（{e.__class__.__name__}）", flush=True)
+        _detail(f"  [!] 昨涨停跟踪加载失败（{e.__class__.__name__}）")
     return result
 
 
@@ -1073,7 +1104,7 @@ def get_industry_representatives(top_n: int = None,
     2. 涨幅榜 top N（盘后降级为涨停密度排行）
     3. 综合强度榜 top N（盘后用5维评分）
     4. 对并集中每个行业，从 6 维度选出代表股
-    5. 概念板块涨幅 top N（自动分类标签）
+    5. 为每个行业设置 sector_type 和 concept_tags + 概念板块排行
 
     :param top_n:    每个榜取前N名行业
     :param date_str: YYYYMMDD格式日期，None=今天（盘中模式）；
@@ -1096,7 +1127,7 @@ def get_industry_representatives(top_n: int = None,
 
     # ── 1. 加载所有数据源 ────────────────────────────────
     mode_label = f"历史（{target_date}）" if is_historical else "实时"
-    print(f"  加载多维数据源（{mode_label}）...", flush=True)
+    _log(f"  加载多维数据源（{mode_label}）...")
 
     change_df = None
     name_df = None
@@ -1120,24 +1151,25 @@ def get_industry_representatives(top_n: int = None,
             try:
                 df = ak.stock_board_change_em()
                 if df is not None and not df.empty:
-                    print(f"  [✓] 全板块异动 {len(df)} 条", flush=True)
+                    _detail(f"  [✓] 全板块异动 {len(df)} 条")
                     return df
             except Exception as e:
-                print(f"  [!] 全板块异动接口失败（{e.__class__.__name__}）", flush=True)
+                _detail(f"  [!] 全板块异动接口失败（{e.__class__.__name__}）")
             return None
         _pool_tasks["change_df"] = _load_change_em
         _pool_tasks["name_df"] = lambda: _fetch_board_industry_name_em()
+        _pool_tasks["concepts"] = lambda: get_concept_rankings()
     else:
-        print("  [i] 盘后模式：跳过 change_em / name_em（仅实时接口）", flush=True)
+        _detail("  [i] 盘后模式：跳过 change_em / name_em（仅实时接口）")
     _pool_results = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with _no_proxy(), ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(fn): key for key, fn in _pool_tasks.items()}
         for f in as_completed(futures):
             key = futures[f]
             try:
                 _pool_results[key] = f.result()
             except Exception as e:
-                print(f"  [!] {key} 加载异常（{e.__class__.__name__}）", flush=True)
+                _detail(f"  [!] {key} 加载异常（{e.__class__.__name__}）")
                 _pool_results[key] = {} if "map" in key or "count" in key else None
     zt_pool     = _pool_results.get("zt_pool", {})
     strong_pool = _pool_results.get("strong_pool", {})
@@ -1151,7 +1183,8 @@ def get_industry_representatives(top_n: int = None,
     if name_df is not None and not isinstance(name_df, pd.DataFrame):
         name_df = None
     if name_df is not None and not name_df.empty:
-        print(f"  [✓] 行业板块行情 {len(name_df)} 条", flush=True)
+        _detail(f"  [✓] 行业板块行情 {len(name_df)} 条")
+    concepts: List[ConceptRanking] = _pool_results.get("concepts") or []
 
     # ── 2. 榜单 A：涨幅排行（盘中）/ 涨停密度排行（盘后）──
     gain_industries: list = []   # [(行业名, {gain_pct, net_inflow, leading_name, leading_gain})]
@@ -1372,5 +1405,14 @@ def get_industry_representatives(top_n: int = None,
         if r.name not in seen_names:
             seen_names.add(r.name)
             merged_list.append(r)
+
+    # ── 5. 设置 sector_type 和 concept_tags ──
+    concept_map = _match_concepts_to_industries(
+        concepts, [r.name for r in merged_list], name_df)
+    for r in gain_list + composite_list + merged_list:
+        r.sector_type = _classify_industry(r.name)
+        if r.name in concept_map:
+            r.concept_tags = concept_map[r.name]
+
 
     return gain_list, composite_list, merged_list, concepts

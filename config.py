@@ -41,9 +41,13 @@ MONITOR_FREQS = ["15min", "30min"]
 # A股: SH.600000 / SZ.000001
 # 港股: HK.00700
 # 美股: US.AAPL
-WHITELIST = [
-    "SH.601958",   # 金钼股份
-]
+WHITELIST_MAP = {
+    "SH.601958": "金钼股份",
+}
+WHITELIST = list(WHITELIST_MAP.keys())
+
+# L3 智能入池上限
+L3_MAX_SYMBOLS: int = 20
 
 # ── 指数配置（Layer 1）────────────────────────────────────
 # A股指数（AKShare格式：sh/sz + 代码）

@@ -426,7 +426,7 @@ def load_meta(meta_path: str) -> ResearchNote:
 
     return ResearchNote(
         title=data.get("title", ""),
-        date=data.get("date", ""),
+        date=str(data.get("date", "")),  # YAML 可能解析为 datetime.date
         source=data.get("source", ""),
         author=data.get("author", ""),
         sectors=data.get("sectors", []),

@@ -29,7 +29,7 @@ class IntraDayScreener:
         self,
         symbols: Optional[List[str]] = None,
         freqs: Optional[List[str]] = None,
-        max_workers: int = 5,
+        max_workers: int = 12,
         notes: Optional[List] = None,
     ):
         self.symbols: List[str] = list(symbols or WHITELIST)
@@ -61,15 +61,26 @@ class IntraDayScreener:
 
     def _get_futu(self) -> Optional[FutuSource]:
         """懒初始化 Futu 连接"""
+        from signals.dashboard import get_dashboard
+        dash = get_dashboard()
+
         if self._futu_failed:
             return None
         if self._futu_source is None:
             try:
                 self._futu_source = FutuSource(host=FUTU_HOST, port=FUTU_PORT)
                 self._futu_source.connect()
-                print("  [Futu] 连接成功，可用作分钟线降级源")
+                msg = "  [Futu] 连接成功，可用作分钟线降级源"
+                if dash:
+                    dash.detail(msg)
+                else:
+                    print(msg, flush=True)
             except Exception as e:
-                print(f"  [Futu] 连接失败（{e}），跳过")
+                msg = f"  [Futu] 连接失败（{e}），跳过"
+                if dash:
+                    dash.log(msg)
+                else:
+                    print(msg, flush=True)
                 self._futu_failed = True
                 return None
         return self._futu_source
@@ -103,6 +114,9 @@ class IntraDayScreener:
 
     def _fetch_minute_bars_api(self, sym: str, freq: Freq) -> List:
         """原始 API 获取逻辑（不含缓存）。"""
+        from signals.dashboard import get_dashboard
+        dash = get_dashboard()
+
         market = detect_market(sym)
         if market == "A":
             # 主路径：AKShare Sina（连续失败 3 次后熔断跳过）
@@ -113,11 +127,20 @@ class IntraDayScreener:
                         self._ak_consecutive_fails = 0
                         return bars
                 except Exception as e:
-                    print(f"    [Sina] {sym} {freq.value} 失败: {e.__class__.__name__}", flush=True)
+                    msg = f"    [Sina] {sym} {freq.value} 失败: {e.__class__.__name__}"
+                    if dash:
+                        dash.detail(msg)
+                    else:
+                        print(msg, flush=True)
                 self._ak_consecutive_fails += 1
                 if self._ak_consecutive_fails >= 3 and not self._ak_sina_degraded:
                     self._ak_sina_degraded = True
-                    print("  [!] AKShare(Sina) 连续3次失败，后续直接走东财", flush=True)
+                    msg = "  [!] AKShare(Sina) 连续3次失败，后续直接走东财"
+                    if dash:
+                        dash.log(msg)
+                        dash.degradation("AKShare(Sina)", "东财", "连续3次失败")
+                    else:
+                        print(msg, flush=True)
             # 降级1：AKShare 东财（push2his，间歇性SSL超时，快速放弃走 Futu）
             if not self._em_degraded:
                 try:
@@ -126,11 +149,20 @@ class IntraDayScreener:
                         self._em_consecutive_fails = 0
                         return bars
                 except Exception as e:
-                    print(f"    [东财] {sym} {freq.value} 失败: {e.__class__.__name__}", flush=True)
+                    msg = f"    [东财] {sym} {freq.value} 失败: {e.__class__.__name__}"
+                    if dash:
+                        dash.detail(msg)
+                    else:
+                        print(msg, flush=True)
                 self._em_consecutive_fails += 1
                 if self._em_consecutive_fails >= 3:
                     self._em_degraded = True
-                    print("  [!] AKShare(东财) 连续3次失败，后续跳过", flush=True)
+                    msg = "  [!] AKShare(东财) 连续3次失败，后续跳过"
+                    if dash:
+                        dash.log(msg)
+                        dash.degradation("AKShare(东财)", "跳过", "连续3次失败")
+                    else:
+                        print(msg, flush=True)
             # 降级2：Futu（需A股行情权限）
             futu = self._get_futu()
             if futu:
@@ -150,6 +182,9 @@ class IntraDayScreener:
 
     def initialize(self, symbols: Optional[List[str]] = None):
         """并发拉取分钟线，为所有标的 × 所有级别创建 SymbolAnalyzer。"""
+        from signals.dashboard import get_dashboard
+        dash = get_dashboard()
+
         target = symbols or self.symbols
         # 按市场分组：A股可并发，US股顺序获取
         a_tasks = [(sym, freq) for sym in target for freq in self.czsc_freqs
@@ -158,9 +193,14 @@ class IntraDayScreener:
                     if detect_market(sym) == "US"]
 
         total = len(a_tasks) + len(us_tasks)
-        print(f"[{_ts()}] 初始化 {len(target)} 只 × {len(self.czsc_freqs)} 级别 = {total} 个 analyzer ...")
+        _log = dash.log if dash else lambda m: print(m, flush=True)
+        _detail = dash.detail if dash else lambda m: print(m, flush=True)
+        _detail(f"[{_ts()}] 初始化 {len(target)} 只 × {len(self.czsc_freqs)} 级别 = {total} 个 analyzer ...")
         if a_tasks:
-            print(f"  A股: {len(a_tasks)} 个（并发），美股: {len(us_tasks)} 个（顺序）")
+            _detail(f"  A股: {len(a_tasks)} 个（并发），美股: {len(us_tasks)} 个（顺序）")
+
+        if dash:
+            dash.phase_start("L3.init", total=total)
 
         # A股预热：测试 AKShare(Sina) 可用性
         ak_ok = True
@@ -170,67 +210,95 @@ class IntraDayScreener:
                 test_bars = self.ak_source.get_a_minute(_warm_sym, _warm_freq)
                 if not test_bars:
                     raise ValueError("AKShare 返回空数据")
-                print(f"  AKShare(Sina) 预热成功 ✓")
+                _detail(f"  AKShare(Sina) 预热成功 ✓")
             except Exception as e:
                 ak_ok = False
                 self._ak_sina_degraded = True
-                print(f"  [!] AKShare(Sina) 不可用（{e}）", flush=True)
+                _log(f"  [!] AKShare(Sina) 不可用（{e}）")
+                if dash:
+                    dash.degradation("AKShare(Sina)", "东财", str(e))
                 # 快速测试东财可用性
                 try:
                     em_test = self.ak_source.get_a_minute_em(_warm_sym, _warm_freq,
                                                              max_retries=1)
                     if em_test:
-                        print(f"  → AKShare(东财) 可用 ✓", flush=True)
+                        _log(f"  → AKShare(东财) 可用 ✓")
                     else:
                         raise ValueError("东财返回空数据")
                 except Exception:
                     self._em_degraded = True
-                    print(f"  [!] AKShare(东财) 也不可用", flush=True)
+                    _log(f"  [!] AKShare(东财) 也不可用")
+                    if dash:
+                        dash.degradation("AKShare(东财)", "Futu/跳过", "不可用")
                 futu = self._get_futu()
                 if self._em_degraded and not futu:
-                    print(f"  → 所有A股分钟线数据源不可用，跳过A股任务", flush=True)
+                    _log(f"  → 所有A股分钟线数据源不可用，跳过A股任务")
                     a_tasks = []
                 elif not futu:
-                    print(f"  → Futu 不可用，仅东财兜底", flush=True)
+                    _log(f"  → Futu 不可用，仅东财兜底")
 
         # A股获取（统一走 _fetch_minute_bars，内含 fallback）
         def _fetch_and_build(sym: str, freq: Freq):
             bars = self._fetch_minute_bars(sym, freq)
             return sym, freq, bars
 
-        # AKShare 可用时并发；Tushare 需限速串行（workers=1）
+        # 预热已完成 V8 初始化，后续并行安全
         workers = self.max_workers if ak_ok else 1
+        _done = 0
+        _total_a = len(a_tasks)
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(_fetch_and_build, sym, freq): (sym, freq)
                     for sym, freq in a_tasks}
             for fut in as_completed(futs):
                 sym, freq = futs[fut]
+                _done += 1
                 try:
                     _, _, bars = fut.result()
                     self._store_analyzer(sym, freq, bars)
+                    if dash:
+                        dash.task_done("L3.init", f"{sym} {freq.value}")
                 except Exception as e:
-                    print(f"  错误 {sym} {freq.value}: {e}")
+                    _log(f"  错误 {sym} {freq.value}: {e}")
+                    if dash:
+                        dash.task_error("L3.init", f"{sym} {freq.value}", str(e))
+                # 无 dashboard 时保留原进度输出
+                if not dash and (_done % 10 == 0 or _done == _total_a):
+                    print(f"  ── 进度: {_done}/{_total_a} ({_done*100//_total_a}%)", flush=True)
 
         # 美股顺序获取（USDataSource 内部可能用 Futu 连接，非线程安全）
         for sym, freq in us_tasks:
+            if dash:
+                dash.task_start("L3.init", f"{sym} {freq.value}")
             try:
                 bars = self._fetch_minute_bars(sym, freq)
                 self._store_analyzer(sym, freq, bars)
+                if dash:
+                    dash.task_done("L3.init", f"{sym} {freq.value}")
             except Exception as e:
-                print(f"  错误 {sym} {freq.value}: {e}")
+                _log(f"  错误 {sym} {freq.value}: {e}")
+                if dash:
+                    dash.task_error("L3.init", f"{sym} {freq.value}", str(e))
 
-        print(f"[{_ts()}] 初始化完成，共 {sum(len(v) for v in self.analyzers.values())} 个 analyzer。\n")
+        if dash:
+            dash.phase_end("L3.init",
+                           detail=f"{sum(len(v) for v in self.analyzers.values())} analyzers")
+
+        _detail(f"[{_ts()}] 初始化完成，共 {sum(len(v) for v in self.analyzers.values())} 个 analyzer。")
 
     def _store_analyzer(self, sym: str, freq: Freq, bars):
         """存储 Analyzer 并打印状态"""
+        from signals.dashboard import get_dashboard
+        dash = get_dashboard()
+        _detail = dash.detail if dash else lambda m: print(m, flush=True)
+
         if sym not in self.analyzers:
             self.analyzers[sym] = {}
         if bars:
             self.analyzers[sym][freq.value] = SymbolAnalyzer(sym, freq, bars)
             bi_cnt = len(self.analyzers[sym][freq.value].bi_list)
-            print(f"  OK  {sym} {freq.value:6s} {len(bars):5d} bars  {bi_cnt:3d} 笔")
+            _detail(f"  OK  {sym} {freq.value:6s} {len(bars):5d} bars  {bi_cnt:3d} 笔")
         else:
-            print(f"  跳过 {sym} {freq.value} — 无数据")
+            _detail(f"  跳过 {sym} {freq.value} — 无数据")
 
     # ─────────────────────────────────────────────────────
     # 扫描：信号检测 + 评分
@@ -238,15 +306,24 @@ class IntraDayScreener:
     def scan_once(self, symbols: Optional[List[str]] = None,
                   market_direction: str = "分化") -> List[ScoredSymbol]:
         """对所有（或指定）标的运行信号检测，返回按评分降序排列的结果。"""
-        target = symbols or list(self.analyzers.keys())
-        results = []
+        from signals.dashboard import get_dashboard
+        dash = get_dashboard()
 
+        target = symbols or list(self.analyzers.keys())
+        if dash:
+            dash.phase_start("L3.scan", total=len(target))
+
+        results = []
         for sym in target:
+            if dash:
+                dash.task_start("L3.scan", sym)
             all_signals = []
             for _fkey, analyzer in self.analyzers.get(sym, {}).items():
                 sigs = detect_all_signals(analyzer.czsc, sym)
                 all_signals.extend(sigs)
             results.append(score_signals(sym, all_signals))
+            if dash:
+                dash.task_done("L3.scan", sym)
 
         results.sort(key=lambda x: x.total_score, reverse=True)
 
@@ -256,6 +333,10 @@ class IntraDayScreener:
             archive_signals(results, market_direction=market_direction)
         except Exception:
             pass
+
+        if dash:
+            above = sum(1 for r in results if r.total_score >= SCORE_THRESHOLD)
+            dash.phase_end("L3.scan", detail=f"{above} 只达标")
 
         return results
 
@@ -281,7 +362,9 @@ class IntraDayScreener:
                 try:
                     fut.result()
                 except Exception as e:
-                    print(f"  刷新错误: {e}")
+                    from signals.dashboard import get_dashboard as _gd
+                    _d = _gd()
+                    (_d.detail if _d else lambda m: print(m, flush=True))(f"  刷新错误: {e}")
 
         # 美股顺序刷新
         for sym in target:
@@ -293,70 +376,73 @@ class IntraDayScreener:
                         new_bars = self._fetch_minute_bars(sym, freq)
                         self.analyzers[sym][freq.value].update_many(new_bars)
                     except Exception as e:
-                        print(f"  刷新错误 {sym} {freq.value}: {e}")
+                        from signals.dashboard import get_dashboard as _gd
+                        _d = _gd()
+                        (_d.detail if _d else lambda m: print(m, flush=True))(f"  刷新错误 {sym} {freq.value}: {e}")
 
     # ─────────────────────────────────────────────────────
     # 输出
     # ─────────────────────────────────────────────────────
-    def print_results(self, results: List[ScoredSymbol], title: str = "筛选结果"):
+    def print_results(self, results: List[ScoredSymbol], title: str = "筛选结果",
+                      resolver=None):
         from signals.research import match_notes_for_symbol, check_resonance
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n{'='*70}")
+        print(f"\n{'='*78}")
         print(f"  {title}  |  {now}")
-        print(f"{'='*70}")
+        print(f"{'='*78}")
 
         has_signal = any(r.signal_count > 0 for r in results)
         if not has_signal:
             print("  当前无信号（市场结构尚未触发买卖点）")
-            print(f"{'='*70}\n")
+            print(f"{'='*78}\n")
             return
 
-        for r in results:
-            if r.signal_count == 0:
-                continue
-            marker = ">>>" if r.total_score >= SCORE_THRESHOLD else "   "
+        above = [r for r in results
+                 if r.total_score >= SCORE_THRESHOLD and r.signal_count > 0]
+        below = [r for r in results
+                 if r.signal_count > 0 and r.total_score < SCORE_THRESHOLD]
 
-            # 双维度展示：技术面 + 研报
-            note_view = match_notes_for_symbol(r.symbol, self.notes)
-            resonance = check_resonance(r.total_score, note_view)
-            note_tag = ""
-            if note_view.has_coverage:
-                note_tag = f"  |  研报: {note_view.label}"
-            if resonance:
-                note_tag += f"  {resonance}"
-
-            print(f"\n{marker} {r.symbol}  技术分: {r.total_score}  信号数: {r.signal_count}{note_tag}")
-            print(r.details)
-            # 风控信息：止损位 + 仓位建议
-            try:
-                from signals.core.risk import enrich_with_risk
-                risk_line = enrich_with_risk(r)
-                if risk_line:
-                    print(risk_line)
-            except Exception:
-                pass
-            if note_view.catalysts:
-                print(f"  [研报催化] {'、'.join(note_view.catalysts)}")
-
-        above = [r for r in results if r.total_score >= SCORE_THRESHOLD]
-        print(f"\n--- 达到阈值 ({SCORE_THRESHOLD} 分) 的标的: {len(above)} 只 ---")
         if above:
-            for r in above:
-                nv = match_notes_for_symbol(r.symbol, self.notes)
-                res = check_resonance(r.total_score, nv)
-                extra = f"  {nv.label} {res}" if nv.has_coverage else ""
-                print(f"    {r.symbol}  技术分={r.total_score}{extra}")
-        print(f"{'='*70}\n")
+            print(f"\n  {'排名':<4} {'代码':<12} {'名称':<10} {'行业':<8} "
+                  f"{'方向':<4} {'技术分':>6} {'信号':>4}  关键信号")
+            print("  " + "─" * 74)
+
+            for i, r in enumerate(above, 1):
+                name = resolver.get_name(r.symbol) if resolver else r.symbol
+                industry = resolver.get_industry(r.symbol) if resolver else ""
+                # 截断避免对齐错位
+                name = name[:8] if len(name) > 8 else name
+                industry = industry[:6] if len(industry) > 6 else industry
+                dir_str = r.direction or "─"
+                key_sigs = _summarize_signals(r.signals)
+
+                note_view = match_notes_for_symbol(r.symbol, self.notes)
+                resonance = check_resonance(r.total_score, note_view)
+                res_tag = f" {resonance}" if resonance else ""
+
+                print(f"  {i:<4} {r.symbol:<12} {name:<10} {industry:<8} "
+                      f"{dir_str:<4} {r.total_score:>6.1f} {r.signal_count:>4}  "
+                      f"{key_sigs}{res_tag}")
+
+            print("  " + "─" * 74)
+
+        if below:
+            top_below = below[0].total_score if below else 0
+            print(f"  未达标 ({SCORE_THRESHOLD}分以下): {len(below)} 只"
+                  f"  最高分: {top_below:.1f}")
+
+        print(f"{'='*78}\n")
 
     # ─────────────────────────────────────────────────────
     # 运行模式
     # ─────────────────────────────────────────────────────
     def run_whitelist(self) -> List[ScoredSymbol]:
         """第 1 轮：白名单快扫。"""
-        print(f"\n{'─'*40}")
-        print(f"第 1 轮 — 白名单快扫（{len(self.symbols)} 只）")
-        print(f"{'─'*40}")
+        from signals.dashboard import get_dashboard
+        dash = get_dashboard()
+        _detail = dash.detail if dash else lambda m: print(m, flush=True)
+        _detail(f"第 1 轮 — 白名单快扫（{len(self.symbols)} 只）")
         self.initialize(self.symbols)
         results = self.scan_once(self.symbols)
         self.print_results(results, title="白名单筛选结果")
@@ -364,14 +450,16 @@ class IntraDayScreener:
 
     def run_industry(self, industry: str) -> List[ScoredSymbol]:
         """第 2 轮：行业批扫。"""
-        print(f"\n{'─'*40}")
-        print(f"第 2 轮 — 行业批扫：{industry}")
-        print(f"{'─'*40}")
+        from signals.dashboard import get_dashboard
+        dash = get_dashboard()
+        _detail = dash.detail if dash else lambda m: print(m, flush=True)
+        _log = dash.log if dash else lambda m: print(m, flush=True)
+        _detail(f"第 2 轮 — 行业批扫：{industry}")
         ind_symbols = get_industry_stocks(industry)
         if not ind_symbols:
-            print(f"  未获取到 '{industry}' 的成分股，请检查行业名称。")
+            _log(f"  [!] 未获取到 '{industry}' 的成分股")
             return []
-        print(f"  获取到 {len(ind_symbols)} 只成分股")
+        _detail(f"  获取到 {len(ind_symbols)} 只成分股")
         self.initialize(ind_symbols)
         results = self.scan_once(ind_symbols)
         self.print_results(results, title=f"{industry} 行业筛选结果")
@@ -405,6 +493,38 @@ class IntraDayScreener:
                 self.refresh_data()
         except KeyboardInterrupt:
             print("\n已停止。")
+
+    def close(self):
+        """释放数据源连接（Futu socket / US providers）"""
+        if self._futu_source:
+            try:
+                self._futu_source.close()
+            except Exception:
+                pass
+            self._futu_source = None
+        if self._us_source:
+            try:
+                self._us_source.close()
+            except Exception:
+                pass
+            self._us_source = None
+
+
+def _summarize_signals(signals: list) -> str:
+    """将信号列表压缩为一行摘要，如 '三买(15M+30M) 趋势买(30M)'"""
+    freq_abbrev = {
+        "15分钟": "15M", "30分钟": "30M", "60分钟": "60M",
+        "日线": "日", "周线": "周", "5分钟": "5M", "1分钟": "1M",
+    }
+    sig_freq_map: dict = {}
+    for sig in signals:
+        abbr = freq_abbrev.get(sig.freq, sig.freq)
+        sig_freq_map.setdefault(sig.signal_type, []).append(abbr)
+    parts = []
+    for sig_type, freqs in sig_freq_map.items():
+        freq_str = "+".join(freqs)
+        parts.append(f"{sig_type}({freq_str})")
+    return " ".join(parts[:4])
 
 
 def _ts() -> str:

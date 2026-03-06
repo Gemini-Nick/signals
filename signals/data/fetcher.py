@@ -9,7 +9,9 @@
 - USDataSource    : 美股数据路由（Futu优先 → yfinance兜底）
 """
 
+import os
 import sys
+import contextlib
 import warnings
 import pandas as pd
 from datetime import datetime
@@ -17,6 +19,21 @@ from pathlib import Path
 from typing import List, Optional, Callable
 
 warnings.filterwarnings("ignore")
+
+
+@contextlib.contextmanager
+def no_proxy():
+    """临时清除代理环境变量（国内数据源不走代理）"""
+    proxy_keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                  "http_proxy", "https_proxy", "all_proxy"]
+    saved = {k: os.environ.pop(k) for k in proxy_keys if k in os.environ}
+    try:
+        yield
+    finally:
+        os.environ.update(saved)
+
+# 兼容内部引用
+_no_proxy = no_proxy
 
 # 统一使用已安装的 czsc（0.10.11，Rust 加速版）
 from czsc import RawBar, Freq
@@ -146,10 +163,11 @@ class AKShareSource:
         ak_sym, pure_code = self._futu_to_ak_a(futu_code)
         for attempt in range(1, max_retries + 1):
             try:
-                df = ak.stock_zh_a_hist(symbol=pure_code, period="daily",
-                                         start_date=sdt.replace("-", ""),
-                                         end_date=edt.replace("-", ""),
-                                         adjust=adj)
+                with _no_proxy():
+                    df = ak.stock_zh_a_hist(symbol=pure_code, period="daily",
+                                             start_date=sdt.replace("-", ""),
+                                             end_date=edt.replace("-", ""),
+                                             adjust=adj)
                 if df is None or df.empty:
                     return []
                 df = df.rename(columns={"日期": "dt", "开盘": "open", "最高": "high",
@@ -186,10 +204,11 @@ class AKShareSource:
         period_map = {"1分钟": "1", "5分钟": "5", "15分钟": "15",
                       "30分钟": "30", "60分钟": "60"}
         period = period_map.get(freq.value, "15")
-        df = self._call_with_timeout(
-            lambda: ak.stock_zh_a_minute(symbol=ak_sym, period=period, adjust=""),
-            timeout=timeout,
-        )
+        with _no_proxy():
+            df = self._call_with_timeout(
+                lambda: ak.stock_zh_a_minute(symbol=ak_sym, period=period, adjust=""),
+                timeout=timeout,
+            )
         if df is None or df.empty:
             return []
         df = df.rename(columns={"day": "dt", "volume": "vol"})
@@ -211,8 +230,9 @@ class AKShareSource:
         period = period_map.get(freq.value, "15")
         for attempt in range(1, max_retries + 1):
             try:
-                df = ak.stock_zh_a_hist_min_em(
-                    symbol=pure_code, period=period, adjust="")
+                with _no_proxy():
+                    df = ak.stock_zh_a_hist_min_em(
+                        symbol=pure_code, period=period, adjust="")
                 if df is None or df.empty:
                     return []
                 df = df.rename(columns={
@@ -289,7 +309,8 @@ class AKShareSource:
 
         # API 拉取
         import akshare as ak
-        df = ak.stock_zh_index_daily(symbol=symbol)
+        with _no_proxy():
+            df = ak.stock_zh_index_daily(symbol=symbol)
         if df is None or df.empty:
             return []
         df = df.rename(columns={"date": "dt", "volume": "vol"})
@@ -331,10 +352,11 @@ class AKShareSource:
         period_map = {"1分钟": "1", "5分钟": "5", "15分钟": "15",
                       "30分钟": "30", "60分钟": "60"}
         period = period_map.get(freq.value, "15")
-        df = self._call_with_timeout(
-            lambda: ak.stock_zh_a_minute(symbol=symbol, period=period, adjust=""),
-            timeout=timeout,
-        )
+        with _no_proxy():
+            df = self._call_with_timeout(
+                lambda: ak.stock_zh_a_minute(symbol=symbol, period=period, adjust=""),
+                timeout=timeout,
+            )
         if df is None or df.empty:
             return []
         df = df.rename(columns={"day": "dt", "volume": "vol"})
@@ -358,8 +380,22 @@ class FutuSource:
         self._ctx = None
         self._handler_cb: Optional[Callable] = None
 
-    def connect(self):
+    def connect(self, timeout: float = 5.0):
+        """连接 FutuOpenD，先探测端口可达性，避免 SDK 内部无限重试。"""
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect((self.host, self.port))
+        except (socket.timeout, ConnectionRefusedError, OSError) as e:
+            raise ConnectionError(f"FutuOpenD 不可达 {self.host}:{self.port} ({e})")
+        finally:
+            sock.close()
+        # 先 import futu 再抑制日志（SDK 在 import 时注册 logger）
+        import logging
         from futu import OpenQuoteContext
+        for name in ('futu', 'FTConsoleLog', 'FTFileLog'):
+            logging.getLogger(name).setLevel(logging.WARNING)
         self._ctx = OpenQuoteContext(host=self.host, port=self.port)
         return self
 

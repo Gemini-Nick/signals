@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# ── 静默 tqdm（AKShare 内部使用，会干扰 Rich Dashboard）──────
+import tqdm as _tqdm_mod                              # noqa: E402
+_tqdm_mod.tqdm = lambda iterable, *a, **kw: iterable  # noqa: E402
+try:
+    import tqdm.auto as _tqdm_auto                    # noqa: E402
+    _tqdm_auto.tqdm = _tqdm_mod.tqdm
+except ImportError:
+    pass
+
 """
 🐲 隆小侠 LONG CLAW — 实线虚线分析框架
 
@@ -28,12 +37,23 @@
 import sys
 import subprocess
 import argparse
+import time as _time_mod
 from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config
+
+
+# ─────────────────────────────────────────────────────────
+# 进度面板（已迁移到 signals/dashboard/）
+# ─────────────────────────────────────────────────────────
+
+def _fmt_sec(sec: float) -> str:
+    if sec < 60:
+        return f"{sec:.1f}s"
+    return f"{int(sec//60)}m{int(sec%60)}s"
 
 
 # ─────────────────────────────────────────────────────────
@@ -138,43 +158,9 @@ def _load_notes(args):
         print("  研报: 无有效研究笔记")
         return []
 
-    # 列出可用笔记
-    print(f"\n{'─'*50}")
-    print(f"  可用研究笔记（{len(all_notes)} 篇）")
-    print(f"{'─'*50}")
-    for i, note in enumerate(all_notes, 1):
-        sentiment_mark = {"看多": "+", "看空": "-", "中性": "~"}.get(note.sentiment, "?")
-        sectors = "、".join(note.sectors[:2]) or "未分类"
-        print(f"  [{i}] {note.date}  {note.title}")
-        print(f"      {note.source_label}  |  {sectors}  |  {sentiment_mark}{note.sentiment}")
-    print(f"{'─'*50}")
-
-    # 交互选择
-    try:
-        choice = input("  选择笔记 (回车=全部, 0=跳过, 1,3=指定编号): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        choice = ""
-
-    if choice == "0":
-        print("  → 跳过研究笔记")
-        return []
-    elif choice == "":
-        notes = all_notes
-        print(f"  → 加载全部 {len(notes)} 篇")
-    else:
-        indices = []
-        for part in choice.split(","):
-            part = part.strip()
-            if part.isdigit():
-                idx = int(part)
-                if 1 <= idx <= len(all_notes):
-                    indices.append(idx - 1)
-        if indices:
-            notes = [all_notes[i] for i in indices]
-            print(f"  → 加载 {len(notes)} 篇: {', '.join(n.title for n in notes)}")
-        else:
-            print("  → 输入无效，加载全部")
-            notes = all_notes
+    # 默认全部加载，列出摘要
+    notes = all_notes
+    print(f"  研报: 自动加载全部 {len(notes)} 篇")
 
     if notes:
         print_notes_summary(notes)
@@ -196,77 +182,104 @@ def run_intraday(args):
         get_noted_industries, get_noted_stocks,
         match_notes_for_symbol, check_resonance,
     )
+    from signals.dashboard import Dashboard
 
-    # ── 市场时段路由 ─────────────────────────────────────
+    # 市场检测必须在 Dashboard 之前（raw print 不能与 Rich Live 共存）
     active = _get_active_markets(args)
+
+    dash = Dashboard(mode="intraday")
     ak_codes, futu_codes, us_codes = filter_index_codes(
         active, config.INDEX_AK_CODES, config.INDEX_FUTU_CODES, config.INDEX_US_CODES,
     )
 
     # ── 加载研究笔记 ─────────────────────────────────────
+    dash.phase_start("research")
+    dash.pause()  # input() 交互需暂停面板
     notes = _load_notes(args)
+    dash.resume()
     noted_industries = get_noted_industries(notes)
     noted_stocks = get_noted_stocks(notes)
+    dash.phase_end("research", detail=f"{len(notes)} 篇" if notes else "无")
 
     # ── Layer 1：指数研判 ──────────────────────────────────
     screener_l1 = IndexScreener(
         ak_codes=ak_codes, futu_codes=futu_codes, us_codes=us_codes,
     )
     ctx = screener_l1.run()
+    if ctx:
+        dash.set_context(direction=ctx.overall_direction,
+                         style=ctx.recommended_style)
 
     if not ctx.gate_industry_scan:
-        print("⚠️  市场偏空，建议观望，仅扫描白名单。")
+        dash.log("  [yellow]⚠️  市场偏空，建议观望，仅扫描白名单。[/yellow]")
 
     # ── Layer 2：双榜行业筛选 + 多维度个股入池 ─────────────
     ranking_stocks: list = []
+    merged_list: list = []
     if Market.A not in active:
-        print(">>> A股未开盘，跳过 Layer 2 行业筛选")
+        dash.phase_skip("L2.ranking", "A股未开盘")
+        dash.log(">>> A股未开盘，跳过 Layer 2 行业筛选")
     elif config.RANK_TOP_N > 0:
         from signals.layers.industry import get_industry_representatives
 
-        print(f"\n>>> Layer 2 双榜行业筛选（各取前{config.RANK_TOP_N}名）")
-        print("  " + "─" * 60)
+        dash.phase_start("L2.ranking")
 
         try:
             gain_list, composite_list, merged_list, concepts = get_industry_representatives(
                 config.RANK_TOP_N)
         except Exception as e:
-            print(f"  [!] 行业筛选异常（{e}），跳过 Layer 2", flush=True)
+            dash.log(f"  [!] 行业筛选异常（{e}），跳过 Layer 2")
+            dash.task_error("L2.ranking", "行业筛选", str(e))
             gain_list, composite_list, merged_list, concepts = [], [], [], []
 
-        _STYPE_ICON = {"防守": "🛡", "进攻": "⚔", "周期": "🔄", "中性": " "}
+        # ── 汇总入池 ─────────────────────────────────────
+        for r in merged_list:
+            ranking_stocks.extend(r.pool_codes)
+        ranking_stocks = list(dict.fromkeys(ranking_stocks))
 
-        # ── Layer 2A：涨幅排行榜 ─────────────────────────
+        dash.phase_end("L2.ranking", detail=f"{len(ranking_stocks)} 只入池")
+
+        # ── 暂停面板，打印 L2 报告 ────────────────────────
+        dash.pause()
+        print(f"\n>>> Layer 2 双榜行业筛选（各取前{config.RANK_TOP_N}名）")
+        print("  " + "─" * 60)
+
+        _STYPE_ICON = {"防守": "🛡", "进攻": "⚔", "周期": "🔄", "中性": ""}
+
         if gain_list:
             print(f"\n  >>> Layer 2A 行业涨幅排行（今日前{len(gain_list)}名）")
-            print(f"  {'排名':<4} {'行业':<10} {'属性':<6} {'涨幅':>7}  {'净流入(亿)':>10}  {'概念标签'}")
-            print("  " + "─" * 65)
+            print(f"  {'排名':<4} {'行业':<12} {'涨幅':>7}  {'净流入(亿)':>10}")
+            print("  " + "─" * 55)
             for r in gain_list:
                 sign = "+" if r.gain_pct >= 0 else ""
-                icon = _STYPE_ICON.get(r.sector_type, " ")
-                ctags = "、".join(r.concept_tags[:2]) if r.concept_tags else ""
-                print(f"  {r.gain_rank:<4} {r.name:<10} {icon}{r.sector_type:<4} "
-                      f"{sign}{r.gain_pct:.2f}%  {r.net_inflow:>10.2f}  {ctags}")
+                st_icon = _STYPE_ICON.get(r.sector_type, "")
+                st_tag = f"[{r.sector_type}{st_icon}]" if r.sector_type != "中性" else ""
+                print(f"  {r.gain_rank:<4} {r.name:<12} "
+                      f"{sign}{r.gain_pct:.2f}%  {r.net_inflow:>10.2f}  {st_tag}")
+                if r.concept_tags:
+                    print(f"       概念: {'、'.join(r.concept_tags[:3])}")
                 for c in r.candidates:
                     print(f"       {c.role}: {c.name}({c.code}"
                           f"{', ' + c.detail if c.detail else ''})")
                 if r.pool_codes:
                     print(f"       → 入池: {', '.join(r.pool_codes)}")
 
-        # ── Layer 2B：综合强度排行榜 ─────────────────────
         if composite_list:
             print(f"\n  >>> Layer 2B 行业综合强度排行（今日前{len(composite_list)}名）")
-            print(f"  {'排名':<4} {'行业':<10} {'属性':<6} {'综合分':>6} {'涨幅':>7} "
+            print(f"  {'排名':<4} {'行业':<10} {'综合分':>6} {'涨幅':>7} "
                   f"{'流入(亿)':>9} {'涨停':>4} {'强势':>4} {'续板':>4}")
-            print("  " + "─" * 68)
+            print("  " + "─" * 60)
             for r in composite_list:
                 sign = "+" if r.gain_pct >= 0 else ""
                 tag = " ★" if r.source == "both" else ""
-                icon = _STYPE_ICON.get(r.sector_type, " ")
-                print(f"  {r.composite_rank:<4} {r.name:<10} {icon}{r.sector_type:<4} "
+                st_icon = _STYPE_ICON.get(r.sector_type, "")
+                st_tag = f"[{r.sector_type}{st_icon}]" if r.sector_type != "中性" else ""
+                print(f"  {r.composite_rank:<4} {r.name:<10} "
                       f"{r.composite_score:>6.1f} {sign}{r.gain_pct:>6.2f}% "
                       f"{r.net_inflow:>9.2f} {r.zt_count:>4} "
-                      f"{r.strong_count:>4} {r.zbgc_count:>4}{tag}")
+                      f"{r.strong_count:>4} {r.zbgc_count:>4}{tag}  {st_tag}")
+                if r.concept_tags:
+                    print(f"       概念: {'、'.join(r.concept_tags[:3])}")
                 for c in r.candidates:
                     already = " [涨幅榜已入池]" if r.source == "both" else ""
                     print(f"       {c.role}: {c.name}({c.code}"
@@ -274,25 +287,7 @@ def run_intraday(args):
                 if r.pool_codes and r.source != "both":
                     print(f"       → 入池: {', '.join(r.pool_codes)}")
 
-        # ── 概念热点 ─────────────────────────────────────
-        if concepts:
-            print(f"\n  >>> 概念热点 Top {len(concepts)}")
-            print(f"  {'排名':<4} {'概念':<16} {'属性':<6} {'涨幅':>7}  {'领涨股'}")
-            print("  " + "─" * 55)
-            for i, cp in enumerate(concepts, 1):
-                sign = "+" if cp.gain_pct >= 0 else ""
-                icon = _STYPE_ICON.get(cp.sector_type, " ")
-                lead = f"{cp.leading_stock}({cp.leading_gain:+.1f}%)" if cp.leading_stock else ""
-                print(f"  {i:<4} {cp.name:<16} {icon}{cp.sector_type:<4} "
-                      f"{sign}{cp.gain_pct:.2f}%  {lead}")
-
-        # ── 汇总 ─────────────────────────────────────────
-        for r in merged_list:
-            ranking_stocks.extend(r.pool_codes)
-        ranking_stocks = list(dict.fromkeys(ranking_stocks))
-
         if merged_list:
-            gain_only = sum(1 for r in merged_list if r.source == "gain")
             comp_only = sum(1 for r in merged_list if r.source == "composite")
             both_cnt = sum(1 for r in merged_list if r.source == "both")
             print(f"\n  >>> Layer 2 合计: 涨幅榜 {len(gain_list)} 行业 + "
@@ -301,8 +296,40 @@ def run_intraday(args):
                   f" = {len(merged_list)} 行业")
             print(f"  >>> Layer 2 共 {len(ranking_stocks)} 只代表股纳入筛选池")
 
-        # ── 情绪周期更新（用L2数据增强L1判断）──────────
-        _update_sentiment_from_l2(ctx, merged_list)
+        # ── 概念板块 Top N ─────────────────────────────
+        if concepts:
+            print(f"\n  >>> 概念板块热度排行（前{len(concepts)}名）")
+            print(f"  {'排名':<4} {'概念':<14} {'涨幅':>7}  {'属性':<6}")
+            print("  " + "─" * 40)
+            for i, cp in enumerate(concepts, 1):
+                sign = "+" if cp.gain_pct >= 0 else ""
+                cp_icon = _STYPE_ICON.get(cp.concept_type, "")
+                print(f"  {i:<4} {cp.name:<14} "
+                      f"{sign}{cp.gain_pct:.2f}%  {cp.concept_type}{cp_icon}")
+
+        # ── 情绪周期 & 仓位建议 ────────────────────────
+        if ctx:
+            _PHASE_EMOJI = {
+                "恐慌": "🔴", "修复": "🟡", "亢奋": "🟢",
+                "回落": "🟠", "未知": "⚪",
+            }
+            ph_emoji = _PHASE_EMOJI.get(ctx.sentiment_phase, "⚪")
+            print(f"\n  >>> 市场情绪: {ph_emoji}{ctx.sentiment_phase}"
+                  f"  |  分化度: {ctx.divergence_score:+.1f}"
+                  f"{'（避险）' if ctx.divergence_score > 0 else '（风偏）' if ctx.divergence_score < 0 else ''}")
+            if ctx.position_suggestion:
+                print(f"  💡 {ctx.position_suggestion}")
+            if ctx.shield_sectors or ctx.sword_sectors:
+                parts = []
+                if ctx.shield_sectors:
+                    parts.append(f"🛡 防守: {'、'.join(ctx.shield_sectors)}")
+                if ctx.sword_sectors:
+                    parts.append(f"⚔ 进攻: {'、'.join(ctx.sword_sectors)}")
+                print(f"  {' | '.join(parts)}")
+
+        dash.resume()
+
+    dash.set_l2_count(len(ranking_stocks))
 
     # ── --industries 补充行业（直接入池，不做CZSC研判）──────
     named_stocks: list = []
@@ -313,25 +340,35 @@ def run_intraday(args):
             for ni in noted_industries:
                 if ni not in industry_names:
                     industry_names.append(ni)
-            print(f"  研报行业已加入扫描池: {', '.join(noted_industries)}")
+            dash.detail(f"  研报行业已加入扫描池: {', '.join(noted_industries)}")
         if industry_names:
+            dash.phase_start("L2.supplement", total=len(industry_names))
             from signals.layers.industry import get_industry_stocks as _get_ind_stocks
             max_per = getattr(config, "RANK_MAX_STOCKS_PER_IND", 5)
-            print(f"\n>>> Layer 2 补充行业：{', '.join(industry_names)}")
             for ind in industry_names:
+                dash.task_start("L2.supplement", ind)
                 stocks = _get_ind_stocks(ind)
                 named_stocks.extend(stocks[:max_per])
-                print(f"  [{ind}] 取 {min(max_per, len(stocks))} 只")
+                dash.detail(f"  [{ind}] 取 {min(max_per, len(stocks))} 只")
+                dash.task_done("L2.supplement", ind)
             named_stocks = list(dict.fromkeys(named_stocks))
+            dash.phase_end("L2.supplement",
+                           detail=f"{len(named_stocks)} 只")
+
+    # ── 名称解析器（L2 数据注入）────────────────────────────
+    from signals.core.stock_names import get_resolver
+    resolver = get_resolver()
+    resolver.inject_from_whitelist(getattr(config, "WHITELIST_MAP", {}))
+    if merged_list:
+        resolver.inject_from_rankings(merged_list)
 
     # ── Layer 3：标的筛选 ──────────────────────────────────
     # L3 需要分钟线，非交易时段数据源不可用，自动跳过
     from signals.core.market_hours import get_active_markets as _get_live_markets, Market
     _live = _get_live_markets()
-    _a_symbols = [s for s in (config.WHITELIST + noted_stocks + ranking_stocks + named_stocks)
-                  if detect_market(s) == "A"]
-    _us_symbols = [s for s in (config.WHITELIST + noted_stocks)
-                   if detect_market(s) == "US"]
+    _all_pool = (config.WHITELIST + noted_stocks + ranking_stocks + named_stocks)
+    _a_symbols = [s for s in _all_pool if detect_market(s) == "A"]
+    _us_symbols = [s for s in _all_pool if detect_market(s) == "US"]
     _need_a = bool(_a_symbols)
     _need_us = bool(_us_symbols)
     _skip_l3 = ((_need_a and Market.A not in _live and not _need_us)
@@ -339,40 +376,60 @@ def run_intraday(args):
                     and _need_us and Market.US not in _live))
 
     if _skip_l3:
-        print("\n>>> Layer 3 标的筛选 ... 跳过（非交易时段，分钟线不可用）")
+        dash.phase_skip("L3.init", "非交易时段")
+        dash.phase_skip("L3.scan", "非交易时段")
+        dash.log("\n>>> Layer 3 标的筛选 ... 跳过（非交易时段，分钟线不可用）")
     else:
-        print("\n>>> Layer 3 标的筛选 ...")
-        extra_stocks = list(dict.fromkeys(ranking_stocks + named_stocks))
-        all_symbols = list(dict.fromkeys(
-            config.WHITELIST + noted_stocks + extra_stocks
-        ))  # 去重保序
-        all_symbols = filter_symbols(active, all_symbols)
+        # 智能入池：行业轮选优先，白名单/研报保底
+        l3_pool = _smart_pool(
+            config.WHITELIST, noted_stocks, merged_list, named_stocks,
+            max_total=getattr(config, "L3_MAX_SYMBOLS", 20),
+        )
+        l3_pool = filter_symbols(active, l3_pool)
+        dash.log(f"\n>>> Layer 3 标的筛选（{len(l3_pool)} 只入池，从 {len(ranking_stocks)} 候选中智能筛选）...")
 
         screener_l3 = IntraDayScreener(
-            symbols=all_symbols, freqs=config.MONITOR_FREQS, notes=notes,
+            symbols=l3_pool, freqs=config.MONITOR_FREQS, notes=notes,
         )
-        if extra_stocks:
-            wl_results = screener_l3.run_whitelist()
-            screener_l3.initialize(extra_stocks)
-            extra_results = screener_l3.scan_once(extra_stocks)
-            screener_l3.print_results(extra_results, title="行业成分股筛选结果")
 
-            combined = {}
-            for r in wl_results + extra_results:
-                if r.symbol not in combined or r.total_score > combined[r.symbol].total_score:
-                    combined[r.symbol] = r
-            merged = sorted(combined.values(), key=lambda x: -x.total_score)
-            screener_l3.print_results(merged, title="综合筛选结果（三层联动）")
-        else:
-            screener_l3.run_whitelist()
+        try:
+            # 一次性初始化所有标的（dashboard 活跃，显示进度）
+            screener_l3.initialize(l3_pool)
+            l3_results = screener_l3.scan_once(l3_pool)
+
+            above_cnt = sum(1 for r in l3_results
+                           if r.total_score >= config.SCORE_THRESHOLD
+                           and r.signal_count > 0)
+            dash.set_l3_count(above_cnt)
+
+            # 暂停面板，打印综合表 + 操作建议
+            dash.pause()
+            screener_l3.print_results(
+                l3_results, title="L3 标的筛选结果（三层联动）",
+                resolver=resolver)
+
+            from signals.core.summary import print_action_summary
+            print_action_summary(ctx, l3_results, resolver=resolver,
+                                 notes=notes)
+            dash.resume()
+        finally:
+            screener_l3.close()
 
     # ── 飞书推送（卡片模式，含折叠面板）────────────────────
-    try:
-        from signals.notify.feishu import send_card
-        card = ctx.to_feishu_card()
-        send_card(card)
-    except Exception as e:
-        print(f"  [!] 飞书推送异常: {e}")
+    if not config.FEISHU_APP_ID:
+        dash.phase_skip("feishu", "未配置")
+    else:
+        dash.phase_start("feishu")
+        try:
+            from signals.notify.feishu import send_card
+            card = ctx.to_feishu_card()
+            send_card(card)
+        except Exception as e:
+            dash.log(f"  [!] 飞书推送异常: {e}")
+        dash.phase_end("feishu")
+
+    # ── 最终汇总面板 ────────────────────────────────────
+    dash.finish()
 
 
 # ─────────────────────────────────────────────────────────
@@ -460,8 +517,13 @@ def run_index_only(args):
     """仅运行 Layer 1，快速输出指数报告。"""
     from signals.core.market_hours import filter_index_codes
     from signals.layers.index_screener import IndexScreener
+    from signals.dashboard import Dashboard
 
+    # 市场检测必须在 Dashboard 之前（raw print 不能与 Rich Live 共存）
     active = _get_active_markets(args)
+
+    dash = Dashboard(mode="index")
+
     ak_codes, futu_codes, us_codes = filter_index_codes(
         active, config.INDEX_AK_CODES, config.INDEX_FUTU_CODES, config.INDEX_US_CODES,
     )
@@ -471,13 +533,20 @@ def run_index_only(args):
     ctx = screener.run()
 
     # ── 飞书推送（卡片模式）────────────────────────────────
-    if ctx:
-        try:
-            from signals.notify.feishu import send_card
-            card = ctx.to_feishu_card()
-            send_card(card)
-        except Exception as e:
-            print(f"  [!] 飞书推送异常: {e}")
+    if not config.FEISHU_APP_ID:
+        dash.phase_skip("feishu", "未配置")
+    else:
+        dash.phase_start("feishu")
+        if ctx:
+            try:
+                from signals.notify.feishu import send_card
+                card = ctx.to_feishu_card()
+                send_card(card)
+            except Exception as e:
+                dash.log(f"  [!] 飞书推送异常: {e}")
+        dash.phase_end("feishu")
+
+    dash.finish()
 
 
 # ─────────────────────────────────────────────────────────
@@ -536,7 +605,7 @@ def _run_single_review(start_date: str, raw_alias: str, args):
             print(f"  [!] 行业筛选异常（{e}），跳过 Layer 2", flush=True)
             gain_list, composite_list, merged_list, concepts = [], [], [], []
 
-        _STYPE_ICON = {"防守": "🛡", "进攻": "⚔", "周期": "🔄", "中性": " "}
+        _STYPE_ICON = {"防守": "🛡", "进攻": "⚔", "周期": "🔄", "中性": ""}
 
         # ── Layer 2A：涨停密度排行（盘后替代涨幅排行）─────
         if gain_list:
@@ -647,11 +716,11 @@ def _run_multi_review(dates: list, args):
             print("  " + "─" * 50)
 
             try:
-                gain_list, composite_list, merged_list, concepts = get_industry_representatives(
+                gain_list, composite_list, merged_list, _concepts = get_industry_representatives(
                     config.RANK_TOP_N, date_str=date_yyyymmdd)
             except Exception as e:
                 print(f"  [!] {resolved} 行业筛选异常（{e}），跳过", flush=True)
-                gain_list, composite_list, merged_list, concepts = [], [], [], []
+                gain_list, composite_list, merged_list, _concepts = [], [], [], []
 
             per_date_results.append((resolved, label, gain_list, composite_list, merged_list))
 
@@ -786,50 +855,58 @@ def _get_active_markets(args):
     return active
 
 
-def _update_sentiment_from_l2(ctx, merged_list: list):
-    """用 L2 行业数据更新 MarketContext 的情绪周期。"""
-    if not merged_list:
-        return
+def _smart_pool(whitelist, noted_stocks, merged_list, named_stocks,
+                max_total=20):
+    """
+    智能入池：行业轮选 + 信号优先，保证行业分散。
 
-    # 统计涨停/跌停总数和连板高度
-    zt_total = sum(r.zt_count for r in merged_list)
-    # dt 数据在 IndustryRanking 中没有直接暴露，用 0
-    lianban_max = 0
-    for r in merged_list:
-        for c in r.candidates:
-            if "连板" in c.detail:
-                try:
-                    lb = int(c.detail.split("连板")[0])
-                    lianban_max = max(lianban_max, lb)
-                except (ValueError, IndexError):
-                    pass
+    填充顺序：
+    1. 行业轮选（L2 数据驱动）— 每轮从每个行业取 1 只最高优先级候选
+    2. --industries 补充标的
+    3. 白名单 + 研报标的（保底）
+    """
+    pool: list = []
+    seen: set = set()
 
-    # 攻防板块分类
-    shield = [f"{r.name}({r.gain_pct:+.1f}%)"
-              for r in merged_list if r.sector_type == "防守" and r.gain_pct > 0]
-    sword = [f"{r.name}({r.gain_pct:+.1f}%)"
-             for r in merged_list if r.sector_type == "进攻" and r.gain_pct > 0]
+    # 第一优先：行业轮选
+    ind_queues = []
+    for ranking in (merged_list or []):
+        q = [c.code for c in ranking.candidates if c.code]
+        ind_queues.append(q)
 
-    ctx.update_sentiment(
-        zt_total=zt_total,
-        dt_total=0,
-        lianban_max=lianban_max,
-        bank_avg_gain=0.0,
-        shield_sectors=shield[:3],
-        sword_sectors=sword[:3],
-    )
+    round_idx = 0
+    while len(pool) < max_total and ind_queues:
+        found_any = False
+        for q in ind_queues:
+            if len(pool) >= max_total:
+                break
+            if round_idx < len(q):
+                code = q[round_idx]
+                if code not in seen:
+                    pool.append(code)
+                    seen.add(code)
+                found_any = True
+        round_idx += 1
+        if not found_any:
+            break
 
-    # 打印情绪周期摘要
-    _PHASE_EMOJI = {"恐慌": "🔴", "修复": "🟡", "亢奋": "🟢", "回落": "🟠", "未知": "⚪"}
-    emoji = _PHASE_EMOJI.get(ctx.sentiment_phase, "⚪")
-    print(f"\n  >>> 市场情绪: {emoji}{ctx.sentiment_phase}  "
-          f"|  分化度: {ctx.divergence_score:+.1f}")
-    if ctx.position_suggestion:
-        print(f"  💡 {ctx.position_suggestion}")
-    if shield:
-        print(f"  🛡 防守: {', '.join(shield[:3])}")
-    if sword:
-        print(f"  ⚔ 进攻: {', '.join(sword[:3])}")
+    # 第二优先：--industries 补充标的
+    for s in (named_stocks or []):
+        if len(pool) >= max_total:
+            break
+        if s not in seen:
+            pool.append(s)
+            seen.add(s)
+
+    # 第三优先：白名单 + 研报标的（保底）
+    for s in list(whitelist or []) + list(noted_stocks or []):
+        if len(pool) >= max_total:
+            break
+        if s not in seen:
+            pool.append(s)
+            seen.add(s)
+
+    return pool
 
 
 def _parse_industries(args) -> list:

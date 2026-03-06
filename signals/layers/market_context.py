@@ -141,7 +141,7 @@ def get_position_suggestion(direction: str, phase: SentimentPhase) -> str:
 @dataclass
 class MarketContext:
     """
-    11 个指数聚合后的大市研判结果。
+    指数聚合后的大市研判结果。
     """
     reports: List[IndexReport]             # 所有指数报告
     overall_direction: str = "分化"        # "偏多" / "偏空" / "分化"
@@ -156,12 +156,12 @@ class MarketContext:
     recommended_industries: List[str] = field(default_factory=list)  # 推断的强势板块
     gate_industry_scan: bool = True        # 偏多或中性才进行行业扫描
     summary: str = ""                      # 2-3 行综合判断
-    # ── 情绪周期（System Insights 新增）──
-    sentiment_phase: str = "未知"           # 恐慌/修复/亢奋/回落
-    position_suggestion: str = ""          # 仓位建议
+    # 情绪周期相关
+    sentiment_phase: str = "未知"          # 恐慌/修复/亢奋/回落
     divergence_score: float = 0.0          # 大小盘分化度（>0避险，<0风险偏好）
-    shield_sectors: List[str] = field(default_factory=list)   # 当日强势防守板块
-    sword_sectors: List[str] = field(default_factory=list)    # 当日强势进攻板块
+    position_suggestion: str = ""          # 仓位建议
+    shield_sectors: List[str] = field(default_factory=list)   # 防守板块
+    sword_sectors: List[str] = field(default_factory=list)    # 进攻板块
 
     # ─────────────────────────────────────────────────────
     # 情绪周期更新（L2 数据可用后调用）
@@ -390,6 +390,15 @@ class MarketContext:
 
         if not self.gate_industry_scan:
             lines.append("  ⛔ 市场偏空，建议观望")
+
+        # 情绪周期 & 仓位建议
+        if self.sentiment_phase and self.sentiment_phase != "未知":
+            ph_emoji = _SENTIMENT_EMOJI.get(
+                SentimentPhase(self.sentiment_phase), "⚪")
+            lines.append(f"  {ph_emoji} 情绪: {self.sentiment_phase}"
+                         f"  |  分化度: {self.divergence_score:+.1f}")
+            if self.position_suggestion:
+                lines.append(f"  💡 {self.position_suggestion}")
 
         lines.append(SEP)
         return "\n".join(lines)
@@ -862,6 +871,17 @@ def build_market_context(
 
     summary = " ".join(summary_parts)
 
+    # ── 情绪周期 & 分化度 ─────────────────────────────
+    divergence = calc_divergence(reports)
+    phase = detect_sentiment_phase(divergence)
+    pos_suggest = get_position_suggestion(overall_direction, phase)
+
+    # 防守/进攻板块（从指数趋势推断）
+    shield = [r.name for r in available
+              if r.name in _SHIELD_INDICES and r.daily_trend == "上涨趋势"]
+    sword  = [r.name for r in available
+              if r.name in _SWORD_INDICES  and r.daily_trend == "上涨趋势"]
+
     return MarketContext(
         reports=reports,
         overall_direction=overall_direction,
@@ -877,8 +897,8 @@ def build_market_context(
         gate_industry_scan=gate_industry_scan,
         summary=summary,
         sentiment_phase=phase.value,
-        position_suggestion=pos_suggestion,
         divergence_score=divergence,
-        shield_sectors=shield_sectors or [],
-        sword_sectors=sword_sectors or [],
+        position_suggestion=pos_suggest,
+        shield_sectors=shield,
+        sword_sectors=sword,
     )
