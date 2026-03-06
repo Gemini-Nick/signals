@@ -92,35 +92,41 @@ def _detect_second_bs(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
     b1, b2, b3, b4, b5 = bis[-5], bis[-4], bis[-3], bis[-2], bis[-1]
     freq_val = czsc_obj.freq.value
 
-    # 二买：b1↓ b3↓ b5↑，b3 低点高于 b1 低点
+    # 二买：b1↓ b3↓ b5↑，b3 低点高于 b1 低点 且 b3 高点低于 b1 高点（完整结构确认）
     if (b1.direction == Direction.Down and
             b3.direction == Direction.Down and
             b5.direction == Direction.Up and
-            b3.low > b1.low):
-        # 回撤比例：b3.low 相对 b1.high 的位置
-        retracement = (b3.high - b3.low) / (b3.high - b1.low + 1e-9)
-        conf = 0.85 if retracement < 0.618 else 0.65
+            b3.low > b1.low and
+            b3.high < b1.high):  # 高点也在下降才是真二买
+        # 回撤比例：b3 回调幅度 / b2 上涨幅度
+        b2_range = b2.high - b2.low
+        b3_range = b3.high - b3.low
+        retracement = b3_range / (b2_range + 1e-9)
+        conf = 0.80 if retracement < 0.618 else 0.60
         signals.append(SignalEvent(
             symbol=symbol, freq=freq_val,
             dt=b5.sdt, signal_type="二买",
             confidence=conf,
             price=b5.fx_a.fx,
-            details=f"回调低点 {b3.low:.2f} > 前低 {b1.low:.2f}，回撤 {retracement:.1%}",
+            details=f"低点抬升 {b3.low:.2f}>{b1.low:.2f}，高点递降 {b3.high:.2f}<{b1.high:.2f}，回撤 {retracement:.1%}",
         ))
 
-    # 二卖：b1↑ b3↑ b5↓，b3 高点低于 b1 高点
+    # 二卖：b1↑ b3↑ b5↓，b3 高点低于 b1 高点 且 b3 低点高于 b1 低点
     if (b1.direction == Direction.Up and
             b3.direction == Direction.Up and
             b5.direction == Direction.Down and
-            b3.high < b1.high):
-        retracement = (b3.high - b3.low) / (b1.high - b3.low + 1e-9)
-        conf = 0.85 if retracement < 0.618 else 0.65
+            b3.high < b1.high and
+            b3.low > b1.low):  # 低点也在抬升才是真二卖
+        b2_range = b2.high - b2.low
+        b3_range = b3.high - b3.low
+        retracement = b3_range / (b2_range + 1e-9)
+        conf = 0.80 if retracement < 0.618 else 0.60
         signals.append(SignalEvent(
             symbol=symbol, freq=freq_val,
             dt=b5.sdt, signal_type="二卖",
             confidence=conf,
             price=b5.fx_a.fx,
-            details=f"反弹高点 {b3.high:.2f} < 前高 {b1.high:.2f}，反弹比 {retracement:.1%}",
+            details=f"高点递降 {b3.high:.2f}<{b1.high:.2f}，低点抬升 {b3.low:.2f}>{b1.low:.2f}，反弹比 {retracement:.1%}",
         ))
 
     return signals
@@ -148,26 +154,37 @@ def _detect_third_bs(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
     if zs_zd >= zs_zg:
         return []  # 无有效中枢
 
-    # 三买：b4 向上离开中枢，b5↓ 回调但低点 > 中枢上沿
+    # 三买：b4 向上离开中枢（b4.low > zs_zg 确认离开），b5↓ 回调但低点 > 中枢上沿
     if b4.direction == Direction.Up and b5.direction == Direction.Down:
-        if b5.low > zs_zg:
+        b4_left = b4.low > zs_zg  # b4 整根笔在中枢上方 = 确认离开
+        if b5.low > zs_zg and b4_left:
+            # 离开幅度越大、回调越浅 → 置信度越高
+            leave_pct = (b4.high - zs_zg) / (zs_zg + 1e-9) * 100
+            pullback_pct = (b4.high - b5.low) / (b4.high - zs_zg + 1e-9) * 100
+            conf = 0.80 if pullback_pct < 50 else 0.65
             signals.append(SignalEvent(
                 symbol=symbol, freq=freq_val,
                 dt=b5.edt, signal_type="三买",
-                confidence=0.85,
+                confidence=conf,
                 price=b5.low,
-                details=f"回调低点 {b5.low:.2f} > 中枢上沿 {zs_zg:.2f}",
+                details=f"回调低 {b5.low:.2f}>中枢上沿 {zs_zg:.2f}，"
+                        f"离开 {leave_pct:.1f}%，回撤 {pullback_pct:.0f}%",
             ))
 
-    # 三卖：b4 向下离开中枢，b5↑ 反弹但高点 < 中枢下沿
+    # 三卖：b4 向下离开中枢（b4.high < zs_zd 确认离开），b5↑ 反弹但高点 < 中枢下沿
     if b4.direction == Direction.Down and b5.direction == Direction.Up:
-        if b5.high < zs_zd:
+        b4_left = b4.high < zs_zd  # b4 整根笔在中枢下方 = 确认离开
+        if b5.high < zs_zd and b4_left:
+            leave_pct = (zs_zd - b4.low) / (zs_zd + 1e-9) * 100
+            pullback_pct = (b5.high - b4.low) / (zs_zd - b4.low + 1e-9) * 100
+            conf = 0.80 if pullback_pct < 50 else 0.65
             signals.append(SignalEvent(
                 symbol=symbol, freq=freq_val,
                 dt=b5.edt, signal_type="三卖",
-                confidence=0.85,
+                confidence=conf,
                 price=b5.high,
-                details=f"反弹高点 {b5.high:.2f} < 中枢下沿 {zs_zd:.2f}",
+                details=f"反弹高 {b5.high:.2f}<中枢下沿 {zs_zd:.2f}，"
+                        f"离开 {leave_pct:.1f}%，反弹 {pullback_pct:.0f}%",
             ))
 
     return signals
@@ -195,35 +212,40 @@ def _detect_divergence(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
     if prev_same is None:
         return []
 
-    # 背驰卖：都是向上笔，创新高但力度减弱
+    # 背驰卖：都是向上笔，创新高但力度减弱（力度差 >= 10% 才触发）
     if last.direction == Direction.Up:
         if last.high > prev_same.high and last.power_price < prev_same.power_price:
-            vol_div = last.power_volume < prev_same.power_volume
-            conf = 0.75 if vol_div else 0.6
-            signals.append(SignalEvent(
-                symbol=symbol, freq=freq_val,
-                dt=last.edt, signal_type="背驰卖",
-                confidence=conf,
-                price=last.high,
-                details=(f"价创新高 {last.high:.2f}>{prev_same.high:.2f}，"
-                         f"力度 {last.power_price:.2f}<{prev_same.power_price:.2f}"
-                         + ("，量能也背驰" if vol_div else "")),
-            ))
+            # 力度减弱必须达到 10% 阈值，避免微小差异误触发
+            power_drop_pct = (prev_same.power_price - last.power_price) / (prev_same.power_price + 1e-9) * 100
+            if power_drop_pct >= 10:
+                vol_div = last.power_volume < prev_same.power_volume
+                conf = 0.75 if vol_div else 0.60
+                signals.append(SignalEvent(
+                    symbol=symbol, freq=freq_val,
+                    dt=last.edt, signal_type="背驰卖",
+                    confidence=conf,
+                    price=last.high,
+                    details=(f"价创新高 {last.high:.2f}>{prev_same.high:.2f}，"
+                             f"力度降 {power_drop_pct:.0f}%"
+                             + ("，量能也背驰" if vol_div else "")),
+                ))
 
-    # 背驰买：都是向下笔，创新低但力度减弱
+    # 背驰买：都是向下笔，创新低但力度减弱（力度差 >= 10% 才触发）
     if last.direction == Direction.Down:
         if last.low < prev_same.low and last.power_price < prev_same.power_price:
-            vol_div = last.power_volume < prev_same.power_volume
-            conf = 0.75 if vol_div else 0.6
-            signals.append(SignalEvent(
-                symbol=symbol, freq=freq_val,
-                dt=last.edt, signal_type="背驰买",
-                confidence=conf,
-                price=last.low,
-                details=(f"价创新低 {last.low:.2f}<{prev_same.low:.2f}，"
-                         f"力度 {last.power_price:.2f}<{prev_same.power_price:.2f}"
-                         + ("，量能也背驰" if vol_div else "")),
-            ))
+            power_drop_pct = (prev_same.power_price - last.power_price) / (prev_same.power_price + 1e-9) * 100
+            if power_drop_pct >= 10:
+                vol_div = last.power_volume < prev_same.power_volume
+                conf = 0.75 if vol_div else 0.60
+                signals.append(SignalEvent(
+                    symbol=symbol, freq=freq_val,
+                    dt=last.edt, signal_type="背驰买",
+                    confidence=conf,
+                    price=last.low,
+                    details=(f"价创新低 {last.low:.2f}<{prev_same.low:.2f}，"
+                             f"力度降 {power_drop_pct:.0f}%"
+                             + ("，量能也背驰" if vol_div else "")),
+                ))
 
     return signals
 

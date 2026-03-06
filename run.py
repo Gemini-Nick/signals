@@ -21,6 +21,9 @@
   python run.py --mode intraday --market us              # 强制美股（盘中）
   python run.py --mode intraday --market a,hk            # 强制 A+H
   python run.py --mode intraday --market all              # 全市场（不做时段过滤）
+  python run.py --mode backtest                           # 回测验证（评估历史信号）
+  python run.py --mode backtest --signal-type 二买         # 仅看二买信号表现
+  python run.py --mode backtest --freq-filter 日线         # 仅看日线信号
 """
 import sys
 import subprocess
@@ -225,21 +228,25 @@ def run_intraday(args):
         print("  " + "─" * 60)
 
         try:
-            gain_list, composite_list, merged_list = get_industry_representatives(
+            gain_list, composite_list, merged_list, concepts = get_industry_representatives(
                 config.RANK_TOP_N)
         except Exception as e:
             print(f"  [!] 行业筛选异常（{e}），跳过 Layer 2", flush=True)
-            gain_list, composite_list, merged_list = [], [], []
+            gain_list, composite_list, merged_list, concepts = [], [], [], []
+
+        _STYPE_ICON = {"防守": "🛡", "进攻": "⚔", "周期": "🔄", "中性": " "}
 
         # ── Layer 2A：涨幅排行榜 ─────────────────────────
         if gain_list:
             print(f"\n  >>> Layer 2A 行业涨幅排行（今日前{len(gain_list)}名）")
-            print(f"  {'排名':<4} {'行业':<12} {'涨幅':>7}  {'净流入(亿)':>10}")
-            print("  " + "─" * 55)
+            print(f"  {'排名':<4} {'行业':<10} {'属性':<6} {'涨幅':>7}  {'净流入(亿)':>10}  {'概念标签'}")
+            print("  " + "─" * 65)
             for r in gain_list:
                 sign = "+" if r.gain_pct >= 0 else ""
-                print(f"  {r.gain_rank:<4} {r.name:<12} "
-                      f"{sign}{r.gain_pct:.2f}%  {r.net_inflow:>10.2f}")
+                icon = _STYPE_ICON.get(r.sector_type, " ")
+                ctags = "、".join(r.concept_tags[:2]) if r.concept_tags else ""
+                print(f"  {r.gain_rank:<4} {r.name:<10} {icon}{r.sector_type:<4} "
+                      f"{sign}{r.gain_pct:.2f}%  {r.net_inflow:>10.2f}  {ctags}")
                 for c in r.candidates:
                     print(f"       {c.role}: {c.name}({c.code}"
                           f"{', ' + c.detail if c.detail else ''})")
@@ -249,13 +256,14 @@ def run_intraday(args):
         # ── Layer 2B：综合强度排行榜 ─────────────────────
         if composite_list:
             print(f"\n  >>> Layer 2B 行业综合强度排行（今日前{len(composite_list)}名）")
-            print(f"  {'排名':<4} {'行业':<10} {'综合分':>6} {'涨幅':>7} "
+            print(f"  {'排名':<4} {'行业':<10} {'属性':<6} {'综合分':>6} {'涨幅':>7} "
                   f"{'流入(亿)':>9} {'涨停':>4} {'强势':>4} {'续板':>4}")
-            print("  " + "─" * 60)
+            print("  " + "─" * 68)
             for r in composite_list:
                 sign = "+" if r.gain_pct >= 0 else ""
                 tag = " ★" if r.source == "both" else ""
-                print(f"  {r.composite_rank:<4} {r.name:<10} "
+                icon = _STYPE_ICON.get(r.sector_type, " ")
+                print(f"  {r.composite_rank:<4} {r.name:<10} {icon}{r.sector_type:<4} "
                       f"{r.composite_score:>6.1f} {sign}{r.gain_pct:>6.2f}% "
                       f"{r.net_inflow:>9.2f} {r.zt_count:>4} "
                       f"{r.strong_count:>4} {r.zbgc_count:>4}{tag}")
@@ -265,6 +273,18 @@ def run_intraday(args):
                           f"{', ' + c.detail if c.detail else ''}){already}")
                 if r.pool_codes and r.source != "both":
                     print(f"       → 入池: {', '.join(r.pool_codes)}")
+
+        # ── 概念热点 ─────────────────────────────────────
+        if concepts:
+            print(f"\n  >>> 概念热点 Top {len(concepts)}")
+            print(f"  {'排名':<4} {'概念':<16} {'属性':<6} {'涨幅':>7}  {'领涨股'}")
+            print("  " + "─" * 55)
+            for i, cp in enumerate(concepts, 1):
+                sign = "+" if cp.gain_pct >= 0 else ""
+                icon = _STYPE_ICON.get(cp.sector_type, " ")
+                lead = f"{cp.leading_stock}({cp.leading_gain:+.1f}%)" if cp.leading_stock else ""
+                print(f"  {i:<4} {cp.name:<16} {icon}{cp.sector_type:<4} "
+                      f"{sign}{cp.gain_pct:.2f}%  {lead}")
 
         # ── 汇总 ─────────────────────────────────────────
         for r in merged_list:
@@ -280,6 +300,9 @@ def run_intraday(args):
                   f"{f' + {both_cnt} 重叠' if both_cnt else ''}"
                   f" = {len(merged_list)} 行业")
             print(f"  >>> Layer 2 共 {len(ranking_stocks)} 只代表股纳入筛选池")
+
+        # ── 情绪周期更新（用L2数据增强L1判断）──────────
+        _update_sentiment_from_l2(ctx, merged_list)
 
     # ── --industries 补充行业（直接入池，不做CZSC研判）──────
     named_stocks: list = []
@@ -415,6 +438,24 @@ def run_import(args):
 # 仅指数模式：快速查看大市方向
 # ─────────────────────────────────────────────────────────
 
+def run_backtest(args):
+    """
+    回测验证模式：评估历史信号的前瞻表现，输出统计报告。
+
+    信号存档由 screener / review_screener 自动完成（每次运行时存入 SQLite）。
+    本模式负责：评估到期信号 → 买卖配对 → 生成双视角报告 → 输出权重建议。
+    """
+    from signals.core.backtest import run_backtest as _run_backtest
+
+    print(f"\n{'═'*52}")
+    print(f"  回测验证模式 — 信号自我进化")
+    print(f"{'═'*52}")
+
+    signal_type = getattr(args, "signal_type", "") or ""
+    freq_filter = getattr(args, "freq_filter", "") or ""
+    _run_backtest(signal_type=signal_type, freq_filter=freq_filter)
+
+
 def run_index_only(args):
     """仅运行 Layer 1，快速输出指数报告。"""
     from signals.core.market_hours import filter_index_codes
@@ -489,19 +530,22 @@ def _run_single_review(start_date: str, raw_alias: str, args):
         print("  " + "─" * 60)
 
         try:
-            gain_list, composite_list, merged_list = get_industry_representatives(
+            gain_list, composite_list, merged_list, concepts = get_industry_representatives(
                 config.RANK_TOP_N, date_str=pool_date)
         except Exception as e:
             print(f"  [!] 行业筛选异常（{e}），跳过 Layer 2", flush=True)
-            gain_list, composite_list, merged_list = [], [], []
+            gain_list, composite_list, merged_list, concepts = [], [], [], []
+
+        _STYPE_ICON = {"防守": "🛡", "进攻": "⚔", "周期": "🔄", "中性": " "}
 
         # ── Layer 2A：涨停密度排行（盘后替代涨幅排行）─────
         if gain_list:
             print(f"\n  >>> Layer 2A 行业涨停密度排行（前{len(gain_list)}名）")
-            print(f"  {'排名':<4} {'行业':<12} {'涨停':>4}")
-            print("  " + "─" * 40)
+            print(f"  {'排名':<4} {'行业':<10} {'属性':<6} {'涨停':>4}")
+            print("  " + "─" * 45)
             for i, r in enumerate(gain_list, 1):
-                print(f"  {i:<4} {r.name:<12} {r.zt_count:>4}只")
+                icon = _STYPE_ICON.get(r.sector_type, " ")
+                print(f"  {i:<4} {r.name:<10} {icon}{r.sector_type:<4} {r.zt_count:>4}只")
                 for c in r.candidates:
                     print(f"       {c.role}: {c.name}({c.code}"
                           f"{', ' + c.detail if c.detail else ''})")
@@ -513,12 +557,13 @@ def _run_single_review(start_date: str, raw_alias: str, args):
         # ── Layer 2B：综合强度排行（5维评分）───────────────
         if composite_list:
             print(f"\n  >>> Layer 2B 行业综合强度排行（前{len(composite_list)}名）")
-            print(f"  {'排名':<4} {'行业':<10} {'综合分':>6} "
+            print(f"  {'排名':<4} {'行业':<10} {'属性':<6} {'综合分':>6} "
                   f"{'涨停':>4} {'强势':>4} {'续板':>4}")
-            print("  " + "─" * 50)
+            print("  " + "─" * 58)
             for r in composite_list:
                 tag = " ★" if r.source == "both" else ""
-                print(f"  {r.composite_rank:<4} {r.name:<10} "
+                icon = _STYPE_ICON.get(r.sector_type, " ")
+                print(f"  {r.composite_rank:<4} {r.name:<10} {icon}{r.sector_type:<4} "
                       f"{r.composite_score:>6.1f} {r.zt_count:>4} "
                       f"{r.strong_count:>4} {r.zbgc_count:>4}{tag}")
                 for c in r.candidates:
@@ -602,11 +647,11 @@ def _run_multi_review(dates: list, args):
             print("  " + "─" * 50)
 
             try:
-                gain_list, composite_list, merged_list = get_industry_representatives(
+                gain_list, composite_list, merged_list, concepts = get_industry_representatives(
                     config.RANK_TOP_N, date_str=date_yyyymmdd)
             except Exception as e:
                 print(f"  [!] {resolved} 行业筛选异常（{e}），跳过", flush=True)
-                gain_list, composite_list, merged_list = [], [], []
+                gain_list, composite_list, merged_list, concepts = [], [], [], []
 
             per_date_results.append((resolved, label, gain_list, composite_list, merged_list))
 
@@ -741,6 +786,52 @@ def _get_active_markets(args):
     return active
 
 
+def _update_sentiment_from_l2(ctx, merged_list: list):
+    """用 L2 行业数据更新 MarketContext 的情绪周期。"""
+    if not merged_list:
+        return
+
+    # 统计涨停/跌停总数和连板高度
+    zt_total = sum(r.zt_count for r in merged_list)
+    # dt 数据在 IndustryRanking 中没有直接暴露，用 0
+    lianban_max = 0
+    for r in merged_list:
+        for c in r.candidates:
+            if "连板" in c.detail:
+                try:
+                    lb = int(c.detail.split("连板")[0])
+                    lianban_max = max(lianban_max, lb)
+                except (ValueError, IndexError):
+                    pass
+
+    # 攻防板块分类
+    shield = [f"{r.name}({r.gain_pct:+.1f}%)"
+              for r in merged_list if r.sector_type == "防守" and r.gain_pct > 0]
+    sword = [f"{r.name}({r.gain_pct:+.1f}%)"
+             for r in merged_list if r.sector_type == "进攻" and r.gain_pct > 0]
+
+    ctx.update_sentiment(
+        zt_total=zt_total,
+        dt_total=0,
+        lianban_max=lianban_max,
+        bank_avg_gain=0.0,
+        shield_sectors=shield[:3],
+        sword_sectors=sword[:3],
+    )
+
+    # 打印情绪周期摘要
+    _PHASE_EMOJI = {"恐慌": "🔴", "修复": "🟡", "亢奋": "🟢", "回落": "🟠", "未知": "⚪"}
+    emoji = _PHASE_EMOJI.get(ctx.sentiment_phase, "⚪")
+    print(f"\n  >>> 市场情绪: {emoji}{ctx.sentiment_phase}  "
+          f"|  分化度: {ctx.divergence_score:+.1f}")
+    if ctx.position_suggestion:
+        print(f"  💡 {ctx.position_suggestion}")
+    if shield:
+        print(f"  🛡 防守: {', '.join(shield[:3])}")
+    if sword:
+        print(f"  ⚔ 进攻: {', '.join(sword[:3])}")
+
+
 def _parse_industries(args) -> list:
     """
     解析行业列表：
@@ -789,8 +880,8 @@ def main():
     parser.add_argument(
         "--mode",
         default="intraday",
-        choices=["intraday", "review", "index", "import"],
-        help="运行模式：intraday / review / index / import"
+        choices=["intraday", "review", "index", "import", "backtest"],
+        help="运行模式：intraday / review / index / import / backtest"
     )
     parser.add_argument(
         "--start",
@@ -837,6 +928,19 @@ def main():
         help="强制指定市场：a / hk / us / a,hk / all。"
              "默认自动检测当前开盘市场。仅 intraday/index 模式生效。"
     )
+    # backtest 模式专用参数
+    parser.add_argument(
+        "--signal-type",
+        default=None,
+        metavar="TYPE",
+        help="回测筛选：仅分析指定信号类型（如 二买、三买）"
+    )
+    parser.add_argument(
+        "--freq-filter",
+        default=None,
+        metavar="FREQ",
+        help="回测筛选：仅分析指定频率（如 日线、30分钟）"
+    )
     parser.add_argument(
         "--list-dates",
         action="store_true",
@@ -855,6 +959,7 @@ def main():
         "review":   run_review,
         "index":    run_index_only,
         "import":   run_import,
+        "backtest": run_backtest,
     }
     dispatch[args.mode](args)
 
