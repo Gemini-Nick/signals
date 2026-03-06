@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 from .detectors import SignalEvent
@@ -18,6 +18,17 @@ SIGNAL_WEIGHTS = {
     "趋势卖": -30,
 }
 
+# 级别系数：大级别信号权重更高，小级别适当折扣
+FREQ_MULTIPLIER = {
+    "周线":   1.8,
+    "日线":   1.5,
+    "60分钟": 1.1,
+    "30分钟": 1.0,
+    "15分钟": 0.7,
+    "5分钟":  0.5,
+    "1分钟":  0.3,
+}
+
 
 @dataclass
 class ScoredSymbol:
@@ -26,10 +37,42 @@ class ScoredSymbol:
     signal_count: int
     signals: List[SignalEvent]
     details: str
+    direction: str = ""   # "偏多" / "偏空" / "分歧" / ""
 
 
-def score_signals(symbol: str, signals: List[SignalEvent]) -> ScoredSymbol:
-    """对单个标的的所有信号计算综合评分。"""
+def _time_decay(sig_dt, ref_dt=None, half_life_days: float = 30.0) -> float:
+    """
+    信号时间衰减因子。越新的信号越接近 1.0，越老的越低。
+    half_life_days=30 表示 30 天前的信号衰减到 0.5。
+    最低不低于 0.1（避免完全归零）。
+    """
+    from datetime import datetime
+    if ref_dt is None:
+        ref_dt = datetime.now()
+    if sig_dt is None:
+        return 1.0
+    # sig_dt 可能是 Timestamp
+    if hasattr(sig_dt, 'to_pydatetime'):
+        sig_dt = sig_dt.to_pydatetime()
+    if hasattr(ref_dt, 'to_pydatetime'):
+        ref_dt = ref_dt.to_pydatetime()
+    # 去掉 tzinfo 避免比较报错
+    sig_dt = sig_dt.replace(tzinfo=None) if sig_dt.tzinfo else sig_dt
+    ref_dt = ref_dt.replace(tzinfo=None) if ref_dt.tzinfo else ref_dt
+    delta_days = (ref_dt - sig_dt).total_seconds() / 86400.0
+    if delta_days <= 0:
+        return 1.0
+    import math
+    decay = math.pow(0.5, delta_days / half_life_days)
+    return max(decay, 0.1)
+
+
+def score_signals(symbol: str, signals: List[SignalEvent],
+                  enable_decay: bool = True) -> ScoredSymbol:
+    """
+    对单个标的的所有信号计算综合评分。
+    enable_decay=True 时启用时间衰减（默认开启）。
+    """
     if not signals:
         return ScoredSymbol(
             symbol=symbol, total_score=0.0,
@@ -37,26 +80,58 @@ def score_signals(symbol: str, signals: List[SignalEvent]) -> ScoredSymbol:
         )
 
     total = 0.0
+    buy_total = 0.0
+    sell_total = 0.0
     for sig in signals:
         base = SIGNAL_WEIGHTS.get(sig.signal_type, 0)
-        total += base * sig.confidence
+        freq_mult = FREQ_MULTIPLIER.get(sig.freq, 1.0)
+        decay = _time_decay(sig.dt) if enable_decay else 1.0
+        contribution = base * sig.confidence * freq_mult * decay
+        total += contribution
+        if "买" in sig.signal_type:
+            buy_total += abs(contribution)
+        elif "卖" in sig.signal_type:
+            sell_total += abs(contribution)
 
     # 多级别共振加分：同方向信号出现在多个级别
     buy_freqs = {s.freq for s in signals if "买" in s.signal_type}
     sell_freqs = {s.freq for s in signals if "卖" in s.signal_type}
     if len(buy_freqs) > 1:
         total += 15
+        buy_total += 15
     if len(sell_freqs) > 1:
         total -= 15
+        sell_total += 15
 
-    details_lines = [
-        f"  [{s.freq}] {s.signal_type} conf={s.confidence:.2f} @ {s.price:.2f}  {s.details}"
-        for s in signals
-    ]
+    # 买卖互斥判断
+    if buy_total > 0 and sell_total > 0:
+        if abs(buy_total - sell_total) < 20:
+            direction = "分歧"
+        elif buy_total > sell_total:
+            direction = "偏多"
+        else:
+            direction = "偏空"
+    elif buy_total > 0:
+        direction = "偏多"
+    elif sell_total > 0:
+        direction = "偏空"
+    else:
+        direction = ""
+
+    details_lines = []
+    for s in signals:
+        decay = _time_decay(s.dt) if enable_decay else 1.0
+        decay_tag = f" decay={decay:.2f}" if enable_decay and decay < 0.95 else ""
+        details_lines.append(
+            f"  [{s.freq}] {s.signal_type} conf={s.confidence:.2f} @ {s.price:.2f}"
+            f"  ×{FREQ_MULTIPLIER.get(s.freq, 1.0):.1f}{decay_tag}  {s.details}"
+        )
     if len(buy_freqs) > 1:
         details_lines.append(f"  [共振+15] 买信号出现在 {buy_freqs}")
     if len(sell_freqs) > 1:
         details_lines.append(f"  [共振-15] 卖信号出现在 {sell_freqs}")
+    if direction == "分歧":
+        details_lines.append(f"  [分歧] 买力={buy_total:.1f} vs 卖力={sell_total:.1f}，方向不明确")
 
     return ScoredSymbol(
         symbol=symbol,
@@ -64,4 +139,5 @@ def score_signals(symbol: str, signals: List[SignalEvent]) -> ScoredSymbol:
         signal_count=len(signals),
         signals=signals,
         details="\n".join(details_lines),
+        direction=direction,
     )
