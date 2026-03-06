@@ -8,3 +8,5 @@ Pillow
 PyYAML
 python-dotenv
 yfinance
+ib_async
+alpaca-py

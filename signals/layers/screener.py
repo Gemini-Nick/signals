@@ -120,7 +120,8 @@ class IntraDayScreener:
             return []
         elif market == "US":
             if not self._us_source:
-                self._us_source = USDataSource()
+                from signals.data.us_factory import create_us_source
+                self._us_source = create_us_source("intraday")
             return self._us_source.get_us_minute(sym, freq)
         return []
 

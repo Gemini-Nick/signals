@@ -31,7 +31,8 @@ def _load_stock_daily_bars(futu_code: str, start_date: str,
     A股路径：AKShare（免费）。
     美股路径：USDataSource（降级链）。
     """
-    from signals.data.fetcher import AKShareSource, USDataSource, detect_market
+    from signals.data.fetcher import AKShareSource, detect_market
+    from signals.data.us_factory import create_us_source
     from datetime import datetime
     edt = end_date or datetime.now().strftime("%Y-%m-%d")
     market = detect_market(futu_code)
@@ -39,7 +40,7 @@ def _load_stock_daily_bars(futu_code: str, start_date: str,
     # ── 美股路径 ──
     if market == "US":
         try:
-            us = USDataSource()
+            us = create_us_source("review")
             return us.get_us_daily(futu_code)
         except Exception as e:
             print(f"  [✗] {futu_code} 美股日线加载失败：{e}", flush=True)

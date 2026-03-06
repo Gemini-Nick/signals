@@ -87,6 +87,7 @@ class IBSource:
         contract = self._make_contract(ticker)
         bar_size = self._freq_to_bar_size(freq)
 
+        # 计算 duration（多拉几天余量）
         if start:
             delta = (datetime.now() - datetime.strptime(start, "%Y-%m-%d")).days
             lookback_days = max(delta + 5, lookback_days)
@@ -119,6 +120,7 @@ class IBSource:
 
         df = pd.DataFrame(records)
         df["dt"] = pd.to_datetime(df["dt"])
+        # 去掉时区信息，确保 CZSC 兼容
         if df["dt"].dt.tz is not None:
             df["dt"] = df["dt"].dt.tz_localize(None)
 

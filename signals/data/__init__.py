@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""数据源：Tushare / AKShare / Futu / YFinance / USDataSource + IB / Alpaca"""
+"""数据源：Tushare / AKShare / Futu / YFinance / IB / Alpaca / USDataSource"""
 from .fetcher import (TushareSource, AKShareSource, FutuSource,
                       YFinanceSource, USDataSource, detect_market,
                       _classify_error)

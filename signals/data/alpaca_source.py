@@ -70,6 +70,7 @@ class AlpacaSource:
         ticker = self._ticker(futu_code)
         timeframe = self._freq_to_timeframe(freq)
 
+        # 计算起止时间
         if start:
             start_dt = datetime.strptime(start, "%Y-%m-%d")
         else:
@@ -105,6 +106,7 @@ class AlpacaSource:
 
         df = pd.DataFrame(records)
         df["dt"] = pd.to_datetime(df["dt"])
+        # 去掉时区信息，确保 CZSC 兼容
         if df["dt"].dt.tz is not None:
             df["dt"] = df["dt"].dt.tz_localize(None)
 

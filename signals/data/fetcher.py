@@ -683,6 +683,7 @@ def _classify_error(e: Exception) -> str:
 # ─────────────────────────────────────────────────────────
 # 5. USDataSource — 美股数据路由（自动降级链）
 # ─────────────────────────────────────────────────────────
+
 class USDataSource:
     """
     美股统一数据入口 — 自动降级链。
@@ -714,6 +715,7 @@ class USDataSource:
                     *args, **kwargs) -> Optional[List[RawBar]]:
         """
         对单个数据源尝试最多 MAX_RETRIES 次。
+        每次打印详细失败原因（网络/认证/限流/依赖缺失等）。
         遇到不可恢复错误（依赖缺失/认证错误）立即放弃。
         """
         name = src.__class__.__name__
@@ -748,7 +750,8 @@ class USDataSource:
     def _route(self, method_name: str, label: str,
                yf_method: str, yf_args: tuple, yf_kwargs: dict,
                *args, **kwargs) -> List[RawBar]:
-        """统一路由逻辑：遍历 providers → yfinance 兜底。"""
+        """统一路由逻辑：遍历 providers → yfinance 兜底。每个数据源最多重试 3 次。"""
+        # 依次尝试 providers
         for src in self._providers:
             bars = self._try_source(src, method_name, label, *args, **kwargs)
             if bars:
@@ -782,6 +785,7 @@ class USDataSource:
                            lookback_days: int = 180,
                            start: str = None) -> List[RawBar]:
         """美股指数 ETF K线，按降级链自动切换数据源"""
+        # yfinance 兜底根据周期选择方法
         if freq == Freq.D:
             yf_method, yf_args = "get_us_daily", (futu_code,)
             yf_kwargs = {"period": "1y"}
@@ -796,3 +800,12 @@ class USDataSource:
             futu_code, freq,
             lookback_days=lookback_days, start=start,
         )
+
+    def close(self):
+        """清理 provider 连接"""
+        for src in self._providers:
+            if hasattr(src, "close"):
+                try:
+                    src.close()
+                except Exception:
+                    pass
