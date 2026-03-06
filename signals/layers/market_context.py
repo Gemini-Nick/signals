@@ -17,10 +17,12 @@ from .index_report import IndexReport
 @dataclass
 class MarketContext:
     """
-    8 个指数聚合后的大市研判结果。
+    11 个指数聚合后的大市研判结果。
     """
     reports: List[IndexReport]             # 所有指数报告
     overall_direction: str = "分化"        # "偏多" / "偏空" / "分化"
+    direction_strength: float = 0.0        # [-1.0, +1.0] 方向强度连续值
+    structural_divergence: str = ""        # "大强小弱" / "小强大弱" / ""
     buy_indices: List[str] = field(default_factory=list)   # 出现买信号的指数名称
     sell_indices: List[str] = field(default_factory=list)  # 出现卖信号的指数名称
     bullish_indices: List[str] = field(default_factory=list)  # 上涨趋势指数
@@ -177,7 +179,12 @@ class MarketContext:
         # 综合结论
         dir_emoji = {"偏多": "📈", "偏空": "📉", "分化": "↔️"}.get(
             self.overall_direction, "")
-        lines.append(f"  {dir_emoji} 综合: {self.overall_direction}  |  风格: {self.growth_vs_value}")
+        strength_str = f"强度 {self.direction_strength:+.2f}" if self.direction_strength else ""
+        lines.append(f"  {dir_emoji} 综合: {self.overall_direction} ({strength_str})  |  风格: {self.growth_vs_value}")
+
+        # 结构性分化
+        if self.structural_divergence:
+            lines.append(f"  🔀 结构: {self.structural_divergence}")
 
         # 三级共振（最强信号）
         aligned = [r.name for r in self.reports
@@ -236,7 +243,9 @@ class MarketContext:
                 stale_parts.append(f"分钟线({f15_date})")
         if stale_parts:
             lines.append(f"[!] 数据尚未更新到今日: {', '.join(stale_parts)}，分析基于滞后数据（日线源通常 17:00~18:00 更新）")
-        lines.append(f"综合: {self.overall_direction}  风格: {self.growth_vs_value}")
+        strength_str = f"强度{self.direction_strength:+.2f}" if self.direction_strength else ""
+        struct_str = f"  结构:{self.structural_divergence}" if self.structural_divergence else ""
+        lines.append(f"综合: {self.overall_direction}({strength_str})  风格: {self.growth_vs_value}{struct_str}")
         lines.append("─" * 36)
         lines.append("指数     趋势   主要信号")
 
@@ -340,7 +349,9 @@ class MarketContext:
         # 综合结论
         dir_emoji = {"偏多": "📈", "偏空": "📉", "分化": "↔️"}.get(
             self.overall_direction, "")
-        l1_lines.append(f"{dir_emoji} **综合: {self.overall_direction}**  |  风格: {self.growth_vs_value}")
+        strength_str = f"强度 {self.direction_strength:+.2f}" if self.direction_strength else ""
+        struct_str = f"  |  结构: {self.structural_divergence}" if self.structural_divergence else ""
+        l1_lines.append(f"{dir_emoji} **综合: {self.overall_direction}** ({strength_str})  |  风格: {self.growth_vs_value}{struct_str}")
 
         aligned = [r.name for r in self.reports
                    if r.data_available and r.three_level_aligned]
@@ -470,6 +481,14 @@ _INDEX_SECTOR_MAP = {
 _GROWTH_INDICES = {"创业板指", "科创50", "中证1000", "恒生科技", "纳斯达克"}
 _VALUE_INDICES  = {"上证50", "超大盘", "沪深300", "道琼斯"}
 
+# 指数重要性权重（大盘核心 > 小盘辅助）
+_INDEX_WEIGHTS = {
+    "沪深300": 1.5, "上证50": 1.2, "标普500": 1.5,
+    "纳斯达克": 1.2, "道琼斯": 1.0,
+    "创业板指": 1.0, "中证500": 0.8, "科创50": 0.8,
+    "中证1000": 0.7, "超大盘": 0.7, "恒生科技": 0.8,
+}
+
 
 def infer_strong_sectors(ctx: "MarketContext") -> List[str]:
     """
@@ -524,16 +543,35 @@ def build_market_context(reports: List[IndexReport]) -> MarketContext:
     bullish_indices = [r.name for r in available if r.daily_trend == "上涨趋势"]
     bearish_indices = [r.name for r in available if r.daily_trend == "下跌趋势"]
 
-    # 大市方向判断
-    bullish_score = len(bullish_indices) + len(buy_indices) * 0.5
-    bearish_score = len(bearish_indices) + len(sell_indices) * 0.5
+    # 大市方向判断（加权评分，替代简单计数）
+    bullish_score = (sum(_INDEX_WEIGHTS.get(n, 1.0) for n in bullish_indices)
+                     + sum(_INDEX_WEIGHTS.get(n, 1.0) * 0.5 for n in buy_indices))
+    bearish_score = (sum(_INDEX_WEIGHTS.get(n, 1.0) for n in bearish_indices)
+                     + sum(_INDEX_WEIGHTS.get(n, 1.0) * 0.5 for n in sell_indices))
+    total_weight = sum(_INDEX_WEIGHTS.get(r.name, 1.0) for r in available)
 
-    if bullish_score >= n * 0.5:
+    # 方向强度：[-1.0, +1.0] 连续值
+    direction_strength = (bullish_score - bearish_score) / (total_weight + 1e-9)
+    direction_strength = max(-1.0, min(1.0, direction_strength))
+
+    if direction_strength > 0.3:
         overall_direction = "偏多"
-    elif bearish_score >= n * 0.5:
+    elif direction_strength < -0.3:
         overall_direction = "偏空"
     else:
         overall_direction = "分化"
+
+    # 结构性分化检测（大盘 vs 小盘）
+    large_cap_bullish = sum(1 for r in available
+                           if r.name in _VALUE_INDICES and r.is_bullish)
+    small_cap_bullish = sum(1 for r in available
+                           if r.name in _GROWTH_INDICES and r.is_bullish)
+    if large_cap_bullish >= 3 and small_cap_bullish <= 1:
+        structural_divergence = "大强小弱"
+    elif small_cap_bullish >= 3 and large_cap_bullish <= 1:
+        structural_divergence = "小强大弱"
+    else:
+        structural_divergence = ""
 
     # 成长 vs 价值
     growth_bullish = sum(1 for r in available
@@ -558,6 +596,8 @@ def build_market_context(reports: List[IndexReport]) -> MarketContext:
     ctx_temp = MarketContext(
         reports=reports,
         overall_direction=overall_direction,
+        direction_strength=direction_strength,
+        structural_divergence=structural_divergence,
         buy_indices=buy_indices,
         sell_indices=sell_indices,
         bullish_indices=bullish_indices,
@@ -570,8 +610,10 @@ def build_market_context(reports: List[IndexReport]) -> MarketContext:
 
     # 生成综合摘要
     summary_parts = [
-        f"大市{overall_direction}，{growth_vs_value}风格占优。",
+        f"大市{overall_direction}（强度 {direction_strength:+.2f}），{growth_vs_value}风格占优。",
     ]
+    if structural_divergence:
+        summary_parts.append(f"结构: {structural_divergence}。")
     if bullish_indices:
         summary_parts.append(f"上涨趋势：{'、'.join(bullish_indices[:3])}{'等' if len(bullish_indices) > 3 else ''}。")
     if bearish_indices:
@@ -590,6 +632,8 @@ def build_market_context(reports: List[IndexReport]) -> MarketContext:
     return MarketContext(
         reports=reports,
         overall_direction=overall_direction,
+        direction_strength=direction_strength,
+        structural_divergence=structural_divergence,
         buy_indices=buy_indices,
         sell_indices=sell_indices,
         bullish_indices=bullish_indices,

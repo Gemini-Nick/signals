@@ -200,6 +200,14 @@ def review_stock_daily(symbols: List[str], start_date: str,
 
     scored.sort(key=lambda x: -x.total_score)
     _print_stock_report(scored)
+
+    # 信号存档（回测验证用，异常不影响主流程）
+    try:
+        from signals.core.backtest import archive_signals
+        archive_signals(scored)
+    except Exception:
+        pass
+
     return scored
 
 
@@ -214,5 +222,14 @@ def _print_stock_report(scored: list):
     for i, sc in enumerate(scored, 1):
         sigs = ", ".join(f"{s.signal_type}({s.freq})" for s in sc.signals[:4])
         dir_tag = f" [{sc.direction}]" if sc.direction else ""
-        print(f"  {i:2d}. {sc.symbol:15s}  分={sc.total_score:+6.1f}{dir_tag}  {sigs}")
+        # 风控信息
+        risk_str = ""
+        try:
+            from signals.core.risk import enrich_with_risk
+            risk_line = enrich_with_risk(sc)
+            if risk_line:
+                risk_str = f"\n      {risk_line.strip()}"
+        except Exception:
+            pass
+        print(f"  {i:2d}. {sc.symbol:15s}  分={sc.total_score:+6.1f}{dir_tag}  {sigs}{risk_str}")
     print("─" * 60 + "\n")

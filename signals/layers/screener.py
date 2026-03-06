@@ -79,7 +79,30 @@ class IntraDayScreener:
         根据市场路由到正确的数据源获取分钟线。
         A股：AKShare(Sina) → AKShare(东财) → Futu(如有A股权限)
         美股：USDataSource 内部降级链
+
+        集成 MinuteCache：每次把 API 数据追加到本地 SQLite 缓存，
+        随时间推移分钟线窗口从 5 天自动扩展到 20-60 天。
         """
+        # 从 API 获取最新分钟线
+        fresh = self._fetch_minute_bars_api(sym, freq)
+
+        # 缓存层：合并新数据 + 读取全量
+        try:
+            from signals.data.minute_cache import MinuteCache
+            cache = MinuteCache()
+            if fresh:
+                cache.merge(sym, freq.value, fresh)
+            all_bars = cache.get(sym, freq.value)
+            cache.close()
+            if all_bars:
+                return all_bars
+        except Exception:
+            pass  # 缓存异常不影响主流程
+
+        return fresh
+
+    def _fetch_minute_bars_api(self, sym: str, freq: Freq) -> List:
+        """原始 API 获取逻辑（不含缓存）。"""
         market = detect_market(sym)
         if market == "A":
             # 主路径：AKShare Sina（连续失败 3 次后熔断跳过）
@@ -212,7 +235,8 @@ class IntraDayScreener:
     # ─────────────────────────────────────────────────────
     # 扫描：信号检测 + 评分
     # ─────────────────────────────────────────────────────
-    def scan_once(self, symbols: Optional[List[str]] = None) -> List[ScoredSymbol]:
+    def scan_once(self, symbols: Optional[List[str]] = None,
+                  market_direction: str = "分化") -> List[ScoredSymbol]:
         """对所有（或指定）标的运行信号检测，返回按评分降序排列的结果。"""
         target = symbols or list(self.analyzers.keys())
         results = []
@@ -225,6 +249,14 @@ class IntraDayScreener:
             results.append(score_signals(sym, all_signals))
 
         results.sort(key=lambda x: x.total_score, reverse=True)
+
+        # 信号存档（回测验证用，异常不影响主流程）
+        try:
+            from signals.core.backtest import archive_signals
+            archive_signals(results, market_direction=market_direction)
+        except Exception:
+            pass
+
         return results
 
     # ─────────────────────────────────────────────────────
@@ -296,6 +328,14 @@ class IntraDayScreener:
 
             print(f"\n{marker} {r.symbol}  技术分: {r.total_score}  信号数: {r.signal_count}{note_tag}")
             print(r.details)
+            # 风控信息：止损位 + 仓位建议
+            try:
+                from signals.core.risk import enrich_with_risk
+                risk_line = enrich_with_risk(r)
+                if risk_line:
+                    print(risk_line)
+            except Exception:
+                pass
             if note_view.catalysts:
                 print(f"  [研报催化] {'、'.join(note_view.catalysts)}")
 

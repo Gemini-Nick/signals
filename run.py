@@ -21,6 +21,9 @@
   python run.py --mode intraday --market us              # 强制美股（盘中）
   python run.py --mode intraday --market a,hk            # 强制 A+H
   python run.py --mode intraday --market all              # 全市场（不做时段过滤）
+  python run.py --mode backtest                           # 回测验证（评估历史信号）
+  python run.py --mode backtest --signal-type 二买         # 仅看二买信号表现
+  python run.py --mode backtest --freq-filter 日线         # 仅看日线信号
 """
 import sys
 import subprocess
@@ -415,6 +418,24 @@ def run_import(args):
 # 仅指数模式：快速查看大市方向
 # ─────────────────────────────────────────────────────────
 
+def run_backtest(args):
+    """
+    回测验证模式：评估历史信号的前瞻表现，输出统计报告。
+
+    信号存档由 screener / review_screener 自动完成（每次运行时存入 SQLite）。
+    本模式负责：评估到期信号 → 买卖配对 → 生成双视角报告 → 输出权重建议。
+    """
+    from signals.core.backtest import run_backtest as _run_backtest
+
+    print(f"\n{'═'*52}")
+    print(f"  回测验证模式 — 信号自我进化")
+    print(f"{'═'*52}")
+
+    signal_type = getattr(args, "signal_type", "") or ""
+    freq_filter = getattr(args, "freq_filter", "") or ""
+    _run_backtest(signal_type=signal_type, freq_filter=freq_filter)
+
+
 def run_index_only(args):
     """仅运行 Layer 1，快速输出指数报告。"""
     from signals.core.market_hours import filter_index_codes
@@ -789,8 +810,8 @@ def main():
     parser.add_argument(
         "--mode",
         default="intraday",
-        choices=["intraday", "review", "index", "import"],
-        help="运行模式：intraday / review / index / import"
+        choices=["intraday", "review", "index", "import", "backtest"],
+        help="运行模式：intraday / review / index / import / backtest"
     )
     parser.add_argument(
         "--start",
@@ -837,6 +858,19 @@ def main():
         help="强制指定市场：a / hk / us / a,hk / all。"
              "默认自动检测当前开盘市场。仅 intraday/index 模式生效。"
     )
+    # backtest 模式专用参数
+    parser.add_argument(
+        "--signal-type",
+        default=None,
+        metavar="TYPE",
+        help="回测筛选：仅分析指定信号类型（如 二买、三买）"
+    )
+    parser.add_argument(
+        "--freq-filter",
+        default=None,
+        metavar="FREQ",
+        help="回测筛选：仅分析指定频率（如 日线、30分钟）"
+    )
     parser.add_argument(
         "--list-dates",
         action="store_true",
@@ -855,6 +889,7 @@ def main():
         "review":   run_review,
         "index":    run_index_only,
         "import":   run_import,
+        "backtest": run_backtest,
     }
     dispatch[args.mode](args)
 
