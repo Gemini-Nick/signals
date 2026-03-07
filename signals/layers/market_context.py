@@ -393,32 +393,8 @@ class MarketContext:
         if aligned:
             lines.append(f"  ⭐ 三级共振: {'  '.join(aligned)}")
 
-        # 买点汇总
-        if self.buy_indices:
-            n = len(self.buy_indices)
-            shown = "、".join(self.buy_indices[:4])
-            suffix = f" 等{n}只" if n > 4 else ""
-            lines.append(f"  🔔 买点: {shown}{suffix}")
-
-        # 卖点汇总（有卖信号时提示）
-        if self.sell_indices:
-            lines.append(f"  ⚠️  卖点: {'、'.join(self.sell_indices)}")
-
-        # 推荐板块
-        if self.recommended_industries and self.gate_industry_scan:
-            lines.append(f"  📌 推荐关注: {'、'.join(self.recommended_industries[:4])}")
-
         if not self.gate_industry_scan:
             lines.append("  ⛔ 市场偏空，建议观望")
-
-        # 情绪周期 & 仓位建议
-        if self.sentiment_phase and self.sentiment_phase != "未知":
-            ph_emoji = _SENTIMENT_EMOJI.get(
-                SentimentPhase(self.sentiment_phase), "⚪")
-            lines.append(f"  {ph_emoji} 情绪: {self.sentiment_phase}"
-                         f"  |  分化度: {self.divergence_score:+.1f}")
-            if self.position_suggestion:
-                lines.append(f"  💡 {self.position_suggestion}")
 
         lines.append(SEP)
         return "\n".join(lines)
@@ -501,18 +477,6 @@ class MarketContext:
                    if r.data_available and r.three_level_aligned]
         if aligned:
             lines.append(f"三级共振: {'  '.join(aligned)}")
-
-        if self.buy_indices:
-            n = len(self.buy_indices)
-            shown = "、".join(self.buy_indices[:5])
-            suffix = f" 等{n}只" if n > 5 else ""
-            lines.append(f"买点: {shown}{suffix}")
-
-        if self.sell_indices:
-            lines.append(f"注意卖点: {'、'.join(self.sell_indices)}")
-
-        if self.recommended_industries and self.gate_industry_scan:
-            lines.append(f"推荐关注: {'、'.join(self.recommended_industries[:4])}")
 
         if not self.gate_industry_scan:
             lines.append("市场偏空，建议观望")
@@ -622,15 +586,6 @@ class MarketContext:
                    if r.data_available and r.three_level_aligned]
         if aligned:
             l1_lines.append(f"⭐ 三级共振: {'  '.join(aligned)}")
-        if self.buy_indices:
-            n = len(self.buy_indices)
-            shown = "、".join(self.buy_indices[:5])
-            suffix = f" 等{n}只" if n > 5 else ""
-            l1_lines.append(f"🔔 买点: {shown}{suffix}")
-        if self.sell_indices:
-            l1_lines.append(f"⚠️ 卖点: {'、'.join(self.sell_indices)}")
-        if self.recommended_industries and self.gate_industry_scan:
-            l1_lines.append(f"📌 推荐关注: {'、'.join(self.recommended_industries[:4])}")
         if not self.gate_industry_scan:
             l1_lines.append("⛔ 市场偏空，建议观望")
 

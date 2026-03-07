@@ -329,26 +329,6 @@ def run_intraday(args):
                 print(f"  {i:<4} {cp.name:<14} "
                       f"{sign}{cp.gain_pct:.2f}%  {cp.sector_type}{cp_icon}")
 
-        # ── 情绪周期 & 仓位建议 ────────────────────────
-        if ctx:
-            _PHASE_EMOJI = {
-                "恐慌": "🔴", "修复": "🟡", "亢奋": "🟢",
-                "回落": "🟠", "未知": "⚪",
-            }
-            ph_emoji = _PHASE_EMOJI.get(ctx.sentiment_phase, "⚪")
-            print(f"\n  >>> 市场情绪: {ph_emoji}{ctx.sentiment_phase}"
-                  f"  |  分化度: {ctx.divergence_score:+.1f}"
-                  f"{'（避险）' if ctx.divergence_score > 0 else '（风偏）' if ctx.divergence_score < 0 else ''}")
-            if ctx.position_suggestion:
-                print(f"  💡 {ctx.position_suggestion}")
-            if ctx.shield_sectors or ctx.sword_sectors:
-                parts = []
-                if ctx.shield_sectors:
-                    parts.append(f"🛡 防守: {'、'.join(ctx.shield_sectors)}")
-                if ctx.sword_sectors:
-                    parts.append(f"⚔ 进攻: {'、'.join(ctx.sword_sectors)}")
-                print(f"  {' | '.join(parts)}")
-
         dash.resume()
 
     dash.set_l2_count(len(ranking_stocks))
@@ -723,26 +703,6 @@ def _run_single_review(start_date: str, raw_alias: str, args):
                 print(f"  {i:<4} {cp.name:<14} "
                       f"{sign}{cp.gain_pct:.2f}%  {cp.sector_type}{cp_icon}")
 
-        # ── 情绪周期 & 仓位建议 ────────────────────────
-        if ctx:
-            _PHASE_EMOJI = {
-                "恐慌": "🔴", "修复": "🟡", "亢奋": "🟢",
-                "回落": "🟠", "未知": "⚪",
-            }
-            ph_emoji = _PHASE_EMOJI.get(ctx.sentiment_phase, "⚪")
-            print(f"\n  >>> 市场情绪: {ph_emoji}{ctx.sentiment_phase}"
-                  f"  |  分化度: {ctx.divergence_score:+.1f}"
-                  f"{'（避险）' if ctx.divergence_score > 0 else '（风偏）' if ctx.divergence_score < 0 else ''}")
-            if ctx.position_suggestion:
-                print(f"  💡 {ctx.position_suggestion}")
-            if ctx.shield_sectors or ctx.sword_sectors:
-                parts = []
-                if ctx.shield_sectors:
-                    parts.append(f"🛡 防守: {'、'.join(ctx.shield_sectors)}")
-                if ctx.sword_sectors:
-                    parts.append(f"⚔ 进攻: {'、'.join(ctx.sword_sectors)}")
-                print(f"  {' | '.join(parts)}")
-
         # L2 输出后保持 paused（不 resume），L3 纯文本滚动
 
     dash.set_l2_count(len(ranking_stocks))
@@ -865,26 +825,6 @@ def _run_multi_review(dates: list, args):
                 cp_icon = _CP_ICON.get(cp.sector_type, "")
                 print(f"  {i:<4} {cp.name:<14} "
                       f"{sign}{cp.gain_pct:.2f}%  {cp.sector_type}{cp_icon}")
-
-        # ── 情绪周期 & 仓位建议 ────────────────────────
-        if ctx:
-            _PHASE_EMOJI = {
-                "恐慌": "🔴", "修复": "🟡", "亢奋": "🟢",
-                "回落": "🟠", "未知": "⚪",
-            }
-            ph_emoji = _PHASE_EMOJI.get(ctx.sentiment_phase, "⚪")
-            print(f"\n  >>> 市场情绪: {ph_emoji}{ctx.sentiment_phase}"
-                  f"  |  分化度: {ctx.divergence_score:+.1f}"
-                  f"{'（避险）' if ctx.divergence_score > 0 else '（风偏）' if ctx.divergence_score < 0 else ''}")
-            if ctx.position_suggestion:
-                print(f"  💡 {ctx.position_suggestion}")
-            if ctx.shield_sectors or ctx.sword_sectors:
-                parts = []
-                if ctx.shield_sectors:
-                    parts.append(f"🛡 防守: {'、'.join(ctx.shield_sectors)}")
-                if ctx.sword_sectors:
-                    parts.append(f"⚔ 进攻: {'、'.join(ctx.sword_sectors)}")
-                print(f"  {' | '.join(parts)}")
 
         # L2 输出后保持 paused（不 resume），L3 纯文本滚动
 

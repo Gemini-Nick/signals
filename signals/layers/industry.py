@@ -203,12 +203,13 @@ _EM_CIRCUIT_OPEN = False          # True = 东财不可用，跳过网络调用
 _EM_NAME_DF_CACHE: Optional[pd.DataFrame] = None   # 首次成功结果缓存
 
 
-def _fetch_board_industry_name_em(timeout: float = 5.0) -> Optional[pd.DataFrame]:
+def _fetch_board_industry_name_em(timeout: float = 10.0) -> Optional[pd.DataFrame]:
     """
-    带熔断的 stock_board_industry_name_em 调用：
-    - 整体超时 5s（用 ThreadPoolExecutor 强制截断）
+    带熔断+重试的 stock_board_industry_name_em 调用：
+    - 整体超时 10s（用 ThreadPoolExecutor 强制截断）
+    - 失败自动重试 1 次
     - 首次成功后缓存结果，后续直接返回
-    - 失败后标记熔断，本次运行内不再尝试
+    - 两次失败后标记熔断，本次运行内不再尝试
     """
     global _EM_CIRCUIT_OPEN, _EM_NAME_DF_CACHE
 
@@ -226,22 +227,30 @@ def _fetch_board_industry_name_em(timeout: float = 5.0) -> Optional[pd.DataFrame
     def _call():
         return ak.stock_board_industry_name_em()
 
-    try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_call)
-            df = future.result(timeout=timeout)
-            if df is not None and not df.empty:
-                _EM_NAME_DF_CACHE = df
-                return df
+    for attempt in range(2):
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_call)
+                df = future.result(timeout=timeout)
+                if df is not None and not df.empty:
+                    _EM_NAME_DF_CACHE = df
+                    return df
+                return None
+        except FutureTimeout:
+            if attempt == 0:
+                _log(f"  [⚡] 东财行业接口超时（>{timeout}s），重试中...")
+                continue
+            _EM_CIRCUIT_OPEN = True
+            _log(f"  [⚡] 东财行业接口超时（重试仍失败），熔断")
             return None
-    except FutureTimeout:
-        _EM_CIRCUIT_OPEN = True
-        _log(f"  [⚡] 东财行业接口超时（>{timeout}s），熔断")
-        return None
-    except Exception as e:
-        _EM_CIRCUIT_OPEN = True
-        _log(f"  [⚡] 东财行业接口熔断（{e.__class__.__name__}），本次运行跳过后续调用")
-        return None
+        except Exception as e:
+            if attempt == 0:
+                _log(f"  [⚡] 东财行业接口异常（{e.__class__.__name__}），重试中...")
+                continue
+            _EM_CIRCUIT_OPEN = True
+            _log(f"  [⚡] 东财行业接口熔断（{e.__class__.__name__}），本次运行跳过后续调用")
+            return None
+    return None
 
 
 # ─────────────────────────────────────────────────────────
@@ -418,11 +427,23 @@ def get_industry_bars(industry: str,
         s_date = (today - timedelta(days=lookback_days)).strftime("%Y%m%d")
     e_date = today.strftime("%Y%m%d")
 
-    df = ak.stock_board_industry_hist_em(
-        symbol=industry, period="daily",
-        start_date=s_date, end_date=e_date,
-        adjust="qfq"
-    )
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+    def _call():
+        return ak.stock_board_industry_hist_em(
+            symbol=industry, period="daily",
+            start_date=s_date, end_date=e_date,
+            adjust="qfq"
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_call)
+            df = future.result(timeout=15)
+    except (FutureTimeout, Exception) as e:
+        _log(f"  [!] {industry} K线接口超时/失败（{e.__class__.__name__}）")
+        return []
+
     if df is None or df.empty:
         return []
 
@@ -700,7 +721,7 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
     """
     获取概念板块涨幅 top N。
     API: ak.stock_board_concept_name_em()（一次调用，返回全量）
-    超时降级：返回空列表，不影响主流程。
+    超时 15s + 自动重试 1 次；仍失败则返回空列表。
     """
     import akshare as ak
     import config as _cfg
@@ -713,13 +734,19 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
         with _no_proxy():
             return ak.stock_board_concept_name_em()
 
-    try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_call)
-            df = future.result(timeout=8)
-    except (FutureTimeout, Exception) as e:
-        _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}），跳过概念排行")
-        return []
+    df = None
+    for attempt in range(2):
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_call)
+                df = future.result(timeout=15)
+            break
+        except (FutureTimeout, Exception) as e:
+            if attempt == 0:
+                _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}），重试中...")
+                continue
+            _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}，重试仍失败），跳过概念排行")
+            return []
 
     if df is None or df.empty or "涨跌幅" not in df.columns:
         return []
