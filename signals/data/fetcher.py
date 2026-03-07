@@ -181,6 +181,25 @@ class AKShareSource:
                 else:
                     raise
 
+    def get_a_daily_sina(self, futu_code: str, sdt: str, edt: str,
+                         adj: str = "qfq", timeout: float = 10.0) -> List[RawBar]:
+        """A股日线（Sina源），东财 SSL 失败时的降级方案。带 timeout 防无限挂起。"""
+        import akshare as ak
+        ak_sym, _ = self._futu_to_ak_a(futu_code)
+        with _no_proxy():
+            df = self._call_with_timeout(
+                lambda: ak.stock_zh_a_daily(symbol=ak_sym,
+                                             start_date=sdt.replace("-", ""),
+                                             end_date=edt.replace("-", ""),
+                                             adjust=adj),
+                timeout=timeout,
+            )
+        if df is None or df.empty:
+            return []
+        df = df.rename(columns={"date": "dt", "volume": "vol"})
+        return _to_raw_bars(df, futu_code, Freq.D,
+                            "dt", "open", "high", "low", "close", "vol", "amount")
+
     @staticmethod
     def _call_with_timeout(fn, timeout: float = 30.0):
         """在子线程中调用 fn，超时则抛 TimeoutError（防 Sina API 无限挂起）。"""
@@ -641,7 +660,17 @@ class YFinanceSource:
         if df is None or df.empty:
             return []
         df = df.reset_index()
-        dt_col = "Date" if "Date" in df.columns else "Datetime"
+        if df.columns is None or len(df.columns) == 0:
+            return []
+        if "Date" in df.columns:
+            dt_col = "Date"
+        elif "Datetime" in df.columns:
+            dt_col = "Datetime"
+        else:
+            return []
+        required = {"Open", "High", "Low", "Close", "Volume"}
+        if not required.issubset(set(df.columns)):
+            return []
         df = df.rename(columns={dt_col: "dt", "Open": "open", "High": "high",
                                  "Low": "low", "Close": "close", "Volume": "vol"})
         df["amount"] = 0
@@ -669,7 +698,17 @@ class YFinanceSource:
         if df is None or df.empty:
             return []
         df = df.reset_index()
-        dt_col = "Datetime" if "Datetime" in df.columns else "Date"
+        if df.columns is None or len(df.columns) == 0:
+            return []
+        if "Datetime" in df.columns:
+            dt_col = "Datetime"
+        elif "Date" in df.columns:
+            dt_col = "Date"
+        else:
+            return []
+        required = {"Open", "High", "Low", "Close", "Volume"}
+        if not required.issubset(set(df.columns)):
+            return []
         df = df.rename(columns={dt_col: "dt", "Open": "open", "High": "high",
                                  "Low": "low", "Close": "close", "Volume": "vol"})
         df["amount"] = 0
@@ -751,36 +790,44 @@ class USDataSource:
                     *args, **kwargs) -> Optional[List[RawBar]]:
         """
         对单个数据源尝试最多 MAX_RETRIES 次。
-        每次打印详细失败原因（网络/认证/限流/依赖缺失等）。
+        dashboard 模式：仅 log 关键事件（成功/最终失败）。
+        非 dashboard 模式：打印首次尝试 + 最终结果。
         遇到不可恢复错误（依赖缺失/认证错误）立即放弃。
         """
+        from signals.dashboard import get_dashboard
+        dash = get_dashboard()
         name = src.__class__.__name__
         fn = getattr(src, method_name)
+        last_reason = ""
 
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
-                print(f"  [{name}] 第{attempt}次尝试 {label}...", flush=True)
                 bars = fn(*args, **kwargs)
                 if bars:
-                    print(f"  [{name}] {label} 成功 ({len(bars)}根)", flush=True)
+                    if dash:
+                        dash.detail(f"  [{name}] {label} 成功 ({len(bars)}根)")
+                    else:
+                        print(f"  [{name}] {label} 成功 ({len(bars)}根)",
+                              flush=True)
                     return bars
-                print(f"  [{name}] {label} 返回空数据 "
-                      f"({attempt}/{self.MAX_RETRIES})", flush=True)
+                last_reason = "返回空数据"
             except Exception as e:
-                reason = _classify_error(e)
-                print(f"  [{name}] 第{attempt}次失败: {reason} "
-                      f"({attempt}/{self.MAX_RETRIES})", flush=True)
+                last_reason = _classify_error(e)
                 # 依赖未安装 → 不可恢复，立即放弃
                 if type(e).__name__ in _FATAL_ERROR_TYPES:
-                    print(f"  [{name}] 依赖未安装，跳过此数据源", flush=True)
+                    last_reason = "依赖未安装"
                     break
                 # 认证/权限错误 → 不可恢复
-                if "认证/权限" in reason or "配置缺失" in reason:
-                    print(f"  [{name}] {reason.split(':')[0]}，跳过此数据源",
-                          flush=True)
+                if "认证/权限" in last_reason or "配置缺失" in last_reason:
                     break
 
-        print(f"  [{name}] {label} 失败，降级到下一数据源", flush=True)
+        # 最终失败：精简输出（截断长 URL）
+        short_reason = last_reason[:80] + "..." if len(last_reason) > 80 else last_reason
+        msg = f"  [{name}] {label} 失败({short_reason})，降级到下一数据源"
+        if dash:
+            dash.detail(msg)
+        else:
+            print(msg, flush=True)
         return None
 
     def _route(self, method_name: str, label: str,

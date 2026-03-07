@@ -234,6 +234,107 @@ def compute_risk_for_signal(signal: SignalEvent) -> Optional[RiskInfo]:
     )
 
 
+# ─────────────────────────────────────────────────────────
+# 底仓 / 弹性仓位分层
+# ─────────────────────────────────────────────────────────
+
+@dataclass
+class LayeredPosition:
+    """底仓+弹性仓分层建议。"""
+    base_pct: float          # 底仓比例（大级别信号→长持）
+    flex_pct: float          # 弹性仓比例（小级别+均线→波段）
+    flex_buy_ref: str        # 弹性仓买入参考："5周线 2970"
+    flex_sell_ref: str       # 弹性仓卖出参考："前高 3177"
+    rationale: str           # 分层依据说明
+
+
+_LARGE_FREQS = {"日线", "D", "daily", "周线", "W", "weekly"}
+_SMALL_FREQS = {"15分钟", "15min", "F15", "30分钟", "30min", "F30",
+                "5分钟", "5min", "F5", "1分钟", "1min", "F1"}
+
+
+def compute_layered_position(
+    scored: ScoredSymbol,
+    ma_context=None,
+    total_position_pct: float = 0.0,
+) -> Optional[LayeredPosition]:
+    """
+    根据信号级别和均线参照系，将仓位拆分为底仓+弹性仓。
+
+    规则：
+    - 大级别（日线/周线）买信号 → 底仓（长持不动）
+    - 小级别（15M/30M）买信号 → 弹性仓（回合制高抛低吸）
+    - 底仓占比 = 大级别信号贡献比例 × 总仓位
+    - 弹性仓买入参考：MA 支撑位
+    - 弹性仓卖出参考：MA 阻力位 或 前高
+    """
+    if not scored.signals:
+        return None
+
+    buy_sigs = [s for s in scored.signals if "买" in s.signal_type or
+                s.signal_type in ("形态:双底", "形态:头肩底", "形态:上升三角")]
+    if not buy_sigs:
+        return None
+
+    # 如果没给总仓位，用 RiskInfo 计算
+    if total_position_pct <= 0:
+        risk = compute_risk_for_signal(buy_sigs[0])
+        total_position_pct = risk.position_pct if risk else 10.0
+
+    # 区分大小级别信号
+    large_sigs = [s for s in buy_sigs if s.freq in _LARGE_FREQS]
+    small_sigs = [s for s in buy_sigs if s.freq in _SMALL_FREQS]
+
+    # 底仓/弹性仓比例
+    if large_sigs and small_sigs:
+        # 大小级别都有 → 底仓60%, 弹性40%
+        base_ratio = 0.6
+        rationale = f"大级别({','.join(s.freq for s in large_sigs[:2])})持仓 + " \
+                    f"小级别({','.join(s.freq for s in small_sigs[:2])})波段"
+    elif large_sigs:
+        # 只有大级别 → 底仓80%, 弹性20%
+        base_ratio = 0.8
+        rationale = f"大级别({','.join(s.freq for s in large_sigs[:2])})信号为主，少量弹性仓"
+    elif small_sigs:
+        # 只有小级别 → 底仓20%, 弹性80%
+        base_ratio = 0.2
+        rationale = f"小级别({','.join(s.freq for s in small_sigs[:2])})信号为主，以波段为主"
+    else:
+        base_ratio = 0.5
+        rationale = "信号级别未识别，均等分配"
+
+    base_pct = round(total_position_pct * base_ratio, 1)
+    flex_pct = round(total_position_pct * (1 - base_ratio), 1)
+
+    # 弹性仓参考位
+    flex_buy_ref = ""
+    flex_sell_ref = ""
+    if ma_context:
+        # 买入参考：最近支撑位
+        if ma_context.support_levels:
+            s = ma_context.support_levels[0]
+            flex_buy_ref = f"{s.name} {s.value:.0f}({s.distance_pct:+.1f}%)"
+        # 卖出参考：最近阻力位
+        if ma_context.resistance_levels:
+            r = ma_context.resistance_levels[0]
+            flex_sell_ref = f"{r.name} {r.value:.0f}({r.distance_pct:+.1f}%)"
+
+    return LayeredPosition(
+        base_pct=base_pct,
+        flex_pct=flex_pct,
+        flex_buy_ref=flex_buy_ref or "结构支撑位",
+        flex_sell_ref=flex_sell_ref or "结构阻力位",
+        rationale=rationale,
+    )
+
+
+def format_layered_position(lp: LayeredPosition) -> str:
+    """格式化分层仓位输出"""
+    return (f"  [分层] 底仓 {lp.base_pct:.1f}%（长持） + 弹性 {lp.flex_pct:.1f}%（波段）\n"
+            f"         弹性买: {lp.flex_buy_ref}  |  弹性卖: {lp.flex_sell_ref}\n"
+            f"         策略: {lp.rationale}")
+
+
 def enrich_with_risk(scored: ScoredSymbol) -> str:
     """
     为 ScoredSymbol 生成风控行，返回附加文本。

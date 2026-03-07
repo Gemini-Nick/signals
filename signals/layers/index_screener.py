@@ -36,7 +36,8 @@ class IndexScreener:
                  futu_codes: Optional[Dict[str, str]] = None,
                  us_codes: Optional[Dict[str, str]] = None,
                  futu_host: str = "127.0.0.1",
-                 futu_port: int = 11111):
+                 futu_port: int = 11111,
+                 data_source=None):
         import config
         self.ak_codes   = ak_codes   if ak_codes   is not None else config.INDEX_AK_CODES
         self.futu_codes = futu_codes if futu_codes is not None else config.INDEX_FUTU_CODES
@@ -45,6 +46,7 @@ class IndexScreener:
         self.futu_port  = futu_port
         self.analyzers: Dict[str, IndexAnalyzer] = {}
         self._futu_available = False
+        self._data_source = data_source  # 仿真时注入 SimDataSource
 
     # ────────────────────────────────
     # 盘中初始化（滚动窗口）
@@ -58,6 +60,9 @@ class IndexScreener:
         """
         import config
         lb = lookback_days or getattr(config, "INDEX_LOOKBACK_DAYS", 180)
+        # 均线计算需要更多历史数据（10月线需 ~200交易日）
+        ma_lb = getattr(config, "INDEX_MA_LOOKBACK_DAYS", 300)
+        lb = max(lb, ma_lb)
         self._load_ak_indices(lookback_days=lb)
         self._load_futu_indices(lookback_days=lb)
         self._load_us_indices(lookback_days=lb)
@@ -97,7 +102,7 @@ class IndexScreener:
 
         def _load_one(name, sym):
             """加载单只指数的三个周期，返回 (name, IndexAnalyzer)。"""
-            src = AKShareSource()
+            src = self._data_source or AKShareSource()
             if dash:
                 dash.task_start("L1.ak_load", f"{name} ({sym})")
             try:
@@ -185,22 +190,27 @@ class IndexScreener:
         if dash:
             dash.phase_start("L1.futu", total=len(self.futu_codes))
 
-        from signals.data.fetcher import FutuSource
-        futu = FutuSource(self.futu_host, self.futu_port)
-        try:
-            futu.connect()
+        # 仿真模式：直接用注入的数据源，跳过 Futu 连接
+        if self._data_source:
+            futu = self._data_source
             self._futu_available = True
-        except Exception as e:
-            msg = f"  [!] Futu OpenD 连接失败，港股指数跳过：{e}"
-            if dash:
-                dash.log(msg)
-                dash.degradation("Futu", "跳过", str(e))
-                dash.phase_end("L1.futu", detail="连接失败")
-            else:
-                print(msg, flush=True)
-            for name, sym in self.futu_codes.items():
-                self.analyzers[name] = IndexAnalyzer(name, sym, [])
-            return
+        else:
+            from signals.data.fetcher import FutuSource
+            futu = FutuSource(self.futu_host, self.futu_port)
+            try:
+                futu.connect()
+                self._futu_available = True
+            except Exception as e:
+                msg = f"  [!] Futu OpenD 连接失败，港股指数跳过：{e}"
+                if dash:
+                    dash.log(msg)
+                    dash.degradation("Futu", "跳过", str(e))
+                    dash.phase_end("L1.futu", detail="连接失败")
+                else:
+                    print(msg, flush=True)
+                for name, sym in self.futu_codes.items():
+                    self.analyzers[name] = IndexAnalyzer(name, sym, [])
+                return
 
         lb = lookback_days or 180
         try:
@@ -253,7 +263,8 @@ class IndexScreener:
                     else:
                         print(msg, flush=True)
         finally:
-            futu.close()
+            if not self._data_source:
+                futu.close()
 
         if dash:
             dash.phase_end("L1.futu")
@@ -278,20 +289,24 @@ class IndexScreener:
         if dash:
             dash.phase_start("L1.us", total=len(self.us_codes))
 
-        from signals.data.fetcher import FutuSource
-        from signals.data.us_factory import create_us_source
+        # 仿真模式：直接用注入的数据源
+        if self._data_source:
+            us_source = self._data_source
+        else:
+            from signals.data.fetcher import FutuSource
+            from signals.data.us_factory import create_us_source
 
-        # 尝试复用已验证的 Futu 连接（盘中模式下作为 IB 的备选）
-        futu = None
-        if self._futu_available:
-            try:
-                futu = FutuSource(self.futu_host, self.futu_port)
-                futu.connect()
-            except Exception:
-                futu = None
+            # 尝试复用已验证的 Futu 连接（盘中模式下作为 IB 的备选）
+            futu = None
+            if self._futu_available:
+                try:
+                    futu = FutuSource(self.futu_host, self.futu_port)
+                    futu.connect()
+                except Exception:
+                    futu = None
 
-        mode = "review" if start_date else "intraday"
-        us_source = create_us_source(mode, futu_source=futu)
+            mode = "review" if start_date else "intraday"
+            us_source = create_us_source(mode, futu_source=futu)
         lb = lookback_days or 180
 
         try:
@@ -346,7 +361,8 @@ class IndexScreener:
                     else:
                         print(msg, flush=True)
         finally:
-            us_source.close()
+            if not self._data_source:
+                us_source.close()
 
         if dash:
             dash.phase_end("L1.us")

@@ -168,6 +168,15 @@ class IndexAnalyzer:
         f15_last_dt    = (self._f15.bars_raw[-1].dt
                           if self._f15 and self._f15.bars_raw else None)
 
+        # 均线关键位（日线以上，不做分钟线 MA）
+        ma_ctx = None
+        try:
+            from signals.core.ma_levels import compute_ma_levels
+            if self._daily and self._daily.bars_raw:
+                ma_ctx = compute_ma_levels(self._daily.bars_raw, self.symbol)
+        except Exception:
+            pass
+
         # 日线
         d_trend, d_dir, d_sig, d_zs, d_cnt = _build_for(self._daily)
 
@@ -210,4 +219,6 @@ class IndexAnalyzer:
             daily_last_dt=daily_last_dt,
             f15_last_dt=f15_last_dt,
             data_available=True,
+            # 均线关键位
+            ma_context=ma_ctx,
         )

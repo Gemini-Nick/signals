@@ -21,6 +21,7 @@ PHASE_ORDER: List[Tuple[str, str]] = [
     ("L2.supplement", "L2 补充行业"),
     ("L3.init",       "L3 数据加载"),
     ("L3.scan",       "L3 信号检测"),
+    ("L3.review",     "L3 日线复盘"),
     ("feishu",        "飞书推送"),
 ]
 

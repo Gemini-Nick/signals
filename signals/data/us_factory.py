@@ -14,6 +14,16 @@ from typing import Optional
 from .fetcher import USDataSource, FutuSource
 
 
+def _log(msg: str):
+    """Dashboard-aware logging: detail when panel active, print otherwise."""
+    from signals.dashboard import get_dashboard
+    dash = get_dashboard()
+    if dash:
+        dash.detail(msg)
+    else:
+        print(msg, flush=True)
+
+
 def create_us_source(mode: str = "intraday",
                      futu_source: Optional[FutuSource] = None) -> USDataSource:
     """
@@ -43,22 +53,18 @@ def create_us_source(mode: str = "intraday",
             ib = IBSource(config.IB_HOST, config.IB_PORT, config.IB_CLIENT_ID)
             ib.connect()
             providers.append(ib)
-            print(f"  [IBSource] 连接成功 "
-                  f"({config.IB_HOST}:{config.IB_PORT})", flush=True)
+            _log(f"  [IBSource] 连接成功 ({config.IB_HOST}:{config.IB_PORT})")
         except ImportError:
-            print("  [IBSource] 跳过: ib_async 未安装 "
-                  "(pip install ib_async)", flush=True)
+            _log("  [IBSource] 跳过: ib_async 未安装")
         except ConnectionRefusedError:
-            print(f"  [IBSource] 跳过: IB Gateway 未运行 "
-                  f"({config.IB_HOST}:{config.IB_PORT})", flush=True)
+            _log(f"  [IBSource] 跳过: IB Gateway 未运行")
         except Exception as e:
-            print(f"  [IBSource] 跳过: 连接失败 "
-                  f"({type(e).__name__}: {e})", flush=True)
+            _log(f"  [IBSource] 跳过: {type(e).__name__}")
 
         # ── 2. Futu（盘中备选）────────────────────────────
         if futu_source:
             providers.append(futu_source)
-            print("  [FutuSource] 已加入降级链（盘中备选）", flush=True)
+            _log("  [FutuSource] 已加入降级链")
 
     elif mode == "review":
         # ── 1. Alpaca（盘后优先）──────────────────────────
@@ -66,27 +72,24 @@ def create_us_source(mode: str = "intraday",
         alpaca_secret = getattr(config, "ALPACA_SECRET_KEY", "")
 
         if not alpaca_key:
-            print("  [AlpacaSource] 跳过: ALPACA_API_KEY 未配置", flush=True)
+            _log("  [AlpacaSource] 跳过: ALPACA_API_KEY 未配置")
         else:
             try:
                 from .alpaca_source import AlpacaSource
                 alp = AlpacaSource(alpaca_key, alpaca_secret)
                 providers.append(alp)
-                print("  [AlpacaSource] 初始化成功", flush=True)
+                _log("  [AlpacaSource] 初始化成功")
             except ImportError:
-                print("  [AlpacaSource] 跳过: alpaca-py 未安装 "
-                      "(pip install alpaca-py)", flush=True)
+                _log("  [AlpacaSource] 跳过: alpaca-py 未安装")
             except Exception as e:
-                print(f"  [AlpacaSource] 跳过: 初始化失败 "
-                      f"({type(e).__name__}: {e})", flush=True)
+                _log(f"  [AlpacaSource] 跳过: {type(e).__name__}")
 
     else:
-        print(f"  [USDataSource] 未知模式 '{mode}'，使用 yfinance 兜底",
-              flush=True)
+        _log(f"  [USDataSource] 未知模式 '{mode}'，使用 yfinance 兜底")
 
     # 打印最终降级链
     chain_names = [src.__class__.__name__ for src in providers]
     chain_names.append("YFinanceSource(兜底)")
-    print(f"  [USDataSource] 降级链: {' → '.join(chain_names)}", flush=True)
+    _log(f"  [USDataSource] 降级链: {' → '.join(chain_names)}")
 
     return USDataSource(providers=providers)

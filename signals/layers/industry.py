@@ -364,6 +364,18 @@ class IndustryRanking:
     zbgc_count: int = 0                                # 昨涨停续板家数
     sector_type: str = "中性"                           # 防守/进攻/周期/中性
     concept_tags: List[str] = field(default_factory=list)  # 关联的热门概念名
+    oversold_score: float = 0.0                           # 超跌评分(0-100)
+    oversold_detail: str = ""                             # "距高点-18%"
+    rotation_line: str = ""                                # 轮动线: 科技/顺周期/消费/新能源/主题/公用
+
+    @property
+    def display_name(self) -> str:
+        """行业名+属性标签+概念标签（括号化显示）"""
+        _STYPE_ICON = {"防守": "🛡", "进攻": "⚔", "周期": "🔄", "中性": ""}
+        icon = _STYPE_ICON.get(self.sector_type, "")
+        tag = f"[{self.sector_type}{icon}]" if self.sector_type != "中性" else ""
+        concept = f"({'、'.join(self.concept_tags[:3])})" if self.concept_tags else ""
+        return f"{self.name}{tag}{concept}"
 
     @property
     def pool_codes(self) -> List[str]:
@@ -920,6 +932,151 @@ def _load_zbgc_pool(date_str: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────
+# 板块超跌检测
+# ─────────────────────────────────────────────────────────
+
+def compute_oversold_score(bars) -> tuple:
+    """
+    从行业板块日线K线计算超跌评分（满分100）。
+
+    四维度加权：
+    - 距20日高点回撤 (40分): >15%满分, 5~15%线性
+    - 均线偏离度 (30分): 低于20日均线>10%满分, 3~10%线性
+    - 连续下跌天数 (15分): 5天满分, 3天10分, 1~2天线性
+    - RSI超卖 (15分): RSI14<30满分, 30~40线性
+
+    :param bars: List[RawBar] 最近30日板块日线
+    :return: (score, detail_str) — score=0表示不超跌
+    """
+    if not bars or len(bars) < 5:
+        return 0.0, ""
+
+    closes = [b.close for b in bars]
+    latest = closes[-1]
+
+    # 1. 距20日高点回撤 (40分)
+    high_20 = max(closes[-20:]) if len(closes) >= 20 else max(closes)
+    drawdown = (high_20 - latest) / high_20 * 100 if high_20 > 0 else 0
+    if drawdown >= 15:
+        dd_score = 40
+    elif drawdown >= 5:
+        dd_score = (drawdown - 5) / 10 * 40
+    else:
+        dd_score = 0
+
+    # 2. 均线偏离度 (30分) — 低于20日均线的百分比
+    ma20 = sum(closes[-20:]) / min(len(closes), 20) if closes else 0
+    ma_dev = (ma20 - latest) / ma20 * 100 if ma20 > 0 else 0
+    if ma_dev >= 10:
+        ma_score = 30
+    elif ma_dev >= 3:
+        ma_score = (ma_dev - 3) / 7 * 30
+    else:
+        ma_score = 0
+
+    # 3. 连续下跌天数 (15分)
+    consec_down = 0
+    for i in range(len(closes) - 1, 0, -1):
+        if closes[i] < closes[i - 1]:
+            consec_down += 1
+        else:
+            break
+    if consec_down >= 5:
+        cd_score = 15
+    elif consec_down >= 3:
+        cd_score = 10
+    elif consec_down >= 1:
+        cd_score = consec_down * 3
+    else:
+        cd_score = 0
+
+    # 4. RSI14 超卖 (15分)
+    rsi_score = 0
+    if len(closes) >= 15:
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i - 1]
+            gains.append(max(diff, 0))
+            losses.append(max(-diff, 0))
+        # 使用最近14日
+        avg_gain = sum(gains[-14:]) / 14
+        avg_loss = sum(losses[-14:]) / 14
+        if avg_loss > 0:
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+            if rsi < 30:
+                rsi_score = 15
+            elif rsi < 40:
+                rsi_score = (40 - rsi) / 10 * 15
+
+    total = round(dd_score + ma_score + cd_score + rsi_score, 1)
+    detail = f"距高点-{drawdown:.1f}%"
+    if consec_down >= 3:
+        detail += f", 连跌{consec_down}日"
+
+    return total, detail
+
+
+def get_oversold_industries(name_df=None, top_n: int = 5) -> List[IndustryRanking]:
+    """
+    检测超跌行业（取当前跌幅最大的板块，加载K线计算超跌评分）。
+
+    策略：从 name_df 中取涨幅最低的 15 个行业，并行加载30日K线，
+    计算超跌评分，返回评分 >= 40 的 top N。
+
+    :param name_df: stock_board_industry_name_em() 结果
+    :param top_n: 返回前N个超跌行业
+    :return: List[IndustryRanking]（带 oversold_score/oversold_detail）
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if name_df is None or name_df.empty or "涨跌幅" not in name_df.columns:
+        return []
+
+    # 取跌幅最大的 15 个行业作为候选
+    bottom = name_df.sort_values("涨跌幅", ascending=True).head(15)
+    candidates = []
+    for _, row in bottom.iterrows():
+        ind = str(row.get("板块名称", "")).strip()
+        gain = float(row.get("涨跌幅", 0) or 0)
+        if ind:
+            candidates.append((ind, gain))
+
+    if not candidates:
+        return []
+
+    # 并行加载 30 日 K线
+    def _compute_one(ind_name, gain_pct):
+        try:
+            bars = get_industry_bars(ind_name, lookback_days=30)
+            score, detail = compute_oversold_score(bars)
+            from signals.core.rotation import get_rotation_line
+            return IndustryRanking(
+                name=ind_name,
+                gain_pct=gain_pct,
+                sector_type=_classify_industry(ind_name),
+                oversold_score=score,
+                oversold_detail=detail,
+                rotation_line=get_rotation_line(ind_name),
+            )
+        except Exception:
+            return None
+
+    results = []
+    with _no_proxy(), ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(_compute_one, n, g): n for n, g in candidates}
+        for f in as_completed(futures):
+            r = f.result()
+            if r and r.oversold_score >= 40:
+                results.append(r)
+
+    results.sort(key=lambda x: -x.oversold_score)
+    if results:
+        _detail(f"  [✓] 超跌检测: {len(results)} 个行业评分>=40")
+    return results[:top_n]
+
+
+# ─────────────────────────────────────────────────────────
 # 行业综合强度评分
 # ─────────────────────────────────────────────────────────
 
@@ -1095,9 +1252,10 @@ def compute_historical_composite_scores(
 def get_industry_representatives(top_n: int = None,
                                   date_str: str = None) -> Tuple[
         List[IndustryRanking], List[IndustryRanking],
-        List[IndustryRanking], List[ConceptRanking]]:
+        List[IndustryRanking], List[ConceptRanking],
+        List[IndustryRanking]]:
     """
-    双榜合并 + 每行业选出代表股 + 概念板块排行。
+    双榜合并 + 每行业选出代表股 + 概念板块排行 + 超跌检测。
 
     流程：
     1. 加载全部数据源（change_em, name_em, 涨停池, 强势池, 融资, 跌停, 续板, 概念板块）
@@ -1105,15 +1263,17 @@ def get_industry_representatives(top_n: int = None,
     3. 综合强度榜 top N（盘后用5维评分）
     4. 对并集中每个行业，从 6 维度选出代表股
     5. 为每个行业设置 sector_type 和 concept_tags + 概念板块排行
+    6. 超跌检测（盘中模式）
 
     :param top_n:    每个榜取前N名行业
     :param date_str: YYYYMMDD格式日期，None=今天（盘中模式）；
                      传入历史日期则进入盘后模式（跳过 change_em/name_em）
-    :return: (gain_list, composite_list, merged_list, concepts)
+    :return: (gain_list, composite_list, merged_list, concepts, oversold_list)
              gain_list      — 涨幅榜/涨停密度榜 top N（带代表股+标签）
              composite_list — 综合榜 top N（带代表股+标签）
              merged_list    — 并集（去重，带代表股+标签）
              concepts       — 概念板块涨幅排行（带分类标签）
+             oversold_list  — 超跌行业（评分>=40，盘后模式为空）
     """
     import akshare as ak
     import config as _cfg
@@ -1378,6 +1538,7 @@ def get_industry_representatives(top_n: int = None,
             zbgc_count=c.get("zbgc", zbgc_count.get(ind_name, 0)),
             sector_type=stype,
             concept_tags=concept_ind_map.get(ind_name, []),
+            rotation_line=_cfg.ROTATION_LINE_MAP.get(ind_name, ""),
         )
 
     # 概念→行业关联
@@ -1414,5 +1575,12 @@ def get_industry_representatives(top_n: int = None,
         if r.name in concept_map:
             r.concept_tags = concept_map[r.name]
 
+    # ── 6. 超跌检测（盘中模式有 name_df 时）──
+    oversold_list: List[IndustryRanking] = []
+    if not is_historical and name_df is not None:
+        try:
+            oversold_list = get_oversold_industries(name_df)
+        except Exception as e:
+            _detail(f"  [!] 超跌检测失败（{e.__class__.__name__}）")
 
-    return gain_list, composite_list, merged_list, concepts
+    return gain_list, composite_list, merged_list, concepts, oversold_list

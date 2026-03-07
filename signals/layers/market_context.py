@@ -37,20 +37,20 @@ _SENTIMENT_EMOJI = {
 _SHIELD_INDICES = {"上证50", "超大盘"}
 _SWORD_INDICES  = {"创业板指", "科创50", "中证1000"}
 
-# 仓位建议映射
+# 仓位建议映射（含逆向情绪提示）
 _POSITION_MAP = {
-    ("偏空", "恐慌"):  "半仓防守🛡 + 半仓现金💰 等待恐慌释放后埋伏",
+    ("偏空", "恐慌"):  "半仓防守🛡+半仓现金💰 等待恐慌释放后埋伏 ⟵ 逆向：恐慌=底部信号，准备抄底清单",
     ("偏空", "修复"):  "卖出埋伏仓位获利 → 加仓防守🛡（跷跷板切换）",
     ("偏空", "回落"):  "减持半仓防守 → 半仓防守+半仓现金",
-    ("偏空", "亢奋"):  "减仓进攻⚔（反弹非反转），保留防守🛡底仓",
-    ("偏多", "亢奋"):  "减仓进攻⚔ → 增持防守🛡对冲（防大跌）",
+    ("偏空", "亢奋"):  "减仓进攻⚔（反弹非反转），保留防守🛡底仓 ⟵ 逆向：偏空+亢奋=反弹卖点",
+    ("偏多", "亢奋"):  "减仓进攻⚔ → 增持防守🛡对冲（防大跌） ⟵ 逆向：亢奋=离场信号，切勿追高",
     ("偏多", "修复"):  "维持进攻⚔为主 + 关注超跌反弹方向",
-    ("偏多", "恐慌"):  "恐慌即机会 → 逢低加仓进攻⚔",
+    ("偏多", "恐慌"):  "恐慌即机会 → 逢低加仓进攻⚔ ⟵ 逆向：偏多+恐慌=黄金坑",
     ("偏多", "回落"):  "正常回调 → 持仓等待，不追高",
-    ("分化", "恐慌"):  "防守🛡为主 + 少量现金💰，等方向明确",
+    ("分化", "恐慌"):  "防守🛡为主+少量现金💰，等方向明确 ⟵ 逆向：恐慌中观察谁先企稳",
     ("分化", "修复"):  "均衡配置 → 关注跷跷板轮动",
-    ("分化", "亢奋"):  "均衡配置 → 适度减仓锁利",
-    ("分化", "回落"):  "均衡配置 → 关注防守⚔进攻跷跷板轮动",
+    ("分化", "亢奋"):  "均衡配置 → 适度减仓锁利 ⟵ 逆向：亢奋分化=轮动加速",
+    ("分化", "回落"):  "均衡配置 → 关注防守🛡进攻⚔跷跷板轮动",
 }
 
 
@@ -162,6 +162,10 @@ class MarketContext:
     position_suggestion: str = ""          # 仓位建议
     shield_sectors: List[str] = field(default_factory=list)   # 防守板块
     sword_sectors: List[str] = field(default_factory=list)    # 进攻板块
+    # 轮动阶段
+    rotation_stage: str = ""              # "科技领涨" / "顺周期领涨" / "消费领涨" / "混沌"
+    rotation_detail: str = ""             # 分布详情
+    allocation_suggestion: str = ""       # "配置建议（科技领涨+修复）: 科技40% | ..."
 
     # ─────────────────────────────────────────────────────
     # 情绪周期更新（L2 数据可用后调用）
@@ -248,7 +252,7 @@ class MarketContext:
         return f"{r.latest_price:.2f}" if r.latest_price else ""
 
     def _index_lines(self) -> List[str]:
-        """每行：名称 | 日↑ 30→ 15↓ | 信号 | 中枢 | 价格"""
+        """每行：名称 | 日↑ 30→ 15↓ | 信号 | 中枢 | 价格 + 关键价位"""
         lines = []
         for r in self.reports:
             if not r.data_available:
@@ -262,6 +266,15 @@ class MarketContext:
             zs    = self._fmt_zs(r)
             price = self._fmt_price(r)
             lines.append(f"  {name}  {trend}  {sigs:<22}  {zs:<14}  {price}")
+            # 均线关键位（第二行）
+            if r.ma_context:
+                try:
+                    from signals.core.ma_levels import format_key_levels
+                    kl = format_key_levels(r.ma_context)
+                    if kl:
+                        lines.append(f"  {'':5}{kl}")
+                except Exception:
+                    pass
         return lines
 
     # ─────────────────────────────────────────────────────
@@ -358,6 +371,13 @@ class MarketContext:
         if self.position_suggestion:
             lines.append(f"  💡 {self.position_suggestion}")
 
+        # 轮动阶段 + 配置建议
+        if self.rotation_stage:
+            lines.append(f"  🔄 {self.rotation_detail}" if self.rotation_detail
+                         else f"  🔄 轮动: {self.rotation_stage}")
+        if self.allocation_suggestion:
+            lines.append(f"  📦 {self.allocation_suggestion}")
+
         # 攻防板块
         if self.shield_sectors or self.sword_sectors:
             parts = []
@@ -453,12 +473,28 @@ class MarketContext:
             # 三级共振特别标注
             star = " [★三级共振]" if r.three_level_aligned else ""
             lines.append(f"{r.name.ljust(5)}  {trend}  {sigs}{star}  {zs}  {price}")
+            # 均线关键位
+            if r.ma_context:
+                try:
+                    from signals.core.ma_levels import format_key_levels
+                    kl = format_key_levels(r.ma_context)
+                    if kl:
+                        lines.append(f"       {kl}")
+                except Exception:
+                    pass
 
         lines.append("─" * 36)
 
         # 仓位建议
         if self.position_suggestion:
             lines.append(f"仓位: {self.position_suggestion}")
+
+        # 轮动阶段 + 配置建议
+        if self.rotation_stage:
+            lines.append(f"轮动: {self.rotation_stage}" +
+                         (f" ({self.rotation_detail})" if self.rotation_detail else ""))
+        if self.allocation_suggestion:
+            lines.append(self.allocation_suggestion)
 
         # 三级共振
         aligned = [r.name for r in self.reports
@@ -539,6 +575,15 @@ class MarketContext:
             price = self._fmt_price(r)
             star = " **★三级共振**" if r.three_level_aligned else ""
             l1_lines.append(f"**{r.name}**  {trend}  {sigs}{star}  {zs}  {price}")
+            # 均线关键位
+            if r.ma_context:
+                try:
+                    from signals.core.ma_levels import format_key_levels
+                    kl = format_key_levels(r.ma_context)
+                    if kl:
+                        l1_lines.append(f"  {kl}")
+                except Exception:
+                    pass
         l1_lines.append("")
 
         # 综合结论 + 情绪周期
@@ -554,6 +599,15 @@ class MarketContext:
         # 仓位建议
         if self.position_suggestion:
             l1_lines.append(f"💡 {self.position_suggestion}")
+
+        # 轮动阶段 + 配置建议
+        if self.rotation_stage:
+            rot_str = f"🔄 **{self.rotation_stage}**"
+            if self.rotation_detail:
+                rot_str += f"（{self.rotation_detail}）"
+            l1_lines.append(rot_str)
+        if self.allocation_suggestion:
+            l1_lines.append(f"📦 {self.allocation_suggestion}")
 
         # 攻防板块
         if self.shield_sectors or self.sword_sectors:
@@ -585,19 +639,18 @@ class MarketContext:
             "text": {"tag": "lark_md", "content": "\n".join(l1_lines)}
         })
 
-        # ── L2 行业排行（含属性标签）──
-        _STYPE_ICON = {"防守": "🛡", "进攻": "⚔", "周期": "🔄", "中性": ""}
+        # ── L2 行业排行（含属性标签+概念标签）──
         if l2_gain or l2_composite:
             elements.append({"tag": "hr"})
             l2_lines = []
             if l2_gain:
                 top3 = ", ".join(
-                    f"**{r.name}**{_STYPE_ICON.get(r.sector_type, '')}({r.gain_pct:+.1f}%)"
+                    f"**{r.display_name}**({r.gain_pct:+.1f}%)"
                     for r in l2_gain[:3])
                 l2_lines.append(f"📊 涨幅榜: {top3}")
             if l2_composite:
                 top3 = ", ".join(
-                    f"**{r.name}**{_STYPE_ICON.get(r.sector_type, '')}({r.composite_score:.0f}分)"
+                    f"**{r.display_name}**({r.composite_score:.0f}分)"
                     for r in l2_composite[:3])
                 l2_lines.append(f"🏆 综合榜: {top3}")
             elements.append({
@@ -871,16 +924,13 @@ def build_market_context(
 
     summary = " ".join(summary_parts)
 
-    # ── 情绪周期 & 分化度 ─────────────────────────────
-    divergence = calc_divergence(reports)
-    phase = detect_sentiment_phase(divergence)
-    pos_suggest = get_position_suggestion(overall_direction, phase)
-
-    # 防守/进攻板块（从指数趋势推断）
-    shield = [r.name for r in available
-              if r.name in _SHIELD_INDICES and r.daily_trend == "上涨趋势"]
-    sword  = [r.name for r in available
-              if r.name in _SWORD_INDICES  and r.daily_trend == "上涨趋势"]
+    # 防守/进攻板块（从指数趋势推断，可被外部参数覆盖）
+    shield = (shield_sectors if shield_sectors is not None
+              else [r.name for r in available
+                    if r.name in _SHIELD_INDICES and r.daily_trend == "上涨趋势"])
+    sword = (sword_sectors if sword_sectors is not None
+             else [r.name for r in available
+                   if r.name in _SWORD_INDICES and r.daily_trend == "上涨趋势"])
 
     return MarketContext(
         reports=reports,
@@ -898,7 +948,7 @@ def build_market_context(
         summary=summary,
         sentiment_phase=phase.value,
         divergence_score=divergence,
-        position_suggestion=pos_suggest,
+        position_suggestion=pos_suggestion,
         shield_sectors=shield,
         sword_sectors=sword,
     )

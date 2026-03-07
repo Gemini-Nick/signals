@@ -35,6 +35,7 @@ def detect_all_signals(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
     signals.extend(_detect_third_bs(czsc_obj, symbol))
     signals.extend(_detect_divergence(czsc_obj, symbol))
     signals.extend(_detect_trend(czsc_obj, symbol))
+    signals.extend(_detect_patterns(czsc_obj, symbol))
     return signals
 
 
@@ -285,5 +286,217 @@ def _detect_trend(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
                 price=last_bi.high,
                 details=f"内置趋势信号: {key}={value}",
             ))
+
+    return signals
+
+
+# ─────────────────────────────────────────────────────────
+# 经典形态识别（1期：双头双底 + 头肩 + 三角形）
+# ─────────────────────────────────────────────────────────
+
+def _near(a: float, b: float, tol_pct: float = 2.0) -> bool:
+    """判断两个价格是否接近（容差 tol_pct%）"""
+    return abs(a - b) / (max(abs(a), abs(b)) + 1e-9) * 100 < tol_pct
+
+
+def _detect_patterns(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
+    """
+    经典形态识别（Phase 1）：
+    - 双头(M顶) / 双底(W底)：5+ 笔
+    - 头肩顶 / 头肩底：7+ 笔
+    - 上升三角 / 下降三角：7+ 笔
+    """
+    bis = czsc_obj.finished_bis
+    signals: List[SignalEvent] = []
+    freq_val = czsc_obj.freq.value
+
+    # ── 双头 / 双底（需要 5+ 笔）──
+    if len(bis) >= 5:
+        signals.extend(_detect_double_top_bottom(bis, symbol, freq_val))
+
+    # ── 头肩顶 / 头肩底（需要 7+ 笔）──
+    if len(bis) >= 7:
+        signals.extend(_detect_head_shoulders(bis, symbol, freq_val))
+
+    # ── 上升/下降三角（需要 7+ 笔）──
+    if len(bis) >= 7:
+        signals.extend(_detect_triangle(bis, symbol, freq_val))
+
+    return signals
+
+
+def _detect_double_top_bottom(bis, symbol: str, freq_val: str) -> List[SignalEvent]:
+    """
+    双头(M顶)：两次上攻高点近似，第二次力度衰减后回落。
+    双底(W底)：两次下跌低点近似，第二次力度衰减后反弹。
+
+    结构（5笔）：
+    双头: b1↑ b2↓ b3↑ b4↓ b5  — b1.high ≈ b3.high（<2%），b3力度 < b1
+    双底: b1↓ b2↑ b3↓ b4↑ b5  — b1.low ≈ b3.low（<2%），b3力度 < b1
+    """
+    signals = []
+    b1, b2, b3, b4, b5 = bis[-5], bis[-4], bis[-3], bis[-2], bis[-1]
+
+    # ── 双头(M顶) ──
+    if (b1.direction == Direction.Up and
+            b3.direction == Direction.Up and
+            b5.direction == Direction.Down and
+            _near(b1.high, b3.high, 2.0)):
+        # 力度衰减：b3 力度 < b1 力度
+        power_weaken = b3.power_price < b1.power_price
+        # 颈线：b2 低点
+        neckline = b2.low
+        # 确认：b4 跌破颈线
+        broken = b4.low < neckline
+        if power_weaken and broken:
+            drop_pct = (b3.high - b4.low) / (b3.high + 1e-9) * 100
+            signals.append(SignalEvent(
+                symbol=symbol, freq=freq_val,
+                dt=b5.sdt, signal_type="形态:双头",
+                confidence=0.70,
+                price=b4.low,
+                details=f"双峰 {b1.high:.2f}≈{b3.high:.2f}，"
+                        f"颈线 {neckline:.2f} 已破，跌 {drop_pct:.1f}%",
+            ))
+
+    # ── 双底(W底) ──
+    if (b1.direction == Direction.Down and
+            b3.direction == Direction.Down and
+            b5.direction == Direction.Up and
+            _near(b1.low, b3.low, 2.0)):
+        power_weaken = b3.power_price < b1.power_price
+        neckline = b2.high
+        broken = b4.high > neckline
+        if power_weaken and broken:
+            rise_pct = (b4.high - b3.low) / (b3.low + 1e-9) * 100
+            signals.append(SignalEvent(
+                symbol=symbol, freq=freq_val,
+                dt=b5.sdt, signal_type="形态:双底",
+                confidence=0.70,
+                price=b4.high,
+                details=f"双谷 {b1.low:.2f}≈{b3.low:.2f}，"
+                        f"颈线 {neckline:.2f} 已破，涨 {rise_pct:.1f}%",
+            ))
+
+    return signals
+
+
+def _detect_head_shoulders(bis, symbol: str, freq_val: str) -> List[SignalEvent]:
+    """
+    头肩顶：三峰结构，中间峰（头部）最高，两侧肩部近似。
+    头肩底：三谷结构，中间谷（头部）最低，两侧肩部近似。
+
+    结构（7笔）：
+    头肩顶: b1↑ b2↓ b3↑ b4↓ b5↑ b6↓ b7
+            b3.high > b1.high（头>左肩），b5.high < b3.high（右肩<头）
+            b1.high ≈ b5.high（左右肩近似，容差5%）
+    头肩底: 对称镜像
+    """
+    signals = []
+    b1, b2, b3, b4, b5, b6, b7 = bis[-7], bis[-6], bis[-5], bis[-4], bis[-3], bis[-2], bis[-1]
+
+    # ── 头肩顶 ──
+    if (b1.direction == Direction.Up and
+            b3.direction == Direction.Up and
+            b5.direction == Direction.Up and
+            b3.high > b1.high and           # 头 > 左肩
+            b5.high < b3.high and           # 右肩 < 头
+            _near(b1.high, b5.high, 5.0)):  # 左右肩近似
+        neckline = min(b2.low, b4.low)
+        power_decay = b5.power_price < b3.power_price
+        broken = b6.low < neckline or b7.low < neckline
+        if power_decay and broken:
+            signals.append(SignalEvent(
+                symbol=symbol, freq=freq_val,
+                dt=b7.sdt, signal_type="形态:头肩顶",
+                confidence=0.75,
+                price=neckline,
+                details=f"左肩 {b1.high:.2f} 头 {b3.high:.2f} "
+                        f"右肩 {b5.high:.2f}，颈线 {neckline:.2f} 已破",
+            ))
+
+    # ── 头肩底 ──
+    if (b1.direction == Direction.Down and
+            b3.direction == Direction.Down and
+            b5.direction == Direction.Down and
+            b3.low < b1.low and             # 头 < 左肩
+            b5.low > b3.low and             # 右肩 > 头
+            _near(b1.low, b5.low, 5.0)):    # 左右肩近似
+        neckline = max(b2.high, b4.high)
+        power_decay = b5.power_price < b3.power_price
+        broken = b6.high > neckline or b7.high > neckline
+        if power_decay and broken:
+            signals.append(SignalEvent(
+                symbol=symbol, freq=freq_val,
+                dt=b7.sdt, signal_type="形态:头肩底",
+                confidence=0.75,
+                price=neckline,
+                details=f"左肩 {b1.low:.2f} 头 {b3.low:.2f} "
+                        f"右肩 {b5.low:.2f}，颈线 {neckline:.2f} 已破",
+            ))
+
+    return signals
+
+
+def _detect_triangle(bis, symbol: str, freq_val: str) -> List[SignalEvent]:
+    """
+    上升三角：顶部平坦（阻力），底部递升（支撑上移）。
+    下降三角：底部平坦（支撑），顶部递降（阻力下移）。
+
+    使用最近7笔中的向上/向下笔分别提取高低点分析。
+    """
+    signals = []
+    recent = bis[-7:]
+
+    up_bis = [b for b in recent if b.direction == Direction.Up]
+    down_bis = [b for b in recent if b.direction == Direction.Down]
+
+    if len(up_bis) < 3 or len(down_bis) < 3:
+        return signals
+
+    up_highs = [b.high for b in up_bis]
+    down_lows = [b.low for b in down_bis]
+
+    # ── 上升三角 ──
+    flat_top = all(_near(h, up_highs[0], 2.0) for h in up_highs[1:])
+    rising_lows = all(down_lows[i] >= down_lows[i - 1] * 0.99
+                      for i in range(1, len(down_lows)))
+    meaningful_rise = (down_lows[-1] - down_lows[0]) / (down_lows[0] + 1e-9) * 100 > 1.0
+
+    if flat_top and rising_lows and meaningful_rise:
+        resistance = max(up_highs)
+        last_bi = bis[-1]
+        near_breakout = last_bi.direction == Direction.Up and last_bi.high >= resistance * 0.98
+        conf = 0.75 if near_breakout else 0.60
+        signals.append(SignalEvent(
+            symbol=symbol, freq=freq_val,
+            dt=last_bi.edt, signal_type="形态:上升三角",
+            confidence=conf,
+            price=resistance,
+            details=f"阻力 {resistance:.2f}（平顶），"
+                    f"低点递升 {down_lows[0]:.2f}→{down_lows[-1]:.2f}"
+                    + ("，接近突破" if near_breakout else ""),
+        ))
+
+    # ── 下降三角 ──
+    flat_bottom = all(_near(l, down_lows[0], 2.0) for l in down_lows[1:])
+    falling_highs = all(up_highs[i] <= up_highs[i - 1] * 1.01
+                        for i in range(1, len(up_highs)))
+    meaningful_fall = (up_highs[0] - up_highs[-1]) / (up_highs[0] + 1e-9) * 100 > 1.0
+
+    if flat_bottom and falling_highs and meaningful_fall:
+        support = min(down_lows)
+        last_bi = bis[-1]
+        near_breakdown = last_bi.direction == Direction.Down and last_bi.low <= support * 1.02
+        conf = 0.75 if near_breakdown else 0.60
+        signals.append(SignalEvent(
+            symbol=symbol, freq=freq_val,
+            dt=last_bi.edt, signal_type="形态:下降三角",
+            confidence=conf,
+            price=support,
+            details=f"支撑 {support:.2f}（平底），"
+                    f"高点递降 {up_highs[0]:.2f}→{up_highs[-1]:.2f}"
+                    + ("，接近破位" if near_breakdown else ""),
+        ))
 
     return signals

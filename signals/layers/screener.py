@@ -31,12 +31,14 @@ class IntraDayScreener:
         freqs: Optional[List[str]] = None,
         max_workers: int = 12,
         notes: Optional[List] = None,
+        data_source=None,
     ):
         self.symbols: List[str] = list(symbols or WHITELIST)
         self.freqs: List[str] = list(freqs or MONITOR_FREQS)
         self.czsc_freqs: List[Freq] = [config_freq_to_czsc(f) for f in self.freqs]
         self.max_workers = max_workers
-        self.ak_source = AKShareSource()
+        self.ak_source = data_source or AKShareSource()
+        self._sim_source = data_source  # 仿真模式数据源
         # TODO: Tushare 充值后恢复以下三行
         # self._ts_source: Optional[TushareSource] = None
         # self._ts_failed: bool = False
@@ -97,6 +99,10 @@ class IntraDayScreener:
         # 从 API 获取最新分钟线
         fresh = self._fetch_minute_bars_api(sym, freq)
 
+        # 仿真模式：不写入实盘 MinuteCache，直接返回
+        if self._sim_source:
+            return fresh
+
         # 缓存层：合并新数据 + 读取全量
         try:
             from signals.data.minute_cache import MinuteCache
@@ -114,6 +120,10 @@ class IntraDayScreener:
 
     def _fetch_minute_bars_api(self, sym: str, freq: Freq) -> List:
         """原始 API 获取逻辑（不含缓存）。"""
+        # 仿真模式：直接从仿真数据源读取，跳过降级链
+        if self._sim_source:
+            return self._sim_source.get_a_minute(sym, freq) or []
+
         from signals.dashboard import get_dashboard
         dash = get_dashboard()
 

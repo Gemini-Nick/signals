@@ -16,6 +16,10 @@ SIGNAL_WEIGHTS = {
     "一卖":  -40,
     "背驰卖": -35,
     "趋势卖": -30,
+    # 经典形态（辅助参考，约缠论的 1/4~1/3 权重）
+    "形态:头肩顶": -15,  "形态:头肩底": 15,
+    "形态:双头":   -10,  "形态:双底":   10,
+    "形态:上升三角": 10,  "形态:下降三角": -10,
 }
 
 # 级别系数：大级别信号权重更高，小级别适当折扣
@@ -68,6 +72,7 @@ class ScoredSymbol:
     signals: List[SignalEvent]
     details: str
     direction: str = ""   # "偏多" / "偏空" / "分歧" / ""
+    ma_confirmation: str = ""  # 均线交叉确认描述
 
 
 def _time_decay(sig_dt, ref_dt=None, half_life_days: float = 30.0) -> float:
@@ -98,10 +103,12 @@ def _time_decay(sig_dt, ref_dt=None, half_life_days: float = 30.0) -> float:
 
 
 def score_signals(symbol: str, signals: List[SignalEvent],
-                  enable_decay: bool = True) -> ScoredSymbol:
+                  enable_decay: bool = True,
+                  ma_context=None) -> ScoredSymbol:
     """
     对单个标的的所有信号计算综合评分。
     enable_decay=True 时启用时间衰减（默认开启）。
+    ma_context: 可选 MAContext，用于均线+缠论交叉确认加分。
     """
     if not signals:
         return ScoredSymbol(
@@ -118,9 +125,9 @@ def score_signals(symbol: str, signals: List[SignalEvent],
         decay = _time_decay(sig.dt) if enable_decay else 1.0
         contribution = base * sig.confidence * freq_mult * decay
         total += contribution
-        if "买" in sig.signal_type:
+        if "买" in sig.signal_type or base > 0:
             buy_total += abs(contribution)
-        elif "卖" in sig.signal_type:
+        elif "卖" in sig.signal_type or base < 0:
             sell_total += abs(contribution)
 
     # 多级别共振加分：根据共振的级别组合差异化加分
@@ -164,6 +171,33 @@ def score_signals(symbol: str, signals: List[SignalEvent],
     if direction == "分歧":
         details_lines.append(f"  [分歧] 买力={buy_total:.1f} vs 卖力={sell_total:.1f}，方向不明确")
 
+    # ── 均线+缠论交叉确认 ──
+    ma_conf = ""
+    if ma_context and buy_total > 0:
+        # 买信号 + 均线支撑位附近(<2%): +15分
+        near_support = any(
+            abs(lv.distance_pct) < 2.0 and lv.position in ("下方", "贴合")
+            for lv in (ma_context.support_levels or [])
+        )
+        if near_support:
+            total += 15
+            nearest = ma_context.support_levels[0] if ma_context.support_levels else None
+            ref = f"{nearest.name} {nearest.value:.0f}" if nearest else "支撑位"
+            ma_conf = f"回踩{ref}确认"
+            details_lines.append(f"  [均线+15] 买信号+均线支撑确认({ref})")
+
+        # 买信号 + 均线多头排列: +10分
+        if ma_context.trend_summary == "多头排列":
+            total += 10
+            ma_conf = (ma_conf + "+多头" if ma_conf else "多头排列")
+            details_lines.append("  [均线+10] 均线多头排列")
+
+        # 买信号 + 均线空头排列: -5分（逆势）
+        elif ma_context.trend_summary == "空头排列":
+            total -= 5
+            ma_conf = (ma_conf + " 逆势⚠" if ma_conf else "逆势买入⚠")
+            details_lines.append("  [均线-5] 均线空头排列，逆势买入")
+
     return ScoredSymbol(
         symbol=symbol,
         total_score=round(total, 1),
@@ -171,4 +205,5 @@ def score_signals(symbol: str, signals: List[SignalEvent],
         signals=signals,
         details="\n".join(details_lines),
         direction=direction,
+        ma_confirmation=ma_conf,
     )

@@ -223,7 +223,8 @@ class Dashboard:
         """停止面板，输出最终汇总"""
         with self._lock:
             self._state.is_done = True
-        self._renderer.stop()
+        if not self._paused:
+            self._renderer.stop()
         self._estimator.save()
         self._renderer.print_summary(self._state, self._estimator)
 

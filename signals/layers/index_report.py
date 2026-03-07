@@ -54,6 +54,9 @@ class IndexReport:
     data_available: bool = True
     summary: str = ""
 
+    # ── 均线关键位（P0-1）──────────────────────────────────
+    ma_context: Optional[object] = None        # MAContext，日线以上均线关键位
+
     def __post_init__(self):
         if not self.summary and self.data_available:
             all_signals = [self.daily_latest_signal,
