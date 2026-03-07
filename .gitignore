@@ -31,3 +31,7 @@ notes/**/*.meta.yaml
 
 # 缓存
 .cache/
+
+# Node.js (docx生成脚本依赖)
+node_modules/
+package-lock.json
