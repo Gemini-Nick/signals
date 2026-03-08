@@ -289,6 +289,9 @@ class ParameterSpace:
         # 整数参数保持整数
         if isinstance(spec.getter(), int):
             val = int(round(val))
+        else:
+            # 浮点参数保留合理精度
+            val = round(val, 2)
         return val
 
     # ── 验证 ─────────────────────────────────────────────
