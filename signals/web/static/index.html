@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="tradingview">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>隆小侠 LONG CLAW</title>
+  <link rel="stylesheet" href="/static/css/themes.css">
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-logo">LONG CLAW</div>
+    <div class="header-actions">
+      <button class="header-btn" id="theme-toggle" title="Anthropic / TradingView">&#9684;</button>
+      <button class="header-btn" id="refresh-btn" title="刷新数据">&#8635;</button>
+    </div>
+  </header>
+
+  <!-- Navigation -->
+  <nav class="nav-tabs">
+    <div class="nav-tab active" data-page="dashboard">市况总览</div>
+    <div class="nav-tab" data-page="chart">图表</div>
+  </nav>
+
+  <!-- Pages -->
+  <main>
+    <!-- Page 1: Dashboard -->
+    <div id="page-dashboard" class="page active">
+      <div id="banner" class="banner neutral">
+        <div class="banner-direction" id="banner-direction">加载中...</div>
+        <div class="banner-suggestion" id="banner-suggestion"></div>
+      </div>
+
+      <!-- A股指数 -->
+      <div class="section-title">A股</div>
+      <div class="cards-grid" id="cards-a"></div>
+
+      <!-- 港股指数 -->
+      <div class="section-title">港股</div>
+      <div class="cards-grid" id="cards-hk"></div>
+
+      <!-- 美股指数 -->
+      <div class="section-title">美股</div>
+      <div class="cards-grid" id="cards-us"></div>
+
+      <!-- 今日信号 -->
+      <div class="section-title">今日信号</div>
+      <div class="signal-list" id="signal-list">
+        <div class="empty-state">暂无信号数据</div>
+      </div>
+    </div>
+
+    <!-- Page 2: Chart -->
+    <div id="page-chart" class="page">
+      <div class="chart-header">
+        <button class="back-btn" id="chart-back">&larr;</button>
+        <div class="chart-title" id="chart-title">选择一个指数</div>
+        <div class="freq-group">
+          <button class="freq-btn" data-freq="daily">日线</button>
+          <button class="freq-btn" data-freq="30min">30M</button>
+          <button class="freq-btn" data-freq="15min">15M</button>
+        </div>
+      </div>
+
+      <div class="chart-container" id="chart-container" style="height: 500px;"></div>
+
+      <!-- Signal Details -->
+      <div class="signal-details" id="signal-details">
+        <div class="signal-details-header" id="signal-details-toggle">
+          信号详情 <span id="signal-details-arrow">&#9660;</span>
+        </div>
+        <div class="signal-details-body" id="signal-details-body"></div>
+      </div>
+
+      <!-- Summary Bar -->
+      <div class="chart-summary" id="chart-summary"></div>
+    </div>
+  </main>
+
+  <!-- TradingView Lightweight Charts v4 -->
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+
+  <!-- App Scripts -->
+  <script src="/static/js/app.js"></script>
+  <script src="/static/js/dashboard.js"></script>
+  <script src="/static/js/chart.js"></script>
+
+</body>
+</html>

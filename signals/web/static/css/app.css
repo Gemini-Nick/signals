@@ -1,0 +1,483 @@
+/* ═══════════════════════════════════════════════════
+   🐲 隆小侠 — 布局与组件样式
+   所有颜色通过 var() 引用 themes.css，主题无关
+   ═══════════════════════════════════════════════════ */
+
+/* ── Reset & Base ──────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  font-family: var(--font-family);
+  font-size: 14px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Header ────────────────────────────────────────── */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary);
+}
+
+.header-logo {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: 0.5px;
+}
+
+.header-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.header-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.header-btn:hover {
+  border-color: var(--text-secondary);
+  color: var(--text-primary);
+}
+
+/* ── Navigation Tabs ───────────────────────────────── */
+.nav-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-secondary);
+  padding: 0 20px;
+}
+
+.nav-tab {
+  padding: 10px 20px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  font-size: 13px;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.nav-tab:hover {
+  color: var(--text-primary);
+}
+
+.nav-tab.active {
+  color: var(--text-primary);
+  border-bottom-color: var(--accent);
+}
+
+/* ── Page Container ────────────────────────────────── */
+.page {
+  display: none;
+  padding: 20px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.page.active {
+  display: block;
+}
+
+/* ── Banner (建议条) ──────────────────────────────── */
+.banner {
+  padding: 16px 20px;
+  border-radius: 8px;
+  margin-bottom: 24px;
+  border: 1px solid var(--border);
+}
+
+.banner.bullish { background: var(--banner-bullish); }
+.banner.bearish { background: var(--banner-bearish); }
+.banner.neutral { background: var(--banner-neutral); }
+
+.banner-direction {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.banner-suggestion {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+/* ── Section Headers ───────────────────────────────── */
+.section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin: 20px 0 12px;
+}
+
+/* ── Index Cards Grid ──────────────────────────────── */
+.cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.index-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.index-card:hover {
+  border-color: var(--text-muted);
+  background: var(--bg-tertiary);
+}
+
+.card-name {
+  font-size: 14px;
+  font-weight: 500;
+  margin-bottom: 6px;
+  color: var(--text-primary);
+}
+
+.card-trend {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.card-trend.up   { color: var(--color-up); }
+.card-trend.down { color: var(--color-down); }
+.card-trend.flat { color: var(--color-flat); }
+
+.card-signal {
+  font-size: 11px;
+  margin-top: 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  display: inline-block;
+  background: rgba(247, 147, 26, 0.15);
+  color: var(--signal-badge);
+}
+
+/* ── Signal List ───────────────────────────────────── */
+.signal-list {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.signal-row {
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.signal-row:last-child {
+  border-bottom: none;
+}
+
+.signal-row:hover {
+  background: var(--bg-tertiary);
+}
+
+.signal-rank {
+  width: 28px;
+  font-size: 13px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.signal-symbol {
+  flex: 1;
+  min-width: 0;
+}
+
+.signal-symbol-code {
+  font-size: 13px;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+}
+
+.signal-symbol-name {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.signal-score {
+  font-size: 16px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  margin: 0 16px;
+  min-width: 40px;
+  text-align: right;
+}
+
+.signal-type {
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  margin: 0 8px;
+  white-space: nowrap;
+}
+
+.signal-type.buy {
+  background: rgba(247, 147, 26, 0.15);
+  color: var(--signal-buy);
+}
+
+.signal-type.sell {
+  background: rgba(156, 39, 176, 0.15);
+  color: var(--signal-sell);
+}
+
+.signal-direction {
+  font-size: 12px;
+  min-width: 40px;
+  text-align: center;
+}
+
+.signal-direction.bullish { color: var(--color-up); }
+.signal-direction.bearish { color: var(--color-down); }
+
+.signal-arrow {
+  color: var(--text-muted);
+  font-size: 16px;
+  margin-left: 8px;
+}
+
+/* ── Chart Page ────────────────────────────────────── */
+.chart-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.back-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 18px;
+  padding: 4px 8px;
+}
+
+.back-btn:hover {
+  color: var(--text-primary);
+}
+
+.chart-title {
+  font-size: 16px;
+  font-weight: 600;
+  flex: 1;
+}
+
+.freq-group {
+  display: flex;
+  gap: 4px;
+}
+
+.freq-btn {
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  transition: all 0.15s;
+}
+
+.freq-btn:hover {
+  border-color: var(--text-muted);
+  color: var(--text-primary);
+}
+
+.freq-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.chart-container {
+  background: var(--chart-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+
+/* ── Signal Details Panel ──────────────────────────── */
+.signal-details {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.signal-details-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.signal-details-header:hover {
+  color: var(--text-primary);
+}
+
+.signal-details-body {
+  padding: 0 16px 16px;
+  display: none;
+}
+
+.signal-details-body.open {
+  display: block;
+}
+
+.detail-item {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.detail-item:last-child {
+  border-bottom: none;
+}
+
+.detail-freq {
+  font-family: var(--font-mono);
+  color: var(--accent-blue);
+  font-size: 12px;
+}
+
+.detail-type {
+  font-weight: 500;
+}
+
+.detail-desc {
+  color: var(--text-secondary);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+/* ── Chart Summary Bar ─────────────────────────────── */
+.chart-summary {
+  display: flex;
+  gap: 24px;
+  padding: 12px 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-top: 12px;
+  font-size: 13px;
+}
+
+.summary-item {
+  color: var(--text-secondary);
+}
+
+.summary-value {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+/* ── Loading / Empty States ────────────────────────── */
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 200px;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+.skeleton {
+  background: var(--bg-tertiary);
+  border-radius: 4px;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.empty-state {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--text-muted);
+}
+
+/* ── Responsive ────────────────────────────────────── */
+@media (max-width: 768px) {
+  .cards-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .page {
+    padding: 12px;
+  }
+
+  .header {
+    padding: 10px 12px;
+  }
+
+  .nav-tabs {
+    padding: 0 12px;
+    overflow-x: auto;
+  }
+
+  .chart-header {
+    flex-wrap: wrap;
+  }
+
+  .chart-summary {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  .signal-row {
+    padding: 10px 12px;
+  }
+}
+
+@media (max-width: 480px) {
+  .cards-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+  }
+
+  .index-card {
+    padding: 10px;
+  }
+}

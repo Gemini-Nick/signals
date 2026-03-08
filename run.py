@@ -36,6 +36,8 @@ except ImportError:
   python run.py --mode sim --create --start 2026-01-14   # 创建仿真快照
   python run.py --mode sim --session 2026-01-14          # 执行仿真回放
   python run.py --mode sim --list-sessions               # 列出可用快照
+  python run.py --mode web                               # Web UI（TradingView 风格）
+  python run.py --mode web --port 9000                   # 指定端口
 """
 import sys
 import subprocess
@@ -1036,6 +1038,31 @@ def _list_sim_sessions():
     print()
 
 
+def run_web(args):
+    """
+    Web UI 模式：运行 L1 指数分析 → 启动 FastAPI 服务器。
+
+    用法：python run.py --mode web [--port 8000]
+    """
+    port = getattr(args, "port", 8000)
+    print(f"\n🐲 隆小侠 Web UI")
+    print(f"   运行 Layer 1 指数分析...\n")
+
+    # 运行 L1 分析
+    from signals.web.services.engine import get_engine
+    engine = get_engine()
+    engine.run_l1()
+
+    print(f"\n   分析完成，启动 Web 服务器...")
+    print(f"   🌐 http://localhost:{port}\n")
+
+    # 启动 FastAPI
+    import uvicorn
+    from signals.web.app import create_app
+    app = create_app()
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
+
 def run_sim(args):
     """
     仿真模式：全自动 — 检查仓库 → 补全数据 → 创建快照 → 执行回放。
@@ -1205,6 +1232,8 @@ def main():
   python run.py --mode sim --start 2026-01-14 --symbols SH.600519  # 指定额外标的
   python run.py --mode sim --sync --start 2026-01-01            # 手动同步仓库
   python run.py --mode sim --list-sessions                      # 列出可用快照
+  python run.py --mode web                                     # Web UI（TradingView 风格）
+  python run.py --mode web --port 9000                         # 指定端口
   python run.py --list-dates                       # 列出所有日期预设
 
 可用日期预设：{preset_keys}
@@ -1213,8 +1242,8 @@ def main():
     parser.add_argument(
         "--mode",
         default="intraday",
-        choices=["intraday", "review", "index", "import", "backtest", "sim"],
-        help="运行模式：intraday / review / index / import / backtest / sim"
+        choices=["intraday", "review", "index", "import", "backtest", "sim", "web"],
+        help="运行模式：intraday / review / index / import / backtest / sim / web"
     )
     parser.add_argument(
         "--start",
@@ -1313,6 +1342,13 @@ def main():
         action="store_true",
         help="[sim] 手动触发数据仓库全量同步"
     )
+    # web 模式专用参数
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="[web] Web UI 端口号，默认 8000"
+    )
 
     args = parser.parse_args()
 
@@ -1333,6 +1369,7 @@ def main():
         "import":   run_import,
         "backtest": run_backtest,
         "sim":      run_sim,
+        "web":      run_web,
     }
     dispatch[args.mode](args)
 
