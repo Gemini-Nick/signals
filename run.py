@@ -36,6 +36,9 @@ except ImportError:
   python run.py --mode sim --create --start 2026-01-14   # 创建仿真快照
   python run.py --mode sim --session 2026-01-14          # 执行仿真回放
   python run.py --mode sim --list-sessions               # 列出可用快照
+  python run.py --mode autoresearch                      # 自主研究（永不停止）
+  python run.py --mode autoresearch --experiments 10     # 自主研究（跑10轮）
+  python run.py --mode autoresearch --dry-run            # 自主研究（预览不修改）
 """
 import sys
 import subprocess
@@ -513,6 +516,27 @@ def run_backtest(args):
     signal_type = getattr(args, "signal_type", "") or ""
     freq_filter = getattr(args, "freq_filter", "") or ""
     _run_backtest(signal_type=signal_type, freq_filter=freq_filter)
+
+
+def run_autoresearch(args):
+    """
+    AutoResearch 模式 — 策略参数自主研究循环。
+
+    借鉴 Karpathy autoresearch: 变异参数 → 回测 → 保留/回退 → 永不停止。
+    """
+    from signals.autoresearch.agent import AutoResearchAgent
+
+    dry_run = getattr(args, "dry_run", False)
+    experiments = getattr(args, "experiments", None)
+
+    agent = AutoResearchAgent(dry_run=dry_run)
+    try:
+        if experiments:
+            agent.run_n(experiments)
+        else:
+            agent.run_forever()
+    finally:
+        agent.close()
 
 
 def run_index_only(args):
@@ -1213,7 +1237,7 @@ def main():
     parser.add_argument(
         "--mode",
         default="intraday",
-        choices=["intraday", "review", "index", "import", "backtest", "sim"],
+        choices=["intraday", "review", "index", "import", "backtest", "sim", "autoresearch"],
         help="运行模式：intraday / review / index / import / backtest / sim"
     )
     parser.add_argument(
@@ -1313,6 +1337,17 @@ def main():
         action="store_true",
         help="[sim] 手动触发数据仓库全量同步"
     )
+    # autoresearch 模式专用参数
+    parser.add_argument(
+        "--experiments",
+        type=int, default=None, metavar="N",
+        help="[autoresearch] 运行 N 轮实验后停止（默认无限循环）"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="[autoresearch] 预览模式，不实际修改参数"
+    )
 
     args = parser.parse_args()
 
@@ -1327,12 +1362,13 @@ def main():
         return
 
     dispatch = {
-        "intraday": run_intraday,
-        "review":   run_review,
-        "index":    run_index_only,
-        "import":   run_import,
-        "backtest": run_backtest,
-        "sim":      run_sim,
+        "intraday":     run_intraday,
+        "review":       run_review,
+        "index":        run_index_only,
+        "import":       run_import,
+        "backtest":     run_backtest,
+        "sim":          run_sim,
+        "autoresearch": run_autoresearch,
     }
     dispatch[args.mode](args)
 

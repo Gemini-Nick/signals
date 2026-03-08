@@ -154,6 +154,12 @@ BACKTEST_MIN_AGE_DAYS = 20                 # 信号满多少天后才评估
 BACKTEST_NEUTRAL_PCT = 2.0                 # 方向判定中性带 ±%
 BACKTEST_TARGET_PCT = 5.0                  # 目标收益率 %
 
+# ── AutoResearch 自主研究 ──────────────────────────────────
+AUTORESEARCH_DIR = ".data/autoresearch"
+AUTORESEARCH_LOG = ".data/autoresearch/experiments.tsv"
+AUTORESEARCH_MIN_SAMPLES = 20              # 至少 N 条已评估信号才能调参
+AUTORESEARCH_MAX_DELTA_PCT = 10            # 单次变异不超过当前值 10%
+
 # ── 板块属性分类（Layer 2 标签系统）─────────────────────────
 # 东财行业名 → 属性分类
 # 防守：高股息/低波动/刚需   进攻：高弹性/科技成长
