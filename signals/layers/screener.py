@@ -314,8 +314,12 @@ class IntraDayScreener:
     # 扫描：信号检测 + 评分
     # ─────────────────────────────────────────────────────
     def scan_once(self, symbols: Optional[List[str]] = None,
-                  market_direction: str = "分化") -> List[ScoredSymbol]:
-        """对所有（或指定）标的运行信号检测，返回按评分降序排列的结果。"""
+                  market_direction: str = "分化",
+                  sentiment_phase: str = "未知") -> List[ScoredSymbol]:
+        """
+        对所有（或指定）标的运行信号检测，返回按评分降序排列的结果。
+        sentiment_phase: P3-1 情绪感知评分参数。
+        """
         from signals.dashboard import get_dashboard
         dash = get_dashboard()
 
@@ -331,7 +335,8 @@ class IntraDayScreener:
             for _fkey, analyzer in self.analyzers.get(sym, {}).items():
                 sigs = detect_all_signals(analyzer.czsc, sym)
                 all_signals.extend(sigs)
-            results.append(score_signals(sym, all_signals))
+            results.append(score_signals(sym, all_signals,
+                                         sentiment_phase=sentiment_phase))
             if dash:
                 dash.task_done("L3.scan", sym)
 

@@ -57,6 +57,12 @@ class IndexReport:
     # ── 均线关键位（P0-1）──────────────────────────────────
     ma_context: Optional[object] = None        # MAContext，日线以上均线关键位
 
+    # ── P3-2: 情景分叉 ──────────────────────────────────
+    scenario_branches: list = field(default_factory=list)   # List[ScenarioBranch]
+
+    # ── P3-5: 近5日收益率 ─────────────────────────────────
+    recent_5d_return: Optional[float] = None   # 近5个交易日收益率 %
+
     def __post_init__(self):
         if not self.summary and self.data_available:
             all_signals = [self.daily_latest_signal,

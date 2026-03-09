@@ -221,4 +221,33 @@ class IndexAnalyzer:
             data_available=True,
             # 均线关键位
             ma_context=ma_ctx,
+            # P3-2: 情景分叉
+            scenario_branches=self._build_scenarios(ma_ctx),
+            # P3-5: 近5日收益率
+            recent_5d_return=self._calc_recent_return(5),
         )
+
+    def _build_scenarios(self, ma_ctx) -> list:
+        """P3-2: 构建情景分叉"""
+        if ma_ctx is None:
+            return []
+        try:
+            from signals.core.ma_levels import build_scenario_branches
+            import config
+            custom = config.CUSTOM_KEY_LEVELS.get(self.name, {})
+            return build_scenario_branches(ma_ctx, custom_levels=custom or None)
+        except Exception:
+            return []
+
+    def _calc_recent_return(self, days: int = 5) -> float:
+        """计算近 N 个交易日收益率 %"""
+        if not self._daily or not self._daily.bars_raw:
+            return 0.0
+        bars = self._daily.bars_raw
+        if len(bars) < days + 1:
+            return 0.0
+        old_close = bars[-(days + 1)].close
+        new_close = bars[-1].close
+        if old_close <= 0:
+            return 0.0
+        return round((new_close / old_close - 1) * 100, 2)

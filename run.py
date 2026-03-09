@@ -38,6 +38,8 @@ except ImportError:
   python run.py --mode sim --list-sessions               # 列出可用快照
   python run.py --mode web                               # Web UI（TradingView 风格）
   python run.py --mode web --port 9000                   # 指定端口
+  python run.py --mode analog                            # 历史形态匹配（全部指数）
+  python run.py --mode analog --symbol 沪深300           # 指定单个指数匹配
   python run.py --mode index --push                      # 指数分析 + 推送到 Vercel
 """
 import sys
@@ -234,12 +236,21 @@ def run_intraday(args):
         dash.phase_start("L2.ranking")
 
         try:
-            gain_list, composite_list, merged_list, concepts, oversold_list = get_industry_representatives(
+            gain_list, composite_list, merged_list, concepts, oversold_list, l2_stats = get_industry_representatives(
                 config.RANK_TOP_N)
         except Exception as e:
             dash.log(f"  [!] 行业筛选异常（{e}），跳过 Layer 2")
             dash.task_error("L2.ranking", "行业筛选", str(e))
             gain_list, composite_list, merged_list, concepts, oversold_list = [], [], [], [], []
+            l2_stats = {}
+
+        # ── 情绪周期更新（L2 涨跌停数据回传 MarketContext）───
+        if l2_stats:
+            ctx.update_sentiment(
+                zt_total=l2_stats.get("zt_total", 0),
+                dt_total=l2_stats.get("dt_total", 0),
+                lianban_max=l2_stats.get("lianban_max", 0),
+            )
 
         # ── 汇总入池 ─────────────────────────────────────
         for r in merged_list:
@@ -257,6 +268,11 @@ def run_intraday(args):
                 ctx.rotation_detail = rot.format_line()
                 _, alloc_str = suggest_allocation(rot, ctx.sentiment_phase)
                 ctx.allocation_suggestion = alloc_str
+                # P3-4: 轮动持续时间和速度
+                ctx.rotation_duration = rot.duration_days
+                ctx.rotation_velocity = rot.velocity
+                ctx.rotation_peak_warning = rot.peak_warning
+                ctx.rotation_peak_detail = rot.peak_detail
             except Exception:
                 pass
 
@@ -335,6 +351,64 @@ def run_intraday(args):
                 print(f"  {i:<4} {cp.name:<14} "
                       f"{sign}{cp.gain_pct:.2f}%  {cp.sector_type}{cp_icon}")
 
+        # ── 盘中恐慌评估 + 抄底候选 + 主题追踪 ──────────
+        try:
+            from signals.core.panic_detector import assess_intraday_panic
+            name_df = l2_stats.get("name_df") if l2_stats else None
+            panic = assess_intraday_panic(
+                ctx.reports, screener_l1.analyzers, name_df)
+
+            # 存入 ctx 供输出层使用
+            ctx.panic_score = panic.score
+            ctx.panic_level = panic.level
+            ctx.panic_detail = panic.detail
+
+            # ① 始终显示盘中情绪评估
+            _p_icons = {"恐慌": "🔴", "偏弱": "🟡", "正常": "🟢"}
+            _p_icon = _p_icons.get(panic.level, "⚪")
+            print(f"\n  >>> {_p_icon} 盘中情绪: "
+                  f"{panic.score:.0f}/100 ({panic.level})")
+            print(f"      {panic.detail}")
+            if panic.level == "恐慌":
+                print(f"  💡 恐慌=底部信号 → 关注超跌+支撑位的反弹机会")
+
+            # ② 偏弱/恐慌时显示抄底候选
+            if panic.score >= 40:
+                from signals.layers.industry import get_bottom_fishing_candidates
+                _themes = [t.strip() for t in
+                           (args.themes.split(",") if args.themes
+                            else config.WATCH_THEMES) if t.strip()]
+                bottom = get_bottom_fishing_candidates(
+                    name_df, oversold_list, panic.score, _themes)
+                if bottom:
+                    ctx.bottom_candidates = [b.name for b in bottom]
+                    print(f"\n  >>> 🎯 抄底候选板块:")
+                    for _bi, b in enumerate(bottom, 1):
+                        parts = [f"今日{b.gain_pct:+.1f}%"]
+                        if b.oversold_score > 0:
+                            parts.append(f"历史超跌{b.oversold_score:.0f}")
+                        if b.sector_type != "中性":
+                            parts.append(f"{b.sector_type}型")
+                        if b.rotation_line:
+                            parts.append(f"{b.rotation_line}线")
+                        print(f"      {_bi}. {b.name} ({', '.join(parts)})")
+
+            # ③ 主题追踪 — 独立于恐慌门控，始终显示
+            _themes = [t.strip() for t in
+                       (args.themes.split(",") if args.themes
+                        else config.WATCH_THEMES) if t.strip()]
+            if _themes:
+                from signals.core.theme_tracker import match_themes, format_theme_hits
+                hits = match_themes(_themes, name_df, concepts, panic.level)
+                fmt = format_theme_hits(hits)
+                if fmt:
+                    ctx.theme_summary = fmt
+                    print(f"\n  >>> 🏷 主题追踪: {fmt}")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("恐慌评估失败: %s", e)
+            print(f"  [!] 恐慌评估失败: {e}")
+
         dash.resume()
 
     dash.set_l2_count(len(ranking_stocks))
@@ -403,7 +477,10 @@ def run_intraday(args):
         try:
             # 一次性初始化所有标的（dashboard 活跃，显示进度）
             screener_l3.initialize(l3_pool)
-            l3_results = screener_l3.scan_once(l3_pool)
+            l3_results = screener_l3.scan_once(
+                l3_pool,
+                sentiment_phase=ctx.sentiment_phase,
+            )
 
             above_cnt = sum(1 for r in l3_results
                            if r.total_score >= config.SCORE_THRESHOLD
@@ -618,7 +695,7 @@ def _run_single_review(start_date: str, raw_alias: str, args):
         pool_date = datetime.now().strftime("%Y%m%d")
 
         try:
-            gain_list, composite_list, merged_list, concepts, oversold_list = get_industry_representatives(
+            gain_list, composite_list, merged_list, concepts, oversold_list, _ = get_industry_representatives(
                 config.RANK_TOP_N, date_str=pool_date)
         except Exception as e:
             dash.log(f"  [!] 行业筛选异常（{e}），跳过 Layer 2")
@@ -641,6 +718,11 @@ def _run_single_review(start_date: str, raw_alias: str, args):
                 ctx.rotation_detail = rot.format_line()
                 _, alloc_str = suggest_allocation(rot, ctx.sentiment_phase)
                 ctx.allocation_suggestion = alloc_str
+                # P3-4: 轮动持续时间和速度
+                ctx.rotation_duration = rot.duration_days
+                ctx.rotation_velocity = rot.velocity
+                ctx.rotation_peak_warning = rot.peak_warning
+                ctx.rotation_peak_detail = rot.peak_detail
             except Exception:
                 pass
 
@@ -784,7 +866,7 @@ def _run_multi_review(dates: list, args):
             dash.task_start("L2.ranking", f"{resolved}({label})")
 
             try:
-                gain_list, composite_list, merged_list, concepts, _ = get_industry_representatives(
+                gain_list, composite_list, merged_list, concepts, _, _ = get_industry_representatives(
                     config.RANK_TOP_N, date_str=date_yyyymmdd)
             except Exception as e:
                 dash.log(f"  [!] {resolved} 行业筛选异常（{e}），跳过")
@@ -1045,9 +1127,88 @@ def _list_sim_sessions():
     print()
 
 
+def run_analog(args):
+    """
+    历史形态匹配模式：独立运行，对比当前走势与历史走势。
+
+    用法：python run.py --mode analog [--symbol 沪深300]
+    """
+    from signals.data.fetcher import DataFetcher
+    from signals.core.analog_matcher import (
+        find_analogs, save_analog_results, analog_to_dict,
+    )
+    from dataclasses import asdict
+
+    indices = config.ANALOG_INDICES
+    symbol_filter = getattr(args, "symbol", None)
+    if symbol_filter:
+        if symbol_filter not in config.INDEX_AK_CODES:
+            print(f"  [!] 未知指数: {symbol_filter}")
+            print(f"      可选: {', '.join(config.INDEX_AK_CODES.keys())}")
+            return
+        indices = [symbol_filter]
+
+    print(f"\n{'═'*52}")
+    print(f"  📊 历史形态匹配  窗口={config.ANALOG_WINDOW}天  Top{config.ANALOG_TOP_K}")
+    print(f"  匹配指数: {', '.join(indices)}")
+    print(f"{'═'*52}\n")
+
+    fetcher = DataFetcher()
+    all_results = {}
+
+    for name in indices:
+        code = config.INDEX_AK_CODES.get(name)
+        if not code:
+            print(f"  [!] {name}: 无 AKShare 代码，跳过")
+            continue
+
+        print(f"  ▶ {name} ({code})")
+        try:
+            bars = fetcher.get_index_daily(code, lookback_days=config.ANALOG_LOOKBACK_DAYS)
+            if len(bars) < config.ANALOG_WINDOW + 60:
+                print(f"    数据不足 ({len(bars)}根K线)，需要至少 {config.ANALOG_WINDOW + 60} 根")
+                continue
+
+            closes = [b.close for b in bars]
+            dates = [str(b.dt)[:10] for b in bars]
+
+            # 当前走势 = 最近 window 天；历史 = 全部（去掉最近60天）
+            analogs = find_analogs(
+                current_closes=closes,
+                current_dates=dates,
+                history_closes=closes,
+                history_dates=dates,
+                index_name=name,
+                window=config.ANALOG_WINDOW,
+                top_k=config.ANALOG_TOP_K,
+                min_similarity=config.ANALOG_MIN_SIMILARITY,
+            )
+
+            if analogs:
+                all_results[name] = [analog_to_dict(a) for a in analogs]
+                print(f"    找到 {len(analogs)} 个匹配:")
+                for i, a in enumerate(analogs, 1):
+                    print(f"    [{i}] 相似度={a.similarity:.2%}  "
+                          f"{a.match_start}~{a.match_end}  "
+                          f"后10日={a.next_10d_return:+.1f}%  "
+                          f"后30日={a.next_30d_return:+.1f}%")
+                    print(f"        {a.what_happened}")
+            else:
+                print(f"    未找到相似度≥{config.ANALOG_MIN_SIMILARITY:.0%}的匹配")
+
+        except Exception as e:
+            print(f"    [!] 异常: {e}")
+
+    if all_results:
+        save_analog_results(all_results)
+        print(f"\n  ✅ 结果已缓存 → .data/cache/analog_latest.json")
+    else:
+        print(f"\n  未产生任何匹配结果")
+
+
 def run_web(args):
     """
-    Web UI 模式：运行 L1 指数分析 → 启动 FastAPI 服务器。
+    Web UI 模式：运行 L1→L2→L3 分析 → 启动 FastAPI 服务器。
 
     用法：python run.py --mode web [--port 8000]
     """
@@ -1055,10 +1216,19 @@ def run_web(args):
     print(f"\n🐲 隆小侠 Web UI")
     print(f"   运行 Layer 1 指数分析...\n")
 
-    # 运行 L1 分析
     from signals.web.services.engine import get_engine
     engine = get_engine()
+
+    # L1: 指数分析（必须）
     engine.run_l1()
+
+    # L2: 行业分析（可选，失败不影响启动）
+    print(f"\n   运行 Layer 2 行业分析...")
+    engine.run_l2()
+
+    # L3: 标的筛选（可选，依赖 L2）
+    print(f"   运行 Layer 3 标的筛选...")
+    engine.run_l3()
 
     print(f"\n   分析完成，启动 Web 服务器...")
     print(f"   🌐 http://localhost:{port}\n")
@@ -1241,6 +1411,8 @@ def main():
   python run.py --mode sim --list-sessions                      # 列出可用快照
   python run.py --mode web                                     # Web UI（TradingView 风格）
   python run.py --mode web --port 9000                         # 指定端口
+  python run.py --mode analog                                    # 历史形态匹配（全部指数）
+  python run.py --mode analog --symbol 沪深300                   # 指定单个指数匹配
   python run.py --mode index --push                              # 分析 + 推送到 Vercel
   python run.py --mode intraday --push                           # 盘中 + 推送到 Vercel
   python run.py --list-dates                       # 列出所有日期预设
@@ -1251,8 +1423,8 @@ def main():
     parser.add_argument(
         "--mode",
         default="intraday",
-        choices=["intraday", "review", "index", "import", "backtest", "sim", "web"],
-        help="运行模式：intraday / review / index / import / backtest / sim / web"
+        choices=["intraday", "review", "index", "import", "backtest", "sim", "web", "analog"],
+        help="运行模式：intraday / review / index / import / backtest / sim / web / analog"
     )
     parser.add_argument(
         "--start",
@@ -1370,6 +1542,18 @@ def main():
         dest="dry_run",
         help="配合 --push 使用：mock Redis + mock 数据，验证推送逻辑（不连网）"
     )
+    parser.add_argument(
+        "--themes",
+        type=str, default="",
+        help="关注主题（逗号分隔），如 --themes '储能,算力,CLAW'（覆盖 config.WATCH_THEMES）"
+    )
+    # analog 模式专用参数
+    parser.add_argument(
+        "--symbol",
+        default=None,
+        metavar="NAME",
+        help="[analog] 指定匹配的指数名称（如 沪深300），默认匹配全部 ANALOG_INDICES"
+    )
 
     args = parser.parse_args()
 
@@ -1391,6 +1575,7 @@ def main():
         "backtest": run_backtest,
         "sim":      run_sim,
         "web":      run_web,
+        "analog":   run_analog,
     }
     dispatch[args.mode](args)
 

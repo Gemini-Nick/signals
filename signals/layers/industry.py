@@ -376,6 +376,10 @@ class IndustryRanking:
     oversold_score: float = 0.0                           # 超跌评分(0-100)
     oversold_detail: str = ""                             # "距高点-18%"
     rotation_line: str = ""                                # 轮动线: 科技/顺周期/消费/新能源/主题/公用
+    # P3-3: 板块节奏
+    rhythm_phase: str = ""                                 # "启动"/"加速"/"高潮"/"衰竭"/"休整"
+    rhythm_score: float = 0.0                              # 0-100
+    rhythm_hint: str = ""                                  # "可加仓"/"持有"/"兑现"/"回避"
 
     @property
     def display_name(self) -> str:
@@ -697,6 +701,7 @@ class ConceptRanking:
     leading_stock: str = ""
     leading_gain: float = 0.0
     sector_type: str = "中性"      # 自动分类：防守/进攻/周期/中性
+    tag: str = ""                  # 来源标记：""=实时, "static"=硬编码兜底
 
 
 def _classify_concept(name: str) -> str:
@@ -717,11 +722,160 @@ def _classify_industry(name: str) -> str:
 
 
 
+def _concept_cache_path():
+    """概念排行磁盘缓存路径"""
+    from pathlib import Path
+    cache_dir = Path(__file__).resolve().parent.parent.parent / ".data" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / "concept_rankings.json"
+
+
+def _save_concept_cache(results: List[ConceptRanking]):
+    """保存概念排行到磁盘缓存"""
+    import json, time
+    data = {
+        "ts": time.time(),
+        "items": [
+            {"name": c.name, "gain_pct": c.gain_pct,
+             "leading_stock": c.leading_stock, "leading_gain": c.leading_gain,
+             "sector_type": c.sector_type, "tag": c.tag}
+            for c in results
+        ],
+    }
+    try:
+        _concept_cache_path().write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_concept_cache(max_age: float = 86400) -> List[ConceptRanking]:
+    """从磁盘缓存加载概念排行（默认24h过期）"""
+    import json, time
+    path = _concept_cache_path()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if time.time() - data.get("ts", 0) > max_age:
+            return []
+        results = []
+        for item in data.get("items", []):
+            results.append(ConceptRanking(
+                name=item["name"],
+                gain_pct=item.get("gain_pct", 0),
+                leading_stock=item.get("leading_stock", ""),
+                leading_gain=item.get("leading_gain", 0),
+                sector_type=item.get("sector_type", ""),
+                tag=item.get("tag", ""),
+            ))
+        _detail(f"  [缓存] 概念板块 {len(results)} 条（磁盘缓存）")
+        return results
+    except Exception:
+        return []
+
+
+# ── 概念板块硬编码兜底 ───────────────────────────────────
+_FALLBACK_CONCEPTS = [
+    ("AI算力", "进攻"), ("DeepSeek概念", "进攻"), ("机器人概念", "进攻"),
+    ("半导体", "进攻"), ("消费电子", "进攻"), ("新能源车", "周期"),
+    ("光伏", "周期"), ("军工", "主题"), ("中药", "防守"), ("白酒", "消费"),
+]
+
+
+def _fallback_concepts(top_n: int = 10) -> List[ConceptRanking]:
+    """当东财+缓存都失败时的硬编码兜底概念列表"""
+    _detail("  [兜底] 使用静态概念列表")
+    results = []
+    for name, stype in _FALLBACK_CONCEPTS[:top_n]:
+        results.append(ConceptRanking(
+            name=name,
+            gain_pct=0.0,
+            leading_stock="",
+            leading_gain=0.0,
+            sector_type=stype,
+            tag="static",
+        ))
+    return results
+
+
+def _get_concepts_ths(top_n: int = 10) -> List[ConceptRanking]:
+    """
+    同花顺概念板块降级源。
+    获取概念名称列表 + 并行获取 K 线计算涨跌幅。
+    """
+    import akshare as ak
+    from datetime import datetime, timedelta
+    from concurrent.futures import ThreadPoolExecutor
+
+    _detail("  [THS] 尝试同花顺概念板块...")
+    df = ak.stock_board_concept_name_ths()
+    if df is None or df.empty:
+        raise ValueError("THS 概念列表为空")
+
+    # 名称列: 尝试多种可能的列名
+    name_col = None
+    for col in ["概念名称", "name", "板块名称"]:
+        if col in df.columns:
+            name_col = col
+            break
+    if name_col is None and len(df.columns) > 0:
+        name_col = df.columns[0]
+
+    concept_names = df[name_col].tolist()[:top_n * 2]
+    today = datetime.now()
+    start_date = (today - timedelta(days=7)).strftime("%Y%m%d")
+    end_date = today.strftime("%Y%m%d")
+
+    def _fetch_gain(cname):
+        try:
+            kdf = ak.stock_board_concept_index_ths(
+                symbol=cname, start_date=start_date, end_date=end_date)
+            if kdf is not None and len(kdf) >= 2:
+                close_col = None
+                for c in ["收盘价", "收盘", "close"]:
+                    if c in kdf.columns:
+                        close_col = c
+                        break
+                if close_col:
+                    gain = (float(kdf.iloc[-1][close_col]) /
+                            float(kdf.iloc[-2][close_col]) - 1) * 100
+                    return cname, round(gain, 2)
+            return cname, 0.0
+        except Exception:
+            return cname, 0.0
+
+    # 并行获取涨跌幅
+    results_raw = []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(_fetch_gain, n): n for n in concept_names}
+        for fut in futures:
+            try:
+                name, gain = fut.result(timeout=10)
+                results_raw.append((name, gain))
+            except Exception:
+                results_raw.append((futures[fut], 0.0))
+
+    # 按涨幅排序取 top_n
+    results_raw.sort(key=lambda x: -x[1])
+    results = []
+    for name, gain in results_raw[:top_n]:
+        results.append(ConceptRanking(
+            name=name,
+            gain_pct=gain,
+            leading_stock="",
+            leading_gain=0.0,
+            sector_type=_classify_concept(name),
+            tag="ths",
+        ))
+
+    _detail(f"  [✓] THS 概念板块 top {len(results)} 条")
+    return results
+
+
 def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
     """
     获取概念板块涨幅 top N。
-    API: ak.stock_board_concept_name_em()（一次调用，返回全量）
-    超时 15s + 自动重试 1 次；仍失败则返回空列表。
+    降级链: 东财 concept_name_em → 同花顺 THS → 磁盘缓存 → 硬编码兜底
     """
     import akshare as ak
     import config as _cfg
@@ -730,6 +884,7 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
     if top_n is None:
         top_n = getattr(_cfg, "CONCEPT_TOP_N", 10)
 
+    # ── 1. 东财 ──
     def _call():
         with _no_proxy():
             return ak.stock_board_concept_name_em()
@@ -745,34 +900,50 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
             if attempt == 0:
                 _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}），重试中...")
                 continue
-            _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}，重试仍失败），跳过概念排行")
-            return []
+            _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}，重试仍失败）")
+            df = None
+            break
 
-    if df is None or df.empty or "涨跌幅" not in df.columns:
-        return []
+    if df is not None and not df.empty and "涨跌幅" in df.columns:
+        df = df.sort_values("涨跌幅", ascending=False).head(top_n)
+        results = []
+        for _, row in df.iterrows():
+            name = str(row.get("板块名称", "")).strip()
+            if not name:
+                continue
+            leading = str(row.get("领涨股票", ""))
+            leading_gain = 0.0
+            try:
+                leading_gain = float(row.get("领涨股票-涨跌幅", 0) or 0)
+            except (ValueError, TypeError):
+                pass
+            results.append(ConceptRanking(
+                name=name,
+                gain_pct=float(row.get("涨跌幅", 0) or 0),
+                leading_stock=leading,
+                leading_gain=leading_gain,
+                sector_type=_classify_concept(name),
+            ))
+        _detail(f"  [✓] 概念板块 top {len(results)} 条")
+        _save_concept_cache(results)
+        return results
 
-    df = df.sort_values("涨跌幅", ascending=False).head(top_n)
-    results = []
-    for _, row in df.iterrows():
-        name = str(row.get("板块名称", "")).strip()
-        if not name:
-            continue
-        leading = str(row.get("领涨股票", ""))
-        leading_gain = 0.0
-        try:
-            leading_gain = float(row.get("领涨股票-涨跌幅", 0) or 0)
-        except (ValueError, TypeError):
-            pass
-        results.append(ConceptRanking(
-            name=name,
-            gain_pct=float(row.get("涨跌幅", 0) or 0),
-            leading_stock=leading,
-            leading_gain=leading_gain,
-            sector_type=_classify_concept(name),
-        ))
+    # ── 2. 同花顺降级 ──
+    try:
+        ths_results = _get_concepts_ths(top_n)
+        if ths_results:
+            _save_concept_cache(ths_results)
+            return ths_results
+    except Exception as e:
+        _detail(f"  [!] THS 概念板块也失败（{e.__class__.__name__}）")
 
-    _detail(f"  [✓] 概念板块 top {len(results)} 条")
-    return results
+    # ── 3. 磁盘缓存 ──
+    cached = _load_concept_cache()
+    if cached:
+        return cached[:top_n]
+
+    # ── 4. 硬编码兜底 ──
+    return _fallback_concepts(top_n)
 
 
 def _match_concepts_to_industries(
@@ -959,6 +1130,36 @@ def _load_zbgc_pool(date_str: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────
+# P3-3: 板块节奏检测（轻量补充）
+# ─────────────────────────────────────────────────────────
+
+def _enrich_rhythm(rankings: List["IndustryRanking"]):
+    """为 Top-N 行业补充节奏检测（跳过已有 rhythm 的）"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    need_rhythm = [r for r in rankings if not r.rhythm_phase]
+    if not need_rhythm:
+        return
+
+    def _compute(r):
+        try:
+            bars = get_industry_bars(r.name, lookback_days=30)
+            if not bars:
+                return
+            from signals.core.sector_rhythm import compute_sector_rhythm
+            rhythm = compute_sector_rhythm(r.name, bars)
+            if rhythm:
+                r.rhythm_phase = rhythm.phase
+                r.rhythm_score = rhythm.rhythm_score
+                r.rhythm_hint = rhythm.action_hint
+        except Exception:
+            pass
+
+    with _no_proxy(), ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(_compute, r) for r in need_rhythm[:10]]
+        for f in as_completed(futures):
+            f.result()  # propagate exceptions silently
+
+
 # 板块超跌检测
 # ─────────────────────────────────────────────────────────
 
@@ -1078,6 +1279,15 @@ def get_oversold_industries(name_df=None, top_n: int = 5) -> List[IndustryRankin
             bars = get_industry_bars(ind_name, lookback_days=30)
             score, detail = compute_oversold_score(bars)
             from signals.core.rotation import get_rotation_line
+            # P3-3: 板块节奏检测
+            r_phase, r_score, r_hint = "", 0.0, ""
+            try:
+                from signals.core.sector_rhythm import compute_sector_rhythm
+                rhythm = compute_sector_rhythm(ind_name, bars)
+                if rhythm:
+                    r_phase, r_score, r_hint = rhythm.phase, rhythm.rhythm_score, rhythm.action_hint
+            except Exception:
+                pass
             return IndustryRanking(
                 name=ind_name,
                 gain_pct=gain_pct,
@@ -1085,6 +1295,9 @@ def get_oversold_industries(name_df=None, top_n: int = 5) -> List[IndustryRankin
                 oversold_score=score,
                 oversold_detail=detail,
                 rotation_line=get_rotation_line(ind_name),
+                rhythm_phase=r_phase,
+                rhythm_score=r_score,
+                rhythm_hint=r_hint,
             )
         except Exception:
             return None
@@ -1602,6 +1815,9 @@ def get_industry_representatives(top_n: int = None,
         if r.name in concept_map:
             r.concept_tags = concept_map[r.name]
 
+    # ── 5.5 P3-3: 板块节奏检测（Top-N 行业）──
+    _enrich_rhythm(merged_list[:10])
+
     # ── 6. 超跌检测（盘中模式有 name_df 时）──
     oversold_list: List[IndustryRanking] = []
     if not is_historical and name_df is not None:
@@ -1610,4 +1826,150 @@ def get_industry_representatives(top_n: int = None,
         except Exception as e:
             _detail(f"  [!] 超跌检测失败（{e.__class__.__name__}）")
 
-    return gain_list, composite_list, merged_list, concepts, oversold_list
+    # ── 7. 情绪统计（供 MarketContext.update_sentiment 使用）──
+    _zt_total = sum(len(v) for v in zt_pool.values())
+    _dt_total = sum(v for v in dt_count.values())
+    _lianban_max = max(
+        (max((x[2] for x in v), default=0) for v in zt_pool.values()),
+        default=0,
+    ) if zt_pool else 0
+    sentiment_stats = {
+        "zt_total": _zt_total,
+        "dt_total": _dt_total,
+        "lianban_max": _lianban_max,
+        "name_df": name_df,
+    }
+
+    return gain_list, composite_list, merged_list, concepts, oversold_list, sentiment_stats
+
+
+# ─────────────────────────────────────────────────────────
+# 抄底候选板块筛选（恐慌时触发）
+# ─────────────────────────────────────────────────────────
+
+def get_bottom_fishing_candidates(
+    name_df,
+    oversold_list: List[IndustryRanking],
+    panic_score: float,
+    themes: List[str] = None,
+    top_n: int = 5,
+) -> List[IndustryRanking]:
+    """
+    恐慌行情中筛选抄底候选板块。
+
+    选择逻辑:
+    1. 从 name_df 取今日跌幅最大的 15 个行业
+    2. 与历史超跌 oversold_list 取交集 → "双重超跌"
+    3. 评分加权:
+       - 今日跌幅分 (35): 跌得越多分越高
+       - 历史超跌分 (30): 复用 oversold_score
+       - 轮动线加分 (20): 进攻/科技型板块恐慌后弹性最大
+       - 主题命中   (15): 命中用户关注主题
+    4. 排序输出 top N
+
+    :param name_df: 东财行业板块 DataFrame (含板块名+涨跌幅)
+    :param oversold_list: L2 历史超跌列表
+    :param panic_score: 盘中恐慌评分 (0-100)
+    :param themes: 用户关注主题列表
+    :param top_n: 输出数量
+    :return: IndustryRanking 列表（按抄底得分降序）
+    """
+    if name_df is None or name_df.empty:
+        return []
+
+    if panic_score < 40:
+        return []
+
+    import config as _cfg
+
+    # 找列名
+    name_col = None
+    for col in ['板块名称', '板块', '名称', '行业']:
+        if col in name_df.columns:
+            name_col = col
+            break
+    change_col = None
+    for col in ['涨跌幅', '涨跌幅(%)', '涨幅', '涨幅(%)', '最新涨跌幅']:
+        if col in name_df.columns:
+            change_col = col
+            break
+    if not name_col or not change_col:
+        return []
+
+    # 1. 取今日跌幅最大的 15 个行业
+    df = name_df[[name_col, change_col]].copy()
+    df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
+    df = df.dropna(subset=[change_col])
+    df = df.sort_values(change_col, ascending=True).head(15)
+
+    # 历史超跌名单
+    oversold_map = {r.name: r.oversold_score for r in oversold_list}
+
+    # 主题关键词
+    theme_keywords = []
+    if themes:
+        from signals.core.theme_tracker import THEME_KEYWORD_MAP
+        for t in themes:
+            kws = THEME_KEYWORD_MAP.get(t.upper().strip()) or THEME_KEYWORD_MAP.get(t.strip())
+            if kws:
+                theme_keywords.extend(kws)
+            else:
+                theme_keywords.append(t.strip())
+
+    # 板块属性和轮动线
+    sector_type_map = getattr(_cfg, "SECTOR_TYPE_MAP", {})
+    rotation_map = getattr(_cfg, "ROTATION_LINE_MAP", {})
+
+    candidates = []
+    for _, row in df.iterrows():
+        ind_name = str(row[name_col])
+        change = float(row[change_col])
+
+        # 今日跌幅分 (满分35): 跌幅>3%满分, 1~3%线性
+        drop = abs(change) if change < 0 else 0
+        if drop >= 3.0:
+            decline_pts = 35.0
+        elif drop >= 1.0:
+            decline_pts = 35.0 * (drop - 1.0) / 2.0
+        else:
+            decline_pts = 0.0
+
+        # 历史超跌分 (满分30): 直接取 oversold_score 归一化
+        hist_score = oversold_map.get(ind_name, 0.0)
+        oversold_pts = min(30.0, hist_score * 0.3)  # oversold_score 0-100 → 0-30
+
+        # 轮动线/板块属性加分 (满分20): 进攻型+科技线弹性最大
+        stype = sector_type_map.get(ind_name, "中性")
+        rot_line = rotation_map.get(ind_name, "")
+        attr_pts = 0.0
+        if stype == "进攻":
+            attr_pts += 12.0
+        elif stype == "周期":
+            attr_pts += 6.0
+        if rot_line == "科技":
+            attr_pts += 8.0
+        elif rot_line == "新能源":
+            attr_pts += 5.0
+        attr_pts = min(20.0, attr_pts)
+
+        # 主题命中 (满分15)
+        theme_pts = 0.0
+        if theme_keywords and any(kw in ind_name for kw in theme_keywords):
+            theme_pts = 15.0
+
+        total = decline_pts + oversold_pts + attr_pts + theme_pts
+
+        if total > 0:
+            r = IndustryRanking(
+                name=ind_name,
+                gain_pct=change,
+                composite_score=round(total, 1),
+                sector_type=stype,
+                rotation_line=rot_line,
+                oversold_score=hist_score,
+                oversold_detail=f"今日{change:+.1f}%",
+            )
+            candidates.append(r)
+
+    candidates.sort(key=lambda x: x.composite_score, reverse=True)
+    return candidates[:top_n]
