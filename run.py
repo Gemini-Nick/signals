@@ -38,6 +38,7 @@ except ImportError:
   python run.py --mode sim --list-sessions               # 列出可用快照
   python run.py --mode web                               # Web UI（TradingView 风格）
   python run.py --mode web --port 9000                   # 指定端口
+  python run.py --mode index --push                      # 指数分析 + 推送到 Vercel
 """
 import sys
 import subprocess
@@ -214,6 +215,9 @@ def run_intraday(args):
     if ctx:
         dash.set_context(direction=ctx.overall_direction,
                          style=ctx.recommended_style)
+
+    # 保存 screener 引用供 --push 使用
+    args._screener = screener_l1
 
     if not ctx.gate_industry_scan:
         dash.log("  [yellow]⚠️  市场偏空，建议观望，仅扫描白名单。[/yellow]")
@@ -535,6 +539,9 @@ def run_index_only(args):
         ak_codes=ak_codes, futu_codes=futu_codes, us_codes=us_codes,
     )
     ctx = screener.run()
+
+    # 保存 screener 引用供 --push 使用
+    args._screener = screener
 
     # ── 飞书推送（卡片模式）────────────────────────────────
     if not config.FEISHU_APP_ID:
@@ -1234,6 +1241,8 @@ def main():
   python run.py --mode sim --list-sessions                      # 列出可用快照
   python run.py --mode web                                     # Web UI（TradingView 风格）
   python run.py --mode web --port 9000                         # 指定端口
+  python run.py --mode index --push                              # 分析 + 推送到 Vercel
+  python run.py --mode intraday --push                           # 盘中 + 推送到 Vercel
   python run.py --list-dates                       # 列出所有日期预设
 
 可用日期预设：{preset_keys}
@@ -1349,6 +1358,12 @@ def main():
         default=8000,
         help="[web] Web UI 端口号，默认 8000"
     )
+    # 云端推送参数
+    parser.add_argument(
+        "--push",
+        action="store_true",
+        help="分析完成后推送结果到 Upstash Redis（供 Vercel 前端读取）"
+    )
 
     args = parser.parse_args()
 
@@ -1372,6 +1387,13 @@ def main():
         "web":      run_web,
     }
     dispatch[args.mode](args)
+
+    # --push: 分析完成后推送到 Upstash Redis
+    if getattr(args, "push", False) and args.mode in ("index", "intraday", "web"):
+        print("\n  推送分析结果到 Upstash Redis...")
+        from signals.deploy.push_to_kv import push_from_screener
+        screener = getattr(args, "_screener", None)
+        push_from_screener(screener=screener)
 
 
 if __name__ == "__main__":
