@@ -69,7 +69,7 @@ function createChart() {
   });
 
   // K 线
-  candleSeries = chart.addSeries(LightweightCharts.CandlestickSeries, {
+  candleSeries = chart.addCandlestickSeries({
     upColor: c.upColor,
     downColor: c.downColor,
     borderUpColor: c.upColor,
@@ -79,7 +79,7 @@ function createChart() {
   });
 
   // 成交量
-  volumeSeries = chart.addSeries(LightweightCharts.HistogramSeries, {
+  volumeSeries = chart.addHistogramSeries({
     priceFormat: { type: 'volume' },
     priceScaleId: 'volume',
   });
@@ -145,7 +145,7 @@ function drawBiLines(biList) {
 
   if (merged.length < 2) return;
 
-  biSeries = chart.addSeries(LightweightCharts.LineSeries, {
+  biSeries = chart.addLineSeries({
     color: c.biUp,
     lineWidth: 2,
     lineStyle: 0,
