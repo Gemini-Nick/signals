@@ -239,3 +239,136 @@ def format_key_levels(ctx: MAContext) -> str:
         parts.append(f"{arrow}{lv.name} {lv.value:.0f}({lv.distance_pct:+.1f}%)")
 
     return "  关键位: " + "  ".join(parts)
+
+
+# ─────────────────────────────────────────────────────────
+# P3-2: 情景分叉 (Scenario Branches)
+# ─────────────────────────────────────────────────────────
+
+@dataclass
+class ScenarioBranch:
+    """关键价位情景分叉：IF 守住/跌破 → THEN 后续演绎"""
+    level_name: str       # "5周线"
+    level_price: float    # 2970.0
+    distance_pct: float   # -2.5
+    is_support: bool      # True=支撑位, False=阻力位
+    urgency: str          # "接近"(<2%) / "关注"(2-5%) / "远离"(>5%)
+    hold: str             # 守住后的演绎
+    break_: str           # 跌破/突破后的演绎
+
+
+# 情景文案模板
+_SUPPORT_TEMPLATES = {
+    "10月线":  ("长期趋势维持,月线级别支撑有效",      "长期趋势走坏,月线级别破位,宜大幅降仓"),
+    "20周线":  ("中期趋势维持,周线级别震荡偏强",      "中期走弱,周线级别转空,切防守"),
+    "10周线":  ("中短期趋势维持,关注科技轮动",        "中期走弱,切防守降仓"),
+    "5周线":   ("短期反弹延续,关注板块轮动",          "短期转弱,降低仓位观望"),
+    "60日线":  ("日线级别趋势维持,可持股待涨",        "日线趋势转空,减仓观望"),
+    "20日线":  ("短线支撑有效,可继续持有",            "短线走弱,注意止损"),
+}
+
+_RESISTANCE_TEMPLATES = {
+    "10月线":  ("月线级别突破,长期趋势反转向上",       "月线压力有效,反弹空间受限"),
+    "20周线":  ("周线级别突破,中期转强",              "周线压力仍在,震荡格局延续"),
+    "10周线":  ("中短期突破,上方空间打开",            "反弹受阻,继续震荡"),
+    "5周线":   ("短期突破向上,追踪板块强度",          "短期反弹受压,观望为主"),
+    "60日线":  ("日线级别突破,趋势转多",              "日线压力有效,短期震荡"),
+    "20日线":  ("短线突破,可适度参与",                "短线压力仍在,等待突破"),
+}
+
+_DEFAULT_SUPPORT = ("趋势维持,支撑有效", "支撑破位,注意风险")
+_DEFAULT_RESISTANCE = ("向上突破,趋势转强", "压力有效,继续震荡")
+
+
+def _urgency_level(distance_pct: float) -> str:
+    """根据距离判断紧迫度"""
+    abs_dist = abs(distance_pct)
+    if abs_dist < 2.0:
+        return "接近"
+    elif abs_dist < 5.0:
+        return "关注"
+    else:
+        return "远离"
+
+
+def build_scenario_branches(
+    ctx: MAContext,
+    custom_levels: Optional[dict] = None,
+    max_distance_pct: float = 5.0,
+) -> List[ScenarioBranch]:
+    """
+    从 MAContext.key_levels 中距离 < max_distance_pct 的生成 IF/THEN 情景分叉。
+
+    :param ctx: 均线上下文
+    :param custom_levels: 自定义关键价位 {name: price}，与均线合并
+    :param max_distance_pct: 只对距离在此范围内的价位生成分叉
+    :return: ScenarioBranch 列表，按距离排序
+    """
+    if ctx is None:
+        return []
+
+    branches: List[ScenarioBranch] = []
+
+    # 从 key_levels 和 levels 中合并（去重，优先 key_levels）
+    seen_names = set()
+    candidates: List[MALevel] = []
+    for lv in (ctx.key_levels or []):
+        if lv.name not in seen_names:
+            candidates.append(lv)
+            seen_names.add(lv.name)
+    for lv in (ctx.levels or []):
+        if lv.name not in seen_names and abs(lv.distance_pct) < max_distance_pct:
+            candidates.append(lv)
+            seen_names.add(lv.name)
+
+    # 加入自定义关键价位
+    if custom_levels:
+        for name, price in custom_levels.items():
+            if name not in seen_names and price > 0:
+                lv = _make_level(name, price, ctx.latest_price)
+                if lv and abs(lv.distance_pct) < max_distance_pct:
+                    candidates.append(lv)
+                    seen_names.add(name)
+
+    for lv in candidates:
+        if abs(lv.distance_pct) > max_distance_pct:
+            continue
+
+        is_support = lv.position in ("下方", "贴合")
+        urgency = _urgency_level(lv.distance_pct)
+
+        if is_support:
+            templates = _SUPPORT_TEMPLATES.get(lv.name, _DEFAULT_SUPPORT)
+            hold, break_ = templates
+        else:
+            templates = _RESISTANCE_TEMPLATES.get(lv.name, _DEFAULT_RESISTANCE)
+            hold, break_ = templates[1], templates[0]  # 阻力位：守住=压力有效，突破=向上
+
+        branches.append(ScenarioBranch(
+            level_name=lv.name,
+            level_price=lv.value,
+            distance_pct=lv.distance_pct,
+            is_support=is_support,
+            urgency=urgency,
+            hold=hold,
+            break_=break_,
+        ))
+
+    # 按距离绝对值排序（最接近的在前）
+    branches.sort(key=lambda b: abs(b.distance_pct))
+    return branches
+
+
+def format_scenario_branches(branches: List[ScenarioBranch]) -> str:
+    """格式化情景分叉，用于终端输出"""
+    if not branches:
+        return ""
+    lines = ["  情景分叉:"]
+    for b in branches:
+        arrow = "▼" if b.is_support else "▲"
+        action = "守住" if b.is_support else "突破"
+        fail = "跌破" if b.is_support else "受阻"
+        lines.append(f"    {arrow}{b.level_name} {b.level_price:.0f}({b.distance_pct:+.1f}%) [{b.urgency}]")
+        lines.append(f"      IF {action} → {b.hold}")
+        lines.append(f"      IF {fail} → {b.break_}")
+    return "\n".join(lines)

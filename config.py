@@ -255,6 +255,10 @@ CONCEPT_TYPE_KEYWORDS: dict = {
 # 概念板块展示 Top N
 CONCEPT_TOP_N: int = 10
 
+# 关注主题（恐慌抄底时匹配，CLI --themes 覆盖）
+# 示例: ["储能", "算力", "CLAW", "化工"]
+WATCH_THEMES: list = []
+
 # 指标股（情绪周期检测用，仅拉实时快照，不做CZSC分析）
 INDICATOR_STOCKS: dict = {
     "四大行": ["SH.601398", "SH.601939", "SH.601288", "SH.601988"],
@@ -267,6 +271,18 @@ SIM_SESSION_DIR = ".data/sim/sessions"
 SIM_BACKTEST_DB = ".data/sim/backtest.db"
 SIM_MINUTE_CACHE_DB = ".data/sim/minute_cache.db"
 SIM_WAREHOUSE_DB = ".data/sim/warehouse.db"
+
+# ── 自定义关键价位（P3-2 情景分叉）──────────────────────────
+# 手动指定的关键价位（指数名 → {价位名: 价格}），与均线计算结果合并
+# 示例: {"上证50": {"2917关口": 2917}, "沪深300": {"前高": 3950}}
+CUSTOM_KEY_LEVELS: dict = {}
+
+# ── 历史形态匹配配置（P3-6）──────────────────────────────────
+ANALOG_LOOKBACK_DAYS = 1500     # 历史回溯天数（约6年）
+ANALOG_WINDOW = 30              # 匹配窗口长度（交易日）
+ANALOG_TOP_K = 3                # 返回 Top K 匹配
+ANALOG_MIN_SIMILARITY = 0.70    # 最低相似度阈值
+ANALOG_INDICES = ["沪深300", "创业板指", "上证50"]  # 默认匹配指数
 
 # ── 研究笔记（双维度集成）──────────────────────────────────
 # 笔记根目录，按 年/月 子目录存储：notes/2026/03/xxx.pdf

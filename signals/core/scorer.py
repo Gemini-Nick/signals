@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 from .detectors import SignalEvent
+
+# ── 情绪感知系数（P3-1）──
+# 恐慌买入=加分（逆向机会），亢奋买入=减分（追高风险）
+_SENTIMENT_BUY_MULT = {"恐慌": 1.25, "修复": 1.10, "回落": 1.00, "亢奋": 0.80, "未知": 1.00}
+_SENTIMENT_SELL_MULT = {"恐慌": 0.75, "修复": 0.90, "回落": 1.10, "亢奋": 1.25, "未知": 1.00}
 
 # 信号基础分值（买点为正，卖点为负）
 SIGNAL_WEIGHTS = {
@@ -73,6 +78,7 @@ class ScoredSymbol:
     details: str
     direction: str = ""   # "偏多" / "偏空" / "分歧" / ""
     ma_confirmation: str = ""  # 均线交叉确认描述
+    sentiment_tag: str = ""    # 情绪乘数标签，如 "恐慌×1.25"
 
 
 def _time_decay(sig_dt, ref_dt=None, half_life_days: float = 30.0) -> float:
@@ -104,17 +110,24 @@ def _time_decay(sig_dt, ref_dt=None, half_life_days: float = 30.0) -> float:
 
 def score_signals(symbol: str, signals: List[SignalEvent],
                   enable_decay: bool = True,
-                  ma_context=None) -> ScoredSymbol:
+                  ma_context=None,
+                  sentiment_phase: str = "未知") -> ScoredSymbol:
     """
     对单个标的的所有信号计算综合评分。
     enable_decay=True 时启用时间衰减（默认开启）。
     ma_context: 可选 MAContext，用于均线+缠论交叉确认加分。
+    sentiment_phase: 情绪周期（"恐慌"/"修复"/"回落"/"亢奋"/"未知"），
+                     影响买卖信号权重。
     """
     if not signals:
         return ScoredSymbol(
             symbol=symbol, total_score=0.0,
             signal_count=0, signals=[], details="无信号",
         )
+
+    # 情绪乘数
+    buy_mult = _SENTIMENT_BUY_MULT.get(sentiment_phase, 1.0)
+    sell_mult = _SENTIMENT_SELL_MULT.get(sentiment_phase, 1.0)
 
     total = 0.0
     buy_total = 0.0
@@ -123,7 +136,14 @@ def score_signals(symbol: str, signals: List[SignalEvent],
         base = SIGNAL_WEIGHTS.get(sig.signal_type, 0)
         freq_mult = FREQ_MULTIPLIER.get(sig.freq, 1.0)
         decay = _time_decay(sig.dt) if enable_decay else 1.0
-        contribution = base * sig.confidence * freq_mult * decay
+        raw = base * sig.confidence * freq_mult * decay
+        # 情绪乘数：买信号乘 buy_mult，卖信号乘 sell_mult
+        if "买" in sig.signal_type or base > 0:
+            contribution = raw * buy_mult
+        elif "卖" in sig.signal_type or base < 0:
+            contribution = raw * sell_mult
+        else:
+            contribution = raw
         total += contribution
         if "买" in sig.signal_type or base > 0:
             buy_total += abs(contribution)
@@ -156,7 +176,18 @@ def score_signals(symbol: str, signals: List[SignalEvent],
     else:
         direction = ""
 
+    # 情绪标签
+    sentiment_tag = ""
+    if sentiment_phase != "未知":
+        # 取买/卖中较显著的乘数
+        if buy_total >= sell_total:
+            sentiment_tag = f"{sentiment_phase}×{buy_mult:.2f}"
+        else:
+            sentiment_tag = f"{sentiment_phase}×{sell_mult:.2f}"
+
     details_lines = []
+    if sentiment_phase != "未知":
+        details_lines.append(f"  [情绪] {sentiment_phase} 买×{buy_mult:.2f} 卖×{sell_mult:.2f}")
     for s in signals:
         decay = _time_decay(s.dt) if enable_decay else 1.0
         decay_tag = f" decay={decay:.2f}" if enable_decay and decay < 0.95 else ""
@@ -206,4 +237,5 @@ def score_signals(symbol: str, signals: List[SignalEvent],
         details="\n".join(details_lines),
         direction=direction,
         ma_confirmation=ma_conf,
+        sentiment_tag=sentiment_tag,
     )
