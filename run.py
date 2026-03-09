@@ -1364,6 +1364,12 @@ def main():
         action="store_true",
         help="分析完成后推送结果到 Upstash Redis（供 Vercel 前端读取）"
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="配合 --push 使用：mock Redis + mock 数据，验证推送逻辑（不连网）"
+    )
 
     args = parser.parse_args()
 
@@ -1390,10 +1396,12 @@ def main():
 
     # --push: 分析完成后推送到 Upstash Redis
     if getattr(args, "push", False) and args.mode in ("index", "intraday", "web"):
-        print("\n  推送分析结果到 Upstash Redis...")
+        dry_run = getattr(args, "dry_run", False)
+        label = "[dry-run] " if dry_run else ""
+        print(f"\n  {label}推送分析结果到 Upstash Redis...")
         from signals.deploy.push_to_kv import push_from_screener
         screener = getattr(args, "_screener", None)
-        push_from_screener(screener=screener)
+        push_from_screener(screener=screener, dry_run=dry_run)
 
 
 if __name__ == "__main__":
