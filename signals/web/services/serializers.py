@@ -7,6 +7,8 @@ CZSC 对象 → JSON 序列化工具
 from datetime import datetime
 from typing import List, Optional
 
+from czsc import Direction
+
 
 def _dt_to_unix(dt) -> int:
     """datetime / Timestamp → UNIX timestamp (秒级，Lightweight Charts 要求)"""
@@ -52,7 +54,7 @@ def serialize_bi_list(analyzer) -> list:
     bis = []
     for bi in analyzer.finished_bis:
         try:
-            direction = "up" if bi.direction.name == "Up" else "down"
+            direction = "up" if bi.direction == Direction.Up else "down"
         except Exception:
             direction = "unknown"
         bis.append({
@@ -74,7 +76,13 @@ def serialize_fx_list(analyzer) -> list:
     fxs = []
     for fx in analyzer.fx_list:
         try:
-            mark = fx.mark.name.lower()  # "Top" / "Bottom" → "top" / "bottom"
+            mark_str = str(fx.mark).lower()  # Rust enum: "顶" / "底" or "Top" / "Bottom"
+            if "顶" in mark_str or "top" in mark_str:
+                mark = "top"
+            elif "底" in mark_str or "bottom" in mark_str:
+                mark = "bottom"
+            else:
+                mark = "unknown"
         except Exception:
             mark = "unknown"
         fxs.append({
@@ -145,6 +153,50 @@ def serialize_signals(signals: list) -> list:
     ]
 
 
+def _serialize_ma_context(ma_ctx) -> Optional[dict]:
+    """MAContext → JSON dict"""
+    if ma_ctx is None:
+        return None
+    return {
+        "latest_price": ma_ctx.latest_price,
+        "trend_summary": ma_ctx.trend_summary,
+        "levels": [
+            {
+                "name": lv.name,
+                "value": round(lv.value, 2),
+                "distance_pct": lv.distance_pct,
+                "position": lv.position,
+            }
+            for lv in ma_ctx.levels
+        ],
+        "support_levels": [
+            {
+                "name": lv.name,
+                "value": round(lv.value, 2),
+                "distance_pct": lv.distance_pct,
+            }
+            for lv in ma_ctx.support_levels[:3]
+        ],
+        "resistance_levels": [
+            {
+                "name": lv.name,
+                "value": round(lv.value, 2),
+                "distance_pct": lv.distance_pct,
+            }
+            for lv in ma_ctx.resistance_levels[:3]
+        ],
+        "key_levels": [
+            {
+                "name": lv.name,
+                "value": round(lv.value, 2),
+                "distance_pct": lv.distance_pct,
+                "position": lv.position,
+            }
+            for lv in ma_ctx.key_levels
+        ],
+    }
+
+
 def serialize_index_report(report) -> dict:
     """IndexReport → JSON dict"""
     zs_to_dict = lambda zs: (
@@ -182,13 +234,37 @@ def serialize_index_report(report) -> dict:
         "has_sell_signal": report.has_sell_signal,
         "is_bullish": report.is_bullish,
         "three_level_aligned": report.three_level_aligned,
+        # MA 均线关键位
+        "ma_context": _serialize_ma_context(getattr(report, 'ma_context', None)),
+        # P3-2: 情景分叉
+        "scenarios": _serialize_scenarios(getattr(report, 'scenario_branches', None)),
+        # P3-5: 近5日收益率
+        "recent_5d_return": getattr(report, 'recent_5d_return', None),
     }
     return result
 
 
+def _serialize_scenarios(branches) -> list:
+    """ScenarioBranch[] → JSON list"""
+    if not branches:
+        return []
+    return [
+        {
+            "level_name": b.level_name,
+            "level_price": round(b.level_price, 2),
+            "distance_pct": round(b.distance_pct, 2),
+            "is_support": b.is_support,
+            "urgency": b.urgency,
+            "hold": b.hold,
+            "break": b.break_,
+        }
+        for b in branches
+    ]
+
+
 def serialize_market_context(ctx) -> dict:
     """MarketContext → JSON dict (不含 reports，reports 单独序列化)"""
-    return {
+    result = {
         "overall_direction": ctx.overall_direction,
         "direction_strength": round(ctx.direction_strength, 2),
         "structural_divergence": ctx.structural_divergence,
@@ -208,6 +284,27 @@ def serialize_market_context(ctx) -> dict:
         "shield_sectors": ctx.shield_sectors,
         "sword_sectors": ctx.sword_sectors,
         "summary": ctx.summary,
+        # P3-4: 轮动持续时间 & 速度
+        "rotation_duration": getattr(ctx, "rotation_duration", 0),
+        "rotation_velocity": getattr(ctx, "rotation_velocity", "稳定"),
+        "rotation_peak_warning": getattr(ctx, "rotation_peak_warning", False),
+        "rotation_peak_detail": getattr(ctx, "rotation_peak_detail", ""),
+        # P3-5: 风格切换
+        "style_switch": _serialize_style_switch(getattr(ctx, "style_switch", None)),
+    }
+    return result
+
+
+def _serialize_style_switch(sw) -> Optional[dict]:
+    """StyleSwitch → JSON dict"""
+    if sw is None:
+        return None
+    return {
+        "detected": sw.detected,
+        "direction": sw.direction,
+        "evidence": sw.evidence,
+        "confidence": sw.confidence,
+        "suggestion": sw.suggestion,
     }
 
 
@@ -221,4 +318,6 @@ def serialize_scored_symbol(scored) -> dict:
         "ma_confirmation": scored.ma_confirmation,
         "details": scored.details,
         "signals": serialize_signals(scored.signals),
+        # P3-1: 情绪标签
+        "sentiment_tag": getattr(scored, "sentiment_tag", ""),
     }

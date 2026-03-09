@@ -18,12 +18,22 @@ class EngineState:
     market_context: Optional[object] = None     # MarketContext
     index_reports: List[object] = field(default_factory=list)  # IndexReport[]
 
+    # L2 行业结果
+    gain_list: List[object] = field(default_factory=list)       # IndustryRanking[]
+    composite_list: List[object] = field(default_factory=list)  # IndustryRanking[]
+    merged_list: List[object] = field(default_factory=list)     # IndustryRanking[]
+    concepts: List[object] = field(default_factory=list)        # ConceptRanking[]
+    oversold_list: List[object] = field(default_factory=list)   # IndustryRanking[]
+
     # L3 信号结果
     scored_symbols: List[object] = field(default_factory=list)  # ScoredSymbol[]
 
     # 底层分析器引用 (用于图表数据)
     index_screener: Optional[object] = None     # IndexScreener
     analyzers: Dict[str, object] = field(default_factory=dict)  # name -> IndexAnalyzer
+
+    # L2 统计数据 (用于恐慌检测、抄底候选等)
+    l2_stats: Dict = field(default_factory=dict)  # {zt_total, dt_total, name_df, ...}
 
     # 状态
     last_update: float = 0.0
@@ -81,6 +91,51 @@ class WebEngine:
             with self._lock:
                 self._state.is_running = False
 
+    def run_l2(self):
+        """运行 Layer 2 行业分析（同步，阻塞）"""
+        try:
+            from signals.layers.industry import get_industry_representatives
+            gain, composite, merged, concepts, oversold, sentiment_stats = get_industry_representatives()
+            with self._lock:
+                self._state.gain_list = gain
+                self._state.composite_list = composite
+                self._state.merged_list = merged
+                self._state.concepts = concepts
+                self._state.oversold_list = oversold
+                self._state.l2_stats = sentiment_stats or {}
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("L2 行业分析失败: %s", e)
+
+    def run_l3(self):
+        """运行 Layer 3 标的筛选（同步，阻塞）"""
+        try:
+            from signals.layers.screener import IntraDayScreener
+            merged = self._state.merged_list
+            if not merged:
+                return
+            screener = IntraDayScreener()
+            all_scored = []
+            for ind in merged[:5]:
+                try:
+                    scored = screener.run_industry(ind.name)
+                    all_scored.extend(scored)
+                except Exception:
+                    pass
+            # 按分数排序去重
+            seen = set()
+            unique = []
+            for s in sorted(all_scored,
+                            key=lambda x: x.total_score, reverse=True):
+                if s.symbol not in seen:
+                    seen.add(s.symbol)
+                    unique.append(s)
+            with self._lock:
+                self._state.scored_symbols = unique
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("L3 标的筛选失败: %s", e)
+
     def get_market_context(self):
         """获取缓存的 MarketContext"""
         return self._state.market_context
@@ -130,9 +185,324 @@ class WebEngine:
                 return name
         return None
 
+    def get_industry_data(self) -> dict:
+        """获取缓存的 L2 行业数据"""
+        return {
+            "gain_list": self._state.gain_list or [],
+            "composite_list": self._state.composite_list or [],
+            "merged_list": self._state.merged_list or [],
+            "concepts": self._state.concepts or [],
+            "oversold_list": self._state.oversold_list or [],
+        }
+
     def get_scored_symbols(self) -> list:
         """获取缓存的 ScoredSymbol 列表"""
         return self._state.scored_symbols or []
+
+    def get_l2_stats(self) -> dict:
+        """获取 L2 统计数据（含 name_df 等）"""
+        return self._state.l2_stats or {}
+
+    def get_action_summary(self) -> dict:
+        """
+        生成操作建议 JSON（道长策略）。
+        整合 L1 大势 + L2 行业 + L3 标的 + 恐慌检测 + 抄底候选 + 主题追踪。
+        """
+        import logging
+        log = logging.getLogger(__name__)
+        ctx = self._state.market_context
+        reports = self._state.index_reports or []
+        scored = self._state.scored_symbols or []
+        l2_stats = self._state.l2_stats or {}
+        name_df = l2_stats.get("name_df")
+        oversold_list = self._state.oversold_list or []
+        concepts = self._state.concepts or []
+        gain_list = self._state.gain_list or []
+        composite_list = self._state.composite_list or []
+
+        result = {}
+
+        # ── 大势 ──
+        if ctx:
+            dir_map = {"偏多": "📈", "偏空": "📉", "分化": "↔️"}
+            result["market"] = {
+                "direction": ctx.overall_direction,
+                "emoji": dir_map.get(ctx.overall_direction, ""),
+                "style": getattr(ctx, "recommended_style", "未知"),
+                "sentiment": getattr(ctx, "sentiment_phase", "未知"),
+                "position_suggestion": getattr(ctx, "position_suggestion", ""),
+            }
+
+        # ── L1 策略指引（不依赖 L3，永远有内容）──
+        result["l1_guidance"] = []
+        for r in reports:
+            if not getattr(r, "data_available", False):
+                continue
+            sigs = []
+            daily_sig = getattr(r, "daily_latest_signal", "无")
+            f30_sig = getattr(r, "f30_latest_signal", "无")
+            f15_sig = getattr(r, "f15_latest_signal", "无")
+            if daily_sig != "无":
+                sigs.append(f"日:{daily_sig}")
+            if f30_sig != "无":
+                sigs.append(f"30M:{f30_sig}")
+            if f15_sig != "无":
+                sigs.append(f"15M:{f15_sig}")
+            if not sigs:
+                continue
+            has_buy = any("买" in s for s in sigs)
+            has_sell = any("卖" in s for s in sigs)
+            result["l1_guidance"].append({
+                "name": r.name,
+                "trend": getattr(r, "daily_trend", "未知"),
+                "signals": sigs,
+                "aligned": getattr(r, "three_level_aligned", False),
+                "action": "可关注" if has_buy else "需回避" if has_sell else "观望",
+            })
+
+        # ── L2 行业操作建议（不依赖 L3）──
+        result["l2_actions"] = []
+        for ind in composite_list[:5]:
+            cs = getattr(ind, "composite_score", 0)
+            zt = getattr(ind, "zt_count", 0)
+            if cs >= 70 and zt >= 3:
+                verdict = "关注"
+            elif cs >= 40:
+                verdict = "观望"
+            else:
+                verdict = "回避"
+            top_stock = ""
+            if getattr(ind, "candidates", None):
+                top_stock = ind.candidates[0].name
+            result["l2_actions"].append({
+                "name": ind.name,
+                "score": round(cs, 1),
+                "zt": zt,
+                "verdict": verdict,
+                "top_stock": top_stock,
+            })
+
+        # ── 恐慌检测 ──
+        panic_data = {"score": 0, "level": "正常", "detail": "", "action_hint": ""}
+        try:
+            from signals.core.panic_detector import assess_intraday_panic
+            pa = assess_intraday_panic(reports, self._state.analyzers, name_df)
+            panic_data = {
+                "score": pa.score,
+                "level": pa.level,
+                "detail": pa.detail,
+                "action_hint": "",
+            }
+            if pa.score >= 60:
+                panic_data["action_hint"] = "恐慌=底部信号 → 关注超跌+支撑位的反弹机会"
+            elif pa.score >= 40:
+                panic_data["action_hint"] = "市场偏弱 → 控制仓位，等待企稳信号"
+            elif pa.score >= 20:
+                panic_data["action_hint"] = "市场平稳，维持现有仓位"
+            else:
+                panic_data["action_hint"] = "市场平稳，持仓稳定"
+        except Exception as e:
+            log.warning("恐慌检测失败: %s", e)
+        result["panic"] = panic_data
+
+        # ── 抄底候选（门槛降到30）──
+        bottom_candidates = []
+        if panic_data["score"] >= 30:
+            try:
+                from signals.layers.industry import get_bottom_fishing_candidates
+                themes = ["CLAW", "算力", "新能源"]
+                bots = get_bottom_fishing_candidates(
+                    name_df, oversold_list, panic_data["score"], themes, top_n=5)
+                for b in bots:
+                    urgency = "关注" if panic_data["score"] >= 40 else "关注（非急迫）"
+                    bottom_candidates.append({
+                        "name": b.name, "gain_pct": round(b.gain_pct, 2),
+                        "oversold_score": round(b.oversold_score, 1),
+                        "type": b.sector_type, "line": b.rotation_line,
+                        "urgency": urgency,
+                    })
+            except Exception as e:
+                log.warning("抄底候选失败: %s", e)
+        result["bottom_candidates"] = bottom_candidates
+
+        # ── L3 操作建议（买入/风险/关注）──
+        from config import SCORE_THRESHOLD
+        above = [r for r in scored
+                 if r.total_score >= SCORE_THRESHOLD and r.signal_count > 0]
+        buys = [r for r in above if r.direction == "偏多"]
+        sells = [r for r in scored
+                 if r.direction == "偏空" and abs(r.total_score) >= 30
+                 and r.signal_count > 0]
+
+        # 信号简要
+        def _brief(signals):
+            freq_abbrev = {
+                "15分钟": "15M", "30分钟": "30M", "60分钟": "60M",
+                "日线": "日", "周线": "周",
+            }
+            sig_freq = {}
+            for sig in signals:
+                abbr = freq_abbrev.get(sig.freq, sig.freq)
+                sig_freq.setdefault(sig.signal_type, []).append(abbr)
+            parts = []
+            for sig_type, freqs in sig_freq.items():
+                parts.append(f"{sig_type}({'+'.join(freqs)})")
+            return " ".join(parts[:4])
+
+        result["buy_opportunities"] = []
+        for r in buys[:8]:
+            buy_freqs = {s.freq for s in r.signals if "买" in s.signal_type}
+            is_multi_tf = len(buy_freqs) > 1
+            result["buy_opportunities"].append({
+                "symbol": r.symbol,
+                "name": getattr(r, "name", r.symbol),
+                "score": round(r.total_score, 1),
+                "direction": r.direction,
+                "signals_brief": _brief(r.signals),
+                "resonance_tag": "★共振" if is_multi_tf else "",
+            })
+
+        result["risk_alerts"] = []
+        for r in sells[:5]:
+            result["risk_alerts"].append({
+                "symbol": r.symbol,
+                "name": getattr(r, "name", r.symbol),
+                "score": round(r.total_score, 1),
+                "direction": r.direction,
+            })
+
+        # 重点关注
+        result["focus_list"] = []
+        for r in above:
+            buy_freqs = {s.freq for s in r.signals if "买" in s.signal_type}
+            is_multi_tf = len(buy_freqs) > 1
+            if is_multi_tf:
+                result["focus_list"].append({
+                    "symbol": r.symbol,
+                    "name": getattr(r, "name", r.symbol),
+                    "score": round(r.total_score, 1),
+                    "tags": ["多级别共振"],
+                })
+
+        # ── 主题追踪 ──
+        theme_summary = ""
+        try:
+            from signals.core.theme_tracker import match_themes, format_theme_hits
+            themes = ["CLAW", "算力", "储能", "新能源", "半导体"]
+            hits = match_themes(themes, name_df, concepts, panic_data["level"])
+            theme_summary = format_theme_hits(hits)
+        except Exception as e:
+            log.warning("主题追踪失败: %s", e)
+        result["theme_summary"] = theme_summary
+
+        # ── 概念归纳 ──
+        concept_digest = ""
+        if concepts:
+            up_concepts = [c for c in concepts[:10]
+                           if getattr(c, "gain_pct", 0) > 0.5]
+            if up_concepts:
+                names = [c.name for c in up_concepts[:3]]
+                concept_digest = f"今日资金主攻 {'、'.join(names)}"
+        result["concept_digest"] = concept_digest
+
+        # ── 行业研判 ──
+        strong = []
+        for ind in composite_list[:5]:
+            info = f"{ind.name}(综合{ind.composite_score:.0f}"
+            if ind.zt_count > 0:
+                info += f",涨停{ind.zt_count}只"
+            info += ")"
+            strong.append(info)
+        weak = []
+        if name_df is not None and not name_df.empty:
+            from signals.core.theme_tracker import _find_name_col, _find_change_col
+            nc = _find_name_col(name_df)
+            cc = _find_change_col(name_df)
+            if nc and cc:
+                import pandas as pd
+                df_sorted = name_df.copy()
+                df_sorted[cc] = pd.to_numeric(df_sorted[cc], errors='coerce')
+                bottom5 = df_sorted.nsmallest(3, cc)
+                for _, row in bottom5.iterrows():
+                    weak.append(f"{row[nc]}({float(row[cc]):+.1f}%)")
+        result["industry_verdict"] = {
+            "strong": strong,
+            "weak": weak,
+            "note": "⚠ 涨幅靠前的行业可能是高抛兑现，关注综合评分和涨停密度",
+        }
+
+        # ── 结论（即使无 L3 也有意义）──
+        if buys:
+            conclusion = f"有{len(buys)}只偏多标的，可关注买入机会。"
+            if sells:
+                conclusion = "市场分化，精选偏多标的，回避偏空品种。"
+        elif sells:
+            conclusion = "存在卖出信号，控制仓位，回避偏空标的。"
+        else:
+            # 无 L3 数据时，基于 L1 + L2 生成结论
+            l1_buy_names = [g["name"] for g in result.get("l1_guidance", [])
+                            if g["action"] == "可关注"]
+            l2_focus = [a["name"] for a in result.get("l2_actions", [])
+                        if a["verdict"] == "关注"]
+            parts = []
+            if l1_buy_names:
+                parts.append(f"指数级别 {'、'.join(l1_buy_names[:3])} 有买入信号")
+            if l2_focus:
+                parts.append(f"{'、'.join(l2_focus[:3])} 板块涨停密集")
+            if parts:
+                conclusion = "、".join(parts) + "，可重点关注。"
+            else:
+                conclusion = "暂无明确买卖机会，维持观望。"
+            if not scored:
+                conclusion += " 暂无个股级别信号。"
+
+        if ctx:
+            conclusion += f" 大盘{ctx.overall_direction}+{getattr(ctx, 'sentiment_phase', '')}阶段"
+            if getattr(ctx, "recommended_style", ""):
+                conclusion += f"，精选{ctx.recommended_style}"
+        result["conclusion"] = conclusion
+
+        return result
+
+    def get_decision_brief(self) -> Optional[dict]:
+        """
+        P3-7: 生成决策简报。
+        整合情景分叉、风格切换、轮动状态、板块节奏、历史匹配。
+        """
+        ctx = self._state.market_context
+        if ctx is None:
+            return None
+
+        # 收集板块节奏预警 (P3-3)
+        rhythm_alerts = []
+        for ind in (self._state.merged_list or [])[:10]:
+            phase = getattr(ind, "rhythm_phase", "")
+            if phase in ("衰竭", "休整", "高潮"):
+                rhythm_alerts.append({
+                    "name": ind.name,
+                    "phase": phase,
+                    "score": getattr(ind, "rhythm_score", 0),
+                    "hint": getattr(ind, "rhythm_hint", ""),
+                })
+
+        # 加载历史匹配缓存 (P3-6)
+        analog_ref = None
+        try:
+            from signals.core.analog_matcher import load_analog_results
+            cached = load_analog_results()
+            if cached and "results" in cached:
+                analog_ref = cached["results"]
+        except Exception:
+            pass
+
+        try:
+            brief = ctx.build_decision_brief(
+                rhythm_alerts=rhythm_alerts,
+                analog_ref=analog_ref,
+            )
+            return brief
+        except Exception:
+            return None
 
     def is_ready(self) -> bool:
         """是否已完成至少一次分析"""

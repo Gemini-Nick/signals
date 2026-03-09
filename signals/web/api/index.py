@@ -28,6 +28,27 @@ def get_index_reports():
     return [serialize_index_report(r) for r in reports]
 
 
+@router.get("/summary")
+def get_action_summary():
+    """操作建议（道长策略）— 买卖机会 + 恐慌抄底 + 行业研判 + 主题追踪"""
+    engine = get_engine()
+    if not engine.is_ready():
+        raise HTTPException(status_code=503, detail="分析尚未完成")
+    return engine.get_action_summary()
+
+
+@router.get("/brief")
+def get_decision_brief():
+    """P3-7: 决策简报 — 整合情景分叉 + 风格切换 + 轮动 + 节奏 + 历史匹配"""
+    engine = get_engine()
+    if not engine.is_ready():
+        raise HTTPException(status_code=503, detail="分析尚未完成")
+    brief = engine.get_decision_brief()
+    if brief is None:
+        raise HTTPException(status_code=503, detail="决策简报生成失败")
+    return brief
+
+
 @router.get("/status")
 def get_engine_status():
     """引擎运行状态"""

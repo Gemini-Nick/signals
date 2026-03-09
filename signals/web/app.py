@@ -15,6 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api.index import router as index_router
 from .api.chart import router as chart_router
 from .api.screener import router as screener_router
+from .api.industry import router as industry_router
+from .api.stock import router as stock_router
+from .api.analog import router as analog_router
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -39,6 +42,9 @@ def create_app() -> FastAPI:
     app.include_router(index_router)
     app.include_router(chart_router)
     app.include_router(screener_router)
+    app.include_router(industry_router)
+    app.include_router(stock_router)
+    app.include_router(analog_router)
 
     # 静态文件服务
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
