@@ -137,6 +137,60 @@ class PytdxSource:
             futu_code, freq, count,
         )
 
+    # ─────────────────────────────────────────────────────
+    # 行业板块数据（880xxx 日线 + block.dat 成分股）
+    # ─────────────────────────────────────────────────────
+
+    def get_block_info(self, block_file: str = "block_zs.dat") -> pd.DataFrame:
+        """
+        获取板块分类信息（板块名、板块代码、成分股代码）。
+
+        :param block_file: 板块文件名（block_zs.dat=指数板块, block_fg.dat=风格板块）
+        :return: DataFrame with columns: blockname, block_type, code_index, code
+        """
+        self._connect()
+        data = self._api.get_and_parse_block_info(block_file)
+        return self._api.to_df(data)
+
+    def get_board_daily(self, board_code: str, count: int = 800) -> List[RawBar]:
+        """
+        获取 880xxx 板块指数日线 K 线。
+
+        :param board_code: 板块代码，如 '880371'（有色金属）
+        :param count: K 线数量（默认 800 根 ≈ 3年+）
+        :return: List[RawBar]
+        """
+        self._connect()
+        # category=9 表示日线, market=1 表示上海
+        return self._fetch_bars(
+            lambda offset, size: self._api.get_index_bars(
+                9, 1, board_code, offset, size
+            ),
+            board_code, Freq.D, count,
+        )
+
+    def get_board_stocks(self, block_file: str = "block_zs.dat") -> dict:
+        """
+        返回 {板块代码: {成分股代码集合}} 映射。
+
+        :param block_file: 板块文件名
+        :return: {"880371": {"601899", "002460", ...}, ...}
+        """
+        df = self.get_block_info(block_file)
+        if df.empty:
+            return {}
+        result = {}
+        for _, row in df.iterrows():
+            code_idx = str(row.get("code_index", ""))
+            stock_code = str(row.get("code", ""))
+            if code_idx.startswith("880") and stock_code:
+                result.setdefault(code_idx, set()).add(stock_code)
+        return result
+
+    # ─────────────────────────────────────────────────────
+    # 内部：分页拉取 bar
+    # ─────────────────────────────────────────────────────
+
     def _fetch_bars(self, fetch_fn, symbol: str, freq: Freq,
                     count: int) -> List[RawBar]:
         """

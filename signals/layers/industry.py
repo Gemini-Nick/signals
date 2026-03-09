@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 行业工具：
-- 获取行业列表 + 成分股（AKShare）
-- 行业强度研判（两级降级方案）
-  方法 A：行业板块 CZSC（东财接口，间歇性超时 → 降级到方法 B）
+- 获取行业列表 + 成分股（AKShare 东财 + 同花顺双源）
+- 行业强度研判（多级降级方案）
+  方法 A：行业板块 CZSC（东财 → 同花顺 → pytdx → 缓存）
   方法 B：成分股聚合评分（始终可用）
 - 双榜行业排行：涨幅榜 + 综合强度榜
 - 多维度个股入池：涨停/异动/领涨/强势/龙头/融资
+
+数据源降级链：
+  行业涨幅排行: 东财 → 同花顺 → 缓存
+  行业 K 线:    东财 → 同花顺 → pytdx → 缓存
+  行业成分股:   东财 → pytdx → 缓存
+  概念板块排行: 东财 → 缓存
 """
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -197,6 +203,346 @@ _INDUSTRY_LEADERS: dict = {
 
 
 # ─────────────────────────────────────────────────────────
+# 磁盘缓存工具 — 所有降级链的最后兜底
+# ─────────────────────────────────────────────────────────
+_CACHE_DIR = Path(".data/cache")
+
+
+def _save_cache(key: str, data):
+    """保存 JSON 缓存。data 必须是 json-serializable (list/dict)。"""
+    import json
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = _CACHE_DIR / f"{key}.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def _load_cache(key: str, max_age_hours: float = 24):
+    """加载 JSON 缓存，超过 max_age_hours 返回 None。"""
+    import json, time
+    path = _CACHE_DIR / f"{key}.json"
+    if not path.exists():
+        return None
+    age_hours = (time.time() - path.stat().st_mtime) / 3600
+    if age_hours > max_age_hours:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_bar_cache(key: str, bars):
+    """K 线缓存（RawBar 是 Rust 类型不可 pickle，转为 JSON）。"""
+    import json
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = _CACHE_DIR / f"{key}_bars.json"
+    data = []
+    for b in bars:
+        data.append({
+            "dt": str(b.dt), "open": b.open, "high": b.high,
+            "low": b.low, "close": b.close, "vol": b.vol,
+            "amount": getattr(b, "amount", 0),
+        })
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
+def _load_bar_cache(key: str, max_age_hours: float = 24):
+    """加载 K 线缓存，重建为 RawBar 列表。"""
+    import json, time
+    from czsc import RawBar, Freq
+    from datetime import datetime
+
+    path = _CACHE_DIR / f"{key}_bars.json"
+    if not path.exists():
+        return None
+    age_hours = (time.time() - path.stat().st_mtime) / 3600
+    if age_hours > max_age_hours:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        bars = []
+        for d in data:
+            bars.append(RawBar(
+                symbol=key.replace("bars_", ""), freq=Freq.D,
+                dt=datetime.fromisoformat(str(d["dt"])),
+                open=d["open"], high=d["high"], low=d["low"],
+                close=d["close"], vol=d["vol"],
+                amount=d.get("amount", 0),
+            ))
+        return bars if bars else None
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────
+# 同花顺 (THS) 降级函数
+# ─────────────────────────────────────────────────────────
+_THS_CIRCUIT_OPEN = False  # 同花顺熔断标志
+
+
+def _fetch_ths_industry_ranking(top_n: int = 10) -> Optional[list]:
+    """
+    同花顺行业涨幅排行（stock_board_industry_summary_ths）。
+    返回与东财 get_top_industries_by_gain 相同格式的 list of dict。
+    超时 15s，失败返回 None。
+    """
+    global _THS_CIRCUIT_OPEN
+    if _THS_CIRCUIT_OPEN:
+        return None
+
+    import akshare as ak
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+    def _call():
+        return ak.stock_board_industry_summary_ths()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_call)
+            df = future.result(timeout=15)
+    except (FutureTimeout, Exception) as e:
+        _THS_CIRCUIT_OPEN = True
+        _log(f"  [⚡] 同花顺行业排行接口失败（{e.__class__.__name__}），熔断")
+        return None
+
+    if df is None or df.empty or "涨跌幅" not in df.columns:
+        return None
+
+    df = df.sort_values("涨跌幅", ascending=False).head(top_n)
+    result = []
+    for _, row in df.iterrows():
+        leading = str(row.get("领涨股", ""))
+        leading_gain = 0.0
+        try:
+            leading_gain = float(row.get("领涨股-涨跌幅", 0) or 0)
+        except (ValueError, TypeError):
+            pass
+        net_inflow = 0.0
+        try:
+            net_inflow = float(row.get("净流入", 0) or 0)
+        except (ValueError, TypeError):
+            pass
+        result.append({
+            "name":          str(row.get("板块", "")),
+            "gain_pct":      float(row.get("涨跌幅", 0) or 0),
+            "net_inflow":    net_inflow,
+            "leading_stock": leading,
+            "leading_gain":  leading_gain,
+        })
+    _log(f"  [THS] 行业排行降级成功（{len(result)}条）")
+    return result
+
+
+def _fetch_ths_industry_bars(industry: str,
+                              lookback_days: int = 180,
+                              start_date: str = None):
+    """
+    同花顺行业 K 线（stock_board_industry_index_ths）。
+    返回 List[RawBar]，失败返回空列表。
+    """
+    global _THS_CIRCUIT_OPEN
+    if _THS_CIRCUIT_OPEN:
+        return []
+
+    import akshare as ak
+    from datetime import datetime, timedelta
+    from czsc import RawBar, Freq
+    from signals.data.fetcher import _to_raw_bars
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+    today = datetime.now()
+    if start_date:
+        s_date = start_date.replace("-", "")
+    else:
+        s_date = (today - timedelta(days=lookback_days)).strftime("%Y%m%d")
+    e_date = today.strftime("%Y%m%d")
+
+    def _call():
+        return ak.stock_board_industry_index_ths(
+            symbol=industry, start_date=s_date, end_date=e_date
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_call)
+            df = future.result(timeout=15)
+    except (FutureTimeout, Exception) as e:
+        _detail(f"  [THS] {industry} K线失败（{e.__class__.__name__}）")
+        return []
+
+    if df is None or df.empty:
+        return []
+
+    # 同花顺列名：日期, 开盘价, 最高价, 最低价, 收盘价, 成交量, 成交额
+    col_map = {}
+    for src, dst in [("日期", "dt"), ("开盘价", "open"), ("最高价", "high"),
+                     ("最低价", "low"), ("收盘价", "close"), ("成交量", "vol"),
+                     ("成交额", "amount")]:
+        if src in df.columns:
+            col_map[src] = dst
+    df = df.rename(columns=col_map)
+    if "amount" not in df.columns:
+        df["amount"] = 0
+
+    bars = _to_raw_bars(df, industry, Freq.D,
+                        "dt", "open", "high", "low", "close", "vol", "amount")
+    if bars:
+        _detail(f"  [THS] {industry} K线降级成功（{len(bars)}根）")
+    return bars
+
+
+# ─────────────────────────────────────────────────────────
+# 东财→pytdx 映射（成分股代码重叠匹配）
+# ─────────────────────────────────────────────────────────
+_EM_TDX_MAP: Optional[dict] = None   # {"白酒": "880437", ...}
+
+
+def _get_em_tdx_map() -> dict:
+    """获取东财行业名→pytdx 880xxx 代码映射（带磁盘缓存）。"""
+    global _EM_TDX_MAP
+    if _EM_TDX_MAP is not None:
+        return _EM_TDX_MAP
+
+    # 尝试磁盘缓存（7天有效）
+    cached = _load_cache("em_tdx_map", max_age_hours=168)
+    if cached:
+        _EM_TDX_MAP = cached
+        return _EM_TDX_MAP
+
+    _EM_TDX_MAP = {}
+    return _EM_TDX_MAP
+
+
+def _build_em_tdx_mapping() -> dict:
+    """
+    构建东财行业名→pytdx 880xxx 代码映射。
+    通过成分股代码重叠度匹配。调用耗时较长（需遍历行业），
+    在 rank_industries() 中异步触发。
+    """
+    global _EM_TDX_MAP
+    import akshare as ak
+
+    try:
+        from signals.data.pytdx_source import PytdxSource
+        src = PytdxSource()
+        tdx_blocks = src.get_board_stocks()
+        src.disconnect()
+    except Exception as e:
+        _detail(f"  [pytdx] 板块数据获取失败（{e.__class__.__name__}），跳过映射构建")
+        return {}
+
+    if not tdx_blocks:
+        return {}
+
+    # 获取东财行业名称列表
+    df = _fetch_board_industry_name_em()
+    if df is None or df.empty or "板块名称" not in df.columns:
+        return {}
+
+    mapping = {}
+    industry_names = df["板块名称"].tolist()[:30]  # 只匹配前30个热门行业减少耗时
+
+    for name in industry_names:
+        try:
+            with _no_proxy():
+                cons_df = ak.stock_board_industry_cons_em(symbol=name)
+        except Exception:
+            continue
+        if cons_df is None or cons_df.empty:
+            continue
+
+        # 提取6位股票代码
+        code_col = None
+        for col in ["代码", "code", "股票代码"]:
+            if col in cons_df.columns:
+                code_col = col
+                break
+        if not code_col:
+            continue
+
+        em_codes = set(str(c).zfill(6) for c in cons_df[code_col].astype(str))
+
+        # 找到重叠度最高的 pytdx 板块
+        best_code, best_overlap = None, 0
+        for tdx_code, tdx_codes in tdx_blocks.items():
+            overlap = len(em_codes & tdx_codes)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_code = tdx_code
+        if best_code and best_overlap >= 3:
+            mapping[name] = best_code
+
+    if mapping:
+        _save_cache("em_tdx_map", mapping)
+        _EM_TDX_MAP = mapping
+        _detail(f"  [pytdx] 映射构建完成（{len(mapping)}个行业）")
+
+    return mapping
+
+
+def _fetch_pytdx_industry_bars(industry: str, count: int = 800):
+    """
+    pytdx 行业 K 线降级（通过映射表查 880xxx 代码）。
+    返回 List[RawBar]，找不到映射或失败返回空列表。
+    """
+    tdx_map = _get_em_tdx_map()
+    tdx_code = tdx_map.get(industry)
+    if not tdx_code:
+        return []
+
+    try:
+        from signals.data.pytdx_source import PytdxSource
+        src = PytdxSource()
+        bars = src.get_board_daily(tdx_code, count=count)
+        src.disconnect()
+        if bars:
+            _detail(f"  [pytdx] {industry} K线降级成功（{tdx_code}, {len(bars)}根）")
+        return bars
+    except Exception as e:
+        _detail(f"  [pytdx] {industry} K线失败（{e.__class__.__name__}）")
+        return []
+
+
+def _fetch_pytdx_industry_stocks(industry: str) -> List[str]:
+    """
+    pytdx 行业成分股降级。返回 Futu 格式代码列表。
+    """
+    tdx_map = _get_em_tdx_map()
+    tdx_code = tdx_map.get(industry)
+    if not tdx_code:
+        return []
+
+    try:
+        from signals.data.pytdx_source import PytdxSource
+        src = PytdxSource()
+        all_blocks = src.get_board_stocks()
+        src.disconnect()
+    except Exception:
+        return []
+
+    codes = all_blocks.get(tdx_code, set())
+    if not codes:
+        return []
+
+    futu_codes = []
+    for code in codes:
+        code = code.zfill(6)
+        if code.startswith("6"):
+            futu_codes.append(f"SH.{code}")
+        elif code.startswith(("0", "3")):
+            futu_codes.append(f"SZ.{code}")
+        elif code.startswith(("8", "4")):
+            futu_codes.append(f"BJ.{code}")
+    if futu_codes:
+        _detail(f"  [pytdx] {industry} 成分股降级成功（{len(futu_codes)}只）")
+    return futu_codes
+
+
+# ─────────────────────────────────────────────────────────
 # 东财 API 熔断器 — SSLError 一次即熔断，后续调用直接走缓存
 # ─────────────────────────────────────────────────────────
 _EM_CIRCUIT_OPEN = False          # True = 东财不可用，跳过网络调用
@@ -270,39 +616,52 @@ def get_industry_stocks(industry: str) -> List[str]:
     """
     获取指定行业的成分股，返回 Futu 格式代码列表。
 
-    :param industry: 行业名称，如 "有色金属"、"半导体"（需与 AKShare 行业名称一致）
+    降级链：东财 cons_em → pytdx block.dat → 磁盘缓存
+
+    :param industry: 行业名称，如 "有色金属"、"半导体"
     :return: ["SH.600489", "SZ.002460", ...]
     """
     import akshare as ak
+    _cache_key = f"stocks_{industry}"
 
+    # ── 1. 东财 cons_em ──────────────────────────────
     try:
         with _no_proxy():
             df = ak.stock_board_industry_cons_em(symbol=industry)
+        if df is not None and not df.empty:
+            code_col = None
+            for col in ["代码", "code", "股票代码"]:
+                if col in df.columns:
+                    code_col = col
+                    break
+            if code_col:
+                futu_codes = []
+                for code in df[code_col].astype(str):
+                    code = code.zfill(6)
+                    if code.startswith("6"):
+                        futu_codes.append(f"SH.{code}")
+                    elif code.startswith(("0", "3")):
+                        futu_codes.append(f"SZ.{code}")
+                    elif code.startswith(("8", "4")):
+                        futu_codes.append(f"BJ.{code}")
+                if futu_codes:
+                    _save_cache(_cache_key, futu_codes)
+                    return futu_codes
     except Exception as e:
-        _detail(f"  [!] {industry} 成分股接口失败（{e.__class__.__name__}），返回空列表")
-        return []
-    if df is None or df.empty:
-        return []
+        _detail(f"  [!] {industry} 东财成分股失败（{e.__class__.__name__}）")
 
-    # AKShare 返回的代码列（通常是 "代码" 列，6 位数字）
-    code_col = None
-    for col in ["代码", "code", "股票代码"]:
-        if col in df.columns:
-            code_col = col
-            break
-    if code_col is None:
-        return []
+    # ── 2. pytdx block.dat 降级 ──────────────────────
+    pytdx_codes = _fetch_pytdx_industry_stocks(industry)
+    if pytdx_codes:
+        _save_cache(_cache_key, pytdx_codes)
+        return pytdx_codes
 
-    futu_codes = []
-    for code in df[code_col].astype(str):
-        code = code.zfill(6)
-        if code.startswith("6"):
-            futu_codes.append(f"SH.{code}")
-        elif code.startswith(("0", "3")):
-            futu_codes.append(f"SZ.{code}")
-        elif code.startswith("8") or code.startswith("4"):
-            futu_codes.append(f"BJ.{code}")
-    return futu_codes
+    # ── 3. 磁盘缓存兜底 ─────────────────────────────
+    cached = _load_cache(_cache_key, max_age_hours=168)  # 成分股变动少，7天缓存
+    if cached:
+        _detail(f"  [cache] {industry} 成分股使用缓存（{len(cached)}只）")
+        return cached
+    return []
 
 
 # ─────────────────────────────────────────────────────────
@@ -406,10 +765,11 @@ def get_industry_bars(industry: str,
                       lookback_days: int = 180,
                       start_date: str = None):
     """
-    通过 stock_board_industry_hist_em 获取行业板块日线 K 线。
-    东财接口间歇性超时，调用方需 try/except 降级。
+    获取行业板块日线 K 线。
 
-    :param industry:     行业名称（东财格式），如 "有色金属"
+    降级链：东财 hist_em → 同花顺 index_ths → pytdx 880xxx → 磁盘缓存
+
+    :param industry:     行业名称，如 "有色金属"
     :param lookback_days: 盘中模式：近 N 自然日（默认180）
     :param start_date:   盘后模式：固定起点，如 '2024-09-24'
     :return: List[RawBar]，失败返回空列表
@@ -420,6 +780,8 @@ def get_industry_bars(industry: str,
     import pandas as pd
     from signals.data.fetcher import _to_raw_bars
 
+    _bar_cache_key = f"bars_{industry}"
+
     today = datetime.now()
     if start_date:
         s_date = start_date.replace("-", "")
@@ -429,37 +791,56 @@ def get_industry_bars(industry: str,
 
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
-    def _call():
-        return ak.stock_board_industry_hist_em(
-            symbol=industry, period="daily",
-            start_date=s_date, end_date=e_date,
-            adjust="qfq"
-        )
+    # ── 1. 东财 hist_em（现有，15s 超时）──────────────
+    if not _EM_CIRCUIT_OPEN:
+        def _call():
+            return ak.stock_board_industry_hist_em(
+                symbol=industry, period="daily",
+                start_date=s_date, end_date=e_date,
+                adjust="qfq"
+            )
 
-    try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_call)
-            df = future.result(timeout=15)
-    except (FutureTimeout, Exception) as e:
-        _log(f"  [!] {industry} K线接口超时/失败（{e.__class__.__name__}）")
-        return []
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_call)
+                df = future.result(timeout=15)
 
-    if df is None or df.empty:
-        return []
+            if df is not None and not df.empty:
+                col_map = {}
+                for src, dst in [("日期", "dt"), ("开盘", "open"), ("最高", "high"),
+                                 ("最低", "low"), ("收盘", "close"), ("成交量", "vol"),
+                                 ("成交额", "amount"), ("date", "dt"), ("volume", "vol")]:
+                    if src in df.columns:
+                        col_map[src] = dst
+                df = df.rename(columns=col_map)
+                if "amount" not in df.columns:
+                    df["amount"] = 0
+                bars = _to_raw_bars(df, industry, Freq.D,
+                                    "dt", "open", "high", "low", "close", "vol", "amount")
+                if bars:
+                    _save_bar_cache(_bar_cache_key, bars)
+                    return bars
+        except (FutureTimeout, Exception) as e:
+            _detail(f"  [!] {industry} 东财K线超时/失败（{e.__class__.__name__}）")
 
-    # 东财返回的列名可能是中文或英文，尝试两种
-    col_map = {}
-    for src, dst in [("日期", "dt"), ("开盘", "open"), ("最高", "high"),
-                     ("最低", "low"), ("收盘", "close"), ("成交量", "vol"),
-                     ("成交额", "amount"), ("date", "dt"), ("volume", "vol")]:
-        if src in df.columns:
-            col_map[src] = dst
-    df = df.rename(columns=col_map)
-    if "amount" not in df.columns:
-        df["amount"] = 0
+    # ── 2. 同花顺 index_ths（降级）───────────────────
+    bars = _fetch_ths_industry_bars(industry, lookback_days, start_date)
+    if bars:
+        _save_bar_cache(_bar_cache_key, bars)
+        return bars
 
-    return _to_raw_bars(df, industry, Freq.D,
-                        "dt", "open", "high", "low", "close", "vol", "amount")
+    # ── 3. pytdx 880xxx（降级）───────────────────────
+    bars = _fetch_pytdx_industry_bars(industry, count=max(lookback_days, 300))
+    if bars:
+        _save_bar_cache(_bar_cache_key, bars)
+        return bars
+
+    # ── 4. 磁盘缓存兜底 ─────────────────────────────
+    cached = _load_bar_cache(_bar_cache_key, max_age_hours=48)
+    if cached:
+        _detail(f"  [cache] {industry} K线使用缓存（{len(cached)}根）")
+        return cached
+    return []
 
 
 def score_industry_czsc(industry: str,
@@ -588,15 +969,19 @@ def get_top_industries_by_gain(top_n: int = 10, period: str = "今日") -> list:
     """
     获取行业涨幅排行前 top_n 名。
 
-    数据源优先级：
-    A. stock_board_industry_name_em()  — 东财行业板块实时行情（含涨跌幅）
-    B. stock_board_change_em()         — 东财全板块异动（降级，过滤出行业名）
+    数据源降级链：
+    A. 东财 stock_board_industry_name_em（带熔断）
+    B. 同花顺 stock_board_industry_summary_ths（降级）
+    C. 东财 stock_board_change_em（全板块异动，再降级）
+    D. 磁盘缓存兜底
 
     :param top_n:   取前N名行业，默认10
-    :param period:  暂未使用（两个接口均为实时数据）
+    :param period:  暂未使用（接口均为实时数据）
     :return: list of dict，每项含 name/gain_pct/net_inflow/leading_stock/leading_gain
     """
     import akshare as ak
+
+    _cache_key = "industry_gain_ranking"
 
     # ── 方法 A：东财行业板块实时行情（带熔断）──────────────
     df = _fetch_board_industry_name_em()
@@ -617,32 +1002,44 @@ def get_top_industries_by_gain(top_n: int = 10, period: str = "今日") -> list:
                 "leading_stock": leading,
                 "leading_gain":  leading_gain,
             })
+        _save_cache(_cache_key, result)
         return result
 
-    # ── 方法 B：全板块异动（过滤行业名）─────────────────
+    # ── 方法 B：同花顺行业排行（降级）─────────────────
+    ths_result = _fetch_ths_industry_ranking(top_n)
+    if ths_result:
+        _save_cache(_cache_key, ths_result)
+        return ths_result
+
+    # ── 方法 C：东财全板块异动（再降级）────────────────
     try:
         df_all = ak.stock_board_change_em()
-        if df_all is None or df_all.empty:
-            return []
-        # 只保留能被 stock_board_industry_cons_em 识别的行业名
-        # 用已有的行业名集合过滤（懒加载 + 缓存）
-        industry_names = _get_known_industry_names()
-        df_ind = df_all[df_all["板块名称"].isin(industry_names)] if industry_names else df_all
-        df_ind = df_ind.sort_values("涨跌幅", ascending=False).head(top_n)
-        result = []
-        for _, row in df_ind.iterrows():
-            leading_code = str(row.get("板块异动最频繁个股及所属类型-股票代码", ""))
-            result.append({
-                "name":          str(row["板块名称"]),
-                "gain_pct":      float(row.get("涨跌幅", 0) or 0),
-                "net_inflow":    float(row.get("主力净流入", 0) or 0) / 1e8,
-                "leading_stock": leading_code,
-                "leading_gain":  0.0,
-            })
-        return result
+        if df_all is not None and not df_all.empty:
+            industry_names = _get_known_industry_names()
+            df_ind = df_all[df_all["板块名称"].isin(industry_names)] if industry_names else df_all
+            df_ind = df_ind.sort_values("涨跌幅", ascending=False).head(top_n)
+            result = []
+            for _, row in df_ind.iterrows():
+                leading_code = str(row.get("板块异动最频繁个股及所属类型-股票代码", ""))
+                result.append({
+                    "name":          str(row["板块名称"]),
+                    "gain_pct":      float(row.get("涨跌幅", 0) or 0),
+                    "net_inflow":    float(row.get("主力净流入", 0) or 0) / 1e8,
+                    "leading_stock": leading_code,
+                    "leading_gain":  0.0,
+                })
+            if result:
+                _save_cache(_cache_key, result)
+                return result
     except Exception as e:
         _detail(f"  [!] 全板块异动接口也失败（{e}）")
-        return []
+
+    # ── 方法 D：磁盘缓存兜底 ────────────────────────
+    cached = _load_cache(_cache_key, max_age_hours=24)
+    if cached:
+        _log(f"  [cache] 行业排行使用缓存（{len(cached)}条）")
+        return cached
+    return []
 
 
 # 静态行业名缓存（供方法B过滤，首次调用时尝试从接口加载，失败则用内置集合）
@@ -720,8 +1117,9 @@ def _classify_industry(name: str) -> str:
 def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
     """
     获取概念板块涨幅 top N。
-    API: ak.stock_board_concept_name_em()（一次调用，返回全量）
-    超时 15s + 自动重试 1 次；仍失败则返回空列表。
+
+    降级链：东财 concept_name_em（15s+重试） → 磁盘缓存
+    （同花顺/pytdx 均无概念排行能力）
     """
     import akshare as ak
     import config as _cfg
@@ -729,6 +1127,8 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
 
     if top_n is None:
         top_n = getattr(_cfg, "CONCEPT_TOP_N", 10)
+
+    _cache_key = "concept_rankings"
 
     def _call():
         with _no_proxy():
@@ -745,34 +1145,55 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
             if attempt == 0:
                 _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}），重试中...")
                 continue
-            _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}，重试仍失败），跳过概念排行")
-            return []
+            _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}，重试仍失败）")
+            df = None
 
-    if df is None or df.empty or "涨跌幅" not in df.columns:
-        return []
+    if df is not None and not df.empty and "涨跌幅" in df.columns:
+        df = df.sort_values("涨跌幅", ascending=False).head(top_n)
+        results = []
+        for _, row in df.iterrows():
+            name = str(row.get("板块名称", "")).strip()
+            if not name:
+                continue
+            leading = str(row.get("领涨股票", ""))
+            leading_gain = 0.0
+            try:
+                leading_gain = float(row.get("领涨股票-涨跌幅", 0) or 0)
+            except (ValueError, TypeError):
+                pass
+            results.append(ConceptRanking(
+                name=name,
+                gain_pct=float(row.get("涨跌幅", 0) or 0),
+                leading_stock=leading,
+                leading_gain=leading_gain,
+                sector_type=_classify_concept(name),
+            ))
 
-    df = df.sort_values("涨跌幅", ascending=False).head(top_n)
-    results = []
-    for _, row in df.iterrows():
-        name = str(row.get("板块名称", "")).strip()
-        if not name:
-            continue
-        leading = str(row.get("领涨股票", ""))
-        leading_gain = 0.0
-        try:
-            leading_gain = float(row.get("领涨股票-涨跌幅", 0) or 0)
-        except (ValueError, TypeError):
-            pass
-        results.append(ConceptRanking(
-            name=name,
-            gain_pct=float(row.get("涨跌幅", 0) or 0),
-            leading_stock=leading,
-            leading_gain=leading_gain,
-            sector_type=_classify_concept(name),
-        ))
+        if results:
+            # 缓存序列化
+            _save_cache(_cache_key, [
+                {"name": r.name, "gain_pct": r.gain_pct,
+                 "leading_stock": r.leading_stock, "leading_gain": r.leading_gain,
+                 "sector_type": r.sector_type}
+                for r in results
+            ])
+            _detail(f"  [✓] 概念板块 top {len(results)} 条")
+            return results
 
-    _detail(f"  [✓] 概念板块 top {len(results)} 条")
-    return results
+    # ── 磁盘缓存兜底 ────────────────────────────────
+    cached = _load_cache(_cache_key, max_age_hours=24)
+    if cached:
+        _log(f"  [cache] 概念排行使用缓存（{len(cached)}条）")
+        return [
+            ConceptRanking(
+                name=c["name"], gain_pct=c["gain_pct"],
+                leading_stock=c.get("leading_stock", ""),
+                leading_gain=c.get("leading_gain", 0.0),
+                sector_type=c.get("sector_type", "中性"),
+            )
+            for c in cached
+        ]
+    return []
 
 
 def _match_concepts_to_industries(
