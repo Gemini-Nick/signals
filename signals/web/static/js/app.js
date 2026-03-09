@@ -32,6 +32,11 @@ function switchPage(pageName) {
   if (page) page.classList.add('active');
   const tab = document.querySelector(`.nav-tab[data-page="${pageName}"]`);
   if (tab) tab.classList.add('active');
+
+  // 历史对照页：首次切入时加载缓存
+  if (pageName === 'analog' && window.loadAnalogPage) {
+    window.loadAnalogPage();
+  }
 }
 
 function navigateToChart(indexName, freq) {
@@ -85,6 +90,9 @@ document.addEventListener('DOMContentLoaded', () => {
     body.classList.toggle('open');
     arrow.innerHTML = body.classList.contains('open') ? '&#9650;' : '&#9660;';
   });
+
+  // 初始化个股分析页
+  if (window.initStockPage) window.initStockPage();
 
   // 加载首页数据
   if (window.loadDashboard) window.loadDashboard();

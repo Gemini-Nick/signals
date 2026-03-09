@@ -22,15 +22,22 @@
   <nav class="nav-tabs">
     <div class="nav-tab active" data-page="dashboard">市况总览</div>
     <div class="nav-tab" data-page="chart">图表</div>
+    <div class="nav-tab" data-page="stock">个股分析</div>
+    <div class="nav-tab" data-page="analog">历史对照</div>
   </nav>
 
   <!-- Pages -->
   <main>
     <!-- Page 1: Dashboard -->
     <div id="page-dashboard" class="page active">
+      <!-- P3-7: 决策简报 -->
+      <div id="decision-brief" class="decision-brief" style="display:none;"></div>
+
       <div id="banner" class="banner neutral">
         <div class="banner-direction" id="banner-direction">加载中...</div>
         <div class="banner-suggestion" id="banner-suggestion"></div>
+        <!-- P3-5: 风格切换提示 -->
+        <div id="style-switch-alert" class="style-switch-alert" style="display:none;"></div>
       </div>
 
       <!-- A股指数 -->
@@ -45,7 +52,25 @@
       <div class="section-title">美股</div>
       <div class="cards-grid" id="cards-us"></div>
 
-      <!-- 今日信号 -->
+      <!-- L2 行业分析 -->
+      <div class="section-title">行业排行</div>
+      <div id="industry-section">
+        <div class="empty-state">加载中...</div>
+      </div>
+
+      <!-- 情绪仓位面板 -->
+      <div class="section-title">情绪 & 仓位</div>
+      <div id="rotation-section">
+        <div class="empty-state">加载中...</div>
+      </div>
+
+      <!-- 操作建议 (道长策略) -->
+      <div class="section-title">操作建议</div>
+      <div id="action-section" class="action-section">
+        <div class="empty-state">加载中...</div>
+      </div>
+
+      <!-- 今日信号 (L1指数 + L3标的) -->
       <div class="section-title">今日信号</div>
       <div class="signal-list" id="signal-list">
         <div class="empty-state">暂无信号数据</div>
@@ -64,7 +89,7 @@
         </div>
       </div>
 
-      <div class="chart-container" id="chart-container" style="height: 500px;"></div>
+      <div class="chart-container" id="chart-container" style="height: 620px;"></div>
 
       <!-- Signal Details -->
       <div class="signal-details" id="signal-details">
@@ -77,6 +102,36 @@
       <!-- Summary Bar -->
       <div class="chart-summary" id="chart-summary"></div>
     </div>
+
+    <!-- Page 3: Stock Analysis -->
+    <div id="page-stock" class="page">
+      <div class="stock-search-bar">
+        <input type="text" id="stock-input" class="stock-input" placeholder="输入股票代码 (如 600519 或 SZ.002759)" />
+        <button class="stock-search-btn" onclick="analyzeStock()">分析</button>
+      </div>
+      <div id="stock-result">
+        <div class="empty-state">输入代码后点击分析</div>
+      </div>
+    </div>
+
+    <!-- Page 4: Historical Analog -->
+    <div id="page-analog" class="page">
+      <div class="analog-header">
+        <div class="analog-selector">
+          <select id="analog-index-select" class="analog-select">
+            <option value="沪深300">沪深300</option>
+            <option value="创业板指">创业板指</option>
+            <option value="上证50">上证50</option>
+          </select>
+          <button class="stock-search-btn" id="analog-run-btn" onclick="runAnalogMatch()">运行匹配</button>
+        </div>
+        <div class="analog-info">窗口30天 | Pearson相关系数 | Top3匹配</div>
+      </div>
+      <div id="analog-results" class="analog-results">
+        <div class="empty-state">选择指数后点击运行匹配</div>
+      </div>
+      <div id="analog-chart-container" class="chart-container" style="height:400px;display:none;"></div>
+    </div>
   </main>
 
   <!-- TradingView Lightweight Charts v4 -->
@@ -86,6 +141,8 @@
   <script src="/static/js/app.js"></script>
   <script src="/static/js/dashboard.js"></script>
   <script src="/static/js/chart.js"></script>
+  <script src="/static/js/stock.js"></script>
+  <script src="/static/js/analog.js"></script>
 
 </body>
 </html>
