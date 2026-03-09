@@ -11,9 +11,12 @@ router = APIRouter(prefix="/api/screener", tags=["screener"])
 @router.get("/results")
 def get_screener_results():
     """
-    获取评分排序的标的列表（ScoredSymbol[]）。
-    Phase 0-1 阶段，此端点返回空列表（L3 尚未集成到 Web 引擎）。
+    获取评分排序的标的列表（ScoredSymbol[]），含全量结果和阈值。
     """
+    from config import SCORE_THRESHOLD
     engine = get_engine()
     scored = engine.get_scored_symbols()
-    return [serialize_scored_symbol(s) for s in scored]
+    return {
+        "threshold": SCORE_THRESHOLD,
+        "results": [serialize_scored_symbol(s) for s in scored],
+    }
