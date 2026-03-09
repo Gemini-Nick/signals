@@ -361,18 +361,19 @@ function renderIndustry(data) {
     html += '</div>';
   }
 
-  // 热门概念
+  // 热门概念（可点击穿透到行业表）
   if (concepts && concepts.length > 0) {
     html += '<div class="concept-section"><span class="table-title">热门概念: </span>';
     html += concepts.slice(0, 10).map(c => {
       const pctCls = c.gain_pct >= 0 ? 'up' : 'down';
       const hasData = c.gain_pct !== 0 || (c.tag !== 'static');
+      const clickAttr = `onclick="highlightConceptIndustry('${c.name.replace(/'/g, "\\'")}')" style="cursor:pointer;"`;
       if (hasData && c.gain_pct !== 0) {
         let label = `${c.name} ${c.gain_pct > 0 ? '+' : ''}${c.gain_pct.toFixed(1)}%`;
         if (c.leading_stock) label += ` 领涨:${c.leading_stock}`;
-        return `<span class="tag tag-concept ${pctCls}">${label}</span>`;
+        return `<span class="tag tag-concept ${pctCls}" ${clickAttr} title="点击高亮相关行业">${label}</span>`;
       } else {
-        return `<span class="tag tag-concept">${c.name}</span>`;
+        return `<span class="tag tag-concept" ${clickAttr} title="点击高亮相关行业">${c.name}</span>`;
       }
     }).join(' ');
     html += '</div>';
@@ -490,18 +491,21 @@ function renderActionSummary(summary) {
 
   let html = '';
 
-  // 1. 恐慌评估（始终显示）
+  // 1. 恐慌评估（始终显示，含市场状态）
   const panic = summary.panic;
   if (panic) {
     const score = panic.score || 0;
+    const ms = panic.market_state || '平稳';
     let cls, emoji;
     if (score >= 60) { cls = 'high'; emoji = '\uD83D\uDD34'; }
     else if (score >= 40) { cls = 'mid'; emoji = '\uD83D\uDFE1'; }
     else if (score >= 20) { cls = 'low'; emoji = '\uD83D\uDCCA'; }
     else { cls = 'safe'; emoji = '\u2705'; }
+    const stateEmoji = {'急跌': '\uD83D\uDD34', '缓跌': '\uD83D\uDFE1', '企稳': '\uD83D\uDFE2', '反弹': '\uD83D\uDCC8', '平稳': '\u26AA'};
+    const msTag = `<span class="market-state-tag state-${ms}">${stateEmoji[ms] || ''}[${ms}]</span>`;
     html += `<div class="panic-banner ${cls}">
       <div>
-        <div>${emoji} 恐慌指数 <span class="panic-score">${score.toFixed(0)}</span>/100 — ${panic.level}</div>
+        <div>${emoji} 恐慌指数 <span class="panic-score">${score.toFixed(0)}</span>/100 — ${panic.level} ${msTag}</div>
         ${panic.detail ? `<div class="panic-detail">${panic.detail}</div>` : ''}
         ${panic.action_hint ? `<div class="panic-hint">${panic.action_hint}</div>` : ''}
       </div>
@@ -519,13 +523,17 @@ function renderActionSummary(summary) {
     }
   }
 
-  // 2. L1 指数策略（不依赖 L3，永远有内容）
+  // 2. L1 指数策略（基于 market_state 多维度判断）
   if (summary.l1_guidance && summary.l1_guidance.length > 0) {
     html += '<div class="action-subsection"><div class="action-subsection-title">指数策略指引</div>';
     html += '<table class="action-table"><tr><th>指数</th><th>趋势</th><th>信号</th><th>操作建议</th></tr>';
     summary.l1_guidance.forEach(g => {
       const tInfo = trendInfo(g.trend);
-      const actionCls = g.action === '可关注' ? 'action-buy' : g.action === '需回避' ? 'action-sell' : 'action-wait';
+      // 多维度 action 着色
+      const buyActions = ['恐慌抄底窗口', '确认买入', '积极关注', '逢低关注', '持仓待涨', '可关注', '轻仓跟随'];
+      const sellActions = ['回避，勿追跌', '减仓观望', '反弹减仓', '需回避'];
+      const actionCls = buyActions.includes(g.action) ? 'action-buy'
+        : sellActions.includes(g.action) ? 'action-sell' : 'action-wait';
       html += `<tr>
         <td>${g.name}${g.aligned ? ' <span class="card-align-badge">共振</span>' : ''}</td>
         <td class="${tInfo.cls}">${tInfo.arrow} ${tInfo.label}</td>
@@ -536,17 +544,28 @@ function renderActionSummary(summary) {
     html += '</table></div>';
   }
 
-  // 3. L2 行业策略（不依赖 L3）
+  // 3. L2 行业策略（基于 rhythm + 资金 + market_state）
   if (summary.l2_actions && summary.l2_actions.length > 0) {
     html += '<div class="action-subsection"><div class="action-subsection-title">行业策略指引</div>';
-    html += '<table class="action-table"><tr><th>行业</th><th>综合分</th><th>涨停</th><th>建议</th><th>头部个股</th></tr>';
+    html += '<table class="action-table"><tr><th>行业</th><th>综合</th><th>涨幅</th><th>涨停</th><th>阶段</th><th>建议</th><th>头部个股</th></tr>';
     summary.l2_actions.forEach(a => {
-      const verdictCls = a.verdict === '关注' ? 'action-buy' : a.verdict === '回避' ? 'action-sell' : 'action-wait';
+      const buyVerdicts = ['刚进攻', '追强', '关注', '关注启动'];
+      const sellVerdicts = ['高抛兑现', '回避'];
+      const verdictCls = buyVerdicts.some(v => a.verdict.includes(v)) ? 'action-buy'
+        : sellVerdicts.some(v => a.verdict.includes(v)) ? 'action-sell' : 'action-wait';
+      const pctCls = (a.gain_pct || 0) >= 0 ? 'up' : 'down';
+      const rhythmPhaseMap = {
+        '启动': 'rhythm-start', '加速': 'rhythm-accel', '高潮': 'rhythm-peak',
+        '衰竭': 'rhythm-exhaust', '休整': 'rhythm-rest',
+      };
+      const rCls = rhythmPhaseMap[a.rhythm] || '';
       html += `<tr>
         <td>${a.name}</td>
         <td class="score-cell">${a.score.toFixed(0)}</td>
+        <td class="${pctCls}">${(a.gain_pct || 0) > 0 ? '+' : ''}${(a.gain_pct || 0).toFixed(1)}%</td>
         <td>${a.zt}</td>
-        <td class="${verdictCls}">${a.verdict}</td>
+        <td><span class="rhythm ${rCls}">${a.rhythm || '—'}</span></td>
+        <td class="${verdictCls}" title="${a.verdict_detail || ''}">${a.verdict}</td>
         <td>${a.top_stock || '—'}</td>
       </tr>`;
     });
@@ -732,6 +751,7 @@ function renderSignalList(reports, scoredData, industryData) {
 
       above.slice(0, 10).forEach((s, i) => {
         const isBuy = s.direction === '偏多';
+        const displayName = s.name || s.symbol;
         // P3-1: 情绪标签
         let sentimentBadge = '';
         if (s.sentiment_tag) {
@@ -744,8 +764,8 @@ function renderSignalList(reports, scoredData, industryData) {
         row.innerHTML = `
           <span class="signal-rank">${i + 1}</span>
           <div class="signal-symbol">
-            <div class="signal-symbol-name">${s.symbol}</div>
-            <div class="signal-symbol-code">${s.signal_count}个信号 ${s.ma_confirmation || ''}</div>
+            <div class="signal-symbol-name">${displayName}</div>
+            <div class="signal-symbol-code">${s.symbol} | ${s.signal_count}个信号 ${s.ma_confirmation || ''}</div>
           </div>
           <span class="signal-score">${s.total_score.toFixed(1)}</span>
           ${sentimentBadge}
@@ -762,13 +782,14 @@ function renderSignalList(reports, scoredData, industryData) {
       container.appendChild(subtitle);
 
       below.slice(0, 5).forEach((s, i) => {
+        const displayName = s.name || s.symbol;
         const row = document.createElement('div');
         row.className = 'signal-row below-threshold';
         row.innerHTML = `
           <span class="signal-rank">${i + 1}</span>
           <div class="signal-symbol">
-            <div class="signal-symbol-name">${s.symbol}</div>
-            <div class="signal-symbol-code">${s.signal_count}个信号</div>
+            <div class="signal-symbol-name">${displayName}</div>
+            <div class="signal-symbol-code">${s.symbol} | ${s.signal_count}个信号</div>
           </div>
           <span class="signal-score">${s.total_score.toFixed(1)}</span>
           <span class="signal-type">${s.direction || '—'}</span>`;
@@ -795,6 +816,41 @@ function showToast(msg) {
   toast.classList.add('show');
   setTimeout(() => toast.classList.remove('show'), 2000);
 }
+
+// ── 概念点击穿透 → 高亮行业表匹配行 ─────────────────
+function highlightConceptIndustry(conceptName) {
+  // 移除之前的高亮
+  document.querySelectorAll('.industry-row.highlight-concept').forEach(el => {
+    el.classList.remove('highlight-concept');
+  });
+
+  // 在行业表中查找名称包含概念关键词的行
+  const keywords = conceptName.split(/[、,\s]+/).filter(Boolean);
+  let found = false;
+  document.querySelectorAll('.industry-row').forEach(row => {
+    const name = row.dataset.industry || '';
+    const match = keywords.some(kw => name.includes(kw));
+    if (match) {
+      row.classList.add('highlight-concept');
+      if (!found) {
+        row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        found = true;
+      }
+    }
+  });
+
+  if (!found) {
+    showToast(`未找到与"${conceptName}"相关的行业`);
+  }
+
+  // 3秒后自动移除高亮
+  setTimeout(() => {
+    document.querySelectorAll('.industry-row.highlight-concept').forEach(el => {
+      el.classList.remove('highlight-concept');
+    });
+  }, 3000);
+}
+window.highlightConceptIndustry = highlightConceptIndustry;
 
 // ── 加载首页 ─────────────────────────────────────────
 async function loadDashboard() {

@@ -730,11 +730,12 @@ def _concept_cache_path():
     return cache_dir / "concept_rankings.json"
 
 
-def _save_concept_cache(results: List[ConceptRanking]):
-    """保存概念排行到磁盘缓存"""
+def _save_concept_cache(results: List[ConceptRanking], source: str = "em"):
+    """保存概念排行到磁盘缓存（标记来源 source: em/ths）"""
     import json, time
     data = {
         "ts": time.time(),
+        "source": source,
         "items": [
             {"name": c.name, "gain_pct": c.gain_pct,
              "leading_stock": c.leading_stock, "leading_gain": c.leading_gain,
@@ -749,7 +750,7 @@ def _save_concept_cache(results: List[ConceptRanking]):
 
 
 def _load_concept_cache(max_age: float = 86400) -> List[ConceptRanking]:
-    """从磁盘缓存加载概念排行（默认24h过期）"""
+    """从磁盘缓存加载概念排行（默认24h过期）。校验数据有效性。"""
     import json, time
     path = _concept_cache_path()
     if not path.exists():
@@ -758,8 +759,17 @@ def _load_concept_cache(max_age: float = 86400) -> List[ConceptRanking]:
         data = json.loads(path.read_text(encoding="utf-8"))
         if time.time() - data.get("ts", 0) > max_age:
             return []
+        items = data.get("items", [])
+        if not items:
+            return []
+        # 缓存有效性校验：如果 gain_pct 全为 0 且来源是 THS，视为弱数据
+        source = data.get("source", "unknown")
+        gains = [abs(item.get("gain_pct", 0)) for item in items]
+        if source == "ths" and all(g < 0.01 for g in gains):
+            _detail("  [缓存] THS 缓存数据 gain_pct 全为 0，视为无效")
+            return []
         results = []
-        for item in data.get("items", []):
+        for item in items:
             results.append(ConceptRanking(
                 name=item["name"],
                 gain_pct=item.get("gain_pct", 0),
@@ -768,7 +778,7 @@ def _load_concept_cache(max_age: float = 86400) -> List[ConceptRanking]:
                 sector_type=item.get("sector_type", ""),
                 tag=item.get("tag", ""),
             ))
-        _detail(f"  [缓存] 概念板块 {len(results)} 条（磁盘缓存）")
+        _detail(f"  [缓存] 概念板块 {len(results)} 条（磁盘缓存, 来源:{source}）")
         return results
     except Exception:
         return []
@@ -821,7 +831,26 @@ def _get_concepts_ths(top_n: int = 10) -> List[ConceptRanking]:
     if name_col is None and len(df.columns) > 0:
         name_col = df.columns[0]
 
-    concept_names = df[name_col].tolist()[:top_n * 2]
+    # THS 概念列表按拼音排序，不能只取前 N 个（会偏向 A/B 开头）
+    # 策略：取全量名称 → 优先匹配已知热门关键词 → 补齐随机样本
+    all_names = df[name_col].tolist()
+    _HOT_KEYWORDS = ["AI", "算力", "机器人", "芯片", "半导体", "新能源", "光伏",
+                     "储能", "电力", "军工", "低空", "白酒", "医药", "消费",
+                     "汽车", "锂电", "光模块", "ChatGPT", "DeepSeek", "鸿蒙",
+                     "华为", "特斯拉", "比亚迪", "CXO", "CPO"]
+    # 优先选包含热门关键词的概念
+    hot_names = [n for n in all_names if any(kw in n for kw in _HOT_KEYWORDS)]
+    # 补齐：从剩余概念中均匀采样
+    remaining = [n for n in all_names if n not in hot_names]
+    import random
+    sample_size = max(0, top_n * 3 - len(hot_names))
+    if sample_size > 0 and remaining:
+        step = max(1, len(remaining) // sample_size)
+        sampled = remaining[::step][:sample_size]
+    else:
+        sampled = []
+    concept_names = (hot_names + sampled)[:top_n * 3]  # 最多获取 3x 用于排序
+
     today = datetime.now()
     start_date = (today - timedelta(days=7)).strftime("%Y%m%d")
     end_date = today.strftime("%Y%m%d")
@@ -894,7 +923,7 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
         try:
             with ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(_call)
-                df = future.result(timeout=15)
+                df = future.result(timeout=25)
             break
         except (FutureTimeout, Exception) as e:
             if attempt == 0:
@@ -925,14 +954,14 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
                 sector_type=_classify_concept(name),
             ))
         _detail(f"  [✓] 概念板块 top {len(results)} 条")
-        _save_concept_cache(results)
+        _save_concept_cache(results, source="em")
         return results
 
     # ── 2. 同花顺降级 ──
     try:
         ths_results = _get_concepts_ths(top_n)
         if ths_results:
-            _save_concept_cache(ths_results)
+            _save_concept_cache(ths_results, source="ths")
             return ths_results
     except Exception as e:
         _detail(f"  [!] THS 概念板块也失败（{e.__class__.__name__}）")

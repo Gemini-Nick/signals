@@ -41,6 +41,118 @@ class EngineState:
     error: str = ""
 
 
+def _l1_action(market_state: str, has_buy: bool, has_sell: bool,
+               trend: str) -> str:
+    """
+    L1 策略指引 — 基于 market_state + 信号 + 趋势多维度判断。
+
+    | market_state | has_buy | has_sell | → action |
+    |-------------|---------|----------|----------|
+    | 急跌 | ✓ | - | 恐慌抄底窗口 |
+    | 急跌 | - | ✓ | 回避，勿追跌 |
+    | 急跌 | - | - | 等待企稳信号 |
+    | 企稳 | ✓ | - | 确认买入 |
+    | 企稳 | - | - | 观望待方向 |
+    | 反弹 | ✓ | - | 积极关注 |
+    | 反弹 | - | ✓ | 反弹减仓 |
+    | 平稳+上涨 | ✓ | - | 持仓待涨 |
+    | 平稳+下跌 | - | ✓ | 减仓观望 |
+    | 平稳+震荡 | - | - | 轻仓观望 |
+    """
+    if market_state == "急跌":
+        if has_buy:
+            return "恐慌抄底窗口"
+        elif has_sell:
+            return "回避，勿追跌"
+        else:
+            return "等待企稳信号"
+    elif market_state == "缓跌":
+        if has_buy:
+            return "逢低关注"
+        elif has_sell:
+            return "减仓观望"
+        else:
+            return "观望等企稳"
+    elif market_state == "企稳":
+        if has_buy:
+            return "确认买入"
+        elif has_sell:
+            return "谨慎，等确认"
+        else:
+            return "观望待方向"
+    elif market_state == "反弹":
+        if has_buy:
+            return "积极关注"
+        elif has_sell:
+            return "反弹减仓"
+        else:
+            return "轻仓跟随"
+    else:  # 平稳
+        if has_buy and has_sell:
+            return "信号分歧，轻仓"
+        elif has_buy:
+            if "上涨" in trend:
+                return "持仓待涨"
+            else:
+                return "可关注"
+        elif has_sell:
+            if "下跌" in trend:
+                return "减仓观望"
+            else:
+                return "需回避"
+        else:
+            return "轻仓观望"
+
+
+def _l2_verdict(rhythm: str, cs: float, zt: int, net_inflow: float,
+                gain_pct: float, market_state: str) -> tuple:
+    """
+    L2 行业操作建议 — 基于 rhythm_phase + 综合分 + 资金流 + market_state。
+
+    返回 (verdict, verdict_detail)
+    """
+    verdict = "观望"
+    detail = ""
+
+    if rhythm in ("高潮", "衰竭"):
+        verdict = "高抛兑现"
+        detail = f"板块已到{rhythm}阶段"
+    elif rhythm == "启动":
+        if cs >= 60 and (net_inflow or 0) > 0:
+            verdict = "刚进攻"
+            detail = "新启动+资金进场"
+        else:
+            verdict = "关注启动"
+            detail = "启动初期待确认"
+    elif rhythm == "加速":
+        if cs >= 70:
+            verdict = "追强"
+            detail = "强者恒强"
+        else:
+            verdict = "关注"
+            detail = "加速中"
+    elif rhythm == "休整":
+        verdict = "等待"
+        detail = "等二次启动"
+    else:
+        # 无 rhythm 数据 → 兜底逻辑
+        if cs >= 70 and zt >= 3:
+            verdict = "关注"
+            detail = f"综合{cs:.0f}+涨停{zt}"
+        elif cs >= 40:
+            verdict = "观望"
+            detail = ""
+        else:
+            verdict = "回避"
+            detail = ""
+
+    # 恐慌叠加
+    if market_state == "急跌" and rhythm not in ("衰竭",):
+        verdict = f"恐慌中→{verdict}"
+
+    return verdict, detail
+
+
 class WebEngine:
     """
     Web UI 的分析引擎桥接层。
@@ -130,6 +242,18 @@ class WebEngine:
                 if s.symbol not in seen:
                     seen.add(s.symbol)
                     unique.append(s)
+            # 注入公司名称
+            try:
+                from signals.core.stock_names import get_resolver
+                resolver = get_resolver()
+                if self._state.merged_list:
+                    resolver.inject_from_rankings(self._state.merged_list)
+                for s in unique:
+                    if not s.name:
+                        s.name = resolver.get_name(s.symbol)
+            except Exception:
+                pass
+
             with self._lock:
                 self._state.scored_symbols = unique
         except Exception as e:
@@ -233,7 +357,46 @@ class WebEngine:
                 "position_suggestion": getattr(ctx, "position_suggestion", ""),
             }
 
-        # ── L1 策略指引（不依赖 L3，永远有内容）──
+        # ── 恐慌检测（必须在 L1/L2 之前，提供 market_state）──
+        panic_data = {"score": 0, "level": "正常", "detail": "",
+                      "action_hint": "", "velocity": 0, "market_state": "平稳"}
+        market_state = "平稳"
+        panic_velocity = 0.0
+        try:
+            from signals.core.panic_detector import assess_intraday_panic
+            pa = assess_intraday_panic(reports, self._state.analyzers, name_df)
+            market_state = pa.market_state
+            panic_velocity = pa.velocity
+            panic_data = {
+                "score": pa.score,
+                "level": pa.level,
+                "detail": pa.detail,
+                "velocity": pa.velocity,
+                "acceleration": pa.acceleration,
+                "market_state": pa.market_state,
+                "is_stabilizing": pa.is_stabilizing,
+                "action_hint": "",
+            }
+            # action_hint 基于市场状态 + 分数
+            if pa.market_state == "急跌":
+                panic_data["action_hint"] = "急跌中 → 等待速率放缓再考虑抄底"
+            elif pa.market_state == "企稳":
+                panic_data["action_hint"] = "市场企稳中 → 可开始关注反弹机会"
+            elif pa.market_state == "反弹":
+                panic_data["action_hint"] = "反弹进行中 → 轻仓跟随，注意压力位"
+            elif pa.score >= 60:
+                panic_data["action_hint"] = "恐慌=底部信号 → 关注超跌+支撑位的反弹机会"
+            elif pa.score >= 40:
+                panic_data["action_hint"] = "市场偏弱 → 控制仓位，等待企稳信号"
+            elif pa.score >= 20:
+                panic_data["action_hint"] = "市场平稳，维持现有仓位"
+            else:
+                panic_data["action_hint"] = "市场平稳，持仓稳定"
+        except Exception as e:
+            log.warning("恐慌检测失败: %s", e)
+        result["panic"] = panic_data
+
+        # ── L1 策略指引（基于 market_state 多维度判断）──
         result["l1_guidance"] = []
         for r in reports:
             if not getattr(r, "data_available", False):
@@ -252,25 +415,26 @@ class WebEngine:
                 continue
             has_buy = any("买" in s for s in sigs)
             has_sell = any("卖" in s for s in sigs)
+            trend = getattr(r, "daily_trend", "未知")
+            action = _l1_action(market_state, has_buy, has_sell, trend)
             result["l1_guidance"].append({
                 "name": r.name,
-                "trend": getattr(r, "daily_trend", "未知"),
+                "trend": trend,
                 "signals": sigs,
                 "aligned": getattr(r, "three_level_aligned", False),
-                "action": "可关注" if has_buy else "需回避" if has_sell else "观望",
+                "action": action,
             })
 
-        # ── L2 行业操作建议（不依赖 L3）──
+        # ── L2 行业操作建议（基于 rhythm_phase + 资金流 + market_state）──
         result["l2_actions"] = []
         for ind in composite_list[:5]:
             cs = getattr(ind, "composite_score", 0)
             zt = getattr(ind, "zt_count", 0)
-            if cs >= 70 and zt >= 3:
-                verdict = "关注"
-            elif cs >= 40:
-                verdict = "观望"
-            else:
-                verdict = "回避"
+            rhythm = getattr(ind, "rhythm_phase", "")
+            net_inflow = getattr(ind, "net_inflow", 0)
+            gain_pct = getattr(ind, "gain_pct", 0)
+            verdict, verdict_detail = _l2_verdict(
+                rhythm, cs, zt, net_inflow, gain_pct, market_state)
             top_stock = ""
             if getattr(ind, "candidates", None):
                 top_stock = ind.candidates[0].name
@@ -279,31 +443,12 @@ class WebEngine:
                 "score": round(cs, 1),
                 "zt": zt,
                 "verdict": verdict,
+                "verdict_detail": verdict_detail,
+                "rhythm": rhythm or "—",
+                "gain_pct": round(gain_pct, 2) if gain_pct else 0,
+                "net_inflow": round(net_inflow, 2) if net_inflow else 0,
                 "top_stock": top_stock,
             })
-
-        # ── 恐慌检测 ──
-        panic_data = {"score": 0, "level": "正常", "detail": "", "action_hint": ""}
-        try:
-            from signals.core.panic_detector import assess_intraday_panic
-            pa = assess_intraday_panic(reports, self._state.analyzers, name_df)
-            panic_data = {
-                "score": pa.score,
-                "level": pa.level,
-                "detail": pa.detail,
-                "action_hint": "",
-            }
-            if pa.score >= 60:
-                panic_data["action_hint"] = "恐慌=底部信号 → 关注超跌+支撑位的反弹机会"
-            elif pa.score >= 40:
-                panic_data["action_hint"] = "市场偏弱 → 控制仓位，等待企稳信号"
-            elif pa.score >= 20:
-                panic_data["action_hint"] = "市场平稳，维持现有仓位"
-            else:
-                panic_data["action_hint"] = "市场平稳，持仓稳定"
-        except Exception as e:
-            log.warning("恐慌检测失败: %s", e)
-        result["panic"] = panic_data
 
         # ── 抄底候选（门槛降到30）──
         bottom_candidates = []
@@ -388,11 +533,21 @@ class WebEngine:
         theme_summary = ""
         try:
             from signals.core.theme_tracker import match_themes, format_theme_hits
-            themes = ["CLAW", "算力", "储能", "新能源", "半导体"]
+            # 从 config 读取主题列表（如有），否则用默认
+            try:
+                from config import TRACK_THEMES
+                themes = TRACK_THEMES
+            except (ImportError, AttributeError):
+                themes = ["CLAW", "算力", "储能", "新能源", "半导体",
+                          "机器人", "低空", "电力"]
             hits = match_themes(themes, name_df, concepts, panic_data["level"])
             theme_summary = format_theme_hits(hits)
+            if not theme_summary:
+                theme_summary = "当前无明显主题命中"
         except Exception as e:
-            log.warning("主题追踪失败: %s", e)
+            import traceback
+            log.warning("主题追踪失败: %s\n%s", e, traceback.format_exc())
+            theme_summary = "主题追踪暂不可用"
         result["theme_summary"] = theme_summary
 
         # ── 概念归纳 ──
@@ -403,6 +558,17 @@ class WebEngine:
             if up_concepts:
                 names = [c.name for c in up_concepts[:3]]
                 concept_digest = f"今日资金主攻 {'、'.join(names)}"
+            else:
+                # 没有 >0.5% 的概念 → 显示前 3 概念方向
+                top3 = concepts[:3]
+                parts = []
+                for c in top3:
+                    pct = getattr(c, "gain_pct", 0)
+                    parts.append(f"{c.name}{pct:+.1f}%")
+                if parts:
+                    concept_digest = f"概念方向: {'、'.join(parts)}"
+        if not concept_digest:
+            concept_digest = "概念数据暂未加载"
         result["concept_digest"] = concept_digest
 
         # ── 行业研判 ──

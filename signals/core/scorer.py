@@ -77,6 +77,7 @@ class ScoredSymbol:
     signals: List[SignalEvent]
     details: str
     direction: str = ""   # "偏多" / "偏空" / "分歧" / ""
+    name: str = ""        # 公司名称（由 StockNameResolver 注入）
     ma_confirmation: str = ""  # 均线交叉确认描述
     sentiment_tag: str = ""    # 情绪乘数标签，如 "恐慌×1.25"
 

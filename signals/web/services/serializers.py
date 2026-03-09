@@ -312,6 +312,7 @@ def serialize_scored_symbol(scored) -> dict:
     """ScoredSymbol → JSON dict"""
     return {
         "symbol": scored.symbol,
+        "name": getattr(scored, "name", "") or scored.symbol,
         "total_score": round(scored.total_score, 1),
         "signal_count": scored.signal_count,
         "direction": scored.direction,
