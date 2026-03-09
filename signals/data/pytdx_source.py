@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-pytdx 数据源 — A股指数历史分钟线 + 个股兜底
+pytdx 数据源 — A股指数历史分钟线 + 个股兜底 + 行业板块日线/成分股
 
 通达信协议，免费无注册，连接公共行情服务器。
-支持 1min/5min/15min/30min/60min。
+支持 1min/5min/15min/30min/60min + 日线。
 指数分钟线约 500+ 交易日历史，个股类似。
+行业板块 880xxx 日线 K 线 + block.dat 成分股。
 
 安装：pip install pytdx
 """
