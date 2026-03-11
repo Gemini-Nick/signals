@@ -471,7 +471,27 @@ def review_stock_daily(symbols: List[str], start_date: str,
         _log(f"  [i] Sina 降级: 连续失败{_sina_fails}次, "
              f"成功{ok_count}只, 失败{fail_count}只")
 
-    scored.sort(key=lambda x: -x.total_score)
+    # ── 异常检测 + 信号融合（复用盘中 screener 同样逻辑）──
+    try:
+        from signals.core.anomaly import compute_anomaly_profile
+        from signals.core.fusion import fuse_scores
+        for sc in scored:
+            cache_key = f"{sc.symbol.replace('.', '_')}_{datetime.now().strftime('%Y%m%d')}"
+            cached = get_cache().get(cache_key)
+            if cached and len(cached) >= 25:
+                daily_bars = _records_to_rawbars(cached, sc.symbol)
+                anomaly = compute_anomaly_profile(sc.symbol, daily_bars)
+                if anomaly:
+                    fused = fuse_scores(sc, anomaly)
+                    sc.anomaly_profile = anomaly
+                    sc.fused_score = fused
+                    sc.fused_total = fused.fused_total
+    except Exception:
+        pass  # 异常检测失败不影响主流程
+
+    # 排序: 有融合分用融合分，否则用缠论原始分
+    scored.sort(key=lambda x: x.fused_total if x.fused_total else x.total_score,
+                reverse=True)
 
     # ── 耗时统计 ──
     _l3_elapsed = _time.monotonic() - _t_l3_start

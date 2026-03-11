@@ -344,17 +344,18 @@ function _renderSignals(scored) {
     return;
   }
 
-  // 按评分降序
-  scored.sort((a, b) => b.total_score - a.total_score);
+  // 按融合分(优先)或缠论原始分降序
+  scored.sort((a, b) => (b.fused_total || b.total_score) - (a.fused_total || a.total_score));
 
   let html = '<h4>个股信号列表</h4>' +
     '<table class="review-signal-table"><thead><tr>' +
-    '<th>代码</th><th>名称</th><th>评分</th><th>方向</th><th>信号</th><th>共振</th>' +
+    '<th>代码</th><th>名称</th><th>评分</th><th>方向</th><th>信号</th><th>共振</th><th>异常</th><th>置信</th>' +
     '</tr></thead><tbody>';
 
   scored.forEach(s => {
     const dirCls = s.direction === '偏多' ? 'bull' : s.direction === '偏空' ? 'bear' : '';
-    const sign = s.total_score >= 0 ? '+' : '';
+    const displayScore = s.fused_total || s.total_score;
+    const sign = displayScore >= 0 ? '+' : '';
     // 构建信号简报
     const sigMap = {};
     (s.signals || []).forEach(sig => {
@@ -371,13 +372,23 @@ function _renderSignals(scored) {
       (s.signals || []).filter(sig => sig.type.includes('买')).map(sig => sig.freq));
     const resonance = buyFreqs.size > 1 ? '★' : '';
 
+    // 异常信号数
+    const anomalyBadge = s.anomaly && s.anomaly.anomaly_count > 0
+      ? `<span class="badge anomaly-badge">${s.anomaly.anomaly_count}项</span>` : '—';
+
+    // 置信度
+    const conf = s.confidence_level || '';
+    const confCls = conf === 'A' ? 'conf-a' : conf === 'B' ? 'conf-b' : '';
+
     html += `<tr class="${dirCls}" onclick="window._reviewGotoStock && window._reviewGotoStock('${s.symbol}')">
       <td>${s.symbol}</td>
       <td>${s.name}</td>
-      <td>${sign}${s.total_score}</td>
+      <td>${sign}${displayScore}</td>
       <td>${s.direction}</td>
       <td>${sigBrief}</td>
       <td>${resonance}</td>
+      <td>${anomalyBadge}</td>
+      <td><span class="${confCls}">${conf}</span></td>
     </tr>`;
   });
 

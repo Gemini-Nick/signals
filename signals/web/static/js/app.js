@@ -61,14 +61,49 @@ function navigateToIndustryChart(industryName) {
   }
 }
 
+// ── Toast 通知 ──────────────────────────────────────
+function showToast(msg, duration) {
+  let toast = document.getElementById('toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'toast';
+    toast.className = 'toast';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = msg;
+  toast.classList.add('show');
+  setTimeout(() => toast.classList.remove('show'), duration || 2000);
+}
+
 // ── API 工具 ─────────────────────────────────────────
 async function apiFetch(path) {
   const res = await fetch(API_BASE + path);
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`API ${path}: ${res.status} ${text}`);
+    const msg = `API ${path}: ${res.status}`;
+    showToast(msg, 3000);
+    throw new Error(`${msg} ${text}`);
   }
   return res.json();
+}
+
+// ── 导航工具 ─────────────────────────────────────────
+function navigateToStock(symbol) {
+  switchPage('stock');
+  const input = document.getElementById('stock-input');
+  if (input) {
+    input.value = symbol;
+    if (window.analyzeStock) window.analyzeStock();
+  }
+}
+
+function navigateToTheme(theme) {
+  switchPage('stock');
+  const input = document.getElementById('stock-input');
+  if (input) {
+    input.value = theme;
+    if (window.analyzeStock) window.analyzeStock();
+  }
 }
 
 // ── CSS 变量读取 ─────────────────────────────────────

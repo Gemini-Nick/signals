@@ -831,18 +831,7 @@ window.navigateToTheme = navigateToTheme;
 window.navigateToStock = navigateToStock;
 
 // ── Toast 提示 ──────────────────────────────────────
-function showToast(msg) {
-  let toast = document.getElementById('toast');
-  if (!toast) {
-    toast = document.createElement('div');
-    toast.id = 'toast';
-    toast.className = 'toast';
-    document.body.appendChild(toast);
-  }
-  toast.textContent = msg;
-  toast.classList.add('show');
-  setTimeout(() => toast.classList.remove('show'), 2000);
-}
+// showToast() 已移至 app.js 全局工具
 
 // ── 加载首页 ─────────────────────────────────────────
 // ── 加载进度指示 ────────────────────────────────────

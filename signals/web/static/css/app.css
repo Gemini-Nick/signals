@@ -2734,6 +2734,11 @@ html, body {
   color: var(--color-down);
 }
 
+/* ── Review: anomaly & confidence badges ───────────── */
+.anomaly-badge { background: rgba(255,68,68,0.15); color: #ff4444; font-size: 11px; }
+.conf-a { color: #22c55e; font-weight: 600; }
+.conf-b { color: #f7931a; font-weight: 600; }
+
 /* ── Industry Chart Detail ─────────────────────────── */
 .ind-chart-btn {
   cursor: pointer;
