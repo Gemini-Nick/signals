@@ -9,6 +9,7 @@ from ..services.engine import get_engine
 from ..services.serializers import (
     serialize_bars, serialize_bi_list, serialize_fx_list,
     serialize_zhongshu, serialize_signals,
+    compute_ma_lines, compute_macd,
 )
 
 router = APIRouter(prefix="/api/chart", tags=["chart"])
@@ -77,28 +78,7 @@ def get_chart_data(
     ma_lines = []
     if freq == "daily":
         try:
-            from signals.core.ma_levels import _bars_to_df, _compute_ma
-            df = _bars_to_df(analyzer.bars_raw)
-            closes = df["close"]
-            for period, label, color in [
-                (5, "MA5", "#f7931a"),
-                (10, "MA10", "#2962ff"),
-                (20, "MA20", "#e040fb"),
-                (60, "MA60", "#26a69a"),
-            ]:
-                if len(closes) >= period:
-                    ma_vals = closes.rolling(period).mean()
-                    line_data = []
-                    for dt_idx, val in ma_vals.dropna().items():
-                        line_data.append({
-                            "time": int(dt_idx.timestamp()),
-                            "value": round(val, 4),
-                        })
-                    ma_lines.append({
-                        "label": label,
-                        "color": color,
-                        "data": line_data,
-                    })
+            ma_lines = compute_ma_lines(analyzer.bars_raw)
         except Exception as e:
             logger.warning("MA线计算失败 %s: %s", name, e)
 
@@ -106,23 +86,7 @@ def get_chart_data(
     macd_data = []
     if freq == "daily":
         try:
-            from signals.core.ma_levels import _bars_to_df
-            df = _bars_to_df(analyzer.bars_raw)
-            closes = df["close"]
-            if len(closes) >= 26:
-                ema12 = closes.ewm(span=12, adjust=False).mean()
-                ema26 = closes.ewm(span=26, adjust=False).mean()
-                dif = ema12 - ema26
-                dea = dif.ewm(span=9, adjust=False).mean()
-                macd_bar = (dif - dea) * 2
-                for dt_idx in dif.dropna().index:
-                    if dt_idx in dea.dropna().index:
-                        macd_data.append({
-                            "time": int(dt_idx.timestamp()),
-                            "dif": round(float(dif[dt_idx]), 4),
-                            "dea": round(float(dea[dt_idx]), 4),
-                            "bar": round(float(macd_bar[dt_idx]), 4),
-                        })
+            macd_data = compute_macd(analyzer.bars_raw)
         except Exception as e:
             logger.warning("MACD计算失败 %s: %s", name, e)
 
@@ -156,6 +120,18 @@ def get_chart_data(
             report_summary["conclusion"] = conclusion
             break
 
+    # 跨级别信号摘要（所有有效信号）
+    report_signals = []
+    for r in engine.get_index_reports():
+        if r.name == name:
+            if r.daily_latest_signal != "无":
+                report_signals.append({"type": r.daily_latest_signal, "freq": "日线"})
+            if r.f30_latest_signal != "无":
+                report_signals.append({"type": r.f30_latest_signal, "freq": "30M"})
+            if r.f15_latest_signal != "无":
+                report_signals.append({"type": r.f15_latest_signal, "freq": "15M"})
+            break
+
     return {
         "ohlcv": ohlcv,
         "bi_list": bi_list,
@@ -165,6 +141,7 @@ def get_chart_data(
         "ma_lines": ma_lines,
         "macd": macd_data,
         "report": report_summary,
+        "report_signals": report_signals,
         "meta": {
             "name": name,
             "symbol": idx_az.symbol if idx_az else symbol,

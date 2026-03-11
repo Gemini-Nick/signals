@@ -12,6 +12,33 @@ import time
 
 
 @dataclass
+class ReviewState:
+    """Review mode cached state"""
+    start_date: str = ""
+    start_label: str = ""
+    market_context: Optional[object] = None
+    index_reports: List[object] = field(default_factory=list)
+    analyzers: Dict[str, object] = field(default_factory=dict)
+    gain_list: List[object] = field(default_factory=list)
+    composite_list: List[object] = field(default_factory=list)
+    merged_list: List[object] = field(default_factory=list)
+    concepts: List[object] = field(default_factory=list)
+    oversold_list: List[object] = field(default_factory=list)
+    scored_symbols: List[object] = field(default_factory=list)
+    rotation_stage: str = ""
+    rotation_detail: str = ""
+    allocation_suggestion: str = ""
+    # Status
+    is_running: bool = False
+    phase: str = ""  # "L1" / "L2" / "L3" / "" (complete)
+    error: str = ""
+    completed: bool = False
+    # Timing (seconds)
+    timing: Dict[str, float] = field(default_factory=dict)  # {"L1": 12.3, "L2": 8.1, ...}
+    phase_detail: str = ""  # 当前阶段子步骤描述, e.g. "加载A股指数..."
+
+
+@dataclass
 class EngineState:
     """Web 引擎缓存状态"""
     # L1 分析结果
@@ -39,6 +66,7 @@ class EngineState:
     last_update: float = 0.0
     is_running: bool = False
     error: str = ""
+    loading_phase: str = ""  # "L1"/"L2"/"L3"/""(完成)
 
 
 def _l1_action(market_state: str, has_buy: bool, has_sell: bool,
@@ -167,11 +195,16 @@ class WebEngine:
 
     def __init__(self):
         self._state = EngineState()
+        self._review = ReviewState()
         self._lock = threading.Lock()
 
     @property
     def state(self) -> EngineState:
         return self._state
+
+    @property
+    def review_state(self) -> ReviewState:
+        return self._review
 
     def run_l1(self):
         """运行 Layer 1 指数分析（同步，阻塞）"""
@@ -220,7 +253,7 @@ class WebEngine:
             logging.getLogger(__name__).warning("L2 行业分析失败: %s", e)
 
     def run_l3(self):
-        """运行 Layer 3 标的筛选（同步，阻塞）"""
+        """运行 Layer 3 标的筛选（并行处理多行业）"""
         try:
             from signals.layers.screener import IntraDayScreener
             merged = self._state.merged_list
@@ -228,12 +261,27 @@ class WebEngine:
                 return
             screener = IntraDayScreener()
             all_scored = []
-            for ind in merged[:5]:
+
+            # 并行处理前 5 个行业（每个行业内部自己有 ThreadPool 拉数据）
+            # 用 2 个 worker 避免线程爆炸（每个 worker 内部最多 12 线程）
+            industries = [ind.name for ind in merged[:8]]
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            def _scan_one(ind_name):
                 try:
-                    scored = screener.run_industry(ind.name)
-                    all_scored.extend(scored)
+                    # 每个行业用独立 screener 避免状态冲突
+                    s = IntraDayScreener()
+                    return s.run_industry(ind_name)
                 except Exception:
-                    pass
+                    return []
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = {pool.submit(_scan_one, name): name
+                           for name in industries}
+                for f in as_completed(futures):
+                    scored = f.result()
+                    if scored:
+                        all_scored.extend(scored)
             # 按分数排序去重
             seen = set()
             unique = []
@@ -326,6 +374,94 @@ class WebEngine:
     def get_l2_stats(self) -> dict:
         """获取 L2 统计数据（含 name_df 等）"""
         return self._state.l2_stats or {}
+
+    def get_industry_ranking_by_name(self, name: str):
+        """按行业名称查找 IndustryRanking 对象"""
+        for r in (self._state.gain_list or []) + (self._state.composite_list or []):
+            if r.name == name:
+                return r
+        for r in (self._state.merged_list or []):
+            if r.name == name:
+                return r
+        return None
+
+    def resolve_sector(self, query: str) -> dict:
+        """
+        智能板块解析：自然语言 → 行业列表 + 概念列表。
+
+        匹配逻辑（按优先级）：
+        1. 精确匹配行业名（如 "光伏设备"）
+        2. 轮动线匹配（如 "新能源" → 5 个行业）
+        3. 主题关键词匹配（如 "电气新能源" → 匹配含 "新能源" 的关键词）
+        4. 概念模糊匹配（遍历缓存概念列表）
+        """
+        import config as _cfg
+
+        result = {
+            "query": query,
+            "match_type": "none",
+            "matched_industries": [],
+            "matched_concepts": [],
+        }
+
+        # 所有已知行业名
+        rotation_map = getattr(_cfg, "ROTATION_LINE_MAP", {})
+        all_industry_names = set(rotation_map.keys())
+
+        # 1. 精确匹配行业名
+        if query in all_industry_names:
+            result["match_type"] = "exact"
+            result["matched_industries"] = [query]
+            ranking = self.get_industry_ranking_by_name(query)
+            if ranking:
+                result["matched_industries_info"] = [{
+                    "name": query,
+                    "rotation_line": ranking.rotation_line,
+                    "gain_pct": ranking.gain_pct,
+                }]
+            return result
+
+        # 2. 轮动线匹配（如 "新能源" → 光伏设备/风电设备/电网设备/电机/其他电源设备）
+        for ind_name, rot_line in rotation_map.items():
+            if rot_line and query in rot_line:
+                result["matched_industries"].append(ind_name)
+        if result["matched_industries"]:
+            result["match_type"] = "rotation_line"
+            return result
+
+        # 3. 主题关键词匹配
+        try:
+            from signals.core.theme_tracker import THEME_KEYWORD_MAP
+            for theme, keywords in THEME_KEYWORD_MAP.items():
+                if any(kw in query for kw in keywords) or query in theme:
+                    # 找到关联行业
+                    for ind_name, rot_line in rotation_map.items():
+                        if rot_line and theme in rot_line:
+                            if ind_name not in result["matched_industries"]:
+                                result["matched_industries"].append(ind_name)
+                    if result["matched_industries"]:
+                        result["match_type"] = "theme_keyword"
+                        break
+        except ImportError:
+            pass
+
+        # 4. 概念模糊匹配
+        concepts = self._state.concepts or []
+        for c in concepts:
+            if query in c.name or c.name in query:
+                result["matched_concepts"].append(c.name)
+
+        # 也检查行业名的模糊包含
+        if not result["matched_industries"]:
+            for ind_name in all_industry_names:
+                if query in ind_name or ind_name in query:
+                    result["matched_industries"].append(ind_name)
+
+        if result["matched_industries"] or result["matched_concepts"]:
+            if not result["match_type"] or result["match_type"] == "none":
+                result["match_type"] = "fuzzy"
+
+        return result
 
     def get_action_summary(self) -> dict:
         """
@@ -529,48 +665,6 @@ class WebEngine:
                     "tags": ["多级别共振"],
                 })
 
-        # ── 主题追踪 ──
-        theme_summary = ""
-        try:
-            from signals.core.theme_tracker import match_themes, format_theme_hits
-            # 从 config 读取主题列表（如有），否则用默认
-            try:
-                from config import TRACK_THEMES
-                themes = TRACK_THEMES
-            except (ImportError, AttributeError):
-                themes = ["CLAW", "算力", "储能", "新能源", "半导体",
-                          "机器人", "低空", "电力"]
-            hits = match_themes(themes, name_df, concepts, panic_data["level"])
-            theme_summary = format_theme_hits(hits)
-            if not theme_summary:
-                theme_summary = "当前无明显主题命中"
-        except Exception as e:
-            import traceback
-            log.warning("主题追踪失败: %s\n%s", e, traceback.format_exc())
-            theme_summary = "主题追踪暂不可用"
-        result["theme_summary"] = theme_summary
-
-        # ── 概念归纳 ──
-        concept_digest = ""
-        if concepts:
-            up_concepts = [c for c in concepts[:10]
-                           if getattr(c, "gain_pct", 0) > 0.5]
-            if up_concepts:
-                names = [c.name for c in up_concepts[:3]]
-                concept_digest = f"今日资金主攻 {'、'.join(names)}"
-            else:
-                # 没有 >0.5% 的概念 → 显示前 3 概念方向
-                top3 = concepts[:3]
-                parts = []
-                for c in top3:
-                    pct = getattr(c, "gain_pct", 0)
-                    parts.append(f"{c.name}{pct:+.1f}%")
-                if parts:
-                    concept_digest = f"概念方向: {'、'.join(parts)}"
-        if not concept_digest:
-            concept_digest = "概念数据暂未加载"
-        result["concept_digest"] = concept_digest
-
         # ── 行业研判 ──
         strong = []
         for ind in composite_list[:5]:
@@ -630,45 +724,152 @@ class WebEngine:
 
         return result
 
-    def get_decision_brief(self) -> Optional[dict]:
+    def run_review(self, start_date: str, label: str = ""):
         """
-        P3-7: 生成决策简报。
-        整合情景分叉、风格切换、轮动状态、板块节奏、历史匹配。
+        盘后复盘：后台线程运行 L1→L2→L3。
+        前端通过 review_state 轮询进度。
         """
-        ctx = self._state.market_context
-        if ctx is None:
-            return None
-
-        # 收集板块节奏预警 (P3-3)
-        rhythm_alerts = []
-        for ind in (self._state.merged_list or [])[:10]:
-            phase = getattr(ind, "rhythm_phase", "")
-            if phase in ("衰竭", "休整", "高潮"):
-                rhythm_alerts.append({
-                    "name": ind.name,
-                    "phase": phase,
-                    "score": getattr(ind, "rhythm_score", 0),
-                    "hint": getattr(ind, "rhythm_hint", ""),
-                })
-
-        # 加载历史匹配缓存 (P3-6)
-        analog_ref = None
-        try:
-            from signals.core.analog_matcher import load_analog_results
-            cached = load_analog_results()
-            if cached and "results" in cached:
-                analog_ref = cached["results"]
-        except Exception:
-            pass
-
-        try:
-            brief = ctx.build_decision_brief(
-                rhythm_alerts=rhythm_alerts,
-                analog_ref=analog_ref,
+        with self._lock:
+            if self._review.is_running:
+                return
+            # 重置状态
+            self._review = ReviewState(
+                start_date=start_date,
+                start_label=label,
+                is_running=True,
+                phase="L1",
             )
-            return brief
-        except Exception:
-            return None
+
+        def _worker():
+            import time as _time
+            import logging
+            _logger = logging.getLogger("signals.review")
+            rv = self._review
+            def _log(msg):
+                print(msg, flush=True)
+                _logger.info(msg)
+            _t_total = _time.monotonic()
+            try:
+                # ── L1: 指数复盘 ──
+                rv.phase = "L1"
+                rv.phase_detail = "加载指数数据..."
+                _log(f"[复盘] L1 开始 — 指数分析 (start={start_date})")
+                _t0 = _time.monotonic()
+                from signals.layers.index_screener import IndexScreener
+                screener = IndexScreener()
+                ctx = screener.run_review(start_date)
+                rv.market_context = ctx
+                rv.index_reports = ctx.reports if ctx else []
+                rv.analyzers = screener.analyzers
+                rv.timing["L1"] = round(_time.monotonic() - _t0, 1)
+                _log(f"[复盘] L1 完成 — {rv.timing['L1']}s "
+                     f"({len(rv.index_reports)} 指数)")
+
+                # ── L2: 行业筛选 ──
+                rv.phase = "L2"
+                rv.phase_detail = "获取行业排名..."
+                _log("[复盘] L2 开始 — 行业筛选")
+                _t0 = _time.monotonic()
+                from signals.layers.industry import get_industry_representatives
+                from datetime import datetime as _dt
+                import config
+                pool_date = _dt.now().strftime("%Y%m%d")
+                try:
+                    gain, composite, merged, concepts, oversold, _ = \
+                        get_industry_representatives(
+                            config.RANK_TOP_N, date_str=pool_date)
+                except Exception as e:
+                    _log(f"[复盘] L2 异常: {e}")
+                    gain, composite, merged, concepts, oversold = [], [], [], [], []
+                rv.gain_list = gain
+                rv.composite_list = composite
+                rv.merged_list = merged
+                rv.concepts = concepts
+                rv.oversold_list = oversold
+                rv.timing["L2_rank"] = round(_time.monotonic() - _t0, 1)
+                _log(f"[复盘] L2 行业排名 — {rv.timing['L2_rank']}s "
+                     f"({len(merged)} 行业)")
+
+                # 轮动
+                _t0 = _time.monotonic()
+                if ctx and (gain or composite):
+                    try:
+                        from signals.core.rotation import (
+                            detect_rotation_stage, suggest_allocation)
+                        rot = detect_rotation_stage(gain, composite)
+                        rv.rotation_stage = rot.stage
+                        rv.rotation_detail = rot.format_line()
+                        _, alloc_str = suggest_allocation(
+                            rot, ctx.sentiment_phase)
+                        rv.allocation_suggestion = alloc_str
+                    except Exception:
+                        pass
+                rv.timing["L2_rotation"] = round(_time.monotonic() - _t0, 1)
+                rv.timing["L2"] = round(
+                    rv.timing["L2_rank"] + rv.timing["L2_rotation"], 1)
+                _log(f"[复盘] L2 完成 — {rv.timing['L2']}s "
+                     f"(排名{rv.timing['L2_rank']}s + 轮动{rv.timing['L2_rotation']}s)")
+
+                # ── L3: 个股复盘 ──
+                rv.phase = "L3"
+                rv.phase_detail = "准备标的列表..."
+                _log("[复盘] L3 开始 — 个股分析")
+                _t0 = _time.monotonic()
+                ranking_stocks = []
+                for r in merged:
+                    ranking_stocks.extend(r.pool_codes)
+                ranking_stocks = list(dict.fromkeys(ranking_stocks))
+                all_symbols = list(dict.fromkeys(
+                    config.WHITELIST + ranking_stocks))
+                rv.phase_detail = f"分析 {len(all_symbols)} 只个股..."
+                _log(f"[复盘] L3 标的: 白名单{len(config.WHITELIST)} + "
+                     f"行业{len(ranking_stocks)} = {len(all_symbols)} 只")
+
+                from signals.layers.review_screener import review_stock_daily
+                scored = review_stock_daily(all_symbols, start_date)
+                # 注入名称
+                try:
+                    from signals.core.stock_names import get_resolver
+                    resolver = get_resolver()
+                    if merged:
+                        resolver.inject_from_rankings(merged)
+                    for s in scored:
+                        if not s.name:
+                            s.name = resolver.get_name(s.symbol)
+                except Exception:
+                    pass
+                rv.scored_symbols = scored
+                rv.timing["L3"] = round(_time.monotonic() - _t0, 1)
+                _log(f"[复盘] L3 完成 — {rv.timing['L3']}s ({len(scored)} 个股)")
+
+                rv.timing["total"] = round(_time.monotonic() - _t_total, 1)
+                rv.phase = ""
+                rv.phase_detail = ""
+                rv.completed = True
+                _log(f"[复盘] 全部完成 — 总计{rv.timing['total']}s "
+                     f"(L1:{rv.timing.get('L1', 0)}s "
+                     f"L2:{rv.timing.get('L2', 0)}s "
+                     f"L3:{rv.timing.get('L3', 0)}s) "
+                     f"{len(rv.index_reports)}指数 {len(merged)}行业 {len(scored)}个股")
+            except Exception as e:
+                import traceback
+                _log(f"[复盘] 失败: {e}")
+                traceback.print_exc()
+                rv.error = str(e)
+                rv.phase = ""
+            finally:
+                rv.is_running = False
+
+        t = threading.Thread(target=_worker, daemon=True, name="review-worker")
+        t.start()
+
+    def refresh(self) -> bool:
+        """重新运行全部分析（L1+L2+L3）"""
+        if self._state.is_running:
+            return False
+        self._state.last_update = 0
+        self.run_all_async()
+        return True
 
     def is_ready(self) -> bool:
         """是否已完成至少一次分析"""
@@ -683,7 +884,73 @@ class WebEngine:
             "error": self._state.error,
             "index_count": len(self._state.analyzers),
             "signal_count": len(self._state.scored_symbols),
+            "loading_phase": self._state.loading_phase,
         }
+
+    def run_all_async(self):
+        """L1+L2 并行启动，L3 等 L1+L2 都完成后执行"""
+        import time as _time
+
+        def _worker():
+            import logging
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            log = logging.getLogger(__name__)
+            t0 = _time.monotonic()
+            try:
+                # ── Phase 1: L1 + L2 并行 ──────────────────────
+                self._state.loading_phase = "L1"
+                print("   [后台] L1+L2 并行启动...")
+
+                l2_result = [None]  # 用列表存结果以便闭包赋值
+                l2_error = [None]
+
+                def _run_l2():
+                    try:
+                        self.run_l2()
+                    except Exception as e:
+                        l2_error[0] = e
+
+                # L2 在独立线程中并行运行
+                l2_thread = threading.Thread(
+                    target=_run_l2, daemon=True, name="engine-l2")
+                l2_thread.start()
+
+                # L1 在主 worker 线程中运行
+                log.info("后台加载: L1 指数分析...")
+                print("   [后台] 运行 Layer 1 指数分析...")
+                self.run_l1()
+                t1 = _time.monotonic() - t0
+                print(f"   [后台] L1 完成 ({t1:.1f}s)")
+
+                # 等 L2 完成（L2 通常比 L1 慢）
+                self._state.loading_phase = "L2"
+                log.info("后台加载: 等待 L2 行业分析...")
+                l2_thread.join(timeout=120)  # 最多等 2 分钟
+                t2 = _time.monotonic() - t0
+                if l2_error[0]:
+                    print(f"   [后台] L2 异常: {l2_error[0]}")
+                else:
+                    print(f"   [后台] L2 完成 ({t2:.1f}s)")
+
+                # ── Phase 2: L3 串行（依赖 L1+L2 结果）────────
+                self._state.loading_phase = "L3"
+                log.info("后台加载: L3 标的筛选...")
+                print("   [后台] 运行 Layer 3 标的筛选...")
+                self.run_l3()
+                t3 = _time.monotonic() - t0
+                print(f"   [后台] L3 完成 ({t3:.1f}s)")
+
+                self._state.loading_phase = ""
+                total = _time.monotonic() - t0
+                log.info("后台加载: 全部完成")
+                print(f"   [后台] ✅ 全部分析完成 (总计 {total:.1f}s)")
+            except Exception as e:
+                log.error("后台加载失败: %s", e, exc_info=True)
+                self._state.error = str(e)
+                self._state.loading_phase = ""
+
+        t = threading.Thread(target=_worker, daemon=True, name="engine-loader")
+        t.start()
 
 
 # 全局单例

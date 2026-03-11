@@ -210,6 +210,10 @@ def serialize_index_report(report) -> dict:
         "data_available": report.data_available,
         "latest_price": round(report.latest_price, 2) if report.latest_price else 0,
         "daily_last_dt": _dt_to_str(report.daily_last_dt),
+        "snapshot_price": round(report.snapshot_price, 2) if report.snapshot_price else 0,
+        "snapshot_dt": _dt_to_str(report.snapshot_dt),
+        "snapshot_freq": report.snapshot_freq or "",
+        "intraday_change": report.intraday_change,
         "summary": report.summary,
         # 日线
         "daily_trend": report.daily_trend,
@@ -310,10 +314,11 @@ def _serialize_style_switch(sw) -> Optional[dict]:
 
 def serialize_scored_symbol(scored) -> dict:
     """ScoredSymbol → JSON dict"""
-    return {
+    result = {
         "symbol": scored.symbol,
         "name": getattr(scored, "name", "") or scored.symbol,
         "total_score": round(scored.total_score, 1),
+        "fused_total": round(scored.fused_total, 1) if getattr(scored, "fused_total", 0) else None,
         "signal_count": scored.signal_count,
         "direction": scored.direction,
         "ma_confirmation": scored.ma_confirmation,
@@ -322,3 +327,93 @@ def serialize_scored_symbol(scored) -> dict:
         # P3-1: 情绪标签
         "sentiment_tag": getattr(scored, "sentiment_tag", ""),
     }
+    # 异常画像（精简版，给 Dashboard 用）
+    ap = getattr(scored, "anomaly_profile", None)
+    if ap:
+        result["anomaly"] = {
+            "items": [
+                {"name": item.name, "z_score": round(item.z_score, 2),
+                 "is_anomaly": item.is_anomaly, "label": item.label}
+                for item in ap.items.values()
+            ],
+            "anomaly_count": ap.anomaly_count,
+            "convergence": ap.convergence,
+            "capitulation_score": round(ap.capitulation_score, 1),
+        }
+    else:
+        result["anomaly"] = None
+    # 融合置信度
+    fs = getattr(scored, "fused_score", None)
+    if fs:
+        result["confidence_level"] = fs.confidence_level
+    # 社交舆情
+    result["social_heat"] = getattr(scored, "social_heat", "")
+    result["social_tag"] = getattr(scored, "social_tag", "")
+    result["theme_tags"] = getattr(scored, "theme_tags", []) or []
+    return result
+
+
+# ─────────────────────────────────────────────────────────
+# MA / MACD 共享计算（chart.py + industry detail 复用）
+# ─────────────────────────────────────────────────────────
+
+def compute_ma_lines(bars_raw) -> list:
+    """
+    从 bars_raw (RawBar list) 计算 MA5/10/20/60 线。
+    返回 [{label, color, data: [{time, value}]}]
+    """
+    from signals.core.ma_levels import _bars_to_df
+    df = _bars_to_df(bars_raw)
+    closes = df["close"]
+
+    ma_lines = []
+    for period, label, color in [
+        (5, "MA5", "#f7931a"),
+        (10, "MA10", "#2962ff"),
+        (20, "MA20", "#e040fb"),
+        (60, "MA60", "#26a69a"),
+    ]:
+        if len(closes) >= period:
+            ma_vals = closes.rolling(period).mean()
+            line_data = []
+            for dt_idx, val in ma_vals.dropna().items():
+                line_data.append({
+                    "time": int(dt_idx.timestamp()),
+                    "value": round(val, 4),
+                })
+            ma_lines.append({
+                "label": label,
+                "color": color,
+                "data": line_data,
+            })
+    return ma_lines
+
+
+def compute_macd(bars_raw) -> list:
+    """
+    从 bars_raw (RawBar list) 计算 MACD（DIF/DEA/BAR）。
+    返回 [{time, dif, dea, bar}]
+    """
+    from signals.core.ma_levels import _bars_to_df
+    df = _bars_to_df(bars_raw)
+    closes = df["close"]
+
+    if len(closes) < 26:
+        return []
+
+    ema12 = closes.ewm(span=12, adjust=False).mean()
+    ema26 = closes.ewm(span=26, adjust=False).mean()
+    dif = ema12 - ema26
+    dea = dif.ewm(span=9, adjust=False).mean()
+    macd_bar = (dif - dea) * 2
+
+    result = []
+    for dt_idx in dif.dropna().index:
+        if dt_idx in dea.dropna().index:
+            result.append({
+                "time": int(dt_idx.timestamp()),
+                "dif": round(float(dif[dt_idx]), 4),
+                "dea": round(float(dea[dt_idx]), 4),
+                "bar": round(float(macd_bar[dt_idx]), 4),
+            })
+    return result

@@ -90,17 +90,56 @@ def analyze_stock(symbol: str):
         raise HTTPException(status_code=500, detail=f"分析失败: {e}")
 
     try:
-        result = {"symbol": clean, "errors": dive._errors}
+        from signals.core.stock_names import get_resolver
+        resolver = get_resolver()
+        result = {"symbol": clean, "name": resolver.get_name(clean), "errors": dive._errors}
 
         # 评分
         if dive.scored:
             s = dive.scored
             result["scored"] = {
                 "total_score": round(s.total_score, 1),
+                "fused_total": round(s.fused_total, 1) if s.fused_total else None,
                 "direction": s.direction,
                 "signal_count": s.signal_count,
                 "ma_confirmation": getattr(s, "ma_confirmation", ""),
+                "confidence_level": getattr(s.fused_score, "confidence_level", None) if s.fused_score else None,
             }
+
+        # 异常检测
+        anomaly = getattr(dive, "anomaly", None)
+        if anomaly:
+            result["anomaly"] = {
+                "items": [
+                    {"name": item.name, "z_score": round(item.z_score, 2),
+                     "raw_value": round(item.raw_value, 4),
+                     "is_anomaly": item.is_anomaly, "label": item.label}
+                    for item in anomaly.items.values()
+                ],
+                "anomaly_count": anomaly.anomaly_count,
+                "convergence": anomaly.convergence,
+                "capitulation_score": round(anomaly.capitulation_score, 1),
+                "capitulation_detail": anomaly.capitulation_detail,
+                "summary": anomaly.summary,
+            }
+        else:
+            result["anomaly"] = None
+
+        # 融合评分明细
+        fused = getattr(dive, "fused", None)
+        if fused:
+            result["fused"] = {
+                "raw_czsc_score": round(fused.raw_czsc_score, 1),
+                "anomaly_boost": round(fused.anomaly_boost, 1),
+                "convergence_bonus": round(fused.convergence_bonus, 1),
+                "capitulation_bonus": round(fused.capitulation_bonus, 1),
+                "fused_total": round(fused.fused_total, 1),
+                "dimension_count": fused.dimension_count,
+                "confidence_level": fused.confidence_level,
+                "detail": fused.detail,
+            }
+        else:
+            result["fused"] = None
 
         # MA 均线
         result["ma_context"] = _serialize_ma(dive.ma_context)
@@ -136,6 +175,26 @@ def analyze_stock(symbol: str):
             layered["flex_sell_ref"] = lp.flex_sell_ref
             layered["rationale"] = lp.rationale
         result["layered_position"] = layered
+
+        # 社交热度
+        try:
+            from signals.data.social_fetcher import fetch_social_heat
+            soc = fetch_social_heat(clean)
+            if soc:
+                result["social"] = {
+                    "heat_score": round(soc.heat_score, 1),
+                    "heat_grade": soc.heat_grade,
+                    "comment_score": round(soc.comment_score, 1),
+                    "comment_rank": soc.comment_rank,
+                    "focus_index": round(soc.focus_index, 1),
+                    "institution_pct": round(soc.institution_pct, 3),
+                    "concepts": soc.concepts,
+                    "tag": soc.tag,
+                }
+            else:
+                result["social"] = None
+        except Exception:
+            result["social"] = None
 
         # 关键高低点
         result["pivots"] = [

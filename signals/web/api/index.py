@@ -37,16 +37,13 @@ def get_action_summary():
     return engine.get_action_summary()
 
 
-@router.get("/brief")
-def get_decision_brief():
-    """P3-7: 决策简报 — 整合情景分叉 + 风格切换 + 轮动 + 节奏 + 历史匹配"""
+
+@router.post("/refresh")
+def refresh_engine():
+    """手动触发重新分析"""
     engine = get_engine()
-    if not engine.is_ready():
-        raise HTTPException(status_code=503, detail="分析尚未完成")
-    brief = engine.get_decision_brief()
-    if brief is None:
-        raise HTTPException(status_code=503, detail="决策简报生成失败")
-    return brief
+    ok = engine.refresh()
+    return {"triggered": ok}
 
 
 @router.get("/status")
