@@ -54,6 +54,12 @@ class IndexReport:
     data_available: bool = True
     summary: str = ""
 
+    # ── 快照（优先小级别，解决盘中滞后问题）─────────────────
+    snapshot_price: float = 0.0                  # 最新价（f15 > f30 > daily）
+    snapshot_dt: Optional[datetime] = None       # 快照时间
+    snapshot_freq: str = ""                      # "15M" / "30M" / "日线"
+    intraday_change: Optional[float] = None      # 盘中涨跌幅 %（vs 前日收盘）
+
     # ── 均线关键位（P0-1）──────────────────────────────────
     ma_context: Optional[object] = None        # MAContext，日线以上均线关键位
 

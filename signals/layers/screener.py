@@ -143,7 +143,7 @@ class IntraDayScreener:
                     else:
                         print(msg, flush=True)
                 self._ak_consecutive_fails += 1
-                if self._ak_consecutive_fails >= 3 and not self._ak_sina_degraded:
+                if self._ak_consecutive_fails >= 2 and not self._ak_sina_degraded:  # 2次即熔断（从3次降为2次）
                     self._ak_sina_degraded = True
                     msg = "  [!] AKShare(Sina) 连续3次失败，后续直接走东财"
                     if dash:
@@ -165,7 +165,7 @@ class IntraDayScreener:
                     else:
                         print(msg, flush=True)
                 self._em_consecutive_fails += 1
-                if self._em_consecutive_fails >= 3:
+                if self._em_consecutive_fails >= 1:  # 1次即熔断（从3次降为1次）
                     self._em_degraded = True
                     msg = "  [!] AKShare(东财) 连续3次失败，后续跳过"
                     if dash:
@@ -311,6 +311,30 @@ class IntraDayScreener:
             _detail(f"  跳过 {sym} {freq.value} — 无数据")
 
     # ─────────────────────────────────────────────────────
+    # 日线数据（异常检测用）
+    # ─────────────────────────────────────────────────────
+    _daily_bars_cache: Dict[str, List] = {}
+
+    def _get_daily_bars(self, sym: str) -> List:
+        """获取个股日线数据（带内存缓存），用于异常检测。"""
+        if sym in self._daily_bars_cache:
+            return self._daily_bars_cache[sym]
+        try:
+            from datetime import datetime, timedelta
+            market = detect_market(sym)
+            if market == "A":
+                sdt = (datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
+                edt = datetime.now().strftime("%Y%m%d")
+                bars = self.ak_source.get_a_daily(sym, sdt, edt)
+            else:
+                bars = []
+            self._daily_bars_cache[sym] = bars or []
+            return self._daily_bars_cache[sym]
+        except Exception:
+            self._daily_bars_cache[sym] = []
+            return []
+
+    # ─────────────────────────────────────────────────────
     # 扫描：信号检测 + 评分
     # ─────────────────────────────────────────────────────
     def scan_once(self, symbols: Optional[List[str]] = None,
@@ -340,7 +364,25 @@ class IntraDayScreener:
             if dash:
                 dash.task_done("L3.scan", sym)
 
-        results.sort(key=lambda x: x.total_score, reverse=True)
+        # 异常检测 + 信号融合
+        try:
+            from signals.core.anomaly import compute_anomaly_profile
+            from signals.core.fusion import fuse_scores
+            for scored in results:
+                daily_bars = self._get_daily_bars(scored.symbol)
+                if daily_bars and len(daily_bars) >= 25:
+                    anomaly = compute_anomaly_profile(scored.symbol, daily_bars)
+                    if anomaly:
+                        fused = fuse_scores(scored, anomaly)
+                        scored.anomaly_profile = anomaly
+                        scored.fused_score = fused
+                        scored.fused_total = fused.fused_total
+        except Exception:
+            pass  # 异常检测失败不影响主流程
+
+        # 排序: 有融合分用融合分，否则用缠论原始分
+        results.sort(key=lambda x: x.fused_total if x.fused_total else x.total_score,
+                     reverse=True)
 
         # 信号存档（回测验证用，异常不影响主流程）
         try:

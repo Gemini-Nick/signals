@@ -331,6 +331,7 @@ class MarketContext:
                 if b.urgency == "接近":
                     key_scenarios.append({
                         "index_name": r.name,
+                        "current_price": round(r.latest_price, 2) if r.latest_price else 0,
                         "level_name": b.level_name,
                         "level_price": b.level_price,
                         "distance_pct": b.distance_pct,

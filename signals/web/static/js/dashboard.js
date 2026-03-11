@@ -22,76 +22,6 @@ function trendInfo(trend) {
   return TREND_MAP[trend] || TREND_MAP['未知'];
 }
 
-// ── P3-7: 决策简报 ──────────────────────────────────
-function renderDecisionBrief(brief) {
-  const container = document.getElementById('decision-brief');
-  if (!brief) { container.style.display = 'none'; return; }
-
-  const dirCls = brief.direction === '偏多' ? 'bullish'
-    : brief.direction === '偏空' ? 'bearish' : 'neutral';
-  const tagCls = dirCls;
-
-  let html = `<div class="brief-header">
-    <span class="brief-title">决策简报</span>
-    <span class="brief-date">${brief.date || ''}</span>
-    <span class="brief-tag ${tagCls}">${brief.direction || ''}${brief.sentiment ? ' \u00B7 ' + brief.sentiment : ''}</span>
-  </div><div class="brief-body">`;
-
-  // 关键情景
-  if (brief.key_scenarios && brief.key_scenarios.length > 0) {
-    html += '<div class="brief-section"><div class="brief-label">关键判断</div>';
-    brief.key_scenarios.forEach(s => {
-      html += `<div class="scenario-line hold">IF 守住 ${s.level_price} (${s.level_name}) \u2192 ${s.hold}</div>`;
-      html += `<div class="scenario-line break-line">IF 跌破 ${s.level_price} (${s.level_name}) \u2192 ${s.break_text || s['break'] || ''}</div>`;
-    });
-    html += '</div>';
-  }
-
-  // 风格切换 + 轮动 (并排)
-  const ss = brief.style_switch;
-  const rs = brief.rotation_status;
-  if (ss || rs) {
-    html += '<div class="brief-row">';
-    if (ss && ss.detected) {
-      html += `<div class="brief-section brief-style">\u{1F504} ${ss.direction} \u2014 ${ss.evidence}</div>`;
-    }
-    if (rs) {
-      const warn = rs.peak_warning ? ' \u26A0\uFE0F' : '';
-      html += `<div class="brief-section brief-rotation">\u{1F4C5} ${rs.stage || ''} ${rs.duration || 0}\u5929 (${rs.velocity || ''})${warn}</div>`;
-    }
-    html += '</div>';
-  }
-
-  // 节奏预警 + 历史匹配 (并排)
-  if ((brief.rhythm_alerts && brief.rhythm_alerts.length > 0) || brief.analog_ref) {
-    html += '<div class="brief-row">';
-    if (brief.rhythm_alerts && brief.rhythm_alerts.length > 0) {
-      const items = brief.rhythm_alerts.map(r => `${r.name}(${r.phase}${r.score})`).join(' ');
-      html += `<div class="brief-section brief-rhythm">\u23F0 ${items}</div>`;
-    }
-    if (brief.analog_ref) {
-      // 取第一个指数的第一个匹配
-      const firstKey = Object.keys(brief.analog_ref)[0];
-      if (firstKey && brief.analog_ref[firstKey] && brief.analog_ref[firstKey][0]) {
-        const a = brief.analog_ref[firstKey][0];
-        html += `<div class="brief-section brief-analog">\u{1F4CA} \u4E0E${a.match_start}~${a.match_end}\u76F8\u4F3C${(a.similarity * 100).toFixed(0)}%, \u540E30\u65E5${a.next_30d_return > 0 ? '+' : ''}${a.next_30d_return}%</div>`;
-      }
-    }
-    html += '</div>';
-  }
-
-  // 操作建议
-  if (brief.action_items && brief.action_items.length > 0) {
-    html += '<div class="brief-section"><div class="brief-label">操作</div><ol class="brief-actions">';
-    brief.action_items.forEach(a => { html += `<li>${a}</li>`; });
-    html += '</ol></div>';
-  }
-
-  html += '</div>';
-  container.innerHTML = html;
-  container.style.display = 'block';
-}
-
 // ── 建议条 ──────────────────────────────────────────
 function renderBanner(ctx) {
   const banner = document.getElementById('banner');
@@ -112,7 +42,7 @@ function renderBanner(ctx) {
   if (ctx.sentiment_phase && ctx.sentiment_phase !== '未知') {
     dirText += `  |  情绪: ${ctx.sentiment_phase}`;
   }
-  if (ctx.divergence_score > 0) {
+  if (ctx.divergence_score != null && ctx.divergence_score > 0) {
     dirText += `  |  分歧: ${ctx.divergence_score.toFixed(0)}`;
   }
   dirEl.textContent = dirText;
@@ -166,7 +96,32 @@ function renderCards(reports) {
       }
 
       const trend = trendInfo(r.daily_trend);
-      const priceStr = r.latest_price ? r.latest_price.toFixed(2) : '';
+      // 优先用小级别快照价，fallback 到日线收盘
+      const snapPrice = r.snapshot_price || r.latest_price;
+      const priceStr = snapPrice ? snapPrice.toFixed(2) : '';
+
+      // 盘中涨跌幅（vs 前日收盘）— 替代之前误导性的 5 日收益
+      let changeHtml = '';
+      if (r.intraday_change !== null && r.intraday_change !== undefined) {
+        const chgCls = r.intraday_change > 0 ? 'up' : r.intraday_change < 0 ? 'down' : 'flat';
+        changeHtml = `<span class="card-return ${chgCls}">${r.intraday_change > 0 ? '+' : ''}${r.intraday_change.toFixed(2)}%</span>`;
+      }
+
+      // 快照时间标签（如 "15M 14:30" 或 "日线 03-09"）
+      let snapTimeHtml = '';
+      if (r.snapshot_dt) {
+        let timeLabel = '';
+        if (r.snapshot_freq === '15M' || r.snapshot_freq === '30M') {
+          // 分钟级别：显示 HH:MM
+          const parts = r.snapshot_dt.split(' ');
+          timeLabel = parts.length > 1 ? parts[1] : r.snapshot_dt;
+        } else {
+          // 日线级别：显示 MM-DD
+          const parts = r.snapshot_dt.split(' ')[0].split('-');
+          timeLabel = parts.length >= 3 ? `${parts[1]}-${parts[2]}` : r.snapshot_dt;
+        }
+        snapTimeHtml = `<div class="card-snap-time">${r.snapshot_freq || ''} ${timeLabel}</div>`;
+      }
 
       const signals = [];
       if (r.daily_latest_signal !== '无') signals.push(r.daily_latest_signal);
@@ -192,7 +147,8 @@ function renderCards(reports) {
           r.ma_context.key_levels.forEach(lv => {
             const arrow = lv.position === '上方' ? '\u25B2' : '\u25BC';
             const cls = lv.position === '上方' ? 'resistance' : 'support';
-            maHtml += `<span class="card-level ${cls}">${arrow}${lv.name} ${lv.value.toFixed(0)}</span>`;
+            const lvVal = (lv.value != null) ? lv.value.toFixed(0) : '—';
+            maHtml += `<span class="card-level ${cls}">${arrow}${lv.name} ${lvVal}</span>`;
           });
           maHtml += '</div>';
         }
@@ -204,22 +160,23 @@ function renderCards(reports) {
         const urgent = r.scenarios.filter(s => s.urgency === '接近');
         if (urgent.length > 0) {
           const s = urgent[0];
+          const lvPrice = (s.level_price != null) ? s.level_price.toFixed(0) : '—';
           const expanded = urgent.length > 0 ? 'true' : 'false';
           scenarioHtml = `<div class="card-scenarios" data-expanded="${expanded}">
             <div class="scenario-toggle">\u{1F500} <span class="urgency-dot urgent"></span></div>
             <div class="scenario-body">
-              <div class="scenario-branch support">IF \u5B88\u4F4F ${s.level_price.toFixed(0)} (${s.level_name}) \u2192 ${s.hold}</div>
-              <div class="scenario-branch break-branch">IF \u8DCC\u7834 ${s.level_price.toFixed(0)} (${s.level_name}) \u2192 ${s['break']}</div>
+              <div class="scenario-branch support">IF \u5B88\u4F4F ${lvPrice} (${s.level_name}) \u2192 ${s.hold}</div>
+              <div class="scenario-branch break-branch">IF \u8DCC\u7834 ${lvPrice} (${s.level_name}) \u2192 ${s['break']}</div>
             </div>
           </div>`;
         }
       }
 
-      // P3-5: 近5日收益率
-      let retHtml = '';
+      // 近5日收益率 — 移到卡片底部，加明确标签
+      let ret5dHtml = '';
       if (r.recent_5d_return !== null && r.recent_5d_return !== undefined) {
         const retCls = r.recent_5d_return > 0 ? 'up' : r.recent_5d_return < 0 ? 'down' : 'flat';
-        retHtml = `<span class="card-return ${retCls}">${r.recent_5d_return > 0 ? '+' : ''}${r.recent_5d_return.toFixed(1)}%</span>`;
+        ret5dHtml = `<div class="card-5d-return"><span class="label-5d">近5日</span> <span class="${retCls}">${r.recent_5d_return > 0 ? '+' : ''}${r.recent_5d_return.toFixed(1)}%</span></div>`;
       }
 
       const alignBadge = r.three_level_aligned
@@ -228,14 +185,16 @@ function renderCards(reports) {
 
       card.innerHTML = `
         <div class="card-header">
-          <div class="card-name">${name} ${retHtml}</div>
+          <div class="card-name">${name} ${changeHtml}</div>
           ${alignBadge}
         </div>
         <div class="card-trend ${trend.cls}">${trend.arrow} ${trend.label}</div>
         ${signalHtml}
         <div class="card-price">${priceStr}</div>
+        ${snapTimeHtml}
         ${maHtml}
-        ${scenarioHtml}`;
+        ${scenarioHtml}
+        ${ret5dHtml}`;
 
       container.appendChild(card);
     });
@@ -278,7 +237,7 @@ function _stockPanel(candidates, panelId) {
 // ── 行业全景排行（合并单表 + 统计摘要）──────────────
 function renderIndustry(data) {
   const container = document.getElementById('industry-section');
-  const { composite_list, concepts, oversold_list, stats } = data;
+  const { composite_list, oversold_list, stats } = data;
 
   if (!composite_list || composite_list.length === 0) {
     container.innerHTML = '<div class="empty-state">行业数据未加载</div>';
@@ -287,21 +246,21 @@ function renderIndustry(data) {
 
   let html = '';
 
-  // P3-3: 兑现提醒横幅
+  // 兑现提醒横幅
   const rhythmAlerts = composite_list.slice(0, 10).filter(
-    ind => ind.rhythm_phase && (ind.rhythm_phase === '衰竭' || ind.rhythm_phase === '高潮')
+    ind => ind.phase && (ind.phase === '衰竭' || ind.phase === '高潮')
   );
   if (rhythmAlerts.length > 0) {
     html += '<div class="rhythm-alert">\u23F0 兑现提醒: ';
     html += rhythmAlerts.map(ind =>
-      `${ind.display_name || ind.name}(${ind.rhythm_phase}${ind.rhythm_score || ''})`
+      `${ind.display_name || ind.name}(${ind.phase})`
     ).join(' \u00B7 ');
     html += ' \u2014 注意板块节奏</div>';
   }
 
   // 行业全景表（合并综合+涨幅维度 + 节奏列）
   html += '<div class="industry-panorama"><div class="table-title">行业全景 TOP10</div><table>';
-  html += '<tr><th>#</th><th>行业</th><th>综合</th><th>涨幅</th><th>涨停</th><th>净流入</th><th>节奏</th><th>属性</th><th>候选股</th></tr>';
+  html += '<tr><th>#</th><th>行业</th><th>综合</th><th>涨幅</th><th>涨停</th><th>净流入</th><th>阶段</th><th>属性</th><th>候选股</th></tr>';
   composite_list.slice(0, 10).forEach((ind, i) => {
     const panelId = `pano-panel-${i}`;
     const pctCls = ind.gain_pct >= 0 ? 'up' : 'down';
@@ -309,15 +268,16 @@ function renderIndustry(data) {
     const ztBold = ind.zt_count >= 3 ? 'zt-hot' : '';
     const inflowBold = Math.abs(ind.net_inflow) >= 1 ? 'inflow-hot' : '';
 
-    // P3-3: 节奏列
-    const rhythmPhaseMap = {
-      '启动': 'rhythm-start', '加速': 'rhythm-accel', '高潮': 'rhythm-peak',
-      '衰竭': 'rhythm-exhaust', '休整': 'rhythm-rest',
+    // 阶段标签（启动/加速/高潮/衰竭/休整）
+    const phaseClsMap = {
+      '启动': 'phase-startup', '加速': 'phase-accel', '高潮': 'phase-peak',
+      '衰竭': 'phase-exhaust', '休整': 'phase-rest',
     };
-    let rhythmCell = '';
-    if (ind.rhythm_phase) {
-      const rCls = rhythmPhaseMap[ind.rhythm_phase] || '';
-      rhythmCell = `<span class="rhythm ${rCls}">${ind.rhythm_phase} ${ind.rhythm_score || ''}</span>`;
+    let phaseCell = '';
+    if (ind.phase) {
+      const pCls = phaseClsMap[ind.phase] || '';
+      const hint = ind.phase_hint ? ` ${ind.phase_hint}` : '';
+      phaseCell = `<span class="tag tag-phase ${pCls}" title="${ind.phase_hint || ''}">${ind.phase}${hint}</span>`;
     }
 
     // 候选股简要
@@ -328,12 +288,12 @@ function renderIndustry(data) {
 
     html += `<tr class="industry-row ${scoreCls}" data-panel="${panelId}" data-industry="${ind.name}">
       <td>${i + 1}</td>
-      <td class="industry-name-cell">${ind.display_name || ind.name}</td>
+      <td class="industry-name-cell"><span class="ind-chart-btn" onclick="event.stopPropagation();navigateToIndustryChart('${ind.name}')" title="查看K线">&#9632;</span> ${ind.display_name || ind.name}</td>
       <td class="score-cell">${ind.composite_score.toFixed(0)}</td>
       <td class="${pctCls}">${ind.gain_pct > 0 ? '+' : ''}${ind.gain_pct.toFixed(2)}%</td>
       <td class="${ztBold}">${ind.zt_count}</td>
       <td class="${inflowBold}">${ind.net_inflow > 0 ? '+' : ''}${ind.net_inflow.toFixed(1)}亿</td>
-      <td>${rhythmCell}</td>
+      <td>${phaseCell}</td>
       <td><span class="tag tag-${ind.sector_type}">${ind.sector_type}</span>${ind.rotation_line ? ` <span class="tag tag-rotation">${ind.rotation_line}</span>` : ''}</td>
       <td class="stock-brief">${stockBrief}</td>
     </tr>`;
@@ -359,26 +319,6 @@ function renderIndustry(data) {
       `<span class="tag tag-oversold">${ind.display_name || ind.name} (${ind.oversold_detail})</span>`
     ).join(' ');
     html += '</div>';
-  }
-
-  // 热门概念（可点击穿透到行业表）
-  if (concepts && concepts.length > 0) {
-    html += '<div class="concept-section"><span class="table-title">热门概念: </span>';
-    html += concepts.slice(0, 10).map(c => {
-      const pctCls = c.gain_pct >= 0 ? 'up' : 'down';
-      const hasData = c.gain_pct !== 0 || (c.tag !== 'static');
-      const clickAttr = `onclick="highlightConceptIndustry('${c.name.replace(/'/g, "\\'")}')" style="cursor:pointer;"`;
-      if (hasData && c.gain_pct !== 0) {
-        let label = `${c.name} ${c.gain_pct > 0 ? '+' : ''}${c.gain_pct.toFixed(1)}%`;
-        if (c.leading_stock) label += ` 领涨:${c.leading_stock}`;
-        return `<span class="tag tag-concept ${pctCls}" ${clickAttr} title="点击高亮相关行业">${label}</span>`;
-      } else {
-        return `<span class="tag tag-concept" ${clickAttr} title="点击高亮相关行业">${c.name}</span>`;
-      }
-    }).join(' ');
-    html += '</div>';
-  } else {
-    html += '<div class="concept-section"><span class="table-title">热门概念: </span><span class="tag tag-concept">数据源暂不可用</span></div>';
   }
 
   container.innerHTML = html;
@@ -628,17 +568,7 @@ function renderActionSummary(summary) {
     html += '</div>';
   }
 
-  // 8. 概念归纳 + 主题追踪
-  if (summary.concept_digest) {
-    html += `<div class="action-subsection"><div class="action-subsection-title">概念归纳</div>
-      <div class="action-text">${summary.concept_digest}</div></div>`;
-  }
-  if (summary.theme_summary) {
-    html += `<div class="action-subsection"><div class="action-subsection-title">主题追踪</div>
-      <div class="action-text">${summary.theme_summary}</div></div>`;
-  }
-
-  // 9. 结论
+  // 8. 结论
   if (summary.conclusion) {
     html += `<div class="action-conclusion">${summary.conclusion}</div>`;
   }
@@ -740,8 +670,9 @@ function renderSignalList(reports, scoredData, industryData) {
   const results = Array.isArray(scored) ? scored : [];
 
   if (results.length > 0) {
-    const above = results.filter(s => s.total_score >= threshold && s.signal_count > 0);
-    const below = results.filter(s => s.total_score < threshold || s.signal_count === 0);
+    const getScore = s => (s.fused_total && s.fused_total > 0) ? s.fused_total : s.total_score;
+    const above = results.filter(s => getScore(s) >= threshold && s.signal_count > 0);
+    const below = results.filter(s => getScore(s) < threshold || s.signal_count === 0);
 
     if (above.length > 0) {
       const subtitle = document.createElement('div');
@@ -759,30 +690,71 @@ function renderSignalList(reports, scoredData, industryData) {
           const badgeCls = isBoost ? 'sentiment-boost' : 'sentiment-penalty';
           sentimentBadge = `<span class="badge ${badgeCls}">${s.sentiment_tag}</span>`;
         }
+        // 社交热度徽章
+        let heatBadge = '';
+        if (s.social_heat && s.social_heat !== '冷门') {
+          const heatCls = { '\u7206\u70ED': 'heat-fire', '\u70ED\u95E8': 'heat-hot', '\u6E29\u548C': 'heat-warm' }[s.social_heat] || '';
+          heatBadge = `<span class="badge ${heatCls}">${s.social_heat}</span>`;
+        }
+        // 关联主题tags
+        let themeTags = '';
+        if (s.theme_tags && s.theme_tags.length > 0) {
+          themeTags = s.theme_tags.slice(0, 2).map(t => `<span class="tag tag-theme" style="font-size:10px;padding:1px 4px;">${t}</span>`).join('');
+        }
+        // 主分数：优先融合分
+        const mainScore = (s.fused_total && s.fused_total > 0) ? s.fused_total : s.total_score;
+        const czscSub = (s.fused_total && s.fused_total > 0) ? `<span class="signal-czsc-sub">(缠论${s.total_score.toFixed(0)})</span>` : '';
+
+        // 异常指示器
+        let anomalyStrip = '';
+        if (s.anomaly && s.anomaly.items && s.anomaly.items.length > 0) {
+          const dimNames = {volume: '量能', range: '振幅', gap: '跳空', body: '实体', vol_price_div: '背离'};
+          let dots = s.anomaly.items.map(item => {
+            const label = dimNames[item.name] || item.name;
+            const cls = item.is_anomaly ? 'fired' : 'normal';
+            return `<span class="signal-anomaly-dot ${cls}">${item.is_anomaly ? label + 'z' + Math.abs(item.z_score).toFixed(1) : ''}</span>`;
+          }).filter(d => d.includes('fired')).join('');
+          let extras = '';
+          if (s.anomaly.convergence && s.anomaly.anomaly_count >= 2) {
+            extras += `<span class="signal-anomaly-dot conv">${s.anomaly.anomaly_count}维收敛</span>`;
+          }
+          if (s.anomaly.capitulation_score >= 40) {
+            extras += `<span class="signal-anomaly-dot cap">割肉${s.anomaly.capitulation_score.toFixed(0)}</span>`;
+          }
+          if (dots || extras) {
+            anomalyStrip = `<div class="signal-anomaly-strip">${dots}${extras}</div>`;
+          }
+        }
+
         const row = document.createElement('div');
         row.className = 'signal-row';
         row.innerHTML = `
           <span class="signal-rank">${i + 1}</span>
           <div class="signal-symbol">
             <div class="signal-symbol-name">${displayName}</div>
-            <div class="signal-symbol-code">${s.symbol} | ${s.signal_count}个信号 ${s.ma_confirmation || ''}</div>
+            <div class="signal-symbol-code">${s.symbol} | ${s.signal_count}个信号 ${s.ma_confirmation || ''} ${czscSub}</div>
+            ${anomalyStrip}
           </div>
-          <span class="signal-score">${s.total_score.toFixed(1)}</span>
+          <span class="signal-score">${mainScore.toFixed(1)}</span>
           ${sentimentBadge}
+          ${heatBadge}
           <span class="signal-type ${isBuy ? 'buy' : 'sell'}">${s.direction}</span>
+          ${themeTags}
           <span class="signal-arrow">\u203A</span>`;
         container.appendChild(row);
       });
     }
 
     if (below.length > 0) {
+      const topScore = below.length > 0 ? getScore(below[0]).toFixed(0) : 0;
       const subtitle = document.createElement('div');
       subtitle.className = 'signal-section-title';
-      subtitle.textContent = `未达标 (${below.length}) 最高${below.length > 0 ? below[0].total_score.toFixed(0) : 0}分`;
+      subtitle.textContent = `未达标 (${below.length}) 最高${topScore}分`;
       container.appendChild(subtitle);
 
       below.slice(0, 5).forEach((s, i) => {
         const displayName = s.name || s.symbol;
+        const score = getScore(s);
         const row = document.createElement('div');
         row.className = 'signal-row below-threshold';
         row.innerHTML = `
@@ -791,7 +763,7 @@ function renderSignalList(reports, scoredData, industryData) {
             <div class="signal-symbol-name">${displayName}</div>
             <div class="signal-symbol-code">${s.symbol} | ${s.signal_count}个信号</div>
           </div>
-          <span class="signal-score">${s.total_score.toFixed(1)}</span>
+          <span class="signal-score">${score.toFixed(1)}</span>
           <span class="signal-type">${s.direction || '—'}</span>`;
         container.appendChild(row);
       });
@@ -802,6 +774,61 @@ function renderSignalList(reports, scoredData, industryData) {
     container.innerHTML = '<div class="empty-state">当前无明确信号</div>';
   }
 }
+
+// ── 今日舆情 section ─────────────────────────────────
+function renderSocialSection(data) {
+  const container = document.getElementById('social-section');
+  if (!container) return;
+  let html = '';
+
+  // 热门主题词
+  if (data.hot_themes && data.hot_themes.length > 0) {
+    html += '<div class="social-themes-row">';
+    data.hot_themes.forEach(t => {
+      const pctCls = t.change_pct >= 0 ? 'up' : 'down';
+      html += `<span class="tag tag-theme" onclick="navigateToTheme('${t.name}')">${t.name} <small class="${pctCls}">${t.change_pct > 0 ? '+' : ''}${t.change_pct.toFixed(1)}%</small></span>`;
+    });
+    html += '</div>';
+  }
+
+  // 飙升标的
+  if (data.surge_stocks && data.surge_stocks.length > 0) {
+    html += '<div class="social-surge-row">';
+    data.surge_stocks.forEach(s => {
+      const pctCls = s.change_pct >= 0 ? 'up' : 'down';
+      html += `<span class="surge-chip" onclick="navigateToStock('${s.symbol}')">
+        ${s.name} <span class="badge heat-fire">千评${s.score.toFixed(0)}</span>
+        <small class="${pctCls}">${s.change_pct > 0 ? '+' : ''}${s.change_pct.toFixed(1)}%</small>
+      </span>`;
+    });
+    html += '</div>';
+  }
+
+  container.innerHTML = html || '<div class="empty-state">暂无舆情数据</div>';
+}
+
+// 导航到主题发现（切到个股页搜索主题）
+function navigateToTheme(theme) {
+  switchPage('stock');
+  const input = document.getElementById('stock-input');
+  if (input) {
+    input.value = theme;
+    analyzeStock();
+  }
+}
+
+// 导航到个股分析
+function navigateToStock(symbol) {
+  switchPage('stock');
+  const input = document.getElementById('stock-input');
+  if (input) {
+    input.value = symbol;
+    analyzeStock();
+  }
+}
+
+window.navigateToTheme = navigateToTheme;
+window.navigateToStock = navigateToStock;
 
 // ── Toast 提示 ──────────────────────────────────────
 function showToast(msg) {
@@ -817,45 +844,88 @@ function showToast(msg) {
   setTimeout(() => toast.classList.remove('show'), 2000);
 }
 
-// ── 概念点击穿透 → 高亮行业表匹配行 ─────────────────
-function highlightConceptIndustry(conceptName) {
-  // 移除之前的高亮
-  document.querySelectorAll('.industry-row.highlight-concept').forEach(el => {
-    el.classList.remove('highlight-concept');
-  });
-
-  // 在行业表中查找名称包含概念关键词的行
-  const keywords = conceptName.split(/[、,\s]+/).filter(Boolean);
-  let found = false;
-  document.querySelectorAll('.industry-row').forEach(row => {
-    const name = row.dataset.industry || '';
-    const match = keywords.some(kw => name.includes(kw));
-    if (match) {
-      row.classList.add('highlight-concept');
-      if (!found) {
-        row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        found = true;
-      }
-    }
-  });
-
-  if (!found) {
-    showToast(`未找到与"${conceptName}"相关的行业`);
-  }
-
-  // 3秒后自动移除高亮
-  setTimeout(() => {
-    document.querySelectorAll('.industry-row.highlight-concept').forEach(el => {
-      el.classList.remove('highlight-concept');
-    });
-  }, 3000);
-}
-window.highlightConceptIndustry = highlightConceptIndustry;
-
 // ── 加载首页 ─────────────────────────────────────────
+// ── 加载进度指示 ────────────────────────────────────
+const PHASE_LABELS = {
+  'L1': '指数数据加载中...',
+  'L2': '行业数据加载中...',
+  'L3': '标的筛选中...',
+  '': '完成',
+};
+
+function showLoadingOverlay(phase) {
+  let overlay = document.getElementById('loading-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'loading-overlay';
+    overlay.innerHTML = `
+      <div class="loading-card">
+        <div class="loading-spinner"></div>
+        <div class="loading-title">隆小侠正在分析市场</div>
+        <div class="loading-phase" id="loading-phase-text"></div>
+        <div class="loading-hint">服务器已启动，数据后台加载中</div>
+      </div>`;
+    document.body.appendChild(overlay);
+  }
+  const phaseEl = document.getElementById('loading-phase-text');
+  if (phaseEl) phaseEl.textContent = PHASE_LABELS[phase] || phase;
+  overlay.style.display = 'flex';
+}
+
+function hideLoadingOverlay() {
+  const overlay = document.getElementById('loading-overlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+async function waitForEngine() {
+  /**
+   * 轮询 /api/index/status 直到 ready=true。
+   * 显示加载进度。返回 true 当就绪。
+   */
+  let attempts = 0;
+  const MAX_ATTEMPTS = 180;  // 最多等 6 分钟
+  while (attempts < MAX_ATTEMPTS) {
+    try {
+      const status = await apiFetch('/api/index/status');
+      if (status.ready) {
+        hideLoadingOverlay();
+        return true;
+      }
+      if (status.error) {
+        showLoadingOverlay('错误: ' + status.error);
+        return false;
+      }
+      showLoadingOverlay(status.loading_phase || 'L1');
+    } catch (e) {
+      showLoadingOverlay('连接中...');
+    }
+    await new Promise(r => setTimeout(r, 2000));
+    attempts++;
+  }
+  hideLoadingOverlay();
+  return false;
+}
+
 async function loadDashboard() {
   try {
-    // L1: 指数数据（必须，先渲染）
+    // 先检查引擎是否就绪
+    let status;
+    try {
+      status = await apiFetch('/api/index/status');
+    } catch (e) {
+      status = { ready: false };
+    }
+
+    if (!status.ready) {
+      // 引擎还在加载 → 显示进度，轮询等待
+      const ok = await waitForEngine();
+      if (!ok) {
+        document.getElementById('banner-direction').textContent = '数据加载超时，请刷新重试';
+        return;
+      }
+    }
+
+    // 引擎就绪(L1完成) → 立即渲染 L1 部分
     const [ctx, reports] = await Promise.all([
       apiFetch('/api/index/context'),
       apiFetch('/api/index/reports'),
@@ -864,42 +934,74 @@ async function loadDashboard() {
     renderCards(reports);
     renderSentimentPanel(ctx);
 
-    // P3-7: 决策简报（异步，不阻塞）
-    apiFetch('/api/index/brief').then(brief => {
-      renderDecisionBrief(brief);
-    }).catch(e => {
-      console.warn('决策简报加载失败:', e);
-      document.getElementById('decision-brief').style.display = 'none';
+    // 社交舆情（并行加载）
+    apiFetch('/api/social/brief').then(renderSocialSection).catch(e => {
+      console.warn('社交舆情加载失败:', e);
+      const sc = document.getElementById('social-section');
+      if (sc) sc.innerHTML = '<div class="empty-state">舆情数据暂不可用</div>';
     });
 
-    // L2 + L3 + 操作建议: 异步加载，不阻塞 L1 渲染
+    // L2 部分：轮询直到行业数据就绪
     let industryData = null;
-    apiFetch('/api/industry/ranking').then(data => {
-      industryData = data;
-      renderIndustry(data);
-    }).catch(e => {
-      console.warn('L2 行业加载失败:', e);
-      document.getElementById('industry-section').innerHTML =
-        '<div class="empty-state">行业数据暂不可用</div>';
-    });
+    const loadL2Data = async () => {
+      const indSection = document.getElementById('industry-section');
+      const actSection = document.getElementById('action-section');
+      let retries = 0;
+      while (retries < 60) {
+        try {
+          const data = await apiFetch('/api/industry/ranking');
+          if (data.loading) {
+            indSection.innerHTML = '<div class="empty-state"><div class="loading-spinner" style="width:24px;height:24px;border-width:2px;margin:0 auto 8px;"></div>行业数据加载中...</div>';
+            await new Promise(r => setTimeout(r, 2000));
+            retries++;
+            continue;
+          }
+          industryData = data;
+          renderIndustry(data);
+          break;
+        } catch (e) {
+          console.warn('L2 行业加载失败:', e);
+          indSection.innerHTML = '<div class="empty-state">行业数据暂不可用</div>';
+          break;
+        }
+      }
+      // L2 就绪后加载操作建议
+      apiFetch('/api/index/summary').then(renderActionSummary).catch(e => {
+        console.warn('操作建议加载失败:', e);
+        actSection.innerHTML = '<div class="empty-state">操作建议暂不可用</div>';
+      });
+    };
+    loadL2Data();
 
-    // 操作建议
-    apiFetch('/api/index/summary').then(renderActionSummary).catch(e => {
-      console.warn('操作建议加载失败:', e);
-      document.getElementById('action-section').innerHTML =
-        '<div class="empty-state">操作建议暂不可用</div>';
-    });
-
-    const scoredData = await apiFetch('/api/screener/results').catch(e => {
-      console.warn('L3 标的加载失败:', e);
-      return { threshold: 50, results: [] };
-    });
-
-    // 合并渲染信号列表（等 industry 数据到达）
-    // 用短延时确保 industryData 可能已到达
-    setTimeout(() => {
-      renderSignalList(reports, scoredData, industryData);
-    }, 500);
+    // L3 部分：轮询直到标的数据就绪
+    const loadL3Data = async () => {
+      let retries = 0;
+      while (retries < 90) {
+        try {
+          const st = await apiFetch('/api/index/status');
+          if (st.loading_phase) {
+            await new Promise(r => setTimeout(r, 3000));
+            retries++;
+            continue;
+          }
+          break;
+        } catch (e) { break; }
+      }
+      const scoredData = await apiFetch('/api/screener/results').catch(e => {
+        console.warn('L3 标的加载失败:', e);
+        return { threshold: 50, results: [] };
+      });
+      // 等 industry 数据就绪再渲染信号列表
+      const waitAndRender = () => {
+        if (industryData !== null) {
+          renderSignalList(reports, scoredData, industryData);
+        } else {
+          setTimeout(waitAndRender, 500);
+        }
+      };
+      waitAndRender();
+    };
+    loadL3Data();
 
   } catch (err) {
     console.error('Dashboard load failed:', err);

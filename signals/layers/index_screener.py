@@ -421,19 +421,34 @@ class IndexScreener:
 
     def run_review(self, start_date: str) -> MarketContext:
         """盘后复盘一键运行：initialize_with_start → analyze → print_report"""
+        import time as _time
+        import logging
+        _log = logging.getLogger(__name__)
         from signals.dashboard import get_dashboard
         dash = get_dashboard()
         if dash:
             dash.log(f"\n>>> Layer 1 指数复盘（起始：{start_date}）...")
         else:
             print(f"\n>>> Layer 1 指数复盘（起始：{start_date}）...", flush=True)
+
+        _t0 = _time.monotonic()
         self.initialize_with_start(start_date)
+        _t_load = _time.monotonic() - _t0
+        _log.info("[L1] 数据加载完成 — %.1fs (%d 指数)", _t_load, len(self.analyzers))
+
+        _t1 = _time.monotonic()
         ctx = self.analyze()
+        _t_anal = _time.monotonic() - _t1
+        _log.info("[L1] 信号分析完成 — %.1fs", _t_anal)
+
         if dash:
             dash.pause()
         ctx.print_report()
         if dash:
             dash.resume()
+
+        _log.info("[L1] 总计 — %.1fs (加载%.1fs + 分析%.1fs)",
+                  _t_load + _t_anal, _t_load, _t_anal)
         return ctx
 
 

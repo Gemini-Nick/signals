@@ -168,6 +168,28 @@ class IndexAnalyzer:
         f15_last_dt    = (self._f15.bars_raw[-1].dt
                           if self._f15 and self._f15.bars_raw else None)
 
+        # 快照：优先小级别（15M > 30M > 日线）
+        snapshot_price = latest_price
+        snapshot_dt = daily_last_dt
+        snapshot_freq = "日线"
+
+        if self._f15 and self._f15.bars_raw:
+            snapshot_price = self._f15.bars_raw[-1].close
+            snapshot_dt = self._f15.bars_raw[-1].dt
+            snapshot_freq = "15M"
+        elif self._f30 and self._f30.bars_raw:
+            snapshot_price = self._f30.bars_raw[-1].close
+            snapshot_dt = self._f30.bars_raw[-1].dt
+            snapshot_freq = "30M"
+
+        # 盘中涨跌幅：snapshot vs 前一交易日收盘
+        intraday_change = None
+        if snapshot_freq != "日线" and self._daily.bars_raw:
+            prev_close = self._daily.bars_raw[-1].close
+            if prev_close > 0:
+                intraday_change = round(
+                    (snapshot_price / prev_close - 1) * 100, 2)
+
         # 均线关键位（日线以上，不做分钟线 MA）
         ma_ctx = None
         try:
@@ -219,6 +241,11 @@ class IndexAnalyzer:
             daily_last_dt=daily_last_dt,
             f15_last_dt=f15_last_dt,
             data_available=True,
+            # 快照
+            snapshot_price=snapshot_price,
+            snapshot_dt=snapshot_dt,
+            snapshot_freq=snapshot_freq,
+            intraday_change=intraday_change,
             # 均线关键位
             ma_context=ma_ctx,
             # P3-2: 情景分叉

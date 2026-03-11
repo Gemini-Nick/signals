@@ -219,9 +219,45 @@ function drawZhongshu(zhongshuList) {
   });
 }
 
+// ── MA 图例 overlay ─────────────────────────────────
+let maLegendData = []; // [{label, color, series}]
+
+function createMALegend() {
+  const container = document.getElementById('chart-container');
+  let legend = document.getElementById('ma-legend');
+  if (!legend) {
+    legend = document.createElement('div');
+    legend.id = 'ma-legend';
+    legend.className = 'ma-legend';
+    container.appendChild(legend);
+  }
+  legend.innerHTML = '';
+  return legend;
+}
+
+function updateMALegend(param) {
+  const legend = document.getElementById('ma-legend');
+  if (!legend || maLegendData.length === 0) return;
+
+  const parts = maLegendData.map(item => {
+    let val = '—';
+    if (param && param.seriesData) {
+      const d = param.seriesData.get(item.series);
+      if (d && d.value !== undefined) val = d.value.toFixed(0);
+    } else {
+      // 无 crosshair 时显示最新值
+      const lastData = item.lastValue;
+      if (lastData != null) val = lastData.toFixed(0);
+    }
+    return `<span class="ma-legend-item" style="color:${item.color}">${item.label}: ${val}</span>`;
+  });
+  legend.innerHTML = parts.join(' <span class="ma-legend-sep">|</span> ');
+}
+
 // ── 绘制MA均线 ──────────────────────────────────────
 function drawMALines(maLines) {
   if (!maLines || maLines.length === 0) return;
+  maLegendData = [];
 
   maLines.forEach(ma => {
     if (!ma.data || ma.data.length < 2) return;
@@ -231,12 +267,26 @@ function drawMALines(maLines) {
       lineStyle: 0,
       crosshairMarkerVisible: false,
       priceLineVisible: false,
-      lastValueVisible: true,
-      title: ma.label,
+      lastValueVisible: false,
+      title: '',
+      priceScaleId: '',
     });
     series.setData(ma.data);
     maSeries.push(series);
+    maLegendData.push({
+      label: ma.label,
+      color: ma.color,
+      series: series,
+      lastValue: ma.data[ma.data.length - 1].value,
+    });
   });
+
+  // 创建图例并显示最新值
+  createMALegend();
+  updateMALegend(null);
+
+  // crosshair 联动
+  chart.subscribeCrosshairMove(updateMALegend);
 }
 
 // ── 绘制 MACD 子图 ──────────────────────────────────
@@ -312,7 +362,7 @@ function drawSignalMarkers(signals) {
 // ── 信号详情面板 (增强版) ────────────────────────────
 function renderSignalDetails(data) {
   const body = document.getElementById('signal-details-body');
-  const { signals, report, meta, zhongshu } = data;
+  const { signals, report, meta, zhongshu, report_signals } = data;
 
   let html = '';
 
@@ -346,7 +396,9 @@ function renderSignalDetails(data) {
       report.key_levels.forEach(lv => {
         const arrow = lv.position === '上方' ? '\u25B2' : lv.position === '下方' ? '\u25BC' : '\u25C6';
         const cls = lv.position === '上方' ? 'resistance' : 'support';
-        html += `<span class="key-level ${cls}">${arrow}${lv.name} ${lv.value.toFixed(0)} (${lv.distance_pct > 0 ? '+' : ''}${lv.distance_pct.toFixed(1)}%)</span>`;
+        const lvVal = lv.value != null ? lv.value.toFixed(0) : '—';
+        const distPct = lv.distance_pct != null ? `${lv.distance_pct > 0 ? '+' : ''}${lv.distance_pct.toFixed(1)}%` : '';
+        html += `<span class="key-level ${cls}">${arrow}${lv.name} ${lvVal} (${distPct})</span>`;
       });
       html += '</div>';
     }
@@ -363,17 +415,29 @@ function renderSignalDetails(data) {
     html += '</div>';
   }
 
-  // 信号列表
+  // 跨级别信号摘要
+  if (report_signals && report_signals.length > 0) {
+    html += `<div class="detail-section">
+      <div class="detail-section-title">全级别信号快照</div>
+      <div class="detail-tf-signals">`;
+    report_signals.forEach(rs => {
+      const isBuy = rs.type.includes('买');
+      html += `<span class="tf-signal-chip ${isBuy ? 'buy' : 'sell'}">${rs.freq}: ${rs.type}</span>`;
+    });
+    html += '</div></div>';
+  }
+
+  // 当前周期信号列表
   if (signals && signals.length > 0) {
     html += `<div class="detail-section">
-      <div class="detail-section-title">买卖点信号 (${signals.length})</div>`;
+      <div class="detail-section-title">当前周期信号 (${signals.length})</div>`;
     signals.forEach(s => {
       const isBuy = s.type.includes('买');
       html += `<div class="detail-item">
         <span class="detail-freq">[${s.freq}]</span>
         <span class="detail-type ${isBuy ? 'buy' : 'sell'}">${s.type}</span>
-        <span class="detail-conf">conf ${(s.confidence * 100).toFixed(0)}%</span>
-        <span class="detail-price">@ ${s.price.toFixed(2)}</span>
+        <span class="detail-conf">conf ${s.confidence != null ? (s.confidence * 100).toFixed(0) : '—'}%</span>
+        <span class="detail-price">@ ${s.price != null ? s.price.toFixed(2) : '—'}</span>
         ${s.details ? `<div class="detail-desc">${s.details}</div>` : ''}
       </div>`;
     });
@@ -427,6 +491,15 @@ function renderChartSummary(data) {
   }
   if (report && report.ma_trend) {
     items += `<span class="summary-item">MA: <span class="summary-value">${report.ma_trend}</span></span>`;
+  }
+
+  // 跨级别信号
+  if (data.report_signals && data.report_signals.length > 0) {
+    const sigStr = data.report_signals.map(rs => {
+      const cls = rs.type.includes('买') ? 'up' : 'down';
+      return `<span class="${cls}">${rs.freq}:${rs.type}</span>`;
+    }).join(' ');
+    items += `<span class="summary-item">${sigStr}</span>`;
   }
 
   summary.innerHTML = items;
@@ -505,3 +578,150 @@ document.querySelectorAll('.freq-btn').forEach(btn => {
 });
 
 window.loadChart = loadChart;
+
+// ── 行业图表模式 ──────────────────────────────────────
+let isIndustryMode = false;
+
+function renderIndustryInfo(data) {
+  const panel = document.getElementById('industry-info-panel');
+  const related = document.getElementById('industry-related');
+  const detail = document.getElementById('industry-detail');
+  if (!panel || !detail) return;
+
+  detail.style.display = 'block';
+
+  const info = data.industry_info || {};
+  const report = data.report || {};
+
+  let html = '';
+
+  // 行业属性
+  const rotLine = info.rotation_line || '—';
+  const sectorType = info.sector_type || '中性';
+  const phase = info.phase || '—';
+  const phaseHint = info.phase_hint || '';
+
+  html += `<div class="ind-info-row">
+    <span class="ind-tag rotation">${rotLine}</span>
+    <span class="ind-tag sector">${sectorType}</span>
+    ${phase !== '—' ? `<span class="ind-tag phase">${phase}</span>` : ''}
+  </div>`;
+
+  // CZSC 报告
+  const trend = report.daily_trend || '未知';
+  const trendCls = trend === '上涨趋势' ? 'up' : trend === '下跌趋势' ? 'down' : 'flat';
+  const signal = report.daily_latest_signal || '无';
+  const biCount = report.daily_bi_count || 0;
+
+  html += `<div class="ind-info-row">
+    <span class="trend-chip ${trendCls}">趋势: ${trend}</span>
+    <span class="ind-stat">笔数: ${biCount}</span>
+    ${signal !== '无' ? `<span class="ind-stat signal">信号: ${signal}</span>` : ''}
+  </div>`;
+
+  // 涨跌幅 + 综合分
+  if (info.gain_pct !== undefined) {
+    const gainCls = info.gain_pct >= 0 ? 'up' : 'down';
+    html += `<div class="ind-info-row">
+      <span class="ind-stat">今日: <span class="${gainCls}">${info.gain_pct >= 0 ? '+' : ''}${info.gain_pct}%</span></span>
+      ${info.composite_score ? `<span class="ind-stat">综合分: ${info.composite_score}</span>` : ''}
+      ${info.zt_count ? `<span class="ind-stat">涨停: ${info.zt_count}只</span>` : ''}
+    </div>`;
+  }
+
+  if (phaseHint) {
+    html += `<div class="ind-phase-hint">${phaseHint}</div>`;
+  }
+
+  panel.innerHTML = html;
+
+  // 关联行业
+  if (data.related_industries && data.related_industries.length > 0) {
+    related.innerHTML = '<span class="ind-related-label">同线行业: </span>' +
+      data.related_industries.map(name =>
+        `<span class="ind-related-chip" onclick="navigateToIndustryChart('${name}')">${name}</span>`
+      ).join('');
+  } else {
+    related.innerHTML = '';
+  }
+}
+
+async function loadIndustryChart(industryName) {
+  isIndustryMode = true;
+  currentSymbol = industryName;
+  currentFreq = 'daily';
+
+  // 设置行业模式 UI
+  document.getElementById('chart-title').textContent = industryName + ' (行业)';
+
+  // 隐藏周期切换（行业只有日线）
+  const freqGroup = document.querySelector('.freq-group');
+  if (freqGroup) freqGroup.style.display = 'none';
+
+  // 设置频率按钮状态
+  document.querySelectorAll('.freq-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.freq === 'daily');
+  });
+
+  try {
+    const data = await apiFetch(`/api/industry/detail/${encodeURIComponent(industryName)}`);
+
+    createChart();
+
+    // K线数据
+    if (data.ohlcv && data.ohlcv.length > 0) {
+      candleSeries.setData(data.ohlcv);
+
+      const c = chartColors();
+      const volData = data.ohlcv.map(bar => ({
+        time: bar.time,
+        value: bar.volume,
+        color: bar.close >= bar.open ? c.volUp : c.volDown,
+      }));
+      volumeSeries.setData(volData);
+    }
+
+    // CZSC 叠加
+    drawBiLines(data.bi_list);
+    drawZhongshu(data.zhongshu);
+    drawSignalMarkers(data.signals);
+
+    // MA 均线叠加
+    drawMALines(data.ma_lines);
+
+    // MACD 子图
+    drawMACD(data.macd);
+
+    // 行业信息面板
+    renderIndustryInfo(data);
+
+    // 信号详情
+    renderSignalDetails(data);
+
+    // 摘要栏（复用指数摘要逻辑）
+    renderChartSummary(data);
+
+    chart.timeScale().fitContent();
+
+  } catch (err) {
+    console.error('Industry chart load failed:', err);
+    document.getElementById('chart-title').textContent =
+      industryName + ' - 加载失败: ' + err.message;
+  }
+}
+
+// 返回 dashboard 时重置行业模式
+const origChartBack = document.getElementById('chart-back');
+if (origChartBack) {
+  origChartBack.addEventListener('click', () => {
+    if (isIndustryMode) {
+      isIndustryMode = false;
+      const freqGroup = document.querySelector('.freq-group');
+      if (freqGroup) freqGroup.style.display = '';
+      const detail = document.getElementById('industry-detail');
+      if (detail) detail.style.display = 'none';
+    }
+  });
+}
+
+window.loadIndustryChart = loadIndustryChart;

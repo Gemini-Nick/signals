@@ -22,6 +22,9 @@ from signals.dashboard import get_dashboard as _get_dashboard
 # Dashboard 辅助（detail = 细节，log = 重要状态变更）
 # ─────────────────────────────────────────────────────────
 
+import logging as _logging
+_file_log = _logging.getLogger("signals.industry")
+
 def _detail(msg: str):
     """任务级详情输出（per-task status, 线程池回调等）"""
     dash = _get_dashboard()
@@ -29,6 +32,7 @@ def _detail(msg: str):
         dash.detail(msg)
     else:
         print(msg, flush=True)
+    _file_log.info(msg)
 
 def _log(msg: str):
     """重要状态变更输出（熔断、模式切换等）"""
@@ -37,6 +41,7 @@ def _log(msg: str):
         dash.log(msg)
     else:
         print(msg, flush=True)
+    _file_log.info(msg)
 
 
 # ─────────────────────────────────────────────────────────
@@ -201,13 +206,51 @@ _INDUSTRY_LEADERS: dict = {
 # ─────────────────────────────────────────────────────────
 _EM_CIRCUIT_OPEN = False          # True = 东财不可用，跳过网络调用
 _EM_NAME_DF_CACHE: Optional[pd.DataFrame] = None   # 首次成功结果缓存
+_EM_HEALTH_CHECKED = False        # 启动时已做过健康预检
 
 
-def _fetch_board_industry_name_em(timeout: float = 10.0) -> Optional[pd.DataFrame]:
+def _em_health_probe(timeout: float = 3.0) -> bool:
+    """
+    东财 API 快速健康探测（3s）。
+    启动时调用一次，不可用则全局熔断，避免后续每个接口都等 10-25s 超时。
+    """
+    global _EM_CIRCUIT_OPEN, _EM_HEALTH_CHECKED
+    if _EM_HEALTH_CHECKED:
+        return not _EM_CIRCUIT_OPEN
+    _EM_HEALTH_CHECKED = True
+
+    import akshare as ak
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+    def _ping():
+        # 用最轻量的东财接口探测连通性
+        with _no_proxy():
+            df = ak.stock_board_industry_name_em()
+            return df
+
+    _probe_pool = ThreadPoolExecutor(max_workers=1)
+    _probe_future = _probe_pool.submit(_ping)
+    try:
+        df = _probe_future.result(timeout=timeout)
+        if df is not None and not df.empty:
+            global _EM_NAME_DF_CACHE
+            _EM_NAME_DF_CACHE = df  # 顺便缓存结果
+            _log("  [✓] 东财 API 健康探测通过（复用数据）")
+            return True
+    except (FutureTimeout, Exception) as e:
+        _EM_CIRCUIT_OPEN = True
+        _log(f"  [⚡] 东财 API 3s 健康探测失败（{e.__class__.__name__}），全局熔断跳过")
+        return False
+    finally:
+        _probe_pool.shutdown(wait=False, cancel_futures=True)
+    return False
+
+
+def _fetch_board_industry_name_em(timeout: float = 5.0) -> Optional[pd.DataFrame]:
     """
     带熔断+重试的 stock_board_industry_name_em 调用：
-    - 整体超时 10s（用 ThreadPoolExecutor 强制截断）
-    - 失败自动重试 1 次
+    - 整体超时 5s（从10s缩减）
+    - 健康预检失败则直接跳过
     - 首次成功后缓存结果，后续直接返回
     - 两次失败后标记熔断，本次运行内不再尝试
     """
@@ -227,29 +270,96 @@ def _fetch_board_industry_name_em(timeout: float = 10.0) -> Optional[pd.DataFram
     def _call():
         return ak.stock_board_industry_name_em()
 
-    for attempt in range(2):
-        try:
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(_call)
-                df = future.result(timeout=timeout)
-                if df is not None and not df.empty:
-                    _EM_NAME_DF_CACHE = df
-                    return df
-                return None
-        except FutureTimeout:
-            if attempt == 0:
-                _log(f"  [⚡] 东财行业接口超时（>{timeout}s），重试中...")
-                continue
-            _EM_CIRCUIT_OPEN = True
-            _log(f"  [⚡] 东财行业接口超时（重试仍失败），熔断")
-            return None
-        except Exception as e:
-            if attempt == 0:
-                _log(f"  [⚡] 东财行业接口异常（{e.__class__.__name__}），重试中...")
-                continue
-            _EM_CIRCUIT_OPEN = True
-            _log(f"  [⚡] 东财行业接口熔断（{e.__class__.__name__}），本次运行跳过后续调用")
-            return None
+    # 健康预检通过后才尝试（预检已缓存结果，直接返回）
+    _em_pool = ThreadPoolExecutor(max_workers=1)
+    _em_future = _em_pool.submit(_call)
+    try:
+        df = _em_future.result(timeout=timeout)
+        if df is not None and not df.empty:
+            _EM_NAME_DF_CACHE = df
+            return df
+        return None
+    except FutureTimeout:
+        _EM_CIRCUIT_OPEN = True
+        _log(f"  [⚡] 东财行业接口超时（>{timeout}s），熔断")
+        return None
+    except Exception as e:
+        _EM_CIRCUIT_OPEN = True
+        _log(f"  [⚡] 东财行业接口熔断（{e.__class__.__name__}）")
+        return None
+    finally:
+        _em_pool.shutdown(wait=False, cancel_futures=True)
+    return None
+
+
+# ─────────────────────────────────────────────────────────
+# 同花顺 THS 行业排行（降级源 #1）
+# ─────────────────────────────────────────────────────────
+_THS_CIRCUIT_OPEN = False          # True = 同花顺不可用
+_THS_RANKING_CACHE: Optional[pd.DataFrame] = None
+
+
+def _fetch_industry_ranking_ths(timeout: float = 10.0) -> Optional[pd.DataFrame]:
+    """
+    同花顺行业排行 → 统一列名 DataFrame。
+    stock_board_industry_summary_ths() 返回 90 行业，分类与东财一致。
+    列映射：板块 → 板块名称，领涨股 → 领涨股票，领涨股-涨跌幅 → 领涨股票-涨跌幅
+    """
+    global _THS_CIRCUIT_OPEN, _THS_RANKING_CACHE
+
+    if _THS_RANKING_CACHE is not None:
+        return _THS_RANKING_CACHE
+    if _THS_CIRCUIT_OPEN:
+        return None
+
+    import akshare as ak
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+    def _call():
+        with _no_proxy():
+            return ak.stock_board_industry_summary_ths()
+
+    _pool = ThreadPoolExecutor(max_workers=1)
+    _future = _pool.submit(_call)
+    try:
+        df = _future.result(timeout=timeout)
+        if df is not None and not df.empty:
+            # 统一列名，使下游代码无需感知数据来源
+            rename_map = {
+                "板块": "板块名称",
+                "领涨股": "领涨股票",
+                "领涨股-涨跌幅": "领涨股票-涨跌幅",
+            }
+            df = df.rename(columns=rename_map)
+            _THS_RANKING_CACHE = df
+            _detail(f"  [✓] 同花顺行业排行 {len(df)} 条")
+            return df
+        return None
+    except FutureTimeout:
+        _THS_CIRCUIT_OPEN = True
+        _log(f"  [⚡] 同花顺行业排行超时（>{timeout}s），熔断")
+        return None
+    except Exception as e:
+        _THS_CIRCUIT_OPEN = True
+        _log(f"  [⚡] 同花顺行业排行失败（{e.__class__.__name__}），熔断")
+        return None
+    finally:
+        _pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _fetch_industry_ranking_with_fallback() -> Optional[pd.DataFrame]:
+    """
+    行业排行降级链：同花顺(4.5s) → 东财(5s) → None
+    返回统一列名的 DataFrame（板块名称, 涨跌幅, 领涨股票, 领涨股票-涨跌幅）。
+    """
+    # 优先同花顺（更稳定）
+    df = _fetch_industry_ranking_ths()
+    if df is not None and not df.empty:
+        return df
+    # 降级到东财
+    df = _fetch_board_industry_name_em()
+    if df is not None and not df.empty:
+        return df
     return None
 
 
@@ -258,11 +368,10 @@ def _fetch_board_industry_name_em(timeout: float = 10.0) -> Optional[pd.DataFram
 # ─────────────────────────────────────────────────────────
 
 def get_industry_list() -> pd.DataFrame:
-    """返回 A 股所有行业名称列表。"""
-    df = _fetch_board_industry_name_em()
+    """返回 A 股所有行业名称列表（同花顺 → 东财降级）。"""
+    df = _fetch_industry_ranking_with_fallback()
     if df is not None:
         return df
-    # 熔断时返回空 DataFrame
     return pd.DataFrame()
 
 
@@ -403,34 +512,89 @@ class IndustryRanking:
 
 
 # ─────────────────────────────────────────────────────────
-# 方法 A：行业板块 CZSC（东财接口）
+# 行业 K 线磁盘缓存（RawBar 不可 pickle，用 JSON）
 # ─────────────────────────────────────────────────────────
 
-def get_industry_bars(industry: str,
-                      lookback_days: int = 180,
-                      start_date: str = None):
-    """
-    通过 stock_board_industry_hist_em 获取行业板块日线 K 线。
-    东财接口间歇性超时，调用方需 try/except 降级。
+def _bars_cache_path(industry: str) -> Path:
+    cache_dir = Path(__file__).resolve().parent.parent.parent / ".data" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = industry.replace("/", "_").replace("\\", "_")
+    return cache_dir / f"bars_{safe_name}.json"
 
-    :param industry:     行业名称（东财格式），如 "有色金属"
-    :param lookback_days: 盘中模式：近 N 自然日（默认180）
-    :param start_date:   盘后模式：固定起点，如 '2024-09-24'
-    :return: List[RawBar]，失败返回空列表
-    """
-    import akshare as ak
-    from datetime import datetime, timedelta
+
+def _save_bars_cache(industry: str, bars, source: str = "em"):
+    """保存行业 K 线到 JSON 磁盘缓存"""
+    import json, time
+    data = {
+        "ts": time.time(),
+        "source": source,
+        "industry": industry,
+        "bars": [
+            {
+                "dt": bar.dt.isoformat() if hasattr(bar.dt, 'isoformat') else str(bar.dt),
+                "open": float(bar.open),
+                "high": float(bar.high),
+                "low": float(bar.low),
+                "close": float(bar.close),
+                "vol": int(bar.vol),
+                "amount": int(bar.amount) if hasattr(bar, 'amount') else 0,
+            }
+            for bar in bars
+        ],
+    }
+    try:
+        _bars_cache_path(industry).write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_bars_cache(industry: str, max_age: float = 86400):
+    """从磁盘缓存加载行业 K 线（默认24h过期）。"""
+    import json, time
     from czsc import RawBar, Freq
-    import pandas as pd
-    from signals.data.fetcher import _to_raw_bars
 
-    today = datetime.now()
-    if start_date:
-        s_date = start_date.replace("-", "")
-    else:
-        s_date = (today - timedelta(days=lookback_days)).strftime("%Y%m%d")
-    e_date = today.strftime("%Y%m%d")
+    path = _bars_cache_path(industry)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if time.time() - data.get("ts", 0) > max_age:
+            return []
+        items = data.get("bars", [])
+        if not items:
+            return []
+        bars = []
+        for i, item in enumerate(items):
+            bars.append(RawBar(
+                symbol=industry,
+                dt=pd.Timestamp(item["dt"]),
+                id=i,
+                freq=Freq.D,
+                open=float(item["open"]),
+                high=float(item["high"]),
+                low=float(item["low"]),
+                close=float(item["close"]),
+                vol=int(item.get("vol", 0)),
+                amount=int(item.get("amount", 0)),
+            ))
+        source = data.get("source", "unknown")
+        _detail(f"  [缓存] {industry} K线 {len(bars)} 根（磁盘缓存, 来源:{source}）")
+        return bars
+    except Exception:
+        return []
 
+
+# ─────────────────────────────────────────────────────────
+# 方法 A：行业板块 CZSC（多源降级 K 线）
+# ─────────────────────────────────────────────────────────
+
+def _get_industry_bars_em(industry: str, s_date: str, e_date: str):
+    """东财行业 K 线（原始方法）"""
+    if _EM_CIRCUIT_OPEN:
+        return None
+
+    import akshare as ak
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
     def _call():
@@ -440,30 +604,122 @@ def get_industry_bars(industry: str,
             adjust="qfq"
         )
 
+    _pool = ThreadPoolExecutor(max_workers=1)
+    _future = _pool.submit(_call)
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_call)
-            df = future.result(timeout=15)
+        df = _future.result(timeout=6)
+        if df is not None and not df.empty:
+            # 东财列名映射
+            col_map = {}
+            for src, dst in [("日期", "dt"), ("开盘", "open"), ("最高", "high"),
+                             ("最低", "low"), ("收盘", "close"), ("成交量", "vol"),
+                             ("成交额", "amount"), ("date", "dt"), ("volume", "vol")]:
+                if src in df.columns:
+                    col_map[src] = dst
+            df = df.rename(columns=col_map)
+            if "amount" not in df.columns:
+                df["amount"] = 0
+            return df
+        return None
     except (FutureTimeout, Exception) as e:
-        _log(f"  [!] {industry} K线接口超时/失败（{e.__class__.__name__}）")
-        return []
+        _log(f"  [!] {industry} 东财K线超时/失败（{e.__class__.__name__}）")
+        return None
+    finally:
+        _pool.shutdown(wait=False, cancel_futures=True)
 
-    if df is None or df.empty:
-        return []
 
-    # 东财返回的列名可能是中文或英文，尝试两种
-    col_map = {}
-    for src, dst in [("日期", "dt"), ("开盘", "open"), ("最高", "high"),
-                     ("最低", "low"), ("收盘", "close"), ("成交量", "vol"),
-                     ("成交额", "amount"), ("date", "dt"), ("volume", "vol")]:
-        if src in df.columns:
-            col_map[src] = dst
-    df = df.rename(columns=col_map)
-    if "amount" not in df.columns:
-        df["amount"] = 0
+def _get_industry_bars_ths(industry: str, s_date: str, e_date: str):
+    """
+    同花顺行业 K 线降级源。
+    stock_board_industry_index_ths 列名: 日期, 开盘价, 最高价, 最低价, 收盘价, 成交量, 成交额
+    """
+    if _THS_CIRCUIT_OPEN:
+        return None
 
-    return _to_raw_bars(df, industry, Freq.D,
-                        "dt", "open", "high", "low", "close", "vol", "amount")
+    import akshare as ak
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+    # THS 接口用 YYYY-MM-DD 格式
+    s_fmt = f"{s_date[:4]}-{s_date[4:6]}-{s_date[6:]}"
+    e_fmt = f"{e_date[:4]}-{e_date[4:6]}-{e_date[6:]}"
+
+    def _call():
+        with _no_proxy():
+            return ak.stock_board_industry_index_ths(
+                symbol=industry, start_date=s_fmt, end_date=e_fmt)
+
+    _pool = ThreadPoolExecutor(max_workers=1)
+    _future = _pool.submit(_call)
+    try:
+        df = _future.result(timeout=12)
+        if df is not None and not df.empty:
+            # THS 列名映射（与东财不同）
+            col_map = {}
+            for src, dst in [("日期", "dt"), ("开盘价", "open"), ("最高价", "high"),
+                             ("最低价", "low"), ("收盘价", "close"), ("成交量", "vol"),
+                             ("成交额", "amount")]:
+                if src in df.columns:
+                    col_map[src] = dst
+            df = df.rename(columns=col_map)
+            if "amount" not in df.columns:
+                df["amount"] = 0
+            _detail(f"  [✓] {industry} THS K线 {len(df)} 根")
+            return df
+        return None
+    except (FutureTimeout, Exception) as e:
+        _detail(f"  [!] {industry} THS K线失败（{e.__class__.__name__}）")
+        return None
+    finally:
+        _pool.shutdown(wait=False, cancel_futures=True)
+
+
+def get_industry_bars(industry: str,
+                      lookback_days: int = 180,
+                      start_date: str = None):
+    """
+    获取行业板块日线 K 线。
+    降级链：东财(6s) → 同花顺(12s) → 磁盘缓存(24h) → 空
+
+    :param industry:     行业名称，如 "有色金属"
+    :param lookback_days: 盘中模式：近 N 自然日（默认180）
+    :param start_date:   盘后模式：固定起点，如 '2024-09-24'
+    :return: List[RawBar]，失败返回空列表
+    """
+    from datetime import datetime, timedelta
+    from czsc import Freq
+    from signals.data.fetcher import _to_raw_bars
+
+    today = datetime.now()
+    if start_date:
+        s_date = start_date.replace("-", "")
+    else:
+        s_date = (today - timedelta(days=lookback_days)).strftime("%Y%m%d")
+    e_date = today.strftime("%Y%m%d")
+
+    # 1. 东财
+    df = _get_industry_bars_em(industry, s_date, e_date)
+    if df is not None:
+        bars = _to_raw_bars(df, industry, Freq.D,
+                            "dt", "open", "high", "low", "close", "vol", "amount")
+        if bars:
+            _save_bars_cache(industry, bars, source="em")
+            return bars
+
+    # 2. 同花顺降级
+    df = _get_industry_bars_ths(industry, s_date, e_date)
+    if df is not None:
+        bars = _to_raw_bars(df, industry, Freq.D,
+                            "dt", "open", "high", "low", "close", "vol", "amount")
+        if bars:
+            _save_bars_cache(industry, bars, source="ths")
+            return bars
+
+    # 3. 磁盘缓存
+    cached = _load_bars_cache(industry)
+    if cached:
+        return cached
+
+    return []
 
 
 def score_industry_czsc(industry: str,
@@ -849,7 +1105,7 @@ def _get_concepts_ths(top_n: int = 10) -> List[ConceptRanking]:
         sampled = remaining[::step][:sample_size]
     else:
         sampled = []
-    concept_names = (hot_names + sampled)[:top_n * 3]  # 最多获取 3x 用于排序
+    concept_names = (hot_names + sampled)[:top_n * 2]  # 从3x降到2x，减少HTTP请求
 
     today = datetime.now()
     start_date = (today - timedelta(days=7)).strftime("%Y%m%d")
@@ -873,13 +1129,13 @@ def _get_concepts_ths(top_n: int = 10) -> List[ConceptRanking]:
         except Exception:
             return cname, 0.0
 
-    # 并行获取涨跌幅
+    # 并行获取涨跌幅（8 workers 加速，6s 超时）
     results_raw = []
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(_fetch_gain, n): n for n in concept_names}
         for fut in futures:
             try:
-                name, gain = fut.result(timeout=10)
+                name, gain = fut.result(timeout=6)  # 从10s降到6s
                 results_raw.append((name, gain))
             except Exception:
                 results_raw.append((futures[fut], 0.0))
@@ -901,10 +1157,59 @@ def _get_concepts_ths(top_n: int = 10) -> List[ConceptRanking]:
     return results
 
 
+def _get_concepts_sina(top_n: int = 10) -> List[ConceptRanking]:
+    """
+    新浪概念板块排行（2.4s, 175 概念）。
+    stock_sector_spot("概念") 列: label, 板块, 公司家数, 平均价格, 涨跌额,
+                                 涨跌幅, 总成交量, 总成交额, 领涨股票, 涨跌幅.1
+    """
+    import akshare as ak
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+    def _call():
+        with _no_proxy():
+            return ak.stock_sector_spot(indicator="概念")
+
+    _pool = ThreadPoolExecutor(max_workers=1)
+    _future = _pool.submit(_call)
+    try:
+        df = _future.result(timeout=8)
+    except (FutureTimeout, Exception) as e:
+        _detail(f"  [!] 新浪概念板块失败（{e.__class__.__name__}）")
+        return []
+    finally:
+        _pool.shutdown(wait=False, cancel_futures=True)
+
+    if df is None or df.empty or "涨跌幅" not in df.columns:
+        return []
+
+    df = df.sort_values("涨跌幅", ascending=False).head(top_n)
+    results = []
+    for _, row in df.iterrows():
+        name = str(row.get("板块", "")).strip()
+        if not name:
+            continue
+        leading = str(row.get("领涨股票", ""))
+        leading_gain = 0.0
+        try:
+            leading_gain = float(row.get("涨跌幅.1", 0) or 0)
+        except (ValueError, TypeError):
+            pass
+        results.append(ConceptRanking(
+            name=name,
+            gain_pct=float(row.get("涨跌幅", 0) or 0),
+            leading_stock=leading,
+            leading_gain=leading_gain,
+            sector_type=_classify_concept(name),
+        ))
+    _detail(f"  [✓] 新浪概念板块 top {len(results)} 条")
+    return results
+
+
 def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
     """
     获取概念板块涨幅 top N。
-    降级链: 东财 concept_name_em → 同花顺 THS → 磁盘缓存 → 硬编码兜底
+    降级链: 新浪(2.4s) → 东财(8s) → 同花顺 THS(25s) → 磁盘缓存 → 硬编码兜底
     """
     import akshare as ak
     import config as _cfg
@@ -913,25 +1218,28 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
     if top_n is None:
         top_n = getattr(_cfg, "CONCEPT_TOP_N", 10)
 
-    # ── 1. 东财 ──
+    # ── 0. 新浪（最快 ~2.4s）──
+    sina_results = _get_concepts_sina(top_n)
+    if sina_results:
+        _save_concept_cache(sina_results, source="sina")
+        return sina_results
+
+    # ── 1. 东财（熔断时直接跳过）──
     def _call():
         with _no_proxy():
             return ak.stock_board_concept_name_em()
 
     df = None
-    for attempt in range(2):
+    if not _EM_CIRCUIT_OPEN:
         try:
             with ThreadPoolExecutor(max_workers=1) as pool:
                 future = pool.submit(_call)
-                df = future.result(timeout=25)
-            break
+                df = future.result(timeout=8)
         except (FutureTimeout, Exception) as e:
-            if attempt == 0:
-                _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}），重试中...")
-                continue
-            _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}，重试仍失败）")
+            _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}）")
             df = None
-            break
+    else:
+        _detail("  [⚡] 东财已熔断，概念板块直接跳过")
 
     if df is not None and not df.empty and "涨跌幅" in df.columns:
         df = df.sort_values("涨跌幅", ascending=False).head(top_n)
@@ -957,12 +1265,19 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
         _save_concept_cache(results, source="em")
         return results
 
-    # ── 2. 同花顺降级 ──
+    # ── 2. 同花顺降级（全局超时 25s，防止 THS K线拉取太慢）──
     try:
-        ths_results = _get_concepts_ths(top_n)
+        _ths_pool = ThreadPoolExecutor(max_workers=1)
+        _ths_future = _ths_pool.submit(_get_concepts_ths, top_n)
+        try:
+            ths_results = _ths_future.result(timeout=25)
+        finally:
+            _ths_pool.shutdown(wait=False, cancel_futures=True)
         if ths_results:
             _save_concept_cache(ths_results, source="ths")
             return ths_results
+    except (FutureTimeout, TimeoutError):
+        _detail("  [!] THS 概念板块超时（>25s），跳过")
     except Exception as e:
         _detail(f"  [!] THS 概念板块也失败（{e.__class__.__name__}）")
 
@@ -1075,15 +1390,16 @@ def _load_strong_pool(date_str: str) -> dict:
 def _load_margin_map(date_str: str) -> dict:
     """
     加载融资融券数据（上交所），返回 {6位代码: 融资买入额}。
-    注意：融资数据通常为 T-1，自动尝试前一交易日。
+    并行尝试当日+前3天（覆盖周末），取最先成功的。
     """
     import akshare as ak
     from datetime import datetime, timedelta
-    result: dict = {}
-    # 尝试当日和前3天（覆盖周末）
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     base = datetime.strptime(date_str, "%Y%m%d")
-    for delta in range(0, 4):
-        d = (base - timedelta(days=delta)).strftime("%Y%m%d")
+    dates = [(base - timedelta(days=delta)).strftime("%Y%m%d") for delta in range(4)]
+
+    def _try_date(d):
         try:
             df = ak.stock_margin_detail_sse(date=d)
             if df is not None and not df.empty:
@@ -1098,6 +1414,7 @@ def _load_margin_map(date_str: str) -> dict:
                         buy_col = c
                         break
                 if code_col and buy_col:
+                    result = {}
                     for _, row in df.iterrows():
                         code = str(row[code_col]).strip().zfill(6)
                         try:
@@ -1106,12 +1423,21 @@ def _load_margin_map(date_str: str) -> dict:
                             amt = 0.0
                         if amt > 0:
                             result[code] = amt
+                    return d, result
+        except Exception:
+            pass
+        return d, None
+
+    # 并行尝试 4 个日期，取第一个成功的
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for f in as_completed([pool.submit(_try_date, d) for d in dates]):
+            d, result = f.result()
+            if result:
                 _detail(f"  [✓] 融资数据（{d}）{len(result)} 只")
                 return result
-        except Exception:
-            continue
+
     _detail("  [!] 融资数据加载失败（最近4天均无数据）")
-    return result
+    return {}
 
 
 def _load_dt_pool(date_str: str) -> dict:
@@ -1165,6 +1491,7 @@ def _load_zbgc_pool(date_str: str) -> dict:
 def _enrich_rhythm(rankings: List["IndustryRanking"]):
     """为 Top-N 行业补充节奏检测（跳过已有 rhythm 的）"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    # get_industry_bars 自带多源降级（东财→THS→pytdx→缓存），无需东财熔断守卫
     need_rhythm = [r for r in rankings if not r.rhythm_phase]
     if not need_rhythm:
         return
@@ -1287,6 +1614,11 @@ def get_oversold_industries(name_df=None, top_n: int = 5) -> List[IndustryRankin
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    # 东财+同花顺都熔断时跳过超跌检测（K线完全不可用）
+    if _EM_CIRCUIT_OPEN and _THS_CIRCUIT_OPEN:
+        _detail("  [⚡] 东财+同花顺均熔断，跳过超跌检测")
+        return []
+
     if name_df is None or name_df.empty or "涨跌幅" not in name_df.columns:
         return []
 
@@ -1358,7 +1690,11 @@ def compute_industry_composite_scores(
     weights: dict = None,
 ) -> List[dict]:
     """
-    计算所有行业的综合强度评分（7维度加权）。
+    计算所有行业的综合强度评分（9维度加权，含2个领先指标）。
+
+    维度说明:
+      滞后型: gain, inflow, zt_density, lianban, strong_density, continue, dt_penalty
+      领先型: inflow_momentum (资金先行度), startup_ratio (启动率)
 
     :param change_df:   stock_board_change_em() 结果
     :param zt_pool:     _load_zt_pool() 结果
@@ -1372,9 +1708,10 @@ def compute_industry_composite_scores(
 
     if weights is None:
         weights = getattr(_cfg, "RANK_COMPOSITE_WEIGHTS", {
-            "gain": 20, "inflow": 20, "zt_density": 20,
-            "lianban": 10, "strong_density": 15,
-            "continue": 10, "dt_penalty": 5,
+            "gain": 15, "inflow": 15, "zt_density": 15,
+            "lianban": 5, "strong_density": 10,
+            "continue": 5, "dt_penalty": 10,
+            "inflow_momentum": 15, "startup_ratio": 10,
         })
 
     if change_df is None or change_df.empty:
@@ -1390,17 +1727,26 @@ def compute_industry_composite_scores(
     for _, r in df.iterrows():
         name = str(r["板块名称"])
         gain = float(r.get("涨跌幅", 0) or 0)
-        inflow = float(r.get("主力净流入", 0) or 0)
+        inflow_raw = float(r.get("主力净流入", 0) or 0)
+        inflow = inflow_raw / 1e8  # 转为亿
         zt_list = zt_pool.get(name, [])
         zt_cnt = len(zt_list)
         max_lianban = max((x[2] for x in zt_list), default=0)
         strong_cnt = len(strong_pool.get(name, []))
         zbgc = zbgc_count.get(name, 0)
         dt = dt_count.get(name, 0)
+        # 领先指标 1: 资金动量 = 资金流入 / 涨幅绝对值
+        # 资金大量流入但涨幅小 → 资金先行，值越大越领先
+        inflow_momentum = inflow / max(abs(gain), 0.1)
+        # 领先指标 2: 启动率 = (涨停+强势) 占比的代理指标
+        # 涨停+强势数量多但涨幅低 → 个股开始启动但板块还没起来
+        startup_ratio = (zt_cnt + strong_cnt)
         rows.append({
             "name": name, "gain": gain, "inflow": inflow,
             "zt_count": zt_cnt, "max_lianban": max_lianban,
             "strong_count": strong_cnt, "zbgc": zbgc, "dt": dt,
+            "inflow_momentum": inflow_momentum,
+            "startup_ratio": startup_ratio,
         })
 
     if not rows:
@@ -1420,17 +1766,21 @@ def compute_industry_composite_scores(
     strongs    = _norm([r["strong_count"] for r in rows])
     continues  = _norm([r["zbgc"] for r in rows])
     dt_pens    = _norm([r["dt"] for r in rows])
+    inflow_moms = _norm([r["inflow_momentum"] for r in rows])
+    startup_rs  = _norm([r["startup_ratio"] for r in rows])
 
     results = []
     for i, r in enumerate(rows):
         score = (
-            gains[i]     * weights.get("gain", 20)
-            + inflows[i] * weights.get("inflow", 20)
-            + zt_dens[i] * weights.get("zt_density", 20)
-            + lianbans[i] * weights.get("lianban", 10)
-            + strongs[i] * weights.get("strong_density", 15)
-            + continues[i] * weights.get("continue", 10)
-            - dt_pens[i] * weights.get("dt_penalty", 5)
+            gains[i]       * weights.get("gain", 15)
+            + inflows[i]   * weights.get("inflow", 15)
+            + zt_dens[i]   * weights.get("zt_density", 15)
+            + lianbans[i]  * weights.get("lianban", 5)
+            + strongs[i]   * weights.get("strong_density", 10)
+            + continues[i] * weights.get("continue", 5)
+            - dt_pens[i]   * weights.get("dt_penalty", 10)
+            + inflow_moms[i] * weights.get("inflow_momentum", 15)
+            + startup_rs[i]  * weights.get("startup_ratio", 10)
         )
         results.append({**r, "composite_score": round(score, 1)})
 
@@ -1554,7 +1904,16 @@ def get_industry_representatives(top_n: int = None,
     target_date = date_str or datetime.now().strftime("%Y%m%d")
     is_historical = date_str is not None  # 盘后模式标志
 
+    # ── 0. 东财健康预检（3s 快速探测，失败则全局熔断跳过所有东财调用）──
+    import time as _time
+    _l2_start = _time.monotonic()
+
+    _t0 = _time.monotonic()
+    _em_health_probe(timeout=3.0)
+    _detail(f"  [⏱] 东财健康预检 — {_time.monotonic() - _t0:.1f}s (熔断={_EM_CIRCUIT_OPEN})")
+
     # ── 1. 加载所有数据源 ────────────────────────────────
+    _t0 = _time.monotonic()
     mode_label = f"历史（{target_date}）" if is_historical else "实时"
     _log(f"  加载多维数据源（{mode_label}）...")
 
@@ -1586,7 +1945,7 @@ def get_industry_representatives(top_n: int = None,
                 _detail(f"  [!] 全板块异动接口失败（{e.__class__.__name__}）")
             return None
         _pool_tasks["change_df"] = _load_change_em
-        _pool_tasks["name_df"] = lambda: _fetch_board_industry_name_em()
+        _pool_tasks["name_df"] = lambda: _fetch_industry_ranking_with_fallback()
         _pool_tasks["concepts"] = lambda: get_concept_rankings()
     else:
         _detail("  [i] 盘后模式：跳过 change_em / name_em（仅实时接口）")
@@ -1614,8 +1973,10 @@ def get_industry_representatives(top_n: int = None,
     if name_df is not None and not name_df.empty:
         _detail(f"  [✓] 行业板块行情 {len(name_df)} 条")
     concepts: List[ConceptRanking] = _pool_results.get("concepts") or []
+    _detail(f"  [⏱] 数据源并行加载 — {_time.monotonic() - _t0:.1f}s")
 
     # ── 2. 榜单 A：涨幅排行（盘中）/ 涨停密度排行（盘后）──
+    _t0 = _time.monotonic()
     gain_industries: list = []   # [(行业名, {gain_pct, net_inflow, leading_name, leading_gain})]
 
     if is_historical:
@@ -1658,7 +2019,10 @@ def get_industry_representatives(top_n: int = None,
                 "leading_gain": 0.0,
             }))
 
+    _detail(f"  [⏱] 涨幅/涨停榜 — {_time.monotonic() - _t0:.1f}s ({len(gain_industries)} 行业)")
+
     # ── 3. 榜单 B：综合强度排行 ──────────────────────────
+    _t0 = _time.monotonic()
     if is_historical:
         all_scores = compute_historical_composite_scores(
             zt_pool, strong_pool, dt_count, zbgc_count
@@ -1669,7 +2033,10 @@ def get_industry_representatives(top_n: int = None,
         )
     composite_industries = all_scores[:top_n]  # list of dict
 
+    _detail(f"  [⏱] 综合评分 — {_time.monotonic() - _t0:.1f}s ({len(composite_industries)} 行业)")
+
     # ── 4. 合并双榜 → 为每行业选代表股 ──────────────────
+    _t0 = _time.monotonic()
     gain_names = {x[0] for x in gain_industries}
     comp_names = {x["name"] for x in composite_industries}
     all_ind_names = list(dict.fromkeys(
@@ -1836,6 +2203,8 @@ def get_industry_representatives(top_n: int = None,
             seen_names.add(r.name)
             merged_list.append(r)
 
+    _detail(f"  [⏱] 选股+构建列表 — {_time.monotonic() - _t0:.1f}s ({len(merged_list)} 合并)")
+
     # ── 5. 设置 sector_type 和 concept_tags ──
     concept_map = _match_concepts_to_industries(
         concepts, [r.name for r in merged_list], name_df)
@@ -1844,8 +2213,12 @@ def get_industry_representatives(top_n: int = None,
         if r.name in concept_map:
             r.concept_tags = concept_map[r.name]
 
-    # ── 5.5 P3-3: 板块节奏检测（Top-N 行业）──
-    _enrich_rhythm(merged_list[:10])
+    # ── 5.5 P3-3: 板块节奏检测（所有上榜行业）──
+    # gain_list 和 composite_list 是独立对象，需分别 enrich
+    _t0 = _time.monotonic()
+    _enrich_rhythm(gain_list)
+    _enrich_rhythm(composite_list)
+    _detail(f"  [⏱] 节奏检测 — {_time.monotonic() - _t0:.1f}s")
 
     # ── 6. 超跌检测（盘中模式有 name_df 时）──
     oversold_list: List[IndustryRanking] = []
@@ -1868,6 +2241,9 @@ def get_industry_representatives(top_n: int = None,
         "lianban_max": _lianban_max,
         "name_df": name_df,
     }
+
+    _l2_elapsed = _time.monotonic() - _l2_start
+    _log(f"  [⏱] L2 行业分析完成，耗时 {_l2_elapsed:.1f}s")
 
     return gain_list, composite_list, merged_list, concepts, oversold_list, sentiment_stats
 

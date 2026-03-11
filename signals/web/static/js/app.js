@@ -37,12 +37,27 @@ function switchPage(pageName) {
   if (pageName === 'analog' && window.loadAnalogPage) {
     window.loadAnalogPage();
   }
+  // 盘后复盘页
+  if (pageName === 'review' && window.loadReviewPage) {
+    window.loadReviewPage();
+  }
+  // 回测页
+  if (pageName === 'backtest' && window.loadBacktestPage) {
+    window.loadBacktestPage();
+  }
 }
 
 function navigateToChart(indexName, freq) {
   switchPage('chart');
   if (window.loadChart) {
     window.loadChart(indexName, freq || 'daily');
+  }
+}
+
+function navigateToIndustryChart(industryName) {
+  switchPage('chart');
+  if (window.loadIndustryChart) {
+    window.loadIndustryChart(industryName);
   }
 }
 
@@ -73,9 +88,36 @@ document.addEventListener('DOMContentLoaded', () => {
     tab.addEventListener('click', () => switchPage(tab.dataset.page));
   });
 
-  // 刷新按钮
-  document.getElementById('refresh-btn').addEventListener('click', () => {
-    if (window.loadDashboard) window.loadDashboard();
+  // 刷新按钮 — 触发后端重新分析，然后轮询加载
+  document.getElementById('refresh-btn').addEventListener('click', async () => {
+    const btn = document.getElementById('refresh-btn');
+    btn.disabled = true;
+    btn.textContent = '刷新中...';
+    try {
+      await fetch(API_BASE + '/api/index/refresh', { method: 'POST' });
+      // 等待引擎就绪后重新加载
+      const poll = setInterval(async () => {
+        try {
+          const res = await fetch(API_BASE + '/api/index/status');
+          const st = await res.json();
+          if (st.ready && !st.running) {
+            clearInterval(poll);
+            btn.disabled = false;
+            btn.textContent = '刷新';
+            if (window.loadDashboard) window.loadDashboard();
+          }
+        } catch (_) {}
+      }, 2000);
+      // 安全超时 3 分钟
+      setTimeout(() => {
+        clearInterval(poll);
+        btn.disabled = false;
+        btn.textContent = '刷新';
+      }, 180000);
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = '刷新';
+    }
   });
 
   // 图表返回按钮

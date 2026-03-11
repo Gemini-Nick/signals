@@ -201,7 +201,10 @@ class StockDeepDive:
         return []
 
     def _fetch_minute(self, freq: Freq):
-        """分钟线: A股 Sina→东财降级，港美股暂不支持。"""
+        """分钟线: A股 Sina→东财降级，港美股暂不支持。
+        只有当所有数据源都失败时才报错给用户，中间降级不展示。"""
+        import logging
+        _log = logging.getLogger(__name__)
         label = freq.value
         if self.market != "A":
             self._errors.append("{}线暂不支持{}市场".format(label, self.market))
@@ -213,7 +216,7 @@ class StockDeepDive:
                 self._data_sources[label] = "Sina"
                 return bars
         except Exception as e:
-            self._errors.append("{}(Sina)失败: {}".format(label, e.__class__.__name__))
+            _log.debug("%s(Sina)失败: %s — %s", label, e.__class__.__name__, e)
 
         try:
             bars = self._ak.get_a_minute_em(self.symbol, freq, max_retries=2)
@@ -221,8 +224,10 @@ class StockDeepDive:
                 self._data_sources[label] = "东财(降级)"
                 return bars
         except Exception as e:
-            self._errors.append("{}(东财)也失败: {}".format(label, e.__class__.__name__))
+            _log.debug("%s(东财)也失败: %s — %s", label, e.__class__.__name__, e)
 
+        # 所有数据源都失败，才报错给用户
+        self._errors.append("{}数据暂不可用".format(label))
         return []
 
     # ─────────────────────────────────────────────────────
@@ -282,11 +287,32 @@ class StockDeepDive:
         # 均线
         self.ma_context = compute_ma_levels(self.daily_bars, self.symbol)
 
-        # 综合评分
+        # 量价分析（需要在评分之前，量比用于量价确认加减分）
+        self.volume = self._analyze_volume(
+            self.daily_bars, vol_scale=self._daily_vol_scale)
+        vol_ratio = self.volume.ratio if self.volume else 0.0
+
+        # 综合评分（含量价确认）
         self.scored = score_signals(
             self.symbol, self.all_signals,
             enable_decay=True, ma_context=self.ma_context,
+            volume_ratio=vol_ratio,
         )
+
+        # 异常检测 + 信号融合
+        self.anomaly = None
+        self.fused = None
+        try:
+            from signals.core.anomaly import compute_anomaly_profile
+            from signals.core.fusion import fuse_scores
+            self.anomaly = compute_anomaly_profile(self.symbol, self.daily_bars)
+            if self.scored and self.anomaly:
+                self.fused = fuse_scores(self.scored, self.anomaly)
+                self.scored.anomaly_profile = self.anomaly
+                self.scored.fused_score = self.fused
+                self.scored.fused_total = self.fused.fused_total
+        except Exception:
+            pass  # 异常检测失败不影响主流程
 
         # 风控
         buy_sigs = [s for s in self.all_signals if "买" in s.signal_type]
@@ -296,10 +322,6 @@ class StockDeepDive:
             self.layered_pos = compute_layered_position(
                 self.scored, self.ma_context,
             )
-
-        # 量价分析
-        self.volume = self._analyze_volume(
-            self.daily_bars, vol_scale=self._daily_vol_scale)
 
         # 关键高低点
         self.pivots = self._find_pivot_points(self.daily_bars)

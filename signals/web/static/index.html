@@ -24,15 +24,14 @@
     <div class="nav-tab" data-page="chart">图表</div>
     <div class="nav-tab" data-page="stock">个股分析</div>
     <div class="nav-tab" data-page="analog">历史对照</div>
+    <div class="nav-tab" data-page="review">盘后复盘</div>
+    <div class="nav-tab" data-page="backtest">回测</div>
   </nav>
 
   <!-- Pages -->
   <main>
     <!-- Page 1: Dashboard -->
     <div id="page-dashboard" class="page active">
-      <!-- P3-7: 决策简报 -->
-      <div id="decision-brief" class="decision-brief" style="display:none;"></div>
-
       <div id="banner" class="banner neutral">
         <div class="banner-direction" id="banner-direction">加载中...</div>
         <div class="banner-suggestion" id="banner-suggestion"></div>
@@ -55,6 +54,12 @@
       <!-- L2 行业分析 -->
       <div class="section-title">行业排行</div>
       <div id="industry-section">
+        <div class="empty-state">加载中...</div>
+      </div>
+
+      <!-- 今日舆情 -->
+      <div class="section-title">今日舆情</div>
+      <div id="social-section">
         <div class="empty-state">加载中...</div>
       </div>
 
@@ -99,6 +104,12 @@
         <div class="signal-details-body" id="signal-details-body"></div>
       </div>
 
+      <!-- Industry Detail Panel (行业图表模式) -->
+      <div id="industry-detail" class="industry-detail" style="display:none;">
+        <div class="industry-info-grid" id="industry-info-panel"></div>
+        <div class="industry-related" id="industry-related"></div>
+      </div>
+
       <!-- Summary Bar -->
       <div class="chart-summary" id="chart-summary"></div>
     </div>
@@ -106,7 +117,7 @@
     <!-- Page 3: Stock Analysis -->
     <div id="page-stock" class="page">
       <div class="stock-search-bar">
-        <input type="text" id="stock-input" class="stock-input" placeholder="输入股票代码 (如 600519 或 SZ.002759)" />
+        <input type="text" id="stock-input" class="stock-input" placeholder="股票代码 (600519) 或主题关键词 (昇腾, 算力)" />
         <button class="stock-search-btn" onclick="analyzeStock()">分析</button>
       </div>
       <div id="stock-result">
@@ -120,17 +131,128 @@
         <div class="analog-selector">
           <select id="analog-index-select" class="analog-select">
             <option value="沪深300">沪深300</option>
+            <option value="深证成指">深证成指</option>
             <option value="创业板指">创业板指</option>
             <option value="上证50">上证50</option>
+            <option value="科创50">科创50</option>
+            <option value="中证500">中证500</option>
+            <option value="中证1000">中证1000</option>
+            <option value="超大盘">超大盘</option>
           </select>
           <button class="stock-search-btn" id="analog-run-btn" onclick="runAnalogMatch()">运行匹配</button>
         </div>
-        <div class="analog-info">窗口30天 | Pearson相关系数 | Top3匹配</div>
+        <div class="analog-date-range">
+          <label>选区:</label>
+          <input type="date" id="analog-start-date" class="analog-date-input" />
+          <span>~</span>
+          <input type="date" id="analog-end-date" class="analog-date-input" />
+          <button class="analog-clear-btn" id="analog-clear-range" onclick="clearAnalogRange()" title="清除日期，使用最近30天">✕</button>
+        </div>
+        <div class="analog-info" id="analog-info">Pearson相关系数 | Top5匹配</div>
       </div>
+      <!-- K线选区图表 -->
+      <div id="analog-kline-container" class="chart-container" style="height:380px;"></div>
+      <!-- 匹配结果 -->
       <div id="analog-results" class="analog-results">
-        <div class="empty-state">选择指数后点击运行匹配</div>
+        <div class="empty-state">选择指数 → 图表上拖选区间 或 手动输入日期 → 运行匹配</div>
       </div>
-      <div id="analog-chart-container" class="chart-container" style="height:400px;display:none;"></div>
+      <!-- 叠加对比图 -->
+      <div id="analog-chart-container" class="chart-container" style="height:350px;display:none;"></div>
+    </div>
+    <!-- Page 5: Review (盘后复盘) -->
+    <div id="page-review" class="page">
+      <div class="review-header">
+        <div class="review-selector">
+          <select id="review-date-select" class="review-select">
+            <option value="">选择日期预设...</option>
+          </select>
+          <input type="text" id="review-date-custom" class="review-input" placeholder="自定义 YYYY-MM-DD" />
+          <button class="stock-search-btn" id="review-run-btn">运行复盘</button>
+        </div>
+        <div class="review-info" id="review-info"></div>
+      </div>
+      <div id="review-loading" class="review-loading" style="display:none;">
+        <div class="loading-spinner"></div>
+        <div class="loading-phase" id="review-loading-phase">准备中...</div>
+      </div>
+      <div id="review-results" style="display:none;">
+        <div id="review-timing"></div>
+        <div id="review-banner" class="banner neutral"></div>
+        <div class="section-title">A股</div>
+        <div class="cards-grid" id="review-cards-a"></div>
+        <div class="section-title">港股</div>
+        <div class="cards-grid" id="review-cards-hk"></div>
+        <div class="section-title">美股</div>
+        <div class="cards-grid" id="review-cards-us"></div>
+        <div class="section-title">行业排行</div>
+        <div id="review-industry"></div>
+        <div class="section-title">轮动 & 配置</div>
+        <div id="review-rotation"></div>
+        <div class="section-title">概念热度</div>
+        <div id="review-concepts"></div>
+        <div class="section-title">个股信号</div>
+        <div id="review-signals"></div>
+      </div>
+    </div>
+
+    <!-- Page 6: Backtest (回测) -->
+    <div id="page-backtest" class="page">
+      <div class="bt-header">
+        <div class="bt-filters">
+          <select id="bt-signal-type" class="bt-select">
+            <option value="">全部信号类型</option>
+            <option value="一买">一买</option>
+            <option value="二买">二买</option>
+            <option value="三买">三买</option>
+            <option value="背驰买">背驰买</option>
+            <option value="趋势买">趋势买</option>
+            <option value="一卖">一卖</option>
+            <option value="二卖">二卖</option>
+            <option value="三卖">三卖</option>
+            <option value="背驰卖">背驰卖</option>
+          </select>
+          <select id="bt-freq" class="bt-select">
+            <option value="">全部级别</option>
+            <option value="15分钟">15分钟</option>
+            <option value="30分钟">30分钟</option>
+            <option value="日线">日线</option>
+            <option value="周线">周线</option>
+          </select>
+          <button class="stock-search-btn" id="bt-refresh-btn">刷新</button>
+          <button class="stock-search-btn bt-eval-btn" id="bt-eval-btn">评估到期信号</button>
+        </div>
+      </div>
+      <div id="bt-summary-bar" class="bt-summary-bar"></div>
+      <div id="bt-kpis" class="bt-kpis"></div>
+      <div class="bt-view-tabs">
+        <div class="bt-view-tab active" data-view="signals">信号分析</div>
+        <div class="bt-view-tab" data-view="trades">买卖配对</div>
+      </div>
+      <div id="bt-view-signals" class="bt-view active">
+        <div class="section-title">按信号类型</div>
+        <div id="bt-by-type"></div>
+        <div class="section-title">信号衰减曲线</div>
+        <div id="bt-decay-chart" style="height:280px;"></div>
+        <div class="section-title">置信度校准</div>
+        <div id="bt-calibration" style="height:240px;"></div>
+        <div class="section-title">按频率</div>
+        <div id="bt-by-freq"></div>
+        <div class="section-title">按市场环境</div>
+        <div id="bt-by-direction"></div>
+        <div class="section-title">共振 vs 单级别</div>
+        <div id="bt-by-resonance"></div>
+        <div class="section-title">MFE/MAE 分析</div>
+        <div id="bt-mfe-mae"></div>
+        <div class="section-title">权重建议</div>
+        <div id="bt-weight-rec"></div>
+      </div>
+      <div id="bt-view-trades" class="bt-view">
+        <div id="bt-trade-summary"></div>
+        <div class="section-title">累计收益曲线</div>
+        <div id="bt-equity-chart" style="height:300px;"></div>
+        <div class="section-title">交易列表</div>
+        <div id="bt-trade-list"></div>
+      </div>
     </div>
   </main>
 
@@ -143,6 +265,8 @@
   <script src="/static/js/chart.js"></script>
   <script src="/static/js/stock.js"></script>
   <script src="/static/js/analog.js"></script>
+  <script src="/static/js/review.js"></script>
+  <script src="/static/js/backtest.js"></script>
 
 </body>
 </html>
