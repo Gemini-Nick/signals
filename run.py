@@ -1208,32 +1208,43 @@ def run_analog(args):
 
 def run_web(args):
     """
-    Web UI 模式：运行 L1→L2→L3 分析 → 启动 FastAPI 服务器。
+    Web UI 模式：先启动 Web 服务器（秒开），L1→L2→L3 后台异步加载。
 
     用法：python run.py --mode web [--port 8000]
     """
     port = getattr(args, "port", 8000)
+
+    # ── 文件日志初始化 ──
+    import logging, os
+    from datetime import datetime
+    log_dir = os.path.join(os.path.dirname(__file__), ".data", "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"web_{datetime.now():%Y%m%d_%H%M%S}.log")
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S"))
+    # 同时输出到控制台
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
     print(f"\n🐲 隆小侠 Web UI")
-    print(f"   运行 Layer 1 指数分析...\n")
+    print(f"   🌐 http://localhost:{port}")
+    print(f"   📋 日志: {log_file}")
+    print(f"   数据后台加载中...\n")
 
     from signals.web.services.engine import get_engine
     engine = get_engine()
 
-    # L1: 指数分析（必须）
-    engine.run_l1()
+    # 后台异步加载 L1 → L2 → L3
+    engine.run_all_async()
 
-    # L2: 行业分析（可选，失败不影响启动）
-    print(f"\n   运行 Layer 2 行业分析...")
-    engine.run_l2()
-
-    # L3: 标的筛选（可选，依赖 L2）
-    print(f"   运行 Layer 3 标的筛选...")
-    engine.run_l3()
-
-    print(f"\n   分析完成，启动 Web 服务器...")
-    print(f"   🌐 http://localhost:{port}\n")
-
-    # 启动 FastAPI
+    # 立即启动 FastAPI（不等数据加载完成）
     import uvicorn
     from signals.web.app import create_app
     app = create_app()

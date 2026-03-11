@@ -9,16 +9,37 @@
 - USDataSource    : 美股数据路由（Futu优先 → yfinance兜底）
 """
 
+import atexit
 import os
 import sys
 import contextlib
+import threading
 import warnings
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Callable
 
 warnings.filterwarnings("ignore")
+
+
+# ─────────────────────────────────────────────────────────
+# 共享超时线程池（避免每次 API 调用创建/销毁 ThreadPoolExecutor）
+# ─────────────────────────────────────────────────────────
+_TIMEOUT_POOL: Optional[ThreadPoolExecutor] = None
+_TIMEOUT_LOCK = threading.Lock()
+
+
+def _get_timeout_pool() -> ThreadPoolExecutor:
+    global _TIMEOUT_POOL
+    if _TIMEOUT_POOL is None:
+        with _TIMEOUT_LOCK:
+            if _TIMEOUT_POOL is None:
+                _TIMEOUT_POOL = ThreadPoolExecutor(
+                    max_workers=4, thread_name_prefix="api-timeout")
+                atexit.register(_TIMEOUT_POOL.shutdown, wait=False)
+    return _TIMEOUT_POOL
 
 
 @contextlib.contextmanager
@@ -202,14 +223,14 @@ class AKShareSource:
 
     @staticmethod
     def _call_with_timeout(fn, timeout: float = 30.0):
-        """在子线程中调用 fn，超时则抛 TimeoutError（防 Sina API 无限挂起）。"""
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(fn)
-            try:
-                return future.result(timeout=timeout)
-            except FutureTimeout:
-                raise TimeoutError(f"API 调用超时（>{timeout}s）")
+        """在共享线程池中调用 fn，超时则抛 TimeoutError（防 API 无限挂起）。"""
+        pool = _get_timeout_pool()
+        future = pool.submit(fn)
+        try:
+            return future.result(timeout=timeout)
+        except FutureTimeout:
+            future.cancel()
+            raise TimeoutError(f"API 调用超时（>{timeout}s）")
 
     def get_a_minute(self, futu_code: str, freq: Freq,
                      timeout: float = 30.0) -> List[RawBar]:

@@ -54,6 +54,7 @@ L3_MAX_SYMBOLS: int = 20
 INDEX_AK_CODES = {
     "上证50":   "sh000016",
     "沪深300":  "sh000300",
+    "深证成指": "sz399001",
     "创业板指": "sz399006",
     "科创50":   "sh000688",
     "超大盘":   "sh000043",
@@ -95,15 +96,17 @@ WATCH_INDUSTRIES: list = []
 RANK_TOP_N: int = 10
 RANK_MAX_STOCKS_PER_IND: int = 5    # 每个行业最多入池股票数
 
-# 综合强度评分权重（满分100 = 各权重之和，可调）
+# 综合强度评分权重（满分100 = 各权重之和，含2个领先指标）
 RANK_COMPOSITE_WEIGHTS: dict = {
-    "gain": 20,             # 涨幅得分
-    "inflow": 20,           # 资金流入得分
-    "zt_density": 20,       # 涨停密度
-    "lianban": 10,          # 连板高度
-    "strong_density": 15,   # 强势股密度
-    "continue": 10,         # 涨停持续性（昨涨停续板）
-    "dt_penalty": 5,        # 跌停惩罚
+    "gain": 15,              # 涨幅得分 (滞后)
+    "inflow": 15,            # 资金流入得分 (滞后)
+    "zt_density": 15,        # 涨停密度 (滞后)
+    "lianban": 5,            # 连板高度 (滞后，越高越危险)
+    "strong_density": 10,    # 强势股密度 (滞后)
+    "continue": 5,           # 涨停持续性 (滞后)
+    "dt_penalty": 10,        # 跌停惩罚 (加大)
+    "inflow_momentum": 15,   # 资金动量=流入/涨幅 (领先: 资金先行)
+    "startup_ratio": 10,     # 启动率=涨停+强势数 (领先: 个股先动)
 }
 
 # 盘后模式历史评分权重（5维，去掉 gain/inflow，权重重分配）
@@ -278,11 +281,42 @@ SIM_WAREHOUSE_DB = ".data/sim/warehouse.db"
 CUSTOM_KEY_LEVELS: dict = {}
 
 # ── 历史形态匹配配置（P3-6）──────────────────────────────────
-ANALOG_LOOKBACK_DAYS = 1500     # 历史回溯天数（约6年）
-ANALOG_WINDOW = 30              # 匹配窗口长度（交易日）
-ANALOG_TOP_K = 3                # 返回 Top K 匹配
-ANALOG_MIN_SIMILARITY = 0.70    # 最低相似度阈值
-ANALOG_INDICES = ["沪深300", "创业板指", "上证50"]  # 默认匹配指数
+ANALOG_LOOKBACK_DAYS = 3000     # 历史回溯天数（约12年，覆盖完整牛熊周期）
+ANALOG_WINDOW = 30              # 默认匹配窗口长度（交易日）
+ANALOG_TOP_K = 5                # 返回 Top K 匹配
+ANALOG_MIN_SIMILARITY = 0.40    # 最低相似度阈值（0.4=中等正相关）
+ANALOG_INDICES = ["沪深300", "深证成指", "创业板指", "上证50"]  # 默认匹配指数
+
+# ── 异常检测配置（P0: sigma 异常）──────────────────────────
+ANOMALY_ROLLING_WINDOW = 20              # 滚动统计窗口（交易日）
+ANOMALY_THRESHOLDS = {
+    "volume":         {"high": 2.0, "low": -1.5},   # 放量/缩量
+    "range":          {"high": 2.5},                  # 振幅异常
+    "gap":            {"high": 2.0},                  # 跳空异常
+    "body":           {"high": 2.0},                  # 实体异常
+}
+
+# ── 割肉指标权重（散户止损检测）────────────────────────────
+CAPITULATION_WEIGHTS = {
+    "volume_spike": 30,    # 异常放量 (恐慌抛售)
+    "lower_shadow": 25,    # 长下影线 (抛后有承接)
+    "vol_breakout": 25,    # 缩量后突然放量 (最后的投降)
+    "close_at_low": 20,    # 收盘靠近最低 (下跌环境)
+}
+
+# ── 信号融合权重（多维度加权）──────────────────────────────
+FUSION_WEIGHTS = {
+    "anomaly_volume_boost": 15,    # 异常放量加分
+    "anomaly_volume_penalty": -10, # 异常缩量减分
+    "anomaly_gap_boost": 10,       # 异常跳空加分
+    "anomaly_range_boost": 5,      # 异常波动加分
+    "convergence_3dim": 20,        # ≥3维收敛加分
+    "convergence_2dim": 12,        # 2维收敛加分
+    "convergence_1dim": 5,         # 1维异常加分
+    "capitulation_extreme": 25,    # 极度割肉加分 (≥80)
+    "capitulation_high": 15,       # 恐慌割肉加分 (60-80)
+    "capitulation_medium": 8,      # 偏弱割肉加分 (40-60)
+}
 
 # ── 研究笔记（双维度集成）──────────────────────────────────
 # 笔记根目录，按 年/月 子目录存储：notes/2026/03/xxx.pdf
