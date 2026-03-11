@@ -110,44 +110,82 @@ def find_analogs(
     window: int = None,
     top_k: int = None,
     min_similarity: float = None,
+    exclude_start: str = "",
+    exclude_end: str = "",
 ) -> List[HistoricalAnalog]:
     """
     在历史数据中寻找与当前走势最相似的区间。
 
-    :param current_closes: 当前最近 window 天的收盘价列表
+    :param current_closes: 当前选定区间的收盘价列表
     :param current_dates: 当前日期列表（与 closes 对应）
     :param history_closes: 完整历史收盘价列表
     :param history_dates: 历史日期列表（与 closes 对应）
     :param index_name: 指数名称
-    :param window: 匹配窗口，默认 config.ANALOG_WINDOW
+    :param window: 匹配窗口，默认 len(current_closes) 或 config.ANALOG_WINDOW
     :param top_k: 返回 Top K，默认 config.ANALOG_TOP_K
     :param min_similarity: 最低相似度，默认 config.ANALOG_MIN_SIMILARITY
+    :param exclude_start: 排除区间起始日期 (避免与选定区间重叠)
+    :param exclude_end: 排除区间结束日期
     :return: HistoricalAnalog 列表（按相似度降序）
     """
-    window = window or config.ANALOG_WINDOW
     top_k = top_k or config.ANALOG_TOP_K
-    min_similarity = min_similarity or config.ANALOG_MIN_SIMILARITY
 
     # 当前走势的收益率序列
-    if len(current_closes) < window:
+    # window 由 current_closes 长度决定（自定义区间时不截断）
+    actual_len = len(current_closes)
+    if window and actual_len >= window:
+        current_ret = _returns_from_closes(current_closes[-window:])
+    else:
+        window = actual_len
+        current_ret = _returns_from_closes(current_closes)
+
+    if len(current_ret) < 3:
         return []
-    current_ret = _returns_from_closes(current_closes[-window:])
-    if len(current_ret) < window - 1:
-        return []
+
+    match_len = len(current_ret)  # 收益率序列长度
+
+    # 自适应阈值: 长窗口自然相关性低，需降低门槛
+    # 30天 → 0.40, 60天 → 0.30, 120天 → 0.20, 200天+ → 0.15
+    if min_similarity is None or min_similarity == config.ANALOG_MIN_SIMILARITY:
+        if match_len <= 30:
+            min_similarity = 0.40
+        elif match_len <= 60:
+            min_similarity = 0.30
+        elif match_len <= 120:
+            min_similarity = 0.20
+        else:
+            min_similarity = 0.15
+    else:
+        min_similarity = min_similarity or 0.15
 
     # 在历史数据中滑动窗口匹配
     hist_ret = _returns_from_closes(history_closes)
-    if len(hist_ret) < window + 30:
+    if len(hist_ret) < match_len + 30:
         return []
+
+    # 将 exclude 日期转为索引范围 (使用 >= / <= 匹配，容忍非交易日)
+    exclude_start_idx = -1
+    exclude_end_idx = -1
+    if exclude_start and exclude_end:
+        for idx, d in enumerate(history_dates):
+            d_str = str(d)[:10]
+            if d_str >= exclude_start and exclude_start_idx < 0:
+                exclude_start_idx = idx
+            if d_str <= exclude_end:
+                exclude_end_idx = idx
 
     candidates = []
 
-    # 避免匹配最近60天（与当前重叠）
-    search_end = len(hist_ret) - 60
+    for i in range(0, len(hist_ret) - match_len + 1):
+        # 跳过排除区间（选定区间本身 ± 缓冲 20 天）
+        real_start_idx = i + 1  # returns 偏移
+        real_end_idx = i + match_len
+        if exclude_start_idx >= 0 and exclude_end_idx >= 0:
+            if not (real_end_idx < exclude_start_idx - 20 or real_start_idx > exclude_end_idx + 20):
+                continue
 
-    for i in range(0, search_end - window + 1):
-        segment = hist_ret[i:i + window - 1]
-        if len(segment) != len(current_ret):
+        segment = hist_ret[i:i + match_len]
+        if len(segment) != match_len:
             continue
 
         corr = _pearson_corr(current_ret, segment)
@@ -161,11 +199,11 @@ def find_analogs(
     candidates.sort(key=lambda x: -x[1])
     filtered = []
     used_ranges = set()
+    dedup_range = max(10, match_len // 3)  # 自适应去重距离
     for idx, corr in candidates:
-        # 检查是否与已选的重叠（±10天内）
         overlap = False
         for used_idx in used_ranges:
-            if abs(idx - used_idx) < 10:
+            if abs(idx - used_idx) < dedup_range:
                 overlap = True
                 break
         if not overlap:
@@ -179,7 +217,7 @@ def find_analogs(
     for idx, corr in filtered:
         # 匹配区间日期
         match_start_idx = idx + 1  # +1 因为 returns 比 closes 少1
-        match_end_idx = idx + window
+        match_end_idx = idx + match_len
         if match_end_idx >= len(history_dates):
             continue
 
@@ -220,7 +258,7 @@ def find_analogs(
             match_end=match_end,
             index_name=index_name,
             similarity=round(corr, 4),
-            window_days=window,
+            window_days=match_len + 1,  # 收盘价天数 = 收益率天数 + 1
             next_10d_return=next_10d,
             next_30d_return=next_30d,
             what_happened=what_happened,

@@ -29,8 +29,9 @@ logs/
 # 研究笔记自动生成的元数据（用户本地，不入库）
 notes/**/*.meta.yaml
 
-# 缓存
+# 缓存 & 本地数据
 .cache/
+.data/
 
 # Node.js (docx生成脚本依赖)
 node_modules/
