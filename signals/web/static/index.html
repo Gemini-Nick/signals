@@ -26,6 +26,8 @@
     <div class="nav-tab" data-page="analog">历史对照</div>
     <div class="nav-tab" data-page="review">盘后复盘</div>
     <div class="nav-tab" data-page="backtest">回测</div>
+    <div class="nav-tab" data-page="plan">计划</div>
+    <div class="nav-tab" data-page="trade">交易</div>
   </nav>
 
   <!-- Pages -->
@@ -192,6 +194,7 @@
         <div id="review-concepts"></div>
         <div class="section-title">个股信号</div>
         <div id="review-signals"></div>
+        <div id="review-replay-timeline"></div>
       </div>
     </div>
 
@@ -254,6 +257,55 @@
         <div id="bt-trade-list"></div>
       </div>
     </div>
+
+    <!-- Page 7: Plan (计划) -->
+    <div id="page-plan" class="page">
+      <div class="plan-header">
+        <button class="stock-search-btn" id="plan-generate-btn">生成盘前计划</button>
+        <button class="stock-search-btn" id="plan-weekly-btn">周末策略</button>
+      </div>
+      <div id="plan-results"></div>
+      <div id="plan-weekly"></div>
+    </div>
+    <!-- Page 8: Trade (交易日志) -->
+    <div id="page-trade" class="page">
+      <div class="trade-header">
+        <div class="trade-controls">
+          <select id="trade-filter" class="trade-select">
+            <option value="all">全部</option>
+            <option value="open">持仓中</option>
+            <option value="closed">已平仓</option>
+          </select>
+          <button class="stock-search-btn" id="trade-add-btn">+ 新增交易</button>
+          <button class="stock-search-btn" id="trade-refresh-btn">刷新</button>
+        </div>
+      </div>
+      <div id="trade-summary-bar" class="trade-summary-bar"></div>
+      <div class="trade-view-tabs">
+        <div class="trade-view-tab active" data-view="list">交易列表</div>
+        <div class="trade-view-tab" data-view="stats">统计分析</div>
+        <div class="trade-view-tab" data-view="missed">遗漏信号</div>
+      </div>
+      <div id="trade-view-list" class="trade-view active">
+        <div id="trade-list"></div>
+      </div>
+      <div id="trade-view-stats" class="trade-view">
+        <div id="trade-stats"></div>
+      </div>
+      <div id="trade-view-missed" class="trade-view">
+        <div id="trade-missed"></div>
+      </div>
+      <!-- 新增/编辑表单弹窗 -->
+      <div id="trade-form-modal" class="trade-modal" style="display:none;">
+        <div class="trade-modal-content">
+          <div class="trade-modal-header">
+            <span id="trade-form-title">新增交易</span>
+            <button class="trade-modal-close" onclick="window._closeTradeForm()">&times;</button>
+          </div>
+          <div class="trade-modal-body" id="trade-form-body"></div>
+        </div>
+      </div>
+    </div>
   </main>
 
   <!-- TradingView Lightweight Charts v4 -->
@@ -267,6 +319,8 @@
   <script src="/static/js/analog.js"></script>
   <script src="/static/js/review.js"></script>
   <script src="/static/js/backtest.js"></script>
+  <script src="/static/js/plan.js"></script>
+  <script src="/static/js/trade.js"></script>
 
 </body>
 </html>

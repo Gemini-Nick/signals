@@ -147,6 +147,7 @@ async function _loadResults() {
     _renderRotation(data.rotation);
     _renderConcepts(data.concepts);
     _renderSignals(data.scored_symbols);
+    _renderReplayTimeline(data.replay_timelines, data.scored_symbols);
   } catch (e) {
     console.error('加载结果失败', e);
   }
@@ -400,6 +401,81 @@ function _freqAbbr(freq) {
   const map = { '15分钟': '15M', '30分钟': '30M', '60分钟': '60M', '日线': '日', '周线': '周' };
   return map[freq] || freq;
 }
+
+/* ── G: 信号回放时间线 ── */
+function _renderReplayTimeline(timelines, scored) {
+  const el = document.getElementById('review-replay-timeline');
+  if (!el) return;
+
+  if (!timelines || !Object.keys(timelines).length) {
+    el.innerHTML = '';
+    return;
+  }
+
+  // 构建 symbol → name 映射
+  const nameMap = {};
+  (scored || []).forEach(s => { nameMap[s.symbol] = s.name || s.symbol; });
+
+  const symbols = Object.keys(timelines);
+
+  let html = '<div class="replay-timeline-section">' +
+    '<button class="replay-timeline-toggle" onclick="_toggleReplayTimeline(this)">' +
+    '<span class="arrow">&#9660;</span> 信号回放时间线 (' + symbols.length + ' 标的)</button>' +
+    '<div class="replay-timeline-body">';
+
+  // 标的 tabs
+  html += '<div class="replay-stock-tabs">';
+  symbols.forEach((sym, i) => {
+    const name = nameMap[sym] || sym;
+    const cls = i === 0 ? 'replay-stock-tab active' : 'replay-stock-tab';
+    html += `<button class="${cls}" data-symbol="${sym}" onclick="_switchReplayTab(this, '${sym}')">${name}</button>`;
+  });
+  html += '</div>';
+
+  // 每个标的的事件列表
+  symbols.forEach((sym, i) => {
+    const events = timelines[sym];
+    const display = i === 0 ? '' : 'style="display:none"';
+    html += `<div class="replay-events" id="replay-events-${sym.replace('.', '_')}" ${display}>`;
+    if (!events.length) {
+      html += '<p class="replay-empty">该标的回放期间无信号变化</p>';
+    } else {
+      events.forEach(ev => {
+        const actionCls = ev.action === 'appear' ? 'replay-event-appear' : 'replay-event-disappear';
+        const actionText = ev.action === 'appear' ? '出现' : '消失';
+        const confText = ev.action === 'appear' && ev.confidence > 0
+          ? `(conf=${ev.confidence.toFixed(2)})` : '';
+        html += `<div class="replay-event">
+          <span class="replay-event-dt">${ev.dt_str}</span>
+          <span class="replay-event-type ${actionCls}">${ev.signal_type} ${actionText}</span>
+          <span class="replay-event-price">@ ${ev.price.toFixed(2)}</span>
+          <span class="replay-event-conf">${confText}</span>
+        </div>`;
+      });
+    }
+    html += '</div>';
+  });
+
+  html += '</div></div>';
+  el.innerHTML = html;
+}
+
+window._toggleReplayTimeline = function (btn) {
+  btn.classList.toggle('open');
+  const body = btn.nextElementSibling;
+  body.classList.toggle('open');
+};
+
+window._switchReplayTab = function (tab, symbol) {
+  // 切换 tab 高亮
+  tab.parentElement.querySelectorAll('.replay-stock-tab').forEach(t => t.classList.remove('active'));
+  tab.classList.add('active');
+  // 切换事件列表
+  const body = tab.closest('.replay-timeline-body');
+  body.querySelectorAll('.replay-events').forEach(ev => ev.style.display = 'none');
+  const target = document.getElementById('replay-events-' + symbol.replace('.', '_'));
+  if (target) target.style.display = '';
+};
 
 /* ── 跳转到个股分析 ── */
 window._reviewGotoStock = function (symbol) {

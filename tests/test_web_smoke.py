@@ -107,6 +107,57 @@ class TestBacktestAPI:
         assert "total" in data or "error" in data
 
 
+class TestPlanAPI:
+    """计划端点"""
+
+    def test_weekly(self, client):
+        r = client.get("/api/plan/weekly")
+        assert r.status_code == 200
+        data = r.json()
+        assert "week_label" in data
+
+    def test_generate(self, client):
+        r = client.post("/api/plan/generate")
+        # 503 if engine not ready, 200 if ready
+        assert r.status_code in (200, 503)
+
+
+class TestTradeAPI:
+    """交易日志端点"""
+
+    def test_list(self, client):
+        r = client.get("/api/trade/list")
+        assert r.status_code == 200
+        data = r.json()
+        assert "trades" in data
+
+    def test_summary(self, client):
+        r = client.get("/api/trade/summary")
+        assert r.status_code == 200
+        data = r.json()
+        assert "total_trades" in data
+
+    def test_missed(self, client):
+        r = client.get("/api/trade/missed")
+        assert r.status_code == 200
+        data = r.json()
+        assert "missed" in data
+
+    def test_add_and_delete(self, client):
+        # Add
+        r = client.post("/api/trade/add", json={
+            "symbol": "SZ.000001",
+            "name": "平安银行",
+            "entry_date": "2026-03-10",
+            "entry_price": 12.50,
+        })
+        assert r.status_code == 200
+        trade_id = r.json()["id"]
+        # Delete
+        r = client.delete(f"/api/trade/{trade_id}")
+        assert r.status_code == 200
+
+
 class TestStaticFiles:
     """静态资源"""
 

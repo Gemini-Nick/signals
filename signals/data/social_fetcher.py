@@ -74,6 +74,17 @@ class SocialHeatSnapshot:
     institution_pct: float = 0.0     # 机构参与度 (0-1)
     # 微博舆情
     weibo_rate: float = 0.0          # 微博情绪率 (-1 ~ +1)
+    # 股吧深度数据
+    guba_heat: float = 0.0           # 股吧热度 (0-100)
+    guba_post_count: int = 0         # 股吧帖子数
+    guba_sentiment: float = 0.0      # 股吧标题情绪 (-1 ~ +1)
+    # NLP 情绪
+    nlp_sentiment: float = 0.0       # NLP情绪分 (-100 ~ +100)
+    nlp_label: str = ""              # "偏乐观"/"中性"/"偏悲观" 等
+    # 产业链
+    chain_name: str = ""             # 所属产业链
+    chain_position: str = ""         # "上游"/"中游"/"下游"
+    chain_role: str = ""             # 产业链角色描述
     # 综合
     heat_score: float = 0.0          # 0-100 综合热度评分
     heat_grade: str = ""             # "爆热"/"热门"/"温和"/"冷门"
@@ -348,10 +359,12 @@ def fetch_concept_stocks(concept_name: str) -> ConceptTheme:
 # 聚合查询
 # ─────────────────────────────────────────────────────────
 
-def fetch_social_heat(symbol: str) -> SocialHeatSnapshot:
+def fetch_social_heat(symbol: str, deep: bool = False) -> SocialHeatSnapshot:
     """
     获取单股社交热度综合快照。
-    聚合千股千评 + 微博 数据。
+    聚合千股千评 + 微博 + (可选)股吧深度 + NLP情绪 + 产业链 数据。
+
+    :param deep: True 时启用股吧爬虫 + NLP情绪分析（较慢，约2-4s）
     """
     snap = SocialHeatSnapshot(symbol=symbol)
 
@@ -372,6 +385,22 @@ def fetch_social_heat(symbol: str) -> SocialHeatSnapshot:
             snap.weibo_rate = wrate
             break
 
+    # 产业链标注
+    try:
+        from signals.core.chain_map import get_chain_position
+        code = symbol.split(".")[-1] if "." in symbol else symbol
+        pos = get_chain_position(code)
+        if pos:
+            snap.chain_name = pos.chain_name
+            snap.chain_position = pos.position
+            snap.chain_role = pos.role
+    except Exception:
+        pass
+
+    # 深度模式: 股吧 + NLP
+    if deep:
+        _enrich_deep(snap)
+
     # 综合热度评分
     snap.heat_score = _compute_heat_score(snap)
     snap.heat_grade = _heat_grade(snap.heat_score)
@@ -383,9 +412,42 @@ def fetch_social_heat(symbol: str) -> SocialHeatSnapshot:
         parts.append(f"千评#{snap.comment_rank}")
     if snap.comment_score > 0:
         parts.append(f"综合{snap.comment_score:.0f}")
+    if snap.chain_name:
+        parts.append(f"{snap.chain_name}/{snap.chain_position}")
     snap.tag = " ".join(parts)
 
     return snap
+
+
+def _enrich_deep(snap: SocialHeatSnapshot):
+    """深度数据增强：股吧爬虫 + NLP 情绪"""
+    code = snap.symbol.split(".")[-1] if "." in snap.symbol else snap.symbol
+    if len(code) != 6:
+        return
+
+    # 股吧爬虫
+    try:
+        from signals.data.scrapers.tieba import TiebaScraper
+        scraper = TiebaScraper()
+        result = scraper.search(code, limit=20)
+        if result.posts:
+            snap.guba_heat = result.heat_index
+            snap.guba_post_count = len(result.posts)
+            # 平均标题情绪
+            sentiments = [p.sentiment_hint for p in result.posts]
+            snap.guba_sentiment = round(sum(sentiments) / len(sentiments), 2)
+
+            # NLP 情绪分析（用帖子标题）
+            try:
+                from signals.core.sentiment_nlp import analyze_sentiment, classify_sentiment
+                titles = [p.title for p in result.posts if p.title]
+                if titles:
+                    snap.nlp_sentiment = analyze_sentiment(titles)
+                    snap.nlp_label = classify_sentiment(snap.nlp_sentiment)
+            except Exception:
+                pass
+    except Exception as e:
+        _log.debug(f"深度数据增强失败 [{code}]: {e}")
 
 
 def fetch_social_heat_batch(symbols: List[str],
@@ -433,24 +495,45 @@ def _compute_heat_score(snap: SocialHeatSnapshot) -> float:
     """计算综合热度 (0-100)"""
     score = 0.0
 
-    # 千评综合得分 (0-100, 已归一化) — 权重50%
-    if snap.comment_score > 0:
-        score += snap.comment_score * 0.5
+    # 有深度数据时权重调整
+    has_deep = snap.guba_heat > 0
 
-    # 关注指数 (一般范围 50-95) — 归一化后权重25%
-    if snap.focus_index > 0:
-        focus_norm = min(max((snap.focus_index - 50) / 45.0, 0), 1) * 100
-        score += focus_norm * 0.25
-
-    # 千评排名 (越小越好, 范围1-5168) — 归一化后权重15%
-    if snap.comment_rank > 0:
-        rank_norm = max(1.0 - snap.comment_rank / 5168.0, 0) * 100
-        score += rank_norm * 0.15
-
-    # 微博情绪 (如果在Top50中) — 权重10%
-    if snap.weibo_rate != 0:
-        weibo_norm = (snap.weibo_rate + 1) / 2 * 100  # -1~+1 → 0~100
-        score += weibo_norm * 0.10
+    if has_deep:
+        # 深度模式权重分配
+        # 千评综合得分 — 权重35%
+        if snap.comment_score > 0:
+            score += snap.comment_score * 0.35
+        # 关注指数 — 权重15%
+        if snap.focus_index > 0:
+            focus_norm = min(max((snap.focus_index - 50) / 45.0, 0), 1) * 100
+            score += focus_norm * 0.15
+        # 千评排名 — 权重10%
+        if snap.comment_rank > 0:
+            rank_norm = max(1.0 - snap.comment_rank / 5168.0, 0) * 100
+            score += rank_norm * 0.10
+        # 微博情绪 — 权重5%
+        if snap.weibo_rate != 0:
+            weibo_norm = (snap.weibo_rate + 1) / 2 * 100
+            score += weibo_norm * 0.05
+        # 股吧热度 — 权重25%
+        score += snap.guba_heat * 0.25
+        # NLP情绪绝对值 — 权重10%（越极端说明讨论越激烈）
+        if snap.nlp_sentiment != 0:
+            nlp_abs = min(abs(snap.nlp_sentiment), 100)
+            score += nlp_abs * 0.10
+    else:
+        # 基础模式（与原逻辑一致）
+        if snap.comment_score > 0:
+            score += snap.comment_score * 0.5
+        if snap.focus_index > 0:
+            focus_norm = min(max((snap.focus_index - 50) / 45.0, 0), 1) * 100
+            score += focus_norm * 0.25
+        if snap.comment_rank > 0:
+            rank_norm = max(1.0 - snap.comment_rank / 5168.0, 0) * 100
+            score += rank_norm * 0.15
+        if snap.weibo_rate != 0:
+            weibo_norm = (snap.weibo_rate + 1) / 2 * 100
+            score += weibo_norm * 0.10
 
     return round(min(score, 100), 1)
 

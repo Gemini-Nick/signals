@@ -135,6 +135,19 @@ def serialize_zhongshu(analyzer) -> list:
     return result
 
 
+def serialize_signal_change(sc) -> dict:
+    """SignalChange → JSON dict（信号回放时间线）"""
+    return {
+        "dt": _dt_to_unix(sc.dt),
+        "dt_str": _dt_to_str(sc.dt),
+        "signal_type": sc.signal_type,
+        "action": sc.action,
+        "price": round(sc.price, 2),
+        "confidence": round(sc.confidence, 2),
+        "bar_index": sc.bar_index,
+    }
+
+
 def serialize_signals(signals: list) -> list:
     """
     SignalEvent 列表 → JSON

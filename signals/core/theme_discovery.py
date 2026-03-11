@@ -36,6 +36,10 @@ class ThemeStock:
     comment_rank: int = 0             # 排名
     focus_index: float = 0.0          # 关注指数
     institution_pct: float = 0.0      # 机构参与度
+    # 产业链标注
+    chain_name: str = ""              # 所属产业链
+    chain_position: str = ""          # "上游"/"中游"/"下游"
+    chain_role: str = ""              # 产业链角色
     # 聚合
     relevance_score: float = 0.0      # 综合关联度评分 (0-100)
     concepts: List[str] = field(default_factory=list)  # 所属概念 ["华为昇腾","算力概念"]
@@ -124,6 +128,17 @@ def discover_theme(keyword: str) -> ThemeDiscoveryResult:
             stock.comment_rank = comment.get("rank", 0)
             stock.focus_index = comment.get("focus_index", 0)
             stock.institution_pct = comment.get("institution_pct", 0)
+
+        # 产业链标注
+        try:
+            from signals.core.chain_map import get_chain_position
+            chain_pos = get_chain_position(code)
+            if chain_pos:
+                stock.chain_name = chain_pos.chain_name
+                stock.chain_position = chain_pos.position
+                stock.chain_role = chain_pos.role
+        except Exception:
+            pass
 
         # 综合关联度
         stock.relevance_score = _compute_relevance(stock)

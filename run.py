@@ -1206,6 +1206,111 @@ def run_analog(args):
         print(f"\n  未产生任何匹配结果")
 
 
+def run_plan(args):
+    """
+    盘前计划模式：分析主要指数，生成完全分类的 3 种情景。
+
+    用法：python run.py --mode plan
+    """
+    print("\n🐲 隆小侠 — 盘前计划\n")
+
+    from signals.layers.index_screener import IndexScreener
+    from signals.core.planner import generate_plan
+
+    print("  加载指数数据...")
+    screener = IndexScreener()
+    screener.initialize()
+    ctx = screener.analyze()
+
+    main_indices = ["沪深300", "上证50", "创业板指", "科创50", "中证500"]
+    for name in main_indices:
+        az = screener.analyzers.get(name)
+        if az is None:
+            continue
+        daily = getattr(az, "_daily", None)
+        if daily is None:
+            continue
+        # 获取 MA 上下文
+        report = next((r for r in ctx.reports if r.name == name), None)
+        ma_ctx = getattr(report, "ma_context", None) if report else None
+
+        plan = generate_plan(daily, ma_ctx)
+        plan.name = name
+
+        print(f"\n  {'='*50}")
+        print(f"  {plan.name}  现价 {plan.current_price}  {plan.trend}")
+        print(f"  {plan.structure}")
+        if plan.key_levels:
+            lvs = " | ".join(f"{lv['name']} {lv['price']}" for lv in plan.key_levels)
+            print(f"  关键位: {lvs}")
+        for sc in plan.scenarios:
+            print(f"\n  {sc.name} [{sc.probability_hint}]")
+            print(f"    触发: {sc.trigger}")
+            print(f"    操作: {sc.action}")
+            if sc.target_prices:
+                print(f"    目标: {' / '.join(str(p) for p in sc.target_prices)}")
+            if sc.stop_price:
+                print(f"    止损: {sc.stop_price}")
+            if sc.rationale:
+                print(f"    逻辑: {sc.rationale}")
+
+    print(f"\n  {'='*50}")
+    print(f"  大盘方向: {ctx.overall_direction} | 情绪: {ctx.sentiment_phase}")
+    print(f"  建议仓位: {ctx.position_suggestion}")
+    print()
+
+
+def run_weekly(args):
+    """
+    周末策略模式：整合指数 + 轮动 + 宏观事件，生成下周操作策略。
+
+    用法：python run.py --mode weekly
+    """
+    print("\n🐲 隆小侠 — 周末策略\n")
+
+    from signals.layers.index_screener import IndexScreener
+    from signals.core.weekly import generate_weekly
+
+    print("  加载指数数据...")
+    screener = IndexScreener()
+    screener.initialize()
+    ctx = screener.analyze()
+
+    weekly = generate_weekly(
+        index_reports=ctx.reports,
+        market_context=ctx,
+        rotation_stage=ctx.rotation_stage,
+        allocation=ctx.allocation_suggestion,
+    )
+
+    print(f"  {weekly.week_label}")
+    print(f"\n  大盘展望: {weekly.market_outlook}")
+    print(f"  仓位建议: {weekly.position_suggestion}")
+    if weekly.style_suggestion:
+        print(f"  风格建议: {weekly.style_suggestion}")
+    if weekly.rotation_outlook:
+        print(f"  轮动阶段: {weekly.rotation_outlook}")
+
+    if weekly.focus_sectors:
+        print(f"\n  关注板块: {', '.join(weekly.focus_sectors)}")
+    if weekly.avoid_sectors:
+        print(f"  回避板块: {', '.join(weekly.avoid_sectors)}")
+
+    if weekly.events:
+        print(f"\n  宏观事件:")
+        for ev in weekly.events:
+            print(f"    {ev.event_name} {ev.event_date}")
+            for k, v in ev.scenarios.items():
+                print(f"      {k}: {v}")
+
+    if weekly.key_levels:
+        print(f"\n  关键价位:")
+        for lv in weekly.key_levels:
+            print(f"    {lv['index']} {lv['name']} {lv['price']} ({lv['distance_pct']:+.1f}%)")
+
+    print()
+
+
 def run_web(args):
     """
     Web UI 模式：先启动 Web 服务器（秒开），L1→L2→L3 后台异步加载。
@@ -1434,8 +1539,8 @@ def main():
     parser.add_argument(
         "--mode",
         default="intraday",
-        choices=["intraday", "review", "index", "import", "backtest", "sim", "web", "analog"],
-        help="运行模式：intraday / review / index / import / backtest / sim / web / analog"
+        choices=["intraday", "review", "index", "import", "backtest", "sim", "web", "analog", "plan", "weekly"],
+        help="运行模式：intraday / review / index / import / backtest / sim / web / analog / plan / weekly"
     )
     parser.add_argument(
         "--start",
@@ -1587,6 +1692,8 @@ def main():
         "sim":      run_sim,
         "web":      run_web,
         "analog":   run_analog,
+        "plan":     run_plan,
+        "weekly":   run_weekly,
     }
     dispatch[args.mode](args)
 

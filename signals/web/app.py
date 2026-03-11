@@ -21,6 +21,8 @@ from .api.analog import router as analog_router
 from .api.review import router as review_router
 from .api.backtest import router as backtest_router
 from .api.social import router as social_router
+from .api.plan import router as plan_router
+from .api.trade import router as trade_router
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -51,6 +53,8 @@ def create_app() -> FastAPI:
     app.include_router(review_router)
     app.include_router(backtest_router)
     app.include_router(social_router)
+    app.include_router(plan_router)
+    app.include_router(trade_router)
 
     # 静态文件服务
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

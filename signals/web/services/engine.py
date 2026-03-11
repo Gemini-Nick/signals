@@ -36,6 +36,8 @@ class ReviewState:
     # Timing (seconds)
     timing: Dict[str, float] = field(default_factory=dict)  # {"L1": 12.3, "L2": 8.1, ...}
     phase_detail: str = ""  # 当前阶段子步骤描述, e.g. "加载A股指数..."
+    # 信号回放时间线 (Phase 4)
+    replay_timelines: Dict[str, list] = field(default_factory=dict)  # symbol → List[SignalChange]
 
 
 @dataclass
@@ -366,6 +368,10 @@ class WebEngine:
             "concepts": self._state.concepts or [],
             "oversold_list": self._state.oversold_list or [],
         }
+
+    def get_concepts(self) -> list:
+        """获取缓存的概念板块排行"""
+        return self._state.concepts or []
 
     def get_scored_symbols(self) -> list:
         """获取缓存的 ScoredSymbol 列表"""
@@ -841,6 +847,32 @@ class WebEngine:
                 rv.scored_symbols = scored
                 rv.timing["L3"] = round(_time.monotonic() - _t0, 1)
                 _log(f"[复盘] L3 完成 — {rv.timing['L3']}s ({len(scored)} 个股)")
+
+                # ── 信号回放: 对 top-10 标的生成信号时间线 ──
+                _t0 = _time.monotonic()
+                rv.phase_detail = "生成信号回放时间线..."
+                try:
+                    from signals.core.replay import replay_stock
+                    from signals.data.bar_cache import get_cache
+                    from czsc import Freq as _Freq
+                    from datetime import datetime as _dt2
+                    today = _dt2.now().strftime("%Y%m%d")
+                    replay_count = 0
+                    for sc in scored[:10]:
+                        cache_key = f"{sc.symbol.replace('.', '_')}_{today}"
+                        cached = get_cache().get(cache_key)
+                        if cached and len(cached) >= 30:
+                            from signals.layers.review_screener import _records_to_rawbars
+                            daily_bars = _records_to_rawbars(cached, sc.symbol)
+                            timeline = replay_stock(sc.symbol, daily_bars, _Freq.D)
+                            if timeline:
+                                rv.replay_timelines[sc.symbol] = timeline
+                                replay_count += 1
+                    rv.timing["replay"] = round(_time.monotonic() - _t0, 1)
+                    _log(f"[复盘] 回放完成 — {rv.timing['replay']}s ({replay_count} 标的)")
+                except Exception as e:
+                    _log(f"[复盘] 回放跳过: {e}")
+                    rv.timing["replay"] = 0
 
                 rv.timing["total"] = round(_time.monotonic() - _t_total, 1)
                 rv.phase = ""

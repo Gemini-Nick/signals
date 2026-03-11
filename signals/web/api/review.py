@@ -12,6 +12,7 @@ from ..services.serializers import (
     serialize_index_report,
     serialize_market_context,
     serialize_scored_symbol,
+    serialize_signal_change,
 )
 
 router = APIRouter(prefix="/api/review", tags=["review"])
@@ -129,6 +130,11 @@ async def review_results():
         # 个股信号
         scored_symbols = [serialize_scored_symbol(s) for s in rv.scored_symbols]
 
+        # 信号回放时间线
+        replay_timelines = {}
+        for sym, timeline in getattr(rv, "replay_timelines", {}).items():
+            replay_timelines[sym] = [serialize_signal_change(sc) for sc in timeline]
+
         return {
             "start_date": rv.start_date,
             "start_label": rv.start_label,
@@ -139,6 +145,7 @@ async def review_results():
             "concepts": concept_list,
             "rotation": rotation,
             "scored_symbols": scored_symbols,
+            "replay_timelines": replay_timelines,
             "timing": getattr(rv, "timing", {}),
         }
 

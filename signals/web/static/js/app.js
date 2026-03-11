@@ -45,6 +45,14 @@ function switchPage(pageName) {
   if (pageName === 'backtest' && window.loadBacktestPage) {
     window.loadBacktestPage();
   }
+  // 计划页
+  if (pageName === 'plan' && window.loadPlanPage) {
+    window.loadPlanPage();
+  }
+  // 交易页
+  if (pageName === 'trade' && window.loadTradePage) {
+    window.loadTradePage();
+  }
 }
 
 function navigateToChart(indexName, freq) {
