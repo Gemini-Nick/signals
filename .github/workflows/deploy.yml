@@ -1,0 +1,40 @@
+name: Deploy to China Cloud
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'tests/**'
+      - 'notes/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.CN_SERVER_IP }}
+          username: ${{ secrets.CN_SERVER_USER }}
+          key: ${{ secrets.CN_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/signals
+
+            # 拉取最新代码
+            git fetch origin main
+            git reset --hard origin/main
+
+            # 重建并重启分析引擎 (保留 Futu/Redis 不重启)
+            cd deploy
+            docker compose build signals
+            docker compose up -d signals
+
+            # 验证
+            sleep 5
+            docker compose ps
+            echo "✅ 部署完成: $(date +'%Y-%m-%d %H:%M:%S')"

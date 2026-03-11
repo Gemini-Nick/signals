@@ -45,6 +45,17 @@ def create_us_source(mode: str = "intraday",
     import config
 
     providers = []
+    is_cloud = getattr(config, "DEPLOY_MODE", "local") == "cloud"
+
+    if is_cloud:
+        # ── 云端模式: Futu 优先（yfinance/IB/Alpaca 在大陆被 GFW 封锁）──
+        if futu_source:
+            providers.append(futu_source)
+            _log("  [FutuSource] 云端模式: Futu 作为美股主数据源")
+        chain_names = [src.__class__.__name__ for src in providers]
+        chain_names.append("YFinanceSource(兜底)")
+        _log(f"  [USDataSource] 云端降级链: {' → '.join(chain_names)}")
+        return USDataSource(providers=providers)
 
     if mode == "intraday":
         # ── 1. IB（盘中优先）──────────────────────────────

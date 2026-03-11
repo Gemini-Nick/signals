@@ -1,0 +1,23 @@
+# 隆小侠 LONG CLAW — 定时分析任务 (北京时间 Asia/Shanghai)
+# 安装: crontab /etc/cron.d/signals-cron
+
+# ── A股/港股 盘中扫描 ──────────────────────────
+# 开盘前仅指数快报 (9:25)
+25 9 * * 1-5  cd /app && python run.py --mode index >> /app/logs/cron.log 2>&1
+
+# 盘中全量扫描 (9:45, 10:30, 11:15, 13:30, 14:30)
+45 9 * * 1-5   cd /app && python run.py >> /app/logs/cron.log 2>&1
+30 10 * * 1-5  cd /app && python run.py >> /app/logs/cron.log 2>&1
+15 11 * * 1-5  cd /app && python run.py >> /app/logs/cron.log 2>&1
+30 13 * * 1-5  cd /app && python run.py >> /app/logs/cron.log 2>&1
+30 14 * * 1-5  cd /app && python run.py >> /app/logs/cron.log 2>&1
+
+# 盘后复盘 (15:15)
+15 15 * * 1-5  cd /app && python run.py --mode review >> /app/logs/cron.log 2>&1
+
+# ── 美股扫描 (北京时间, 夏令时 EST+13) ────────
+30 22 * * 1-5  cd /app && python run.py --market us >> /app/logs/cron.log 2>&1
+0  0  * * 2-6  cd /app && python run.py --market us >> /app/logs/cron.log 2>&1
+
+# ── 日志清理 (每周日凌晨) ─────────────────────
+0 3 * * 0  find /app/logs -name "*.log" -mtime +30 -delete
