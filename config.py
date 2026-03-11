@@ -8,6 +8,11 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
+# ── 部署模式 ─────────────────────────────────────────────
+# "local" → 本地开发（现有行为，所有数据源直连）
+# "cloud" → 中国云部署（跳过 yfinance/IB/Alpaca，用 Futu+AKShare 覆盖美股）
+DEPLOY_MODE = os.getenv("DEPLOY_MODE", "local")
+
 # ── Tushare ──────────────────────────────────────────────
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
 
