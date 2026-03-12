@@ -122,7 +122,7 @@ def get_prediction_overview():
         merged = getattr(scored, "dynamics_merged_score", 0) or 0
         sell_w = getattr(scored, "sell_warning", {}) or {}
 
-        if merged > 20 or (item.get("fused_total", 0) > 50):
+        if merged > 30 and (item.get("fused_total", 0) > 40):
             stock_buy.append(item)
         if sell_w.get("score", 0) > 40:
             stock_sell.append(item)

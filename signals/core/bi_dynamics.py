@@ -190,6 +190,11 @@ def _analyze_ubi_bars(bars_ubi, profile: BiDynamicsProfile):
         if profile.gain_diminishing and vol_shrinking:
             profile.fake_positive = True
 
+        # 补充条件: 实体比过小 + 量能未放大 = 假阳（十字星群）
+        if not profile.fake_positive and len(bars_ubi) >= 3:
+            if profile.avg_body_ratio < 0.3 and not profile.volume_expanding:
+                profile.fake_positive = True
+
 
 def _calc_dynamics_score(profile: BiDynamicsProfile):
     """综合评分 [-100, +100]"""
@@ -209,14 +214,17 @@ def _calc_dynamics_score(profile: BiDynamicsProfile):
             parts.append(f"空加速-{accel}")
     elif profile.power_trend == "衰竭":
         exhaust = w.get("dynamics_exhaust_bonus", 40)
+        exhaust_mult = 0.8  # 对称系数：衰竭信号统一 ×0.8
         if is_up:
             # 上升笔衰竭 → 见顶信号
-            score -= exhaust * 0.6
-            parts.append(f"上衰竭-{exhaust * 0.6:.0f}")
+            penalty = round(exhaust * exhaust_mult)
+            score -= penalty
+            parts.append(f"上衰竭-{penalty}")
         else:
             # 下降笔衰竭 → 见底信号（抄底机会）
-            score += exhaust
-            parts.append(f"下衰竭+{exhaust}")
+            bonus = round(exhaust * exhaust_mult)
+            score += bonus
+            parts.append(f"下衰竭+{bonus}")
 
     # ── ubi 强势延续 ──
     if profile.ubi_momentum == "强势延续":

@@ -291,7 +291,9 @@ def _load_stock_minute_bars(futu_code: str, freq: Freq) -> List[RawBar]:
 # ─────────────────────────────────────────────────────────
 
 def review_stock_daily(symbols: List[str], start_date: str,
-                       with_minute: bool = True) -> list:
+                       with_minute: bool = True,
+                       l2_stats: Optional[dict] = None,
+                       market_ctx: object = None) -> list:
     """
     对指定个股做多级别缠论分析（盘后复盘）。
 
@@ -303,6 +305,8 @@ def review_stock_daily(symbols: List[str], start_date: str,
     :param symbols: Futu格式代码列表
     :param start_date: 'YYYY-MM-DD'
     :param with_minute: 是否追加30min分析（默认True）
+    :param l2_stats: Layer 2 统计数据（用于 regime_mult 计算）
+    :param market_ctx: 市场上下文（用于 regime_mult 计算）
     :return: List[ScoredSymbol] 按评分降序
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -404,6 +408,26 @@ def review_stock_daily(symbols: List[str], start_date: str,
             all_signals = sigs_d + sigs_w + sigs_30
             sc = score_signals(sym, all_signals)
 
+            # 笔动力学分析（对齐盘中 screener 逻辑）
+            try:
+                from signals.core.bi_dynamics import (
+                    analyze_multi_freq_dynamics,
+                    merge_dynamics_score,
+                    get_best_sell_warning,
+                )
+                sym_analyzers = {"日线": az_d}
+                if bars_30:
+                    sym_analyzers["30分钟"] = az_30
+                profiles = analyze_multi_freq_dynamics(sym_analyzers)
+                sc.dynamics_merged_score = merge_dynamics_score(profiles)
+                sc.sell_warning = get_best_sell_warning(profiles)
+                sc.dynamics_profile = profiles.get("日线") or next(
+                    iter(profiles.values()), None)
+                # 临时存储供后续融合使用
+                sc._dynamics = sc.dynamics_profile
+            except Exception:
+                sc._dynamics = None
+
             anal_sec = _time.monotonic() - _t_anal
             total_sec = _time.monotonic() - _t_stock
 
@@ -471,21 +495,31 @@ def review_stock_daily(symbols: List[str], start_date: str,
         _log(f"  [i] Sina 降级: 连续失败{_sina_fails}次, "
              f"成功{ok_count}只, 失败{fail_count}只")
 
-    # ── 异常检测 + 信号融合（复用盘中 screener 同样逻辑）──
+    # ── 异常检测 + 信号融合（对齐盘中 screener 完整流水线）──
     try:
         from signals.core.anomaly import compute_anomaly_profile
         from signals.core.fusion import fuse_scores
         for sc in scored:
             cache_key = f"{sc.symbol.replace('.', '_')}_{datetime.now().strftime('%Y%m%d')}"
             cached = get_cache().get(cache_key)
+            anomaly = None
             if cached and len(cached) >= 25:
                 daily_bars = _records_to_rawbars(cached, sc.symbol)
                 anomaly = compute_anomaly_profile(sc.symbol, daily_bars)
-                if anomaly:
-                    fused = fuse_scores(sc, anomaly)
-                    sc.anomaly_profile = anomaly
-                    sc.fused_score = fused
-                    sc.fused_total = fused.fused_total
+
+            # 取出 _review_one 中计算的 dynamics
+            dynamics = getattr(sc, '_dynamics', None)
+
+            fused = fuse_scores(
+                sc, anomaly,
+                dynamics=dynamics,
+                l2_stats=l2_stats,
+                market_ctx=market_ctx,
+            )
+            if anomaly:
+                sc.anomaly_profile = anomaly
+            sc.fused_score = fused
+            sc.fused_total = fused.fused_total
     except Exception:
         pass  # 异常检测失败不影响主流程
 

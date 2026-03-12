@@ -130,7 +130,7 @@ def _time_decay(sig_dt, ref_dt=None, half_life_days: float = 30.0,
         return 1.0
     import math
     decay = math.pow(0.5, delta_days / half_life_days)
-    return max(decay, 0.1)
+    return max(decay, 0.05)
 
 
 def score_signals(symbol: str, signals: List[SignalEvent],
@@ -238,17 +238,17 @@ def score_signals(symbol: str, signals: List[SignalEvent],
             for lv in (ma_context.support_levels or [])
         )
         if near_support:
-            total += 15
+            total += 8
             nearest = ma_context.support_levels[0] if ma_context.support_levels else None
             ref = f"{nearest.name} {nearest.value:.0f}" if nearest else "支撑位"
             ma_conf = f"回踩{ref}确认"
-            details_lines.append(f"  [均线+15] 买信号+均线支撑确认({ref})")
+            details_lines.append(f"  [均线+8] 买信号+均线支撑确认({ref})")
 
-        # 买信号 + 均线多头排列: +10分
+        # 买信号 + 均线多头排列: +5分
         if ma_context.trend_summary == "多头排列":
-            total += 10
+            total += 5
             ma_conf = (ma_conf + "+多头" if ma_conf else "多头排列")
-            details_lines.append("  [均线+10] 均线多头排列")
+            details_lines.append("  [均线+5] 均线多头排列")
 
         # 买信号 + 均线空头排列: -5分（逆势）
         elif ma_context.trend_summary == "空头排列":
@@ -267,8 +267,11 @@ def score_signals(symbol: str, signals: List[SignalEvent],
                 details_lines.append(f"  [量价-10] 买入信号+缩量(量比{volume_ratio:.1f})")
         elif sell_total > buy_total:
             if volume_ratio >= 1.5:
-                total -= 5
-                details_lines.append(f"  [量价-5] 卖出信号+放量(量比{volume_ratio:.1f})")
+                total -= 10
+                details_lines.append(f"  [量价-10] 卖出信号+放量(量比{volume_ratio:.1f})")
+            elif volume_ratio < 0.7:
+                total += 5
+                details_lines.append(f"  [量价+5] 卖出信号+缩量=假信号(量比{volume_ratio:.1f})")
 
     # ── 社交舆情确认 ──
     social_heat = ""

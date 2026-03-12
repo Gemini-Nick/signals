@@ -35,6 +35,15 @@ class FusedScore:
     detail: str = ""             # 融合明细
 
 
+def fused_sell_penalty(sell_warning_score: float, weights: dict) -> float:
+    """sell_warning 越高，对 fused_total 的扣分越大。"""
+    if sell_warning_score >= 80:
+        return weights.get("sell_warning_extreme", 25)
+    elif sell_warning_score >= 60:
+        return weights.get("sell_warning_high", 15)
+    return 0.0
+
+
 def fuse_scores(
     scored,
     anomaly=None,
@@ -177,13 +186,27 @@ def fuse_scores(
 
     sector_momentum_boost = 0.0
     if sector_mom and sector_mom.momentum_score >= 20:
-        if sector_mom.signal_level == "强":
-            sector_momentum_boost = w.get("sector_momentum_strong", 30)
-        elif sector_mom.signal_level == "中":
-            sector_momentum_boost = w.get("sector_momentum_medium", 15)
-        detail_parts.append(
-            f"板块+{sector_momentum_boost:.0f}({sector_mom.concept_name})"
-        )
+        # 只有个股方向与板块方向一致时才加分
+        stock_dir = getattr(scored, "direction", "")
+        sector_aligned = stock_dir not in ("偏空",)  # 偏空个股不享受板块加分
+        if sector_aligned:
+            if sector_mom.signal_level == "强":
+                sector_momentum_boost = w.get("sector_momentum_strong", 30)
+            elif sector_mom.signal_level == "中":
+                sector_momentum_boost = w.get("sector_momentum_medium", 15)
+            detail_parts.append(
+                f"板块+{sector_momentum_boost:.0f}({sector_mom.concept_name})"
+            )
+        else:
+            detail_parts.append(f"板块方向冲突(个股{stock_dir})")
+
+    # ── 卖点预警折扣（sell_warning 参与融合）──
+    sell_discount = 0.0
+    if dynamics and hasattr(dynamics, 'sell_warning_score'):
+        sw = dynamics.sell_warning_score or 0
+        if sw >= 60:
+            sell_discount = -fused_sell_penalty(sw, w)
+            detail_parts.append(f"卖警{sell_discount:+.0f}(预警{sw})")
 
     # ════════════════════════════════════════════════════════
     # 融合总分
@@ -191,7 +214,7 @@ def fuse_scores(
 
     fused_total = (
         base + anomaly_boost + convergence_bonus + capitulation_bonus
-        + dynamics_boost + sector_momentum_boost
+        + dynamics_boost + sector_momentum_boost + sell_discount
     )
 
     # 置信度分级（综合预测+确认维度）
@@ -265,8 +288,8 @@ def _calc_market_regime_mult(l2_stats: dict, market_ctx=None) -> float:
 
     regime_score = zt_score * 0.4 + vol_score * 0.4 + lianban_score * 0.2
 
-    # 映射到 [0.15, 1.0]
-    return round(0.15 + regime_score * 0.85, 2)
+    # 映射到 [0.30, 1.0]（熊市保留 30% 信号价值）
+    return round(0.30 + regime_score * 0.70, 2)
 
 
 def _get_market_volume_ratio(market_ctx) -> float:

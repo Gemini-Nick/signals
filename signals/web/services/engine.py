@@ -301,7 +301,11 @@ class WebEngine:
 
             from signals.layers.review_screener import review_stock_daily
             start = (_dt.now() - timedelta(days=60)).strftime("%Y-%m-%d")
-            scored = review_stock_daily(all_symbols, start, with_minute=False)
+            scored = review_stock_daily(
+                all_symbols, start, with_minute=False,
+                l2_stats=self._state.l2_stats,
+                market_ctx=self._state.market_context,
+            )
 
             # 注入公司名称
             try:

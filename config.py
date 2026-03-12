@@ -334,12 +334,15 @@ FUSION_WEIGHTS = {
     "anomaly_gap_boost": 5,        # 异常跳空加分 (10→5)
     "anomaly_range_boost": 3,      # 异常波动加分 (5→3)
     "anomaly_body_boost": 6,       # 异常大阳/大阴加分 (12→6)
-    "convergence_3dim": 10,        # ≥3维收敛加分 (20→10)
-    "convergence_2dim": 6,         # 2维收敛加分 (12→6)
-    "convergence_1dim": 3,         # 1维异常加分 (5→3)
-    "capitulation_extreme": 12,    # 极度割肉加分 (25→12)
-    "capitulation_high": 8,        # 恐慌割肉加分 (15→8)
-    "capitulation_medium": 4,      # 偏弱割肉加分 (8→4)
+    "convergence_3dim": 20,        # ≥3维收敛加分
+    "convergence_2dim": 12,        # 2维收敛加分
+    "convergence_1dim": 6,         # 1维异常加分
+    "capitulation_extreme": 24,    # 极度割肉加分
+    "capitulation_high": 16,       # 恐慌割肉加分
+    "capitulation_medium": 8,      # 偏弱割肉加分
+    # ─── 卖点预警折扣 ───
+    "sell_warning_extreme": 25,    # sell_warning≥80 扣分
+    "sell_warning_high": 15,       # sell_warning≥60 扣分
     # ─── 动力学预测（主导权重 60%）───
     "dynamics_accel_bonus": 45,    # 笔加速 → 启动点信号（最强）
     "dynamics_exhaust_bonus": 40,  # 笔衰竭见底 → 抄底点信号
