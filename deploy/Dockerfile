@@ -21,5 +21,6 @@ RUN mkdir -p /app/.data /app/logs
 COPY deploy/scripts/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+EXPOSE 8000
+
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["python", "run.py"]

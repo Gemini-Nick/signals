@@ -19,7 +19,7 @@ services:
       timeout: 5s
       retries: 3
 
-  # ── 分析引擎 (主应用) ────────────────────────
+  # ── 分析引擎 + Web 预览 ────────────────────────
   signals:
     build:
       context: ..
@@ -33,6 +33,8 @@ services:
       - FEISHU_RECEIVE_ID=${FEISHU_RECEIVE_ID}
       - DEPLOY_MODE=cloud
       - TZ=Asia/Shanghai
+    ports:
+      - "${WEB_PORT:-8000}:8000"   # Web 预览端口
     depends_on:
       futu-opend:
         condition: service_healthy
@@ -42,17 +44,7 @@ services:
       - signals-logs:/app/logs            # 日志持久化
       - ./cron/signals-cron:/etc/cron.d/signals-cron:ro
 
-  # ── Redis 缓存 (可选, 后续扩展用) ───────────
-  redis:
-    image: redis:7-alpine
-    container_name: redis
-    restart: unless-stopped
-    volumes:
-      - redis-data:/data
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
-
 volumes:
   futu-data:
   signals-data:
-  redis-data:
   signals-logs:
