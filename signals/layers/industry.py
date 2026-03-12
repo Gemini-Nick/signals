@@ -10,7 +10,7 @@
 
 数据源降级链（新浪/THS 优先，东财备选）：
   行业涨幅排行: 同花顺 → 东财 → 缓存
-  行业 K 线:    东财 → 同花顺 → pytdx → 缓存
+  行业 K 线:    同花顺 → 东财 → pytdx → 缓存
   行业成分股:   同花顺 → 东财 → pytdx → 缓存
   概念板块排行: 新浪 → 东财 → 同花顺 → 缓存 → 硬编码
 """
@@ -1080,7 +1080,7 @@ def get_industry_bars(industry: str,
                       start_date: str = None):
     """
     获取行业板块日线 K 线。
-    降级链：东财(6s) → 同花顺(12s) → 磁盘缓存(24h) → 空
+    降级链：同花顺(12s) → 东财(6s) → 磁盘缓存(24h) → 空
 
     :param industry:     行业名称，如 "有色金属"
     :param lookback_days: 盘中模式：近 N 自然日（默认180）
@@ -1098,22 +1098,22 @@ def get_industry_bars(industry: str,
         s_date = (today - timedelta(days=lookback_days)).strftime("%Y%m%d")
     e_date = today.strftime("%Y%m%d")
 
-    # 1. 东财
-    df = _get_industry_bars_em(industry, s_date, e_date)
-    if df is not None:
-        bars = _to_raw_bars(df, industry, Freq.D,
-                            "dt", "open", "high", "low", "close", "vol", "amount")
-        if bars:
-            _save_bars_cache(industry, bars, source="em")
-            return bars
-
-    # 2. 同花顺降级
+    # 1. 同花顺优先（云端不封）
     df = _get_industry_bars_ths(industry, s_date, e_date)
     if df is not None:
         bars = _to_raw_bars(df, industry, Freq.D,
                             "dt", "open", "high", "low", "close", "vol", "amount")
         if bars:
             _save_bars_cache(industry, bars, source="ths")
+            return bars
+
+    # 2. 东财备选
+    df = _get_industry_bars_em(industry, s_date, e_date)
+    if df is not None:
+        bars = _to_raw_bars(df, industry, Freq.D,
+                            "dt", "open", "high", "low", "close", "vol", "amount")
+        if bars:
+            _save_bars_cache(industry, bars, source="em")
             return bars
 
     # 3. 磁盘缓存
