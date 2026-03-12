@@ -92,6 +92,39 @@ def get_industry_ranking():
     }
 
 
+@router.get("/concept-ranking")
+def get_concept_ranking():
+    """
+    获取概念板块综合排行（过滤噪音、多维评分、关联行业）。
+    L2 未完成时返回 loading 状态。
+    """
+    engine = get_engine()
+    status = engine.get_status()
+    if status.get("loading_phase") in ("L1", "L2"):
+        return {"loading": True, "phase": status.get("loading_phase", "L2")}
+
+    concepts = engine.get_concepts()
+    concept_list = []
+    for c in concepts:
+        total = c.up_count + c.down_count
+        up_ratio = round(c.up_count / total * 100, 1) if total > 0 else 0
+        concept_list.append({
+            "name": c.name,
+            "code": c.code,
+            "composite_score": round(c.composite_score, 1),
+            "gain_pct": round(c.gain_pct, 2),
+            "up_count": c.up_count,
+            "down_count": c.down_count,
+            "up_ratio": up_ratio,
+            "turnover_rate": round(c.turnover_rate, 2),
+            "leading_stock": c.leading_stock,
+            "leading_gain": round(c.leading_gain, 2),
+            "sector_type": c.sector_type,
+            "related_industries": c.related_industries,
+        })
+    return {"concept_list": concept_list}
+
+
 @router.get("/detail/{name}")
 def get_industry_detail(name: str):
     """

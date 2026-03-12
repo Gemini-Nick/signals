@@ -364,21 +364,48 @@ class IntraDayScreener:
             if dash:
                 dash.task_done("L3.scan", sym)
 
-        # 异常检测 + 信号融合
+        # 异常检测 + 笔动力学 + 信号融合
         try:
             from signals.core.anomaly import compute_anomaly_profile
             from signals.core.fusion import fuse_scores
+            from signals.core.bi_dynamics import (
+                analyze_bi_dynamics, analyze_multi_freq_dynamics,
+                merge_dynamics_score, get_best_sell_warning,
+            )
             for scored in results:
                 daily_bars = self._get_daily_bars(scored.symbol)
+                anomaly = None
                 if daily_bars and len(daily_bars) >= 25:
                     anomaly = compute_anomaly_profile(scored.symbol, daily_bars)
-                    if anomaly:
-                        fused = fuse_scores(scored, anomaly)
-                        scored.anomaly_profile = anomaly
-                        scored.fused_score = fused
-                        scored.fused_total = fused.fused_total
+
+                # 笔动力学（多级别）
+                dynamics = None
+                dynamics_merged = 0.0
+                sell_warning = {}
+                sym_analyzers = self.analyzers.get(scored.symbol, {})
+                if sym_analyzers:
+                    profiles = analyze_multi_freq_dynamics(sym_analyzers)
+                    dynamics_merged = merge_dynamics_score(profiles)
+                    sell_warning = get_best_sell_warning(profiles)
+                    # 日线动力学作为主 dynamics 传入融合
+                    dynamics = profiles.get("日线") or next(iter(profiles.values()), None)
+
+                fused = fuse_scores(
+                    scored, anomaly,
+                    dynamics=dynamics,
+                    l2_stats=getattr(self, '_l2_stats', None),
+                    market_ctx=getattr(self, '_market_ctx', None),
+                )
+                if anomaly:
+                    scored.anomaly_profile = anomaly
+                scored.fused_score = fused
+                scored.fused_total = fused.fused_total
+                # 附加动力学数据供 API 使用
+                scored.dynamics_merged_score = dynamics_merged
+                scored.sell_warning = sell_warning
+                scored.dynamics_profile = dynamics
         except Exception:
-            pass  # 异常检测失败不影响主流程
+            pass  # 异常/动力学检测失败不影响主流程
 
         # 排序: 有融合分用融合分，否则用缠论原始分
         results.sort(key=lambda x: x.fused_total if x.fused_total else x.total_score,

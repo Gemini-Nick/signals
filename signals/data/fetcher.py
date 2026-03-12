@@ -56,6 +56,140 @@ def no_proxy():
 # 兼容内部引用
 _no_proxy = no_proxy
 
+
+def em_call_with_retry(fn, *args, retries: int = 3, delay: float = 0.5, **kwargs):
+    """
+    东财 API 调用封装：自动重试 + Clash TUN 全局模式自动修复。
+
+    根因：Clash Verge (mihomo) TUN + fake-ip + mode=global 时，
+    东财 push2.eastmoney.com 流量经过代理转发导致连接断开。
+    解决：检测到连接失败时，自动通过 Clash API 将模式切为 rule，
+    使无规则匹配的国内流量直连。
+
+    :param fn: akshare 函数（如 ak.stock_board_concept_cons_em）
+    :param retries: 最大重试次数（默认 3 次）
+    :param delay: 重试间隔秒数（默认 0.5s）
+    """
+    import time as _time
+    import ssl
+    import urllib3
+
+    _TRANSIENT = (
+        ssl.SSLError,
+        ConnectionError,
+        ConnectionResetError,
+        ConnectionAbortedError,
+        urllib3.exceptions.ProtocolError,
+    )
+    try:
+        from requests.exceptions import ConnectionError as ReqConnErr
+        _TRANSIENT = _TRANSIENT + (ReqConnErr,)
+    except ImportError:
+        pass
+
+    last_err = None
+    for attempt in range(retries):
+        try:
+            with no_proxy():
+                return fn(*args, **kwargs)
+        except _TRANSIENT as e:
+            last_err = e
+            # 首次失败时尝试修复 Clash 全局代理
+            if attempt == 0:
+                _try_fix_clash_global_mode()
+            if attempt < retries - 1:
+                _time.sleep(delay * (attempt + 1))
+            continue
+    raise last_err
+
+
+# ─── Clash TUN 全局模式检测 & 自动修复 ───────────────────
+
+_CLASH_FIX_ATTEMPTED = False
+_CLASH_ORIGINAL_MODE = None
+
+
+def _try_fix_clash_global_mode():
+    """
+    检测 Clash Verge (mihomo) 是否以 TUN + global 模式运行。
+    如果是，自动切换到 rule 模式使国内流量直连。
+
+    Clash API 通过 Unix Socket 通信（/tmp/verge/verge-mihomo.sock）。
+    """
+    global _CLASH_FIX_ATTEMPTED, _CLASH_ORIGINAL_MODE
+    if _CLASH_FIX_ATTEMPTED:
+        return
+    _CLASH_FIX_ATTEMPTED = True
+
+    import logging
+    log = logging.getLogger("signals.data.clash_fix")
+
+    sock_path = "/tmp/verge/verge-mihomo.sock"
+    if not os.path.exists(sock_path):
+        return  # Clash 未运行
+
+    try:
+        import urllib.request
+        import json
+        import http.client
+        import socket
+
+        # 通过 Unix Socket 连接 Clash API
+        class _UnixConnection(http.client.HTTPConnection):
+            def __init__(self, sock_path):
+                super().__init__("localhost")
+                self._sock_path = sock_path
+
+            def connect(self):
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.connect(self._sock_path)
+
+        conn = _UnixConnection(sock_path)
+
+        # 获取当前模式
+        conn.request("GET", "/configs")
+        resp = conn.getresponse()
+        cfg = json.loads(resp.read())
+        current_mode = cfg.get("mode", "")
+
+        if current_mode != "global":
+            log.debug(f"Clash 模式为 {current_mode}，无需修复")
+            conn.close()
+            return
+
+        # 检查 TUN 是否启用
+        tun = cfg.get("tun", {})
+        if not tun.get("enable"):
+            conn.close()
+            return
+
+        # global + TUN = 所有流量走代理，国内数据源会失败
+        _CLASH_ORIGINAL_MODE = current_mode
+        log.warning(
+            "检测到 Clash Verge TUN + global 模式，"
+            "东财等国内数据源流量被代理转发导致连接失败。"
+            "自动切换到 rule 模式使国内流量直连。"
+        )
+
+        # 切换到 rule 模式
+        conn2 = _UnixConnection(sock_path)
+        body = json.dumps({"mode": "rule"}).encode()
+        conn2.request(
+            "PATCH", "/configs",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp2 = conn2.getresponse()
+        if resp2.status == 204 or resp2.status == 200:
+            log.warning("✅ 已将 Clash 切换到 rule 模式（国内流量直连）")
+        else:
+            log.warning(f"Clash 模式切换失败: HTTP {resp2.status}")
+        conn.close()
+        conn2.close()
+
+    except Exception as e:
+        log.debug(f"Clash 检测/修复失败（非致命）: {e}")
+
 # 统一使用已安装的 czsc（0.10.11，Rust 加速版）
 from czsc import RawBar, Freq
 

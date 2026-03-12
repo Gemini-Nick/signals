@@ -116,6 +116,7 @@ class StockDeepDive:
         self.volume: Optional[VolumeProfile] = None
         self.pivots: List[PivotPoint] = []
         self.scenarios: List[Scenario] = []
+        self.freq_analyzers: Dict[str, SymbolAnalyzer] = {}  # freq_label -> SymbolAnalyzer
 
         self._errors: List[str] = []
         self._data_sources: Dict[str, str] = {}
@@ -283,6 +284,7 @@ class StockDeepDive:
                 zs_range=(zs.zd, zs.zg) if zs else None,
                 latest_bis=latest_bis,
             )
+            self.freq_analyzers[label] = analyzer
 
         # 均线
         self.ma_context = compute_ma_levels(self.daily_bars, self.symbol)
@@ -487,6 +489,9 @@ class StockDeepDive:
         if daily_tf.trend == "上涨趋势":
             bull_evidence.append("日线上涨趋势")
             bull_prob = "偏高"
+        elif daily_tf.trend == "反弹修复":
+            bull_evidence.append("日线反弹修复中")
+            bull_prob = "偏高"
         if ma_trend == "多头排列":
             bull_evidence.append("均线多头")
             bull_prob = "偏高"
@@ -517,6 +522,8 @@ class StockDeepDive:
 
         if daily_tf.trend == "下跌趋势" and ma_trend == "空头排列":
             bull_prob = "偏低"
+        if daily_tf.trend == "反弹修复":
+            bull_prob = max(bull_prob, "中等") if bull_prob == "偏低" else bull_prob
 
         trigger = ("，".join(bull_evidence) if bull_evidence
                    else "价格站稳 {:.2f}".format(nearest_sup) if nearest_sup
@@ -537,6 +544,9 @@ class StockDeepDive:
 
         if daily_tf.trend == "下跌趋势":
             bear_evidence.append("日线下跌趋势")
+            bear_prob = "偏高"
+        elif daily_tf.trend == "回调修正":
+            bear_evidence.append("日线回调修正中")
             bear_prob = "偏高"
         if ma_trend == "空头排列":
             bear_evidence.append("均线空头压制")
@@ -559,7 +569,7 @@ class StockDeepDive:
             if recent_lows:
                 bear_targets.append(max(recent_lows))
 
-        if daily_tf.trend == "上涨趋势" and ma_trend == "多头排列":
+        if daily_tf.trend in ("上涨趋势", "反弹修复") and ma_trend != "空头排列":
             bear_prob = "偏低"
 
         trigger = ("，".join(bear_evidence) if bear_evidence

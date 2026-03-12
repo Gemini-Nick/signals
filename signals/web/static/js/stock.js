@@ -133,6 +133,11 @@ function renderStockResult(data) {
     html += renderAnomalyRadar(data.anomaly, data.fused);
   }
 
+  // 1.6 笔动力学（多级别）
+  if (data.bi_dynamics) {
+    html += renderBiDynamics(data.bi_dynamics);
+  }
+
   // 2. MA 均线
   if (data.ma_context && data.ma_context.trend_summary) {
     const ma = data.ma_context;
@@ -160,7 +165,8 @@ function renderStockResult(data) {
     html += `<div class="stock-section"><div class="stock-section-title">多级别缠论结构</div>`;
     html += '<div class="stock-tf-grid">';
     tfEntries.forEach(([label, tf]) => {
-      const trendCls = tf.trend === '上涨趋势' ? 'up' : tf.trend === '下跌趋势' ? 'down' : 'flat';
+      const trendCls = (tf.trend === '上涨趋势' || tf.trend === '反弹修复') ? 'up'
+        : (tf.trend === '下跌趋势' || tf.trend === '回调修正') ? 'down' : 'flat';
       html += `<div class="stock-tf-card">
         <div class="stock-tf-freq">${label}</div>
         <div class="stock-tf-trend ${trendCls}">${tf.trend}</div>
@@ -354,6 +360,46 @@ function initStockPage() {
       if (e.key === 'Enter') analyzeStock();
     });
   }
+}
+
+// ── 笔动力学卡片 ─────────────────────────────────────
+function renderBiDynamics(bd) {
+  if (!bd || !bd.levels) return '';
+  const freqOrder = ['日线', '30分钟', '15分钟'];
+  let html = '<div class="stock-section dynamics-card"><div class="stock-section-title">笔动力学</div>';
+  html += '<div class="stock-tf-grid">';
+
+  freqOrder.forEach(freq => {
+    const p = bd.levels[freq];
+    if (!p) return;
+    const scoreCls = p.dynamics_score > 30 ? 'up' : p.dynamics_score < -30 ? 'down' : 'flat';
+    const trendIcon = p.power_trend === '加速' ? '▲' : p.power_trend === '衰竭' ? '▼' : '—';
+    const fakeWarn = p.fake_positive ? ' <span class="tag tag-warn">假阳</span>' : '';
+    html += `<div class="stock-tf-card">
+      <div class="stock-tf-freq">${freq}</div>
+      <div class="stock-tf-detail">
+        <span class="${scoreCls}">${trendIcon}${p.power_trend}(${p.power_ratio}x)</span>
+        ubi: ${p.ubi_momentum} ${p.ubi_bar_count}bar${fakeWarn}
+      </div>
+      <div class="stock-tf-detail">
+        阳线${p.consecutive_bullish} ${p.volume_expanding ? '放量' : ''}
+        <span class="${scoreCls}" style="font-weight:600;">${p.dynamics_score > 0 ? '+' : ''}${p.dynamics_score}</span>
+      </div>
+      <div class="stock-tf-signal ${scoreCls}">${p.signal}</div>
+    </div>`;
+  });
+
+  html += '</div>';
+
+  // 融合分 + 卖点预警
+  html += '<div class="dynamics-summary">';
+  html += `<span class="dynamics-merged">融合预测分: <strong>${bd.merged_score > 0 ? '+' : ''}${bd.merged_score}</strong></span>`;
+  if (bd.sell_warning && bd.sell_warning.score > 40) {
+    const warnCls = bd.sell_warning.score > 60 ? 'warn-high' : 'warn-mid';
+    html += `<span class="dynamics-sell-warn ${warnCls}">⚠ 卖点预警 ${bd.sell_warning.score} (${bd.sell_warning.warning})</span>`;
+  }
+  html += '</div></div>';
+  return html;
 }
 
 window.analyzeStock = analyzeStock;

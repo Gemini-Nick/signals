@@ -64,6 +64,12 @@ class EngineState:
     # L2 统计数据 (用于恐慌检测、抄底候选等)
     l2_stats: Dict = field(default_factory=dict)  # {zt_total, dt_total, name_df, ...}
 
+    # 板块动量 (预测维度)
+    momentum_signals: List[object] = field(default_factory=list)  # SectorMomentumSignal[]
+
+    # 时段模式
+    session_mode: Optional[object] = None  # SessionMode
+
     # 状态
     last_update: float = 0.0
     is_running: bool = False
@@ -238,11 +244,15 @@ class WebEngine:
             with self._lock:
                 self._state.is_running = False
 
-    def run_l2(self):
+    def run_l2(self, session=None):
         """运行 Layer 2 行业分析（同步，阻塞）"""
         try:
             from signals.layers.industry import get_industry_representatives
-            gain, composite, merged, concepts, oversold, sentiment_stats = get_industry_representatives()
+            kwargs = {}
+            if session and not session.a_live:
+                from datetime import datetime as _dt
+                kwargs["date_str"] = _dt.now().strftime("%Y%m%d")
+            gain, composite, merged, concepts, oversold, sentiment_stats = get_industry_representatives(**kwargs)
             with self._lock:
                 self._state.gain_list = gain
                 self._state.composite_list = composite
@@ -254,25 +264,85 @@ class WebEngine:
             import logging
             logging.getLogger(__name__).warning("L2 行业分析失败: %s", e)
 
-    def run_l3(self):
-        """运行 Layer 3 标的筛选（并行处理多行业）"""
+        # 板块动量扫描（预测维度，嵌入 L2 主流程）
+        try:
+            from signals.core.sector_momentum import scan_hot_sectors
+            concept_names = [c.name for c in (self._state.concepts or [])[:30]]
+            if concept_names:
+                momentum = scan_hot_sectors(concept_names=concept_names, top_n=10)
+                with self._lock:
+                    self._state.momentum_signals = momentum
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("板块动量扫描失败: %s", e)
+
+    def run_l3(self, session=None):
+        """运行 Layer 3 标的筛选（并行处理多行业 + 动量板块领涨股）"""
+        if session and session.use_daily_l3:
+            self._run_l3_daily()
+        else:
+            self._run_l3_intraday()
+
+    def _run_l3_daily(self):
+        """盘后 L3: 使用日线 review_screener（不拉分钟线）"""
+        try:
+            import config
+            from datetime import datetime as _dt, timedelta
+            merged = self._state.merged_list
+            ranking_stocks = []
+            for r in (merged or []):
+                ranking_stocks.extend(r.pool_codes)
+            ranking_stocks = list(dict.fromkeys(ranking_stocks))
+            all_symbols = list(dict.fromkeys(
+                config.WHITELIST + ranking_stocks))
+
+            if not all_symbols:
+                return
+
+            from signals.layers.review_screener import review_stock_daily
+            start = (_dt.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+            scored = review_stock_daily(all_symbols, start, with_minute=False)
+
+            # 注入公司名称
+            try:
+                from signals.core.stock_names import get_resolver
+                resolver = get_resolver()
+                if merged:
+                    resolver.inject_from_rankings(merged)
+                for s in scored:
+                    if not s.name:
+                        s.name = resolver.get_name(s.symbol)
+            except Exception:
+                pass
+
+            with self._lock:
+                self._state.scored_symbols = scored
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("L3 日线分析失败: %s", e)
+
+    def _run_l3_intraday(self):
+        """盘中 L3: 使用 IntraDayScreener（分钟线）"""
         try:
             from signals.layers.screener import IntraDayScreener
             merged = self._state.merged_list
             if not merged:
                 return
-            screener = IntraDayScreener()
             all_scored = []
 
-            # 并行处理前 5 个行业（每个行业内部自己有 ThreadPool 拉数据）
-            # 用 2 个 worker 避免线程爆炸（每个 worker 内部最多 12 线程）
+            # 行业列表 + 动量板块领涨股入池
             industries = [ind.name for ind in merged[:8]]
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
+            # 传递 l2_stats 和 market_ctx 给 screener
+            l2_stats = self._state.l2_stats
+            market_ctx = self._state.market_context
+
             def _scan_one(ind_name):
                 try:
-                    # 每个行业用独立 screener 避免状态冲突
                     s = IntraDayScreener()
+                    s._l2_stats = l2_stats
+                    s._market_ctx = market_ctx
                     return s.run_industry(ind_name)
                 except Exception:
                     return []
@@ -284,11 +354,33 @@ class WebEngine:
                     scored = f.result()
                     if scored:
                         all_scored.extend(scored)
-            # 按分数排序去重
+
+            # 动量板块领涨股作为额外入池来源
+            momentum_symbols = set()
+            for sig in (self._state.momentum_signals or [])[:5]:
+                for mover in (sig.top_movers or [])[:3]:
+                    if mover.code:
+                        momentum_symbols.add(mover.code)
+            # 去掉已扫过的
+            existing = {s.symbol for s in all_scored}
+            new_momentum = [s for s in momentum_symbols if s not in existing]
+            if new_momentum:
+                try:
+                    s = IntraDayScreener(symbols=new_momentum)
+                    s._l2_stats = l2_stats
+                    s._market_ctx = market_ctx
+                    s.init_analyzers()
+                    momentum_scored = s.scan_once()
+                    all_scored.extend(momentum_scored)
+                except Exception:
+                    pass
+
+            # 按分数排序去重（优先融合分）
             seen = set()
             unique = []
             for s in sorted(all_scored,
-                            key=lambda x: x.total_score, reverse=True):
+                            key=lambda x: x.fused_total if x.fused_total else x.total_score,
+                            reverse=True):
                 if s.symbol not in seen:
                     seen.add(s.symbol)
                     unique.append(s)
@@ -380,6 +472,10 @@ class WebEngine:
     def get_l2_stats(self) -> dict:
         """获取 L2 统计数据（含 name_df 等）"""
         return self._state.l2_stats or {}
+
+    def get_momentum_signals(self) -> list:
+        """获取板块动量信号列表"""
+        return self._state.momentum_signals or []
 
     def get_industry_ranking_by_name(self, name: str):
         """按行业名称查找 IndustryRanking 对象"""
@@ -908,8 +1004,9 @@ class WebEngine:
         return self._state.last_update > 0
 
     def get_status(self) -> dict:
-        """返回引擎状态摘要"""
-        return {
+        """返回引擎状态摘要（含时段信息）"""
+        session = self._state.session_mode
+        result = {
             "ready": self.is_ready(),
             "running": self._state.is_running,
             "last_update": self._state.last_update,
@@ -918,27 +1015,52 @@ class WebEngine:
             "signal_count": len(self._state.scored_symbols),
             "loading_phase": self._state.loading_phase,
         }
+        if session:
+            from datetime import datetime as _dt
+            data_as_of = ""
+            if self._state.last_update:
+                data_as_of = _dt.fromtimestamp(
+                    self._state.last_update).strftime("%H:%M")
+            result.update({
+                "session_mode": session.name,
+                "session_label": session.label,
+                "a_live": session.a_live,
+                "hk_live": session.hk_live,
+                "us_live": session.us_live,
+                "refresh_interval": session.refresh_interval,
+                "data_as_of": data_as_of,
+            })
+        return result
 
     def run_all_async(self):
-        """L1+L2 并行启动，L3 等 L1+L2 都完成后执行"""
+        """L1+L2 并行启动，L3 等 L1+L2 都完成后执行。自动检测时段。"""
         import time as _time
+        from signals.core.market_hours import get_session_mode
+
+        session = get_session_mode()
+        self._state.session_mode = session
 
         def _worker():
             import logging
-            from concurrent.futures import ThreadPoolExecutor, as_completed
             log = logging.getLogger(__name__)
             t0 = _time.monotonic()
             try:
+                # 预加载 layers 包，避免 L1/L2 并行线程争抢模块锁导致 deadlock
+                import signals.layers  # noqa: F401
+
                 # ── Phase 1: L1 + L2 并行 ──────────────────────
                 self._state.loading_phase = "L1"
+                print(f"   [后台] 时段={session.label} "
+                      f"(A={'✅' if session.a_live else '❌'} "
+                      f"H={'✅' if session.hk_live else '❌'} "
+                      f"US={'✅' if session.us_live else '❌'})")
                 print("   [后台] L1+L2 并行启动...")
 
-                l2_result = [None]  # 用列表存结果以便闭包赋值
                 l2_error = [None]
 
                 def _run_l2():
                     try:
-                        self.run_l2()
+                        self.run_l2(session=session)
                     except Exception as e:
                         l2_error[0] = e
 
@@ -966,9 +1088,10 @@ class WebEngine:
 
                 # ── Phase 2: L3 串行（依赖 L1+L2 结果）────────
                 self._state.loading_phase = "L3"
-                log.info("后台加载: L3 标的筛选...")
-                print("   [后台] 运行 Layer 3 标的筛选...")
-                self.run_l3()
+                l3_mode = "日线复盘" if session.use_daily_l3 else "分钟线盘中"
+                log.info("后台加载: L3 标的筛选 (%s)...", l3_mode)
+                print(f"   [后台] 运行 Layer 3 标的筛选 ({l3_mode})...")
+                self.run_l3(session=session)
                 t3 = _time.monotonic() - t0
                 print(f"   [后台] L3 完成 ({t3:.1f}s)")
 
@@ -976,12 +1099,33 @@ class WebEngine:
                 total = _time.monotonic() - t0
                 log.info("后台加载: 全部完成")
                 print(f"   [后台] ✅ 全部分析完成 (总计 {total:.1f}s)")
+
+                # ── 自动刷新定时器 ──
+                if session.refresh_interval > 0:
+                    self._schedule_refresh(session.refresh_interval)
+
             except Exception as e:
                 log.error("后台加载失败: %s", e, exc_info=True)
                 self._state.error = str(e)
                 self._state.loading_phase = ""
 
         t = threading.Thread(target=_worker, daemon=True, name="engine-loader")
+        t.start()
+
+    def _schedule_refresh(self, interval: int):
+        """盘中自动刷新：等待 interval 秒后重新检测时段并刷新。"""
+        def _tick():
+            time.sleep(interval)
+            from signals.core.market_hours import get_session_mode
+            new_session = get_session_mode()
+            self._state.session_mode = new_session
+            if new_session.refresh_interval > 0 and not self._state.is_running:
+                print(f"   [自动刷新] {new_session.label} — 重新加载...")
+                self.run_all_async()
+            else:
+                print(f"   [自动刷新] {new_session.label} — 已停止刷新")
+
+        t = threading.Thread(target=_tick, daemon=True, name="auto-refresh")
         t.start()
 
 

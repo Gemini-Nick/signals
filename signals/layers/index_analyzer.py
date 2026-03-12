@@ -20,10 +20,18 @@ from .index_report import IndexReport, ZSLevel
 # ─────────────────────────────────────────────────────────
 
 def _determine_trend(analyzer: SymbolAnalyzer) -> str:
-    """根据最近4笔高低点的序列判断趋势"""
+    """
+    根据完成笔结构 + 未完成笔进展判断趋势。
+
+    逻辑:
+    1. 先看最后4根完成笔的高低点序列（结构趋势）
+    2. 再考虑当前未完成笔的力度 — 如果未完成笔已经大幅反转（力度超前笔50%），
+       则将结构趋势修正为"转折中"（不再简单标注下跌/上涨）
+    """
     bis = analyzer.finished_bis
     if len(bis) < 4:
         return "结构未成型"
+
     last4 = bis[-4:]
     highs = [b.high for b in last4]
     lows  = [b.low  for b in last4]
@@ -31,11 +39,35 @@ def _determine_trend(analyzer: SymbolAnalyzer) -> str:
     low_up  = lows[-1]  > lows[0]
     high_dn = highs[-1] < highs[0]
     low_dn  = lows[-1]  < lows[0]
+
+    # 结构趋势
     if high_up and low_up:
-        return "上涨趋势"
-    if high_dn and low_dn:
-        return "下跌趋势"
-    return "中枢震荡"
+        struct = "上涨趋势"
+    elif high_dn and low_dn:
+        struct = "下跌趋势"
+    else:
+        struct = "中枢震荡"
+
+    # 考虑未完成笔：bars_ubi 是当前未完成笔中的K线
+    try:
+        bars_ubi = analyzer.czsc.bars_ubi
+        if bars_ubi and len(bars_ubi) >= 2 and len(bis) >= 2:
+            last_bi = bis[-1]
+            last_power = last_bi.power_price
+            ubi_high = max(bar.high for bar in bars_ubi)
+            ubi_low = min(bar.low for bar in bars_ubi)
+            ubi_power = ubi_high - ubi_low
+
+            # 如果未完成笔力度超过前笔50%，表明可能正在发生趋势转折
+            if last_power > 0 and ubi_power / last_power > 0.5:
+                if struct == "下跌趋势" and last_bi.direction == Direction.Down:
+                    struct = "反弹修复"
+                elif struct == "上涨趋势" and last_bi.direction == Direction.Up:
+                    struct = "回调修正"
+    except Exception:
+        pass  # czsc 版本差异
+
+    return struct
 
 
 def _last_direction(analyzer: SymbolAnalyzer) -> str:

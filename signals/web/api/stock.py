@@ -204,6 +204,51 @@ def analyze_stock(symbol: str):
             for p in dive.pivots[:8]
         ]
 
+        # 笔动力学（多级别）
+        try:
+            from signals.core.bi_dynamics import (
+                analyze_multi_freq_dynamics, merge_dynamics_score,
+                get_best_sell_warning,
+            )
+            dynamics_profiles = getattr(dive, "freq_analyzers", {}) or {}
+            if dynamics_profiles:
+                profiles = analyze_multi_freq_dynamics(dynamics_profiles)
+                merged_score = merge_dynamics_score(profiles)
+                sell_warning = get_best_sell_warning(profiles)
+                result["bi_dynamics"] = {
+                    "merged_score": round(merged_score, 1),
+                    "sell_warning": sell_warning,
+                    "levels": {
+                        freq: {
+                            "signal": p.signal,
+                            "dynamics_score": round(p.dynamics_score, 1),
+                            "power_trend": p.power_trend,
+                            "power_ratio": round(p.power_ratio, 3),
+                            "ubi_momentum": p.ubi_momentum,
+                            "ubi_bar_count": p.ubi_bar_count,
+                            "consecutive_bullish": p.consecutive_bullish,
+                            "volume_expanding": p.volume_expanding,
+                            "fake_positive": p.fake_positive,
+                            "detail": p.detail,
+                        }
+                        for freq, p in profiles.items()
+                    },
+                }
+            else:
+                result["bi_dynamics"] = None
+        except Exception:
+            result["bi_dynamics"] = None
+
+        # 融合评分补充动力学/板块字段
+        if result.get("fused") and result["bi_dynamics"]:
+            result["fused"]["dynamics_boost"] = round(
+                getattr(fused, "dynamics_boost", 0), 1
+            )
+            result["fused"]["sector_momentum"] = round(
+                getattr(fused, "sector_momentum", 0), 1
+            )
+            result["fused"]["regime_mult"] = getattr(fused, "regime_mult", 1.0)
+
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"序列化失败: {e}")

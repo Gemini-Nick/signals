@@ -234,13 +234,91 @@ function _stockPanel(candidates, panelId) {
   </div>`;
 }
 
+// ── 概念板块排行（主视图）──────────────────────────────
+let _cachedIndustryData = null;
+let _cachedConceptData = null;
+
+function renderConceptRanking(data) {
+  const container = document.getElementById('industry-section');
+  if (!data || !data.concept_list || data.concept_list.length === 0) {
+    _renderIndustryTabs('concept', '<div class="empty-state">概念数据未加载</div>');
+    return;
+  }
+
+  let html = '';
+  html += '<div class="industry-panorama"><table>';
+  html += '<tr><th>#</th><th>概念</th><th>综合</th><th>涨幅</th><th>涨/跌</th><th>换手</th><th>领涨</th><th>属性</th></tr>';
+  data.concept_list.forEach((c, i) => {
+    const pctCls = c.gain_pct >= 0 ? 'up' : 'down';
+    const scoreCls = c.composite_score >= 70 ? 'score-high' : '';
+    const leadCls = c.leading_gain >= 5 ? 'up' : c.leading_gain >= 0 ? '' : 'down';
+    const total = c.up_count + c.down_count;
+    const upPct = total > 0 ? (c.up_count / total * 100) : 50;
+
+    // 属性标签
+    let attrHtml = `<span class="tag tag-${c.sector_type}">${c.sector_type}</span>`;
+    if (c.related_industries && c.related_industries.length > 0) {
+      attrHtml += c.related_industries.slice(0, 2).map(r =>
+        `<span class="tag tag-rotation" onclick="event.stopPropagation();navigateToIndustryChart('${r}')" style="cursor:pointer">${r}</span>`
+      ).join('');
+    }
+
+    // 涨跌比例条
+    const udBar = total > 0
+      ? `<div class="ud-bar"><div class="ud-up" style="width:${upPct}%"></div></div><small>${c.up_count}\u2191 ${c.down_count}\u2193</small>`
+      : '<small>-</small>';
+
+    html += `<tr class="industry-row ${scoreCls}" onclick="navigateToTheme('${c.name}')">
+      <td>${i + 1}</td>
+      <td class="industry-name-cell">${c.name}</td>
+      <td class="score-cell">${c.composite_score.toFixed(0)}</td>
+      <td class="${pctCls}">${c.gain_pct > 0 ? '+' : ''}${c.gain_pct.toFixed(2)}%</td>
+      <td class="ud-cell">${udBar}</td>
+      <td>${c.turnover_rate.toFixed(1)}%</td>
+      <td class="${leadCls}">${c.leading_stock} ${c.leading_gain > 0 ? '+' : ''}${c.leading_gain.toFixed(1)}%</td>
+      <td>${attrHtml}</td>
+    </tr>`;
+  });
+  html += '</table></div>';
+  _renderIndustryTabs('concept', html);
+}
+
+function _renderIndustryTabs(activeTab, contentHtml) {
+  const container = document.getElementById('industry-section');
+  const cActive = activeTab === 'concept' ? 'active' : '';
+  const iActive = activeTab === 'industry' ? 'active' : '';
+  const tabs = `<div class="ranking-tabs">
+    <span class="ranking-tab ${cActive}" onclick="switchRankingTab('concept')">概念热点</span>
+    <span class="ranking-tab ${iActive}" onclick="switchRankingTab('industry')">行业全景</span>
+  </div>`;
+  container.innerHTML = tabs + contentHtml;
+}
+
+function switchRankingTab(tab) {
+  if (tab === 'concept' && _cachedConceptData) {
+    renderConceptRanking(_cachedConceptData);
+  } else if (tab === 'industry' && _cachedIndustryData) {
+    renderIndustryTable(_cachedIndustryData);
+  }
+}
+window.switchRankingTab = switchRankingTab;
+
 // ── 行业全景排行（合并单表 + 统计摘要）──────────────
 function renderIndustry(data) {
-  const container = document.getElementById('industry-section');
+  _cachedIndustryData = data;
+  // 默认显示概念排行（如果已有数据），否则先显示行业
+  if (_cachedConceptData) {
+    renderConceptRanking(_cachedConceptData);
+    return;
+  }
+  renderIndustryTable(data);
+}
+
+function renderIndustryTable(data) {
   const { composite_list, oversold_list, stats } = data;
 
   if (!composite_list || composite_list.length === 0) {
-    container.innerHTML = '<div class="empty-state">行业数据未加载</div>';
+    _renderIndustryTabs('industry', '<div class="empty-state">行业数据未加载</div>');
     return;
   }
 
@@ -258,8 +336,8 @@ function renderIndustry(data) {
     html += ' \u2014 注意板块节奏</div>';
   }
 
-  // 行业全景表（合并综合+涨幅维度 + 节奏列）
-  html += '<div class="industry-panorama"><div class="table-title">行业全景 TOP10</div><table>';
+  // 行业全景表
+  html += '<div class="industry-panorama"><table>';
   html += '<tr><th>#</th><th>行业</th><th>综合</th><th>涨幅</th><th>涨停</th><th>净流入</th><th>阶段</th><th>属性</th><th>候选股</th></tr>';
   composite_list.slice(0, 10).forEach((ind, i) => {
     const panelId = `pano-panel-${i}`;
@@ -321,9 +399,10 @@ function renderIndustry(data) {
     html += '</div>';
   }
 
-  container.innerHTML = html;
+  _renderIndustryTabs('industry', html);
 
   // 行业行点击 → 展开/收起候选股
+  const container = document.getElementById('industry-section');
   container.querySelectorAll('.industry-row').forEach(row => {
     row.style.cursor = 'pointer';
     row.addEventListener('click', () => {
@@ -914,6 +993,12 @@ async function loadDashboard() {
       }
     }
 
+    // 时段指示器（盘中/盘后/盘前标识）
+    initSessionIndicator();
+
+    // 预测数据（置顶，优先加载）
+    loadPredictionSection();
+
     // 引擎就绪(L1完成) → 立即渲染 L1 部分
     const [ctx, reports] = await Promise.all([
       apiFetch('/api/index/context'),
@@ -947,6 +1032,13 @@ async function loadDashboard() {
           }
           industryData = data;
           renderIndustry(data);
+          // L2 就绪后并行加载概念排行
+          apiFetch('/api/industry/concept-ranking').then(cData => {
+            if (!cData.loading && cData.concept_list) {
+              _cachedConceptData = cData;
+              renderConceptRanking(cData);  // 切换到概念视图
+            }
+          }).catch(e => console.warn('概念排行加载失败:', e));
           break;
         } catch (e) {
           console.warn('L2 行业加载失败:', e);
@@ -996,6 +1088,239 @@ async function loadDashboard() {
     console.error('Dashboard load failed:', err);
     document.getElementById('banner-direction').textContent =
       '数据加载失败: ' + err.message;
+  }
+}
+
+// ═══════════════════════════════════════════════════
+// 预测模块渲染
+// ═══════════════════════════════════════════════════
+
+async function loadPredictionSection() {
+  const container = document.getElementById('prediction-section');
+  const regimeEl = document.getElementById('regime-section');
+  if (!container) return;
+
+  // 轮询等待预测数据就绪
+  let retries = 0;
+  while (retries < 60) {
+    try {
+      const data = await apiFetch('/api/prediction/overview');
+      if (data.loading) {
+        container.innerHTML = '<div class="empty-state"><div class="loading-spinner" style="width:24px;height:24px;border-width:2px;margin:0 auto 8px;"></div>预测数据加载中...</div>';
+        await new Promise(r => setTimeout(r, 3000));
+        retries++;
+        continue;
+      }
+      renderPrediction(container, data);
+      if (regimeEl && data.market_regime) {
+        renderRegime(regimeEl, data.market_regime);
+      }
+      return;
+    } catch (e) {
+      console.warn('预测数据加载失败:', e);
+      await new Promise(r => setTimeout(r, 3000));
+      retries++;
+    }
+  }
+  container.innerHTML = '<div class="empty-state">预测数据暂不可用</div>';
+}
+
+function renderPrediction(container, data) {
+  let html = '';
+
+  // ── 行业预测 ──
+  html += '<div class="prediction-block">';
+  html += '<div class="prediction-header">行业预测</div>';
+
+  // 买入预测
+  if (data.sector_buy && data.sector_buy.length > 0) {
+    html += '<div class="prediction-sub-header prediction-buy-header">买入预测 · 板块启动信号</div>';
+    html += '<div class="prediction-list">';
+    data.sector_buy.forEach((s, i) => {
+      const levelCls = s.signal_level === '强' ? 'level-strong' : s.signal_level === '中' ? 'level-mid' : 'level-weak';
+      const movers = (s.top_movers || []).slice(0, 3).map(m =>
+        `<span class="mover-tag" onclick="navigateToStock('${m.code}')">${m.name}(${m.momentum_days}d)</span>`
+      ).join('');
+      html += `<div class="prediction-row ${levelCls}">
+        <span class="pred-rank">#${i + 1}</span>
+        <span class="pred-name">${s.concept_name}</span>
+        <span class="pred-badge badge-${levelCls}">${s.signal_level}</span>
+        <span class="pred-score">动量${s.momentum_score.toFixed(0)}</span>
+        <span class="pred-detail">${s.detail || ''}</span>
+        <div class="pred-movers">${movers}</div>
+      </div>`;
+    });
+    html += '</div>';
+  }
+
+  // 卖出预警
+  if (data.sector_sell && data.sector_sell.length > 0) {
+    html += '<div class="prediction-sub-header prediction-sell-header">卖出预警 · 板块见顶信号</div>';
+    html += '<div class="prediction-list">';
+    data.sector_sell.forEach((s, i) => {
+      html += `<div class="prediction-row level-warn">
+        <span class="pred-rank">#${i + 1}</span>
+        <span class="pred-name">${s.concept_name}</span>
+        <span class="pred-badge badge-warn">⚠</span>
+        <span class="pred-detail">${s.sell_signal || ''} 分化${(s.bearish_ratio * 100).toFixed(0)}%</span>
+      </div>`;
+    });
+    html += '</div>';
+  }
+
+  if ((!data.sector_buy || data.sector_buy.length === 0) && (!data.sector_sell || data.sector_sell.length === 0)) {
+    html += '<div class="empty-state">暂无板块动量信号</div>';
+  }
+  html += '</div>';
+
+  // ── 个股预测 ──
+  html += '<div class="prediction-block">';
+  html += '<div class="prediction-header">个股预测</div>';
+
+  // 买入预测
+  if (data.stock_buy && data.stock_buy.length > 0) {
+    html += '<div class="prediction-sub-header prediction-buy-header">买入预测 · 个股启动/抄底</div>';
+    html += '<div class="prediction-list">';
+    data.stock_buy.slice(0, 10).forEach((s, i) => {
+      const dyn = s.dynamics || {};
+      const dynDetail = dyn.signal ? `${dyn.signal}` : '';
+      const fDetail = s.fusion_detail || {};
+      const scoreCls = s.dynamics_merged_score > 50 ? 'score-high' : s.dynamics_merged_score > 20 ? 'score-mid' : 'score-low';
+      html += `<div class="prediction-row stock-row" onclick="navigateToStock('${s.symbol}')">
+        <span class="pred-rank">#${i + 1}</span>
+        <span class="pred-name">${s.name || s.symbol}</span>
+        <span class="pred-score ${scoreCls}">+${s.dynamics_merged_score.toFixed(0)}</span>
+        <span class="pred-detail">${dynDetail}</span>
+        <span class="pred-conf">${fDetail.confidence || ''}</span>
+      </div>`;
+    });
+    html += '</div>';
+  }
+
+  // 卖出预警
+  if (data.stock_sell && data.stock_sell.length > 0) {
+    html += '<div class="prediction-sub-header prediction-sell-header">卖出预警 · 个股见顶/衰竭</div>';
+    html += '<div class="prediction-list">';
+    data.stock_sell.slice(0, 5).forEach((s, i) => {
+      const sw = s.sell_warning || {};
+      html += `<div class="prediction-row level-warn stock-row" onclick="navigateToStock('${s.symbol}')">
+        <span class="pred-rank">#${i + 1}</span>
+        <span class="pred-name">${s.name || s.symbol}</span>
+        <span class="pred-badge badge-warn">⚠${sw.score || 0}</span>
+        <span class="pred-detail">${sw.warning || ''}</span>
+      </div>`;
+    });
+    html += '</div>';
+  }
+
+  if ((!data.stock_buy || data.stock_buy.length === 0) && (!data.stock_sell || data.stock_sell.length === 0)) {
+    html += '<div class="empty-state">暂无个股预测信号</div>';
+  }
+  html += '</div>';
+
+  container.innerHTML = html;
+}
+
+function renderRegime(el, regime) {
+  if (!regime) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  const mult = regime.regime_mult || 1.0;
+  const barWidth = Math.round(mult * 100);
+  const colorCls = mult > 0.8 ? 'regime-bull' : mult > 0.5 ? 'regime-neutral' : 'regime-bear';
+  el.innerHTML = `<div class="regime-bar ${colorCls}">
+    <span class="regime-label">市场环境</span>
+    <span class="regime-stats">涨停${regime.zt_total} 跌停${regime.dt_total} 连板${regime.lianban_max}</span>
+    <span class="regime-tag">${regime.label}</span>
+    <div class="regime-fill" style="width:${barWidth}%"></div>
+  </div>`;
+}
+
+// ═══════════════════════════════════════════════════
+// 时段指示器 + 自动刷新
+// ═══════════════════════════════════════════════════
+
+const SESSION_CONFIG = {
+  'pre_market':   { cls: 'pre',     icon: '🌅' },
+  'ah_intraday':  { cls: 'live',    icon: '🟢' },
+  'hk_tail':      { cls: 'partial', icon: '🔶' },
+  'ah_post':      { cls: 'review',  icon: '📊' },
+  'us_intraday':  { cls: 'live',    icon: '🇺🇸' },
+  'overnight':    { cls: 'off',     icon: '🌙' },
+};
+
+function renderSessionIndicator(status) {
+  const badge = document.getElementById('session-badge');
+  const timeEl = document.getElementById('session-time');
+  if (!badge || !status.session_mode) return;
+
+  const cfg = SESSION_CONFIG[status.session_mode] || { cls: '', icon: '' };
+  badge.textContent = `${cfg.icon} ${status.session_label || ''}`;
+  badge.className = `session-badge ${cfg.cls}`;
+
+  if (timeEl && status.data_as_of) {
+    timeEl.textContent = `数据截至 ${status.data_as_of}`;
+  }
+
+  // 动态信号区标题
+  const titleEl = document.getElementById('signal-section-title');
+  if (titleEl) {
+    if (status.session_mode === 'ah_post' || status.session_mode === 'pre_market' || status.session_mode === 'overnight') {
+      titleEl.textContent = '次日预判';
+    } else if (status.session_mode === 'ah_intraday' || status.session_mode === 'hk_tail') {
+      titleEl.textContent = '实时信号';
+    } else {
+      titleEl.textContent = '今日信号';
+    }
+  }
+}
+
+let _autoRefreshTimer = null;
+let _lastUpdate = 0;
+
+function startAutoRefresh(intervalMs) {
+  stopAutoRefresh();
+  if (intervalMs <= 0) return;
+
+  _autoRefreshTimer = setInterval(async () => {
+    try {
+      const st = await apiFetch('/api/index/status');
+      renderSessionIndicator(st);
+
+      // 时段变化（如收盘了）→ 停止刷新
+      if (!st.refresh_interval || st.refresh_interval === 0) {
+        stopAutoRefresh();
+        return;
+      }
+
+      // 有新数据 → 重新加载 dashboard
+      if (st.ready && !st.running && st.last_update > _lastUpdate) {
+        _lastUpdate = st.last_update;
+        loadDashboard();
+      }
+    } catch (e) {
+      console.warn('自动刷新检查失败:', e);
+    }
+  }, intervalMs);
+}
+
+function stopAutoRefresh() {
+  if (_autoRefreshTimer) {
+    clearInterval(_autoRefreshTimer);
+    _autoRefreshTimer = null;
+  }
+}
+
+// 在 loadDashboard 完成后初始化时段指示器
+async function initSessionIndicator() {
+  try {
+    const st = await apiFetch('/api/index/status');
+    renderSessionIndicator(st);
+    _lastUpdate = st.last_update || 0;
+    if (st.refresh_interval && st.refresh_interval > 0) {
+      startAutoRefresh(st.refresh_interval * 1000);
+    }
+  } catch (e) {
+    console.warn('时段信息获取失败:', e);
   }
 }
 

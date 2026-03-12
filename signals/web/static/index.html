@@ -12,6 +12,10 @@
   <!-- Header -->
   <header class="header">
     <div class="header-logo">LONG CLAW</div>
+    <div class="session-indicator" id="session-indicator">
+      <span class="session-badge" id="session-badge"></span>
+      <span class="session-time" id="session-time"></span>
+    </div>
     <div class="header-actions">
       <button class="header-btn" id="theme-toggle" title="Anthropic / TradingView">&#9684;</button>
       <button class="header-btn" id="refresh-btn" title="刷新数据">&#8635;</button>
@@ -34,12 +38,35 @@
   <main>
     <!-- Page 1: Dashboard -->
     <div id="page-dashboard" class="page active">
+      <!-- 预测总览（置顶 — 第一屏核心内容）-->
+      <div id="prediction-section" class="prediction-section">
+        <div class="empty-state">加载预测数据...</div>
+      </div>
+
+      <!-- 市场环境指示器 -->
+      <div id="regime-section" class="regime-section" style="display:none;"></div>
+
+      <!-- 大盘方向 Banner -->
       <div id="banner" class="banner neutral">
         <div class="banner-direction" id="banner-direction">加载中...</div>
         <div class="banner-suggestion" id="banner-suggestion"></div>
-        <!-- P3-5: 风格切换提示 -->
         <div id="style-switch-alert" class="style-switch-alert" style="display:none;"></div>
       </div>
+
+      <!-- 操作建议 (保留在上方) -->
+      <div class="section-title">操作建议</div>
+      <div id="action-section" class="action-section">
+        <div class="empty-state">加载中...</div>
+      </div>
+
+      <!-- 今日信号 (L1指数 + L3标的) -->
+      <div class="section-title" id="signal-section-title">今日信号</div>
+      <div class="signal-list" id="signal-list">
+        <div class="empty-state">暂无信号数据</div>
+      </div>
+
+      <!-- 以下为第二屏（下移）-->
+      <div class="section-title section-divider">指数 & 行业详情</div>
 
       <!-- A股指数 -->
       <div class="section-title">A股</div>
@@ -69,18 +96,6 @@
       <div class="section-title">情绪 & 仓位</div>
       <div id="rotation-section">
         <div class="empty-state">加载中...</div>
-      </div>
-
-      <!-- 操作建议 (道长策略) -->
-      <div class="section-title">操作建议</div>
-      <div id="action-section" class="action-section">
-        <div class="empty-state">加载中...</div>
-      </div>
-
-      <!-- 今日信号 (L1指数 + L3标的) -->
-      <div class="section-title">今日信号</div>
-      <div class="signal-list" id="signal-list">
-        <div class="empty-state">暂无信号数据</div>
       </div>
     </div>
 

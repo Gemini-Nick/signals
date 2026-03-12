@@ -261,7 +261,18 @@ CONCEPT_TYPE_KEYWORDS: dict = {
 }
 
 # 概念板块展示 Top N
-CONCEPT_TOP_N: int = 10
+CONCEPT_TOP_N: int = 15
+
+# 噪音概念过滤（非主题性概念，按子串匹配排除）
+CONCEPT_NOISE_PATTERNS: list = [
+    "昨日首板", "昨日涨停", "昨日连板", "昨日触板",
+    "百元股", "次新股", "ST板块", "B股",
+    "破净股", "新进指数", "MSCI", "富时",
+    "基金重仓", "社保重仓", "券商重仓",
+    "预亏预减", "预盈预增", "东方财富热股",
+    "高校背景", "国企改革", "参股新三板",
+    "最近多板", "融资融券", "转融券标的",
+]
 
 # 关注主题（恐慌抄底时匹配，CLI --themes 覆盖）
 # 示例: ["储能", "算力", "CLAW", "化工"]
@@ -309,18 +320,29 @@ CAPITULATION_WEIGHTS = {
     "close_at_low": 20,    # 收盘靠近最低 (下跌环境)
 }
 
-# ── 信号融合权重（多维度加权）──────────────────────────────
+# ── 信号融合权重（预测导向 — 动力学60% / 结构25% / 事后确认15%）───
 FUSION_WEIGHTS = {
-    "anomaly_volume_boost": 15,    # 异常放量加分
-    "anomaly_volume_penalty": -10, # 异常缩量减分
-    "anomaly_gap_boost": 10,       # 异常跳空加分
-    "anomaly_range_boost": 5,      # 异常波动加分
-    "convergence_3dim": 20,        # ≥3维收敛加分
-    "convergence_2dim": 12,        # 2维收敛加分
-    "convergence_1dim": 5,         # 1维异常加分
-    "capitulation_extreme": 25,    # 极度割肉加分 (≥80)
-    "capitulation_high": 15,       # 恐慌割肉加分 (60-80)
-    "capitulation_medium": 8,      # 偏弱割肉加分 (40-60)
+    # ─── 事后确认维度（降权，受市场环境系数调节）───
+    "anomaly_volume_boost": 8,     # 异常放量加分 (15→8)
+    "anomaly_volume_penalty": -5,  # 异常缩量减分 (-10→-5)
+    "anomaly_gap_boost": 5,        # 异常跳空加分 (10→5)
+    "anomaly_range_boost": 3,      # 异常波动加分 (5→3)
+    "anomaly_body_boost": 6,       # 异常大阳/大阴加分 (12→6)
+    "convergence_3dim": 10,        # ≥3维收敛加分 (20→10)
+    "convergence_2dim": 6,         # 2维收敛加分 (12→6)
+    "convergence_1dim": 3,         # 1维异常加分 (5→3)
+    "capitulation_extreme": 12,    # 极度割肉加分 (25→12)
+    "capitulation_high": 8,        # 恐慌割肉加分 (15→8)
+    "capitulation_medium": 4,      # 偏弱割肉加分 (8→4)
+    # ─── 动力学预测（主导权重 60%）───
+    "dynamics_accel_bonus": 45,    # 笔加速 → 启动点信号（最强）
+    "dynamics_exhaust_bonus": 40,  # 笔衰竭见底 → 抄底点信号
+    "dynamics_ubi_strong": 35,     # 未完成笔强势延续
+    "dynamics_consecutive": 25,    # 动量区间阳线占比高
+    "dynamics_volume_expand": 20,  # 量能递增确认
+    # ─── 板块动量（预测维度）───
+    "sector_momentum_strong": 30,  # 板块动量强 → 板块级启动
+    "sector_momentum_medium": 15,  # 板块动量中
 }
 
 # ── 研究笔记（双维度集成）──────────────────────────────────

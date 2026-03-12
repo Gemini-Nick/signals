@@ -23,6 +23,7 @@ from .api.backtest import router as backtest_router
 from .api.social import router as social_router
 from .api.plan import router as plan_router
 from .api.trade import router as trade_router
+from .api.prediction import router as prediction_router
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -55,6 +56,7 @@ def create_app() -> FastAPI:
     app.include_router(social_router)
     app.include_router(plan_router)
     app.include_router(trade_router)
+    app.include_router(prediction_router)
 
     # 静态文件服务
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
