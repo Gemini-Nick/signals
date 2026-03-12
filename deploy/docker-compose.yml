@@ -1,0 +1,50 @@
+version: "3.8"
+
+services:
+  # ── Futu OpenD 数据网关 ──────────────────────
+  futu-opend:
+    image: futuopend/ftopend:latest
+    container_name: futu-opend
+    environment:
+      - login_account=${FUTU_ACCOUNT}
+      - login_pwd_md5=${FUTU_PWD_MD5}
+    ports:
+      - "127.0.0.1:11111:11111"    # 仅本机访问
+    restart: unless-stopped
+    volumes:
+      - futu-data:/home/futu/data
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "11111"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── 分析引擎 + Web 预览 ────────────────────────
+  signals:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: signals
+    environment:
+      - FUTU_HOST=futu-opend
+      - FUTU_PORT=11111
+      - FEISHU_APP_ID=${FEISHU_APP_ID}
+      - FEISHU_APP_SECRET=${FEISHU_APP_SECRET}
+      - FEISHU_RECEIVE_ID=${FEISHU_RECEIVE_ID}
+      - DEPLOY_MODE=cloud
+      - TZ=Asia/Shanghai
+    ports:
+      - "${WEB_PORT:-8000}:8000"   # Web 预览端口
+    depends_on:
+      futu-opend:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - signals-data:/app/.data           # SQLite 缓存持久化
+      - signals-logs:/app/logs            # 日志持久化
+      - ./cron/signals-cron:/etc/cron.d/signals-cron:ro
+
+volumes:
+  futu-data:
+  signals-data:
+  signals-logs:

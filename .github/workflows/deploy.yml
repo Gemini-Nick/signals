@@ -1,0 +1,57 @@
+name: Deploy to Cloud
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - 'tests/**'
+      - 'notes/**'
+
+jobs:
+  # ── Docker 云服务器部署 ────────────────────────
+  deploy-docker:
+    runs-on: ubuntu-latest
+    if: vars.DEPLOY_TARGET == 'docker' || vars.DEPLOY_TARGET == 'all'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via SSH (Docker)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.CN_SERVER_IP }}
+          username: ${{ secrets.CN_SERVER_USER }}
+          key: ${{ secrets.CN_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/signals
+
+            git fetch origin main
+            git reset --hard origin/main
+
+            cd deploy
+            docker compose build signals
+            docker compose up -d signals
+
+            sleep 5
+            docker compose ps
+            echo "✅ Docker 部署完成: $(date +'%Y-%m-%d %H:%M:%S')"
+
+  # ── AutoDL 部署 ──────────────────────────────
+  deploy-autodl:
+    runs-on: ubuntu-latest
+    if: vars.DEPLOY_TARGET == 'autodl' || vars.DEPLOY_TARGET == 'all'
+    steps:
+      - name: Deploy via SSH (AutoDL)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.AUTODL_HOST }}
+          port: ${{ secrets.AUTODL_PORT }}
+          username: root
+          key: ${{ secrets.AUTODL_SSH_KEY }}
+          script: |
+            set -e
+            cd /root/autodl-tmp/signals
+            bash deploy/autodl/sync.sh
+            echo "✅ AutoDL 部署完成: $(date +'%Y-%m-%d %H:%M:%S')"

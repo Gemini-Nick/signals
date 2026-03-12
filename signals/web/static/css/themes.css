@@ -1,0 +1,215 @@
+/* ═══════════════════════════════════════════════════
+   🐲 隆小侠 — 双主题 CSS 变量
+   主题 A: Anthropic 风格（温暖克制）
+   主题 B: TradingView 风格（专业锐利）
+   ═══════════════════════════════════════════════════ */
+
+/* ── 主题 A: Anthropic — 温暖、人文、低对比度 ──────── */
+:root[data-theme="anthropic"] {
+  /* 基底 */
+  --bg-primary:      #141413;
+  --bg-secondary:    #1e1e1c;
+  --bg-tertiary:     #2a2a27;
+  --border:          #3a3a36;
+
+  /* 文字 */
+  --text-primary:    #faf9f5;
+  --text-secondary:  #b0aea5;
+  --text-muted:      #6b6963;
+
+  /* 强调色 */
+  --accent:          #d97757;
+  --accent-hover:    #e08a6d;
+  --accent-blue:     #6a9bcc;
+  --accent-green:    #788c5d;
+
+  /* 涨跌 (A股: 红涨绿跌) */
+  --color-up:        #d97757;
+  --color-down:      #788c5d;
+  --color-flat:      #b0aea5;
+
+  /* 信号标记 */
+  --signal-buy:      #d97757;
+  --signal-sell:     #6a9bcc;
+  --signal-badge:    #d97757;
+
+  /* 建议条 */
+  --banner-bullish:  #2d2118;
+  --banner-bearish:  #1a2318;
+  --banner-neutral:  #1e1e1c;
+
+  /* 图表 */
+  --chart-bg:        #141413;
+  --chart-grid:      #2a2a27;
+  --chart-crosshair: #b0aea5;
+  --bi-up:           #d97757;
+  --bi-down:         #6a9bcc;
+  --zhongshu-fill:   rgba(106, 155, 204, 0.12);
+  --zhongshu-stroke: rgba(106, 155, 204, 0.6);
+
+  /* 成交量 */
+  --vol-up:          rgba(217, 119, 87, 0.5);
+  --vol-down:        rgba(120, 140, 93, 0.5);
+
+  /* MA 均线颜色 */
+  --ma5-color:       #f7931a;
+  --ma10-color:      #6a9bcc;
+  --ma20-color:      #d97757;
+  --ma60-color:      #788c5d;
+  --support-color:   #788c5d;
+  --resistance-color:#d97757;
+  --conclusion-bg:   #2a2518;
+
+  /* MACD */
+  --macd-dif:        #f7931a;
+  --macd-dea:        #6a9bcc;
+  --macd-bar-up:     rgba(217, 119, 87, 0.7);
+  --macd-bar-down:   rgba(120, 140, 93, 0.7);
+
+  /* 恐慌 */
+  --panic-high:      #d97757;
+  --panic-mid:       #e6a23c;
+
+  /* 卡片 */
+  --card-shadow:     0 1px 3px rgba(0, 0, 0, 0.3);
+
+  /* 交互 */
+  --bg-hover:        rgba(255, 255, 255, 0.04);
+  --border-color:    #3a3a36;
+
+  /* 字体 */
+  --font-family:     -apple-system, BlinkMacSystemFont, "Segoe UI",
+                     "Noto Sans SC", "PingFang SC", sans-serif;
+  --font-mono:       "SF Mono", "Fira Code", "Cascadia Code", monospace;
+}
+
+/* ── 主题 B: TradingView — 冷色调、高对比度 ────────── */
+:root[data-theme="tradingview"] {
+  /* 基底 */
+  --bg-primary:      #131722;
+  --bg-secondary:    #1e222d;
+  --bg-tertiary:     #2a2e39;
+  --border:          #363a45;
+
+  /* 文字 */
+  --text-primary:    #d1d4dc;
+  --text-secondary:  #787b86;
+  --text-muted:      #4c525e;
+
+  /* 强调色 */
+  --accent:          #2962ff;
+  --accent-hover:    #1e53e5;
+  --accent-blue:     #2962ff;
+  --accent-green:    #26a69a;
+
+  /* 涨跌 (A股: 红涨绿跌) */
+  --color-up:        #f23645;
+  --color-down:      #26a69a;
+  --color-flat:      #787b86;
+
+  /* 信号标记 */
+  --signal-buy:      #f7931a;
+  --signal-sell:     #9c27b0;
+  --signal-badge:    #f7931a;
+
+  /* 建议条 */
+  --banner-bullish:  #1a1520;
+  --banner-bearish:  #121d1a;
+  --banner-neutral:  #1e222d;
+
+  /* 图表 */
+  --chart-bg:        #131722;
+  --chart-grid:      #1e222d;
+  --chart-crosshair: #787b86;
+  --bi-up:           #f23645;
+  --bi-down:         #26a69a;
+  --zhongshu-fill:   rgba(41, 98, 255, 0.12);
+  --zhongshu-stroke: rgba(41, 98, 255, 0.6);
+
+  /* 成交量 */
+  --vol-up:          rgba(242, 54, 69, 0.5);
+  --vol-down:        rgba(38, 166, 154, 0.5);
+
+  /* MA 均线颜色 */
+  --ma5-color:       #f7931a;
+  --ma10-color:      #2962ff;
+  --ma20-color:      #e040fb;
+  --ma60-color:      #26a69a;
+  --support-color:   #26a69a;
+  --resistance-color:#f23645;
+  --conclusion-bg:   #1a2535;
+
+  /* MACD */
+  --macd-dif:        #f7931a;
+  --macd-dea:        #2962ff;
+  --macd-bar-up:     rgba(242, 54, 69, 0.7);
+  --macd-bar-down:   rgba(38, 166, 154, 0.7);
+
+  /* 恐慌 */
+  --panic-high:      #f23645;
+  --panic-mid:       #e6a23c;
+
+  /* 卡片 */
+  --card-shadow:     0 1px 3px rgba(0, 0, 0, 0.4);
+
+  /* 交互 */
+  --bg-hover:        rgba(255, 255, 255, 0.03);
+  --border-color:    #363a45;
+
+  /* 字体 */
+  --font-family:     -apple-system, BlinkMacSystemFont, "Trebuchet MS",
+                     "Noto Sans SC", "PingFang SC", sans-serif;
+  --font-mono:       "Roboto Mono", "Consolas", monospace;
+}
+
+/* ── 默认主题 = TradingView ────────────────────────── */
+:root {
+  --bg-primary:      #131722;
+  --bg-secondary:    #1e222d;
+  --bg-tertiary:     #2a2e39;
+  --border:          #363a45;
+  --text-primary:    #d1d4dc;
+  --text-secondary:  #787b86;
+  --text-muted:      #4c525e;
+  --accent:          #2962ff;
+  --accent-hover:    #1e53e5;
+  --accent-blue:     #2962ff;
+  --accent-green:    #26a69a;
+  --color-up:        #f23645;
+  --color-down:      #26a69a;
+  --color-flat:      #787b86;
+  --signal-buy:      #f7931a;
+  --signal-sell:     #9c27b0;
+  --signal-badge:    #f7931a;
+  --banner-bullish:  #1a1520;
+  --banner-bearish:  #121d1a;
+  --banner-neutral:  #1e222d;
+  --chart-bg:        #131722;
+  --chart-grid:      #1e222d;
+  --chart-crosshair: #787b86;
+  --bi-up:           #f23645;
+  --bi-down:         #26a69a;
+  --zhongshu-fill:   rgba(41, 98, 255, 0.12);
+  --zhongshu-stroke: rgba(41, 98, 255, 0.6);
+  --vol-up:          rgba(242, 54, 69, 0.5);
+  --vol-down:        rgba(38, 166, 154, 0.5);
+  --ma5-color:       #f7931a;
+  --ma10-color:      #2962ff;
+  --ma20-color:      #e040fb;
+  --ma60-color:      #26a69a;
+  --support-color:   #26a69a;
+  --resistance-color:#f23645;
+  --conclusion-bg:   #1a2535;
+  --macd-dif:        #f7931a;
+  --macd-dea:        #2962ff;
+  --macd-bar-up:     rgba(242, 54, 69, 0.7);
+  --macd-bar-down:   rgba(38, 166, 154, 0.7);
+  --panic-high:      #f23645;
+  --panic-mid:       #e6a23c;
+  --card-shadow:     0 1px 3px rgba(0, 0, 0, 0.4);
+  --bg-hover:        rgba(255, 255, 255, 0.03);
+  --border-color:    #363a45;
+  --font-family:     -apple-system, BlinkMacSystemFont, "Trebuchet MS",
+                     "Noto Sans SC", "PingFang SC", sans-serif;
+  --font-mono:       "Roboto Mono", "Consolas", monospace;
+}

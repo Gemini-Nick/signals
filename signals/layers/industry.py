@@ -20,13 +20,16 @@ from typing import List, Optional, Tuple
 
 import pandas as pd
 
-from signals.data.fetcher import no_proxy as _no_proxy
+from signals.data.fetcher import no_proxy as _no_proxy, em_call_with_retry as _em_retry
 from signals.dashboard import get_dashboard as _get_dashboard
 
 
 # ─────────────────────────────────────────────────────────
 # Dashboard 辅助（detail = 细节，log = 重要状态变更）
 # ─────────────────────────────────────────────────────────
+
+import logging as _logging
+_file_log = _logging.getLogger("signals.industry")
 
 def _detail(msg: str):
     """任务级详情输出（per-task status, 线程池回调等）"""
@@ -35,6 +38,7 @@ def _detail(msg: str):
         dash.detail(msg)
     else:
         print(msg, flush=True)
+    _file_log.info(msg)
 
 def _log(msg: str):
     """重要状态变更输出（熔断、模式切换等）"""
@@ -43,6 +47,7 @@ def _log(msg: str):
         dash.log(msg)
     else:
         print(msg, flush=True)
+    _file_log.info(msg)
 
 
 # ─────────────────────────────────────────────────────────
@@ -547,13 +552,61 @@ def _fetch_pytdx_industry_stocks(industry: str) -> List[str]:
 # ─────────────────────────────────────────────────────────
 _EM_CIRCUIT_OPEN = False          # True = 东财不可用，跳过网络调用
 _EM_NAME_DF_CACHE: Optional[pd.DataFrame] = None   # 首次成功结果缓存
+_EM_HEALTH_CHECKED = False        # 启动时已做过健康预检
 
 
-def _fetch_board_industry_name_em(timeout: float = 10.0) -> Optional[pd.DataFrame]:
+def _em_health_probe(timeout: float = 3.0) -> bool:
+    """
+    东财 API 快速健康探测（3s）。
+    启动时调用一次，不可用则全局熔断，避免后续每个接口都等 10-25s 超时。
+    """
+    global _EM_CIRCUIT_OPEN, _EM_HEALTH_CHECKED
+    if _EM_HEALTH_CHECKED:
+        return not _EM_CIRCUIT_OPEN
+    _EM_HEALTH_CHECKED = True
+
+    # 预先检测 Clash 代理，避免所有东财调用超时
+    from signals.data.fetcher import _try_fix_clash_global_mode
+    _try_fix_clash_global_mode()
+
+    import akshare as ak
+    import time as _htime
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+    # 最多尝试 3 次，每次独立超时
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        def _ping():
+            with _no_proxy():
+                return ak.stock_board_industry_name_em()
+
+        _probe_pool = ThreadPoolExecutor(max_workers=1)
+        _probe_future = _probe_pool.submit(_ping)
+        try:
+            df = _probe_future.result(timeout=timeout)
+            if df is not None and not df.empty:
+                global _EM_NAME_DF_CACHE
+                _EM_NAME_DF_CACHE = df
+                _log("  [✓] 东财 API 健康探测通过（复用数据）")
+                return True
+        except (FutureTimeout, Exception) as e:
+            if attempt < max_attempts - 1:
+                _log(f"  [⚡] 东财健康探测第{attempt+1}次失败（{e.__class__.__name__}），重试...")
+                _htime.sleep(0.5 * (attempt + 1))
+                continue
+            _EM_CIRCUIT_OPEN = True
+            _log(f"  [⚡] 东财 API 健康探测{max_attempts}次均失败（{e.__class__.__name__}），全局熔断")
+            return False
+        finally:
+            _probe_pool.shutdown(wait=False, cancel_futures=True)
+    return False
+
+
+def _fetch_board_industry_name_em(timeout: float = 5.0) -> Optional[pd.DataFrame]:
     """
     带熔断+重试的 stock_board_industry_name_em 调用：
-    - 整体超时 10s（用 ThreadPoolExecutor 强制截断）
-    - 失败自动重试 1 次
+    - 整体超时 5s（从10s缩减）
+    - 健康预检失败则直接跳过
     - 首次成功后缓存结果，后续直接返回
     - 两次失败后标记熔断，本次运行内不再尝试
     """
@@ -573,29 +626,96 @@ def _fetch_board_industry_name_em(timeout: float = 10.0) -> Optional[pd.DataFram
     def _call():
         return ak.stock_board_industry_name_em()
 
-    for attempt in range(2):
-        try:
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(_call)
-                df = future.result(timeout=timeout)
-                if df is not None and not df.empty:
-                    _EM_NAME_DF_CACHE = df
-                    return df
-                return None
-        except FutureTimeout:
-            if attempt == 0:
-                _log(f"  [⚡] 东财行业接口超时（>{timeout}s），重试中...")
-                continue
-            _EM_CIRCUIT_OPEN = True
-            _log(f"  [⚡] 东财行业接口超时（重试仍失败），熔断")
-            return None
-        except Exception as e:
-            if attempt == 0:
-                _log(f"  [⚡] 东财行业接口异常（{e.__class__.__name__}），重试中...")
-                continue
-            _EM_CIRCUIT_OPEN = True
-            _log(f"  [⚡] 东财行业接口熔断（{e.__class__.__name__}），本次运行跳过后续调用")
-            return None
+    # 健康预检通过后才尝试（预检已缓存结果，直接返回）
+    _em_pool = ThreadPoolExecutor(max_workers=1)
+    _em_future = _em_pool.submit(_call)
+    try:
+        df = _em_future.result(timeout=timeout)
+        if df is not None and not df.empty:
+            _EM_NAME_DF_CACHE = df
+            return df
+        return None
+    except FutureTimeout:
+        _EM_CIRCUIT_OPEN = True
+        _log(f"  [⚡] 东财行业接口超时（>{timeout}s），熔断")
+        return None
+    except Exception as e:
+        _EM_CIRCUIT_OPEN = True
+        _log(f"  [⚡] 东财行业接口熔断（{e.__class__.__name__}）")
+        return None
+    finally:
+        _em_pool.shutdown(wait=False, cancel_futures=True)
+    return None
+
+
+# ─────────────────────────────────────────────────────────
+# 同花顺 THS 行业排行（降级源 #1）
+# ─────────────────────────────────────────────────────────
+_THS_CIRCUIT_OPEN = False          # True = 同花顺不可用
+_THS_RANKING_CACHE: Optional[pd.DataFrame] = None
+
+
+def _fetch_industry_ranking_ths(timeout: float = 10.0) -> Optional[pd.DataFrame]:
+    """
+    同花顺行业排行 → 统一列名 DataFrame。
+    stock_board_industry_summary_ths() 返回 90 行业，分类与东财一致。
+    列映射：板块 → 板块名称，领涨股 → 领涨股票，领涨股-涨跌幅 → 领涨股票-涨跌幅
+    """
+    global _THS_CIRCUIT_OPEN, _THS_RANKING_CACHE
+
+    if _THS_RANKING_CACHE is not None:
+        return _THS_RANKING_CACHE
+    if _THS_CIRCUIT_OPEN:
+        return None
+
+    import akshare as ak
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+    def _call():
+        with _no_proxy():
+            return ak.stock_board_industry_summary_ths()
+
+    _pool = ThreadPoolExecutor(max_workers=1)
+    _future = _pool.submit(_call)
+    try:
+        df = _future.result(timeout=timeout)
+        if df is not None and not df.empty:
+            # 统一列名，使下游代码无需感知数据来源
+            rename_map = {
+                "板块": "板块名称",
+                "领涨股": "领涨股票",
+                "领涨股-涨跌幅": "领涨股票-涨跌幅",
+            }
+            df = df.rename(columns=rename_map)
+            _THS_RANKING_CACHE = df
+            _detail(f"  [✓] 同花顺行业排行 {len(df)} 条")
+            return df
+        return None
+    except FutureTimeout:
+        _THS_CIRCUIT_OPEN = True
+        _log(f"  [⚡] 同花顺行业排行超时（>{timeout}s），熔断")
+        return None
+    except Exception as e:
+        _THS_CIRCUIT_OPEN = True
+        _log(f"  [⚡] 同花顺行业排行失败（{e.__class__.__name__}），熔断")
+        return None
+    finally:
+        _pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _fetch_industry_ranking_with_fallback() -> Optional[pd.DataFrame]:
+    """
+    行业排行降级链：同花顺(4.5s) → 东财(5s) → None
+    返回统一列名的 DataFrame（板块名称, 涨跌幅, 领涨股票, 领涨股票-涨跌幅）。
+    """
+    # 优先同花顺（更稳定）
+    df = _fetch_industry_ranking_ths()
+    if df is not None and not df.empty:
+        return df
+    # 降级到东财
+    df = _fetch_board_industry_name_em()
+    if df is not None and not df.empty:
+        return df
     return None
 
 
@@ -604,11 +724,10 @@ def _fetch_board_industry_name_em(timeout: float = 10.0) -> Optional[pd.DataFram
 # ─────────────────────────────────────────────────────────
 
 def get_industry_list() -> pd.DataFrame:
-    """返回 A 股所有行业名称列表。"""
-    df = _fetch_board_industry_name_em()
+    """返回 A 股所有行业名称列表（同花顺 → 东财降级）。"""
+    df = _fetch_industry_ranking_with_fallback()
     if df is not None:
         return df
-    # 熔断时返回空 DataFrame
     return pd.DataFrame()
 
 
@@ -626,27 +745,7 @@ def get_industry_stocks(industry: str) -> List[str]:
 
     # ── 1. 东财 cons_em ──────────────────────────────
     try:
-        with _no_proxy():
-            df = ak.stock_board_industry_cons_em(symbol=industry)
-        if df is not None and not df.empty:
-            code_col = None
-            for col in ["代码", "code", "股票代码"]:
-                if col in df.columns:
-                    code_col = col
-                    break
-            if code_col:
-                futu_codes = []
-                for code in df[code_col].astype(str):
-                    code = code.zfill(6)
-                    if code.startswith("6"):
-                        futu_codes.append(f"SH.{code}")
-                    elif code.startswith(("0", "3")):
-                        futu_codes.append(f"SZ.{code}")
-                    elif code.startswith(("8", "4")):
-                        futu_codes.append(f"BJ.{code}")
-                if futu_codes:
-                    _save_cache(_cache_key, futu_codes)
-                    return futu_codes
+        df = _em_retry(ak.stock_board_industry_cons_em, symbol=industry, retries=2, delay=0.5)
     except Exception as e:
         _detail(f"  [!] {industry} 东财成分股失败（{e.__class__.__name__}）")
 
@@ -735,6 +834,10 @@ class IndustryRanking:
     oversold_score: float = 0.0                           # 超跌评分(0-100)
     oversold_detail: str = ""                             # "距高点-18%"
     rotation_line: str = ""                                # 轮动线: 科技/顺周期/消费/新能源/主题/公用
+    # P3-3: 板块节奏
+    rhythm_phase: str = ""                                 # "启动"/"加速"/"高潮"/"衰竭"/"休整"
+    rhythm_score: float = 0.0                              # 0-100
+    rhythm_hint: str = ""                                  # "可加仓"/"持有"/"兑现"/"回避"
 
     @property
     def display_name(self) -> str:
@@ -758,37 +861,89 @@ class IndustryRanking:
 
 
 # ─────────────────────────────────────────────────────────
-# 方法 A：行业板块 CZSC（东财接口）
+# 行业 K 线磁盘缓存（RawBar 不可 pickle，用 JSON）
 # ─────────────────────────────────────────────────────────
 
-def get_industry_bars(industry: str,
-                      lookback_days: int = 180,
-                      start_date: str = None):
-    """
-    获取行业板块日线 K 线。
+def _bars_cache_path(industry: str) -> Path:
+    cache_dir = Path(__file__).resolve().parent.parent.parent / ".data" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = industry.replace("/", "_").replace("\\", "_")
+    return cache_dir / f"bars_{safe_name}.json"
 
-    降级链：东财 hist_em → 同花顺 index_ths → pytdx 880xxx → 磁盘缓存
 
-    :param industry:     行业名称，如 "有色金属"
-    :param lookback_days: 盘中模式：近 N 自然日（默认180）
-    :param start_date:   盘后模式：固定起点，如 '2024-09-24'
-    :return: List[RawBar]，失败返回空列表
-    """
-    import akshare as ak
-    from datetime import datetime, timedelta
+def _save_bars_cache(industry: str, bars, source: str = "em"):
+    """保存行业 K 线到 JSON 磁盘缓存"""
+    import json, time
+    data = {
+        "ts": time.time(),
+        "source": source,
+        "industry": industry,
+        "bars": [
+            {
+                "dt": bar.dt.isoformat() if hasattr(bar.dt, 'isoformat') else str(bar.dt),
+                "open": float(bar.open),
+                "high": float(bar.high),
+                "low": float(bar.low),
+                "close": float(bar.close),
+                "vol": int(bar.vol),
+                "amount": int(bar.amount) if hasattr(bar, 'amount') else 0,
+            }
+            for bar in bars
+        ],
+    }
+    try:
+        _bars_cache_path(industry).write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_bars_cache(industry: str, max_age: float = 86400):
+    """从磁盘缓存加载行业 K 线（默认24h过期）。"""
+    import json, time
     from czsc import RawBar, Freq
-    import pandas as pd
-    from signals.data.fetcher import _to_raw_bars
 
-    _bar_cache_key = f"bars_{industry}"
+    path = _bars_cache_path(industry)
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if time.time() - data.get("ts", 0) > max_age:
+            return []
+        items = data.get("bars", [])
+        if not items:
+            return []
+        bars = []
+        for i, item in enumerate(items):
+            bars.append(RawBar(
+                symbol=industry,
+                dt=pd.Timestamp(item["dt"]),
+                id=i,
+                freq=Freq.D,
+                open=float(item["open"]),
+                high=float(item["high"]),
+                low=float(item["low"]),
+                close=float(item["close"]),
+                vol=int(item.get("vol", 0)),
+                amount=int(item.get("amount", 0)),
+            ))
+        source = data.get("source", "unknown")
+        _detail(f"  [缓存] {industry} K线 {len(bars)} 根（磁盘缓存, 来源:{source}）")
+        return bars
+    except Exception:
+        return []
 
-    today = datetime.now()
-    if start_date:
-        s_date = start_date.replace("-", "")
-    else:
-        s_date = (today - timedelta(days=lookback_days)).strftime("%Y%m%d")
-    e_date = today.strftime("%Y%m%d")
 
+# ─────────────────────────────────────────────────────────
+# 方法 A：行业板块 CZSC（多源降级 K 线）
+# ─────────────────────────────────────────────────────────
+
+def _get_industry_bars_em(industry: str, s_date: str, e_date: str):
+    """东财行业 K 线（原始方法）"""
+    if _EM_CIRCUIT_OPEN:
+        return None
+
+    import akshare as ak
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
     # ── 1. 东财 hist_em（现有，15s 超时）──────────────
@@ -800,46 +955,121 @@ def get_industry_bars(industry: str,
                 adjust="qfq"
             )
 
-        try:
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(_call)
-                df = future.result(timeout=15)
+    _pool = ThreadPoolExecutor(max_workers=1)
+    _future = _pool.submit(_call)
+    try:
+        df = _future.result(timeout=6)
+        if df is not None and not df.empty:
+            # 东财列名映射
+            col_map = {}
+            for src, dst in [("日期", "dt"), ("开盘", "open"), ("最高", "high"),
+                             ("最低", "low"), ("收盘", "close"), ("成交量", "vol"),
+                             ("成交额", "amount"), ("date", "dt"), ("volume", "vol")]:
+                if src in df.columns:
+                    col_map[src] = dst
+            df = df.rename(columns=col_map)
+            if "amount" not in df.columns:
+                df["amount"] = 0
+            return df
+        return None
+    except (FutureTimeout, Exception) as e:
+        _log(f"  [!] {industry} 东财K线超时/失败（{e.__class__.__name__}）")
+        return None
+    finally:
+        _pool.shutdown(wait=False, cancel_futures=True)
 
-            if df is not None and not df.empty:
-                col_map = {}
-                for src, dst in [("日期", "dt"), ("开盘", "open"), ("最高", "high"),
-                                 ("最低", "low"), ("收盘", "close"), ("成交量", "vol"),
-                                 ("成交额", "amount"), ("date", "dt"), ("volume", "vol")]:
-                    if src in df.columns:
-                        col_map[src] = dst
-                df = df.rename(columns=col_map)
-                if "amount" not in df.columns:
-                    df["amount"] = 0
-                bars = _to_raw_bars(df, industry, Freq.D,
-                                    "dt", "open", "high", "low", "close", "vol", "amount")
-                if bars:
-                    _save_bar_cache(_bar_cache_key, bars)
-                    return bars
-        except (FutureTimeout, Exception) as e:
-            _detail(f"  [!] {industry} 东财K线超时/失败（{e.__class__.__name__}）")
 
-    # ── 2. 同花顺 index_ths（降级）───────────────────
-    bars = _fetch_ths_industry_bars(industry, lookback_days, start_date)
-    if bars:
-        _save_bar_cache(_bar_cache_key, bars)
-        return bars
+def _get_industry_bars_ths(industry: str, s_date: str, e_date: str):
+    """
+    同花顺行业 K 线降级源。
+    stock_board_industry_index_ths 列名: 日期, 开盘价, 最高价, 最低价, 收盘价, 成交量, 成交额
+    """
+    if _THS_CIRCUIT_OPEN:
+        return None
 
-    # ── 3. pytdx 880xxx（降级）───────────────────────
-    bars = _fetch_pytdx_industry_bars(industry, count=max(lookback_days, 300))
-    if bars:
-        _save_bar_cache(_bar_cache_key, bars)
-        return bars
+    import akshare as ak
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
-    # ── 4. 磁盘缓存兜底 ─────────────────────────────
-    cached = _load_bar_cache(_bar_cache_key, max_age_hours=48)
+    # THS 接口用 YYYY-MM-DD 格式
+    s_fmt = f"{s_date[:4]}-{s_date[4:6]}-{s_date[6:]}"
+    e_fmt = f"{e_date[:4]}-{e_date[4:6]}-{e_date[6:]}"
+
+    def _call():
+        with _no_proxy():
+            return ak.stock_board_industry_index_ths(
+                symbol=industry, start_date=s_fmt, end_date=e_fmt)
+
+    _pool = ThreadPoolExecutor(max_workers=1)
+    _future = _pool.submit(_call)
+    try:
+        df = _future.result(timeout=12)
+        if df is not None and not df.empty:
+            # THS 列名映射（与东财不同）
+            col_map = {}
+            for src, dst in [("日期", "dt"), ("开盘价", "open"), ("最高价", "high"),
+                             ("最低价", "low"), ("收盘价", "close"), ("成交量", "vol"),
+                             ("成交额", "amount")]:
+                if src in df.columns:
+                    col_map[src] = dst
+            df = df.rename(columns=col_map)
+            if "amount" not in df.columns:
+                df["amount"] = 0
+            _detail(f"  [✓] {industry} THS K线 {len(df)} 根")
+            return df
+        return None
+    except (FutureTimeout, Exception) as e:
+        _detail(f"  [!] {industry} THS K线失败（{e.__class__.__name__}）")
+        return None
+    finally:
+        _pool.shutdown(wait=False, cancel_futures=True)
+
+
+def get_industry_bars(industry: str,
+                      lookback_days: int = 180,
+                      start_date: str = None):
+    """
+    获取行业板块日线 K 线。
+    降级链：东财(6s) → 同花顺(12s) → 磁盘缓存(24h) → 空
+
+    :param industry:     行业名称，如 "有色金属"
+    :param lookback_days: 盘中模式：近 N 自然日（默认180）
+    :param start_date:   盘后模式：固定起点，如 '2024-09-24'
+    :return: List[RawBar]，失败返回空列表
+    """
+    from datetime import datetime, timedelta
+    from czsc import Freq
+    from signals.data.fetcher import _to_raw_bars
+
+    today = datetime.now()
+    if start_date:
+        s_date = start_date.replace("-", "")
+    else:
+        s_date = (today - timedelta(days=lookback_days)).strftime("%Y%m%d")
+    e_date = today.strftime("%Y%m%d")
+
+    # 1. 东财
+    df = _get_industry_bars_em(industry, s_date, e_date)
+    if df is not None:
+        bars = _to_raw_bars(df, industry, Freq.D,
+                            "dt", "open", "high", "low", "close", "vol", "amount")
+        if bars:
+            _save_bars_cache(industry, bars, source="em")
+            return bars
+
+    # 2. 同花顺降级
+    df = _get_industry_bars_ths(industry, s_date, e_date)
+    if df is not None:
+        bars = _to_raw_bars(df, industry, Freq.D,
+                            "dt", "open", "high", "low", "close", "vol", "amount")
+        if bars:
+            _save_bars_cache(industry, bars, source="ths")
+            return bars
+
+    # 3. 磁盘缓存
+    cached = _load_bars_cache(industry)
     if cached:
-        _detail(f"  [cache] {industry} K线使用缓存（{len(cached)}根）")
         return cached
+
     return []
 
 
@@ -1090,10 +1320,18 @@ def _get_known_industry_names() -> set:
 class ConceptRanking:
     """概念板块排名"""
     name: str
+    code: str = ""                 # 板块代码 BK0xxx
     gain_pct: float = 0.0
     leading_stock: str = ""
     leading_gain: float = 0.0
     sector_type: str = "中性"      # 自动分类：防守/进攻/周期/中性
+    tag: str = ""                  # 来源标记：""=实时, "static"=硬编码兜底
+    # 丰富字段（东财概念板块数据）
+    up_count: int = 0              # 上涨家数
+    down_count: int = 0            # 下跌家数
+    turnover_rate: float = 0.0     # 换手率
+    composite_score: float = 0.0   # 综合评分（多维度加权）
+    related_industries: List[str] = field(default_factory=list)  # 关联行业名
 
 
 def _classify_concept(name: str) -> str:
@@ -1113,47 +1351,377 @@ def _classify_industry(name: str) -> str:
     return getattr(_cfg, "SECTOR_TYPE_MAP", {}).get(name, "中性")
 
 
+def _is_noise_concept(name: str) -> bool:
+    """判断是否为噪音概念（非主题性的统计/回溯类板块）。"""
+    import config as _cfg
+    patterns = getattr(_cfg, "CONCEPT_NOISE_PATTERNS", [])
+    for p in patterns:
+        if p in name:
+            return True
+    return False
+
+
+def _compute_concept_score(gain_pct: float, up_count: int, down_count: int,
+                           turnover_rate: float, leading_gain: float,
+                           sector_type: str) -> float:
+    """
+    概念板块综合评分 (0-100)。
+    维度: 涨跌幅30% + 上涨比例25% + 换手率20% + 领涨股涨幅15% + 属性10%
+    """
+    # 涨跌幅 (30%): [-10, +10] → [0, 100]
+    gain_norm = min(max((gain_pct + 10) / 20 * 100, 0), 100)
+
+    # 上涨比例 (25%): up/(up+down) → [0, 100]
+    total = up_count + down_count
+    up_ratio = (up_count / total * 100) if total > 0 else 50
+
+    # 换手率 (20%): [0, 5%] → [0, 100]
+    turn_norm = min(turnover_rate / 5 * 100, 100)
+
+    # 领涨股涨幅 (15%): [0, 20%] → [0, 100]
+    lead_norm = min(max(leading_gain / 20 * 100, 0), 100)
+
+    # 属性加分 (10%): 进攻/周期 偏高
+    type_score = {"进攻": 80, "周期": 60, "防守": 40, "中性": 50}.get(sector_type, 50)
+
+    score = (gain_norm * 0.30 + up_ratio * 0.25 + turn_norm * 0.20
+             + lead_norm * 0.15 + type_score * 0.10)
+    return round(min(score, 100), 1)
+
+
+_CONCEPT_INDUSTRY_HINTS = {
+    "储能": ["电力", "光伏设备", "电网设备"],
+    "电池": ["能源金属", "光伏设备"],
+    "锂电": ["能源金属", "化学原料"],
+    "锂矿": ["能源金属", "小金属"],
+    "光伏": ["光伏设备", "电网设备"],
+    "风电": ["风电设备", "电网设备"],
+    "芯片": ["半导体", "消费电子"],
+    "半导体": ["半导体", "元件"],
+    "AI": ["计算机设备", "软件开发"],
+    "算力": ["计算机设备", "通信设备"],
+    "机器人": ["通用设备", "专用设备"],
+    "汽车": ["汽车整车", "汽车零部件"],
+    "军工": ["军工装备", "航空航天装备"],
+    "医药": ["化学制药", "生物制药"],
+    "白酒": ["白酒"],
+    "化工": ["化学原料", "化学制品"],
+    "钢铁": ["钢铁"],
+    "银行": ["银行"],
+    "券商": ["证券"],
+    "地产": ["房地产开发"],
+    "稀土": ["小金属", "工业金属"],
+}
+
+
+def _map_concept_to_industries(concept_name: str) -> List[str]:
+    """概念名关键词匹配行业名。优先用提示表，再用 ROTATION_LINE_MAP。"""
+    import config as _cfg
+
+    # 先用提示表精确匹配
+    for keyword, industries in _CONCEPT_INDUSTRY_HINTS.items():
+        if keyword in concept_name:
+            return industries[:3]
+
+    # 回退到 ROTATION_LINE_MAP 子串匹配
+    rot_map = getattr(_cfg, "ROTATION_LINE_MAP", {})
+    matched = []
+    kw = concept_name.replace("概念", "").replace("板块", "").strip()
+    for ind_name in sorted(rot_map.keys(), key=len, reverse=True):
+        if ind_name in concept_name or (kw and len(kw) >= 2 and kw in ind_name):
+            matched.append(ind_name)
+        if len(matched) >= 3:
+            break
+    return matched
+
+
+
+def _concept_cache_path():
+    """概念排行磁盘缓存路径"""
+    from pathlib import Path
+    cache_dir = Path(__file__).resolve().parent.parent.parent / ".data" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / "concept_rankings.json"
+
+
+def _save_concept_cache(results: List[ConceptRanking], source: str = "em"):
+    """保存概念排行到磁盘缓存（标记来源 source: em/ths）"""
+    import json, time
+    data = {
+        "ts": time.time(),
+        "source": source,
+        "items": [
+            {"name": c.name, "code": c.code, "gain_pct": c.gain_pct,
+             "leading_stock": c.leading_stock, "leading_gain": c.leading_gain,
+             "sector_type": c.sector_type, "tag": c.tag,
+             "up_count": c.up_count, "down_count": c.down_count,
+             "turnover_rate": c.turnover_rate, "composite_score": c.composite_score,
+             "related_industries": c.related_industries}
+            for c in results
+        ],
+    }
+    try:
+        _concept_cache_path().write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_concept_cache(max_age: float = 86400) -> List[ConceptRanking]:
+    """从磁盘缓存加载概念排行（默认24h过期）。校验数据有效性。"""
+    import json, time
+    path = _concept_cache_path()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if time.time() - data.get("ts", 0) > max_age:
+            return []
+        items = data.get("items", [])
+        if not items:
+            return []
+        # 缓存有效性校验：如果 gain_pct 全为 0 且来源是 THS，视为弱数据
+        source = data.get("source", "unknown")
+        gains = [abs(item.get("gain_pct", 0)) for item in items]
+        if source == "ths" and all(g < 0.01 for g in gains):
+            _detail("  [缓存] THS 缓存数据 gain_pct 全为 0，视为无效")
+            return []
+        results = []
+        for item in items:
+            results.append(ConceptRanking(
+                name=item["name"],
+                code=item.get("code", ""),
+                gain_pct=item.get("gain_pct", 0),
+                leading_stock=item.get("leading_stock", ""),
+                leading_gain=item.get("leading_gain", 0),
+                sector_type=item.get("sector_type", ""),
+                tag=item.get("tag", ""),
+                up_count=item.get("up_count", 0),
+                down_count=item.get("down_count", 0),
+                turnover_rate=item.get("turnover_rate", 0),
+                composite_score=item.get("composite_score", 0),
+                related_industries=item.get("related_industries", []),
+            ))
+        _detail(f"  [缓存] 概念板块 {len(results)} 条（磁盘缓存, 来源:{source}）")
+        return results
+    except Exception:
+        return []
+
+
+# ── 概念板块硬编码兜底 ───────────────────────────────────
+_FALLBACK_CONCEPTS = [
+    ("AI算力", "进攻"), ("DeepSeek概念", "进攻"), ("机器人概念", "进攻"),
+    ("半导体", "进攻"), ("消费电子", "进攻"), ("新能源车", "周期"),
+    ("光伏", "周期"), ("军工", "主题"), ("中药", "防守"), ("白酒", "消费"),
+]
+
+
+def _fallback_concepts(top_n: int = 10) -> List[ConceptRanking]:
+    """当东财+缓存都失败时的硬编码兜底概念列表"""
+    _detail("  [兜底] 使用静态概念列表")
+    results = []
+    for name, stype in _FALLBACK_CONCEPTS[:top_n]:
+        results.append(ConceptRanking(
+            name=name,
+            gain_pct=0.0,
+            leading_stock="",
+            leading_gain=0.0,
+            sector_type=stype,
+            tag="static",
+        ))
+    return results
+
+
+def _get_concepts_ths(top_n: int = 10) -> List[ConceptRanking]:
+    """
+    同花顺概念板块降级源。
+    获取概念名称列表 + 并行获取 K 线计算涨跌幅。
+    """
+    import akshare as ak
+    from datetime import datetime, timedelta
+    from concurrent.futures import ThreadPoolExecutor
+
+    _detail("  [THS] 尝试同花顺概念板块...")
+    df = ak.stock_board_concept_name_ths()
+    if df is None or df.empty:
+        raise ValueError("THS 概念列表为空")
+
+    # 名称列: 尝试多种可能的列名
+    name_col = None
+    for col in ["概念名称", "name", "板块名称"]:
+        if col in df.columns:
+            name_col = col
+            break
+    if name_col is None and len(df.columns) > 0:
+        name_col = df.columns[0]
+
+    # THS 概念列表按拼音排序，不能只取前 N 个（会偏向 A/B 开头）
+    # 策略：取全量名称 → 优先匹配已知热门关键词 → 补齐随机样本
+    all_names = df[name_col].tolist()
+    _HOT_KEYWORDS = ["AI", "算力", "机器人", "芯片", "半导体", "新能源", "光伏",
+                     "储能", "电力", "军工", "低空", "白酒", "医药", "消费",
+                     "汽车", "锂电", "光模块", "ChatGPT", "DeepSeek", "鸿蒙",
+                     "华为", "特斯拉", "比亚迪", "CXO", "CPO"]
+    # 优先选包含热门关键词的概念
+    hot_names = [n for n in all_names if any(kw in n for kw in _HOT_KEYWORDS)]
+    # 补齐：从剩余概念中均匀采样
+    remaining = [n for n in all_names if n not in hot_names]
+    import random
+    sample_size = max(0, top_n * 3 - len(hot_names))
+    if sample_size > 0 and remaining:
+        step = max(1, len(remaining) // sample_size)
+        sampled = remaining[::step][:sample_size]
+    else:
+        sampled = []
+    concept_names = (hot_names + sampled)[:top_n * 2]  # 从3x降到2x，减少HTTP请求
+
+    today = datetime.now()
+    start_date = (today - timedelta(days=7)).strftime("%Y%m%d")
+    end_date = today.strftime("%Y%m%d")
+
+    def _fetch_gain(cname):
+        try:
+            kdf = ak.stock_board_concept_index_ths(
+                symbol=cname, start_date=start_date, end_date=end_date)
+            if kdf is not None and len(kdf) >= 2:
+                close_col = None
+                for c in ["收盘价", "收盘", "close"]:
+                    if c in kdf.columns:
+                        close_col = c
+                        break
+                if close_col:
+                    gain = (float(kdf.iloc[-1][close_col]) /
+                            float(kdf.iloc[-2][close_col]) - 1) * 100
+                    return cname, round(gain, 2)
+            return cname, 0.0
+        except Exception:
+            return cname, 0.0
+
+    # 并行获取涨跌幅（8 workers 加速，6s 超时）
+    results_raw = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fetch_gain, n): n for n in concept_names}
+        for fut in futures:
+            try:
+                name, gain = fut.result(timeout=6)  # 从10s降到6s
+                results_raw.append((name, gain))
+            except Exception:
+                results_raw.append((futures[fut], 0.0))
+
+    # 按涨幅排序取 top_n
+    results_raw.sort(key=lambda x: -x[1])
+    results = []
+    for name, gain in results_raw[:top_n]:
+        results.append(ConceptRanking(
+            name=name,
+            gain_pct=gain,
+            leading_stock="",
+            leading_gain=0.0,
+            sector_type=_classify_concept(name),
+            tag="ths",
+        ))
+
+    _detail(f"  [✓] THS 概念板块 top {len(results)} 条")
+    return results
+
+
+def _get_concepts_sina(top_n: int = 10) -> List[ConceptRanking]:
+    """
+    新浪概念板块排行（2.4s, 175 概念）。
+    stock_sector_spot("概念") 列: label, 板块, 公司家数, 平均价格, 涨跌额,
+                                 涨跌幅, 总成交量, 总成交额, 领涨股票, 涨跌幅.1
+    """
+    import akshare as ak
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+    def _call():
+        with _no_proxy():
+            return ak.stock_sector_spot(indicator="概念")
+
+    _pool = ThreadPoolExecutor(max_workers=1)
+    _future = _pool.submit(_call)
+    try:
+        df = _future.result(timeout=8)
+    except (FutureTimeout, Exception) as e:
+        _detail(f"  [!] 新浪概念板块失败（{e.__class__.__name__}）")
+        return []
+    finally:
+        _pool.shutdown(wait=False, cancel_futures=True)
+
+    if df is None or df.empty or "涨跌幅" not in df.columns:
+        return []
+
+    # 全量处理：先过滤噪音，再评分排序
+    results = []
+    for _, row in df.iterrows():
+        name = str(row.get("板块", "")).strip()
+        if not name or _is_noise_concept(name):
+            continue
+        leading = str(row.get("领涨股票", ""))
+        leading_gain = 0.0
+        try:
+            leading_gain = float(row.get("涨跌幅.1", 0) or 0)
+        except (ValueError, TypeError):
+            pass
+        gain_pct = float(row.get("涨跌幅", 0) or 0)
+        stype = _classify_concept(name)
+        # 新浪无上涨家数/换手率，用简化评分
+        score = _compute_concept_score(gain_pct, 0, 0, 0, leading_gain, stype)
+        related = _map_concept_to_industries(name)
+        results.append(ConceptRanking(
+            name=name,
+            gain_pct=gain_pct,
+            leading_stock=leading,
+            leading_gain=leading_gain,
+            sector_type=stype,
+            composite_score=score,
+            related_industries=related,
+        ))
+    results.sort(key=lambda x: x.composite_score, reverse=True)
+    results = results[:top_n]
+    _detail(f"  [✓] 新浪概念板块 top {len(results)} 条（已过滤噪音）")
+    return results
+
 
 def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
     """
-    获取概念板块涨幅 top N。
-
-    降级链：东财 concept_name_em（15s+重试） → 磁盘缓存
-    （同花顺/pytdx 均无概念排行能力）
+    获取概念板块综合排行 top N（过滤噪音 + 多维评分）。
+    降级链: 东财(8s,468概念,字段丰富) → 新浪(2.4s,175概念) → THS(25s) → 磁盘缓存 → 硬编码兜底
     """
     import akshare as ak
     import config as _cfg
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
     if top_n is None:
-        top_n = getattr(_cfg, "CONCEPT_TOP_N", 10)
+        top_n = getattr(_cfg, "CONCEPT_TOP_N", 15)
 
-    _cache_key = "concept_rankings"
-
-    def _call():
-        with _no_proxy():
-            return ak.stock_board_concept_name_em()
-
+    # ── 0. 东财优先（468概念, 上涨/下跌/换手率等丰富字段）──
+    # 先尝试 social_fetcher 的内存/磁盘缓存（毫秒级），再尝试直接网络调用
     df = None
-    for attempt in range(2):
+    try:
+        from signals.data.social_fetcher import fetch_concept_list
+        df = fetch_concept_list()
+        if df is not None and not df.empty and "涨跌幅" in df.columns:
+            _detail(f"  [✓] 东财概念板块（缓存） {len(df)} 条")
+        else:
+            df = None
+    except Exception as e:
+        _detail(f"  [!] 概念板块缓存读取失败: {e}")
+        df = None
+
+    if df is None:
+        # 缓存未命中，尝试直接网络调用（带 SSL 重试，不受行业板块熔断控制）
         try:
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(_call)
-                df = future.result(timeout=15)
-            break
-        except (FutureTimeout, Exception) as e:
-            if attempt == 0:
-                _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}），重试中...")
-                continue
-            _detail(f"  [!] 概念板块接口失败（{e.__class__.__name__}，重试仍失败）")
+            df = _em_retry(ak.stock_board_concept_name_em, retries=3, delay=1.0)
+        except Exception as e:
+            _detail(f"  [!] 东财概念板块接口失败（3次重试后，{e.__class__.__name__}: {e}）")
             df = None
 
     if df is not None and not df.empty and "涨跌幅" in df.columns:
-        df = df.sort_values("涨跌幅", ascending=False).head(top_n)
+        # 全量处理：先过滤噪音，再评分排序，最后截取 top_n
         results = []
         for _, row in df.iterrows():
             name = str(row.get("板块名称", "")).strip()
-            if not name:
+            if not name or _is_noise_concept(name):
                 continue
             leading = str(row.get("领涨股票", ""))
             leading_gain = 0.0
@@ -1161,39 +1729,63 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
                 leading_gain = float(row.get("领涨股票-涨跌幅", 0) or 0)
             except (ValueError, TypeError):
                 pass
+            gain_pct = float(row.get("涨跌幅", 0) or 0)
+            up_c = int(row.get("上涨家数", 0) or 0)
+            down_c = int(row.get("下跌家数", 0) or 0)
+            turn = float(row.get("换手率", 0) or 0)
+            code = str(row.get("板块代码", ""))
+            stype = _classify_concept(name)
+            score = _compute_concept_score(
+                gain_pct, up_c, down_c, turn, leading_gain, stype)
+            related = _map_concept_to_industries(name)
             results.append(ConceptRanking(
-                name=name,
-                gain_pct=float(row.get("涨跌幅", 0) or 0),
+                name=name, code=code,
+                gain_pct=gain_pct,
                 leading_stock=leading,
                 leading_gain=leading_gain,
-                sector_type=_classify_concept(name),
+                sector_type=stype,
+                up_count=up_c,
+                down_count=down_c,
+                turnover_rate=turn,
+                composite_score=score,
+                related_industries=related,
             ))
+        # 按综合评分排序
+        results.sort(key=lambda x: x.composite_score, reverse=True)
+        results = results[:top_n]
+        _detail(f"  [✓] 概念板块 top {len(results)} 条（已过滤噪音+综合评分排序）")
+        _save_concept_cache(results, source="em")
+        return results
 
-        if results:
-            # 缓存序列化
-            _save_cache(_cache_key, [
-                {"name": r.name, "gain_pct": r.gain_pct,
-                 "leading_stock": r.leading_stock, "leading_gain": r.leading_gain,
-                 "sector_type": r.sector_type}
-                for r in results
-            ])
-            _detail(f"  [✓] 概念板块 top {len(results)} 条")
-            return results
+    # ── 1. 新浪降级（2.4s, 175概念, 无上涨/下跌/换手率）──
+    sina_results = _get_concepts_sina(top_n)
+    if sina_results:
+        _save_concept_cache(sina_results, source="sina")
+        return sina_results
 
-    # ── 磁盘缓存兜底 ────────────────────────────────
-    cached = _load_cache(_cache_key, max_age_hours=24)
+    # ── 2. 同花顺降级（全局超时 25s，防止 THS K线拉取太慢）──
+    try:
+        _ths_pool = ThreadPoolExecutor(max_workers=1)
+        _ths_future = _ths_pool.submit(_get_concepts_ths, top_n)
+        try:
+            ths_results = _ths_future.result(timeout=25)
+        finally:
+            _ths_pool.shutdown(wait=False, cancel_futures=True)
+        if ths_results:
+            _save_concept_cache(ths_results, source="ths")
+            return ths_results
+    except (FutureTimeout, TimeoutError):
+        _detail("  [!] THS 概念板块超时（>25s），跳过")
+    except Exception as e:
+        _detail(f"  [!] THS 概念板块也失败（{e.__class__.__name__}）")
+
+    # ── 3. 磁盘缓存 ──
+    cached = _load_concept_cache()
     if cached:
-        _log(f"  [cache] 概念排行使用缓存（{len(cached)}条）")
-        return [
-            ConceptRanking(
-                name=c["name"], gain_pct=c["gain_pct"],
-                leading_stock=c.get("leading_stock", ""),
-                leading_gain=c.get("leading_gain", 0.0),
-                sector_type=c.get("sector_type", "中性"),
-            )
-            for c in cached
-        ]
-    return []
+        return cached[:top_n]
+
+    # ── 4. 硬编码兜底 ──
+    return _fallback_concepts(top_n)
 
 
 def _match_concepts_to_industries(
@@ -1296,15 +1888,16 @@ def _load_strong_pool(date_str: str) -> dict:
 def _load_margin_map(date_str: str) -> dict:
     """
     加载融资融券数据（上交所），返回 {6位代码: 融资买入额}。
-    注意：融资数据通常为 T-1，自动尝试前一交易日。
+    并行尝试当日+前3天（覆盖周末），取最先成功的。
     """
     import akshare as ak
     from datetime import datetime, timedelta
-    result: dict = {}
-    # 尝试当日和前3天（覆盖周末）
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     base = datetime.strptime(date_str, "%Y%m%d")
-    for delta in range(0, 4):
-        d = (base - timedelta(days=delta)).strftime("%Y%m%d")
+    dates = [(base - timedelta(days=delta)).strftime("%Y%m%d") for delta in range(4)]
+
+    def _try_date(d):
         try:
             df = ak.stock_margin_detail_sse(date=d)
             if df is not None and not df.empty:
@@ -1319,6 +1912,7 @@ def _load_margin_map(date_str: str) -> dict:
                         buy_col = c
                         break
                 if code_col and buy_col:
+                    result = {}
                     for _, row in df.iterrows():
                         code = str(row[code_col]).strip().zfill(6)
                         try:
@@ -1327,12 +1921,21 @@ def _load_margin_map(date_str: str) -> dict:
                             amt = 0.0
                         if amt > 0:
                             result[code] = amt
+                    return d, result
+        except Exception:
+            pass
+        return d, None
+
+    # 并行尝试 4 个日期，取第一个成功的
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for f in as_completed([pool.submit(_try_date, d) for d in dates]):
+            d, result = f.result()
+            if result:
                 _detail(f"  [✓] 融资数据（{d}）{len(result)} 只")
                 return result
-        except Exception:
-            continue
+
     _detail("  [!] 融资数据加载失败（最近4天均无数据）")
-    return result
+    return {}
 
 
 def _load_dt_pool(date_str: str) -> dict:
@@ -1380,6 +1983,37 @@ def _load_zbgc_pool(date_str: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────
+# P3-3: 板块节奏检测（轻量补充）
+# ─────────────────────────────────────────────────────────
+
+def _enrich_rhythm(rankings: List["IndustryRanking"]):
+    """为 Top-N 行业补充节奏检测（跳过已有 rhythm 的）"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # get_industry_bars 自带多源降级（东财→THS→pytdx→缓存），无需东财熔断守卫
+    need_rhythm = [r for r in rankings if not r.rhythm_phase]
+    if not need_rhythm:
+        return
+
+    def _compute(r):
+        try:
+            bars = get_industry_bars(r.name, lookback_days=30)
+            if not bars:
+                return
+            from signals.core.sector_rhythm import compute_sector_rhythm
+            rhythm = compute_sector_rhythm(r.name, bars)
+            if rhythm:
+                r.rhythm_phase = rhythm.phase
+                r.rhythm_score = rhythm.rhythm_score
+                r.rhythm_hint = rhythm.action_hint
+        except Exception:
+            pass
+
+    with _no_proxy(), ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(_compute, r) for r in need_rhythm[:10]]
+        for f in as_completed(futures):
+            f.result()  # propagate exceptions silently
+
+
 # 板块超跌检测
 # ─────────────────────────────────────────────────────────
 
@@ -1478,6 +2112,11 @@ def get_oversold_industries(name_df=None, top_n: int = 5) -> List[IndustryRankin
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    # 东财+同花顺都熔断时跳过超跌检测（K线完全不可用）
+    if _EM_CIRCUIT_OPEN and _THS_CIRCUIT_OPEN:
+        _detail("  [⚡] 东财+同花顺均熔断，跳过超跌检测")
+        return []
+
     if name_df is None or name_df.empty or "涨跌幅" not in name_df.columns:
         return []
 
@@ -1499,6 +2138,15 @@ def get_oversold_industries(name_df=None, top_n: int = 5) -> List[IndustryRankin
             bars = get_industry_bars(ind_name, lookback_days=30)
             score, detail = compute_oversold_score(bars)
             from signals.core.rotation import get_rotation_line
+            # P3-3: 板块节奏检测
+            r_phase, r_score, r_hint = "", 0.0, ""
+            try:
+                from signals.core.sector_rhythm import compute_sector_rhythm
+                rhythm = compute_sector_rhythm(ind_name, bars)
+                if rhythm:
+                    r_phase, r_score, r_hint = rhythm.phase, rhythm.rhythm_score, rhythm.action_hint
+            except Exception:
+                pass
             return IndustryRanking(
                 name=ind_name,
                 gain_pct=gain_pct,
@@ -1506,6 +2154,9 @@ def get_oversold_industries(name_df=None, top_n: int = 5) -> List[IndustryRankin
                 oversold_score=score,
                 oversold_detail=detail,
                 rotation_line=get_rotation_line(ind_name),
+                rhythm_phase=r_phase,
+                rhythm_score=r_score,
+                rhythm_hint=r_hint,
             )
         except Exception:
             return None
@@ -1537,7 +2188,11 @@ def compute_industry_composite_scores(
     weights: dict = None,
 ) -> List[dict]:
     """
-    计算所有行业的综合强度评分（7维度加权）。
+    计算所有行业的综合强度评分（9维度加权，含2个领先指标）。
+
+    维度说明:
+      滞后型: gain, inflow, zt_density, lianban, strong_density, continue, dt_penalty
+      领先型: inflow_momentum (资金先行度), startup_ratio (启动率)
 
     :param change_df:   stock_board_change_em() 结果
     :param zt_pool:     _load_zt_pool() 结果
@@ -1551,9 +2206,10 @@ def compute_industry_composite_scores(
 
     if weights is None:
         weights = getattr(_cfg, "RANK_COMPOSITE_WEIGHTS", {
-            "gain": 20, "inflow": 20, "zt_density": 20,
-            "lianban": 10, "strong_density": 15,
-            "continue": 10, "dt_penalty": 5,
+            "gain": 15, "inflow": 15, "zt_density": 15,
+            "lianban": 5, "strong_density": 10,
+            "continue": 5, "dt_penalty": 10,
+            "inflow_momentum": 15, "startup_ratio": 10,
         })
 
     if change_df is None or change_df.empty:
@@ -1569,17 +2225,26 @@ def compute_industry_composite_scores(
     for _, r in df.iterrows():
         name = str(r["板块名称"])
         gain = float(r.get("涨跌幅", 0) or 0)
-        inflow = float(r.get("主力净流入", 0) or 0)
+        inflow_raw = float(r.get("主力净流入", 0) or 0)
+        inflow = inflow_raw / 1e8  # 转为亿
         zt_list = zt_pool.get(name, [])
         zt_cnt = len(zt_list)
         max_lianban = max((x[2] for x in zt_list), default=0)
         strong_cnt = len(strong_pool.get(name, []))
         zbgc = zbgc_count.get(name, 0)
         dt = dt_count.get(name, 0)
+        # 领先指标 1: 资金动量 = 资金流入 / 涨幅绝对值
+        # 资金大量流入但涨幅小 → 资金先行，值越大越领先
+        inflow_momentum = inflow / max(abs(gain), 0.1)
+        # 领先指标 2: 启动率 = (涨停+强势) 占比的代理指标
+        # 涨停+强势数量多但涨幅低 → 个股开始启动但板块还没起来
+        startup_ratio = (zt_cnt + strong_cnt)
         rows.append({
             "name": name, "gain": gain, "inflow": inflow,
             "zt_count": zt_cnt, "max_lianban": max_lianban,
             "strong_count": strong_cnt, "zbgc": zbgc, "dt": dt,
+            "inflow_momentum": inflow_momentum,
+            "startup_ratio": startup_ratio,
         })
 
     if not rows:
@@ -1599,17 +2264,21 @@ def compute_industry_composite_scores(
     strongs    = _norm([r["strong_count"] for r in rows])
     continues  = _norm([r["zbgc"] for r in rows])
     dt_pens    = _norm([r["dt"] for r in rows])
+    inflow_moms = _norm([r["inflow_momentum"] for r in rows])
+    startup_rs  = _norm([r["startup_ratio"] for r in rows])
 
     results = []
     for i, r in enumerate(rows):
         score = (
-            gains[i]     * weights.get("gain", 20)
-            + inflows[i] * weights.get("inflow", 20)
-            + zt_dens[i] * weights.get("zt_density", 20)
-            + lianbans[i] * weights.get("lianban", 10)
-            + strongs[i] * weights.get("strong_density", 15)
-            + continues[i] * weights.get("continue", 10)
-            - dt_pens[i] * weights.get("dt_penalty", 5)
+            gains[i]       * weights.get("gain", 15)
+            + inflows[i]   * weights.get("inflow", 15)
+            + zt_dens[i]   * weights.get("zt_density", 15)
+            + lianbans[i]  * weights.get("lianban", 5)
+            + strongs[i]   * weights.get("strong_density", 10)
+            + continues[i] * weights.get("continue", 5)
+            - dt_pens[i]   * weights.get("dt_penalty", 10)
+            + inflow_moms[i] * weights.get("inflow_momentum", 15)
+            + startup_rs[i]  * weights.get("startup_ratio", 10)
         )
         results.append({**r, "composite_score": round(score, 1)})
 
@@ -1733,7 +2402,16 @@ def get_industry_representatives(top_n: int = None,
     target_date = date_str or datetime.now().strftime("%Y%m%d")
     is_historical = date_str is not None  # 盘后模式标志
 
+    # ── 0. 东财健康预检（3s 快速探测，失败则全局熔断跳过所有东财调用）──
+    import time as _time
+    _l2_start = _time.monotonic()
+
+    _t0 = _time.monotonic()
+    _em_health_probe(timeout=3.0)
+    _detail(f"  [⏱] 东财健康预检 — {_time.monotonic() - _t0:.1f}s (熔断={_EM_CIRCUIT_OPEN})")
+
     # ── 1. 加载所有数据源 ────────────────────────────────
+    _t0 = _time.monotonic()
     mode_label = f"历史（{target_date}）" if is_historical else "实时"
     _log(f"  加载多维数据源（{mode_label}）...")
 
@@ -1765,7 +2443,7 @@ def get_industry_representatives(top_n: int = None,
                 _detail(f"  [!] 全板块异动接口失败（{e.__class__.__name__}）")
             return None
         _pool_tasks["change_df"] = _load_change_em
-        _pool_tasks["name_df"] = lambda: _fetch_board_industry_name_em()
+        _pool_tasks["name_df"] = lambda: _fetch_industry_ranking_with_fallback()
         _pool_tasks["concepts"] = lambda: get_concept_rankings()
     else:
         _detail("  [i] 盘后模式：跳过 change_em / name_em（仅实时接口）")
@@ -1793,8 +2471,10 @@ def get_industry_representatives(top_n: int = None,
     if name_df is not None and not name_df.empty:
         _detail(f"  [✓] 行业板块行情 {len(name_df)} 条")
     concepts: List[ConceptRanking] = _pool_results.get("concepts") or []
+    _detail(f"  [⏱] 数据源并行加载 — {_time.monotonic() - _t0:.1f}s")
 
     # ── 2. 榜单 A：涨幅排行（盘中）/ 涨停密度排行（盘后）──
+    _t0 = _time.monotonic()
     gain_industries: list = []   # [(行业名, {gain_pct, net_inflow, leading_name, leading_gain})]
 
     if is_historical:
@@ -1837,7 +2517,10 @@ def get_industry_representatives(top_n: int = None,
                 "leading_gain": 0.0,
             }))
 
+    _detail(f"  [⏱] 涨幅/涨停榜 — {_time.monotonic() - _t0:.1f}s ({len(gain_industries)} 行业)")
+
     # ── 3. 榜单 B：综合强度排行 ──────────────────────────
+    _t0 = _time.monotonic()
     if is_historical:
         all_scores = compute_historical_composite_scores(
             zt_pool, strong_pool, dt_count, zbgc_count
@@ -1848,7 +2531,10 @@ def get_industry_representatives(top_n: int = None,
         )
     composite_industries = all_scores[:top_n]  # list of dict
 
+    _detail(f"  [⏱] 综合评分 — {_time.monotonic() - _t0:.1f}s ({len(composite_industries)} 行业)")
+
     # ── 4. 合并双榜 → 为每行业选代表股 ──────────────────
+    _t0 = _time.monotonic()
     gain_names = {x[0] for x in gain_industries}
     comp_names = {x["name"] for x in composite_industries}
     all_ind_names = list(dict.fromkeys(
@@ -2015,6 +2701,8 @@ def get_industry_representatives(top_n: int = None,
             seen_names.add(r.name)
             merged_list.append(r)
 
+    _detail(f"  [⏱] 选股+构建列表 — {_time.monotonic() - _t0:.1f}s ({len(merged_list)} 合并)")
+
     # ── 5. 设置 sector_type 和 concept_tags ──
     concept_map = _match_concepts_to_industries(
         concepts, [r.name for r in merged_list], name_df)
@@ -2022,6 +2710,13 @@ def get_industry_representatives(top_n: int = None,
         r.sector_type = _classify_industry(r.name)
         if r.name in concept_map:
             r.concept_tags = concept_map[r.name]
+
+    # ── 5.5 P3-3: 板块节奏检测（所有上榜行业）──
+    # gain_list 和 composite_list 是独立对象，需分别 enrich
+    _t0 = _time.monotonic()
+    _enrich_rhythm(gain_list)
+    _enrich_rhythm(composite_list)
+    _detail(f"  [⏱] 节奏检测 — {_time.monotonic() - _t0:.1f}s")
 
     # ── 6. 超跌检测（盘中模式有 name_df 时）──
     oversold_list: List[IndustryRanking] = []
@@ -2031,4 +2726,153 @@ def get_industry_representatives(top_n: int = None,
         except Exception as e:
             _detail(f"  [!] 超跌检测失败（{e.__class__.__name__}）")
 
-    return gain_list, composite_list, merged_list, concepts, oversold_list
+    # ── 7. 情绪统计（供 MarketContext.update_sentiment 使用）──
+    _zt_total = sum(len(v) for v in zt_pool.values())
+    _dt_total = sum(v for v in dt_count.values())
+    _lianban_max = max(
+        (max((x[2] for x in v), default=0) for v in zt_pool.values()),
+        default=0,
+    ) if zt_pool else 0
+    sentiment_stats = {
+        "zt_total": _zt_total,
+        "dt_total": _dt_total,
+        "lianban_max": _lianban_max,
+        "name_df": name_df,
+    }
+
+    _l2_elapsed = _time.monotonic() - _l2_start
+    _log(f"  [⏱] L2 行业分析完成，耗时 {_l2_elapsed:.1f}s")
+
+    return gain_list, composite_list, merged_list, concepts, oversold_list, sentiment_stats
+
+
+# ─────────────────────────────────────────────────────────
+# 抄底候选板块筛选（恐慌时触发）
+# ─────────────────────────────────────────────────────────
+
+def get_bottom_fishing_candidates(
+    name_df,
+    oversold_list: List[IndustryRanking],
+    panic_score: float,
+    themes: List[str] = None,
+    top_n: int = 5,
+) -> List[IndustryRanking]:
+    """
+    恐慌行情中筛选抄底候选板块。
+
+    选择逻辑:
+    1. 从 name_df 取今日跌幅最大的 15 个行业
+    2. 与历史超跌 oversold_list 取交集 → "双重超跌"
+    3. 评分加权:
+       - 今日跌幅分 (35): 跌得越多分越高
+       - 历史超跌分 (30): 复用 oversold_score
+       - 轮动线加分 (20): 进攻/科技型板块恐慌后弹性最大
+       - 主题命中   (15): 命中用户关注主题
+    4. 排序输出 top N
+
+    :param name_df: 东财行业板块 DataFrame (含板块名+涨跌幅)
+    :param oversold_list: L2 历史超跌列表
+    :param panic_score: 盘中恐慌评分 (0-100)
+    :param themes: 用户关注主题列表
+    :param top_n: 输出数量
+    :return: IndustryRanking 列表（按抄底得分降序）
+    """
+    if name_df is None or name_df.empty:
+        return []
+
+    if panic_score < 40:
+        return []
+
+    import config as _cfg
+
+    # 找列名
+    name_col = None
+    for col in ['板块名称', '板块', '名称', '行业']:
+        if col in name_df.columns:
+            name_col = col
+            break
+    change_col = None
+    for col in ['涨跌幅', '涨跌幅(%)', '涨幅', '涨幅(%)', '最新涨跌幅']:
+        if col in name_df.columns:
+            change_col = col
+            break
+    if not name_col or not change_col:
+        return []
+
+    # 1. 取今日跌幅最大的 15 个行业
+    df = name_df[[name_col, change_col]].copy()
+    df[change_col] = pd.to_numeric(df[change_col], errors='coerce')
+    df = df.dropna(subset=[change_col])
+    df = df.sort_values(change_col, ascending=True).head(15)
+
+    # 历史超跌名单
+    oversold_map = {r.name: r.oversold_score for r in oversold_list}
+
+    # 主题关键词
+    theme_keywords = []
+    if themes:
+        from signals.core.theme_tracker import THEME_KEYWORD_MAP
+        for t in themes:
+            kws = THEME_KEYWORD_MAP.get(t.upper().strip()) or THEME_KEYWORD_MAP.get(t.strip())
+            if kws:
+                theme_keywords.extend(kws)
+            else:
+                theme_keywords.append(t.strip())
+
+    # 板块属性和轮动线
+    sector_type_map = getattr(_cfg, "SECTOR_TYPE_MAP", {})
+    rotation_map = getattr(_cfg, "ROTATION_LINE_MAP", {})
+
+    candidates = []
+    for _, row in df.iterrows():
+        ind_name = str(row[name_col])
+        change = float(row[change_col])
+
+        # 今日跌幅分 (满分35): 跌幅>3%满分, 1~3%线性
+        drop = abs(change) if change < 0 else 0
+        if drop >= 3.0:
+            decline_pts = 35.0
+        elif drop >= 1.0:
+            decline_pts = 35.0 * (drop - 1.0) / 2.0
+        else:
+            decline_pts = 0.0
+
+        # 历史超跌分 (满分30): 直接取 oversold_score 归一化
+        hist_score = oversold_map.get(ind_name, 0.0)
+        oversold_pts = min(30.0, hist_score * 0.3)  # oversold_score 0-100 → 0-30
+
+        # 轮动线/板块属性加分 (满分20): 进攻型+科技线弹性最大
+        stype = sector_type_map.get(ind_name, "中性")
+        rot_line = rotation_map.get(ind_name, "")
+        attr_pts = 0.0
+        if stype == "进攻":
+            attr_pts += 12.0
+        elif stype == "周期":
+            attr_pts += 6.0
+        if rot_line == "科技":
+            attr_pts += 8.0
+        elif rot_line == "新能源":
+            attr_pts += 5.0
+        attr_pts = min(20.0, attr_pts)
+
+        # 主题命中 (满分15)
+        theme_pts = 0.0
+        if theme_keywords and any(kw in ind_name for kw in theme_keywords):
+            theme_pts = 15.0
+
+        total = decline_pts + oversold_pts + attr_pts + theme_pts
+
+        if total > 0:
+            r = IndustryRanking(
+                name=ind_name,
+                gain_pct=change,
+                composite_score=round(total, 1),
+                sector_type=stype,
+                rotation_line=rot_line,
+                oversold_score=hist_score,
+                oversold_detail=f"今日{change:+.1f}%",
+            )
+            candidates.append(r)
+
+    candidates.sort(key=lambda x: x.composite_score, reverse=True)
+    return candidates[:top_n]

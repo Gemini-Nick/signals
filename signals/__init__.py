@@ -10,18 +10,44 @@ Signals — 缠论三层联动分析系统
   notify/   通知（飞书推送）
 """
 
-# Re-export：保持 `from signals import Xxx` 的兼容性
-from signals.core.freq_utils import config_freq_to_czsc, FREQ_MAP
-from signals.core.analyzer import SymbolAnalyzer
-from signals.core.detectors import detect_all_signals, SignalEvent
-from signals.core.scorer import score_signals, ScoredSymbol
+# Lazy imports：避免顶层加载 czsc 等重依赖，
+# 让 signals.web / signals.deploy 等轻量子模块可以独立使用。
+# 保持 `from signals import Xxx` 的兼容性。
 
-from signals.layers.index_report import ZSLevel, IndexReport
-from signals.layers.index_analyzer import IndexAnalyzer
-from signals.layers.market_context import (MarketContext, build_market_context, infer_strong_sectors,
-                                            SentimentPhase, calc_divergence, detect_sentiment_phase)
-from signals.layers.index_screener import IndexScreener
-from signals.layers.industry import get_industry_list, get_industry_stocks, IndustryScore, score_industry
-from signals.layers.industry import get_industry_representatives, ConceptRanking
-from signals.layers.screener import IntraDayScreener
-from signals.layers.review_screener import review_stock_daily
+_LAZY_IMPORTS = {
+    # core
+    "config_freq_to_czsc": "signals.core.freq_utils",
+    "FREQ_MAP":            "signals.core.freq_utils",
+    "SymbolAnalyzer":      "signals.core.analyzer",
+    "detect_all_signals":  "signals.core.detectors",
+    "SignalEvent":         "signals.core.detectors",
+    "score_signals":       "signals.core.scorer",
+    "ScoredSymbol":        "signals.core.scorer",
+    # layers
+    "ZSLevel":             "signals.layers.index_report",
+    "IndexReport":         "signals.layers.index_report",
+    "IndexAnalyzer":       "signals.layers.index_analyzer",
+    "MarketContext":       "signals.layers.market_context",
+    "build_market_context":"signals.layers.market_context",
+    "infer_strong_sectors":"signals.layers.market_context",
+    "SentimentPhase":      "signals.layers.market_context",
+    "calc_divergence":     "signals.layers.market_context",
+    "detect_sentiment_phase":"signals.layers.market_context",
+    "IndexScreener":       "signals.layers.index_screener",
+    "get_industry_list":   "signals.layers.industry",
+    "get_industry_stocks": "signals.layers.industry",
+    "IndustryScore":       "signals.layers.industry",
+    "score_industry":      "signals.layers.industry",
+    "get_industry_representatives": "signals.layers.industry",
+    "ConceptRanking":      "signals.layers.industry",
+    "IntraDayScreener":    "signals.layers.screener",
+    "review_stock_daily":  "signals.layers.review_screener",
+}
+
+
+def __getattr__(name):
+    if name in _LAZY_IMPORTS:
+        import importlib
+        module = importlib.import_module(_LAZY_IMPORTS[name])
+        return getattr(module, name)
+    raise AttributeError(f"module 'signals' has no attribute {name!r}")

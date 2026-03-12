@@ -36,9 +36,11 @@ except ImportError:
   python run.py --mode sim --create --start 2026-01-14   # 创建仿真快照
   python run.py --mode sim --session 2026-01-14          # 执行仿真回放
   python run.py --mode sim --list-sessions               # 列出可用快照
-  python run.py --mode autoresearch                      # 自主研究（永不停止）
-  python run.py --mode autoresearch --experiments 10     # 自主研究（跑10轮）
-  python run.py --mode autoresearch --dry-run            # 自主研究（预览不修改）
+  python run.py --mode web                               # Web UI（TradingView 风格）
+  python run.py --mode web --port 9000                   # 指定端口
+  python run.py --mode analog                            # 历史形态匹配（全部指数）
+  python run.py --mode analog --symbol 沪深300           # 指定单个指数匹配
+  python run.py --mode index --push                      # 指数分析 + 推送到 Vercel
 """
 import sys
 import subprocess
@@ -216,6 +218,9 @@ def run_intraday(args):
         dash.set_context(direction=ctx.overall_direction,
                          style=ctx.recommended_style)
 
+    # 保存 screener 引用供 --push 使用
+    args._screener = screener_l1
+
     if not ctx.gate_industry_scan:
         dash.log("  [yellow]⚠️  市场偏空，建议观望，仅扫描白名单。[/yellow]")
 
@@ -231,12 +236,21 @@ def run_intraday(args):
         dash.phase_start("L2.ranking")
 
         try:
-            gain_list, composite_list, merged_list, concepts, oversold_list = get_industry_representatives(
+            gain_list, composite_list, merged_list, concepts, oversold_list, l2_stats = get_industry_representatives(
                 config.RANK_TOP_N)
         except Exception as e:
             dash.log(f"  [!] 行业筛选异常（{e}），跳过 Layer 2")
             dash.task_error("L2.ranking", "行业筛选", str(e))
             gain_list, composite_list, merged_list, concepts, oversold_list = [], [], [], [], []
+            l2_stats = {}
+
+        # ── 情绪周期更新（L2 涨跌停数据回传 MarketContext）───
+        if l2_stats:
+            ctx.update_sentiment(
+                zt_total=l2_stats.get("zt_total", 0),
+                dt_total=l2_stats.get("dt_total", 0),
+                lianban_max=l2_stats.get("lianban_max", 0),
+            )
 
         # ── 汇总入池 ─────────────────────────────────────
         for r in merged_list:
@@ -254,6 +268,11 @@ def run_intraday(args):
                 ctx.rotation_detail = rot.format_line()
                 _, alloc_str = suggest_allocation(rot, ctx.sentiment_phase)
                 ctx.allocation_suggestion = alloc_str
+                # P3-4: 轮动持续时间和速度
+                ctx.rotation_duration = rot.duration_days
+                ctx.rotation_velocity = rot.velocity
+                ctx.rotation_peak_warning = rot.peak_warning
+                ctx.rotation_peak_detail = rot.peak_detail
             except Exception:
                 pass
 
@@ -332,6 +351,64 @@ def run_intraday(args):
                 print(f"  {i:<4} {cp.name:<14} "
                       f"{sign}{cp.gain_pct:.2f}%  {cp.sector_type}{cp_icon}")
 
+        # ── 盘中恐慌评估 + 抄底候选 + 主题追踪 ──────────
+        try:
+            from signals.core.panic_detector import assess_intraday_panic
+            name_df = l2_stats.get("name_df") if l2_stats else None
+            panic = assess_intraday_panic(
+                ctx.reports, screener_l1.analyzers, name_df)
+
+            # 存入 ctx 供输出层使用
+            ctx.panic_score = panic.score
+            ctx.panic_level = panic.level
+            ctx.panic_detail = panic.detail
+
+            # ① 始终显示盘中情绪评估
+            _p_icons = {"恐慌": "🔴", "偏弱": "🟡", "正常": "🟢"}
+            _p_icon = _p_icons.get(panic.level, "⚪")
+            print(f"\n  >>> {_p_icon} 盘中情绪: "
+                  f"{panic.score:.0f}/100 ({panic.level})")
+            print(f"      {panic.detail}")
+            if panic.level == "恐慌":
+                print(f"  💡 恐慌=底部信号 → 关注超跌+支撑位的反弹机会")
+
+            # ② 偏弱/恐慌时显示抄底候选
+            if panic.score >= 40:
+                from signals.layers.industry import get_bottom_fishing_candidates
+                _themes = [t.strip() for t in
+                           (args.themes.split(",") if args.themes
+                            else config.WATCH_THEMES) if t.strip()]
+                bottom = get_bottom_fishing_candidates(
+                    name_df, oversold_list, panic.score, _themes)
+                if bottom:
+                    ctx.bottom_candidates = [b.name for b in bottom]
+                    print(f"\n  >>> 🎯 抄底候选板块:")
+                    for _bi, b in enumerate(bottom, 1):
+                        parts = [f"今日{b.gain_pct:+.1f}%"]
+                        if b.oversold_score > 0:
+                            parts.append(f"历史超跌{b.oversold_score:.0f}")
+                        if b.sector_type != "中性":
+                            parts.append(f"{b.sector_type}型")
+                        if b.rotation_line:
+                            parts.append(f"{b.rotation_line}线")
+                        print(f"      {_bi}. {b.name} ({', '.join(parts)})")
+
+            # ③ 主题追踪 — 独立于恐慌门控，始终显示
+            _themes = [t.strip() for t in
+                       (args.themes.split(",") if args.themes
+                        else config.WATCH_THEMES) if t.strip()]
+            if _themes:
+                from signals.core.theme_tracker import match_themes, format_theme_hits
+                hits = match_themes(_themes, name_df, concepts, panic.level)
+                fmt = format_theme_hits(hits)
+                if fmt:
+                    ctx.theme_summary = fmt
+                    print(f"\n  >>> 🏷 主题追踪: {fmt}")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("恐慌评估失败: %s", e)
+            print(f"  [!] 恐慌评估失败: {e}")
+
         dash.resume()
 
     dash.set_l2_count(len(ranking_stocks))
@@ -400,7 +477,10 @@ def run_intraday(args):
         try:
             # 一次性初始化所有标的（dashboard 活跃，显示进度）
             screener_l3.initialize(l3_pool)
-            l3_results = screener_l3.scan_once(l3_pool)
+            l3_results = screener_l3.scan_once(
+                l3_pool,
+                sentiment_phase=ctx.sentiment_phase,
+            )
 
             above_cnt = sum(1 for r in l3_results
                            if r.total_score >= config.SCORE_THRESHOLD
@@ -558,6 +638,9 @@ def run_index_only(args):
     )
     ctx = screener.run()
 
+    # 保存 screener 引用供 --push 使用
+    args._screener = screener
+
     # ── 飞书推送（卡片模式）────────────────────────────────
     if not config.FEISHU_APP_ID:
         dash.phase_skip("feishu", "未配置")
@@ -633,7 +716,7 @@ def _run_single_review(start_date: str, raw_alias: str, args):
         pool_date = datetime.now().strftime("%Y%m%d")
 
         try:
-            gain_list, composite_list, merged_list, concepts, oversold_list = get_industry_representatives(
+            gain_list, composite_list, merged_list, concepts, oversold_list, _ = get_industry_representatives(
                 config.RANK_TOP_N, date_str=pool_date)
         except Exception as e:
             dash.log(f"  [!] 行业筛选异常（{e}），跳过 Layer 2")
@@ -656,6 +739,11 @@ def _run_single_review(start_date: str, raw_alias: str, args):
                 ctx.rotation_detail = rot.format_line()
                 _, alloc_str = suggest_allocation(rot, ctx.sentiment_phase)
                 ctx.allocation_suggestion = alloc_str
+                # P3-4: 轮动持续时间和速度
+                ctx.rotation_duration = rot.duration_days
+                ctx.rotation_velocity = rot.velocity
+                ctx.rotation_peak_warning = rot.peak_warning
+                ctx.rotation_peak_detail = rot.peak_detail
             except Exception:
                 pass
 
@@ -799,7 +887,7 @@ def _run_multi_review(dates: list, args):
             dash.task_start("L2.ranking", f"{resolved}({label})")
 
             try:
-                gain_list, composite_list, merged_list, concepts, _ = get_industry_representatives(
+                gain_list, composite_list, merged_list, concepts, _, _ = get_industry_representatives(
                     config.RANK_TOP_N, date_str=date_yyyymmdd)
             except Exception as e:
                 dash.log(f"  [!] {resolved} 行业筛选异常（{e}），跳过")
@@ -1060,6 +1148,235 @@ def _list_sim_sessions():
     print()
 
 
+def run_analog(args):
+    """
+    历史形态匹配模式：独立运行，对比当前走势与历史走势。
+
+    用法：python run.py --mode analog [--symbol 沪深300]
+    """
+    from signals.data.fetcher import DataFetcher
+    from signals.core.analog_matcher import (
+        find_analogs, save_analog_results, analog_to_dict,
+    )
+    from dataclasses import asdict
+
+    indices = config.ANALOG_INDICES
+    symbol_filter = getattr(args, "symbol", None)
+    if symbol_filter:
+        if symbol_filter not in config.INDEX_AK_CODES:
+            print(f"  [!] 未知指数: {symbol_filter}")
+            print(f"      可选: {', '.join(config.INDEX_AK_CODES.keys())}")
+            return
+        indices = [symbol_filter]
+
+    print(f"\n{'═'*52}")
+    print(f"  📊 历史形态匹配  窗口={config.ANALOG_WINDOW}天  Top{config.ANALOG_TOP_K}")
+    print(f"  匹配指数: {', '.join(indices)}")
+    print(f"{'═'*52}\n")
+
+    fetcher = DataFetcher()
+    all_results = {}
+
+    for name in indices:
+        code = config.INDEX_AK_CODES.get(name)
+        if not code:
+            print(f"  [!] {name}: 无 AKShare 代码，跳过")
+            continue
+
+        print(f"  ▶ {name} ({code})")
+        try:
+            bars = fetcher.get_index_daily(code, lookback_days=config.ANALOG_LOOKBACK_DAYS)
+            if len(bars) < config.ANALOG_WINDOW + 60:
+                print(f"    数据不足 ({len(bars)}根K线)，需要至少 {config.ANALOG_WINDOW + 60} 根")
+                continue
+
+            closes = [b.close for b in bars]
+            dates = [str(b.dt)[:10] for b in bars]
+
+            # 当前走势 = 最近 window 天；历史 = 全部（去掉最近60天）
+            analogs = find_analogs(
+                current_closes=closes,
+                current_dates=dates,
+                history_closes=closes,
+                history_dates=dates,
+                index_name=name,
+                window=config.ANALOG_WINDOW,
+                top_k=config.ANALOG_TOP_K,
+                min_similarity=config.ANALOG_MIN_SIMILARITY,
+            )
+
+            if analogs:
+                all_results[name] = [analog_to_dict(a) for a in analogs]
+                print(f"    找到 {len(analogs)} 个匹配:")
+                for i, a in enumerate(analogs, 1):
+                    print(f"    [{i}] 相似度={a.similarity:.2%}  "
+                          f"{a.match_start}~{a.match_end}  "
+                          f"后10日={a.next_10d_return:+.1f}%  "
+                          f"后30日={a.next_30d_return:+.1f}%")
+                    print(f"        {a.what_happened}")
+            else:
+                print(f"    未找到相似度≥{config.ANALOG_MIN_SIMILARITY:.0%}的匹配")
+
+        except Exception as e:
+            print(f"    [!] 异常: {e}")
+
+    if all_results:
+        save_analog_results(all_results)
+        print(f"\n  ✅ 结果已缓存 → .data/cache/analog_latest.json")
+    else:
+        print(f"\n  未产生任何匹配结果")
+
+
+def run_plan(args):
+    """
+    盘前计划模式：分析主要指数，生成完全分类的 3 种情景。
+
+    用法：python run.py --mode plan
+    """
+    print("\n🐲 隆小侠 — 盘前计划\n")
+
+    from signals.layers.index_screener import IndexScreener
+    from signals.core.planner import generate_plan
+
+    print("  加载指数数据...")
+    screener = IndexScreener()
+    screener.initialize()
+    ctx = screener.analyze()
+
+    main_indices = ["沪深300", "上证50", "创业板指", "科创50", "中证500"]
+    for name in main_indices:
+        az = screener.analyzers.get(name)
+        if az is None:
+            continue
+        daily = getattr(az, "_daily", None)
+        if daily is None:
+            continue
+        # 获取 MA 上下文
+        report = next((r for r in ctx.reports if r.name == name), None)
+        ma_ctx = getattr(report, "ma_context", None) if report else None
+
+        plan = generate_plan(daily, ma_ctx)
+        plan.name = name
+
+        print(f"\n  {'='*50}")
+        print(f"  {plan.name}  现价 {plan.current_price}  {plan.trend}")
+        print(f"  {plan.structure}")
+        if plan.key_levels:
+            lvs = " | ".join(f"{lv['name']} {lv['price']}" for lv in plan.key_levels)
+            print(f"  关键位: {lvs}")
+        for sc in plan.scenarios:
+            print(f"\n  {sc.name} [{sc.probability_hint}]")
+            print(f"    触发: {sc.trigger}")
+            print(f"    操作: {sc.action}")
+            if sc.target_prices:
+                print(f"    目标: {' / '.join(str(p) for p in sc.target_prices)}")
+            if sc.stop_price:
+                print(f"    止损: {sc.stop_price}")
+            if sc.rationale:
+                print(f"    逻辑: {sc.rationale}")
+
+    print(f"\n  {'='*50}")
+    print(f"  大盘方向: {ctx.overall_direction} | 情绪: {ctx.sentiment_phase}")
+    print(f"  建议仓位: {ctx.position_suggestion}")
+    print()
+
+
+def run_weekly(args):
+    """
+    周末策略模式：整合指数 + 轮动 + 宏观事件，生成下周操作策略。
+
+    用法：python run.py --mode weekly
+    """
+    print("\n🐲 隆小侠 — 周末策略\n")
+
+    from signals.layers.index_screener import IndexScreener
+    from signals.core.weekly import generate_weekly
+
+    print("  加载指数数据...")
+    screener = IndexScreener()
+    screener.initialize()
+    ctx = screener.analyze()
+
+    weekly = generate_weekly(
+        index_reports=ctx.reports,
+        market_context=ctx,
+        rotation_stage=ctx.rotation_stage,
+        allocation=ctx.allocation_suggestion,
+    )
+
+    print(f"  {weekly.week_label}")
+    print(f"\n  大盘展望: {weekly.market_outlook}")
+    print(f"  仓位建议: {weekly.position_suggestion}")
+    if weekly.style_suggestion:
+        print(f"  风格建议: {weekly.style_suggestion}")
+    if weekly.rotation_outlook:
+        print(f"  轮动阶段: {weekly.rotation_outlook}")
+
+    if weekly.focus_sectors:
+        print(f"\n  关注板块: {', '.join(weekly.focus_sectors)}")
+    if weekly.avoid_sectors:
+        print(f"  回避板块: {', '.join(weekly.avoid_sectors)}")
+
+    if weekly.events:
+        print(f"\n  宏观事件:")
+        for ev in weekly.events:
+            print(f"    {ev.event_name} {ev.event_date}")
+            for k, v in ev.scenarios.items():
+                print(f"      {k}: {v}")
+
+    if weekly.key_levels:
+        print(f"\n  关键价位:")
+        for lv in weekly.key_levels:
+            print(f"    {lv['index']} {lv['name']} {lv['price']} ({lv['distance_pct']:+.1f}%)")
+
+    print()
+
+
+def run_web(args):
+    """
+    Web UI 模式：先启动 Web 服务器（秒开），L1→L2→L3 后台异步加载。
+
+    用法：python run.py --mode web [--port 8000]
+    """
+    port = getattr(args, "port", 8000)
+
+    # ── 文件日志初始化 ──
+    import logging, os
+    from datetime import datetime
+    log_dir = os.path.join(os.path.dirname(__file__), ".data", "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"web_{datetime.now():%Y%m%d_%H%M%S}.log")
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S"))
+    # 同时输出到控制台
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+    print(f"\n🐲 隆小侠 Web UI")
+    print(f"   🌐 http://localhost:{port}")
+    print(f"   📋 日志: {log_file}")
+    print(f"   数据后台加载中...\n")
+
+    from signals.web.services.engine import get_engine
+    engine = get_engine()
+
+    # 后台异步加载 L1 → L2 → L3
+    engine.run_all_async()
+
+    # 立即启动 FastAPI（不等数据加载完成）
+    import uvicorn
+    from signals.web.app import create_app
+    app = create_app()
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
+
 def run_sim(args):
     """
     仿真模式：全自动 — 检查仓库 → 补全数据 → 创建快照 → 执行回放。
@@ -1229,6 +1546,12 @@ def main():
   python run.py --mode sim --start 2026-01-14 --symbols SH.600519  # 指定额外标的
   python run.py --mode sim --sync --start 2026-01-01            # 手动同步仓库
   python run.py --mode sim --list-sessions                      # 列出可用快照
+  python run.py --mode web                                     # Web UI（TradingView 风格）
+  python run.py --mode web --port 9000                         # 指定端口
+  python run.py --mode analog                                    # 历史形态匹配（全部指数）
+  python run.py --mode analog --symbol 沪深300                   # 指定单个指数匹配
+  python run.py --mode index --push                              # 分析 + 推送到 Vercel
+  python run.py --mode intraday --push                           # 盘中 + 推送到 Vercel
   python run.py --list-dates                       # 列出所有日期预设
 
 可用日期预设：{preset_keys}
@@ -1237,8 +1560,8 @@ def main():
     parser.add_argument(
         "--mode",
         default="intraday",
-        choices=["intraday", "review", "index", "import", "backtest", "sim", "autoresearch"],
-        help="运行模式：intraday / review / index / import / backtest / sim"
+        choices=["intraday", "review", "index", "import", "backtest", "sim", "web", "analog", "plan", "weekly"],
+        help="运行模式：intraday / review / index / import / backtest / sim / web / analog / plan / weekly"
     )
     parser.add_argument(
         "--start",
@@ -1337,16 +1660,36 @@ def main():
         action="store_true",
         help="[sim] 手动触发数据仓库全量同步"
     )
-    # autoresearch 模式专用参数
+    # web 模式专用参数
     parser.add_argument(
-        "--experiments",
-        type=int, default=None, metavar="N",
-        help="[autoresearch] 运行 N 轮实验后停止（默认无限循环）"
+        "--port",
+        type=int,
+        default=8000,
+        help="[web] Web UI 端口号，默认 8000"
+    )
+    # 云端推送参数
+    parser.add_argument(
+        "--push",
+        action="store_true",
+        help="分析完成后推送结果到 Upstash Redis（供 Vercel 前端读取）"
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="[autoresearch] 预览模式，不实际修改参数"
+        dest="dry_run",
+        help="配合 --push 使用：mock Redis + mock 数据，验证推送逻辑（不连网）"
+    )
+    parser.add_argument(
+        "--themes",
+        type=str, default="",
+        help="关注主题（逗号分隔），如 --themes '储能,算力,CLAW'（覆盖 config.WATCH_THEMES）"
+    )
+    # analog 模式专用参数
+    parser.add_argument(
+        "--symbol",
+        default=None,
+        metavar="NAME",
+        help="[analog] 指定匹配的指数名称（如 沪深300），默认匹配全部 ANALOG_INDICES"
     )
 
     args = parser.parse_args()
@@ -1362,15 +1705,27 @@ def main():
         return
 
     dispatch = {
-        "intraday":     run_intraday,
-        "review":       run_review,
-        "index":        run_index_only,
-        "import":       run_import,
-        "backtest":     run_backtest,
-        "sim":          run_sim,
-        "autoresearch": run_autoresearch,
+        "intraday": run_intraday,
+        "review":   run_review,
+        "index":    run_index_only,
+        "import":   run_import,
+        "backtest": run_backtest,
+        "sim":      run_sim,
+        "web":      run_web,
+        "analog":   run_analog,
+        "plan":     run_plan,
+        "weekly":   run_weekly,
     }
     dispatch[args.mode](args)
+
+    # --push: 分析完成后推送到 Upstash Redis
+    if getattr(args, "push", False) and args.mode in ("index", "intraday", "web"):
+        dry_run = getattr(args, "dry_run", False)
+        label = "[dry-run] " if dry_run else ""
+        print(f"\n  {label}推送分析结果到 Upstash Redis...")
+        from signals.deploy.push_to_kv import push_from_screener
+        screener = getattr(args, "_screener", None)
+        push_from_screener(screener=screener, dry_run=dry_run)
 
 
 if __name__ == "__main__":

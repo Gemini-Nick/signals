@@ -8,10 +8,16 @@
     from signals.core.rotation import detect_rotation_stage, RotationStage
     stage = detect_rotation_stage(gain_list, composite_list)
 """
+import json
+import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 import config
+
+# 轮动历史快照文件
+_ROTATION_HISTORY_PATH = ".data/cache/rotation_history.json"
 
 
 # 轮动线展示图标
@@ -32,6 +38,11 @@ class RotationStage:
     dominant_line: str         # "科技" / "顺周期" / "消费" / ""
     line_distribution: dict    # {"科技": 5, "顺周期": 3, "消费": 2, ...}
     detail: str                # 人类可读描述
+    # P3-4: 轮动持续时间 & 速度
+    duration_days: int = 0     # 连续领涨天数
+    velocity: str = "稳定"     # "加速"/"稳定"/"减速"
+    peak_warning: bool = False # duration>10 且 减速
+    peak_detail: str = ""      # 峰值警告详情
 
     @property
     def icon(self) -> str:
@@ -131,12 +142,124 @@ def detect_rotation_stage(
                     for l, p in sorted_lines if p > 0]
     detail = " | ".join(detail_parts)
 
-    return RotationStage(
+    result = RotationStage(
         stage=stage,
         dominant_line=dominant,
         line_distribution=merged,
         detail=detail,
     )
+
+    # P3-4: 计算持续时间和速度
+    _enrich_duration_velocity(result)
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────
+# P3-4: 轮动持续时间 & 速度
+# ─────────────────────────────────────────────────────────
+
+def _load_rotation_history() -> list:
+    """加载轮动历史快照"""
+    if not os.path.exists(_ROTATION_HISTORY_PATH):
+        return []
+    try:
+        with open(_ROTATION_HISTORY_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return []
+
+
+def _save_rotation_snapshot(stage: RotationStage) -> None:
+    """保存当天轮动快照（每天一条，覆盖当天已有）"""
+    history = _load_rotation_history()
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    snapshot = {
+        "date": today,
+        "dominant_line": stage.dominant_line,
+        "stage": stage.stage,
+        "distribution": stage.line_distribution,
+    }
+
+    # 计算主线占比百分比
+    total = sum(stage.line_distribution.values()) or 1
+    if stage.dominant_line:
+        snapshot["dominant_pct"] = round(
+            stage.line_distribution.get(stage.dominant_line, 0) / total * 100, 1
+        )
+    else:
+        snapshot["dominant_pct"] = 0.0
+
+    # 覆盖当天已有快照
+    history = [h for h in history if h.get("date") != today]
+    history.append(snapshot)
+
+    # 保留最多60天历史
+    history = history[-60:]
+
+    os.makedirs(os.path.dirname(_ROTATION_HISTORY_PATH), exist_ok=True)
+    with open(_ROTATION_HISTORY_PATH, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+def _enrich_duration_velocity(stage: RotationStage) -> None:
+    """
+    根据历史快照计算轮动持续天数和速度，原地更新 stage 字段。
+    同时保存当天快照。
+    """
+    _save_rotation_snapshot(stage)
+
+    if not stage.dominant_line:
+        return
+
+    history = _load_rotation_history()
+    if len(history) < 2:
+        stage.duration_days = 1
+        return
+
+    # 计算连续领涨天数（从最近往前数，同一 dominant_line 连续出现的天数）
+    dominant = stage.dominant_line
+    count = 0
+    for snap in reversed(history):
+        if snap.get("dominant_line") == dominant:
+            count += 1
+        else:
+            break
+    stage.duration_days = max(count, 1)
+
+    # 计算速度：比较最近3天和前3天的主线占比变化
+    recent_pcts = [
+        h.get("dominant_pct", 0) for h in history[-3:]
+        if h.get("dominant_line") == dominant
+    ]
+    older_pcts = [
+        h.get("dominant_pct", 0) for h in history[-6:-3]
+        if h.get("dominant_line") == dominant
+    ]
+
+    if recent_pcts and older_pcts:
+        avg_recent = sum(recent_pcts) / len(recent_pcts)
+        avg_older = sum(older_pcts) / len(older_pcts)
+        delta = avg_recent - avg_older
+        if delta > 5:
+            stage.velocity = "加速"
+        elif delta < -5:
+            stage.velocity = "减速"
+        else:
+            stage.velocity = "稳定"
+    else:
+        stage.velocity = "稳定"
+
+    # 峰值警告：连续领涨>10天 且 减速
+    if stage.duration_days > 10 and stage.velocity == "减速":
+        stage.peak_warning = True
+        current_pct = recent_pcts[-1] if recent_pcts else 0
+        first_pct = history[0].get("dominant_pct", 0) if history else 0
+        stage.peak_detail = (
+            f"{dominant}已领涨{stage.duration_days}日,"
+            f"占比{first_pct:.0f}%→{current_pct:.0f}%,注意轮动切换"
+        )
 
 
 # ─────────────────────────────────────────────────────────

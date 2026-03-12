@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="tradingview">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>隆小侠 LONG CLAW</title>
+  <link rel="stylesheet" href="/static/css/themes.css">
+  <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body>
+
+  <!-- Header -->
+  <header class="header">
+    <div class="header-logo">LONG CLAW</div>
+    <div class="session-indicator" id="session-indicator">
+      <span class="session-badge" id="session-badge"></span>
+      <span class="session-time" id="session-time"></span>
+    </div>
+    <div class="header-actions">
+      <button class="header-btn" id="theme-toggle" title="Anthropic / TradingView">&#9684;</button>
+      <button class="header-btn" id="refresh-btn" title="刷新数据">&#8635;</button>
+    </div>
+  </header>
+
+  <!-- Navigation -->
+  <nav class="nav-tabs">
+    <div class="nav-tab active" data-page="dashboard">市况总览</div>
+    <div class="nav-tab" data-page="chart">图表</div>
+    <div class="nav-tab" data-page="stock">个股分析</div>
+    <div class="nav-tab" data-page="analog">历史对照</div>
+    <div class="nav-tab" data-page="review">盘后复盘</div>
+    <div class="nav-tab" data-page="backtest">回测</div>
+    <div class="nav-tab" data-page="plan">计划</div>
+    <div class="nav-tab" data-page="trade">交易</div>
+  </nav>
+
+  <!-- Pages -->
+  <main>
+    <!-- Page 1: Dashboard -->
+    <div id="page-dashboard" class="page active">
+      <!-- 预测总览（置顶 — 第一屏核心内容）-->
+      <div id="prediction-section" class="prediction-section">
+        <div class="empty-state">加载预测数据...</div>
+      </div>
+
+      <!-- 市场环境指示器 -->
+      <div id="regime-section" class="regime-section" style="display:none;"></div>
+
+      <!-- 大盘方向 Banner -->
+      <div id="banner" class="banner neutral">
+        <div class="banner-direction" id="banner-direction">加载中...</div>
+        <div class="banner-suggestion" id="banner-suggestion"></div>
+        <div id="style-switch-alert" class="style-switch-alert" style="display:none;"></div>
+      </div>
+
+      <!-- 操作建议 (保留在上方) -->
+      <div class="section-title">操作建议</div>
+      <div id="action-section" class="action-section">
+        <div class="empty-state">加载中...</div>
+      </div>
+
+      <!-- 今日信号 (L1指数 + L3标的) -->
+      <div class="section-title" id="signal-section-title">今日信号</div>
+      <div class="signal-list" id="signal-list">
+        <div class="empty-state">暂无信号数据</div>
+      </div>
+
+      <!-- 以下为第二屏（下移）-->
+      <div class="section-title section-divider">指数 & 行业详情</div>
+
+      <!-- A股指数 -->
+      <div class="section-title">A股</div>
+      <div class="cards-grid" id="cards-a"></div>
+
+      <!-- 港股指数 -->
+      <div class="section-title">港股</div>
+      <div class="cards-grid" id="cards-hk"></div>
+
+      <!-- 美股指数 -->
+      <div class="section-title">美股</div>
+      <div class="cards-grid" id="cards-us"></div>
+
+      <!-- L2 行业分析 -->
+      <div class="section-title">行业排行</div>
+      <div id="industry-section">
+        <div class="empty-state">加载中...</div>
+      </div>
+
+      <!-- 今日舆情 -->
+      <div class="section-title">今日舆情</div>
+      <div id="social-section">
+        <div class="empty-state">加载中...</div>
+      </div>
+
+      <!-- 情绪仓位面板 -->
+      <div class="section-title">情绪 & 仓位</div>
+      <div id="rotation-section">
+        <div class="empty-state">加载中...</div>
+      </div>
+    </div>
+
+    <!-- Page 2: Chart -->
+    <div id="page-chart" class="page">
+      <div class="chart-header">
+        <button class="back-btn" id="chart-back">&larr;</button>
+        <div class="chart-title" id="chart-title">选择一个指数</div>
+        <div class="freq-group">
+          <button class="freq-btn" data-freq="daily">日线</button>
+          <button class="freq-btn" data-freq="30min">30M</button>
+          <button class="freq-btn" data-freq="15min">15M</button>
+        </div>
+      </div>
+
+      <div class="chart-container" id="chart-container" style="height: 620px;"></div>
+
+      <!-- Signal Details -->
+      <div class="signal-details" id="signal-details">
+        <div class="signal-details-header" id="signal-details-toggle">
+          信号详情 <span id="signal-details-arrow">&#9660;</span>
+        </div>
+        <div class="signal-details-body" id="signal-details-body"></div>
+      </div>
+
+      <!-- Industry Detail Panel (行业图表模式) -->
+      <div id="industry-detail" class="industry-detail" style="display:none;">
+        <div class="industry-info-grid" id="industry-info-panel"></div>
+        <div class="industry-related" id="industry-related"></div>
+      </div>
+
+      <!-- Summary Bar -->
+      <div class="chart-summary" id="chart-summary"></div>
+    </div>
+
+    <!-- Page 3: Stock Analysis -->
+    <div id="page-stock" class="page">
+      <div class="stock-search-bar">
+        <input type="text" id="stock-input" class="stock-input" placeholder="股票代码 (600519) 或主题关键词 (昇腾, 算力)" />
+        <button class="stock-search-btn" onclick="analyzeStock()">分析</button>
+      </div>
+      <div id="stock-result">
+        <div class="empty-state">输入代码后点击分析</div>
+      </div>
+    </div>
+
+    <!-- Page 4: Historical Analog -->
+    <div id="page-analog" class="page">
+      <div class="analog-header">
+        <div class="analog-selector">
+          <select id="analog-index-select" class="analog-select">
+            <option value="沪深300">沪深300</option>
+            <option value="深证成指">深证成指</option>
+            <option value="创业板指">创业板指</option>
+            <option value="上证50">上证50</option>
+            <option value="科创50">科创50</option>
+            <option value="中证500">中证500</option>
+            <option value="中证1000">中证1000</option>
+            <option value="超大盘">超大盘</option>
+          </select>
+          <button class="stock-search-btn" id="analog-run-btn" onclick="runAnalogMatch()">运行匹配</button>
+        </div>
+        <div class="analog-date-range">
+          <label>选区:</label>
+          <input type="date" id="analog-start-date" class="analog-date-input" />
+          <span>~</span>
+          <input type="date" id="analog-end-date" class="analog-date-input" />
+          <button class="analog-clear-btn" id="analog-clear-range" onclick="clearAnalogRange()" title="清除日期，使用最近30天">✕</button>
+        </div>
+        <div class="analog-info" id="analog-info">Pearson相关系数 | Top5匹配</div>
+      </div>
+      <!-- K线选区图表 -->
+      <div id="analog-kline-container" class="chart-container" style="height:380px;"></div>
+      <!-- 匹配结果 -->
+      <div id="analog-results" class="analog-results">
+        <div class="empty-state">选择指数 → 图表上拖选区间 或 手动输入日期 → 运行匹配</div>
+      </div>
+      <!-- 叠加对比图 -->
+      <div id="analog-chart-container" class="chart-container" style="height:350px;display:none;"></div>
+    </div>
+    <!-- Page 5: Review (盘后复盘) -->
+    <div id="page-review" class="page">
+      <div class="review-header">
+        <div class="review-selector">
+          <select id="review-date-select" class="review-select">
+            <option value="">选择日期预设...</option>
+          </select>
+          <input type="text" id="review-date-custom" class="review-input" placeholder="自定义 YYYY-MM-DD" />
+          <button class="stock-search-btn" id="review-run-btn">运行复盘</button>
+        </div>
+        <div class="review-info" id="review-info"></div>
+      </div>
+      <div id="review-loading" class="review-loading" style="display:none;">
+        <div class="loading-spinner"></div>
+        <div class="loading-phase" id="review-loading-phase">准备中...</div>
+      </div>
+      <div id="review-results" style="display:none;">
+        <div id="review-timing"></div>
+        <div id="review-banner" class="banner neutral"></div>
+        <div class="section-title">A股</div>
+        <div class="cards-grid" id="review-cards-a"></div>
+        <div class="section-title">港股</div>
+        <div class="cards-grid" id="review-cards-hk"></div>
+        <div class="section-title">美股</div>
+        <div class="cards-grid" id="review-cards-us"></div>
+        <div class="section-title">行业排行</div>
+        <div id="review-industry"></div>
+        <div class="section-title">轮动 & 配置</div>
+        <div id="review-rotation"></div>
+        <div class="section-title">概念热度</div>
+        <div id="review-concepts"></div>
+        <div class="section-title">个股信号</div>
+        <div id="review-signals"></div>
+        <div id="review-replay-timeline"></div>
+      </div>
+    </div>
+
+    <!-- Page 6: Backtest (回测) -->
+    <div id="page-backtest" class="page">
+      <div class="bt-header">
+        <div class="bt-filters">
+          <select id="bt-signal-type" class="bt-select">
+            <option value="">全部信号类型</option>
+            <option value="一买">一买</option>
+            <option value="二买">二买</option>
+            <option value="三买">三买</option>
+            <option value="背驰买">背驰买</option>
+            <option value="趋势买">趋势买</option>
+            <option value="一卖">一卖</option>
+            <option value="二卖">二卖</option>
+            <option value="三卖">三卖</option>
+            <option value="背驰卖">背驰卖</option>
+          </select>
+          <select id="bt-freq" class="bt-select">
+            <option value="">全部级别</option>
+            <option value="15分钟">15分钟</option>
+            <option value="30分钟">30分钟</option>
+            <option value="日线">日线</option>
+            <option value="周线">周线</option>
+          </select>
+          <button class="stock-search-btn" id="bt-refresh-btn">刷新</button>
+          <button class="stock-search-btn bt-eval-btn" id="bt-eval-btn">评估到期信号</button>
+        </div>
+      </div>
+      <div id="bt-summary-bar" class="bt-summary-bar"></div>
+      <div id="bt-kpis" class="bt-kpis"></div>
+      <div class="bt-view-tabs">
+        <div class="bt-view-tab active" data-view="signals">信号分析</div>
+        <div class="bt-view-tab" data-view="trades">买卖配对</div>
+      </div>
+      <div id="bt-view-signals" class="bt-view active">
+        <div class="section-title">按信号类型</div>
+        <div id="bt-by-type"></div>
+        <div class="section-title">信号衰减曲线</div>
+        <div id="bt-decay-chart" style="height:280px;"></div>
+        <div class="section-title">置信度校准</div>
+        <div id="bt-calibration" style="height:240px;"></div>
+        <div class="section-title">按频率</div>
+        <div id="bt-by-freq"></div>
+        <div class="section-title">按市场环境</div>
+        <div id="bt-by-direction"></div>
+        <div class="section-title">共振 vs 单级别</div>
+        <div id="bt-by-resonance"></div>
+        <div class="section-title">MFE/MAE 分析</div>
+        <div id="bt-mfe-mae"></div>
+        <div class="section-title">权重建议</div>
+        <div id="bt-weight-rec"></div>
+      </div>
+      <div id="bt-view-trades" class="bt-view">
+        <div id="bt-trade-summary"></div>
+        <div class="section-title">累计收益曲线</div>
+        <div id="bt-equity-chart" style="height:300px;"></div>
+        <div class="section-title">交易列表</div>
+        <div id="bt-trade-list"></div>
+      </div>
+    </div>
+
+    <!-- Page 7: Plan (计划) -->
+    <div id="page-plan" class="page">
+      <div class="plan-header">
+        <button class="stock-search-btn" id="plan-generate-btn">生成盘前计划</button>
+        <button class="stock-search-btn" id="plan-weekly-btn">周末策略</button>
+      </div>
+      <div id="plan-results"></div>
+      <div id="plan-weekly"></div>
+    </div>
+    <!-- Page 8: Trade (交易日志) -->
+    <div id="page-trade" class="page">
+      <div class="trade-header">
+        <div class="trade-controls">
+          <select id="trade-filter" class="trade-select">
+            <option value="all">全部</option>
+            <option value="open">持仓中</option>
+            <option value="closed">已平仓</option>
+          </select>
+          <button class="stock-search-btn" id="trade-add-btn">+ 新增交易</button>
+          <button class="stock-search-btn" id="trade-refresh-btn">刷新</button>
+        </div>
+      </div>
+      <div id="trade-summary-bar" class="trade-summary-bar"></div>
+      <div class="trade-view-tabs">
+        <div class="trade-view-tab active" data-view="list">交易列表</div>
+        <div class="trade-view-tab" data-view="stats">统计分析</div>
+        <div class="trade-view-tab" data-view="missed">遗漏信号</div>
+      </div>
+      <div id="trade-view-list" class="trade-view active">
+        <div id="trade-list"></div>
+      </div>
+      <div id="trade-view-stats" class="trade-view">
+        <div id="trade-stats"></div>
+      </div>
+      <div id="trade-view-missed" class="trade-view">
+        <div id="trade-missed"></div>
+      </div>
+      <!-- 新增/编辑表单弹窗 -->
+      <div id="trade-form-modal" class="trade-modal" style="display:none;">
+        <div class="trade-modal-content">
+          <div class="trade-modal-header">
+            <span id="trade-form-title">新增交易</span>
+            <button class="trade-modal-close" onclick="window._closeTradeForm()">&times;</button>
+          </div>
+          <div class="trade-modal-body" id="trade-form-body"></div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- TradingView Lightweight Charts v4 -->
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+
+  <!-- App Scripts -->
+  <script src="/static/js/app.js"></script>
+  <script src="/static/js/dashboard.js"></script>
+  <script src="/static/js/chart.js"></script>
+  <script src="/static/js/stock.js"></script>
+  <script src="/static/js/analog.js"></script>
+  <script src="/static/js/review.js"></script>
+  <script src="/static/js/backtest.js"></script>
+  <script src="/static/js/plan.js"></script>
+  <script src="/static/js/trade.js"></script>
+
+</body>
+</html>

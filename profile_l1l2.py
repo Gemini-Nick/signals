@@ -458,7 +458,7 @@ def run_profile(args):
     with timed("L2 行业筛选", root) as l2:
         from signals.layers.industry import get_industry_representatives
         try:
-            gain_list, composite_list, merged_list = \
+            gain_list, composite_list, merged_list, *_ = \
                 get_industry_representatives(top_n)
         except Exception as e:
             print(f"  [!] Layer 2 异常: {e}")

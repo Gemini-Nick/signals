@@ -135,6 +135,95 @@ def get_position_suggestion(direction: str, phase: SentimentPhase) -> str:
 
 
 # ─────────────────────────────────────────────────────────
+# P3-5: 高低风格切换检测
+# ─────────────────────────────────────────────────────────
+
+@dataclass
+class StyleSwitch:
+    """高低风格切换检测结果"""
+    detected: bool = False
+    direction: str = ""         # "低切高" / "高切低"
+    evidence: str = ""          # 证据描述
+    confidence: str = ""        # "强" / "中" / "弱"
+    suggestion: str = ""        # 操作建议
+
+
+# 高位指数（大盘价值）vs 低位指数（小盘成长）
+_HIGH_INDICES = {"上证50", "沪深300", "超大盘"}
+_LOW_INDICES = {"科创50", "中证1000", "创业板指"}
+
+
+def detect_style_switch(reports: List["IndexReport"]) -> Optional[StyleSwitch]:
+    """
+    检测高低风格切换：
+    - 低切高：低位指数（小盘/成长）连跌后反弹，高位指数同时走弱
+    - 高切低：高位指数（大盘/价值）走弱，资金流向防守/大盘
+
+    需要 IndexReport 有 recent_5d_return 字段。
+    """
+    high_reports = [r for r in reports if r.name in _HIGH_INDICES and r.data_available]
+    low_reports = [r for r in reports if r.name in _LOW_INDICES and r.data_available]
+
+    if not high_reports or not low_reports:
+        return None
+
+    # 获取5日收益率（如果 IndexReport 有此字段）
+    def _get_5d_return(r):
+        return getattr(r, 'recent_5d_return', None)
+
+    high_returns = [_get_5d_return(r) for r in high_reports if _get_5d_return(r) is not None]
+    low_returns = [_get_5d_return(r) for r in low_reports if _get_5d_return(r) is not None]
+
+    if not high_returns or not low_returns:
+        return None
+
+    avg_high = sum(high_returns) / len(high_returns)
+    avg_low = sum(low_returns) / len(low_returns)
+
+    # 今日涨跌（用 daily_trend 和最新价判断当日表现）
+    high_today_bullish = sum(1 for r in high_reports if r.daily_trend == "上涨趋势")
+    low_today_bullish = sum(1 for r in low_reports if r.daily_trend == "上涨趋势")
+
+    # 低切高：低位指数5日连跌(avg_low < -3%) + 今日反弹(low_today_bullish > 0) + 高位指数走弱
+    if avg_low < -3.0 and low_today_bullish >= 1 and avg_high > avg_low + 2:
+        # 找出反弹最强的低位指数
+        best_low = max(low_reports, key=lambda r: _get_5d_return(r) or -999)
+        best_low_name = best_low.name
+        best_low_ret = _get_5d_return(best_low) or 0
+
+        # 找出最弱的高位指数
+        worst_high = min(high_reports, key=lambda r: _get_5d_return(r) or 999)
+
+        evidence = f"{best_low_name}近5日{best_low_ret:+.1f}%后企稳反弹"
+        confidence = "强" if avg_low < -5.0 else "中"
+        suggestion = f"关注超跌{best_low_name}相关板块反弹机会"
+
+        return StyleSwitch(
+            detected=True,
+            direction="低切高",
+            evidence=evidence,
+            confidence=confidence,
+            suggestion=suggestion,
+        )
+
+    # 高切低：高位指数连涨(avg_high > 3%) + 今日走弱 + 低位补涨
+    if avg_high > 3.0 and high_today_bullish == 0 and low_today_bullish >= 1:
+        evidence = f"大盘价值股近5日+{avg_high:.1f}%后走弱,小盘成长补涨"
+        confidence = "强" if avg_high > 5.0 else "中"
+        suggestion = "大盘价值股获利了结,关注小盘成长补涨"
+
+        return StyleSwitch(
+            detected=True,
+            direction="高切低",
+            evidence=evidence,
+            confidence=confidence,
+            suggestion=suggestion,
+        )
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────
 # 数据类
 # ─────────────────────────────────────────────────────────
 
@@ -166,6 +255,19 @@ class MarketContext:
     rotation_stage: str = ""              # "科技领涨" / "顺周期领涨" / "消费领涨" / "混沌"
     rotation_detail: str = ""             # 分布详情
     allocation_suggestion: str = ""       # "配置建议（科技领涨+修复）: 科技40% | ..."
+    # 盘中恐慌评估
+    panic_score: float = 0.0             # 恐慌指数 (0-100)
+    panic_level: str = ""                # "恐慌"/"偏弱"/"正常"
+    panic_detail: str = ""               # 恐慌分项明细
+    bottom_candidates: List[str] = field(default_factory=list)  # 抄底候选板块名
+    theme_summary: str = ""              # 主题追踪摘要
+    # P3-5: 风格切换
+    style_switch: Optional[StyleSwitch] = None
+    # P3-4: 轮动持续时间和速度（从 RotationStage 传入）
+    rotation_duration: int = 0
+    rotation_velocity: str = ""
+    rotation_peak_warning: bool = False
+    rotation_peak_detail: str = ""
 
     # ─────────────────────────────────────────────────────
     # 情绪周期更新（L2 数据可用后调用）
@@ -200,6 +302,131 @@ class MarketContext:
             self.shield_sectors = shield_sectors
         if sword_sectors is not None:
             self.sword_sectors = sword_sectors
+
+    # ─────────────────────────────────────────────────────
+    # P3-7: 决策简报
+    # ─────────────────────────────────────────────────────
+
+    def build_decision_brief(
+        self,
+        rhythm_alerts: list = None,
+        analog_ref: dict = None,
+    ) -> dict:
+        """
+        构建决策简报结构化 dict（P3-7）。
+
+        :param rhythm_alerts: P3-3 衰竭/休整的板块列表 [{name, phase, score, hint}]
+        :param analog_ref: P3-6 缓存的历史匹配结果 dict
+        :return: 决策简报 dict
+        """
+        from datetime import datetime
+
+        # 关键情景分叉（来自 P3-2，从 reports 中提取 urgency=="接近" 的）
+        key_scenarios = []
+        for r in self.reports:
+            if not r.data_available:
+                continue
+            branches = getattr(r, 'scenario_branches', None) or []
+            for b in branches:
+                if b.urgency == "接近":
+                    key_scenarios.append({
+                        "index_name": r.name,
+                        "current_price": round(r.latest_price, 2) if r.latest_price else 0,
+                        "level_name": b.level_name,
+                        "level_price": b.level_price,
+                        "distance_pct": b.distance_pct,
+                        "is_support": b.is_support,
+                        "hold": b.hold,
+                        "break": b.break_,
+                    })
+
+        # 风格切换
+        style_data = None
+        if self.style_switch and self.style_switch.detected:
+            style_data = {
+                "detected": True,
+                "direction": self.style_switch.direction,
+                "evidence": self.style_switch.evidence,
+                "confidence": self.style_switch.confidence,
+                "suggestion": self.style_switch.suggestion,
+            }
+
+        # 轮动状态
+        rotation_status = {
+            "stage": self.rotation_stage,
+            "duration": self.rotation_duration,
+            "velocity": self.rotation_velocity,
+            "peak_warning": self.rotation_peak_warning,
+            "peak_detail": self.rotation_peak_detail,
+        }
+
+        # 自动生成操作建议（最多3条）
+        action_items = self._generate_action_items(
+            rhythm_alerts=rhythm_alerts or [],
+            analog_ref=analog_ref,
+        )
+
+        return {
+            "date": datetime.now().strftime("%Y-%m-%d"),
+            "direction": self.overall_direction,
+            "sentiment": self.sentiment_phase,
+            "direction_strength": self.direction_strength,
+            "position_suggestion": self.position_suggestion,
+            "key_scenarios": key_scenarios,
+            "style_switch": style_data,
+            "rotation_status": rotation_status,
+            "rhythm_alerts": rhythm_alerts or [],
+            "analog_ref": analog_ref,
+            "action_items": action_items,
+        }
+
+    def _generate_action_items(
+        self,
+        rhythm_alerts: list,
+        analog_ref: dict = None,
+    ) -> list:
+        """自动生成操作建议（最多3条）"""
+        items = []
+
+        # 1. 板块节奏兑现提醒
+        exhaust_names = [
+            a for a in rhythm_alerts
+            if a.get("phase") in ("衰竭", "休整")
+        ]
+        if exhaust_names:
+            names = [f"{a['name']}({a['phase']}{a.get('score', 0):.0f})"
+                     for a in exhaust_names[:2]]
+            items.append(f"{'、'.join(names)} 减持兑现")
+
+        # 2. 轮动峰值警告
+        if self.rotation_peak_warning and self.rotation_peak_detail:
+            items.append(self.rotation_peak_detail)
+
+        # 3. 风格切换建议
+        if self.style_switch and self.style_switch.detected:
+            items.append(self.style_switch.suggestion)
+
+        # 4. 超跌+恐慌=抄底
+        if self.sentiment_phase == "恐慌" and self.bottom_candidates:
+            candidates = "、".join(self.bottom_candidates[:3])
+            items.append(f"超跌关注: {candidates} (恐慌释放后分批)")
+
+        # 5. 历史匹配参考
+        if analog_ref and isinstance(analog_ref, dict):
+            results = analog_ref.get("results", {})
+            for idx_name, analogs in results.items():
+                if analogs and len(analogs) > 0:
+                    best = analogs[0]
+                    sim = best.get("similarity", 0)
+                    ret30 = best.get("next_30d_return", 0)
+                    if sim > 0.8:
+                        items.append(
+                            f"历史参考: 与{best.get('match_end', '')}相似{sim:.0%},"
+                            f"后30日{ret30:+.1f}%"
+                        )
+                    break
+
+        return items[:3]
 
     # ─────────────────────────────────────────────────────
     # 格式化工具（内部）
@@ -387,6 +614,18 @@ class MarketContext:
                 parts.append(f"⚔进攻: {'、'.join(self.sword_sectors[:3])}")
             lines.append(f"  {' | '.join(parts)}")
 
+        # 盘中情绪评估（始终显示）
+        if self.panic_level:
+            p_icons = {"恐慌": "🔴", "偏弱": "🟡", "正常": "🟢"}
+            p_icon = p_icons.get(self.panic_level, "⚪")
+            lines.append(f"  {p_icon} 盘中情绪: {self.panic_score:.0f}/100 ({self.panic_level})")
+            if self.panic_detail:
+                lines.append(f"     {self.panic_detail}")
+            if self.bottom_candidates:
+                lines.append(f"  🎯 抄底候选: {'、'.join(self.bottom_candidates[:5])}")
+        if self.theme_summary:
+            lines.append(f"  🏷 {self.theme_summary}")
+
         # 三级共振（最强信号）
         aligned = [r.name for r in self.reports
                    if r.data_available and r.three_level_aligned]
@@ -471,6 +710,16 @@ class MarketContext:
                          (f" ({self.rotation_detail})" if self.rotation_detail else ""))
         if self.allocation_suggestion:
             lines.append(self.allocation_suggestion)
+
+        # 盘中情绪评估（始终显示）
+        if self.panic_level:
+            lines.append(f"盘中情绪: {self.panic_score:.0f}/100 ({self.panic_level})")
+            if self.panic_detail:
+                lines.append(f"  {self.panic_detail}")
+            if self.bottom_candidates:
+                lines.append(f"抄底候选: {'、'.join(self.bottom_candidates[:5])}")
+        if self.theme_summary:
+            lines.append(f"主题: {self.theme_summary}")
 
         # 三级共振
         aligned = [r.name for r in self.reports
@@ -887,6 +1136,13 @@ def build_market_context(
              else [r.name for r in available
                    if r.name in _SWORD_INDICES and r.daily_trend == "上涨趋势"])
 
+    # P3-5: 风格切换检测
+    style_sw = None
+    try:
+        style_sw = detect_style_switch(reports)
+    except Exception:
+        pass
+
     return MarketContext(
         reports=reports,
         overall_direction=overall_direction,
@@ -906,4 +1162,5 @@ def build_market_context(
         position_suggestion=pos_suggestion,
         shield_sectors=shield,
         sword_sectors=sword,
+        style_switch=style_sw,
     )

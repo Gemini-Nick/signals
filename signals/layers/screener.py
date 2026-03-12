@@ -143,7 +143,7 @@ class IntraDayScreener:
                     else:
                         print(msg, flush=True)
                 self._ak_consecutive_fails += 1
-                if self._ak_consecutive_fails >= 3 and not self._ak_sina_degraded:
+                if self._ak_consecutive_fails >= 2 and not self._ak_sina_degraded:  # 2次即熔断（从3次降为2次）
                     self._ak_sina_degraded = True
                     msg = "  [!] AKShare(Sina) 连续3次失败，后续直接走东财"
                     if dash:
@@ -165,7 +165,7 @@ class IntraDayScreener:
                     else:
                         print(msg, flush=True)
                 self._em_consecutive_fails += 1
-                if self._em_consecutive_fails >= 3:
+                if self._em_consecutive_fails >= 1:  # 1次即熔断（从3次降为1次）
                     self._em_degraded = True
                     msg = "  [!] AKShare(东财) 连续3次失败，后续跳过"
                     if dash:
@@ -311,11 +311,39 @@ class IntraDayScreener:
             _detail(f"  跳过 {sym} {freq.value} — 无数据")
 
     # ─────────────────────────────────────────────────────
+    # 日线数据（异常检测用）
+    # ─────────────────────────────────────────────────────
+    _daily_bars_cache: Dict[str, List] = {}
+
+    def _get_daily_bars(self, sym: str) -> List:
+        """获取个股日线数据（带内存缓存），用于异常检测。"""
+        if sym in self._daily_bars_cache:
+            return self._daily_bars_cache[sym]
+        try:
+            from datetime import datetime, timedelta
+            market = detect_market(sym)
+            if market == "A":
+                sdt = (datetime.now() - timedelta(days=60)).strftime("%Y%m%d")
+                edt = datetime.now().strftime("%Y%m%d")
+                bars = self.ak_source.get_a_daily(sym, sdt, edt)
+            else:
+                bars = []
+            self._daily_bars_cache[sym] = bars or []
+            return self._daily_bars_cache[sym]
+        except Exception:
+            self._daily_bars_cache[sym] = []
+            return []
+
+    # ─────────────────────────────────────────────────────
     # 扫描：信号检测 + 评分
     # ─────────────────────────────────────────────────────
     def scan_once(self, symbols: Optional[List[str]] = None,
-                  market_direction: str = "分化") -> List[ScoredSymbol]:
-        """对所有（或指定）标的运行信号检测，返回按评分降序排列的结果。"""
+                  market_direction: str = "分化",
+                  sentiment_phase: str = "未知") -> List[ScoredSymbol]:
+        """
+        对所有（或指定）标的运行信号检测，返回按评分降序排列的结果。
+        sentiment_phase: P3-1 情绪感知评分参数。
+        """
         from signals.dashboard import get_dashboard
         dash = get_dashboard()
 
@@ -331,11 +359,57 @@ class IntraDayScreener:
             for _fkey, analyzer in self.analyzers.get(sym, {}).items():
                 sigs = detect_all_signals(analyzer.czsc, sym)
                 all_signals.extend(sigs)
-            results.append(score_signals(sym, all_signals))
+            results.append(score_signals(sym, all_signals,
+                                         sentiment_phase=sentiment_phase))
             if dash:
                 dash.task_done("L3.scan", sym)
 
-        results.sort(key=lambda x: x.total_score, reverse=True)
+        # 异常检测 + 笔动力学 + 信号融合
+        try:
+            from signals.core.anomaly import compute_anomaly_profile
+            from signals.core.fusion import fuse_scores
+            from signals.core.bi_dynamics import (
+                analyze_bi_dynamics, analyze_multi_freq_dynamics,
+                merge_dynamics_score, get_best_sell_warning,
+            )
+            for scored in results:
+                daily_bars = self._get_daily_bars(scored.symbol)
+                anomaly = None
+                if daily_bars and len(daily_bars) >= 25:
+                    anomaly = compute_anomaly_profile(scored.symbol, daily_bars)
+
+                # 笔动力学（多级别）
+                dynamics = None
+                dynamics_merged = 0.0
+                sell_warning = {}
+                sym_analyzers = self.analyzers.get(scored.symbol, {})
+                if sym_analyzers:
+                    profiles = analyze_multi_freq_dynamics(sym_analyzers)
+                    dynamics_merged = merge_dynamics_score(profiles)
+                    sell_warning = get_best_sell_warning(profiles)
+                    # 日线动力学作为主 dynamics 传入融合
+                    dynamics = profiles.get("日线") or next(iter(profiles.values()), None)
+
+                fused = fuse_scores(
+                    scored, anomaly,
+                    dynamics=dynamics,
+                    l2_stats=getattr(self, '_l2_stats', None),
+                    market_ctx=getattr(self, '_market_ctx', None),
+                )
+                if anomaly:
+                    scored.anomaly_profile = anomaly
+                scored.fused_score = fused
+                scored.fused_total = fused.fused_total
+                # 附加动力学数据供 API 使用
+                scored.dynamics_merged_score = dynamics_merged
+                scored.sell_warning = sell_warning
+                scored.dynamics_profile = dynamics
+        except Exception:
+            pass  # 异常/动力学检测失败不影响主流程
+
+        # 排序: 有融合分用融合分，否则用缠论原始分
+        results.sort(key=lambda x: x.fused_total if x.fused_total else x.total_score,
+                     reverse=True)
 
         # 信号存档（回测验证用，异常不影响主流程）
         try:

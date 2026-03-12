@@ -11,3 +11,6 @@ rich
 yfinance
 ib_async
 alpaca-py
+fastapi>=0.104
+uvicorn[standard]>=0.24
+upstash-redis

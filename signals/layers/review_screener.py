@@ -6,15 +6,21 @@
 支持 A股（AKShare 东财→Sina 降级链）和 美股（USDataSource）。
 """
 import threading
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 import pandas as pd
 from czsc import Freq, RawBar
 
+from signals.data.bar_cache import get_cache, DiskBarCache
+
 
 # ─────────────────────────────────────────────────────────
 # Dashboard-aware logging
 # ─────────────────────────────────────────────────────────
+
+import logging as _logging
+_file_log = _logging.getLogger("signals.review_screener")
 
 def _log(msg: str):
     from signals.dashboard import get_dashboard
@@ -23,6 +29,7 @@ def _log(msg: str):
         dash.log(msg)
     else:
         print(msg, flush=True)
+    _file_log.info(msg)
 
 
 # ─────────────────────────────────────────────────────────
@@ -96,7 +103,31 @@ def _reset_all_counters():
 
 
 # ─────────────────────────────────────────────────────────
-# 个股日线加载工具（东财 → Sina 降级链）
+# 缓存辅助：records ↔ RawBar 转换
+# ─────────────────────────────────────────────────────────
+
+def _bars_to_records(bars: List[RawBar]) -> list:
+    """RawBar 列表 → 可 JSON 序列化的 dict 列表。"""
+    return [{"dt": str(b.dt), "open": b.open, "high": b.high,
+             "low": b.low, "close": b.close,
+             "vol": b.vol, "amount": b.amount} for b in bars]
+
+
+def _records_to_rawbars(records: list, symbol: str) -> List[RawBar]:
+    """JSON dict 列表 → RawBar 列表。"""
+    bars = []
+    for i, r in enumerate(records):
+        bars.append(RawBar(
+            symbol=symbol, dt=pd.to_datetime(r["dt"]), id=i, freq=Freq.D,
+            open=float(r["open"]), high=float(r["high"]),
+            low=float(r["low"]), close=float(r["close"]),
+            vol=int(r["vol"]), amount=int(r.get("amount", 0)),
+        ))
+    return bars
+
+
+# ─────────────────────────────────────────────────────────
+# 个股日线加载工具（缓存 → 东财 → Sina 降级链）
 # ─────────────────────────────────────────────────────────
 
 def _load_stock_daily_bars(futu_code: str, start_date: str,
@@ -105,14 +136,24 @@ def _load_stock_daily_bars(futu_code: str, start_date: str,
     加载个股日线，供盘后复盘使用。
     返回 (bars, error_type): bars 为空时 error_type 标识失败原因。
 
-    A股降级链: 东财(stock_zh_a_hist) → Sina(stock_zh_a_daily)
+    优先级: 磁盘缓存(当日) → 东财(stock_zh_a_hist) → Sina(stock_zh_a_daily)
     美股路径: USDataSource（独立降级链）
     """
     from signals.data.fetcher import AKShareSource, detect_market
     from signals.data.us_factory import create_us_source
-    from datetime import datetime
     edt = end_date or datetime.now().strftime("%Y-%m-%d")
     market = detect_market(futu_code)
+
+    # ── 缓存命中（A股，当日有效）──
+    if market == "A":
+        today = datetime.now().strftime("%Y%m%d")
+        cache_key = f"{futu_code.replace('.', '_')}_{today}"
+        cache = get_cache()
+        cached = cache.get(cache_key)
+        if cached is not None:
+            bars = _records_to_rawbars(cached, futu_code)
+            if bars:
+                return bars, ""
 
     # ── 美股路径 ──
     if market == "US":
@@ -128,15 +169,20 @@ def _load_stock_daily_bars(futu_code: str, start_date: str,
     # ── A股路径 ──
     ak_src = AKShareSource()
 
-    # 1. 东财源（SSL 计数器未超限时尝试）
+    # 1. 东财源（SSL 计数器未超限时尝试，8s 超时保护）
     if _em_ssl_fails < _EM_SKIP_THRESHOLD:
         try:
-            bars = ak_src.get_a_daily(futu_code, sdt=start_date, edt=edt)
+            bars = ak_src._call_with_timeout(
+                lambda: ak_src.get_a_daily(futu_code, sdt=start_date, edt=edt,
+                                            max_retries=1),
+                timeout=8.0,
+            )
             if bars:
                 _reset_em_counter()
+                cache.set(cache_key, _bars_to_records(bars))
                 return bars, ""
         except Exception as e:
-            if _is_ssl_error(e):
+            if _is_ssl_error(e) or isinstance(e, TimeoutError):
                 _bump_em_fail("日线")
             else:
                 err_msg = f"{type(e).__name__}: {e}"
@@ -150,6 +196,7 @@ def _load_stock_daily_bars(futu_code: str, start_date: str,
             bars = ak_src.get_a_daily_sina(futu_code, sdt=start_date, edt=edt)
             if bars:
                 _reset_sina_counter()
+                cache.set(cache_key, _bars_to_records(bars))
                 return bars, ""
         except Exception as e:
             _bump_sina_fail()
@@ -218,7 +265,7 @@ def _load_stock_minute_bars(futu_code: str, freq: Freq) -> List[RawBar]:
     # 1. Sina 源（优先，受连续失败计数器控制）
     if _sina_fails < _SINA_SKIP_THRESHOLD:
         try:
-            bars = ak_src.get_a_minute(futu_code, freq)
+            bars = ak_src.get_a_minute(futu_code, freq, timeout=10.0)
             if bars:
                 _reset_sina_counter()
                 return bars
@@ -268,8 +315,14 @@ def review_stock_daily(symbols: List[str], start_date: str,
         _log("  跳过个股复盘（未指定标的）")
         return []
 
-    # 每次 review 入口重置熔断计数器
+    # 每次 review 入口重置熔断计数器 + 清理过期缓存
     _reset_all_counters()
+    _cache = get_cache()
+    if isinstance(_cache, DiskBarCache):
+        _cache.cleanup_old(datetime.now().strftime("%Y%m%d"))
+
+    import time as _time
+    _t_l3_start = _time.monotonic()
 
     level_desc = "周线+日线+30min" if with_minute else "日线+周线"
     _log(f"\n>>> Layer 3 个股复盘（{level_desc}）：{len(symbols)} 只 ...")
@@ -286,15 +339,35 @@ def review_stock_daily(symbols: List[str], start_date: str,
     _total = len(symbols)
     _result_lock = threading.Lock()
 
+    # 耗时统计（线程安全）
+    _timing_lock = threading.Lock()
+    _load_times: list = []   # 每只股票的数据加载耗时
+    _anal_times: list = []   # 每只股票的分析耗时
+    _slow_stocks: list = []  # 耗时 >5s 的慢股
+
     def _review_one(sym: str):
         """处理单只股票（在线程池中执行）。"""
         nonlocal ok_count, fail_count, _done
+        _t_stock = _time.monotonic()
 
-        bars, err_type = _load_stock_daily_bars(sym, start_date)
+        # ── 并行加载日线 + 分钟线 ──
+        _t_load = _time.monotonic()
+        if with_minute:
+            from concurrent.futures import ThreadPoolExecutor as _MiniPool
+            with _MiniPool(max_workers=2) as mini:
+                fut_d = mini.submit(_load_stock_daily_bars, sym, start_date)
+                fut_m = mini.submit(_load_stock_minute_bars, sym, Freq.F30)
+                bars, err_type = fut_d.result()
+                bars_30 = fut_m.result()
+        else:
+            bars, err_type = _load_stock_daily_bars(sym, start_date)
+            bars_30 = []
+        load_sec = _time.monotonic() - _t_load
+
         if not bars:
             with _result_lock:
                 if err_type != "no_data" or _em_ssl_fails == 0:
-                    _log(f"  [✗] {sym}: 无数据")
+                    _log(f"  [✗] {sym}: 无数据 (加载{load_sec:.1f}s)")
                 fail_count += 1
                 _done += 1
             if dash:
@@ -302,6 +375,8 @@ def review_stock_daily(symbols: List[str], start_date: str,
             return None
 
         try:
+            _t_anal = _time.monotonic()
+
             # 日线分析
             az_d = SymbolAnalyzer(sym, Freq.D, bars, max_bi_num=200)
             sigs_d = detect_all_signals(az_d.czsc, sym)
@@ -315,21 +390,22 @@ def review_stock_daily(symbols: List[str], start_date: str,
                 sigs_w = detect_all_signals(az_w.czsc, sym)
                 w_bi_cnt = len(az_w.finished_bis)
 
-            # 30min 当下补充（最近5天）
+            # 30min 分析（数据已并行加载完毕）
             sigs_30 = []
             m_bi_cnt = 0
             m_bar_cnt = 0
-            if with_minute:
-                bars_30 = _load_stock_minute_bars(sym, Freq.F30)
-                if bars_30:
-                    m_bar_cnt = len(bars_30)
-                    az_30 = SymbolAnalyzer(sym, Freq.F30, bars_30)
-                    sigs_30 = detect_all_signals(az_30.czsc, sym)
-                    m_bi_cnt = len(az_30.finished_bis)
+            if bars_30:
+                m_bar_cnt = len(bars_30)
+                az_30 = SymbolAnalyzer(sym, Freq.F30, bars_30)
+                sigs_30 = detect_all_signals(az_30.czsc, sym)
+                m_bi_cnt = len(az_30.finished_bis)
 
             # 合并全部信号（含时间衰减）
             all_signals = sigs_d + sigs_w + sigs_30
             sc = score_signals(sym, all_signals)
+
+            anal_sec = _time.monotonic() - _t_anal
+            total_sec = _time.monotonic() - _t_stock
 
             sig_str = f"得分={sc.total_score:+.0f}" if sc.total_score != 0 else "无信号"
             dir_tag = f" [{sc.direction}]" if sc.direction else ""
@@ -342,6 +418,11 @@ def review_stock_daily(symbols: List[str], start_date: str,
                 _done += 1
                 _log(f"  [✓] {sym}: {len(bars)}根日线 {len(az_d.finished_bis)}笔"
                      f"{w_info}{m_info}  {sig_str}{dir_tag}")
+            with _timing_lock:
+                _load_times.append(load_sec)
+                _anal_times.append(anal_sec)
+                if total_sec > 5.0:
+                    _slow_stocks.append((sym, total_sec, load_sec, anal_sec))
 
             if dash:
                 dash.task_done("L3.review", sym)
@@ -357,7 +438,7 @@ def review_stock_daily(symbols: List[str], start_date: str,
             return None
 
     # ── 并发执行 ─────────────────────────────────────────
-    max_workers = 8
+    max_workers = min(12, len(symbols))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futs = {pool.submit(_review_one, sym): sym for sym in symbols}
         for fut in as_completed(futs):
@@ -390,7 +471,42 @@ def review_stock_daily(symbols: List[str], start_date: str,
         _log(f"  [i] Sina 降级: 连续失败{_sina_fails}次, "
              f"成功{ok_count}只, 失败{fail_count}只")
 
-    scored.sort(key=lambda x: -x.total_score)
+    # ── 异常检测 + 信号融合（复用盘中 screener 同样逻辑）──
+    try:
+        from signals.core.anomaly import compute_anomaly_profile
+        from signals.core.fusion import fuse_scores
+        for sc in scored:
+            cache_key = f"{sc.symbol.replace('.', '_')}_{datetime.now().strftime('%Y%m%d')}"
+            cached = get_cache().get(cache_key)
+            if cached and len(cached) >= 25:
+                daily_bars = _records_to_rawbars(cached, sc.symbol)
+                anomaly = compute_anomaly_profile(sc.symbol, daily_bars)
+                if anomaly:
+                    fused = fuse_scores(sc, anomaly)
+                    sc.anomaly_profile = anomaly
+                    sc.fused_score = fused
+                    sc.fused_total = fused.fused_total
+    except Exception:
+        pass  # 异常检测失败不影响主流程
+
+    # 排序: 有融合分用融合分，否则用缠论原始分
+    scored.sort(key=lambda x: x.fused_total if x.fused_total else x.total_score,
+                reverse=True)
+
+    # ── 耗时统计 ──
+    _l3_elapsed = _time.monotonic() - _t_l3_start
+    avg_load = sum(_load_times) / len(_load_times) if _load_times else 0
+    avg_anal = sum(_anal_times) / len(_anal_times) if _anal_times else 0
+    _log(f"\n  [⏱] L3 耗时统计:")
+    _log(f"       总耗时: {_l3_elapsed:.1f}s ({len(symbols)}只, "
+         f"成功{ok_count} 失败{fail_count})")
+    _log(f"       平均加载: {avg_load:.2f}s  平均分析: {avg_anal:.2f}s")
+    if _slow_stocks:
+        _slow_stocks.sort(key=lambda x: -x[1])
+        _log(f"       慢股 (>5s): {len(_slow_stocks)}只")
+        for sym, total, load, anal in _slow_stocks[:5]:
+            _log(f"         {sym}: {total:.1f}s (加载{load:.1f}s 分析{anal:.1f}s)")
+
     _print_stock_report(scored)
 
     # 信号存档（回测验证用，异常不影响主流程）

@@ -20,10 +20,18 @@ from .index_report import IndexReport, ZSLevel
 # ─────────────────────────────────────────────────────────
 
 def _determine_trend(analyzer: SymbolAnalyzer) -> str:
-    """根据最近4笔高低点的序列判断趋势"""
+    """
+    根据完成笔结构 + 未完成笔进展判断趋势。
+
+    逻辑:
+    1. 先看最后4根完成笔的高低点序列（结构趋势）
+    2. 再考虑当前未完成笔的力度 — 如果未完成笔已经大幅反转（力度超前笔50%），
+       则将结构趋势修正为"转折中"（不再简单标注下跌/上涨）
+    """
     bis = analyzer.finished_bis
     if len(bis) < 4:
         return "结构未成型"
+
     last4 = bis[-4:]
     highs = [b.high for b in last4]
     lows  = [b.low  for b in last4]
@@ -31,11 +39,35 @@ def _determine_trend(analyzer: SymbolAnalyzer) -> str:
     low_up  = lows[-1]  > lows[0]
     high_dn = highs[-1] < highs[0]
     low_dn  = lows[-1]  < lows[0]
+
+    # 结构趋势
     if high_up and low_up:
-        return "上涨趋势"
-    if high_dn and low_dn:
-        return "下跌趋势"
-    return "中枢震荡"
+        struct = "上涨趋势"
+    elif high_dn and low_dn:
+        struct = "下跌趋势"
+    else:
+        struct = "中枢震荡"
+
+    # 考虑未完成笔：bars_ubi 是当前未完成笔中的K线
+    try:
+        bars_ubi = analyzer.czsc.bars_ubi
+        if bars_ubi and len(bars_ubi) >= 2 and len(bis) >= 2:
+            last_bi = bis[-1]
+            last_power = last_bi.power_price
+            ubi_high = max(bar.high for bar in bars_ubi)
+            ubi_low = min(bar.low for bar in bars_ubi)
+            ubi_power = ubi_high - ubi_low
+
+            # 如果未完成笔力度超过前笔50%，表明可能正在发生趋势转折
+            if last_power > 0 and ubi_power / last_power > 0.5:
+                if struct == "下跌趋势" and last_bi.direction == Direction.Down:
+                    struct = "反弹修复"
+                elif struct == "上涨趋势" and last_bi.direction == Direction.Up:
+                    struct = "回调修正"
+    except Exception:
+        pass  # czsc 版本差异
+
+    return struct
 
 
 def _last_direction(analyzer: SymbolAnalyzer) -> str:
@@ -168,6 +200,28 @@ class IndexAnalyzer:
         f15_last_dt    = (self._f15.bars_raw[-1].dt
                           if self._f15 and self._f15.bars_raw else None)
 
+        # 快照：优先小级别（15M > 30M > 日线）
+        snapshot_price = latest_price
+        snapshot_dt = daily_last_dt
+        snapshot_freq = "日线"
+
+        if self._f15 and self._f15.bars_raw:
+            snapshot_price = self._f15.bars_raw[-1].close
+            snapshot_dt = self._f15.bars_raw[-1].dt
+            snapshot_freq = "15M"
+        elif self._f30 and self._f30.bars_raw:
+            snapshot_price = self._f30.bars_raw[-1].close
+            snapshot_dt = self._f30.bars_raw[-1].dt
+            snapshot_freq = "30M"
+
+        # 盘中涨跌幅：snapshot vs 前一交易日收盘
+        intraday_change = None
+        if snapshot_freq != "日线" and self._daily.bars_raw:
+            prev_close = self._daily.bars_raw[-1].close
+            if prev_close > 0:
+                intraday_change = round(
+                    (snapshot_price / prev_close - 1) * 100, 2)
+
         # 均线关键位（日线以上，不做分钟线 MA）
         ma_ctx = None
         try:
@@ -219,6 +273,40 @@ class IndexAnalyzer:
             daily_last_dt=daily_last_dt,
             f15_last_dt=f15_last_dt,
             data_available=True,
+            # 快照
+            snapshot_price=snapshot_price,
+            snapshot_dt=snapshot_dt,
+            snapshot_freq=snapshot_freq,
+            intraday_change=intraday_change,
             # 均线关键位
             ma_context=ma_ctx,
+            # P3-2: 情景分叉
+            scenario_branches=self._build_scenarios(ma_ctx),
+            # P3-5: 近5日收益率
+            recent_5d_return=self._calc_recent_return(5),
         )
+
+    def _build_scenarios(self, ma_ctx) -> list:
+        """P3-2: 构建情景分叉"""
+        if ma_ctx is None:
+            return []
+        try:
+            from signals.core.ma_levels import build_scenario_branches
+            import config
+            custom = config.CUSTOM_KEY_LEVELS.get(self.name, {})
+            return build_scenario_branches(ma_ctx, custom_levels=custom or None)
+        except Exception:
+            return []
+
+    def _calc_recent_return(self, days: int = 5) -> float:
+        """计算近 N 个交易日收益率 %"""
+        if not self._daily or not self._daily.bars_raw:
+            return 0.0
+        bars = self._daily.bars_raw
+        if len(bars) < days + 1:
+            return 0.0
+        old_close = bars[-(days + 1)].close
+        new_close = bars[-1].close
+        if old_close <= 0:
+            return 0.0
+        return round((new_close / old_close - 1) * 100, 2)
