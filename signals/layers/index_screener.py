@@ -277,6 +277,7 @@ class IndexScreener:
         """
         加载美股指数 ETF（SPY/QQQ/DIA）三个周期。
         Futu 优先（需美股行情权限），降级 yfinance（免费兜底）。
+        云端模式（DEPLOY_MODE=cloud）：无 Futu 且 yfinance 被限速，直接跳过。
         """
         from signals.dashboard import get_dashboard
         dash = get_dashboard()
@@ -284,6 +285,17 @@ class IndexScreener:
         if not self.us_codes:
             if dash:
                 dash.phase_skip("L1.us", "无美股指数")
+            return
+
+        # 云端模式：无可用美股数据源（Futu 未装 + yfinance 被限速），跳过
+        import config
+        if getattr(config, "DEPLOY_MODE", "local") == "cloud" and not self._futu_available:
+            msg = "  [跳过] 美股指数：云端模式无可用数据源（需 Futu 或住宅 IP）"
+            if dash:
+                dash.phase_skip("L1.us", "云端无数据源")
+                dash.log(msg)
+            else:
+                print(msg, flush=True)
             return
 
         if dash:
