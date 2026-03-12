@@ -744,10 +744,28 @@ def get_industry_stocks(industry: str) -> List[str]:
     _cache_key = f"stocks_{industry}"
 
     # ── 1. 东财 cons_em ──────────────────────────────
+    df = None
     try:
-        df = _em_retry(ak.stock_board_industry_cons_em, symbol=industry, retries=2, delay=0.5)
+        df = _em_retry(ak.stock_board_industry_cons_em, symbol=industry, retries=3, delay=1.0)
     except Exception as e:
         _detail(f"  [!] {industry} 东财成分股失败（{e.__class__.__name__}）")
+
+    if df is not None and not df.empty:
+        code_col = None
+        for col in ["代码", "code", "股票代码"]:
+            if col in df.columns:
+                code_col = col
+                break
+        if code_col:
+            codes = []
+            for raw in df[code_col].astype(str):
+                c = raw.strip()
+                if len(c) == 6 and c.isdigit():
+                    prefix = "SH." if c.startswith(("6", "5")) else "SZ."
+                    codes.append(prefix + c)
+            if codes:
+                _save_cache(_cache_key, codes)
+                return codes
 
     # ── 2. pytdx block.dat 降级 ──────────────────────
     pytdx_codes = _fetch_pytdx_industry_stocks(industry)
