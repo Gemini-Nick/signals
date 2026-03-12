@@ -13,7 +13,8 @@ echo "  工作目录: $WORK"
 if [ -d "$WORK/.git" ]; then
     echo "  代码仓库已存在，拉取最新..."
     cd "$WORK"
-    git pull origin main
+    BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    git pull origin "$BRANCH"
 else
     echo ">>> 克隆代码..."
     git clone "$REPO" "$WORK"

@@ -10,7 +10,8 @@ echo "$(date +'%Y-%m-%d %H:%M:%S') 开始同步..."
 
 # 拉取最新代码
 OLD_HEAD=$(git rev-parse HEAD)
-git pull origin main 2>&1
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+git pull origin "$BRANCH" 2>&1
 NEW_HEAD=$(git rev-parse HEAD)
 
 # 无更新则跳过
