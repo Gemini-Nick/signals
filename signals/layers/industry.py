@@ -11,7 +11,7 @@
 数据源降级链：
   行业涨幅排行: 东财 → 同花顺 → 缓存
   行业 K 线:    东财 → 同花顺 → pytdx → 缓存
-  行业成分股:   东财 → pytdx → 缓存
+  行业成分股:   同花顺 → 东财 → pytdx → 缓存
   概念板块排行: 东财 → 缓存
 """
 from dataclasses import dataclass, field
@@ -731,11 +731,30 @@ def get_industry_list() -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _extract_stock_codes(df, industry: str) -> List[str]:
+    """从 DataFrame 提取股票代码，转为 Futu 格式。"""
+    code_col = None
+    for col in ["代码", "code", "股票代码"]:
+        if col in df.columns:
+            code_col = col
+            break
+    if not code_col:
+        return []
+    codes = []
+    for raw in df[code_col].astype(str):
+        c = raw.strip()
+        if len(c) == 6 and c.isdigit():
+            prefix = "SH." if c.startswith(("6", "5")) else "SZ."
+            codes.append(prefix + c)
+    return codes
+
+
 def get_industry_stocks(industry: str) -> List[str]:
     """
     获取指定行业的成分股，返回 Futu 格式代码列表。
 
-    降级链：东财 cons_em → pytdx block.dat → 磁盘缓存
+    降级链：THS cons_ths → 东财 cons_em → pytdx block.dat → 磁盘缓存
+    THS 优先：走 10jqka.com，数据中心 IP 不被封。
 
     :param industry: 行业名称，如 "有色金属"、"半导体"
     :return: ["SH.600489", "SZ.002460", ...]
@@ -743,37 +762,35 @@ def get_industry_stocks(industry: str) -> List[str]:
     import akshare as ak
     _cache_key = f"stocks_{industry}"
 
-    # ── 1. 东财 cons_em ──────────────────────────────
-    df = None
+    # ── 1. THS 成分股（优先，云端可用）───────────────
     try:
-        df = _em_retry(ak.stock_board_industry_cons_em, symbol=industry, retries=3, delay=1.0)
-    except Exception as e:
-        _detail(f"  [!] {industry} 东财成分股失败（{e.__class__.__name__}）")
-
-    if df is not None and not df.empty:
-        code_col = None
-        for col in ["代码", "code", "股票代码"]:
-            if col in df.columns:
-                code_col = col
-                break
-        if code_col:
-            codes = []
-            for raw in df[code_col].astype(str):
-                c = raw.strip()
-                if len(c) == 6 and c.isdigit():
-                    prefix = "SH." if c.startswith(("6", "5")) else "SZ."
-                    codes.append(prefix + c)
+        df_ths = ak.stock_board_industry_cons_ths(symbol=industry)
+        if df_ths is not None and not df_ths.empty:
+            codes = _extract_stock_codes(df_ths, industry)
             if codes:
                 _save_cache(_cache_key, codes)
                 return codes
+    except Exception as e:
+        _detail(f"  [!] {industry} THS成分股失败（{e.__class__.__name__}）")
 
-    # ── 2. pytdx block.dat 降级 ──────────────────────
+    # ── 2. 东财 cons_em（备选）───────────────────────
+    try:
+        df_em = _em_retry(ak.stock_board_industry_cons_em, symbol=industry, retries=2, delay=1.0)
+        if df_em is not None and not df_em.empty:
+            codes = _extract_stock_codes(df_em, industry)
+            if codes:
+                _save_cache(_cache_key, codes)
+                return codes
+    except Exception as e:
+        _detail(f"  [!] {industry} 东财成分股失败（{e.__class__.__name__}）")
+
+    # ── 3. pytdx block.dat 降级 ──────────────────────
     pytdx_codes = _fetch_pytdx_industry_stocks(industry)
     if pytdx_codes:
         _save_cache(_cache_key, pytdx_codes)
         return pytdx_codes
 
-    # ── 3. 磁盘缓存兜底 ─────────────────────────────
+    # ── 4. 磁盘缓存兜底 ─────────────────────────────
     cached = _load_cache(_cache_key, max_age_hours=168)  # 成分股变动少，7天缓存
     if cached:
         _detail(f"  [cache] {industry} 成分股使用缓存（{len(cached)}只）")

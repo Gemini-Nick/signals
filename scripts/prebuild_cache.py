@@ -85,8 +85,8 @@ def main():
             print(f"❌ {e.__class__.__name__}")
             fail += 1
 
-        # 防止频率限制
-        time.sleep(0.3)
+        # 防止东财频率限制（0.8s × ~90行业 ≈ 2-3分钟）
+        time.sleep(0.8)
 
     print(f"\n>>> 完成！成功: {success}, 失败: {fail}")
     print(f"  缓存目录: {CACHE_DIR}")
