@@ -8,11 +8,11 @@
 - 双榜行业排行：涨幅榜 + 综合强度榜
 - 多维度个股入池：涨停/异动/领涨/强势/龙头/融资
 
-数据源降级链：
-  行业涨幅排行: 东财 → 同花顺 → 缓存
+数据源降级链（新浪/THS 优先，东财备选）：
+  行业涨幅排行: 同花顺 → 东财 → 缓存
   行业 K 线:    东财 → 同花顺 → pytdx → 缓存
   行业成分股:   同花顺 → 东财 → pytdx → 缓存
-  概念板块排行: 东财 → 缓存
+  概念板块排行: 新浪 → 东财 → 同花顺 → 缓存 → 硬编码
 """
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,11 +83,13 @@ def _build_name_to_code_map() -> dict:
     import json, os
     from datetime import datetime, timedelta
 
-    # 尝试本地缓存
+    # 尝试本地缓存（云端放宽到 30 天，本地 7 天）
+    import config as _cfg_nm
+    _max_days = 30 if getattr(_cfg_nm, "DEPLOY_MODE", "local") == "cloud" else 7
     try:
         if os.path.exists(_NAME_CACHE_PATH):
             mtime = datetime.fromtimestamp(os.path.getmtime(_NAME_CACHE_PATH))
-            if datetime.now() - mtime < timedelta(days=7):
+            if datetime.now() - mtime < timedelta(days=_max_days):
                 with open(_NAME_CACHE_PATH, "r", encoding="utf-8") as f:
                     _NAME_TO_CODE.update(json.load(f))
                 _detail(f"  [✓] 名称映射从缓存加载（{len(_NAME_TO_CODE)} 只，"
@@ -96,7 +98,7 @@ def _build_name_to_code_map() -> dict:
     except Exception:
         pass
 
-    # API 拉取
+    # API 拉取（东财 stock_info_a_code_name）
     import akshare as ak
     try:
         df = ak.stock_info_a_code_name()
@@ -114,8 +116,18 @@ def _build_name_to_code_map() -> dict:
             except Exception:
                 pass
             _detail(f"  [✓] 名称映射已加载（{len(_NAME_TO_CODE)} 只，已缓存）")
+            return _NAME_TO_CODE
     except Exception as e:
         _detail(f"  [!] 股票名称映射加载失败（{e.__class__.__name__}）")
+
+    # 过期缓存兜底（API 失败时仍可使用旧数据）
+    try:
+        if os.path.exists(_NAME_CACHE_PATH):
+            with open(_NAME_CACHE_PATH, "r", encoding="utf-8") as f:
+                _NAME_TO_CODE.update(json.load(f))
+            _detail(f"  [!] 名称映射使用过期缓存兜底（{len(_NAME_TO_CODE)} 只）")
+    except Exception:
+        pass
     return _NAME_TO_CODE
 
 
@@ -366,9 +378,13 @@ def _fetch_ths_industry_bars(industry: str,
         s_date = (today - timedelta(days=lookback_days)).strftime("%Y%m%d")
     e_date = today.strftime("%Y%m%d")
 
+    # THS 接口需要 YYYY-MM-DD 格式
+    s_fmt = f"{s_date[:4]}-{s_date[4:6]}-{s_date[6:]}" if len(s_date) == 8 else s_date
+    e_fmt = f"{e_date[:4]}-{e_date[4:6]}-{e_date[6:]}" if len(e_date) == 8 else e_date
+
     def _call():
         return ak.stock_board_industry_index_ths(
-            symbol=industry, start_date=s_date, end_date=e_date
+            symbol=industry, start_date=s_fmt, end_date=e_fmt
         )
 
     try:
@@ -1720,7 +1736,7 @@ def _get_concepts_sina(top_n: int = 10) -> List[ConceptRanking]:
 def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
     """
     获取概念板块综合排行 top N（过滤噪音 + 多维评分）。
-    降级链: 东财(8s,468概念,字段丰富) → 新浪(2.4s,175概念) → THS(25s) → 磁盘缓存 → 硬编码兜底
+    降级链: 新浪(2.4s) → 东财(8s,468概念) → THS(25s) → 磁盘缓存 → 硬编码兜底
     """
     import akshare as ak
     import config as _cfg
@@ -1729,7 +1745,13 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
     if top_n is None:
         top_n = getattr(_cfg, "CONCEPT_TOP_N", 15)
 
-    # ── 0. 东财优先（468概念, 上涨/下跌/换手率等丰富字段）──
+    # ── 0. 新浪优先（2.4s, 175概念, 云端不封）──────────
+    sina_results = _get_concepts_sina(top_n)
+    if sina_results:
+        _save_concept_cache(sina_results, source="sina")
+        return sina_results
+
+    # ── 1. 东财备选（468概念, 上涨/下跌/换手率等丰富字段）──
     # 先尝试 social_fetcher 的内存/磁盘缓存（毫秒级），再尝试直接网络调用
     df = None
     try:
@@ -1744,15 +1766,13 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
         df = None
 
     if df is None:
-        # 缓存未命中，尝试直接网络调用（带 SSL 重试，不受行业板块熔断控制）
         try:
-            df = _em_retry(ak.stock_board_concept_name_em, retries=3, delay=1.0)
+            df = _em_retry(ak.stock_board_concept_name_em, retries=2, delay=1.0)
         except Exception as e:
-            _detail(f"  [!] 东财概念板块接口失败（3次重试后，{e.__class__.__name__}: {e}）")
+            _detail(f"  [!] 东财概念板块接口失败（{e.__class__.__name__}）")
             df = None
 
     if df is not None and not df.empty and "涨跌幅" in df.columns:
-        # 全量处理：先过滤噪音，再评分排序，最后截取 top_n
         results = []
         for _, row in df.iterrows():
             name = str(row.get("板块名称", "")).strip()
@@ -1785,18 +1805,11 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
                 composite_score=score,
                 related_industries=related,
             ))
-        # 按综合评分排序
         results.sort(key=lambda x: x.composite_score, reverse=True)
         results = results[:top_n]
         _detail(f"  [✓] 概念板块 top {len(results)} 条（已过滤噪音+综合评分排序）")
         _save_concept_cache(results, source="em")
         return results
-
-    # ── 1. 新浪降级（2.4s, 175概念, 无上涨/下跌/换手率）──
-    sina_results = _get_concepts_sina(top_n)
-    if sina_results:
-        _save_concept_cache(sina_results, source="sina")
-        return sina_results
 
     # ── 2. 同花顺降级（全局超时 25s，防止 THS K线拉取太慢）──
     try:

@@ -276,15 +276,34 @@ def fetch_concept_list(force: bool = False) -> pd.DataFrame:
             return df
 
     import akshare as ak
+
+    # 检查东财熔断状态（云端 push2 被封时避免无效重试）
+    em_ok = True
     try:
-        df = em_call_with_retry(ak.stock_board_concept_name_em, retries=3, delay=1.0)
+        from signals.layers.industry import _EM_CIRCUIT_OPEN
+        em_ok = not _EM_CIRCUIT_OPEN
+    except ImportError:
+        pass
+
+    if not em_ok:
+        _log.info("概念板块列表: 东财已熔断，使用缓存")
+        cached = _load_cache("concept_list", max_age=86400 * 7)
+        if cached and "records" in cached:
+            df = pd.DataFrame(cached["records"])
+            _concept_list_cache = df
+            _concept_list_ts = cached.get("ts", now)
+            return df
+        return pd.DataFrame()
+
+    try:
+        df = em_call_with_retry(ak.stock_board_concept_name_em, retries=2, delay=1.0)
         _save_cache("concept_list", {"ts": time.time(), "records": df.to_dict("records")})
         _concept_list_cache = df
         _concept_list_ts = time.time()
         _log.info(f"概念板块列表 获取成功: {len(df)} 个概念")
         return df
     except Exception as e:
-        _log.warning(f"概念板块列表 获取失败(3次重试后): {e}")
+        _log.warning(f"概念板块列表 获取失败: {e}")
         cached = _load_cache("concept_list", max_age=86400 * 7)
         if cached and "records" in cached:
             return pd.DataFrame(cached["records"])
@@ -320,10 +339,29 @@ def fetch_concept_stocks(concept_name: str) -> ConceptTheme:
         )
 
     import akshare as ak
+
+    # 检查东财熔断状态（云端 push2 被封时避免无效重试）
+    em_ok = True
+    try:
+        from signals.layers.industry import _EM_CIRCUIT_OPEN
+        em_ok = not _EM_CIRCUIT_OPEN
+    except ImportError:
+        pass
+
+    if not em_ok:
+        _log.info(f"概念成分股 [{concept_name}] 东财已熔断，跳过")
+        cached = _load_cache(cache_key, max_age=86400 * 7)
+        if cached and "stocks" in cached:
+            return ConceptTheme(
+                name=concept_name, code=cached.get("code", ""),
+                stocks=cached["stocks"], stock_count=len(cached["stocks"]),
+            )
+        return ConceptTheme(name=concept_name)
+
     try:
         df = em_call_with_retry(
             ak.stock_board_concept_cons_em, symbol=concept_name,
-            retries=3, delay=0.5,
+            retries=2, delay=0.5,
         )
         stocks = [
             {
