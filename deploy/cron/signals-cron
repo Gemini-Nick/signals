@@ -1,6 +1,5 @@
 # 隆小侠 LONG CLAW — 定时分析任务 (北京时间 Asia/Shanghai)
-# Docker: crontab /etc/cron.d/signals-cron (路径 /app)
-# AutoDL: setup.sh 会自动将 /app 替换为实际路径
+# 安装: crontab /etc/cron.d/signals-cron
 
 # ── A股/港股 盘中扫描 ──────────────────────────
 # 开盘前仅指数快报 (9:25)
