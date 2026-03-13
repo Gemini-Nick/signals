@@ -60,8 +60,20 @@ fi
 nohup python run.py --mode web --port 6006 > logs/web.log 2>&1 &
 echo $! > logs/web.pid
 echo "  🌐 Web 服务: PID=$(cat logs/web.pid), port=6006"
+
+# ── Web2 服务（行业聚类 + 回测）──────────────────
+if [ -f logs/web2.pid ]; then
+    kill $(cat logs/web2.pid) 2>/dev/null || true
+    rm -f logs/web2.pid
+fi
+
+nohup python run.py --mode web2 --port 6007 > logs/web2.log 2>&1 &
+echo $! > logs/web2.pid
+echo "  🐲 Web2 服务: PID=$(cat logs/web2.pid), port=6007"
+
 echo ""
 echo "✅ 启动完成！"
-echo "  Web 日志: tail -f $WORK/logs/web.log"
+echo "  Web  日志: tail -f $WORK/logs/web.log"
+echo "  Web2 日志: tail -f $WORK/logs/web2.log"
 echo "  Futu 日志: tail -f $WORK/logs/futu.log"
-echo "  访问: AutoDL 控制台 → 自定义服务"
+echo "  访问: AutoDL 控制台 → 自定义服务 (6006=Web, 6007=Web2)"

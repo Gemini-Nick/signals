@@ -13,6 +13,12 @@ if [ -f logs/web.pid ]; then
     rm -f logs/web.pid
 fi
 
+# 停止 Web2
+if [ -f logs/web2.pid ]; then
+    kill $(cat logs/web2.pid) 2>/dev/null && echo "  Web2 已停止"
+    rm -f logs/web2.pid
+fi
+
 # 停止 Futu OpenD
 if [ -f logs/futu.pid ]; then
     kill $(cat logs/futu.pid) 2>/dev/null && echo "  Futu OpenD 已停止"
