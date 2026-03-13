@@ -3,7 +3,7 @@
 # 用法: bash deploy/autodl/setup.sh
 set -e
 
-WORK=/root/autodl-tmp/signals
+WORK=${SIGNALS_WORK:-$(cd "$(dirname "$0")/../.." && pwd)}
 REPO=${GITHUB_REPO:-"https://github.com/Gemini-Nick/signals.git"}
 
 echo "🐲 隆小侠 AutoDL 部署初始化..."
@@ -50,7 +50,16 @@ else
     echo "  deploy/.env 已存在"
 fi
 
-# ── 5. cron 定时任务 ──────────────────────────────
+# ── 5. 东财缓存检查 ──────────────────────────────
+if [ -f .cache/name_to_code.json ] && [ -f .cache/board_industry.csv ]; then
+    echo "  东财缓存已存在（随 git 同步）"
+else
+    echo ">>> 东财缓存缺失，尝试生成..."
+    python deploy/autodl/gen_cache.py || echo "  ⚠️  缓存生成失败（云端东财不通属正常）"
+    echo "  💡 可在本地运行: python deploy/autodl/gen_cache.py --push"
+fi
+
+# ── 6. cron 定时任务 ──────────────────────────────
 echo ">>> 配置定时任务..."
 CRON_FILE=/tmp/signals-cron
 sed "s|/app|$WORK|g" deploy/cron/signals-cron > "$CRON_FILE"
@@ -61,8 +70,8 @@ echo "0 * * * *  cd $WORK && bash deploy/autodl/sync.sh >> logs/sync.log 2>&1" >
 crontab "$CRON_FILE"
 echo "  定时任务已安装 (crontab -l 查看)"
 
-# ── 6. 数据 & 日志目录 ────────────────────────────
-mkdir -p .data logs
+# ── 7. 数据 & 日志目录 ────────────────────────────
+mkdir -p .cache .data logs
 
 echo ""
 echo "✅ 初始化完成！后续步骤:"

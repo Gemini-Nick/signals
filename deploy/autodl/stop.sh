@@ -2,7 +2,7 @@
 # 隆小侠 LONG CLAW — AutoDL 停止服务
 # 用法: bash deploy/autodl/stop.sh
 
-WORK=/root/autodl-tmp/signals
+WORK=${SIGNALS_WORK:-$(cd "$(dirname "$0")/../.." && pwd)}
 cd "$WORK" 2>/dev/null || true
 
 echo "🐲 停止隆小侠服务..."

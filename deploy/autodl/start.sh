@@ -3,7 +3,7 @@
 # 用法: bash deploy/autodl/start.sh
 set -e
 
-WORK=/root/autodl-tmp/signals
+WORK=${SIGNALS_WORK:-$(cd "$(dirname "$0")/../.." && pwd)}
 cd "$WORK"
 
 # 加载环境变量

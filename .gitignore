@@ -33,7 +33,10 @@ notes/**/*.meta.yaml
 # 缓存 & 本地数据
 .cache/
 .data/
-# 允许成分股缓存入库（供 AutoDL 等云端使用）
+# 允许东财预生成缓存入库（供 AutoDL 等云端使用）
+!.cache/name_to_code.json
+!.cache/board_industry.csv
+# 允许成分股缓存入库
 !.data/cache/
 !.data/cache/stocks_*.json
 
