@@ -3,7 +3,7 @@
 # 用法: bash deploy/autodl/sync.sh
 # 可由 cron 自动调用，或 GitHub Actions SSH 触发
 
-WORK=/root/autodl-tmp/signals
+WORK=${SIGNALS_WORK:-$(cd "$(dirname "$0")/../.." && pwd)}
 cd "$WORK"
 
 echo "$(date +'%Y-%m-%d %H:%M:%S') 开始同步..."
@@ -27,6 +27,11 @@ git log --oneline "$OLD_HEAD".."$NEW_HEAD"
 if git diff "$OLD_HEAD".."$NEW_HEAD" --name-only | grep -q requirements.txt; then
     echo "  依赖变化，重新安装..."
     pip install -r requirements.txt
+fi
+
+# 检查东财缓存是否随代码更新
+if git diff "$OLD_HEAD".."$NEW_HEAD" --name-only | grep -q '.cache/'; then
+    echo "  东财缓存已更新（随 git 同步）"
 fi
 
 # 热重启 Web 服务

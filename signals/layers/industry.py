@@ -618,6 +618,24 @@ def _em_health_probe(timeout: float = 3.0) -> bool:
     return False
 
 
+# 行业板块磁盘缓存路径（gen_cache.py 预生成）
+_BOARD_INDUSTRY_CACHE_PATH = str(Path(__file__).resolve().parent.parent.parent / ".cache" / "board_industry.csv")
+
+
+def _load_board_industry_cache() -> Optional[pd.DataFrame]:
+    """从磁盘加载行业板块缓存（gen_cache.py 预生成，随 git 同步）"""
+    import os
+    try:
+        if os.path.exists(_BOARD_INDUSTRY_CACHE_PATH):
+            df = pd.read_csv(_BOARD_INDUSTRY_CACHE_PATH)
+            if df is not None and not df.empty:
+                _log(f"  [✓] 行业板块从磁盘缓存加载（{len(df)} 个行业）")
+                return df
+    except Exception:
+        pass
+    return None
+
+
 def _fetch_board_industry_name_em(timeout: float = 5.0) -> Optional[pd.DataFrame]:
     """
     带熔断+重试的 stock_board_industry_name_em 调用：
@@ -628,13 +646,16 @@ def _fetch_board_industry_name_em(timeout: float = 5.0) -> Optional[pd.DataFrame
     """
     global _EM_CIRCUIT_OPEN, _EM_NAME_DF_CACHE
 
-    # 有缓存直接返回
+    # 有内存缓存直接返回
     if _EM_NAME_DF_CACHE is not None:
         return _EM_NAME_DF_CACHE
 
-    # 熔断打开 → 跳过
+    # 熔断打开 → 尝试磁盘缓存兜底
     if _EM_CIRCUIT_OPEN:
-        return None
+        _disk = _load_board_industry_cache()
+        if _disk is not None:
+            _EM_NAME_DF_CACHE = _disk
+        return _disk
 
     import akshare as ak
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
