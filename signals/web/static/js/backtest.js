@@ -1,479 +1,495 @@
 /**
- * 隆小侠 LONG CLAW — 回测页
- * KPI + 信号分析(GroupStats表 + 衰减曲线 + 校准) + 买卖配对
+ * 隆小侠 LONG CLAW — 回测页（重写版）
+ * K线图 + MACD 子图 + MA均线 + 缠论笔/中枢 + 信号标记 + KPI + 信号表格
+ * 使用 TradingView Lightweight Charts v4
  */
 
+let _btChart = null;
+let _btCandleSeries = null;
+let _btVolumeSeries = null;
+let _btMacdBarSeries = null;
+let _btMacdDifSeries = null;
+let _btMacdDeaSeries = null;
+let _btBiSeries = null;
+let _btMaSeries = [];
 let _btLoaded = false;
 
+// ── 页面初始化 ──────────────────────────────────────
 window.loadBacktestPage = function () {
   if (_btLoaded) return;
   _btLoaded = true;
-  loadBacktestData();
   _initBtEvents();
 };
 
 function _initBtEvents() {
-  // 筛选
-  document.getElementById('bt-signal-type').addEventListener('change', _onFilterChange);
-  document.getElementById('bt-freq').addEventListener('change', _onFilterChange);
-  document.getElementById('bt-refresh-btn').addEventListener('click', () => {
-    _btLoaded = false;
-    loadBacktestData();
-    _btLoaded = true;
-  });
-  // 评估按钮
-  document.getElementById('bt-eval-btn').addEventListener('click', _triggerEvaluate);
-  // 视图 tab
-  document.querySelectorAll('.bt-view-tab').forEach(tab => {
-    tab.addEventListener('click', () => _switchBtView(tab.dataset.view));
+  const runBtn = document.getElementById('bt-run-btn');
+  const codeInput = document.getElementById('bt-code-input');
+
+  runBtn.addEventListener('click', _runBacktest);
+  codeInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') _runBacktest();
   });
 }
 
-function _onFilterChange() {
-  loadBacktestData();
-}
+// ── 主运行逻辑 ──────────────────────────────────────
+async function _runBacktest() {
+  const code = document.getElementById('bt-code-input').value.trim();
+  if (!code) return;
 
-async function _triggerEvaluate() {
-  const btn = document.getElementById('bt-eval-btn');
-  btn.disabled = true;
-  btn.textContent = '评估中...';
-  try {
-    const res = await fetch(API_BASE + '/api/backtest/evaluate', { method: 'POST' });
-    const data = await res.json();
-    btn.textContent = data.message || '完成';
-    setTimeout(() => { btn.textContent = '评估到期信号'; btn.disabled = false; }, 2000);
-    _btLoaded = false;
-    loadBacktestData();
-    _btLoaded = true;
-  } catch (e) {
-    btn.textContent = '失败';
-    btn.disabled = false;
-  }
-}
+  const freq = document.getElementById('bt-freq-select').value;
+  const signalGroup = document.getElementById('bt-signal-group').value;
+  const status = document.getElementById('bt-status');
+  const runBtn = document.getElementById('bt-run-btn');
 
-function _switchBtView(viewName) {
-  document.querySelectorAll('.bt-view-tab').forEach(t => t.classList.toggle('active', t.dataset.view === viewName));
-  document.querySelectorAll('.bt-view').forEach(v => v.classList.remove('active'));
-  const view = document.getElementById('bt-view-' + viewName);
-  if (view) view.classList.add('active');
-}
-
-async function loadBacktestData() {
-  const sigType = document.getElementById('bt-signal-type').value;
-  const freq = document.getElementById('bt-freq').value;
-  const params = new URLSearchParams();
-  if (sigType) params.set('signal_type', sigType);
-  if (freq) params.set('freq', freq);
+  status.textContent = '加载中...';
+  status.className = 'bt-status';
+  runBtn.disabled = true;
 
   try {
-    const [summary, report, tradePairs] = await Promise.all([
-      apiFetch('/api/backtest/summary'),
-      apiFetch('/api/backtest/report?' + params.toString()),
-      apiFetch('/api/backtest/trade-pairs'),
-    ]);
-    _renderSummaryBar(summary);
-    if (report.empty) {
-      _renderEmpty();
+    const params = new URLSearchParams({ code, freq, signal_group: signalGroup });
+    const data = await apiFetch('/api/backtest/run?' + params.toString());
+
+    if (data.error) {
+      status.textContent = data.error;
+      status.className = 'bt-status error';
       return;
     }
-    _renderKPIs(report.kpi);
-    _renderByType(report.by_type, report.sqs);
-    _renderDecayCurve(report.decay);
-    _renderCalibration(report.calibration);
-    _renderGroupTable('bt-by-freq', report.by_freq, '频率');
-    _renderGroupTable('bt-by-direction', report.by_direction, '环境');
-    _renderGroupTable('bt-by-resonance', report.by_resonance, '类型');
-    _renderMfeMae(report.mfe_mae);
-    _renderWeightRec(report.weight_rec, report.sqs);
-    _renderTradeSummary(tradePairs.summary);
-    _renderTradeList(tradePairs.pairs);
-    _renderEquityCurve(tradePairs.pairs);
+
+    status.textContent = `${data.symbol} ${data.freq} — ${data.signals.length} 信号`;
+    status.className = 'bt-status';
+
+    _createBtChart(data);
+    _renderKPI(data.kpi);
+    _renderSignalTable(data.signals);
+    _renderDatePresets(data.date_presets);
+
   } catch (e) {
-    console.error('Backtest load error:', e);
-    _renderEmpty('加载失败: ' + e.message);
+    console.error('Backtest error:', e);
+    status.textContent = '失败: ' + e.message;
+    status.className = 'bt-status error';
+  } finally {
+    runBtn.disabled = false;
   }
 }
 
-// ── Summary Bar ───────────────────────────────────
-function _renderSummaryBar(s) {
-  const el = document.getElementById('bt-summary-bar');
-  if (s.error) {
-    el.innerHTML = `<span class="bt-summary-error">数据库错误: ${s.error}</span>`;
+// ── 图表创建 ─────────────────────────────────────────
+function _createBtChart(data) {
+  const container = document.getElementById('bt-chart-container');
+  const c = chartColors();
+
+  // 销毁旧图表
+  if (_btChart) {
+    _btChart.remove();
+    _btChart = null;
+  }
+  container.innerHTML = '';
+  _btBiSeries = null;
+  _btMaSeries = [];
+
+  _btChart = LightweightCharts.createChart(container, {
+    width: container.clientWidth,
+    height: container.clientHeight || 520,
+    layout: {
+      background: { type: 'solid', color: c.bg },
+      textColor: c.text,
+    },
+    grid: {
+      vertLines: { color: c.grid },
+      horzLines: { color: c.grid },
+    },
+    crosshair: {
+      vertLine: { color: c.crosshair, width: 1, style: 2 },
+      horzLine: { color: c.crosshair, width: 1, style: 2 },
+    },
+    timeScale: {
+      borderColor: c.grid,
+      timeVisible: false,
+    },
+    rightPriceScale: { borderColor: c.grid },
+  });
+
+  // K线
+  _btCandleSeries = _btChart.addCandlestickSeries({
+    upColor: c.upColor, downColor: c.downColor,
+    borderUpColor: c.upColor, borderDownColor: c.downColor,
+    wickUpColor: c.upColor, wickDownColor: c.downColor,
+    priceScaleId: 'right',
+  });
+
+  // 成交量
+  _btVolumeSeries = _btChart.addHistogramSeries({
+    priceFormat: { type: 'volume' },
+    priceScaleId: 'volume',
+  });
+  _btChart.priceScale('volume').applyOptions({
+    scaleMargins: { top: 0.72, bottom: 0.18 },
+  });
+
+  // 设置数据
+  if (data.ohlcv && data.ohlcv.length > 0) {
+    _btCandleSeries.setData(data.ohlcv);
+    _btVolumeSeries.setData(data.ohlcv.map(bar => ({
+      time: bar.time,
+      value: bar.volume,
+      color: bar.close >= bar.open ? c.volUp : c.volDown,
+    })));
+  }
+
+  // MA 均线
+  _drawBtMALines(data.ma_lines);
+
+  // 缠论笔线 + 中枢
+  if (data.bi_list && data.bi_list.length > 0) {
+    _drawBtBiLines(data.bi_list);
+  }
+  if (data.zhongshu && data.zhongshu.length > 0) {
+    _drawBtZhongshu(data.zhongshu);
+  }
+
+  // MACD 子图
+  _drawBtMACD(data.macd);
+
+  // 信号标记
+  _drawBtSignalMarkers(data.signals);
+
+  // 响应式
+  const ro = new ResizeObserver(() => {
+    if (_btChart) _btChart.applyOptions({ width: container.clientWidth });
+  });
+  ro.observe(container);
+
+  _btChart.timeScale().fitContent();
+}
+
+// ── MA 均线 ──────────────────────────────────────────
+function _drawBtMALines(maLines) {
+  if (!maLines || maLines.length === 0) return;
+
+  maLines.forEach(ma => {
+    if (!ma.data || ma.data.length < 2) return;
+    const series = _btChart.addLineSeries({
+      color: ma.color,
+      lineWidth: 1,
+      lineStyle: 0,
+      crosshairMarkerVisible: false,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      priceScaleId: '',
+    });
+    series.setData(ma.data);
+    _btMaSeries.push(series);
+  });
+}
+
+// ── 笔线 ────────────────────────────────────────────
+function _drawBtBiLines(biList) {
+  if (!biList || biList.length === 0) return;
+  const c = chartColors();
+
+  const points = [];
+  biList.forEach(bi => {
+    if (bi.direction === 'up') {
+      points.push({ time: bi.sdt, value: bi.low });
+      points.push({ time: bi.edt, value: bi.high });
+    } else {
+      points.push({ time: bi.sdt, value: bi.high });
+      points.push({ time: bi.edt, value: bi.low });
+    }
+  });
+
+  // 去重 + 排序 + 合并
+  const seen = new Set();
+  const unique = [];
+  points.forEach(p => {
+    const key = p.time + '_' + p.value;
+    if (!seen.has(key)) { seen.add(key); unique.push(p); }
+  });
+  unique.sort((a, b) => a.time - b.time);
+
+  const merged = [];
+  unique.forEach(p => {
+    if (merged.length > 0 && merged[merged.length - 1].time === p.time) {
+      merged[merged.length - 1] = p;
+    } else {
+      merged.push(p);
+    }
+  });
+
+  if (merged.length < 2) return;
+
+  _btBiSeries = _btChart.addLineSeries({
+    color: c.biUp,
+    lineWidth: 2,
+    lineStyle: 0,
+    crosshairMarkerVisible: false,
+    priceLineVisible: false,
+    lastValueVisible: false,
+  });
+  _btBiSeries.setData(merged);
+}
+
+// ── 中枢 ────────────────────────────────────────────
+function _drawBtZhongshu(zhongshuList) {
+  if (!zhongshuList || zhongshuList.length === 0) return;
+  const c = chartColors();
+
+  zhongshuList.forEach(zs => {
+    // 上沿
+    const upper = _btChart.addLineSeries({
+      color: c.zhongshuStroke, lineWidth: 2, lineStyle: 0,
+      crosshairMarkerVisible: false, priceLineVisible: false, lastValueVisible: false,
+    });
+    upper.setData([
+      { time: zs.start_dt, value: zs.zg },
+      { time: zs.end_dt, value: zs.zg },
+    ]);
+
+    // 下沿
+    const lower = _btChart.addLineSeries({
+      color: c.zhongshuStroke, lineWidth: 2, lineStyle: 0,
+      crosshairMarkerVisible: false, priceLineVisible: false, lastValueVisible: false,
+    });
+    lower.setData([
+      { time: zs.start_dt, value: zs.zd },
+      { time: zs.end_dt, value: zs.zd },
+    ]);
+
+    // 左竖线
+    const left = _btChart.addLineSeries({
+      color: c.zhongshuStroke, lineWidth: 2, lineStyle: 0,
+      crosshairMarkerVisible: false, priceLineVisible: false, lastValueVisible: false,
+    });
+    left.setData([
+      { time: zs.start_dt, value: zs.zd },
+      { time: zs.start_dt, value: zs.zg },
+    ]);
+
+    // 右竖线
+    const right = _btChart.addLineSeries({
+      color: c.zhongshuStroke, lineWidth: 2, lineStyle: 0,
+      crosshairMarkerVisible: false, priceLineVisible: false, lastValueVisible: false,
+    });
+    right.setData([
+      { time: zs.end_dt, value: zs.zd },
+      { time: zs.end_dt, value: zs.zg },
+    ]);
+
+    // 中枢标记
+    upper.setMarkers([{
+      time: Math.floor((zs.start_dt + zs.end_dt) / 2),
+      position: 'aboveBar',
+      color: c.zhongshuStroke,
+      shape: 'square',
+      text: 'ZS ' + zs.bi_count + 'B',
+    }]);
+  });
+}
+
+// ── MACD 子图 ────────────────────────────────────────
+function _drawBtMACD(macdData) {
+  if (!macdData || macdData.length < 2) return;
+  const c = chartColors();
+
+  // MACD 柱
+  _btMacdBarSeries = _btChart.addHistogramSeries({
+    priceScaleId: 'macd',
+    priceFormat: { type: 'price', precision: 4, minMove: 0.0001 },
+    lastValueVisible: false,
+  });
+  _btChart.priceScale('macd').applyOptions({
+    scaleMargins: { top: 0.85, bottom: 0 },
+  });
+  _btMacdBarSeries.setData(macdData.map(d => ({
+    time: d.time,
+    value: d.bar,
+    color: d.bar >= 0 ? c.macdBarUp : c.macdBarDown,
+  })));
+
+  // DIF
+  _btMacdDifSeries = _btChart.addLineSeries({
+    color: c.macdDif, lineWidth: 1, lineStyle: 0,
+    priceScaleId: 'macd',
+    crosshairMarkerVisible: false, priceLineVisible: false,
+    lastValueVisible: false, title: 'DIF',
+  });
+  _btMacdDifSeries.setData(macdData.map(d => ({ time: d.time, value: d.dif })));
+
+  // DEA
+  _btMacdDeaSeries = _btChart.addLineSeries({
+    color: c.macdDea, lineWidth: 1, lineStyle: 0,
+    priceScaleId: 'macd',
+    crosshairMarkerVisible: false, priceLineVisible: false,
+    lastValueVisible: false, title: 'DEA',
+  });
+  _btMacdDeaSeries.setData(macdData.map(d => ({ time: d.time, value: d.dea })));
+}
+
+// ── 信号箭头标记 ────────────────────────────────────
+function _drawBtSignalMarkers(signals) {
+  if (!_btCandleSeries || !signals || signals.length === 0) return;
+
+  const c = chartColors();
+  const markers = signals.map(s => {
+    let color, shape, position;
+
+    if (s.group === 'macd') {
+      // MACD A(零上回踩) → 绿色, B(零下企稳) → 橙色
+      const isA = s.type.includes('A_') || s.type.includes('零上');
+      color = isA ? '#26a69a' : '#f7931a';
+      shape = 'arrowUp';
+      position = 'belowBar';
+    } else {
+      // 缠论信号
+      const isBuy = s.type.includes('买') || s.type.includes('背驰');
+      const isSell = s.type.includes('卖');
+      if (isSell && !isBuy) {
+        color = c.signalSell;
+        shape = 'arrowDown';
+        position = 'aboveBar';
+      } else {
+        color = c.signalBuy;
+        shape = 'arrowUp';
+        position = 'belowBar';
+      }
+    }
+
+    return {
+      time: s.dt,
+      position: position,
+      color: color,
+      shape: shape,
+      text: s.type,
+    };
+  });
+
+  markers.sort((a, b) => a.time - b.time);
+  _btCandleSeries.setMarkers(markers);
+}
+
+// ── KPI 卡片 ────────────────────────────────────────
+function _renderKPI(kpi) {
+  const el = document.getElementById('bt-kpis');
+  if (!kpi || kpi.total === 0) {
+    el.innerHTML = '<div class="empty-state">无信号数据</div>';
     return;
   }
-  el.innerHTML = `
-    <span>信号数据库: 总计 <b>${s.total}</b> 条</span>
-    <span class="bt-sep">|</span>
-    <span>已评估 <b>${s.evaluated}</b></span>
-    <span class="bt-sep">|</span>
-    <span>待评估 <b>${s.pending}</b></span>
-  `;
-}
 
-// ── Empty State ───────────────────────────────────
-function _renderEmpty(msg) {
-  const kpi = document.getElementById('bt-kpis');
-  kpi.innerHTML = `<div class="empty-state">${msg || '暂无已评估信号数据。请先运行盘中监测或盘后复盘积累信号，等待20天后再来查看。'}</div>`;
-  ['bt-by-type', 'bt-decay-chart', 'bt-calibration', 'bt-by-freq', 'bt-by-direction',
-    'bt-by-resonance', 'bt-mfe-mae', 'bt-weight-rec', 'bt-trade-summary', 'bt-trade-list', 'bt-equity-chart']
-    .forEach(id => { document.getElementById(id).innerHTML = ''; });
-}
-
-// ── KPI Cards ─────────────────────────────────────
-function _renderKPIs(kpi) {
-  const el = document.getElementById('bt-kpis');
   const items = [
-    { value: kpi.total, label: '评估样本', cls: '' },
-    { value: kpi.win_rate + '%', label: '总胜率', cls: kpi.win_rate >= 50 ? 'up' : 'down' },
-    { value: kpi.profit_factor, label: '盈亏比(PF)', cls: kpi.profit_factor >= 1.5 ? 'up' : kpi.profit_factor < 1 ? 'down' : '' },
+    { value: kpi.total, label: '总信号', cls: '' },
+    { value: (kpi.evaluated || kpi.total) + '/' + kpi.total, label: '已评估', cls: '' },
+    { value: kpi.win_rate + '%', label: '胜率(T+10)', cls: kpi.win_rate >= 50 ? 'up' : 'down' },
     { value: (kpi.expectancy >= 0 ? '+' : '') + kpi.expectancy + '%', label: '期望收益', cls: kpi.expectancy >= 0 ? 'up' : 'down' },
+    { value: kpi.avg_return_t10 + '%', label: '平均T+10', cls: kpi.avg_return_t10 >= 0 ? 'up' : 'down' },
+    { value: '+' + (kpi.avg_mfe || 0) + '%', label: 'MFE均', cls: 'up' },
+    { value: (kpi.avg_mae || 0) + '%', label: 'MAE均', cls: 'down' },
   ];
+
   el.innerHTML = items.map(it => `
     <div class="bt-kpi-card">
       <div class="bt-kpi-value ${it.cls}">${it.value}</div>
       <div class="bt-kpi-label">${it.label}</div>
     </div>
   `).join('');
-}
 
-// ── Signal Type Table (with SQS) ──────────────────
-function _renderByType(byType, sqs) {
-  const container = document.getElementById('bt-by-type');
-  const entries = Object.entries(byType).sort((a, b) => (sqs[b[0]] || 0) - (sqs[a[0]] || 0));
-  if (!entries.length) { container.innerHTML = '<div class="empty-state">无数据</div>'; return; }
-
-  let html = `<table class="bt-stats-table">
-    <thead><tr>
-      <th>信号</th><th>样本</th><th>胜率</th><th>PF</th><th>期望值</th>
-      <th>MFE均</th><th>MAE均</th><th>MFE/MAE</th><th>SQS</th>
-    </tr></thead><tbody>`;
-  for (const [sigType, s] of entries) {
-    const score = sqs[sigType] || 0;
-    const sqsCls = score >= 70 ? 'sqs-high' : score >= 50 ? 'sqs-mid' : 'sqs-low';
-    html += `<tr>
-      <td><b>${sigType}</b></td>
-      <td>${s.count}</td>
-      <td class="${s.win_rate >= 50 ? 'up' : 'down'}">${s.win_rate}%</td>
-      <td>${s.profit_factor}</td>
-      <td class="${s.expectancy >= 0 ? 'up' : 'down'}">${s.expectancy >= 0 ? '+' : ''}${s.expectancy}%</td>
-      <td class="up">${s.avg_mfe >= 0 ? '+' : ''}${s.avg_mfe}</td>
-      <td class="down">${s.avg_mae}</td>
-      <td>${s.mfe_mae_ratio}</td>
-      <td><span class="bt-sqs-badge ${sqsCls}">${score}</span></td>
-    </tr>`;
-  }
-  html += '</tbody></table>';
-  container.innerHTML = html;
-}
-
-// ── Generic GroupStats Table ──────────────────────
-function _renderGroupTable(containerId, data, label) {
-  const container = document.getElementById(containerId);
-  const entries = Object.entries(data);
-  if (!entries.length) { container.innerHTML = '<div class="empty-state">无数据</div>'; return; }
-
-  let html = `<table class="bt-stats-table">
-    <thead><tr>
-      <th>${label}</th><th>样本</th><th>胜率</th><th>PF</th><th>期望值</th><th>MFE/MAE</th>
-    </tr></thead><tbody>`;
-  for (const [key, s] of entries) {
-    html += `<tr>
-      <td><b>${key}</b></td>
-      <td>${s.count}</td>
-      <td class="${s.win_rate >= 50 ? 'up' : 'down'}">${s.win_rate}%</td>
-      <td>${s.profit_factor}</td>
-      <td class="${s.expectancy >= 0 ? 'up' : 'down'}">${s.expectancy >= 0 ? '+' : ''}${s.expectancy}%</td>
-      <td>${s.mfe_mae_ratio}</td>
-    </tr>`;
-  }
-  html += '</tbody></table>';
-  container.innerHTML = html;
-}
-
-// ── Signal Decay Curve (Canvas) ───────────────────
-function _renderDecayCurve(decay) {
-  const container = document.getElementById('bt-decay-chart');
-  if (!decay || (!decay['买'] && !decay['卖'])) {
-    container.innerHTML = '<div class="empty-state">无衰减数据</div>';
-    return;
-  }
-  container.innerHTML = '<canvas id="bt-decay-canvas"></canvas>';
-  const canvas = document.getElementById('bt-decay-canvas');
-  canvas.width = container.clientWidth;
-  canvas.height = container.clientHeight;
-  const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height;
-  const pad = { top: 30, right: 30, bottom: 40, left: 60 };
-
-  const windows = [5, 10, 20];
-  const buyData = windows.map(w => (decay['买'] || {})[w] || 0);
-  const sellData = windows.map(w => (decay['卖'] || {})[w] || 0);
-  const allVals = [...buyData, ...sellData];
-  const yMin = Math.min(0, ...allVals) - 0.5;
-  const yMax = Math.max(0, ...allVals) + 0.5;
-
-  const xScale = i => pad.left + i * (W - pad.left - pad.right) / (windows.length - 1);
-  const yScale = v => pad.top + (1 - (v - yMin) / (yMax - yMin)) * (H - pad.top - pad.bottom);
-
-  // Background
-  ctx.fillStyle = cssVar('--bg-secondary') || '#1e222d';
-  ctx.fillRect(0, 0, W, H);
-
-  // Grid
-  ctx.strokeStyle = cssVar('--border') || '#2a2e39';
-  ctx.lineWidth = 1;
-  const yZero = yScale(0);
-  ctx.beginPath(); ctx.moveTo(pad.left, yZero); ctx.lineTo(W - pad.right, yZero); ctx.stroke();
-
-  // Axes labels
-  ctx.fillStyle = cssVar('--text-secondary') || '#787b86';
-  ctx.font = '12px sans-serif';
-  ctx.textAlign = 'center';
-  windows.forEach((w, i) => ctx.fillText('T+' + w, xScale(i), H - pad.bottom + 20));
-  ctx.textAlign = 'right';
-  [yMin, 0, yMax].forEach(v => ctx.fillText(v.toFixed(1) + '%', pad.left - 8, yScale(v) + 4));
-
-  function drawLine(data, color) {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2.5;
-    ctx.beginPath();
-    data.forEach((v, i) => {
-      const x = xScale(i), y = yScale(v);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    });
-    ctx.stroke();
-    // dots
-    data.forEach((v, i) => {
-      ctx.beginPath();
-      ctx.arc(xScale(i), yScale(v), 4, 0, Math.PI * 2);
-      ctx.fillStyle = color;
-      ctx.fill();
-    });
-  }
-
-  const colorUp = cssVar('--color-up') || '#26a69a';
-  const colorDown = cssVar('--color-down') || '#ef5350';
-  drawLine(buyData, colorUp);
-  drawLine(sellData, colorDown);
-
-  // Legend
-  ctx.font = '12px sans-serif';
-  ctx.fillStyle = colorUp;
-  ctx.fillText('\u25CF 买信号', pad.left + 20, pad.top - 10);
-  ctx.fillStyle = colorDown;
-  ctx.fillText('\u25CF 卖信号', pad.left + 100, pad.top - 10);
-}
-
-// ── Confidence Calibration (Canvas) ───────────────
-function _renderCalibration(calibration) {
-  const container = document.getElementById('bt-calibration');
-  if (!calibration || !calibration.length) {
-    container.innerHTML = '<div class="empty-state">无校准数据</div>';
-    return;
-  }
-  container.innerHTML = '<canvas id="bt-cal-canvas"></canvas>';
-  const canvas = document.getElementById('bt-cal-canvas');
-  canvas.width = container.clientWidth;
-  canvas.height = container.clientHeight;
-  const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height;
-  const pad = { top: 30, right: 20, bottom: 50, left: 50 };
-
-  const n = calibration.length;
-  const barW = Math.min(40, (W - pad.left - pad.right) / (n * 3));
-  const maxVal = Math.max(100, ...calibration.map(c => Math.max(c.avg_confidence, c.actual_win_rate)));
-  const yScale = v => pad.top + (1 - v / maxVal) * (H - pad.top - pad.bottom);
-  const groupW = barW * 2 + 8;
-  const groupStart = i => pad.left + (W - pad.left - pad.right) / 2 - (n * groupW) / 2 + i * groupW;
-
-  // Background
-  ctx.fillStyle = cssVar('--bg-secondary') || '#1e222d';
-  ctx.fillRect(0, 0, W, H);
-
-  const colorPred = cssVar('--text-muted') || '#787b86';
-  const colorActual = cssVar('--color-up') || '#26a69a';
-
-  calibration.forEach((c, i) => {
-    const x = groupStart(i);
-    // Predicted bar
-    ctx.fillStyle = colorPred;
-    const h1 = H - pad.bottom - yScale(c.avg_confidence);
-    ctx.fillRect(x, yScale(c.avg_confidence), barW, h1);
-    // Actual bar
-    ctx.fillStyle = colorActual;
-    const h2 = H - pad.bottom - yScale(c.actual_win_rate);
-    ctx.fillRect(x + barW + 4, yScale(c.actual_win_rate), barW, h2);
-    // Label
-    ctx.fillStyle = cssVar('--text-secondary') || '#787b86';
-    ctx.font = '11px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(c.bucket, x + groupW / 2, H - pad.bottom + 16);
-    // Values on top
-    ctx.fillStyle = colorPred;
-    ctx.fillText(c.avg_confidence.toFixed(0), x + barW / 2, yScale(c.avg_confidence) - 4);
-    ctx.fillStyle = colorActual;
-    ctx.fillText(c.actual_win_rate.toFixed(0), x + barW + 4 + barW / 2, yScale(c.actual_win_rate) - 4);
-  });
-
-  // Legend
-  ctx.font = '12px sans-serif';
-  ctx.textAlign = 'left';
-  ctx.fillStyle = colorPred;
-  ctx.fillText('\u25A0 预测置信度', pad.left, pad.top - 10);
-  ctx.fillStyle = colorActual;
-  ctx.fillText('\u25A0 实际胜率', pad.left + 100, pad.top - 10);
-}
-
-// ── MFE/MAE ───────────────────────────────────────
-function _renderMfeMae(data) {
-  const container = document.getElementById('bt-mfe-mae');
-  const entries = Object.entries(data);
-  if (!entries.length) { container.innerHTML = '<div class="empty-state">无数据</div>'; return; }
-
-  let html = `<table class="bt-stats-table">
-    <thead><tr><th>信号</th><th>样本</th><th>MFE均</th><th>MAE均</th><th>MFE/MAE</th></tr></thead><tbody>`;
-  for (const [sigType, s] of entries) {
-    html += `<tr>
-      <td><b>${sigType}</b></td><td>${s.count}</td>
-      <td class="up">${s.avg_mfe >= 0 ? '+' : ''}${s.avg_mfe}</td>
-      <td class="down">${s.avg_mae}</td>
-      <td>${s.mfe_mae_ratio}</td>
-    </tr>`;
-  }
-  html += '</tbody></table>';
-  container.innerHTML = html;
-}
-
-// ── Weight Recommendation ─────────────────────────
-function _renderWeightRec(rec, sqs) {
-  const container = document.getElementById('bt-weight-rec');
-  const entries = Object.entries(rec);
-  if (!entries.length) { container.innerHTML = '<div class="empty-state">无权重建议</div>'; return; }
-
-  entries.sort((a, b) => (sqs[b[0]] || 0) - (sqs[a[0]] || 0));
-
-  let html = `<table class="bt-stats-table">
-    <thead><tr><th>信号</th><th>当前</th><th>建议</th><th>说明</th></tr></thead><tbody>`;
-  for (const [sigType, r] of entries) {
-    const diff = r.suggested - r.current;
-    const cls = diff > 0 ? 'up' : diff < 0 ? 'down' : '';
-    html += `<tr>
-      <td><b>${sigType}</b></td>
-      <td>${r.current}</td>
-      <td class="${cls}"><b>${r.suggested}</b></td>
-      <td>${r.note}</td>
-    </tr>`;
-  }
-  html += '</tbody></table>';
-  container.innerHTML = html;
-}
-
-// ── Trade Summary ─────────────────────────────────
-function _renderTradeSummary(summary) {
-  const container = document.getElementById('bt-trade-summary');
-  if (!summary || !summary.pair_count) {
-    container.innerHTML = '<div class="empty-state">无买卖配对数据</div>';
-    return;
-  }
-  const s = summary;
-  const best = s.best_pair || {};
-  const worst = s.worst_pair || {};
-  container.innerHTML = `
-    <div class="bt-trade-summary-card">
-      <div class="bt-trade-stat"><b>${s.pair_count}</b> 组配对</div>
-      <div class="bt-trade-stat">平均持仓 <b>${s.avg_holding_days}天</b></div>
-      <div class="bt-trade-stat">平均收益 <b class="${s.avg_return_pct >= 0 ? 'up' : 'down'}">${s.avg_return_pct >= 0 ? '+' : ''}${s.avg_return_pct}%</b></div>
-      <div class="bt-trade-stat">连盈 <b>${s.max_consecutive_wins}</b> | 连亏 <b>${s.max_consecutive_losses}</b></div>
-      ${best.symbol ? `<div class="bt-trade-stat best">最佳: ${best.symbol} ${best.buy_signal_type || ''}→${best.sell_signal_type || ''} <b class="up">${best.return_pct >= 0 ? '+' : ''}${best.return_pct}%</b> (${best.holding_days}日)</div>` : ''}
-      ${worst.symbol ? `<div class="bt-trade-stat worst">最差: ${worst.symbol} <b class="down">${worst.return_pct}%</b></div>` : ''}
-    </div>
-  `;
-}
-
-// ── Trade List ────────────────────────────────────
-function _renderTradeList(pairs) {
-  const container = document.getElementById('bt-trade-list');
-  if (!pairs || !pairs.length) { container.innerHTML = '<div class="empty-state">无配对</div>'; return; }
-
-  let html = `<div class="bt-trade-list-wrapper"><table class="bt-stats-table">
-    <thead><tr><th>代码</th><th>买入日</th><th>卖出日</th><th>买型</th><th>卖型</th><th>持仓</th><th>收益%</th></tr></thead><tbody>`;
-  for (const p of pairs) {
-    const cls = p.return_pct > 0 ? 'bt-trade-win' : p.return_pct < 0 ? 'bt-trade-loss' : '';
-    html += `<tr class="${cls}">
-      <td>${p.symbol}</td>
-      <td>${(p.buy_date || '').slice(5)}</td>
-      <td>${(p.sell_date || '').slice(5)}</td>
-      <td>${p.buy_signal_type || ''}</td>
-      <td>${p.sell_signal_type || ''}</td>
-      <td>${p.holding_days}天</td>
-      <td class="${p.return_pct >= 0 ? 'up' : 'down'}"><b>${p.return_pct >= 0 ? '+' : ''}${p.return_pct}%</b></td>
-    </tr>`;
-  }
-  html += '</tbody></table></div>';
-  container.innerHTML = html;
-}
-
-// ── Equity Curve (Lightweight Charts) ─────────────
-let _equityChart = null;
-
-function _renderEquityCurve(pairs) {
-  const container = document.getElementById('bt-equity-chart');
-  if (!pairs || !pairs.length) {
-    container.innerHTML = '<div class="empty-state">无配对数据</div>';
-    return;
-  }
-  container.innerHTML = '';
-
-  // Sort by sell_date, compute cumulative return
-  const sorted = [...pairs].filter(p => p.sell_date).sort((a, b) => a.sell_date.localeCompare(b.sell_date));
-  let cum = 0;
-  const data = sorted.map(p => {
-    cum += p.return_pct;
-    const [y, m, d] = p.sell_date.split('-').map(Number);
-    return { time: `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`, value: Math.round(cum * 100) / 100 };
-  });
-
-  if (!data.length) return;
-
-  // Dedup same dates (keep last)
-  const deduped = [];
-  for (const d of data) {
-    if (deduped.length && deduped[deduped.length - 1].time === d.time) {
-      deduped[deduped.length - 1].value = d.value;
-    } else {
-      deduped.push(d);
+  // 按类型分组 KPI
+  if (kpi.by_type && Object.keys(kpi.by_type).length > 0) {
+    let html = '<table class="bt-stats-table"><thead><tr><th>信号类型</th><th>数量</th><th>胜率</th><th>平均T+10</th></tr></thead><tbody>';
+    for (const [sigType, info] of Object.entries(kpi.by_type)) {
+      html += `<tr>
+        <td><b>${sigType}</b></td>
+        <td>${info.count}</td>
+        <td class="${info.win_rate >= 50 ? 'up' : 'down'}">${info.win_rate}%</td>
+        <td class="${info.avg_return_t10 >= 0 ? 'up' : 'down'}">${info.avg_return_t10 >= 0 ? '+' : ''}${info.avg_return_t10}%</td>
+      </tr>`;
     }
+    html += '</tbody></table>';
+    el.innerHTML += html;
   }
+}
 
-  if (typeof LightweightCharts === 'undefined') {
-    container.innerHTML = '<div class="empty-state">图表库未加载</div>';
+// ── 信号列表表格 ────────────────────────────────────
+function _renderSignalTable(signals) {
+  const container = document.getElementById('bt-signal-list');
+  const countEl = document.getElementById('bt-signal-count');
+
+  if (!signals || signals.length === 0) {
+    container.innerHTML = '<div class="bt-empty-msg">无信号</div>';
+    countEl.textContent = '';
     return;
   }
 
-  if (_equityChart) { _equityChart.remove(); _equityChart = null; }
+  countEl.textContent = `(${signals.length})`;
 
-  const isDark = document.documentElement.dataset.theme === 'tradingview';
-  _equityChart = LightweightCharts.createChart(container, {
-    width: container.clientWidth,
-    height: 300,
-    layout: {
-      background: { type: 'solid', color: isDark ? '#1e222d' : '#f8f6f2' },
-      textColor: isDark ? '#d1d4dc' : '#4a4a4a',
-    },
-    grid: {
-      vertLines: { color: isDark ? '#2a2e39' : '#e0ddd4' },
-      horzLines: { color: isDark ? '#2a2e39' : '#e0ddd4' },
-    },
-    rightPriceScale: { borderColor: isDark ? '#2a2e39' : '#d0cdc4' },
-    timeScale: { borderColor: isDark ? '#2a2e39' : '#d0cdc4' },
-  });
+  let html = `<table class="bt-stats-table">
+    <thead><tr>
+      <th>日期</th><th>类型</th><th>组</th><th>价格</th><th>置信度</th>
+      <th>T+5</th><th>T+10</th><th>T+20</th><th>MFE</th><th>MAE</th>
+    </tr></thead><tbody>`;
 
-  const series = _equityChart.addAreaSeries({
-    lineColor: deduped[deduped.length - 1].value >= 0 ? '#26a69a' : '#ef5350',
-    topColor: deduped[deduped.length - 1].value >= 0 ? 'rgba(38,166,154,0.3)' : 'rgba(239,83,80,0.3)',
-    bottomColor: 'rgba(0,0,0,0)',
-    lineWidth: 2,
-  });
-  series.setData(deduped);
-  _equityChart.timeScale().fitContent();
+  for (const s of signals) {
+    const ev = s.eval || {};
+    const t10 = ev.return_t10;
+    const isWin = t10 != null && t10 > 0;
+    const isLoss = t10 != null && t10 < 0;
+    const rowCls = isWin ? 'bt-signal-win' : isLoss ? 'bt-signal-loss' : '';
+    const groupBadge = s.group === 'macd'
+      ? '<span class="bt-pattern-badge macd">MACD</span>'
+      : '<span class="bt-pattern-badge czsc">缠论</span>';
+
+    html += `<tr class="bt-signal-row ${rowCls}" data-time="${s.dt}" onclick="_btScrollTo(${s.dt})">
+      <td>${s.date_str}</td>
+      <td><b>${s.type}</b></td>
+      <td>${groupBadge}</td>
+      <td>${s.price.toFixed(2)}</td>
+      <td>${s.confidence != null ? (s.confidence * 100).toFixed(0) + '%' : '—'}</td>
+      <td class="${_retCls(ev.return_t5)}">${_fmtRet(ev.return_t5)}</td>
+      <td class="${_retCls(ev.return_t10)}">${_fmtRet(ev.return_t10)}</td>
+      <td class="${_retCls(ev.return_t20)}">${_fmtRet(ev.return_t20)}</td>
+      <td class="up">${ev.mfe != null ? '+' + ev.mfe + '%' : '—'}</td>
+      <td class="down">${ev.mae != null ? ev.mae + '%' : '—'}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  container.innerHTML = html;
 }
+
+function _fmtRet(val) {
+  if (val == null) return '—';
+  return (val >= 0 ? '+' : '') + val + '%';
+}
+
+function _retCls(val) {
+  if (val == null) return '';
+  return val >= 0 ? 'up' : 'down';
+}
+
+// ── 点击信号跳转 ────────────────────────────────────
+window._btScrollTo = function (unixTime) {
+  if (!_btChart) return;
+  _btChart.timeScale().scrollToPosition(-5, false);
+
+  // 使用 setVisibleRange 定位到信号附近
+  const from = unixTime - 60 * 86400;  // 前60天
+  const to = unixTime + 30 * 86400;    // 后30天
+  _btChart.timeScale().setVisibleRange({ from, to });
+};
+
+// ── 日期预设 chips ──────────────────────────────────
+function _renderDatePresets(presets) {
+  const container = document.getElementById('bt-preset-chips');
+  if (!presets || presets.length === 0) {
+    container.innerHTML = '';
+    return;
+  }
+
+  container.innerHTML = presets.map(p =>
+    `<span class="bt-preset-chip" onclick="_btScrollTo(${p.time})" title="${p.date}">${p.label}</span>`
+  ).join('');
+}
+
+// ── 主题切换重建 ────────────────────────────────────
+window.btChartInstance = {
+  applyTheme: () => {
+    // 主题切换时不自动重建，用户点回测按钮即可
+  }
+};

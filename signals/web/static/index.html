@@ -213,64 +213,30 @@
       </div>
     </div>
 
-    <!-- Page 6: Backtest (回测) -->
+    <!-- Page 6: Backtest (信号回测) -->
     <div id="page-backtest" class="page">
       <div class="bt-header">
-        <div class="bt-filters">
-          <select id="bt-signal-type" class="bt-select">
-            <option value="">全部信号类型</option>
-            <option value="一买">一买</option>
-            <option value="二买">二买</option>
-            <option value="三买">三买</option>
-            <option value="背驰买">背驰买</option>
-            <option value="趋势买">趋势买</option>
-            <option value="一卖">一卖</option>
-            <option value="二卖">二卖</option>
-            <option value="三卖">三卖</option>
-            <option value="背驰卖">背驰卖</option>
+        <div class="bt-input-row">
+          <input type="text" id="bt-code-input" class="bt-code-input"
+                 placeholder="股票代码 (002759 / 09988)" />
+          <select id="bt-freq-select" class="bt-select">
+            <option value="daily">日线</option>
+            <option value="weekly">周线</option>
           </select>
-          <select id="bt-freq" class="bt-select">
-            <option value="">全部级别</option>
-            <option value="15分钟">15分钟</option>
-            <option value="30分钟">30分钟</option>
-            <option value="日线">日线</option>
-            <option value="周线">周线</option>
+          <select id="bt-signal-group" class="bt-select">
+            <option value="all">全部信号</option>
+            <option value="macd">MACD 信号</option>
+            <option value="czsc">缠论信号</option>
           </select>
-          <button class="stock-search-btn" id="bt-refresh-btn">刷新</button>
-          <button class="stock-search-btn bt-eval-btn" id="bt-eval-btn">评估到期信号</button>
+          <button class="stock-search-btn" id="bt-run-btn">回测</button>
+          <span id="bt-status" class="bt-status"></span>
         </div>
+        <div class="bt-preset-chips" id="bt-preset-chips"></div>
       </div>
-      <div id="bt-summary-bar" class="bt-summary-bar"></div>
       <div id="bt-kpis" class="bt-kpis"></div>
-      <div class="bt-view-tabs">
-        <div class="bt-view-tab active" data-view="signals">信号分析</div>
-        <div class="bt-view-tab" data-view="trades">买卖配对</div>
-      </div>
-      <div id="bt-view-signals" class="bt-view active">
-        <div class="section-title">按信号类型</div>
-        <div id="bt-by-type"></div>
-        <div class="section-title">信号衰减曲线</div>
-        <div id="bt-decay-chart" style="height:280px;"></div>
-        <div class="section-title">置信度校准</div>
-        <div id="bt-calibration" style="height:240px;"></div>
-        <div class="section-title">按频率</div>
-        <div id="bt-by-freq"></div>
-        <div class="section-title">按市场环境</div>
-        <div id="bt-by-direction"></div>
-        <div class="section-title">共振 vs 单级别</div>
-        <div id="bt-by-resonance"></div>
-        <div class="section-title">MFE/MAE 分析</div>
-        <div id="bt-mfe-mae"></div>
-        <div class="section-title">权重建议</div>
-        <div id="bt-weight-rec"></div>
-      </div>
-      <div id="bt-view-trades" class="bt-view">
-        <div id="bt-trade-summary"></div>
-        <div class="section-title">累计收益曲线</div>
-        <div id="bt-equity-chart" style="height:300px;"></div>
-        <div class="section-title">交易列表</div>
-        <div id="bt-trade-list"></div>
-      </div>
+      <div id="bt-chart-container" style="height:520px; position:relative;"></div>
+      <div class="section-title">信号列表 <span id="bt-signal-count" class="bt-signal-count"></span></div>
+      <div id="bt-signal-list" class="bt-signal-list-wrapper"></div>
     </div>
 
     <!-- Page 7: Plan (计划) -->
