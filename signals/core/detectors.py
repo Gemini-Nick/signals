@@ -36,7 +36,48 @@ def detect_all_signals(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
     signals.extend(_detect_divergence(czsc_obj, symbol))
     signals.extend(_detect_trend(czsc_obj, symbol))
     signals.extend(_detect_patterns(czsc_obj, symbol))
+    signals.extend(_detect_macd_convergence(czsc_obj, symbol))
     return signals
+
+
+def _detect_macd_convergence(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
+    """MACD 绿柱极端状态信号（从 CZSC bars_raw 提取 OHLC 数据）"""
+    try:
+        from signals.core.macd_detector import detect_macd_signals
+        import pandas as pd
+
+        bars = czsc_obj.bars_raw
+        if not bars or len(bars) < 35:
+            return []
+
+        freq_val = czsc_obj.freq.value
+        records = [{"open": b.open, "high": b.high, "low": b.low, "close": b.close}
+                   for b in bars]
+        df = pd.DataFrame(records)
+        df.index = pd.DatetimeIndex([b.dt for b in bars])
+
+        macd_sigs = detect_macd_signals(df, symbol, freq_val, lookback=10)
+
+        # 转换为 SignalEvent
+        events = []
+        for sig in macd_sigs:
+            if "A_" in sig.pattern:
+                sig_type = "MACD绿柱扩大_零上"
+            else:
+                sig_type = "MACD绿柱缩小_零下"
+
+            events.append(SignalEvent(
+                symbol=symbol,
+                freq=freq_val,
+                dt=sig.dt,
+                signal_type=sig_type,
+                confidence=sig.confidence,
+                price=sig.price,
+                details=sig.details,
+            ))
+        return events
+    except Exception:
+        return []
 
 
 # ─────────────────────────────────────────────────────────
