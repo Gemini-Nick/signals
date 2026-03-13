@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="tradingview">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>隆小侠 Web2</title>
+  <link rel="stylesheet" href="/static/css/themes.css">
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="https://unpkg.com/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <!-- ── 顶栏 ──────────────────────────────────────── -->
+  <header class="header">
+    <div class="header-left">
+      <span class="logo">🐲 隆小侠</span>
+      <nav class="tabs">
+        <button class="tab active" data-page="cluster">行业聚类</button>
+        <button class="tab" data-page="backtest">MACD 回测</button>
+      </nav>
+    </div>
+    <div class="header-right">
+      <button id="theme-toggle" class="btn-icon" title="切换主题">🎨</button>
+    </div>
+  </header>
+
+  <!-- ── 行业聚类页 ────────────────────────────────── -->
+  <div id="page-cluster" class="page active">
+    <div class="page-toolbar">
+      <h2>行业板块聚类分析</h2>
+      <div class="toolbar-actions">
+        <span id="cluster-meta" class="meta-text"></span>
+        <button id="cluster-refresh" class="btn btn-sm">刷新</button>
+      </div>
+    </div>
+    <!-- 行业板块聚类（东财数据源） -->
+    <div class="section-label">行业板块 <span class="source-badge" id="industry-source"></span></div>
+    <div id="cluster-cards" class="cluster-cards"></div>
+    <!-- 概念板块聚类（新浪/东财/THS 数据源） -->
+    <div class="section-label">概念板块 <span class="source-badge" id="concept-source"></span></div>
+    <div id="concept-cards" class="cluster-cards"></div>
+    <!-- 本周趋势 -->
+    <div class="section-title">本周趋势</div>
+    <div id="cluster-history" class="cluster-history"></div>
+  </div>
+
+  <!-- ── MACD 回测页 ──────────────────────────────── -->
+  <div id="page-backtest" class="page">
+    <div class="bt-header">
+      <div class="bt-input-row">
+        <input id="bt-code" type="text" placeholder="股票代码 (如 002759)" class="input">
+        <select id="bt-freq" class="input">
+          <option value="daily">日线</option>
+          <option value="weekly">周线</option>
+        </select>
+        <select id="bt-group" class="input">
+          <option value="all">全部信号</option>
+          <option value="macd">仅 MACD</option>
+          <option value="czsc">仅缠论</option>
+        </select>
+        <button id="bt-run" class="btn btn-primary">运行回测</button>
+      </div>
+      <div id="bt-presets" class="preset-chips"></div>
+    </div>
+    <div id="bt-kpis" class="bt-kpis"></div>
+    <div id="bt-chart-container" style="height:520px;"></div>
+    <div class="section-title">信号明细</div>
+    <div id="bt-signal-list" class="bt-signal-list-wrapper"></div>
+  </div>
+
+  <!-- ── Toast ──────────────────────────────────────── -->
+  <div id="toast" class="toast"></div>
+
+  <script src="/static/js/app.js"></script>
+  <script src="/static/js/cluster.js"></script>
+  <script src="/static/js/backtest.js"></script>
+</body>
+</html>

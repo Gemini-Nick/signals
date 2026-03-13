@@ -19,5 +19,9 @@
 30 22 * * 1-5  cd /app && python run.py --market us >> /app/logs/cron.log 2>&1
 0  0  * * 2-6  cd /app && python run.py --market us >> /app/logs/cron.log 2>&1
 
+# ── 行业聚类飞书推送 (10:00, 14:00) ──────────
+0 10 * * 1-5  cd /app && python -m signals.notify.cluster_notify >> /app/logs/cron.log 2>&1
+0 14 * * 1-5  cd /app && python -m signals.notify.cluster_notify >> /app/logs/cron.log 2>&1
+
 # ── 日志清理 (每周日凌晨) ─────────────────────
 0 3 * * 0  find /app/logs -name "*.log" -mtime +30 -delete

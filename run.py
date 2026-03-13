@@ -1377,6 +1377,14 @@ def run_web(args):
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
 
+def run_web2(args):
+    """Web2 精简版：行业聚类 + MACD 回测"""
+    import uvicorn
+    port = getattr(args, "port", None) or 8001
+    from signals.web2.app import app
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
+
 def run_sim(args):
     """
     仿真模式：全自动 — 检查仓库 → 补全数据 → 创建快照 → 执行回放。
@@ -1560,8 +1568,8 @@ def main():
     parser.add_argument(
         "--mode",
         default="intraday",
-        choices=["intraday", "review", "index", "import", "backtest", "sim", "web", "analog", "plan", "weekly"],
-        help="运行模式：intraday / review / index / import / backtest / sim / web / analog / plan / weekly"
+        choices=["intraday", "review", "index", "import", "backtest", "sim", "web", "web2", "analog", "plan", "weekly"],
+        help="运行模式：intraday / review / index / import / backtest / sim / web / web2 / analog / plan / weekly"
     )
     parser.add_argument(
         "--start",
@@ -1712,6 +1720,7 @@ def main():
         "backtest": run_backtest,
         "sim":      run_sim,
         "web":      run_web,
+        "web2":     run_web2,
         "analog":   run_analog,
         "plan":     run_plan,
         "weekly":   run_weekly,
