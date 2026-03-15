@@ -5,15 +5,17 @@
 
 ---
 
-## 五大模块
+## 六大模块
 
 | 模块 | 路径 | 功能 |
 |------|------|------|
-| **Core** | `signals/core/` | 信号检测引擎：一买/二买/三买/背驰买卖 + 评分系统 + 多级别共振 |
-| **Data** | `signals/data/` | 多数据源统一接口：A股(AKShare/Tushare) + 港股(Futu) + 美股(IB/Alpaca/Futu/yfinance 四级降级) |
-| **Layers** | `signals/layers/` | 三层联动：指数大势 → 行业强弱（双榜系统） → 个股筛选 |
+| **Core** | `signals/core/` | 信号检测引擎 + 评分系统 + 异常检测 + 信号融合 + 行业主题聚类 |
+| **Data** | `signals/data/` | 多数据源统一接口：A股(AKShare) + 港股(Futu) + 美股(Futu/yfinance) + 社交舆情 |
+| **Layers** | `signals/layers/` | 三层联动：指数大势 → 行业强弱（双榜+轮动） → 个股筛选 |
+| **Web** | `signals/web/` | 全功能 Web UI — 6 页 SPA + 9 个 API 路由（Dashboard/Chart/Stock/Review/Backtest/Analog） |
+| **Web2** | `signals/web2/` | 精简版 Web — 行业主题聚合 + MACD 回测（独立 FastAPI 应用） |
 | **Research** | `signals/research/` | 研报导入(MD/PDF/图片OCR) + 自动归档(notes/YYYY/MM/) + 时间衰减 |
-| **Notify** | `signals/notify/` | 飞书群聊推送分析结果 |
+| **Notify** | `signals/notify/` | 飞书推送（分析结果 + 行业聚类报告） |
 
 ---
 
@@ -24,54 +26,49 @@ python run.py                                      # 盘中监测（默认）
 python run.py --mode index                          # 仅指数报告（快速）
 python run.py --mode review --start 2024-09-24      # 盘后复盘（指定日期）
 python run.py --mode review --start 924             # 盘后复盘（日期预设）
-python run.py --mode review --start ytd             # 盘后复盘（今年以来）
 python run.py --mode backtest                       # 信号回测评估
-python run.py --mode backtest --signal-type 三买     # 仅评估三买信号
-python run.py --mode backtest --freq-filter daily   # 仅评估日线级别
-python run.py --list-dates                           # 查看所有日期预设
 python run.py --mode import --file 研报.pdf          # 导入研究笔记
-python run.py --mode intraday --industries 有色金属,半导体   # 指定行业
+python run.py --mode web --port 8000                # Web 全功能版
+python run.py --mode web2 --port 8001               # Web2 精简版（行业聚类+回测）
 ```
 
 ### 模式定位
 
-| 模式 | 使用频率 | 定位 | 解决的问题 |
-|------|----------|------|------------|
-| `intraday` | 盘中实时 | 监测 | 盘中信号实时推送，自动路由 A+H / 美股 |
-| `index` | 随时 | 快速 | 只看 11 只指数的缠论结构，不扫个股 |
-| `review` | 每天盘后 | 决策 | 今天有什么机会？检测信号 → 排名 → 自动存档 |
-| `backtest` | 每月/季 | 调优 | 我的信号系统准不准？评估历史信号表现 |
-| `import` | 有研报时 | 归档 | 导入 MD/PDF/图片 研究笔记 |
+| 模式 | 定位 | 解决的问题 |
+|------|------|------------|
+| `intraday` | 盘中实时 | 三层联动信号推送，自动路由 A+H / 美股 |
+| `index` | 快速 | 只看 11 只指数的缠论结构，不扫个股 |
+| `review` | 盘后决策 | 今天有什么机会？检测信号 → 排名 → 自动存档 |
+| `backtest` | 调优 | 我的信号系统准不准？评估历史信号表现 |
+| `import` | 归档 | 导入 MD/PDF/图片 研究笔记 |
+| `web` | 可视化 | 全功能 SPA：Dashboard + K线图表 + 个股分析 + 复盘 + 回测 + 历史对照 |
+| `web2` | 轻量可视化 | 行业主题聚合（15 类主题分类）+ MACD 回测验证 |
 
-### 信号闭环：review → backtest
+---
 
-`review` 和 `backtest` 构成数据驱动的信号自我进化闭环：
+## Web UI
 
-```
-                            ┌─────────────────────────────────────┐
-                            │         信号自我进化闭环               │
-                            └─────────────────────────────────────┘
+两个独立的 FastAPI 应用，可按需启动。
 
-review 每天盘后运行 ──→ 检测买卖点 ──→ 评分排名 ──→ 自动存档到 SQLite
-                                                          │
-                          ┌───────────────────────────────┘
-                          ▼
-backtest 每月运行 ──→ 读取已存档信号（≥20天前）──→ 加载前瞻K线
-                          │
-                          ▼
-          计算 T+5/10/20 收益、MFE/MAE、胜率、盈亏比
-                          │
-                          ▼
-              SQS 评分 ──→ 权重建议 ──→ 优化 SIGNAL_WEIGHTS
-                          │
-                          ▼
-              下次 review 使用优化后的权重 ──→ 信号质量提升
-```
+### Web — 全功能版 (端口 6006/8000)
 
-- **review 产生数据**：每次运行自动将检测到的信号存入 `backtest.db`
-- **backtest 消费数据**：评估信号在未来 5/10/20 个交易日的实际表现
-- **SQS (Signal Quality Score)**：综合胜率、盈亏比、MFE/MAE 的 0-100 评分
-- **权重建议**：根据 SQS 排名，建议调高/调低各信号类型的权重
+| 页面 | 功能 |
+|------|------|
+| Dashboard | 大盘方向/情绪/指数卡片/行业排行/标的信号 |
+| Chart | TradingView K线 + 缠论笔段/中枢/MA叠加 |
+| Stock | 个股深度分析（多级别结构/异常检测/完全分类/风控） |
+| Review | 盘后复盘（异步运行/进度轮询/三层结果） |
+| Backtest | 回测验证（胜率/期望/校准/MFE-MAE） |
+| Analog | 历史对照（形态相似度匹配） |
+
+### Web2 — 精简版 (端口 6008/8001)
+
+| 页面 | 功能 |
+|------|------|
+| 行业聚类 | 15 类主题分类 → 聚合评分 → Top 3 强势主题 + 本周趋势 |
+| MACD 回测 | TradingView K线 + MACD 信号检测 + 缠论笔段中枢叠加 |
+
+行业聚类采用**先分主题再聚合**算法：通过关键词词典将 ~450 个行业板块分类到 15 个主题（化工/周期资源/新能源/科技硬件/AI软件/消费/家居家电/医药生物/金融/地产基建/汽车交运/军工/电力公用/农牧/传媒文娱），盘中每 30 分钟自动刷新。
 
 ---
 
@@ -89,23 +86,122 @@ backtest 每月运行 ──→ 读取已存档信号（≥20天前）──→ 
 
 ## 数据源架构
 
-### A 股数据降级链
+### A 股
 
 | 场景 | 降级链 |
 |------|--------|
-| 日线（盘后） | AKShare → Tushare(SSL降级) |
+| 指数日线 | AKShare `stock_zh_index_daily` |
 | 分钟线（盘中） | AKShare(Sina) → Tushare(限速) → Futu |
-| 行业板块 | 东财(AKShare) → 自动重试 |
+| 行业涨幅排行 | 同花顺 THS → 东财 EM → 磁盘缓存 |
+| 行业 K 线 | 东财 EM → 同花顺 THS → 磁盘缓存(JSON) |
+| 行业成分股 | 东财 EM → pytdx → 磁盘缓存 |
+| 概念排行 | 新浪 → 东财 → 同花顺 → 磁盘缓存 |
 
-### 美股数据降级链
+### 港美股
 
 | 场景 | 降级链 |
 |------|--------|
-| 盘中 | IB Gateway → Futu → yfinance |
-| 盘后 | Alpaca → yfinance |
+| 港股 | Futu OpenD |
+| 美股盘中 | Futu → yfinance |
+| 美股盘后 | yfinance |
 
-通过 `create_us_source(mode)` 工厂函数自动组装，未安装的数据源自动跳过。
-每个源最多重试 3 次，致命错误（依赖缺失/认证失败）立即跳过。
+熔断器模式：东财/THS 连续失败自动熔断，切换数据源。磁盘缓存 24h 过期（成分股 7 天）。
+
+---
+
+## 信号闭环：review → backtest
+
+```
+review 每天盘后运行 ──→ 检测买卖点 ──→ 评分排名 ──→ 自动存档到 SQLite
+                                                         │
+                         ┌───────────────────────────────┘
+                         ▼
+backtest 每月运行 ──→ 读取已存档信号（≥20天前）──→ 加载前瞻K线
+                         │
+                         ▼
+         计算 T+5/10/20 收益、MFE/MAE、胜率、盈亏比
+                         │
+                         ▼
+             SQS 评分 ──→ 权重建议 ──→ 优化 SIGNAL_WEIGHTS
+                         │
+                         ▼
+             下次 review 使用优化后的权重 ──→ 信号质量提升
+```
+
+---
+
+## AutoDL 部署
+
+```bash
+# 拉取最新代码
+git pull origin main
+
+# 全部启动（web=6006, web2=6008）
+bash deploy/autodl/start.sh
+
+# 只启动某个服务
+bash deploy/autodl/start.sh web 6006     # 全功能版
+bash deploy/autodl/start.sh web2 6008    # 精简版
+
+# 停止
+bash deploy/autodl/stop.sh               # 全部停止
+bash deploy/autodl/stop.sh web2          # 只停 web2
+```
+
+AutoDL 开放端口：6006 (Web) / 6008 (Web2)，通过控制台「自定义服务」访问。
+
+---
+
+## 项目架构
+
+```
+🐲 隆小侠 LONG CLAW
+├── run.py                  # 总入口（七种模式调度 + 交易时段路由）
+├── config.py               # 全局配置（凭证 + 指数/白名单/行业/轮动/日期预设）
+├── signals/
+│   ├── core/               # 核心引擎
+│   │   ├── analyzer.py     #   缠论分析器（笔、段、中枢）
+│   │   ├── detectors.py    #   买卖点 / 背驰 / 形态检测
+│   │   ├── scorer.py       #   评分系统（信号+交叉确认）
+│   │   ├── backtest.py     #   信号回测引擎（存档+前瞻评估+SQS）
+│   │   ├── clustering.py   #   行业主题聚类（15类分类+聚合评分）
+│   │   ├── cluster_store.py#   聚类结果持久化（JSON+周历史）
+│   │   ├── ma_levels.py    #   MA 均线关键位（支撑/阻力/趋势）
+│   │   ├── rotation.py     #   三线轮动（科技/顺周期/消费）
+│   │   ├── risk.py         #   风控模块（缠论止损+分层仓位）
+│   │   ├── market_hours.py #   交易时段判断（A+H / 美股路由）
+│   │   └── freq_utils.py   #   多周期工具
+│   ├── layers/             # 三层联动分析
+│   │   ├── index_screener.py   # Layer 1 指数筛选调度
+│   │   ├── index_analyzer.py   # Layer 1 指数分析
+│   │   ├── market_context.py   # 市场环境上下文（情绪+轮动+配置建议）
+│   │   ├── industry.py         # Layer 2 行业分析（双榜+超跌+轮动+多源降级）
+│   │   ├── screener.py         # Layer 3 盘中标的筛选
+│   │   └── review_screener.py  # Layer 3 盘后复盘
+│   ├── data/               # 多数据源统一接口
+│   │   ├── fetcher.py      #   核心数据源 + 降级链
+│   │   ├── us_factory.py   #   美股数据源工厂
+│   │   ├── minute_cache.py #   分钟线 SQLite 缓存
+│   │   └── bar_cache.py    #   K 线缓存
+│   ├── web/                # Web 全功能版
+│   │   ├── api/            #   9 个 REST API 路由
+│   │   ├── services/       #   引擎桥接层
+│   │   └── static/         #   前端 SPA（HTML/JS/CSS）
+│   ├── web2/               # Web2 精简版
+│   │   ├── app.py          #   FastAPI + lifespan 调度器
+│   │   ├── api/            #   cluster + backtest API
+│   │   └── static/         #   前端 SPA
+│   ├── research/           # 研报子系统
+│   │   └── research.py     #   多格式导入 + 自动归档
+│   └── notify/             # 消息推送
+│       ├── feishu.py       #   飞书群聊通知
+│       └── cluster_notify.py   # 行业聚类飞书推送
+├── deploy/
+│   ├── autodl/             # AutoDL 部署（start.sh / stop.sh）
+│   └── cron/               # 定时任务
+├── scripts/                # 辅助脚本（缓存预生成等）
+└── notes/                  # 研究笔记归档（YYYY/MM/）
+```
 
 ---
 
@@ -113,14 +209,23 @@ backtest 每月运行 ──→ 读取已存档信号（≥20天前）──→ 
 
 | 组件 | 用途 |
 |------|------|
-| [czsc](https://github.com/waditu/czsc) | 缠论核心引擎（笔、段、中枢、买卖点识别） |
+| [czsc](https://github.com/waditu/czsc) | 缠论核心引擎（Rust 加速，笔/段/中枢/买卖点） |
+| [FastAPI](https://fastapi.tiangolo.com/) | Web 后端框架（异步 + lifespan 调度） |
+| [TradingView Lightweight Charts](https://tradingview.github.io/lightweight-charts/) | 前端 K 线图表（v4） |
 | [AKShare](https://github.com/akfamily/akshare) | A 股指数 / 行业 / 个股行情 |
 | [Futu OpenD](https://openapi.futunn.com/) | 港股 + 美股盘中数据 |
 | [yfinance](https://github.com/ranaroussi/yfinance) | 美股免费兜底（日线+分钟线） |
-| [Tushare](https://tushare.pro/) | A 股补充行情（SSL降级备选） |
-| [ib_async](https://github.com/ib-api-reloaded/ib_async) | IB Gateway 美股盘中优先（可选） |
-| [alpaca-py](https://github.com/alpacahq/alpaca-py) | Alpaca 美股盘后优先（可选） |
 | [python-dotenv](https://github.com/theskumar/python-dotenv) | 凭证安全管理 |
+
+---
+
+## 版本历史
+
+| Tag | 说明 |
+|-----|------|
+| `v0.3.0` | Web 双站 + 行业主题聚合 + MACD 回测 + AutoDL 部署 |
+| `v0.2.0` | 道长策略融合 + AutoResearch + Skills |
+| `v0.1.0` | 三层联动框架 + 缠论信号引擎 |
 
 ---
 
@@ -136,74 +241,12 @@ pip install -r requirements.txt
 
 # 3. 配置凭证（从模板创建 .env）
 cp .env.example .env
-# 编辑 .env，填入你的 Tushare Token、Futu OpenD 地址等
-# IB Gateway / Alpaca 为可选配置，不填则自动跳过
+# 编辑 .env，填入你的 Futu OpenD 地址等（可选，不填用 AKShare 免费源）
 
 # 4. 运行
-python run.py                          # 盘中监测
-python run.py --mode index             # 仅看指数
-python run.py --mode review --start 924   # 盘后复盘（924新政以来）
+python run.py --mode index             # 看指数大盘
+python run.py --mode web2 --port 8001  # 启动精简版 Web
 ```
-
----
-
-## 项目架构
-
-```
-🐲 隆小侠 LONG CLAW
-├── run.py                  # 总入口（五种模式调度 + 交易时段路由）
-├── config.py               # 全局配置（.env 凭证 + 指数/白名单/行业/日期预设）
-├── .env.example            # 环境变量模板
-├── requirements.txt        # Python 依赖
-├── notes/                  # 研究笔记归档（YYYY/MM/ 子目录）
-├── signals/
-│   ├── core/               # 缠论核心引擎
-│   │   ├── analyzer.py     #   分析器（笔、段、中枢）
-│   │   ├── backtest.py     #   信号回测引擎（存档+前瞻评估+SQS评分）
-│   │   ├── detectors.py    #   买卖点 / 背驰检测
-│   │   ├── freq_utils.py   #   多周期工具
-│   │   ├── market_hours.py #   交易时段判断（A+H / 美股自动路由）
-│   │   ├── risk.py         #   风控模块（缠论止损 + 仓位建议）
-│   │   └── scorer.py       #   评分系统
-│   ├── layers/             # 三层联动分析
-│   │   ├── index_screener.py   # Layer 1 指数筛选调度
-│   │   ├── index_analyzer.py   # Layer 1 指数分析
-│   │   ├── index_report.py     # Layer 1 报告输出
-│   │   ├── market_context.py   # 市场环境上下文
-│   │   ├── industry.py         # Layer 2 行业分析（双榜系统 + 7维评分）
-│   │   ├── screener.py         # Layer 3 盘中标的筛选（三级降级链）
-│   │   └── review_screener.py  # Layer 3 盘后复盘
-│   ├── data/               # 多数据源统一接口
-│   │   ├── fetcher.py      #   核心数据源 + USDataSource 降级链
-│   │   ├── ib_source.py    #   IB Gateway 美股盘中数据源（可选）
-│   │   ├── alpaca_source.py#   Alpaca 美股盘后数据源（可选）
-│   │   ├── minute_cache.py #   分钟线 SQLite 缓存（累积扩展5天窗口）
-│   │   └── us_factory.py   #   美股数据源工厂（按模式组装降级链）
-│   ├── research/           # 研报子系统
-│   │   └── research.py     #   多格式导入 + 自动归档 + 双维度展示
-│   └── notify/             # 消息推送
-│       └── feishu.py       #   飞书群聊通知
-```
-
----
-
-## 配置说明
-
-核心配置项位于 `config.py`（凭证通过 `.env` 加载）：
-
-| 配置 | 说明 | 默认值 |
-|------|------|--------|
-| `INDEX_AK_CODES` | A 股指数（AKShare 格式） | 7 个主要宽基指数 |
-| `INDEX_FUTU_CODES` | 港股指数（Futu 格式） | 恒生科技 |
-| `INDEX_US_CODES` | 美股指数 ETF（Futu 格式） | SPY / QQQ / DIA |
-| `INDEX_FREQS` | 指数分析周期 | `daily`, `30min`, `15min` |
-| `INDEX_LOOKBACK_DAYS` | 日线回溯天数 | 180（≈120 交易日） |
-| `WHITELIST` | 白名单标的 | 自定义 |
-| `WATCH_INDUSTRIES` | 关注行业板块 | 空（跳过 Layer 2） |
-| `RANK_TOP_N` | 行业双榜各取前 N 名 | 10 |
-| `DATE_PRESETS` | 盘后复盘日期预设 | 15 个（相对+历史节点） |
-| `MONITOR_FREQS` | 标的监控周期 | `15min`, `30min` |
-| `NOTES_DIR` | 研究笔记目录 | `notes` |
 
 ---
 
