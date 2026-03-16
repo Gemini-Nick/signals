@@ -41,7 +41,8 @@ def _build_symbol(code: str, market: str) -> str:
 
 
 def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
-    """通过 akshare 拉取 K 线，返回带 datetime index 的 DataFrame"""
+    """通过 akshare 拉取 K 线，返回带 datetime index 的 DataFrame（含重试）"""
+    import time
     import akshare as ak
     from signals.data.fetcher import _no_proxy
 
@@ -50,15 +51,32 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
     edt = datetime.now().strftime("%Y%m%d")
     period = "daily" if freq == "daily" else "weekly"
 
-    with _no_proxy():
-        if market == "A":
-            df = ak.stock_zh_a_hist(
-                symbol=code, period=period,
-                start_date=sdt, end_date=edt, adjust="qfq")
-        else:
-            df = ak.stock_hk_hist(
-                symbol=code, period=period,
-                start_date=sdt, end_date=edt, adjust="qfq")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            with _no_proxy():
+                if market == "A":
+                    df = ak.stock_zh_a_hist(
+                        symbol=code, period=period,
+                        start_date=sdt, end_date=edt, adjust="qfq")
+                else:
+                    df = ak.stock_hk_hist(
+                        symbol=code, period=period,
+                        start_date=sdt, end_date=edt, adjust="qfq")
+            break
+        except (ConnectionError, Exception) as e:
+            err_msg = str(e)
+            if attempt < max_retries - 1 and (
+                "RemoteDisconnected" in err_msg
+                or "ConnectionReset" in err_msg
+                or "Connection aborted" in err_msg
+            ):
+                wait = (attempt + 1) * 2
+                logger.warning("回测K线: %s %s 第%d次重试 (等待%ds): %s",
+                               code, freq, attempt + 1, wait, err_msg)
+                time.sleep(wait)
+                continue
+            raise
 
     if df is None or df.empty:
         return pd.DataFrame()
