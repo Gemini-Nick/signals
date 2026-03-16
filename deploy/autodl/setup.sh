@@ -26,7 +26,7 @@ echo ">>> 安装 Python 依赖..."
 pip install -r requirements.txt
 
 # ── 3. Futu OpenD ──────────────────────────────
-FUTU_DIR=/root/autodl-tmp/futu
+FUTU_DIR=${FUTU_DIR:-/root/futu}
 if [ ! -f "$FUTU_DIR/FutuOpenD" ]; then
     mkdir -p "$FUTU_DIR"
     echo ""

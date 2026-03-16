@@ -23,15 +23,22 @@ echo "  时区: $(date +'%Z %Y-%m-%d %H:%M:%S')"
 
 # ── 启动函数 ──────────────────────────────────────
 start_futu() {
-    FUTU_DIR=/root/autodl-tmp/futu
+    FUTU_DIR=${FUTU_DIR:-/root/futu}
     if [ -f "$FUTU_DIR/FutuOpenD" ]; then
         pkill -f FutuOpenD 2>/dev/null || true
         sleep 1
         cd "$FUTU_DIR"
+        # 优先用明文密码，兼容 MD5
+        if [ -n "$FUTU_PWD" ]; then
+            FUTU_PWD_ARG="-login_pwd=$FUTU_PWD"
+        else
+            FUTU_PWD_ARG="-login_pwd_md5=$FUTU_PWD_MD5"
+        fi
+        export LD_LIBRARY_PATH="$FUTU_DIR:$LD_LIBRARY_PATH"
         nohup ./FutuOpenD \
-            -login_account "$FUTU_ACCOUNT" \
-            -login_pwd_md5 "$FUTU_PWD_MD5" \
-            -lang chs \
+            -login_account="$FUTU_ACCOUNT" \
+            $FUTU_PWD_ARG \
+            -lang=chs \
             > "$WORK/logs/futu.log" 2>&1 &
         echo $! > "$WORK/logs/futu.pid"
         echo "  🔌 Futu OpenD: PID=$(cat $WORK/logs/futu.pid), port=11111"
