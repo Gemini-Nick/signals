@@ -564,19 +564,21 @@ def _fetch_pytdx_industry_stocks(industry: str) -> List[str]:
 
 
 # ─────────────────────────────────────────────────────────
-# 东财 API 熔断器 — SSLError 一次即熔断，后续调用直接走缓存
+# 东财 API 熔断器 — 失败即熔断，半开机制定期重试恢复
 # ─────────────────────────────────────────────────────────
 _EM_CIRCUIT_OPEN = False          # True = 东财不可用，跳过网络调用
 _EM_NAME_DF_CACHE: Optional[pd.DataFrame] = None   # 首次成功结果缓存
 _EM_HEALTH_CHECKED = False        # 启动时已做过健康预检
+_EM_CIRCUIT_OPEN_TIME: float = 0  # 熔断触发时间戳
+_EM_HALF_OPEN_INTERVAL = 300      # 半开重试间隔（秒），5分钟
 
 
-def _em_health_probe(timeout: float = 3.0) -> bool:
+def _em_health_probe(timeout: float = 5.0) -> bool:
     """
-    东财 API 快速健康探测（3s）。
+    东财 API 快速健康探测（5s）。
     启动时调用一次，不可用则全局熔断，避免后续每个接口都等 10-25s 超时。
     """
-    global _EM_CIRCUIT_OPEN, _EM_HEALTH_CHECKED
+    global _EM_CIRCUIT_OPEN, _EM_HEALTH_CHECKED, _EM_CIRCUIT_OPEN_TIME
     if _EM_HEALTH_CHECKED:
         return not _EM_CIRCUIT_OPEN
     _EM_HEALTH_CHECKED = True
@@ -586,12 +588,15 @@ def _em_health_probe(timeout: float = 3.0) -> bool:
     _try_fix_clash_global_mode()
 
     import akshare as ak
+    import requests
     import time as _htime
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
-    # 最多尝试 3 次，每次独立超时
+    # 最多尝试 3 次，每次独立超时（递增：5s/7s/10s）
     max_attempts = 3
     for attempt in range(max_attempts):
+        attempt_timeout = timeout + attempt * 2.5
+
         def _ping():
             with _no_proxy():
                 return ak.stock_board_industry_name_em()
@@ -599,7 +604,7 @@ def _em_health_probe(timeout: float = 3.0) -> bool:
         _probe_pool = ThreadPoolExecutor(max_workers=1)
         _probe_future = _probe_pool.submit(_ping)
         try:
-            df = _probe_future.result(timeout=timeout)
+            df = _probe_future.result(timeout=attempt_timeout)
             if df is not None and not df.empty:
                 global _EM_NAME_DF_CACHE
                 _EM_NAME_DF_CACHE = df
@@ -608,10 +613,16 @@ def _em_health_probe(timeout: float = 3.0) -> bool:
         except (FutureTimeout, Exception) as e:
             if attempt < max_attempts - 1:
                 _log(f"  [⚡] 东财健康探测第{attempt+1}次失败（{e.__class__.__name__}），重试...")
-                _htime.sleep(0.5 * (attempt + 1))
+                # 清除死连接后重试
+                try:
+                    requests.Session().close()
+                except Exception:
+                    pass
+                _htime.sleep(1.0 * (attempt + 1))
                 continue
             _EM_CIRCUIT_OPEN = True
-            _log(f"  [⚡] 东财 API 健康探测{max_attempts}次均失败（{e.__class__.__name__}），全局熔断")
+            _EM_CIRCUIT_OPEN_TIME = _htime.monotonic()
+            _log(f"  [⚡] 东财 API 健康探测{max_attempts}次均失败（{e.__class__.__name__}），全局熔断（{_EM_HALF_OPEN_INTERVAL}s后半开重试）")
             return False
         finally:
             _probe_pool.shutdown(wait=False, cancel_futures=True)
@@ -638,24 +649,30 @@ def _load_board_industry_cache() -> Optional[pd.DataFrame]:
 
 def _fetch_board_industry_name_em(timeout: float = 5.0) -> Optional[pd.DataFrame]:
     """
-    带熔断+重试的 stock_board_industry_name_em 调用：
-    - 整体超时 5s（从10s缩减）
-    - 健康预检失败则直接跳过
+    带熔断+半开重试的 stock_board_industry_name_em 调用：
+    - 整体超时 5s
     - 首次成功后缓存结果，后续直接返回
-    - 两次失败后标记熔断，本次运行内不再尝试
+    - 失败后标记熔断，5分钟后半开重试一次
     """
-    global _EM_CIRCUIT_OPEN, _EM_NAME_DF_CACHE
+    global _EM_CIRCUIT_OPEN, _EM_NAME_DF_CACHE, _EM_CIRCUIT_OPEN_TIME
 
     # 有内存缓存直接返回
     if _EM_NAME_DF_CACHE is not None:
         return _EM_NAME_DF_CACHE
 
-    # 熔断打开 → 尝试磁盘缓存兜底
+    # 熔断打开 → 检查是否到了半开重试时间
     if _EM_CIRCUIT_OPEN:
-        _disk = _load_board_industry_cache()
-        if _disk is not None:
-            _EM_NAME_DF_CACHE = _disk
-        return _disk
+        import time as _ctime
+        elapsed = _ctime.monotonic() - _EM_CIRCUIT_OPEN_TIME if _EM_CIRCUIT_OPEN_TIME else 0
+        if elapsed < _EM_HALF_OPEN_INTERVAL:
+            # 未到重试时间，走磁盘缓存
+            _disk = _load_board_industry_cache()
+            if _disk is not None:
+                _EM_NAME_DF_CACHE = _disk
+            return _disk
+        # 半开：重置熔断，尝试重新连接
+        _EM_CIRCUIT_OPEN = False
+        _log(f"  [↻] 东财熔断半开重试（已过{int(elapsed)}s）")
 
     import akshare as ak
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
@@ -674,10 +691,12 @@ def _fetch_board_industry_name_em(timeout: float = 5.0) -> Optional[pd.DataFrame
         return None
     except FutureTimeout:
         _EM_CIRCUIT_OPEN = True
+        import time as _ftime; _EM_CIRCUIT_OPEN_TIME = _ftime.monotonic()
         _log(f"  [⚡] 东财行业接口超时（>{timeout}s），熔断")
         return None
     except Exception as e:
         _EM_CIRCUIT_OPEN = True
+        import time as _ftime; _EM_CIRCUIT_OPEN_TIME = _ftime.monotonic()
         _log(f"  [⚡] 东财行业接口熔断（{e.__class__.__name__}）")
         return None
     finally:
