@@ -5,13 +5,14 @@
 
 ---
 
-## 六大模块
+## 八大模块
 
 | 模块 | 路径 | 功能 |
 |------|------|------|
-| **Core** | `signals/core/` | 信号检测引擎 + 评分系统 + 异常检测 + 信号融合 + 行业主题聚类 |
-| **Data** | `signals/data/` | 多数据源统一接口：A股(AKShare) + 港股(Futu) + 美股(Futu/yfinance) + 社交舆情 |
+| **Core** | `signals/core/` | 信号检测引擎 + 评分系统 + 跳空缺口检测 + 异常检测 + 信号融合 + 行业主题聚类 |
+| **Data** | `signals/data/` | 多数据源统一接口：MongoDB + A股(AKShare) + 港股(Futu) + 美股(Futu/yfinance) + 社交舆情 |
 | **Layers** | `signals/layers/` | 三层联动：指数大势 → 行业强弱（双榜+轮动） → 个股筛选 |
+| **Sync** | `signals/sync/` | 数据同步引擎：6 模块定时同步 + MongoDB 持久化 + 隧道代理 + 指数退避重试 |
 | **Web** | `signals/web/` | 全功能 Web UI — 6 页 SPA + 9 个 API 路由（Dashboard/Chart/Stock/Review/Backtest/Analog） |
 | **Web2** | `signals/web2/` | 精简版 Web — 行业主题聚合 + MACD 回测（独立 FastAPI 应用） |
 | **Research** | `signals/research/` | 研报导入(MD/PDF/图片OCR) + 自动归档(notes/YYYY/MM/) + 时间衰减 |
@@ -30,6 +31,9 @@ python run.py --mode backtest                       # 信号回测评估
 python run.py --mode import --file 研报.pdf          # 导入研究笔记
 python run.py --mode web --port 8000                # Web 全功能版
 python run.py --mode web2 --port 8001               # Web2 精简版（行业聚类+回测）
+python -m signals.sync --once                       # 数据同步（一次性全量）
+python -m signals.sync --once --module index_daily   # 数据同步（单模块）
+python -m signals.sync --daemon                      # 同步守护进程
 ```
 
 ### 模式定位
@@ -43,6 +47,7 @@ python run.py --mode web2 --port 8001               # Web2 精简版（行业聚
 | `import` | 归档 | 导入 MD/PDF/图片 研究笔记 |
 | `web` | 可视化 | 全功能 SPA：Dashboard + K线图表 + 个股分析 + 复盘 + 回测 + 历史对照 |
 | `web2` | 轻量可视化 | 行业主题聚合（15 类主题分类）+ MACD 回测验证 |
+| `sync` | 数据同步 | 6 模块定时同步到 MongoDB（指数/个股/行业/成分股） |
 
 ---
 
@@ -86,26 +91,30 @@ python run.py --mode web2 --port 8001               # Web2 精简版（行业聚
 
 ## 数据源架构
 
+云端部署时，MongoDB 作为降级链首选源（由 Sync 模块定时填充），本地开发时自动跳过。
+
 ### A 股
 
 | 场景 | 降级链 |
 |------|--------|
-| 指数日线 | AKShare `stock_zh_index_daily` |
-| 分钟线（盘中） | AKShare(Sina) → Tushare(限速) → Futu |
-| 行业涨幅排行 | 同花顺 THS → 东财 EM → 磁盘缓存 |
-| 行业 K 线 | 东财 EM → 同花顺 THS → 磁盘缓存(JSON) |
-| 行业成分股 | 东财 EM → pytdx → 磁盘缓存 |
+| 指数日线 | **MongoDB** → AKShare `stock_zh_index_daily` |
+| 个股日线 | **MongoDB** → AKShare |
+| 分钟线（盘中） | **MongoDB** → AKShare(Sina) → Tushare(限速) → Futu |
+| 行业涨幅排行 | **MongoDB** → 同花顺 THS → 东财 EM → 磁盘缓存 |
+| 行业 K 线 | **MongoDB** → 东财 EM → 同花顺 THS → 磁盘缓存(JSON) |
+| 行业成分股 | **MongoDB** → 东财 EM → pytdx → 磁盘缓存 |
 | 概念排行 | 新浪 → 东财 → 同花顺 → 磁盘缓存 |
 
 ### 港美股
 
 | 场景 | 降级链 |
 |------|--------|
-| 港股 | Futu OpenD |
-| 美股盘中 | Futu → yfinance |
+| 港股 | **MongoDB** → Futu OpenD |
+| 美股盘中 | **MongoDB** → Futu → yfinance |
 | 美股盘后 | yfinance |
 
 熔断器模式：东财/THS 连续失败自动熔断，切换数据源。磁盘缓存 24h 过期（成分股 7 天）。
+隧道代理：云端通过 `EM_PROXY_URL` 自动换 IP，规避东财频繁访问封禁。
 
 ---
 
@@ -136,12 +145,14 @@ backtest 每月运行 ──→ 读取已存档信号（≥20天前）──→ 
 # 拉取最新代码
 git pull origin main
 
-# 全部启动（web=6006, web2=6008）
+# 全部启动（mongo + futu + sync + web + web2）
 bash deploy/autodl/start.sh
 
-# 只启动某个服务
+# 按需启动单个服务
 bash deploy/autodl/start.sh web 6006     # 全功能版
 bash deploy/autodl/start.sh web2 6008    # 精简版
+bash deploy/autodl/start.sh mongo        # MongoDB
+bash deploy/autodl/start.sh sync         # 同步守护进程
 
 # 停止
 bash deploy/autodl/stop.sh               # 全部停止
@@ -149,6 +160,32 @@ bash deploy/autodl/stop.sh web2          # 只停 web2
 ```
 
 AutoDL 开放端口：6006 (Web) / 6008 (Web2)，通过控制台「自定义服务」访问。
+
+### Docker Compose（完整微服务）
+
+```bash
+cd deploy && docker-compose up -d
+```
+
+| 服务 | 说明 | 端口 |
+|------|------|------|
+| `futu-opend` | Futu 网关 | 11111 |
+| `mongo` | MongoDB 8.0（时序数据） | 27017 |
+| `sync-worker` | 数据同步守护进程 | — |
+| `signals` | 分析引擎 + Web | 6006 |
+| `redis` | 缓存层（可选） | 6379 |
+
+### 定时任务
+
+| 时间 | 任务 |
+|------|------|
+| 09:25 | 指数快报 |
+| 09:45 ~ 14:30 | 盘中五轮扫描 |
+| 15:15 | 盘后复盘 |
+| 16:30 | 全量数据同步 |
+| 22:30 / 00:00 | 美股扫描 |
+| 03:00 | MongoDB 备份（30天轮转） |
+| 周日 10:00 | 行业成分股全量更新 |
 
 ---
 
@@ -161,7 +198,8 @@ AutoDL 开放端口：6006 (Web) / 6008 (Web2)，通过控制台「自定义服�
 ├── signals/
 │   ├── core/               # 核心引擎
 │   │   ├── analyzer.py     #   缠论分析器（笔、段、中枢）
-│   │   ├── detectors.py    #   买卖点 / 背驰 / 形态检测
+│   │   ├── detectors.py    #   买卖点 / 背驰 / 形态 / 跳空缺口检测
+│   │   ├── gap_detector.py #   跳空缺口信号（突破/持续/衰竭/普通）
 │   │   ├── scorer.py       #   评分系统（信号+交叉确认）
 │   │   ├── backtest.py     #   信号回测引擎（存档+前瞻评估+SQS）
 │   │   ├── clustering.py   #   行业主题聚类（15类分类+聚合评分）
@@ -180,9 +218,16 @@ AutoDL 开放端口：6006 (Web) / 6008 (Web2)，通过控制台「自定义服�
 │   │   └── review_screener.py  # Layer 3 盘后复盘
 │   ├── data/               # 多数据源统一接口
 │   │   ├── fetcher.py      #   核心数据源 + 降级链
+│   │   ├── db_source.py    #   MongoDB 数据源封装
 │   │   ├── us_factory.py   #   美股数据源工厂
 │   │   ├── minute_cache.py #   分钟线 SQLite 缓存
-│   │   └── bar_cache.py    #   K 线缓存
+│   │   └── bar_cache.py    #   K 线缓存（磁盘 + MongoDB）
+│   ├── sync/               # 数据同步引擎
+│   │   ├── engine.py       #   调度引擎（ThreadPoolExecutor + 定时任务）
+│   │   ├── db.py           #   MongoDB 连接管理
+│   │   ├── proxy.py        #   隧道代理（东财 IP 限流规避）
+│   │   ├── retry.py        #   指数退避重试装饰器
+│   │   └── modules/        #   6 个同步模块（index/stock/board 日线+分钟线）
 │   ├── web/                # Web 全功能版
 │   │   ├── api/            #   9 个 REST API 路由
 │   │   ├── services/       #   引擎桥接层
@@ -197,8 +242,10 @@ AutoDL 开放端口：6006 (Web) / 6008 (Web2)，通过控制台「自定义服�
 │       ├── feishu.py       #   飞书群聊通知
 │       └── cluster_notify.py   # 行业聚类飞书推送
 ├── deploy/
-│   ├── autodl/             # AutoDL 部署（start.sh / stop.sh）
-│   └── cron/               # 定时任务
+│   ├── docker-compose.yml  # 5 服务编排（Futu + MongoDB + Sync + Web + Redis）
+│   ├── init-mongo.js       # MongoDB 初始化（集合 + 索引 + TTL）
+│   ├── autodl/             # AutoDL 部署（start.sh / stop.sh / gen_cache.py）
+│   └── cron/               # 定时任务（盘中扫描 + 同步 + 备份）
 ├── scripts/                # 辅助脚本（缓存预生成等）
 └── notes/                  # 研究笔记归档（YYYY/MM/）
 ```
@@ -215,6 +262,9 @@ AutoDL 开放端口：6006 (Web) / 6008 (Web2)，通过控制台「自定义服�
 | [AKShare](https://github.com/akfamily/akshare) | A 股指数 / 行业 / 个股行情 |
 | [Futu OpenD](https://openapi.futunn.com/) | 港股 + 美股盘中数据 |
 | [yfinance](https://github.com/ranaroussi/yfinance) | 美股免费兜底（日线+分钟线） |
+| [MongoDB](https://www.mongodb.com/) | 时序数据持久化（8.0，TTL 自动清理） |
+| [pymongo](https://pymongo.readthedocs.io/) | MongoDB Python 驱动 |
+| [tenacity](https://tenacity.readthedocs.io/) | 重试策略（指数退避） |
 | [python-dotenv](https://github.com/theskumar/python-dotenv) | 凭证安全管理 |
 
 ---
@@ -223,6 +273,7 @@ AutoDL 开放端口：6006 (Web) / 6008 (Web2)，通过控制台「自定义服�
 
 | Tag | 说明 |
 |-----|------|
+| `v0.4.0` | MongoDB 数据同步引擎 + 跳空缺口检测 + Docker 微服务编排 |
 | `v0.3.0` | Web 双站 + 行业主题聚合 + MACD 回测 + AutoDL 部署 |
 | `v0.2.0` | 道长策略融合 + AutoResearch + Skills |
 | `v0.1.0` | 三层联动框架 + 缠论信号引擎 |
