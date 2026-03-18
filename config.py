@@ -13,6 +13,19 @@ load_dotenv()
 # "cloud" → 中国云部署（跳过 yfinance/IB/Alpaca，用 Futu+AKShare 覆盖美股）
 DEPLOY_MODE = os.getenv("DEPLOY_MODE", "local")
 
+# ── 云端数据库（MongoDB）─────────────────────────────────
+# 设置后自动启用 MongoDB 作为数据降级链首选源
+# 格式: mongodb://user:pass@host:27017/dbname?authSource=admin
+MONGO_URL = os.getenv("MONGO_URL", "")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "signals")
+DB_ENABLED = bool(MONGO_URL)
+
+# ── 东财隧道代理（cheapproxy.net）────────────────────────
+# 隧道代理每次请求自动换 IP，解决东财频繁访问封禁
+# 格式: http://user:pass@tunnel.cheapproxy.net:port
+EM_PROXY_URL = os.getenv("EM_PROXY_URL", "")
+EM_PROXY_ENABLED = os.getenv("EM_PROXY_ENABLED", "false").lower() == "true"
+
 # ── Tushare ──────────────────────────────────────────────
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
 

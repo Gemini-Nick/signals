@@ -30,6 +30,24 @@ case "$TARGET" in
             echo "  Web2 未在运行"
         fi
         ;;
+    sync)
+        if [ -f logs/sync.pid ]; then
+            kill $(cat logs/sync.pid) 2>/dev/null && echo "  Sync Worker 已停止"
+            rm -f logs/sync.pid
+        else
+            echo "  Sync Worker 未在运行"
+        fi
+        ;;
+    mongo)
+        if command -v docker &>/dev/null; then
+            cd "$WORK/deploy" 2>/dev/null
+            docker compose stop mongo 2>/dev/null || docker-compose stop mongo 2>/dev/null || true
+            cd "$WORK" 2>/dev/null
+            echo "  MongoDB 已停止"
+        else
+            echo "  Docker 未安装"
+        fi
+        ;;
     all)
         if [ -f logs/web.pid ]; then
             kill $(cat logs/web.pid) 2>/dev/null && echo "  Web 已停止"
@@ -39,15 +57,25 @@ case "$TARGET" in
             kill $(cat logs/web2.pid) 2>/dev/null && echo "  Web2 已停止"
             rm -f logs/web2.pid
         fi
+        if [ -f logs/sync.pid ]; then
+            kill $(cat logs/sync.pid) 2>/dev/null && echo "  Sync Worker 已停止"
+            rm -f logs/sync.pid
+        fi
         if [ -f logs/futu.pid ]; then
             kill $(cat logs/futu.pid) 2>/dev/null && echo "  Futu OpenD 已停止"
             rm -f logs/futu.pid
         fi
         pkill -f FutuOpenD 2>/dev/null || true
+        if command -v docker &>/dev/null; then
+            cd "$WORK/deploy" 2>/dev/null
+            docker compose stop mongo 2>/dev/null || docker-compose stop mongo 2>/dev/null || true
+            cd "$WORK" 2>/dev/null
+            echo "  MongoDB 已停止"
+        fi
         echo "✅ 全部已停止"
         ;;
     *)
-        echo "用法: $0 [web|web2|all]"
+        echo "用法: $0 [web|web2|sync|mongo|all]"
         exit 1
         ;;
 esac

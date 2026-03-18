@@ -313,6 +313,17 @@ class AKShareSource:
     def get_a_daily(self, futu_code: str, sdt: str, edt: str,
                     adj: str = "qfq", max_retries: int = 3) -> List[RawBar]:
         """A股日线（完整历史），内置重试 + 指数退避应对东财 SSL 间歇性故障。"""
+        # MongoDB 优先（云端同步数据，零网络开销）
+        try:
+            from .db_source import get_mongo_source
+            mongo = get_mongo_source()
+            if mongo:
+                bars = mongo.get_a_daily(futu_code, sdt, edt)
+                if bars:
+                    return bars
+        except Exception:
+            pass
+
         import akshare as ak
         import time as _time
         ak_sym, pure_code = self._futu_to_ak_a(futu_code)
@@ -460,6 +471,17 @@ class AKShareSource:
         盘中模式：传 lookback_days（滚动窗口，默认180自然日≈120交易日）
         盘后复盘：传 start_date（固定起点，如 '2024-09-24'）
         """
+        # MongoDB 优先（云端同步数据）
+        try:
+            from .db_source import get_mongo_source
+            mongo = get_mongo_source()
+            if mongo:
+                bars = mongo.get_index_daily(symbol, lookback_days, start_date)
+                if bars:
+                    return bars
+        except Exception:
+            pass
+
         import os, json
 
         # 尝试磁盘缓存（当日有效）

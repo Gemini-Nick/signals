@@ -761,14 +761,32 @@ def _fetch_industry_ranking_ths(timeout: float = 10.0) -> Optional[pd.DataFrame]
 
 def _fetch_industry_ranking_with_fallback() -> Optional[pd.DataFrame]:
     """
-    行业排行降级链：同花顺(4.5s) → 东财(5s) → None
+    行业排行降级链：MongoDB → 同花顺(4.5s) → 东财(5s) → None
     返回统一列名的 DataFrame（板块名称, 涨跌幅, 领涨股票, 领涨股票-涨跌幅）。
     """
-    # 优先同花顺（更稳定）
+    # 0. MongoDB 优先（云端同步数据）
+    try:
+        from signals.data.db_source import get_mongo_source
+        mongo = get_mongo_source()
+        if mongo:
+            df = mongo.get_board_ranking(source="ths")
+            if df is None or df.empty:
+                df = mongo.get_board_ranking(source="em")
+            if df is not None and not df.empty:
+                # 统一列名
+                col_map = {"board_name": "板块名称", "change_pct": "涨跌幅"}
+                df = df.rename(columns={k: v for k, v in col_map.items()
+                                        if k in df.columns})
+                _detail("  [MongoDB] 行业排行命中")
+                return df
+    except Exception:
+        pass
+
+    # 1. 同花顺（更稳定）
     df = _fetch_industry_ranking_ths()
     if df is not None and not df.empty:
         return df
-    # 降级到东财
+    # 2. 降级到东财
     df = _fetch_board_industry_name_em()
     if df is not None and not df.empty:
         return df
@@ -809,14 +827,27 @@ def get_industry_stocks(industry: str) -> List[str]:
     """
     获取指定行业的成分股，返回 Futu 格式代码列表。
 
-    降级链：THS cons_ths → 东财 cons_em → pytdx block.dat → 磁盘缓存
-    THS 优先：走 10jqka.com，数据中心 IP 不被封。
+    降级链：MongoDB → THS cons_ths → 东财 cons_em → pytdx block.dat → 磁盘缓存
+    MongoDB 优先（云端同步数据），THS 次之（10jqka.com 不封 IP）。
 
     :param industry: 行业名称，如 "有色金属"、"半导体"
     :return: ["SH.600489", "SZ.002460", ...]
     """
     import akshare as ak
     _cache_key = f"stocks_{industry}"
+
+    # ── 0. MongoDB 优先（云端同步数据）─────────────
+    try:
+        from signals.data.db_source import get_mongo_source
+        mongo = get_mongo_source()
+        if mongo:
+            codes = mongo.get_board_constituents(industry)
+            if codes:
+                _detail(f"  [MongoDB] {industry} 成分股命中 ({len(codes)}只)")
+                _save_cache(_cache_key, codes)
+                return codes
+    except Exception:
+        pass
 
     # ── 1. THS 成分股（优先，云端可用）───────────────
     try:
@@ -1120,7 +1151,7 @@ def get_industry_bars(industry: str,
                       start_date: str = None):
     """
     获取行业板块日线 K 线。
-    降级链：同花顺(12s) → 东财(6s) → 磁盘缓存(24h) → 空
+    降级链：MongoDB → 同花顺(12s) → 东财(6s) → 磁盘缓存(24h) → 空
 
     :param industry:     行业名称，如 "有色金属"
     :param lookback_days: 盘中模式：近 N 自然日（默认180）
@@ -1137,6 +1168,19 @@ def get_industry_bars(industry: str,
     else:
         s_date = (today - timedelta(days=lookback_days)).strftime("%Y%m%d")
     e_date = today.strftime("%Y%m%d")
+
+    # 0. MongoDB 优先（云端同步数据）
+    try:
+        from signals.data.db_source import get_mongo_source
+        mongo = get_mongo_source()
+        if mongo:
+            bars = mongo._query_bars(
+                industry, "日线", Freq.D, industry, s_date, e_date)
+            if bars:
+                _detail(f"  [MongoDB] {industry} K线命中 ({len(bars)}根)")
+                return bars
+    except Exception:
+        pass
 
     # 1. 同花顺优先（云端不封）
     df = _get_industry_bars_ths(industry, s_date, e_date)

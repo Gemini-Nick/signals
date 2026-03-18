@@ -37,6 +37,7 @@ def detect_all_signals(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
     signals.extend(_detect_trend(czsc_obj, symbol))
     signals.extend(_detect_patterns(czsc_obj, symbol))
     signals.extend(_detect_macd_convergence(czsc_obj, symbol))
+    signals.extend(_detect_gaps(czsc_obj, symbol))
     return signals
 
 
@@ -76,6 +77,19 @@ def _detect_macd_convergence(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
                 details=sig.details,
             ))
         return events
+    except Exception:
+        return []
+
+
+def _detect_gaps(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
+    """跳空缺口信号检测（从 CZSC bars_raw 提取）"""
+    try:
+        from signals.core.gap_detector import detect_gap_signals
+
+        bars = czsc_obj.bars_raw
+        if not bars or len(bars) < 25:
+            return []
+        return detect_gap_signals(bars, symbol, czsc_obj.freq.value)
     except Exception:
         return []
 

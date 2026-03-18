@@ -78,6 +78,35 @@ start_web2() {
     echo "  🐲 Web2 服务: PID=$(cat logs/web2.pid), port=$port"
 }
 
+start_mongo() {
+    # MongoDB 通过 Docker 启动（docker-compose 管理）
+    if command -v docker &>/dev/null; then
+        cd "$WORK/deploy"
+        docker compose up -d mongo 2>/dev/null || docker-compose up -d mongo 2>/dev/null || true
+        cd "$WORK"
+        echo -n "  等待 MongoDB 就绪"
+        for i in $(seq 1 10); do
+            if docker exec signals-mongo mongosh --eval "db.runCommand('ping').ok" -u signals -p "${MONGO_PASSWORD:-signals_secret}" --authenticationDatabase admin --quiet 2>/dev/null | grep -q 1; then
+                echo " ✅"; break
+            fi
+            echo -n "."; sleep 2
+        done
+        echo "  💾 MongoDB: port=27017"
+    else
+        echo "  ⚠️ Docker 未安装，跳过 MongoDB"
+    fi
+}
+
+start_sync() {
+    if [ -f logs/sync.pid ]; then
+        kill $(cat logs/sync.pid) 2>/dev/null || true
+        rm -f logs/sync.pid
+    fi
+    nohup python -m signals.sync --daemon > logs/sync.log 2>&1 &
+    echo $! > logs/sync.pid
+    echo "  🔄 Sync Worker: PID=$(cat logs/sync.pid)"
+}
+
 # ── 参数解析 ──────────────────────────────────────
 mkdir -p logs
 TARGET=${1:-all}
@@ -93,22 +122,36 @@ case "$TARGET" in
         start_web2 "${PORT:-6008}"
         echo -e "\n✅ Web2 已启动！日志: tail -f $WORK/logs/web2.log"
         ;;
+    mongo)
+        start_mongo
+        echo -e "\n✅ MongoDB 已启动！"
+        ;;
+    sync)
+        start_sync
+        echo -e "\n✅ Sync Worker 已启动！日志: tail -f $WORK/logs/sync.log"
+        ;;
     all)
+        start_mongo
         start_futu
+        start_sync
         start_web 6006
         start_web2 6008
         echo ""
         echo "✅ 全部启动！"
-        echo "  Web  日志: tail -f $WORK/logs/web.log"
-        echo "  Web2 日志: tail -f $WORK/logs/web2.log"
-        echo "  Futu 日志: tail -f $WORK/logs/futu.log"
+        echo "  MongoDB日志: docker logs signals-mongo"
+        echo "  Sync  日志: tail -f $WORK/logs/sync.log"
+        echo "  Web   日志: tail -f $WORK/logs/web.log"
+        echo "  Web2  日志: tail -f $WORK/logs/web2.log"
+        echo "  Futu  日志: tail -f $WORK/logs/futu.log"
         echo "  访问: AutoDL → 自定义服务 (6006=Web, 6008=Web2)"
         ;;
     *)
-        echo "用法: $0 [web|web2|all] [端口号]"
-        echo "  $0              → 全部启动 (web=6006, web2=6008)"
+        echo "用法: $0 [web|web2|mongo|sync|all] [端口号]"
+        echo "  $0              → 全部启动 (mongo+futu+sync+web+web2)"
         echo "  $0 web 6006     → 只启动 web"
         echo "  $0 web2 6008    → 只启动 web2"
+        echo "  $0 mongo        → 只启动 MongoDB"
+        echo "  $0 sync         → 只启动 Sync Worker"
         exit 1
         ;;
 esac

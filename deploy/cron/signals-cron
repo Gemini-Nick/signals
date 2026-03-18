@@ -23,5 +23,15 @@
 0 10 * * 1-5  cd /app && python -m signals.notify.cluster_notify >> /app/logs/cron.log 2>&1
 0 14 * * 1-5  cd /app && python -m signals.notify.cluster_notify >> /app/logs/cron.log 2>&1
 
+# ── 数据同步 (盘后 + 周末) ───────────────────
+# 盘后全量同步 (16:30, 交易日结束后)
+30 16 * * 1-5  cd /app && python -m signals.sync --once >> /app/logs/sync-cron.log 2>&1
+
+# 周日成分股全量更新 (10:00)
+0 10 * * 0  cd /app && python -m signals.sync --once --module board_cons >> /app/logs/sync-cron.log 2>&1
+
+# ── MongoDB 备份 (每日凌晨 3:00) ────────────
+0 3 * * *  docker exec signals-mongo mongodump --uri="mongodb://signals:${MONGO_PASSWORD}@localhost:27017/signals?authSource=admin" --gzip --out=/data/db/backup/$(date +\%Y\%m\%d) 2>/dev/null; find /data/db/backup -maxdepth 1 -mtime +30 -exec rm -rf {} \; 2>/dev/null
+
 # ── 日志清理 (每周日凌晨) ─────────────────────
 0 3 * * 0  find /app/logs -name "*.log" -mtime +30 -delete
