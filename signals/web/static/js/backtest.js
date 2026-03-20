@@ -13,6 +13,7 @@ let _btMacdDeaSeries = null;
 let _btBiSeries = null;
 let _btMaSeries = [];
 let _btLoaded = false;
+let _btEquityChart = null;
 
 // ── 页面初始化 ──────────────────────────────────────
 window.loadBacktestPage = function () {
@@ -23,11 +24,18 @@ window.loadBacktestPage = function () {
 
 function _initBtEvents() {
   const runBtn = document.getElementById('bt-run-btn');
+  const simBtn = document.getElementById('bt-sim-btn');
   const codeInput = document.getElementById('bt-code-input');
 
   runBtn.addEventListener('click', _runBacktest);
+  simBtn.addEventListener('click', _runSimulate);
   codeInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') _runBacktest();
+  });
+
+  // 点击模拟按钮时展开参数面板
+  simBtn.addEventListener('mouseenter', () => {
+    document.getElementById('bt-sim-params').style.display = 'flex';
   });
 }
 
@@ -485,6 +493,217 @@ function _renderDatePresets(presets) {
   container.innerHTML = presets.map(p =>
     `<span class="bt-preset-chip" onclick="_btScrollTo(${p.time})" title="${p.date}">${p.label}</span>`
   ).join('');
+}
+
+// ── 模拟交易逻辑 ──────────────────────────────────────
+async function _runSimulate() {
+  const code = document.getElementById('bt-code-input').value.trim();
+  if (!code) return;
+
+  const freq = document.getElementById('bt-freq-select').value;
+  const signalGroup = document.getElementById('bt-signal-group').value;
+  const status = document.getElementById('bt-status');
+  const simBtn = document.getElementById('bt-sim-btn');
+
+  // 展开参数面板
+  document.getElementById('bt-sim-params').style.display = 'flex';
+
+  const stopLoss = document.getElementById('bt-stop-loss').value;
+  const trailStop = document.getElementById('bt-trail-stop').value;
+  const maxHold = document.getElementById('bt-max-hold').value;
+  const slippage = document.getElementById('bt-slippage').value;
+
+  status.textContent = '模拟中...';
+  status.className = 'bt-status';
+  simBtn.disabled = true;
+
+  try {
+    const params = new URLSearchParams({
+      code, freq, signal_group: signalGroup,
+      stop_loss: stopLoss, trail_stop: trailStop,
+      max_hold: maxHold, slippage: slippage,
+    });
+    const data = await apiFetch('/api/backtest/simulate?' + params.toString());
+
+    if (data.error) {
+      status.textContent = data.error;
+      status.className = 'bt-status error';
+      return;
+    }
+
+    const filledCount = (data.sim_kpi || {}).filled_trades || 0;
+    status.textContent = `${data.symbol} ${data.freq} — ${data.signals.length} 信号, ${filledCount} 笔成交`;
+    status.className = 'bt-status';
+
+    // 渲染K线图 (复用现有逻辑)
+    _createBtChart(data);
+    _renderKPI(data.forward_kpi);
+    _renderSignalTable(data.signals);
+    _renderDatePresets(data.date_presets);
+
+    // 渲染模拟结果
+    _renderSimResults(data);
+
+  } catch (e) {
+    console.error('Simulate error:', e);
+    status.textContent = '模拟失败: ' + e.message;
+    status.className = 'bt-status error';
+  } finally {
+    simBtn.disabled = false;
+  }
+}
+
+function _renderSimResults(data) {
+  const section = document.getElementById('bt-sim-section');
+  section.style.display = 'block';
+
+  // 模拟 KPI
+  _renderSimKPI(data.sim_kpi || {});
+
+  // 资金曲线
+  _renderEquityCurve(data.sim_equity || []);
+
+  // 交易记录表
+  _renderTradeTable(data.sim_trades || []);
+
+  // 跳过原因
+  _renderSkipReasons(data.sim_skip_reasons || {});
+}
+
+function _renderSimKPI(kpi) {
+  const el = document.getElementById('bt-sim-kpis');
+  if (!kpi || kpi.total_trades === 0) {
+    el.innerHTML = '<div class="empty-state">无成交记录</div>';
+    return;
+  }
+
+  const items = [
+    { value: kpi.filled_trades, label: '成交笔数', cls: '' },
+    { value: kpi.win_rate + '%', label: '胜率', cls: kpi.win_rate >= 50 ? 'up' : 'down' },
+    { value: (kpi.total_return_pct >= 0 ? '+' : '') + kpi.total_return_pct + '%', label: '总收益', cls: kpi.total_return_pct >= 0 ? 'up' : 'down' },
+    { value: kpi.sharpe, label: 'Sharpe', cls: kpi.sharpe >= 1 ? 'up' : kpi.sharpe < 0 ? 'down' : '' },
+    { value: kpi.sortino, label: 'Sortino', cls: kpi.sortino >= 1 ? 'up' : kpi.sortino < 0 ? 'down' : '' },
+    { value: kpi.profit_factor, label: '盈亏比', cls: kpi.profit_factor >= 1 ? 'up' : 'down' },
+    { value: '-' + kpi.max_drawdown_pct + '%', label: '最大回撤', cls: 'down' },
+    { value: (kpi.expectancy >= 0 ? '+' : '') + kpi.expectancy + '%', label: '期望', cls: kpi.expectancy >= 0 ? 'up' : 'down' },
+    { value: kpi.avg_hold_days + 'D', label: '平均持仓', cls: '' },
+    { value: '+' + kpi.avg_mfe + '%', label: 'MFE均', cls: 'up' },
+    { value: kpi.avg_mae + '%', label: 'MAE均', cls: 'down' },
+    { value: kpi.avg_cost_pct + '%', label: '成本均', cls: '' },
+  ];
+
+  el.innerHTML = items.map(it => `
+    <div class="bt-kpi-card">
+      <div class="bt-kpi-value ${it.cls}">${it.value}</div>
+      <div class="bt-kpi-label">${it.label}</div>
+    </div>
+  `).join('');
+}
+
+function _renderEquityCurve(equity) {
+  const container = document.getElementById('bt-equity-container');
+  if (_btEquityChart) {
+    _btEquityChart.remove();
+    _btEquityChart = null;
+  }
+  container.innerHTML = '';
+
+  if (!equity || equity.length < 2) {
+    container.innerHTML = '<div class="empty-state">资金曲线数据不足</div>';
+    return;
+  }
+
+  const c = chartColors();
+  _btEquityChart = LightweightCharts.createChart(container, {
+    width: container.clientWidth,
+    height: container.clientHeight || 250,
+    layout: { background: { type: 'solid', color: c.bg }, textColor: c.text },
+    grid: { vertLines: { color: c.grid }, horzLines: { color: c.grid } },
+    timeScale: { borderColor: c.grid, timeVisible: false },
+    rightPriceScale: { borderColor: c.grid },
+  });
+
+  const areaSeries = _btEquityChart.addAreaSeries({
+    topColor: 'rgba(38, 166, 154, 0.28)',
+    bottomColor: 'rgba(38, 166, 154, 0.02)',
+    lineColor: '#26a69a',
+    lineWidth: 2,
+    priceLineVisible: false,
+    lastValueVisible: true,
+  });
+  areaSeries.setData(equity);
+  _btEquityChart.timeScale().fitContent();
+
+  const ro = new ResizeObserver(() => {
+    if (_btEquityChart) _btEquityChart.applyOptions({ width: container.clientWidth });
+  });
+  ro.observe(container);
+}
+
+function _renderTradeTable(trades) {
+  const container = document.getElementById('bt-trade-list');
+  const countEl = document.getElementById('bt-trade-count');
+
+  const filled = trades.filter(t => t.entry_price != null);
+  const skipped = trades.filter(t => t.skip_reason != null);
+
+  countEl.textContent = `(${filled.length} 成交 / ${skipped.length} 跳过)`;
+
+  if (filled.length === 0) {
+    container.innerHTML = '<div class="bt-empty-msg">无成交记录</div>';
+    return;
+  }
+
+  let html = `<table class="bt-stats-table">
+    <thead><tr>
+      <th>信号日</th><th>类型</th><th>入场日</th><th>入场价</th><th>成交方式</th>
+      <th>出场日</th><th>出场价</th><th>出场原因</th><th>持仓天</th>
+      <th>毛利</th><th>净利</th><th>成本</th><th>MFE</th><th>MAE</th>
+    </tr></thead><tbody>`;
+
+  for (const t of filled) {
+    const retCls = (t.net_return_pct || 0) >= 0 ? 'up' : 'down';
+    const rowCls = (t.net_return_pct || 0) >= 0 ? 'bt-signal-win' : 'bt-signal-loss';
+    const exitLabel = {
+      'stop_loss': '止损', 'trail_stop': '移动止盈', 'time_exit': '时间止损',
+      'signal_exit': '信号出场', 'data_end': '数据终点',
+    }[t.exit_reason] || t.exit_reason || '—';
+    const fillLabel = t.fill_type === 'open_fill' ? '开盘成交' : t.fill_type === 'trigger_fill' ? '触发成交' : t.fill_type || '—';
+
+    html += `<tr class="bt-signal-row ${rowCls}" onclick="_btScrollTo(${new Date(t.signal_date).getTime() / 1000 | 0})">
+      <td>${t.signal_date || '—'}</td>
+      <td><b>${t.signal_type}</b></td>
+      <td>${t.entry_date || '—'}</td>
+      <td>${t.entry_price != null ? t.entry_price.toFixed(2) : '—'}</td>
+      <td>${fillLabel}</td>
+      <td>${t.exit_date || '—'}</td>
+      <td>${t.exit_price != null ? t.exit_price.toFixed(2) : '—'}</td>
+      <td>${exitLabel}</td>
+      <td>${t.holding_days != null ? t.holding_days : '—'}</td>
+      <td class="${retCls}">${_fmtRet(t.return_pct)}</td>
+      <td class="${retCls}"><b>${_fmtRet(t.net_return_pct)}</b></td>
+      <td>${t.cost_pct != null ? t.cost_pct + '%' : '—'}</td>
+      <td class="up">${t.mfe_pct != null ? '+' + t.mfe_pct + '%' : '—'}</td>
+      <td class="down">${t.mae_pct != null ? t.mae_pct + '%' : '—'}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+function _renderSkipReasons(skipReasons) {
+  const el = document.getElementById('bt-skip-reasons');
+  const keys = Object.keys(skipReasons);
+  if (keys.length === 0) { el.innerHTML = ''; return; }
+
+  const labels = {
+    'unfilled': '未触发', 'zero_volume': '零成交量', 'locked_bar': '一字板',
+    'insufficient_data': '数据不足', 'date_not_found': '日期未匹配',
+    'overlapping_position': '持仓重叠', 'no_exit_data': '无出场数据',
+  };
+
+  el.innerHTML = '<div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">跳过原因: ' +
+    keys.map(k => `${labels[k] || k} (${skipReasons[k]})`).join(' | ') + '</div>';
 }
 
 // ── 主题切换重建 ────────────────────────────────────
