@@ -58,11 +58,33 @@
           <option value="czsc">仅缠论</option>
         </select>
         <button id="bt-run" class="btn btn-primary">运行回测</button>
+        <button id="bt-sim" class="btn" style="background:#e040fb;border-color:#e040fb;color:#fff;">模拟交易</button>
+      </div>
+      <!-- 模拟参数行 -->
+      <div class="bt-input-row" id="bt-sim-params" style="display:none; margin-top:6px;">
+        <label style="font-size:12px;color:var(--text-secondary);">止损%</label>
+        <input type="number" id="bt-stop-loss" class="bt-param-input" value="5" min="1" max="20" step="0.5" />
+        <label style="font-size:12px;color:var(--text-secondary);">移动止盈回撤%</label>
+        <input type="number" id="bt-trail-stop" class="bt-param-input" value="50" min="10" max="90" step="5" />
+        <label style="font-size:12px;color:var(--text-secondary);">最大持仓日</label>
+        <input type="number" id="bt-max-hold" class="bt-param-input" value="20" min="3" max="60" step="1" />
+        <label style="font-size:12px;color:var(--text-secondary);">滑点%</label>
+        <input type="number" id="bt-slippage" class="bt-param-input" value="0.1" min="0" max="1" step="0.05" />
       </div>
       <div id="bt-presets" class="preset-chips"></div>
     </div>
     <div id="bt-kpis" class="bt-kpis"></div>
     <div id="bt-chart-container" style="height:520px;"></div>
+    <!-- 模拟交易结果区域 -->
+    <div id="bt-sim-section" style="display:none;">
+      <div class="section-title">模拟交易 KPI</div>
+      <div id="bt-sim-kpis" class="bt-kpis"></div>
+      <div class="section-title">资金曲线</div>
+      <div id="bt-equity-container" style="height:250px; position:relative;"></div>
+      <div class="section-title">交易记录 <span id="bt-trade-count" style="font-size:12px;color:var(--text-muted);font-weight:400;"></span></div>
+      <div id="bt-trade-list" class="bt-signal-list-wrapper"></div>
+      <div id="bt-skip-reasons" style="margin-top:8px;"></div>
+    </div>
     <div class="section-title">信号明细</div>
     <div id="bt-signal-list" class="bt-signal-list-wrapper"></div>
   </div>

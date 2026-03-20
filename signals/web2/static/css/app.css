@@ -274,6 +274,20 @@ body {
 .bt-header { margin-bottom: 20px; }
 .bt-input-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
+.bt-param-input {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  width: 60px;
+  outline: none;
+}
+.bt-param-input:focus {
+  border-color: var(--accent);
+}
+
 .preset-chips {
   display: flex;
   gap: 6px;
@@ -311,6 +325,70 @@ body {
 .kpi-value { font-size: 20px; font-weight: 700; font-family: var(--font-mono); }
 .kpi-value.positive { color: var(--color-up); }
 .kpi-value.negative { color: var(--color-down); }
+
+/* KPI 卡片 */
+.bt-kpi-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  min-width: 100px;
+  text-align: center;
+}
+.bt-kpi-value { font-size: 18px; font-weight: 700; font-family: var(--font-mono); }
+.bt-kpi-value.up { color: var(--color-up); }
+.bt-kpi-value.down { color: var(--color-down); }
+.bt-kpi-label { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+
+/* 信号表通用 */
+.bt-stats-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.bt-stats-table th, .bt-stats-table td {
+  padding: 6px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.bt-stats-table th {
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 11px;
+  position: sticky;
+  top: 0;
+  background: var(--bg-primary);
+}
+.bt-stats-table .up { color: var(--color-up); }
+.bt-stats-table .down { color: var(--color-down); }
+
+.bt-pattern-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+}
+.bt-pattern-badge.macd { background: rgba(242, 54, 69, 0.15); color: var(--color-up); }
+.bt-pattern-badge.czsc { background: rgba(41, 98, 255, 0.15); color: var(--accent-blue, #2962ff); }
+
+.bt-signal-win { background: rgba(38, 166, 154, 0.06); }
+.bt-signal-loss { background: rgba(242, 54, 69, 0.06); }
+.bt-signal-row { cursor: pointer; transition: background 0.1s; }
+.bt-signal-row:hover { background: var(--bg-hover); }
+
+.bt-preset-chip {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.bt-preset-chip:hover { color: var(--text-primary); border-color: var(--accent); }
 
 /* 信号表 */
 .bt-signal-list-wrapper { overflow-x: auto; }
