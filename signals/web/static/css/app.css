@@ -2382,6 +2382,20 @@ html, body {
   font-size: 13px;
 }
 
+.bt-param-input {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  width: 60px;
+  outline: none;
+}
+.bt-param-input:focus {
+  border-color: var(--accent);
+}
+
 .bt-status {
   font-size: 13px;
   color: var(--text-secondary);
