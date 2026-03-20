@@ -514,6 +514,122 @@ async def backtest_run(
         })
 
 
+@router.get("/simulate")
+async def backtest_simulate(
+    code: str = Query(..., description="股票代码 (如 002759, 09988)"),
+    freq: str = Query("daily", description="daily / weekly"),
+    signal_group: str = Query("all", description="macd / czsc / all"),
+    lookback: int = Query(999, description="信号回看窗口"),
+    stop_loss: float = Query(5.0, description="止损百分比"),
+    trail_stop: float = Query(50.0, description="移动止盈回撤百分比"),
+    max_hold: int = Query(20, description="最大持仓天数"),
+    slippage: float = Query(0.1, description="滑点百分比"),
+    scan_param: str = Query("", description="扫描参数名 (stop_loss_pct / trail_stop_pct / max_hold_days)"),
+    scan_values: str = Query("", description="扫描值列表 (逗号分隔, 如 3,5,7,10)"),
+    scan_metric: str = Query("sharpe", description="优化目标 (sharpe / win_rate / expectancy)"),
+):
+    """
+    交易模拟回测 — 基于 trade_simulator 的 Stop-Entry 成交模型。
+    支持可选的参数扫描优化。
+    """
+    from signals.core.trade_simulator import SimConfig, simulate_trades, run_parameter_scan
+
+    try:
+        code = code.strip()
+        market = _detect_market(code)
+        symbol = _build_symbol(code, market)
+        freq_label = "日线" if freq == "daily" else "周线"
+
+        # 1. 拉取K线
+        df = _fetch_kline(code, market, freq)
+        if df.empty:
+            return JSONResponse(status_code=404, content={
+                "error": f"无法获取 {code} 的{freq_label}数据"
+            })
+
+        # 2. 信号检测 (复用现有逻辑)
+        all_signals = []
+        bi_list = []
+        zhongshu = []
+
+        if signal_group in ("macd", "all"):
+            macd_lookback = min(lookback, len(df) - 35)
+            macd_sigs = _detect_macd(df, symbol, freq_label, macd_lookback)
+            all_signals.extend(macd_sigs)
+
+        if signal_group in ("czsc", "all"):
+            czsc_sigs, bi_list, zhongshu = _detect_czsc(df, symbol, freq_label)
+            all_signals.extend(czsc_sigs)
+
+        all_signals.sort(key=lambda s: s["dt"])
+
+        # 3. 构建模拟配置
+        sim_config = SimConfig(
+            stop_loss_pct=stop_loss,
+            trail_stop_pct=trail_stop,
+            max_hold_days=max_hold,
+            slippage=slippage / 100.0,
+        )
+
+        # 4. 参数扫描 or 单次模拟
+        scan_result = None
+        if scan_param and scan_values:
+            try:
+                values = [float(v.strip()) for v in scan_values.split(",") if v.strip()]
+                if values:
+                    scan_result = run_parameter_scan(
+                        df, all_signals, sim_config,
+                        param1_name=scan_param,
+                        param1_values=values,
+                        metric=scan_metric,
+                    )
+            except Exception as e:
+                logger.warning("参数扫描失败: %s", e)
+
+        # 5. 单次模拟
+        sim = simulate_trades(df, all_signals, sim_config)
+
+        # 6. 序列化图表数据
+        ohlcv = _serialize_ohlcv(df)
+        macd_data = _compute_macd_data(df)
+        ma_lines = _compute_ma_lines(df)
+
+        # 7. 原始 KPI (前瞻评估)
+        forward_kpi = _compute_kpi(all_signals)
+
+        result = {
+            "symbol": symbol,
+            "code": code,
+            "freq": freq_label,
+            "ohlcv": ohlcv,
+            "macd": macd_data,
+            "ma_lines": ma_lines,
+            "signals": all_signals,
+            "bi_list": bi_list,
+            "zhongshu": zhongshu,
+            "forward_kpi": forward_kpi,
+            # 模拟结果
+            "sim_trades": sim.trades,
+            "sim_equity": sim.equity_curve,
+            "sim_kpi": sim.kpi,
+            "sim_config": sim.config,
+            "sim_skip_reasons": sim.skip_reasons,
+            "date_presets": _get_date_presets(),
+        }
+
+        if scan_result:
+            result["scan"] = scan_result
+
+        return result
+
+    except Exception as e:
+        logger.exception("模拟回测失败: code=%s freq=%s", code, freq)
+        return JSONResponse(status_code=500, content={
+            "error": str(e),
+            "detail": traceback.format_exc(),
+        })
+
+
 @router.get("/presets")
 async def backtest_presets():
     """返回日期预设列表"""
