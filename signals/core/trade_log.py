@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-交易日志 — SQLite 存储 + 操作评分 + 遗漏分析
+交易日志 — MongoDB 优先 + SQLite 降级 + 操作评分 + 遗漏分析
 
 功能:
 1. 交易记录增删查改 (TradeRecord)
@@ -8,6 +8,10 @@
 3. 错误分类: A-type(系统方差) / B-type(执行偏差) / C-type(情绪交易)
 4. 遗漏分析: 信号出现但未操作的标的
 5. 月度/季度统计
+
+数据存储:
+  MongoDB (跨设备): Mac/AutoDL/手机 共享交易记录
+  SQLite  (降级):   无 MongoDB 时自动切换本地存储
 """
 import json
 import logging
@@ -19,7 +23,7 @@ from typing import Dict, List, Optional
 
 _log = logging.getLogger("signals.trade_log")
 
-# 数据库路径
+# 数据库路径（SQLite 降级用）
 _DB_DIR = Path(__file__).resolve().parent.parent.parent / ".data"
 _DB_PATH = _DB_DIR / "trade_log.db"
 
@@ -100,12 +104,33 @@ class TradeSummary:
 
 
 class TradeLog:
-    """交易日志管理器"""
+    """交易日志管理器（MongoDB 优先，SQLite 降级）"""
 
     def __init__(self, db_path: Optional[Path] = None):
+        # 尝试 MongoDB
+        self._mongo_trades = None
+        self._mongo_missed = None
+        self._use_mongo = False
+        try:
+            import config
+            if getattr(config, "DB_ENABLED", False):
+                from signals.sync.db import get_db
+                db = get_db()
+                db.command("ping")
+                self._mongo_trades = db["trades"]
+                self._mongo_missed = db["missed_signals"]
+                self._use_mongo = True
+                _log.info("TradeLog 后端: MongoDB")
+        except Exception as e:
+            _log.debug(f"TradeLog MongoDB 不可用，降级 SQLite: {e}")
+
+        # SQLite 降级（总是初始化）
         self._db_path = db_path or _DB_PATH
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+
+        if not self._use_mongo:
+            _log.info("TradeLog 后端: SQLite")
 
     def _init_db(self):
         """初始化数据库表"""
@@ -170,6 +195,12 @@ class TradeLog:
             if trade.direction == "short":
                 trade.pnl_pct = -trade.pnl_pct
 
+        if self._use_mongo:
+            doc = {k: v for k, v in asdict(trade).items() if k != "id"}
+            result = self._mongo_trades.insert_one(doc)
+            _log.info(f"添加交易 [MongoDB]: {trade.symbol} {trade.entry_date}")
+            return 0  # MongoDB 不返回 int ID
+
         with self._conn() as conn:
             cur = conn.execute("""
                 INSERT INTO trades (symbol, name, direction, entry_date, entry_price,
@@ -190,7 +221,7 @@ class TradeLog:
                 trade.created_at, trade.updated_at,
             ))
             trade.id = cur.lastrowid
-            _log.info(f"添加交易: {trade.symbol} {trade.entry_date} → ID={trade.id}")
+            _log.info(f"添加交易 [SQLite]: {trade.symbol} {trade.entry_date} → ID={trade.id}")
             return trade.id
 
     def update_trade(self, trade: TradeRecord) -> bool:
@@ -270,6 +301,9 @@ class TradeLog:
         列出交易记录。
         status: "all" / "open" / "closed"
         """
+        if self._use_mongo:
+            return self._mongo_list_trades(status, limit, offset)
+
         query = "SELECT * FROM trades"
         params = []
 
@@ -285,6 +319,51 @@ class TradeLog:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(query, params).fetchall()
         return [self._row_to_trade(r) for r in rows]
+
+    def _mongo_list_trades(self, status, limit, offset) -> List[TradeRecord]:
+        mongo_query = {}
+        if status == "open":
+            mongo_query["$or"] = [
+                {"exit_date": ""},
+                {"exit_date": {"$exists": False}},
+                {"exit_date": None},
+            ]
+        elif status == "closed":
+            mongo_query["exit_date"] = {"$nin": ["", None]}
+        cursor = self._mongo_trades.find(mongo_query).sort(
+            [("entry_date", -1)]
+        ).skip(offset).limit(limit)
+        return [self._doc_to_trade(doc) for doc in cursor]
+
+    @staticmethod
+    def _doc_to_trade(doc: dict) -> "TradeRecord":
+        """MongoDB document → TradeRecord"""
+        return TradeRecord(
+            id=0,
+            symbol=doc.get("symbol", ""),
+            name=doc.get("name", ""),
+            direction=doc.get("direction", "long"),
+            entry_date=doc.get("entry_date", ""),
+            entry_price=doc.get("entry_price", 0.0),
+            entry_reason=doc.get("entry_reason", ""),
+            entry_signal=doc.get("entry_signal", ""),
+            exit_date=doc.get("exit_date", "") or "",
+            exit_price=doc.get("exit_price", 0.0),
+            exit_reason=doc.get("exit_reason", ""),
+            position_pct=doc.get("position_pct", 0.0),
+            shares=doc.get("shares", 0),
+            timing_score=doc.get("timing_score", 0),
+            position_score=doc.get("position_score", 0),
+            exit_score=doc.get("exit_score", 0),
+            error_type=doc.get("error_type", ""),
+            pnl_pct=doc.get("pnl_pct", 0.0),
+            pnl_amount=doc.get("pnl_amount", 0.0),
+            holding_days=doc.get("holding_days", 0),
+            notes=doc.get("notes", ""),
+            tags=doc.get("tags", ""),
+            created_at=doc.get("created_at", ""),
+            updated_at=doc.get("updated_at", ""),
+        )
 
     def score_trade(self, trade_id: int, timing: int = 0,
                     position: int = 0, exit: int = 0,
@@ -308,6 +387,19 @@ class TradeLog:
     def add_missed_signal(self, signal: MissedSignal) -> int:
         """记录遗漏的信号"""
         now = datetime.now().isoformat()
+
+        if self._use_mongo:
+            doc = {
+                "symbol": signal.symbol, "name": signal.name,
+                "signal_type": signal.signal_type, "signal_date": signal.signal_date,
+                "signal_price": signal.signal_price, "current_price": signal.current_price,
+                "max_price_after": signal.max_price_after,
+                "potential_pnl_pct": signal.potential_pnl_pct,
+                "created_at": now,
+            }
+            self._mongo_missed.insert_one(doc)
+            return 0
+
         with self._conn() as conn:
             cur = conn.execute("""
                 INSERT INTO missed_signals
@@ -324,6 +416,20 @@ class TradeLog:
 
     def list_missed_signals(self, limit: int = 30) -> List[MissedSignal]:
         """列出遗漏信号"""
+        if self._use_mongo:
+            cursor = self._mongo_missed.find({}).sort(
+                "signal_date", -1
+            ).limit(limit)
+            return [MissedSignal(
+                symbol=r.get("symbol", ""), name=r.get("name", ""),
+                signal_type=r.get("signal_type", ""),
+                signal_date=r.get("signal_date", ""),
+                signal_price=r.get("signal_price", 0.0),
+                current_price=r.get("current_price", 0.0),
+                max_price_after=r.get("max_price_after", 0.0),
+                potential_pnl_pct=r.get("potential_pnl_pct", 0.0),
+            ) for r in cursor]
+
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(

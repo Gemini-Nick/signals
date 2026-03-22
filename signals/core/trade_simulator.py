@@ -32,6 +32,13 @@ class SimConfig:
     trail_stop_pct: float = 50.0      # 移动止盈: 最高浮盈回撤 50% 触发
     max_hold_days: int = 20           # 最大持仓天数
     initial_capital: float = 100000   # 初始资金
+    # Phase 3: 高级出场
+    take_profit_pct: float = 0.0      # 固定止盈% (0=禁用)
+    ma_exit_period: int = 0           # 均线离场周期 (0=禁用)
+    profit_drawdown_pct: float = 0.0  # 利润回撤% (0=禁用)
+    batch_exit_enabled: bool = False  # 分批出场
+    batch_exit_ratios: list = field(default_factory=lambda: [0.5, 0.5])
+    batch_exit_targets: list = field(default_factory=lambda: [5.0, 10.0])
 
 
 @dataclass
@@ -157,15 +164,42 @@ def check_exit(
     day_high = float(bar["high"])
     holding_days = current_idx - entry_idx
 
-    # 1. 固定止损
+    # 1. 固定止损 (最高优先级)
     stop_price = entry_price * (1.0 - config.stop_loss_pct / 100.0)
     if day_low <= stop_price:
-        # 以止损价成交 (如果开盘就低于止损价，以开盘价成交)
         actual_exit = max(stop_price, float(bar["open"]))
         actual_exit *= (1.0 - config.slippage)
         return actual_exit, "stop_loss"
 
-    # 2. 移动止盈 (最高浮盈回撤 N%)
+    # 2. 固定止盈 (Phase 3)
+    if config.take_profit_pct > 0:
+        tp_price = entry_price * (1.0 + config.take_profit_pct / 100.0)
+        if day_high >= tp_price:
+            actual_exit = min(tp_price, day_high)
+            actual_exit *= (1.0 - config.slippage)
+            return actual_exit, "take_profit"
+
+    # 3. 利润回撤 (Phase 3: 绝对百分比)
+    if config.profit_drawdown_pct > 0 and max_high > entry_price:
+        peak_profit_pct = (max_high - entry_price) / entry_price * 100.0
+        current_profit_pct = (day_close - entry_price) / entry_price * 100.0
+        if peak_profit_pct > config.profit_drawdown_pct:
+            profit_loss = peak_profit_pct - current_profit_pct
+            if profit_loss >= config.profit_drawdown_pct:
+                exit_price = day_close * (1.0 - config.slippage)
+                return exit_price, "profit_drawdown"
+
+    # 4. 均线离场 (Phase 3)
+    if config.ma_exit_period > 0 and holding_days >= 3:
+        ma_start = max(0, current_idx - config.ma_exit_period + 1)
+        ma_slice = df.iloc[ma_start:current_idx + 1]["close"]
+        if len(ma_slice) >= config.ma_exit_period:
+            ma_val = float(ma_slice.mean())
+            if day_close < ma_val:
+                exit_price = day_close * (1.0 - config.slippage)
+                return exit_price, "ma_exit"
+
+    # 5. 移动止盈 (最高浮盈回撤 N%)
     if max_high > entry_price:
         max_profit = (max_high - entry_price) / entry_price * 100.0
         current_profit = (day_close - entry_price) / entry_price * 100.0
@@ -175,7 +209,7 @@ def check_exit(
                 exit_price = day_close * (1.0 - config.slippage)
                 return exit_price, "trail_stop"
 
-    # 3. 时间止损
+    # 6. 时间止损
     if holding_days >= config.max_hold_days:
         exit_price = day_close * (1.0 - config.slippage)
         return exit_price, "time_exit"

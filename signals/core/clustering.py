@@ -117,7 +117,7 @@ _ROTATION_OVERRIDE = {
 
 # ── 主题分类 ─────────────────────────────────────────────────
 
-def _classify_board(name: str) -> str:
+def _classify_board(name) -> str:
     """将板块名称归入主题类别（行业 + 概念通用）。
 
     优先级：
@@ -125,6 +125,8 @@ def _classify_board(name: str) -> str:
     2. THEME_KEYWORDS 关键词匹配（取命中数最多的主题）
     3. 未匹配 → "其他"
     """
+    if not isinstance(name, str) or not name:
+        return "其他"
     # 1. 精确匹配（先查例外表，再查轮动线大类）
     if name in _ROTATION_OVERRIDE:
         return _ROTATION_OVERRIDE[name]
@@ -161,47 +163,157 @@ def _strength_label(avg_gain: float) -> str:
 
 # ── 数据加载与预处理 ────────────────────────────────────────
 
-def _load_industry_df() -> pd.DataFrame:
-    """
-    获取行业数据：东财优先（4D 特征完整）→ CSV 缓存兜底。
-    不使用 THS 作为行业数据源（THS 概念板块单独聚类展示）。
-    """
-    import os
-    from signals.layers.industry import (
-        _fetch_board_industry_name_em,
-        _load_board_industry_cache,
-    )
-
-    # 1. 东财优先 — 有换手率/上涨下跌家数（4D 特征完整）
-    em_df = _fetch_board_industry_name_em()
-    if em_df is not None and not em_df.empty:
-        logger.info("聚类：东财数据 %d 个行业（4D）", len(em_df))
-        return em_df
-
-    # 2. CSV 缓存兜底 — gen_cache.py 预生成的东财快照
-    cache_df = _load_board_industry_cache()
-    if cache_df is not None and not cache_df.empty:
-        logger.info("聚类：CSV 缓存 %d 个行业", len(cache_df))
-        return cache_df
-
-    # 3. 硬路径兜底
-    csv_path = os.path.join(os.path.dirname(__file__), "../../.cache/board_industry.csv")
-    if os.path.exists(csv_path):
-        df = pd.read_csv(csv_path)
-        logger.info("聚类：硬路径 CSV 缓存 %d 个行业", len(df))
+def _fetch_sina_industry() -> pd.DataFrame:
+    """新浪行业数据源 — 实时涨跌幅，列名标准化为东财格式。"""
+    try:
+        import akshare as ak
+        df = ak.stock_sector_spot("行业")
+        if df is None or df.empty:
+            return pd.DataFrame()
+        # 标准化列名为东财格式
+        df = df.rename(columns={
+            "板块": "板块名称",
+            "涨跌幅": "涨跌幅",
+            "总成交量": "总成交量",
+            "总成交额": "总成交额",
+            "公司家数": "公司家数",
+        })
+        # 加排名列
+        df = df.sort_values("涨跌幅", ascending=False).reset_index(drop=True)
+        df["排名"] = range(1, len(df) + 1)
         return df
+    except Exception as e:
+        logger.warning("新浪行业数据失败: %s", e)
+        return pd.DataFrame()
 
-    logger.warning("聚类：无行业数据")
-    return pd.DataFrame()
+
+def _load_industry_df() -> tuple:
+    """
+    获取行业数据 — 多源合并模式。
+
+    从 board_ths / board_em / board_sina 三个 MongoDB 集合读取，
+    用 board_normalizer.merge_industry_sources() 合并互补字段。
+
+    盘中时先尝试实时 API，成功后存入对应集合；
+    非交易日/盘后直接从 MongoDB 读取。
+
+    Returns:
+        (DataFrame, fetch_meta) — fetch_meta 包含 source/data_date/update_time
+    """
+    from signals.data.mongo_fallback import (
+        get_latest_df, get_last_trading_day, is_any_market_live, save_snapshot,
+    )
+    from signals.data.board_normalizer import (
+        merge_industry_sources, normalize_ths_industry,
+        normalize_em_industry, normalize_sina_industry,
+    )
+    from datetime import datetime as _dt
+
+    live = is_any_market_live()
+    trading_day = get_last_trading_day()
+    update_time = _dt.now().strftime("%m-%d %H:%M")
+
+    # 盘中：先尝试实时源，成功的 normalize 后存入对应集合
+    if live:
+        _try_realtime_fetch("board_em", _fetch_em_for_cluster, normalize_em_industry)
+        _try_realtime_fetch("board_ths", _fetch_ths_for_cluster, normalize_ths_industry)
+        _try_realtime_fetch("board_sina", _fetch_sina_industry, normalize_sina_industry)
+
+    # 从 MongoDB 读各源最新数据
+    dfs = {}
+    sources_used = []
+    source_details = []  # 记录具体来源：api/mongodb
+
+    for src, col in [("em", "board_em"), ("ths", "board_ths"), ("sina", "board_sina")]:
+        df = get_latest_df(col)
+        if df is not None and not df.empty:
+            dfs[src] = df
+            # 判断是实时还是历史
+            src_label = {"em": "东财", "ths": "THS", "sina": "新浪"}[src]
+            if live:
+                source_details.append(f"{src_label}(实时API)")
+            else:
+                source_details.append(f"{src_label}(MongoDB历史)")
+            sources_used.append(src)
+
+    meta = {
+        "source": " + ".join(source_details) if source_details else "无数据",
+        "data_date": trading_day,
+        "update_time": update_time,
+    }
+
+    if not dfs:
+        logger.warning("聚类：所有数据源均无数据")
+        return pd.DataFrame(), meta
+
+    # 合并多源
+    merged = merge_industry_sources(dfs)
+    logger.info("聚类：获取到 %d 个行业 (源: %s)", len(merged), meta["source"])
+    return merged, meta
+
+
+def _fetch_em_for_cluster():
+    """东财行业排行（供聚类用）"""
+    try:
+        from signals.layers.industry import _fetch_board_industry_name_em
+        return _fetch_board_industry_name_em()
+    except Exception:
+        return None
+
+
+def _fetch_ths_for_cluster():
+    """THS 行业排行（供聚类用）"""
+    try:
+        import akshare as ak
+        return ak.stock_board_industry_summary_ths()
+    except Exception:
+        return None
+
+
+def _try_realtime_fetch(collection, fetch_fn, normalize_fn):
+    """尝试实时获取 → normalize → 存入 MongoDB。"""
+    from signals.data.mongo_fallback import save_snapshot, get_last_trading_day
+    try:
+        raw = fetch_fn()
+        if raw is None or (isinstance(raw, pd.DataFrame) and raw.empty):
+            return
+        normalized = normalize_fn(raw)
+        if normalized is not None and not normalized.empty:
+            trading_day = get_last_trading_day()
+            normalized["dt"] = trading_day
+            docs = normalized.to_dict("records")
+            save_snapshot(collection, docs, dedup={"dt": trading_day})
+            logger.info("聚类：%s 实时获取成功 (%d 条)", collection, len(docs))
+    except Exception as e:
+        logger.debug("聚类：%s 实时获取失败: %s", collection, e)
+
+
+def _save_industry_snapshot(df: pd.DataFrame, source: str):
+    """保存行业数据快照到 MongoDB"""
+    from signals.data.mongo_fallback import save_snapshot
+    try:
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        docs = []
+        for _, row in df.iterrows():
+            doc = {"dt": today, "source": source}
+            for col in df.columns:
+                doc[col] = row[col]
+            docs.append(doc)
+        save_snapshot("board_ranking", docs, dedup={"dt": today, "source": source})
+    except Exception as e:
+        logger.debug("保存行业快照失败: %s", e)
 
 
 def _dedup_boards(df: pd.DataFrame) -> pd.DataFrame:
     """去重 Ⅱ/Ⅲ 同名板块（涨幅差 < 0.05 的保留排名靠前的）。"""
-    if "板块名称" not in df.columns:
+    # 兼容新旧列名
+    name_col = "board_name" if "board_name" in df.columns else (
+        "板块名称" if "板块名称" in df.columns else None)
+    if not name_col:
         return df
 
     df = df.copy()
-    df["_base_name"] = df["板块名称"].apply(lambda x: re.sub(r'[ⅡⅢⅣ]$', '', str(x).strip()))
+    df["_base_name"] = df[name_col].apply(lambda x: re.sub(r'[ⅡⅢⅣ]$', '', str(x).strip()))
 
     # 找出需要去重的
     change_col = _find_change_col(df)
@@ -279,7 +391,12 @@ def cluster_industries(top_n: int = 3, **_kw) -> dict:
     :param top_n: 返回 Top N 强势主题
     :return: {top: [...], all_clusters: [...], meta: {...}}
     """
-    df = _load_industry_df()
+    df_result = _load_industry_df()
+    # _load_industry_df 返回 (df, fetch_meta) 元组
+    if isinstance(df_result, tuple):
+        df, fetch_meta = df_result
+    else:
+        df, fetch_meta = df_result, {}
     if df is None or (isinstance(df, pd.DataFrame) and df.empty):
         return {"top": [], "all_clusters": [], "meta": {"error": "无行业数据"}}
 
@@ -287,44 +404,57 @@ def cluster_industries(top_n: int = 3, **_kw) -> dict:
     df = _dedup_boards(df)
     total_boards = len(df)
 
-    # 列名探测
-    name_col = "板块名称" if "板块名称" in df.columns else df.columns[1]
-    change_col = _find_change_col(df)
+    # 列名探测 — 兼容新统一格式 (board_name/change_pct) 和旧格式 (板块名称/涨跌幅)
+    name_col = "board_name" if "board_name" in df.columns else (
+        "板块名称" if "板块名称" in df.columns else df.columns[1])
+
+    # 涨跌幅列
+    if "change_pct" in df.columns:
+        change_col = "change_pct"
+    else:
+        change_col = _find_change_col(df)
     if not change_col:
         return {"top": [], "all_clusters": [], "meta": {"error": "找不到涨跌幅列"}}
 
     df["_pct_change"] = pd.to_numeric(df[change_col], errors="coerce").fillna(0)
 
-    # 广度
-    has_breadth = "上涨家数" in df.columns and "下跌家数" in df.columns
-    if has_breadth:
-        up = pd.to_numeric(df["上涨家数"], errors="coerce").fillna(0)
-        down = pd.to_numeric(df["下跌家数"], errors="coerce").fillna(0)
+    # 广度 — 兼容 up_count/down_count (新) 和 上涨家数/下跌家数 (旧)
+    up_col = "up_count" if "up_count" in df.columns else ("上涨家数" if "上涨家数" in df.columns else "")
+    dn_col = "down_count" if "down_count" in df.columns else ("下跌家数" if "下跌家数" in df.columns else "")
+    if up_col and dn_col:
+        up = pd.to_numeric(df[up_col], errors="coerce").fillna(0)
+        down = pd.to_numeric(df[dn_col], errors="coerce").fillna(0)
         total = up + down
         df["_breadth"] = np.where(total > 0, up / total, 0.5)
+        has_breadth = True
     else:
         df["_breadth"] = 0.5
+        has_breadth = False
 
-    # 换手率
-    if "换手率" in df.columns:
-        df["_turnover"] = pd.to_numeric(df["换手率"], errors="coerce").fillna(0)
+    # 换手率 — 兼容 turnover_pct (新) 和 换手率 (旧)
+    turnover_col = "turnover_pct" if "turnover_pct" in df.columns else (
+        "换手率" if "换手率" in df.columns else "")
+    if turnover_col:
+        df["_turnover"] = pd.to_numeric(df[turnover_col], errors="coerce").fillna(0)
     else:
         df["_turnover"] = 0.0
 
-    # 领涨差
-    leader_col = "领涨股票-涨跌幅" if "领涨股票-涨跌幅" in df.columns else (
-        "领涨股-涨跌幅" if "领涨股-涨跌幅" in df.columns else "")
+    # 领涨差 — 兼容 leader_change_pct (新) 和 领涨股票-涨跌幅 (旧)
+    leader_col = "leader_change_pct" if "leader_change_pct" in df.columns else (
+        "领涨股票-涨跌幅" if "领涨股票-涨跌幅" in df.columns else (
+            "领涨股-涨跌幅" if "领涨股-涨跌幅" in df.columns else ""))
     if leader_col:
         leader_val = pd.to_numeric(df[leader_col], errors="coerce").fillna(0)
         df["_leader_spread"] = leader_val - df["_pct_change"]
     else:
         df["_leader_spread"] = 0.0
 
-    leader_name_col = "领涨股票" if "领涨股票" in df.columns else (
-        "领涨股" if "领涨股" in df.columns else "")
+    leader_name_col = "leader_name" if "leader_name" in df.columns else (
+        "领涨股票" if "领涨股票" in df.columns else (
+            "领涨股" if "领涨股" in df.columns else ""))
 
     # 数据源标识
-    source = "东财" if "换手率" in df.columns else "CSV缓存"
+    source = fetch_meta.get("source", "未知")
 
     # ── 核心：主题分类 + groupby 聚合 ──
     df["_theme"] = df[name_col].apply(_classify_board)
@@ -346,13 +476,16 @@ def cluster_industries(top_n: int = 3, **_kw) -> dict:
                 "name": str(row[name_col]),
                 "gain_pct": round(float(row["_pct_change"]), 2),
             }
-            if has_breadth:
-                m["up_count"] = int(row.get("上涨家数", 0)) if "上涨家数" in group.columns else 0
-                m["down_count"] = int(row.get("下跌家数", 0)) if "下跌家数" in group.columns else 0
+            if has_breadth and up_col and dn_col:
+                _up = row.get(up_col, 0)
+                _dn = row.get(dn_col, 0)
+                m["up_count"] = int(_up) if pd.notna(_up) else 0
+                m["down_count"] = int(_dn) if pd.notna(_dn) else 0
             if leader_name_col and leader_name_col in group.columns:
                 m["leader"] = str(row[leader_name_col])
             if leader_col and leader_col in group.columns:
-                m["leader_gain"] = round(float(pd.to_numeric(row[leader_col], errors="coerce") or 0), 2)
+                _lg = pd.to_numeric(row[leader_col], errors="coerce")
+                m["leader_gain"] = round(float(_lg), 2) if pd.notna(_lg) else 0.0
             member_list.append(m)
 
         # 按涨幅排序
@@ -362,14 +495,17 @@ def cluster_industries(top_n: int = 3, **_kw) -> dict:
         strength = _strength_label(avg_gain)
         label = f"{theme}（{strength}）"
 
+        def _safe(v, decimals=2):
+            return round(float(v), decimals) if pd.notna(v) else 0.0
+
         cluster_stats.append({
             "cluster_id": cid,
             "label": label,
             "size": len(group),
-            "avg_gain": round(avg_gain, 2),
-            "avg_breadth": round(avg_breadth, 3),
-            "avg_turnover": round(avg_turnover, 2),
-            "avg_leader_spread": round(avg_leader_spread, 2),
+            "avg_gain": _safe(avg_gain),
+            "avg_breadth": _safe(avg_breadth, 3),
+            "avg_turnover": _safe(avg_turnover),
+            "avg_leader_spread": _safe(avg_leader_spread),
             "members": member_list,
         })
 
@@ -377,12 +513,15 @@ def cluster_industries(top_n: int = 3, **_kw) -> dict:
     ranked = _rank_clusters(cluster_stats)
 
     now = datetime.now()
+    trading_day = fetch_meta.get("data_date", now.strftime("%Y-%m-%d"))
+    update_time = fetch_meta.get("update_time", now.strftime("%m-%d %H:%M"))
     return {
         "top": ranked[:top_n],
         "all_clusters": ranked,
         "meta": {
-            "date": now.strftime("%Y-%m-%d"),
+            "date": trading_day,
             "timestamp": now.isoformat(),
+            "update_time": update_time,
             "total_boards": total_boards,
             "deduped_boards": len(df),
             "n_themes": len(ranked),
@@ -452,10 +591,22 @@ def cluster_concepts(top_n: int = 3, **_kw) -> dict:
     else:
         df["_leader_spread"] = 0.0
 
-    # 数据源标识
-    source = "概念(新浪/东财)"
-    if rankings and hasattr(rankings[0], "tag") and rankings[0].tag == "ths":
-        source = "概念(THS)"
+    # 数据源标识 — 从 rankings 的 tag 属性获取真实源
+    from signals.data.mongo_fallback import is_any_market_live as _live_check
+    _live = _live_check()
+    source = "概念(未知)"
+    if rankings:
+        tag = getattr(rankings[0], "tag", None) or getattr(rankings[0], "source", None)
+        if tag == "ths":
+            source = "THS(实时API)" if _live else "THS(MongoDB历史)"
+        elif tag == "sina":
+            source = "新浪(实时API)" if _live else "新浪(MongoDB历史)"
+        elif tag == "em":
+            source = "东财(实时API)" if _live else "东财(MongoDB历史)"
+        elif tag == "mongo":
+            source = "MongoDB(历史)"
+        else:
+            source = "新浪/东财"
 
     # ── 核心：主题分类 + groupby 聚合 ──
     df["_theme"] = df["name"].apply(_classify_board)
@@ -471,28 +622,37 @@ def cluster_concepts(top_n: int = 3, **_kw) -> dict:
 
         member_list = []
         for _, row in group.iterrows():
+            _name = row["name"]
+            if not isinstance(_name, str) or not _name:
+                continue
+            _gpct = row["gain_pct"]
             m = {
-                "name": row["name"],
-                "gain_pct": round(float(row["gain_pct"]), 2),
-                "type": _classify_board(row["name"]),  # 用主题替代旧 sector_type
+                "name": _name,
+                "gain_pct": round(float(_gpct), 2) if pd.notna(_gpct) else 0.0,
+                "type": _classify_board(_name),
             }
-            if row["leading_stock"]:
-                m["leader"] = row["leading_stock"]
-            if row["leading_gain"] != 0:
-                m["leader_gain"] = round(float(row["leading_gain"]), 2)
+            _leader = row.get("leading_stock")
+            if _leader and isinstance(_leader, str):
+                m["leader"] = _leader
+            _lg = row.get("leading_gain", 0)
+            if pd.notna(_lg) and _lg != 0:
+                m["leader_gain"] = round(float(_lg), 2)
             member_list.append(m)
         member_list.sort(key=lambda m: m["gain_pct"], reverse=True)
 
-        strength = _strength_label(avg_gain)
+        def _safe(v, decimals=2):
+            return round(float(v), decimals) if pd.notna(v) else 0.0
+
+        strength = _strength_label(avg_gain if pd.notna(avg_gain) else 0)
         label = f"{theme}（{strength}）"
 
         cluster_stats.append({
             "cluster_id": cid,
             "label": label,
             "size": len(group),
-            "avg_gain": round(avg_gain, 2),
-            "avg_breadth": round(avg_breadth, 3),
-            "avg_turnover": round(avg_turnover, 2),
+            "avg_gain": _safe(avg_gain),
+            "avg_breadth": _safe(avg_breadth, 3),
+            "avg_turnover": _safe(avg_turnover),
             "avg_leader_spread": 0,
             "members": member_list,
         })
@@ -500,12 +660,16 @@ def cluster_concepts(top_n: int = 3, **_kw) -> dict:
     ranked = _rank_clusters(cluster_stats)
     now = datetime.now()
 
+    from signals.data.mongo_fallback import get_last_trading_day
+    trading_day = get_last_trading_day()
+
     return {
         "top": ranked[:top_n],
         "all_clusters": ranked,
         "meta": {
-            "date": now.strftime("%Y-%m-%d"),
+            "date": trading_day,
             "timestamp": now.isoformat(),
+            "update_time": now.strftime("%m-%d %H:%M"),
             "total_concepts": len(df),
             "n_themes": len(ranked),
             "valid_clusters": len(ranked),

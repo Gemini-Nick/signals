@@ -6,7 +6,7 @@
   <title>隆小侠 Web2</title>
   <link rel="stylesheet" href="/static/css/themes.css">
   <link rel="stylesheet" href="/static/css/app.css">
-  <script src="https://unpkg.com/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="/static/js/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
   <!-- ── 顶栏 ──────────────────────────────────────── -->
@@ -15,7 +15,7 @@
       <span class="logo">🐲 隆小侠</span>
       <nav class="tabs">
         <button class="tab active" data-page="cluster">行业聚类</button>
-        <button class="tab" data-page="backtest">MACD 回测</button>
+        <button class="tab" data-page="backtest">回测工作台</button>
       </nav>
     </div>
     <div class="header-right">
@@ -27,11 +27,10 @@
   <div id="page-cluster" class="page active">
     <div class="page-toolbar">
       <h2>行业板块聚类分析</h2>
-      <div class="toolbar-actions">
-        <span id="cluster-meta" class="meta-text"></span>
-        <button id="cluster-refresh" class="btn btn-sm">刷新</button>
-      </div>
+      <button id="cluster-refresh" class="btn btn-sm">刷新</button>
     </div>
+    <!-- 信息面板：交易日 + 数据源 + 市场状态 -->
+    <div id="cluster-meta" class="cluster-info-panel"></div>
     <!-- 行业板块聚类（东财数据源） -->
     <div class="section-label">行业板块 <span class="source-badge" id="industry-source"></span></div>
     <div id="cluster-cards" class="cluster-cards"></div>
@@ -43,57 +42,243 @@
     <div id="cluster-history" class="cluster-history"></div>
   </div>
 
-  <!-- ── MACD 回测页 ──────────────────────────────── -->
+  <!-- ── 回测工作台页 ──────────────────────────────── -->
   <div id="page-backtest" class="page">
+    <!-- 控制栏 -->
     <div class="bt-header">
       <div class="bt-input-row">
-        <input id="bt-code" type="text" placeholder="股票代码 (如 002759)" class="input">
-        <select id="bt-freq" class="input">
+        <input id="bt-code" type="text" placeholder="股票代码 (如 002759)" class="bt-code-input">
+        <select id="bt-freq" class="bt-select">
           <option value="daily">日线</option>
           <option value="weekly">周线</option>
         </select>
-        <select id="bt-group" class="input">
-          <option value="all">全部信号</option>
-          <option value="macd">仅 MACD</option>
-          <option value="czsc">仅缠论</option>
+        <select id="bt-signal-type" class="bt-select">
+          <optgroup label="经典信号">
+            <option value="all">全部信号</option>
+            <option value="macd">MACD</option>
+            <option value="czsc">缠论</option>
+          </optgroup>
+          <optgroup label="入场因子">
+            <option value="gap">跳空缺口</option>
+            <option value="trend_breakout">趋势突破</option>
+            <option value="vol_contraction">波动收缩</option>
+          </optgroup>
         </select>
-        <button id="bt-run" class="btn btn-primary">运行回测</button>
-        <button id="bt-sim" class="btn" style="background:#e040fb;border-color:#e040fb;color:#fff;">模拟交易</button>
+        <button id="bt-analyze" class="btn btn-analyze">运行分析</button>
+        <button id="bt-export" class="btn btn-sm btn-export" title="导出 CSV" style="display:none;">⬇ 导出</button>
+        <span id="bt-status" class="bt-status-text"></span>
       </div>
-      <!-- 模拟参数行 -->
-      <div class="bt-input-row" id="bt-sim-params" style="display:none; margin-top:6px;">
-        <label style="font-size:12px;color:var(--text-secondary);">止损%</label>
-        <input type="number" id="bt-stop-loss" class="bt-param-input" value="5" min="1" max="20" step="0.5" />
-        <label style="font-size:12px;color:var(--text-secondary);">移动止盈回撤%</label>
-        <input type="number" id="bt-trail-stop" class="bt-param-input" value="50" min="10" max="90" step="5" />
-        <label style="font-size:12px;color:var(--text-secondary);">最大持仓日</label>
-        <input type="number" id="bt-max-hold" class="bt-param-input" value="20" min="3" max="60" step="1" />
-        <label style="font-size:12px;color:var(--text-secondary);">滑点%</label>
-        <input type="number" id="bt-slippage" class="bt-param-input" value="0.1" min="0" max="1" step="0.05" />
+
+      <!-- 因子参数行（按选择的因子动态显示） -->
+      <div class="bt-input-row bt-factor-params" id="bt-factor-params" style="display:none;">
+        <!-- gap 参数 -->
+        <div class="bt-param-group" data-factor="gap">
+          <label>跳空幅度%</label>
+          <input type="number" id="bt-gap-pct" class="bt-param-input" value="2" min="0.5" max="10" step="0.5">
+          <label>量比≥</label>
+          <input type="number" id="bt-gap-vol-ratio" class="bt-param-input" value="1.5" min="1" max="5" step="0.1">
+        </div>
+        <!-- trend_breakout 参数 -->
+        <div class="bt-param-group" data-factor="trend_breakout">
+          <label>回看天数</label>
+          <input type="number" id="bt-trend-lookback" class="bt-param-input" value="20" min="5" max="120" step="5">
+          <label>量比≥</label>
+          <input type="number" id="bt-trend-vol-ratio" class="bt-param-input" value="1.3" min="1" max="5" step="0.1">
+        </div>
+        <!-- vol_contraction 参数 -->
+        <div class="bt-param-group" data-factor="vol_contraction">
+          <label>BB周期</label>
+          <input type="number" id="bt-bb-period" class="bt-param-input" value="20" min="10" max="60" step="5">
+          <label>挤压阈值</label>
+          <input type="number" id="bt-squeeze-thresh" class="bt-param-input" value="0.05" min="0.01" max="0.2" step="0.01">
+        </div>
       </div>
+
+      <!-- 日期快捷跳转 -->
       <div id="bt-presets" class="preset-chips"></div>
     </div>
-    <div id="bt-kpis" class="bt-kpis"></div>
-    <div id="bt-chart-container" style="height:520px;"></div>
-    <!-- 模拟交易结果区域 -->
-    <div id="bt-sim-section" style="display:none;">
-      <div class="section-title">模拟交易 KPI</div>
-      <div id="bt-sim-kpis" class="bt-kpis"></div>
-      <div class="section-title">资金曲线</div>
-      <div id="bt-equity-container" style="height:250px; position:relative;"></div>
-      <div class="section-title">交易记录 <span id="bt-trade-count" style="font-size:12px;color:var(--text-muted);font-weight:400;"></span></div>
-      <div id="bt-trade-list" class="bt-signal-list-wrapper"></div>
-      <div id="bt-skip-reasons" style="margin-top:8px;"></div>
+
+    <!-- ⚙️ 模拟参数折叠面板 -->
+    <div class="bt-section" id="bt-sim-section-config">
+      <div class="bt-section-header" onclick="toggleExpander('bt-sim-expander')">
+        <span>⚙️ 模拟参数</span>
+        <span class="bt-toggle-icon" id="bt-sim-expander-icon">▶</span>
+      </div>
+      <div class="bt-expander" id="bt-sim-expander">
+        <!-- Row 1: 基础风控 -->
+        <div class="bt-param-row">
+          <div class="bt-param-cell">
+            <label>止损%</label>
+            <input type="number" id="bt-stop-loss" class="bt-param-input" value="5" min="1" max="20" step="0.5">
+          </div>
+          <div class="bt-param-cell">
+            <label>移动止盈回撤%</label>
+            <input type="number" id="bt-trail-stop" class="bt-param-input" value="50" min="10" max="90" step="5">
+          </div>
+          <div class="bt-param-cell">
+            <label>最大持仓日</label>
+            <input type="number" id="bt-max-hold" class="bt-param-input" value="20" min="3" max="60" step="1">
+          </div>
+          <div class="bt-param-cell">
+            <label>滑点%</label>
+            <input type="number" id="bt-slippage" class="bt-param-input" value="0.1" min="0" max="1" step="0.05">
+          </div>
+        </div>
+        <!-- Row 2: 高级出场 -->
+        <div class="bt-param-row">
+          <div class="bt-param-cell">
+            <label>固定止盈%</label>
+            <input type="number" id="bt-take-profit" class="bt-param-input" value="0" min="0" max="50" step="1">
+          </div>
+          <div class="bt-param-cell">
+            <label>均线离场周期</label>
+            <input type="number" id="bt-ma-exit" class="bt-param-input" value="0" min="0" max="120" step="5">
+          </div>
+          <div class="bt-param-cell">
+            <label>利润回撤%</label>
+            <input type="number" id="bt-profit-dd" class="bt-param-input" value="0" min="0" max="30" step="1">
+          </div>
+        </div>
+        <!-- Row 3: 分批出场 -->
+        <div class="bt-param-row">
+          <div class="bt-param-cell" style="flex:0 0 auto;">
+            <label>
+              <input type="checkbox" id="bt-batch-exit"> 分批出场
+            </label>
+          </div>
+          <div class="bt-param-cell bt-batch-fields" style="display:none;">
+            <label>第1批仓位%</label>
+            <input type="number" id="bt-batch1-ratio" class="bt-param-input" value="50" min="10" max="90" step="10">
+          </div>
+          <div class="bt-param-cell bt-batch-fields" style="display:none;">
+            <label>第1批目标%</label>
+            <input type="number" id="bt-batch1-target" class="bt-param-input" value="5" min="1" max="30" step="1">
+          </div>
+          <div class="bt-param-cell bt-batch-fields" style="display:none;">
+            <label>第2批目标%</label>
+            <input type="number" id="bt-batch2-target" class="bt-param-input" value="10" min="2" max="50" step="1">
+          </div>
+        </div>
+      </div>
     </div>
-    <div class="section-title">信号明细</div>
-    <div id="bt-signal-list" class="bt-signal-list-wrapper"></div>
+
+    <!-- 🔎 参数扫描折叠面板 -->
+    <div class="bt-section" id="bt-scan-section">
+      <div class="bt-section-header" onclick="toggleExpander('bt-scan-expander')">
+        <span>🔎 参数敏感性扫描</span>
+        <span class="bt-toggle-icon" id="bt-scan-expander-icon">▶</span>
+      </div>
+      <div class="bt-expander" id="bt-scan-expander">
+        <div class="bt-param-row">
+          <div class="bt-param-cell">
+            <label>维度1</label>
+            <select id="bt-scan-param1" class="bt-select">
+              <option value="">不扫描</option>
+              <option value="stop_loss_pct">止损%</option>
+              <option value="trail_stop_pct">移动止盈%</option>
+              <option value="max_hold_days">最大持仓日</option>
+              <option value="take_profit_pct">固定止盈%</option>
+            </select>
+          </div>
+          <div class="bt-param-cell">
+            <label>取值 (逗号分隔)</label>
+            <input type="text" id="bt-scan-values1" class="bt-code-input" placeholder="3,5,7,10" style="width:140px;">
+          </div>
+          <div class="bt-param-cell">
+            <label>维度2 (可选)</label>
+            <select id="bt-scan-param2" class="bt-select">
+              <option value="">无</option>
+              <option value="stop_loss_pct">止损%</option>
+              <option value="trail_stop_pct">移动止盈%</option>
+              <option value="max_hold_days">最大持仓日</option>
+              <option value="take_profit_pct">固定止盈%</option>
+            </select>
+          </div>
+          <div class="bt-param-cell">
+            <label>取值</label>
+            <input type="text" id="bt-scan-values2" class="bt-code-input" placeholder="30,50,70" style="width:140px;">
+          </div>
+          <div class="bt-param-cell">
+            <label>优化目标</label>
+            <select id="bt-scan-metric" class="bt-select">
+              <option value="sharpe">Sharpe</option>
+              <option value="win_rate">胜率</option>
+              <option value="expectancy">期望收益</option>
+              <option value="total_return_pct">总收益</option>
+            </select>
+          </div>
+          <div class="bt-param-cell" style="align-self:flex-end;">
+            <button id="bt-scan-run" class="btn btn-sm btn-scan">运行扫描</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- K 线图（始终可见） -->
+    <div id="bt-chart-container" style="height:520px;"></div>
+
+    <!-- Tab 化结果区域 -->
+    <div id="bt-result-area" style="display:none;">
+      <div class="bt-tabs">
+        <button class="bt-tab-btn active" data-tab="perf">📊 绩效总览</button>
+        <button class="bt-tab-btn" data-tab="equity">📈 资金曲线</button>
+        <button class="bt-tab-btn" data-tab="trades">📝 交易明细</button>
+        <button class="bt-tab-btn" data-tab="signals">🔍 信号详情</button>
+        <button class="bt-tab-btn" data-tab="scan">🔎 参数扫描</button>
+      </div>
+
+      <!-- Tab 1: 绩效总览（双栏：信号质量 + 交易模拟） -->
+      <div class="bt-tab-panel active" data-tab="perf">
+        <div class="bt-perf-grid">
+          <div class="bt-perf-section">
+            <div class="bt-perf-title">信号质量</div>
+            <div id="bt-kpis" class="bt-kpis"></div>
+            <div id="bt-kpi-bytype"></div>
+          </div>
+          <div class="bt-perf-section">
+            <div class="bt-perf-title">交易模拟</div>
+            <div id="bt-sim-kpis" class="bt-kpis"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab 2: 资金曲线 -->
+      <div class="bt-tab-panel" data-tab="equity">
+        <div id="bt-equity-container" style="height:280px; position:relative;"></div>
+      </div>
+
+      <!-- Tab 3: 交易明细 -->
+      <div class="bt-tab-panel" data-tab="trades">
+        <div id="bt-trade-summary" class="bt-trade-summary"></div>
+        <div id="bt-trade-list" class="bt-signal-list-wrapper"></div>
+        <div id="bt-skip-reasons" style="margin-top:8px;"></div>
+      </div>
+
+      <!-- Tab 4: 信号详情 -->
+      <div class="bt-tab-panel" data-tab="signals">
+        <div id="bt-signal-filter" class="bt-signal-filter">
+          <span class="bt-filter-label">筛选:</span>
+          <div id="bt-signal-filter-chips" class="bt-filter-chips"></div>
+          <span id="bt-signal-count" class="bt-filter-count"></span>
+        </div>
+        <div id="bt-signal-list" class="bt-signal-list-wrapper"></div>
+      </div>
+
+      <!-- Tab 5: 参数扫描 -->
+      <div class="bt-tab-panel" data-tab="scan">
+        <div id="bt-scan-best" class="bt-scan-best"></div>
+        <div id="bt-scan-chart" style="height:280px; position:relative;"></div>
+        <div id="bt-scan-heatmap" class="bt-heatmap"></div>
+        <div id="bt-scan-table" class="bt-signal-list-wrapper"></div>
+      </div>
+    </div>
   </div>
 
   <!-- ── Toast ──────────────────────────────────────── -->
   <div id="toast" class="toast"></div>
 
-  <script src="/static/js/app.js"></script>
-  <script src="/static/js/cluster.js"></script>
-  <script src="/static/js/backtest.js"></script>
+  <script src="/static/js/app.js?v=7"></script>
+  <script src="/static/js/cluster.js?v=7"></script>
+  <script src="/static/js/backtest.js?v=6"></script>
 </body>
 </html>

@@ -33,15 +33,23 @@ function toggleTheme() {
 }
 
 // ── API ────────────────────────────────────────────
-async function apiFetch(path) {
+async function apiFetch(path, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const resp = await fetch(path);
+    const resp = await fetch(path, { signal: controller.signal });
+    clearTimeout(timer);
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.error || `HTTP ${resp.status}`);
     }
     return await resp.json();
   } catch (e) {
+    clearTimeout(timer);
+    if (e.name === 'AbortError') {
+      showToast('请求超时，请重试');
+      throw new Error('请求超时');
+    }
     showToast(`请求失败: ${e.message}`);
     throw e;
   }

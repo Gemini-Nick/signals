@@ -40,7 +40,7 @@ async function loadCluster() {
       industryGrid.innerHTML = `<div class="cl-empty">${industry.meta.error}</div>`;
     } else {
       _renderClusterCards(industry.top, industryGrid);
-      _renderClusterMeta(industry.meta, status);
+      _renderClusterMeta(industry.meta, data.market_status, status);
       if (industrySrc) industrySrc.textContent = industry.meta?.source || '东财';
     }
 
@@ -125,16 +125,86 @@ function _renderClusterCards(clusters, container) {
   }).join('');
 }
 
-// ── 渲染元信息 ───────────────────────────────────────
-function _renderClusterMeta(meta, el) {
+// ── 渲染元信息（含市场状态）─────────────────────────
+function _renderClusterMeta(meta, marketStatus, el) {
   if (!meta) return;
-  const parts = [];
-  if (meta.date) parts.push(meta.date);
-  if (meta.source) parts.push(`数据源: ${meta.source}`);
-  if (meta.total_boards) parts.push(`${meta.total_boards} 板块`);
-  if (meta.n_clusters) parts.push(`${meta.n_clusters} 簇`);
-  if (meta.features) parts.push(`${meta.features.length}D特征`);
-  el.textContent = parts.join(' | ');
+
+  // 数据日期 + 星期
+  const dateStr = meta.date || '—';
+  let weekday = '';
+  try {
+    const d = new Date(dateStr + 'T00:00:00');
+    weekday = ['周日','周一','周二','周三','周四','周五','周六'][d.getDay()];
+  } catch(e) {}
+
+  // 市场精细状态
+  const ms = marketStatus || {};
+  const mkts = ms.markets || {};
+
+  // 当前时间
+  const now = new Date();
+  const nowStr = `${now.getMonth()+1}-${now.getDate()} ${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
+  const nowWeekday = ['周日','周一','周二','周三','周四','周五','周六'][now.getDay()];
+
+  // 数据源
+  const source = meta.source || '—';
+  const boards = meta.total_boards || meta.deduped_boards || '—';
+
+  // 渲染单个市场状态 pill
+  function _mkt(label, key) {
+    const m = mkts[key];
+    if (!m) return `<span class="mkt-pill mkt-off">${label} 🔴未知</span>`;
+    const detail = m.detail ? `<span class="mkt-detail">${m.detail}</span>` : '';
+    const cls = m.icon === '🟢' ? 'mkt-on' : m.icon === '🟠' ? 'mkt-night' : m.icon === '🔵' ? 'mkt-pre' : m.icon === '🟡' ? 'mkt-pause' : 'mkt-off';
+    return `<span class="mkt-pill ${cls}">${m.icon} ${label} <b>${m.status}</b> ${detail}</span>`;
+  }
+
+  el.innerHTML = `
+    <div class="info-grid">
+      <div class="info-cell info-date">
+        <div class="info-label">最后交易日</div>
+        <div class="info-value"><strong>${dateStr}</strong> ${weekday}</div>
+      </div>
+      <div class="info-cell info-now">
+        <div class="info-label">当前时间</div>
+        <div class="info-value">${nowStr} ${nowWeekday}</div>
+      </div>
+      <div class="info-cell info-src">
+        <div class="info-label">数据源</div>
+        <div class="info-value">${source}</div>
+      </div>
+      <div class="info-cell info-count">
+        <div class="info-label">板块数</div>
+        <div class="info-value">${boards}</div>
+      </div>
+    </div>
+    <div class="mkt-status-grid">
+      <div class="mkt-group">
+        <div class="mkt-group-label">股票</div>
+        <div class="mkt-group-pills">
+          ${_mkt('A股', 'a_stock')}
+          ${_mkt('港股', 'hk_stock')}
+          ${_mkt('美股', 'us_stock')}
+        </div>
+      </div>
+      <div class="mkt-group">
+        <div class="mkt-group-label">期货</div>
+        <div class="mkt-group-pills">
+          ${_mkt('股指', 'a_index_futures')}
+          ${_mkt('商品', 'a_commodity_futures')}
+          ${_mkt('恒指', 'hk_futures')}
+          ${_mkt('美期', 'us_futures')}
+        </div>
+      </div>
+      <div class="mkt-group">
+        <div class="mkt-group-label">期权</div>
+        <div class="mkt-group-pills">
+          ${_mkt('A股期权', 'a_options')}
+          ${_mkt('美股期权', 'us_options')}
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 // ── 本周历史 ─────────────────────────────────────────

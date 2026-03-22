@@ -3,14 +3,19 @@
 信号回测验证引擎 —— 自我进化的核心
 
 三层架构：
-  SignalJournal    — 信号持久化（SQLite）
+  SignalJournal    — 信号持久化（MongoDB 优先，SQLite 降级）
   ForwardEvaluator — 单信号前瞻评估（多窗口收益 + MFE/MAE）
   BacktestReport   — 双视角统计报告（群组级 + 交易级）
 
 设计理念：
   信号发出 → 持久化 → N日后自动验证 → 用数据反哺权重
   这是将「拍脑袋的权重」变为「数据驱动的权重」的关键环节。
+
+数据存储：
+  MongoDB (跨设备): Mac 产生的信号可在云端/手机访问
+  SQLite  (降级):   无 MongoDB 时自动降级到本地 SQLite
 """
+import logging
 import os
 import sqlite3
 from collections import deque
@@ -19,6 +24,8 @@ from datetime import datetime, date
 from typing import Dict, List, Optional, Tuple
 
 import config
+
+logger = logging.getLogger("signals.core.backtest")
 
 
 # ─────────────────────────────────────────────────────────
@@ -89,23 +96,62 @@ class GroupStats:
 
 
 # ─────────────────────────────────────────────────────────
-# SignalJournal — 信号持久化
+# SignalJournal — 信号持久化（MongoDB 优先，SQLite 降级）
 # ─────────────────────────────────────────────────────────
+
+# MongoDB 信号文档字段列表（与 SQLite 表对齐）
+_SIGNAL_FIELDS = [
+    "symbol", "signal_date", "signal_type", "freq", "confidence",
+    "price", "total_score", "market_direction", "has_resonance",
+    "details", "created_at", "evaluated", "eval_date",
+    "return_t5", "return_t10", "return_t20",
+    "mfe", "mae", "mfe_day", "mae_day", "direction_correct",
+    "hit_target", "days_to_target",
+    "panic_score", "capitulation_score",  # Phase 2 恐慌字段
+]
+
+
+def _try_get_mongo_collection(collection_name: str):
+    """尝试获取 MongoDB collection，失败返回 None。"""
+    try:
+        if not getattr(config, "DB_ENABLED", False):
+            return None
+        from signals.sync.db import get_db
+        db = get_db()
+        db.command("ping")
+        return db[collection_name]
+    except Exception as e:
+        logger.debug(f"MongoDB {collection_name} 不可用，降级 SQLite: {e}")
+        return None
+
 
 class SignalJournal:
     """
-    信号日志存储（SQLite）。
+    信号日志存储（MongoDB 优先，SQLite 降级）。
+
+    MongoDB 模式: 跨设备共享（Mac/AutoDL/手机）
+    SQLite 模式:  离线降级（无 MongoDB 时自动切换）
 
     每次 screener/review 运行时调用 log_batch() 把检出信号存入。
-    INSERT OR IGNORE 防重复（同一标的+日期+类型+频率 唯一）。
+    唯一键: (symbol, signal_date, signal_type, freq)
     """
 
     def __init__(self, db_path: str = ""):
+        # 尝试 MongoDB
+        self._mongo_signals = _try_get_mongo_collection("signals")
+        self._mongo_pairs = _try_get_mongo_collection("trade_pairs") \
+            if self._mongo_signals else None
+        self._use_mongo = self._mongo_signals is not None
+
+        # SQLite 降级（总是初始化，作为备用）
         self._db_path = db_path or config.BACKTEST_DB_PATH
         os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
         self._conn = sqlite3.connect(self._db_path)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._ensure_tables()
+
+        backend = "MongoDB" if self._use_mongo else "SQLite"
+        logger.info(f"SignalJournal 后端: {backend}")
 
     def _ensure_tables(self):
         self._conn.executescript("""
@@ -161,10 +207,46 @@ class SignalJournal:
             );
         """)
 
+    # ── 写入 ─────────────────────────────────────────────
+
     def log_batch(self, records: List[SignalRecord]) -> int:
         """批量写入信号记录，返回新增条数。"""
         if not records:
             return 0
+        if self._use_mongo:
+            return self._mongo_log_batch(records)
+        return self._sqlite_log_batch(records)
+
+    def _mongo_log_batch(self, records: List[SignalRecord]) -> int:
+        from pymongo.errors import BulkWriteError
+        docs = []
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for r in records:
+            docs.append({
+                "symbol": r.symbol,
+                "signal_date": r.signal_date,
+                "signal_type": r.signal_type,
+                "freq": r.freq,
+                "confidence": r.confidence,
+                "price": r.price,
+                "total_score": r.total_score,
+                "market_direction": r.market_direction,
+                "has_resonance": r.has_resonance,
+                "details": r.details,
+                "created_at": now,
+                "evaluated": 0,
+            })
+        try:
+            result = self._mongo_signals.insert_many(docs, ordered=False)
+            return len(result.inserted_ids)
+        except BulkWriteError as e:
+            # 重复键忽略，返回成功插入数
+            return e.details.get("nInserted", 0)
+        except Exception as e:
+            logger.warning(f"MongoDB 写入失败，降级 SQLite: {e}")
+            return self._sqlite_log_batch(records)
+
+    def _sqlite_log_batch(self, records: List[SignalRecord]) -> int:
         inserted = 0
         with self._conn:
             for r in records:
@@ -185,9 +267,29 @@ class SignalJournal:
                     pass
         return inserted
 
+    # ── 读取 ─────────────────────────────────────────────
+
     def get_pending(self, min_age_days: int = 0) -> List[dict]:
         """获取待评估的信号记录（signal_date 距今 >= min_age_days）。"""
         min_age = min_age_days or config.BACKTEST_MIN_AGE_DAYS
+        if self._use_mongo:
+            return self._mongo_get_pending(min_age)
+        return self._sqlite_get_pending(min_age)
+
+    def _mongo_get_pending(self, min_age: int) -> List[dict]:
+        from datetime import timedelta
+        cutoff = (datetime.now() - timedelta(days=min_age)).strftime("%Y-%m-%d")
+        cursor = self._mongo_signals.find(
+            {"evaluated": 0, "signal_date": {"$lte": cutoff}},
+            {"_id": 0},
+        ).sort("signal_date", 1)
+        results = list(cursor)
+        # 添加 id 字段（MongoDB 用 _id，但外部接口需要 id）
+        for r in results:
+            r.setdefault("id", str(r.get("_id", "")))
+        return results
+
+    def _sqlite_get_pending(self, min_age: int) -> List[dict]:
         cur = self._conn.execute("""
             SELECT id, symbol, signal_date, signal_type, freq,
                    confidence, price, total_score, market_direction,
@@ -203,6 +305,25 @@ class SignalJournal:
     def get_evaluated(self, signal_type: str = "", freq: str = "",
                       market_direction: str = "") -> List[dict]:
         """获取已评估记录，支持按类型/频率/大势筛选。"""
+        if self._use_mongo:
+            return self._mongo_get_evaluated(signal_type, freq, market_direction)
+        return self._sqlite_get_evaluated(signal_type, freq, market_direction)
+
+    def _mongo_get_evaluated(self, signal_type, freq, market_direction) -> List[dict]:
+        query = {"evaluated": 1}
+        if signal_type:
+            query["signal_type"] = signal_type
+        if freq:
+            query["freq"] = freq
+        if market_direction:
+            query["market_direction"] = market_direction
+        cursor = self._mongo_signals.find(query, {"_id": 0}).sort("signal_date", 1)
+        results = list(cursor)
+        for r in results:
+            r.setdefault("id", 0)
+        return results
+
+    def _sqlite_get_evaluated(self, signal_type, freq, market_direction) -> List[dict]:
         sql = "SELECT * FROM signal_records WHERE evaluated = 1"
         params = []
         if signal_type:
@@ -219,8 +340,28 @@ class SignalJournal:
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-    def get_all_records(self, signal_type: str = "", freq: str = "") -> List[dict]:
+    def get_all_records(self, signal_type: str = "", freq: str = "",
+                        symbol: str = "") -> List[dict]:
         """获取所有记录（含未评估），用于买卖配对。"""
+        if self._use_mongo:
+            return self._mongo_get_all(signal_type, freq, symbol)
+        return self._sqlite_get_all(signal_type, freq)
+
+    def _mongo_get_all(self, signal_type, freq, symbol) -> List[dict]:
+        query = {}
+        if signal_type:
+            query["signal_type"] = signal_type
+        if freq:
+            query["freq"] = freq
+        if symbol:
+            query["symbol"] = symbol
+        cursor = self._mongo_signals.find(query, {"_id": 0}).sort("signal_date", 1)
+        results = list(cursor)
+        for r in results:
+            r.setdefault("id", 0)
+        return results
+
+    def _sqlite_get_all(self, signal_type, freq) -> List[dict]:
         sql = "SELECT * FROM signal_records WHERE 1=1"
         params = []
         if signal_type:
@@ -234,8 +375,49 @@ class SignalJournal:
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-    def update_evaluation(self, row_id: int, result: EvalResult):
+    # ── 更新 ─────────────────────────────────────────────
+
+    def update_evaluation(self, row_id, result: EvalResult):
         """将评估结果写回数据库。"""
+        if self._use_mongo:
+            self._mongo_update_eval(row_id, result)
+        else:
+            self._sqlite_update_eval(row_id, result)
+
+    def _mongo_update_eval(self, row_id, result: EvalResult):
+        # row_id 在 MongoDB 模式下是 signal 的唯一键组合
+        # 但为兼容现有流程，get_pending 返回的 dict 含 symbol+signal_date+signal_type+freq
+        update_doc = {
+            "$set": {
+                "evaluated": 1,
+                "eval_date": datetime.now().strftime("%Y-%m-%d"),
+                "return_t5": result.return_t5,
+                "return_t10": result.return_t10,
+                "return_t20": result.return_t20,
+                "mfe": result.mfe,
+                "mae": result.mae,
+                "mfe_day": result.mfe_day,
+                "mae_day": result.mae_day,
+                "direction_correct": result.direction_correct,
+                "hit_target": result.hit_target,
+                "days_to_target": result.days_to_target,
+            }
+        }
+        if isinstance(row_id, dict):
+            # 直接用记录字典中的唯一键查询
+            query = {
+                "symbol": row_id["symbol"],
+                "signal_date": row_id["signal_date"],
+                "signal_type": row_id["signal_type"],
+                "freq": row_id["freq"],
+            }
+        else:
+            # 兼容: 按 SQLite id 模式（不应发生在 MongoDB 模式）
+            logger.warning(f"MongoDB 模式下收到 SQLite row_id={row_id}")
+            return
+        self._mongo_signals.update_one(query, update_doc)
+
+    def _sqlite_update_eval(self, row_id: int, result: EvalResult):
         with self._conn:
             self._conn.execute("""
                 UPDATE signal_records SET
@@ -260,10 +442,38 @@ class SignalJournal:
                 result.days_to_target, row_id,
             ))
 
+    # ── 交易配对 ─────────────────────────────────────────
+
     def save_trade_pairs(self, pairs: List[TradePair]):
         """保存买卖配对。"""
         if not pairs:
             return
+        if self._use_mongo and self._mongo_pairs:
+            self._mongo_save_pairs(pairs)
+        else:
+            self._sqlite_save_pairs(pairs)
+
+    def _mongo_save_pairs(self, pairs: List[TradePair]):
+        from pymongo.errors import BulkWriteError
+        docs = [{
+            "symbol": p.symbol,
+            "buy_record_id": p.buy_record_id,
+            "sell_record_id": p.sell_record_id,
+            "buy_date": p.buy_date,
+            "sell_date": p.sell_date,
+            "buy_price": p.buy_price,
+            "sell_price": p.sell_price,
+            "buy_signal_type": p.buy_signal_type,
+            "sell_signal_type": p.sell_signal_type,
+            "holding_days": p.holding_days,
+            "return_pct": p.return_pct,
+        } for p in pairs]
+        try:
+            self._mongo_pairs.insert_many(docs, ordered=False)
+        except BulkWriteError:
+            pass
+
+    def _sqlite_save_pairs(self, pairs: List[TradePair]):
         with self._conn:
             for p in pairs:
                 try:
@@ -282,12 +492,22 @@ class SignalJournal:
 
     def get_trade_pairs(self) -> List[dict]:
         """获取所有买卖配对。"""
+        if self._use_mongo and self._mongo_pairs:
+            cursor = self._mongo_pairs.find({}, {"_id": 0}).sort("buy_date", 1)
+            return list(cursor)
         cur = self._conn.execute("SELECT * FROM trade_pairs ORDER BY buy_date")
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
+    # ── 统计与管理 ───────────────────────────────────────
+
     def summary(self) -> dict:
         """数据库概要统计。"""
+        if self._use_mongo:
+            total = self._mongo_signals.count_documents({})
+            evaluated = self._mongo_signals.count_documents({"evaluated": 1})
+            pending = total - evaluated
+            return {"total": total, "evaluated": evaluated, "pending": pending}
         cur = self._conn.execute("""
             SELECT
                 COUNT(*) as total,
@@ -297,6 +517,11 @@ class SignalJournal:
         """)
         row = cur.fetchone()
         return {"total": row[0], "evaluated": row[1], "pending": row[2]}
+
+    @property
+    def backend(self) -> str:
+        """当前使用的后端。"""
+        return "mongodb" if self._use_mongo else "sqlite"
 
     def close(self):
         self._conn.close()

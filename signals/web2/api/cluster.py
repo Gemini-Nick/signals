@@ -118,9 +118,26 @@ def get_latest(top: int = 3):
             "concept": {"top": [], "all_clusters": [], "meta": {}},
         }
 
+    # 市场状态（精细到盘前/午休/盘后/期货）
+    try:
+        from signals.core.market_hours import get_session_mode, get_market_detail
+        session = get_session_mode()
+        detail = get_market_detail()
+        market_status = {
+            "session_name": session.name,
+            "session_label": session.label,
+            "a_live": session.a_live,
+            "hk_live": session.hk_live,
+            "us_live": session.us_live,
+            "markets": detail,  # 每个市场精细状态
+        }
+    except Exception:
+        market_status = {"session_label": "未知", "a_live": False, "markets": {}}
+
     return {
         "industry": industry or {"top": [], "all_clusters": [], "meta": {"error": "行业数据加载中"}},
         "concept": concept or {"top": [], "all_clusters": [], "meta": {}},
+        "market_status": market_status,
     }
 
 

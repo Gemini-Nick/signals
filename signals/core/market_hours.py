@@ -95,6 +95,263 @@ def describe_sessions(now_utc: datetime = None) -> str:
     return " | ".join(parts)
 
 
+# ── 精细市场状态（含盘前/午休/盘后/期货）──────────────
+
+def get_market_detail(now_utc: datetime = None) -> dict:
+    """
+    返回每个市场的精细状态，供前端展示。
+
+    返回:
+        {
+            "a_stock":    {"status": "午休", "icon": "🟡", "detail": "11:30-13:00"},
+            "hk_stock":   {"status": "盘中", "icon": "🟢", "detail": "09:30-16:00"},
+            "us_stock":   {"status": "盘前", "icon": "🔵", "detail": "16:00-21:30 ET"},
+            "a_futures":  {"status": "交易中", "icon": "🟢", "detail": "IF/IC/IM 09:30-15:00"},
+            "hk_futures": {"status": "休市", "icon": "🔴", "detail": ""},
+            "us_futures": {"status": "交易中", "icon": "🟢", "detail": "ES/NQ 近24h"},
+        }
+    """
+    if now_utc is None:
+        now_utc = datetime.now(TZ_UTC)
+
+    now_bj = now_utc.astimezone(TZ_BEIJING)
+    now_et = now_utc.astimezone(TZ_US_EAST)
+    now_hk = now_bj  # 港股同北京时区
+    bj_t = now_bj.time()
+    et_t = now_et.time()
+    bj_wd = now_bj.weekday()
+    et_wd = now_et.weekday()
+
+    result = {}
+
+    # ── A 股 ──
+    result["a_stock"] = _detect_a_stock(bj_t, bj_wd)
+
+    # ── 港股 ──
+    result["hk_stock"] = _detect_hk_stock(bj_t, bj_wd)
+
+    # ── 美股 ──
+    result["us_stock"] = _detect_us_stock(et_t, et_wd)
+
+    # ── 期货 ──
+    result["a_index_futures"] = _detect_a_index_futures(bj_t, bj_wd)
+    result["a_commodity_futures"] = _detect_a_commodity_futures(bj_t, bj_wd)
+    result["hk_futures"] = _detect_hk_futures(bj_t, bj_wd)
+    result["us_futures"] = _detect_us_futures(et_t, et_wd)
+
+    # ── 期权 ──
+    result["a_options"] = _detect_a_options(bj_t, bj_wd)
+    result["us_options"] = _detect_us_options(et_t, et_wd)
+
+    return result
+
+
+def _detect_a_stock(bj_t, bj_wd):
+    """A 股精细状态"""
+    if bj_wd >= 5:
+        return {"status": "休市", "icon": "🔴", "detail": "周末"}
+
+    if bj_t < time(9, 15):
+        return {"status": "盘前", "icon": "🔵", "detail": "集合竞价 09:15"}
+    elif bj_t < time(9, 30):
+        return {"status": "集合竞价", "icon": "🟡", "detail": "09:15-09:30"}
+    elif bj_t < time(11, 30):
+        return {"status": "盘中", "icon": "🟢", "detail": "09:30-11:30"}
+    elif bj_t < time(13, 0):
+        return {"status": "午休", "icon": "🟡", "detail": "11:30-13:00"}
+    elif bj_t < time(15, 0):
+        return {"status": "盘中", "icon": "🟢", "detail": "13:00-15:00"}
+    else:
+        return {"status": "收盘", "icon": "🔴", "detail": "15:00 后"}
+
+
+def _detect_hk_stock(bj_t, bj_wd):
+    """港股精细状态（与北京时间相同）"""
+    if bj_wd >= 5:
+        return {"status": "休市", "icon": "🔴", "detail": "周末"}
+
+    if bj_t < time(9, 0):
+        return {"status": "盘前", "icon": "🔵", "detail": "开市前"}
+    elif bj_t < time(9, 30):
+        return {"status": "竞价时段", "icon": "🟡", "detail": "09:00-09:30"}
+    elif bj_t < time(12, 0):
+        return {"status": "早盘", "icon": "🟢", "detail": "09:30-12:00"}
+    elif bj_t < time(13, 0):
+        return {"status": "午休", "icon": "🟡", "detail": "12:00-13:00"}
+    elif bj_t < time(16, 0):
+        return {"status": "午盘", "icon": "🟢", "detail": "13:00-16:00"}
+    elif bj_t < time(16, 10):
+        return {"status": "收市竞价", "icon": "🟡", "detail": "16:00-16:10"}
+    else:
+        return {"status": "收盘", "icon": "🔴", "detail": "16:10 后"}
+
+
+def _detect_us_stock(et_t, et_wd):
+    """美股精细状态（Eastern Time）"""
+    if et_wd >= 5:
+        return {"status": "休市", "icon": "🔴", "detail": "周末"}
+
+    if et_t < time(4, 0):
+        return {"status": "休市", "icon": "🔴", "detail": ""}
+    elif et_t < time(9, 30):
+        return {"status": "盘前", "icon": "🔵", "detail": "04:00-09:30 ET"}
+    elif et_t < time(16, 0):
+        return {"status": "盘中", "icon": "🟢", "detail": "09:30-16:00 ET"}
+    elif et_t < time(20, 0):
+        return {"status": "盘后", "icon": "🔵", "detail": "16:00-20:00 ET"}
+    else:
+        return {"status": "收盘", "icon": "🔴", "detail": "20:00 ET 后"}
+
+
+def _detect_a_index_futures(bj_t, bj_wd):
+    """
+    A股股指期货（中金所）— IF/IC/IM/IH
+    交易时段: 09:30-11:30, 13:00-15:00（无夜盘）
+    """
+    if bj_wd >= 5:
+        return {"status": "休市", "icon": "🔴", "detail": "周末"}
+
+    if time(9, 30) <= bj_t < time(11, 30):
+        return {"status": "交易中", "icon": "🟢", "detail": "IF/IC/IM 09:30-11:30"}
+    elif time(11, 30) <= bj_t < time(13, 0):
+        return {"status": "午休", "icon": "🟡", "detail": "11:30-13:00"}
+    elif time(13, 0) <= bj_t < time(15, 0):
+        return {"status": "交易中", "icon": "🟢", "detail": "IF/IC/IM 13:00-15:00"}
+    elif time(15, 0) <= bj_t < time(15, 15):
+        return {"status": "交易中", "icon": "🟢", "detail": "国债T/TF 至15:15"}
+    else:
+        return {"status": "收盘", "icon": "🔴", "detail": "无夜盘"}
+
+
+def _detect_a_commodity_futures(bj_t, bj_wd):
+    """
+    A股商品期货 — 上期所/大商所/郑商所/广期所
+    日盘: 09:00-10:15, 10:30-11:30, 13:30-15:00
+    夜盘: 21:00-次日02:30（品种不同收盘时间不同）
+      - 铜/铝/锌等: 21:00-01:00
+      - 金/银: 21:00-02:30
+      - 螺纹/热卷等: 21:00-23:00
+    """
+    if bj_wd >= 5:
+        # 周六凌晨可能仍有周五夜盘
+        if bj_wd == 5 and bj_t < time(2, 30):
+            return {"status": "夜盘", "icon": "🟠", "detail": "周五夜盘至02:30"}
+        return {"status": "休市", "icon": "🔴", "detail": "周末"}
+
+    # 夜盘（跨日）
+    if time(21, 0) <= bj_t <= time(23, 59):
+        return {"status": "夜盘", "icon": "🟠", "detail": "21:00-02:30"}
+    if bj_t < time(2, 30):
+        return {"status": "夜盘", "icon": "🟠", "detail": "21:00-02:30"}
+
+    # 日盘
+    if time(9, 0) <= bj_t < time(10, 15):
+        return {"status": "交易中", "icon": "🟢", "detail": "09:00-10:15"}
+    elif time(10, 15) <= bj_t < time(10, 30):
+        return {"status": "小节休息", "icon": "🟡", "detail": "10:15-10:30"}
+    elif time(10, 30) <= bj_t < time(11, 30):
+        return {"status": "交易中", "icon": "🟢", "detail": "10:30-11:30"}
+    elif time(11, 30) <= bj_t < time(13, 30):
+        return {"status": "午休", "icon": "🟡", "detail": "11:30-13:30"}
+    elif time(13, 30) <= bj_t < time(15, 0):
+        return {"status": "交易中", "icon": "🟢", "detail": "13:30-15:00"}
+    else:
+        return {"status": "盘间休息", "icon": "🔴", "detail": "15:00-21:00"}
+
+
+def _detect_a_options(bj_t, bj_wd):
+    """
+    A股期权 — 50ETF/300ETF期权 + 沪深300指数期权(IO)
+    集合竞价: 09:15-09:25
+    交易: 09:30-11:30, 13:00-15:00（同A股，无夜盘）
+    """
+    if bj_wd >= 5:
+        return {"status": "休市", "icon": "🔴", "detail": "周末"}
+
+    if time(9, 15) <= bj_t < time(9, 25):
+        return {"status": "集合竞价", "icon": "🟡", "detail": "09:15-09:25"}
+    elif time(9, 30) <= bj_t < time(11, 30):
+        return {"status": "交易中", "icon": "🟢", "detail": "50ETF/300ETF/IO"}
+    elif time(11, 30) <= bj_t < time(13, 0):
+        return {"status": "午休", "icon": "🟡", "detail": "11:30-13:00"}
+    elif time(13, 0) <= bj_t < time(15, 0):
+        return {"status": "交易中", "icon": "🟢", "detail": "50ETF/300ETF/IO"}
+    else:
+        return {"status": "收盘", "icon": "🔴", "detail": ""}
+
+
+def _detect_hk_futures(bj_t, bj_wd):
+    """
+    港股期货（HKEX）— 恒指(HSI)/科指(HHIT)
+    日盘: 09:15-12:00, 13:00-16:30 (北京时间)
+    夜盘(T+1): 17:15-03:00 (次日北京时间)
+    """
+    if bj_wd >= 5:
+        # 周六凌晨可能仍有周五夜盘
+        if bj_wd == 5 and bj_t < time(3, 0):
+            return {"status": "夜盘", "icon": "🟠", "detail": "HSI 周五夜盘至03:00"}
+        return {"status": "休市", "icon": "🔴", "detail": "周末"}
+
+    if bj_t < time(3, 0):
+        return {"status": "夜盘", "icon": "🟠", "detail": "HSI T+1 17:15-03:00"}
+    elif bj_t < time(9, 15):
+        return {"status": "休市", "icon": "🔴", "detail": ""}
+    elif bj_t < time(12, 0):
+        return {"status": "日盘", "icon": "🟢", "detail": "HSI 09:15-12:00"}
+    elif bj_t < time(13, 0):
+        return {"status": "午休", "icon": "🟡", "detail": "12:00-13:00"}
+    elif bj_t < time(16, 30):
+        return {"status": "日盘", "icon": "🟢", "detail": "HSI 13:00-16:30"}
+    elif bj_t < time(17, 15):
+        return {"status": "休盘", "icon": "🟡", "detail": "16:30-17:15 过渡"}
+    else:
+        return {"status": "夜盘", "icon": "🟠", "detail": "HSI T+1 17:15-03:00"}
+
+
+def _detect_us_futures(et_t, et_wd):
+    """
+    美股期货（CME Globex）— ES/NQ/YM/RTY
+    交易: 周日18:00 - 周五17:00 ET（几乎24h，每日暂停 17:00-18:00 ET）
+    """
+    if et_wd == 5:
+        return {"status": "休市", "icon": "🔴", "detail": "周末"}
+
+    if et_wd == 6:
+        if et_t >= time(18, 0):
+            return {"status": "交易中", "icon": "🟢", "detail": "ES/NQ 周日18:00开盘"}
+        return {"status": "休市", "icon": "🔴", "detail": "18:00 ET 开盘"}
+
+    if time(17, 0) <= et_t < time(18, 0):
+        return {"status": "维护", "icon": "🟡", "detail": "暂停 17:00-18:00 ET"}
+
+    if et_wd == 4 and et_t >= time(17, 0):
+        return {"status": "周末休市", "icon": "🔴", "detail": "周五17:00 ET收盘"}
+
+    return {"status": "交易中", "icon": "🟢", "detail": "ES/NQ 近24h"}
+
+
+def _detect_us_options(et_t, et_wd):
+    """
+    美股期权（CBOE/各交易所）— 个股期权(NVDA等) + 指数期权(SPX/VIX)
+    常规: 09:30-16:00 ET
+    SPX/VIX 指数期权: 可延长至 16:15 ET
+    部分ETF期权(SPY/QQQ): 有盘前盘后（04:00-09:30, 16:00-17:30 ET）
+    """
+    if et_wd >= 5:
+        return {"status": "休市", "icon": "🔴", "detail": "周末"}
+
+    if time(4, 0) <= et_t < time(9, 30):
+        return {"status": "盘前", "icon": "🔵", "detail": "SPY/QQQ 04:00起"}
+    elif time(9, 30) <= et_t < time(16, 0):
+        return {"status": "交易中", "icon": "🟢", "detail": "NVDA/SPX 09:30-16:00"}
+    elif time(16, 0) <= et_t < time(16, 15):
+        return {"status": "延长", "icon": "🟢", "detail": "SPX/VIX 至16:15"}
+    elif time(16, 15) <= et_t < time(17, 30):
+        return {"status": "盘后", "icon": "🔵", "detail": "SPY/QQQ 至17:30"}
+    else:
+        return {"status": "收盘", "icon": "🔴", "detail": ""}
+
+
 def filter_index_codes(active: Set[Market],
                        ak_codes: dict,
                        futu_codes: dict,

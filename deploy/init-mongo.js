@@ -71,4 +71,45 @@ db.bar_cache.createIndex({ created_at: 1 }, { expireAfterSeconds: 86400 });
 
 print("✅ bar_cache collection created (TTL: 24h)");
 
+// ── 信号记录（迁移自 SQLite backtest.db）──────────────────────
+db.createCollection("signals");
+db.signals.createIndex(
+  { symbol: 1, signal_date: 1, signal_type: 1, freq: 1 },
+  { unique: true }
+);
+db.signals.createIndex({ evaluated: 1, signal_date: 1 });
+db.signals.createIndex({ signal_type: 1, freq: 1 });
+
+print("✅ signals collection created");
+
+// ── 交易配对 ──────────────────────────────────────────────────
+db.createCollection("trade_pairs");
+db.trade_pairs.createIndex({ symbol: 1, buy_date: 1 });
+db.trade_pairs.createIndex(
+  { buy_record_id: 1, sell_record_id: 1 },
+  { unique: true }
+);
+
+print("✅ trade_pairs collection created");
+
+// ── 交易日志（迁移自 SQLite trade_log.db）─────────────────────
+db.createCollection("trades");
+db.trades.createIndex({ symbol: 1, entry_date: -1 });
+db.trades.createIndex({ tags: 1 });
+
+print("✅ trades collection created");
+
+// ── 遗漏信号 ──────────────────────────────────────────────────
+db.createCollection("missed_signals");
+db.missed_signals.createIndex({ symbol: 1, signal_date: -1 });
+
+print("✅ missed_signals collection created");
+
+// ── 实验日志（迁移自 TSV）─────────────────────────────────────
+db.createCollection("experiments");
+db.experiments.createIndex({ timestamp: -1 });
+db.experiments.createIndex({ decision: 1 });
+
+print("✅ experiments collection created");
+
 print("🐲 MongoDB initialization complete — 隆小侠 ready");
