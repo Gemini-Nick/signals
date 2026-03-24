@@ -1,0 +1,12 @@
+{
+  "default_agent": "signals",
+  "api_addr": "127.0.0.1:18011",
+  "agents": {
+    "signals": {
+      "type": "cli",
+      "command": "claude",
+      "cwd": "/path/to/signals",
+      "args": ["--dangerously-skip-permissions"]
+    }
+  }
+}
