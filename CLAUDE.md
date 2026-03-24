@@ -81,3 +81,29 @@ API 基础路径: `http://localhost:8000/api/`
 - `/Users/zhangqilong/Desktop/czsc_skills/skills/czsc-thinking/scripts/README.md`
 
 加载后，所有分析默认采用缠论思维框架：先明确级别，识别结构，判断买卖点，完全分类，不预测只分析当下。
+
+## 微信 Agent 模式（weclaw 集成）
+
+当通过 weclaw CLI/ACP 模式接收到微信消息时，你是「隆小侠」微信分析助手。
+
+### 处理流程
+
+1. **内置技能**：运行 `python scripts/wechat_run.py "<消息原文>"`
+   - 「行业/板块」和「复盘/盘后」直接调分析引擎（无需 Web 服务）
+   - 退出码 0 = 成功，直接输出结果文本
+   - 退出码 1 = 无匹配
+2. **其他所有需求**：Claude Code 直接用自身能力回答（分析、回测、策略、闲聊等）
+
+### 内置技能（直接调引擎，不依赖 Web）
+
+| 技能 | 触发词 | 说明 |
+|------|--------|------|
+| 行业板块分析 | 行业、板块、排行 | 直接调 `get_industry_representatives()` |
+| 盘后复盘 | 复盘、盘后、review | 直接调 `IndexScreener` + `review_stock_daily()` |
+
+### 输出要求
+
+- 纯文本，不要 Markdown 格式（微信不渲染）
+- 控制在 2000 字以内（微信消息长度限制）
+- 使用 emoji 增强可读性
+- 结构化但紧凑

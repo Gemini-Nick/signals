@@ -5,7 +5,7 @@
 
 ---
 
-## 八大模块
+## 九大模块
 
 | 模块 | 路径 | 功能 |
 |------|------|------|
@@ -16,6 +16,7 @@
 | **Web** | `signals/web/` | 全功能 Web UI — 6 页 SPA + 9 个 API 路由（Dashboard/Chart/Stock/Review/Backtest/Analog） |
 | **Web2** | `signals/web2/` | 精简版 Web — 行业主题聚合 + MACD 回测（独立 FastAPI 应用） |
 | **Research** | `signals/research/` | 研报导入(MD/PDF/图片OCR) + 自动归档(notes/YYYY/MM/) + 时间衰减 |
+| **WeChat** | `signals/wechat/` | 微信 Agent 技能（weclaw + Claude Code CLI 集成） |
 | **Notify** | `signals/notify/` | 飞书推送（分析结果 + 行业聚类报告） |
 
 ---
@@ -139,6 +140,180 @@ backtest 每月运行 ──→ 读取已存档信号（≥20天前）──→ 
 
 ---
 
+## 微信 Agent — weclaw + Claude Code 完整工作流
+
+通过 weclaw 桥接微信消息到 Claude Code CLI，实现微信端的智能分析助手「隆小侠」。
+
+### 端到端工作流
+
+```
+                          ┌─────────────────────────────────────────────────┐
+                          │              Mac / 云服务器                      │
+                          │                                                 │
+ ┌────────┐   微信协议     │  ┌──────────┐                                   │
+ │  微信    │─────────────→│  │  weclaw   │   weclaw 常驻进程                 │
+ │  用户    │              │  │  serve    │   监听微信消息                     │
+ └────────┘              │  └────┬─────┘                                   │
+     ▲                    │       │                                         │
+     │                    │       │ 收到消息后 fork 子进程:                    │
+     │                    │       │ claude -p "<消息>" --cwd /path/to/signals│
+     │                    │       ▼                                         │
+     │                    │  ┌─────────────────────────────────────────┐    │
+     │                    │  │  Claude Code CLI (Max Plan)             │    │
+     │                    │  │                                         │    │
+     │                    │  │  ① 启动 → 读取 CLAUDE.md                │    │
+     │                    │  │     识别「微信 Agent 模式」指令           │    │
+     │                    │  │                                         │    │
+     │                    │  │  ② 判断消息类型                         │    │
+     │                    │  │     ┌──────────────┬──────────────────┐ │    │
+     │                    │  │     │ 行业/板块/排行 │  复盘/盘后        │ │    │
+     │                    │  │     │ 复盘/盘后     │                  │ │    │
+     │                    │  │     └──────┬───────┘                  │ │    │
+     │                    │  │            │           ┌──────────────┘ │    │
+     │                    │  │            ▼           │ 其他所有消息    │    │
+     │                    │  │  ③A 运行 Bash 工具:    │                │    │
+     │                    │  │  python scripts/       │ ③B CC 直接回答  │    │
+     │                    │  │   wechat_run.py "xxx"  │  用自身知识能力  │    │
+     │                    │  │            │           │  回答用户问题    │    │
+     │                    │  │            ▼           └───────┬────────┘    │
+     │                    │  │  ┌─────────────────┐          │             │
+     │                    │  │  │ skills.py       │          │             │
+     │                    │  │  │ 匹配技能 →      │          │             │
+     │                    │  │  │ 直接调分析引擎   │          │             │
+     │                    │  │  └────────┬────────┘          │             │
+     │                    │  │           │                    │             │
+     │                    │  │           ▼                    ▼             │
+     │                    │  │  ④ 格式化输出                                │
+     │                    │  │     纯文本 + emoji + ≤2000字                 │
+     │                    │  │                                         │    │
+     │                    │  │  ⑤ stdout 输出结果                      │    │
+     │                    │  └──────────────────┬──────────────────────┘    │
+     │                    │                     │                           │
+     │                    │  ┌──────────────────▼─────┐                     │
+     │                    │  │  weclaw                 │                     │
+     │                    │  │  读取 stdout → 发送回微信 │                     │
+     │                    │  └──────────┬─────────────┘                     │
+     │                    │             │                                   │
+     │                    └─────────────┼───────────────────────────────────┘
+     │                                  │
+     └──────────────────────────────────┘
+               微信回复消息
+```
+
+### 详细步骤
+
+```
+Step 1  用户在微信发送 "行业排行"
+        │
+Step 2  weclaw 监听到消息，fork 子进程:
+        $ claude -p "行业排行" --cwd ~/signals
+        │
+Step 3  Claude Code 启动，读取 CLAUDE.md
+        看到「微信 Agent 模式」章节，知道自己的角色
+        │
+Step 4  Claude Code 判断 "行业排行" 包含触发词「行业」
+        决定走技能路径
+        │
+Step 5  Claude Code 用 Bash 工具执行:
+        $ python scripts/wechat_run.py "行业排行"
+        │
+Step 6  wechat_run.py 加载 skills.py
+        IndustryAnalysisSkill.match("行业排行") → 匹配!
+        │
+Step 7  skill.execute() 直接调引擎:
+        get_industry_representatives() → 涨幅榜/综合榜/超跌/概念
+        │
+Step 8  skill 格式化为纯文本:
+        "📊 行业涨幅榜 Top 10\n1. 🔴 半导体 +3.21% ..."
+        │
+Step 9  wechat_run.py 打印到 stdout，退出码 0
+        │
+Step 10 Claude Code 收到输出，直接作为回复
+        │
+Step 11 Claude Code 退出，weclaw 读取 stdout
+        │
+Step 12 weclaw 通过微信协议发送回复给用户
+```
+
+```
+另一条路径 — 用户发送 "茅台怎么样"
+
+Step 1~3  同上
+        │
+Step 4  "茅台怎么样" 不含行业/复盘触发词
+        Claude Code 决定自行回答
+        │
+Step 5  Claude Code 用自身知识 + 缠论框架
+        直接生成分析文本（纯文本、emoji、≤2000字）
+        │
+Step 6  stdout 输出 → weclaw 发回微信
+```
+
+### 进程模型
+
+```
+常驻进程 (长期运行)
+└── weclaw serve              # 微信桥接，监听消息（仅此一个）
+
+临时进程 (每条消息一个)
+└── claude -p "消息"           # Claude Code，处理完即退出
+     └── python scripts/wechat_run.py "消息"   # 行业/复盘时直接调引擎
+
+可选进程 (仅 Web UI 需要)
+└── python run.py --mode web  # 给人看的 UI 界面，微信 Agent 不依赖
+```
+
+### 部署
+
+```bash
+# 1. 配置 weclaw
+cp deploy/weclaw/config.example.json ~/.weclaw/config.json
+# 编辑 config.json，将 cwd 改为 signals 项目实际路径
+
+# 2. 启动 weclaw，扫码登录微信（只需这一步）
+weclaw serve
+
+# （可选）启动 Web UI — 仅当你需要浏览器界面时
+python run.py --mode web --port 8000
+```
+
+### 文件清单
+
+| 文件 | 角色 |
+|------|------|
+| `deploy/weclaw/config.example.json` | weclaw 配置模板 — 告诉 weclaw 用 Claude Code CLI 作为 agent |
+| `CLAUDE.md` | Agent 行为指令 — Claude Code 读取后知道自己是微信助手 |
+| `scripts/wechat_run.py` | 技能入口 — 匹配触发词 → 直接调引擎 → 输出文本 |
+| `signals/wechat/skills.py` | 技能实现 — IndustryAnalysisSkill + ReviewSkill（直接调引擎） |
+
+### 设计思路：两个界面，两个消费者
+
+```
+                    ┌──────────────┐
+                    │  分析引擎     │  ← 同一套底层函数
+                    │  (core/layers)│
+                    └──────┬───────┘
+                           │
+              ┌────────────┼────────────┐
+              ▼                         ▼
+      ┌──────────────┐         ┌──────────────┐
+      │  Web (API+UI) │         │  Skill (微信)  │
+      │  给人看        │         │  给 AI 用      │
+      └──────────────┘         └──────────────┘
+```
+
+|  | Web UI | Skill (微信 Agent) |
+|---|---|---|
+| **消费者** | 人（浏览器） | AI（Claude Code CLI） |
+| **输出** | HTML/图表/JSON | 纯文本 + emoji（≤2000字） |
+| **需要** | 可视化、交互、实时刷新 | 结构化数据、快速、自包含 |
+| **调引擎方式** | HTTP API（FastAPI 路由） | Python 直接 import 调用 |
+| **常驻服务** | 需要 `python run.py --mode web` | 不需要，每次临时 import |
+
+Web 是给你在浏览器里看 K 线图、热力图、仪表盘的 — AI 不需要看图，它只需要拿到数据，压成微信能读的文本。所以 Skill 直接 import 引擎函数，不绕 HTTP，不依赖 Web 服务。
+
+---
+
 ## AutoDL 部署
 
 ```bash
@@ -236,6 +411,9 @@ cd deploy && docker-compose up -d
 │   │   ├── app.py          #   FastAPI + lifespan 调度器
 │   │   ├── api/            #   cluster + backtest API
 │   │   └── static/         #   前端 SPA
+│   ├── wechat/             # 微信 Agent
+│   │   ├── skills.py       #   Web API 技能（行业分析 + 盘后复盘）
+│   │   └── __init__.py
 │   ├── research/           # 研报子系统
 │   │   └── research.py     #   多格式导入 + 自动归档
 │   └── notify/             # 消息推送
@@ -245,8 +423,9 @@ cd deploy && docker-compose up -d
 │   ├── docker-compose.yml  # 5 服务编排（Futu + MongoDB + Sync + Web + Redis）
 │   ├── init-mongo.js       # MongoDB 初始化（集合 + 索引 + TTL）
 │   ├── autodl/             # AutoDL 部署（start.sh / stop.sh / gen_cache.py）
+│   ├── weclaw/             # weclaw 微信桥接配置
 │   └── cron/               # 定时任务（盘中扫描 + 同步 + 备份）
-├── scripts/                # 辅助脚本（缓存预生成等）
+├── scripts/                # 辅助脚本（缓存预生成 + wechat_run.py）
 └── notes/                  # 研究笔记归档（YYYY/MM/）
 ```
 
