@@ -1,0 +1,183 @@
+/* ═══════════════════════════════════════════════════
+   🐲 图表页面样式
+   ═══════════════════════════════════════════════════ */
+
+.chart-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.chart-title {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.chart-index-list {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.chart-index-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.chart-index-btn:hover { color: var(--text-primary); border-color: var(--text-muted); }
+.chart-index-btn.active {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border-color: var(--accent);
+}
+
+.chart-freq-group {
+  display: flex;
+  gap: 4px;
+}
+
+.chart-freq-btn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  padding: 4px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.chart-freq-btn:hover { color: var(--text-primary); }
+.chart-freq-btn.active {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ── 图表容器 ──────────────────────────────────────── */
+.chart-main-container {
+  position: relative;
+  height: 580px;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.ma-legend {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 10;
+  padding: 4px 8px;
+  background: rgba(0,0,0,0.5);
+  border-radius: 4px;
+  backdrop-filter: blur(4px);
+}
+
+/* ── 信号详情面板 ──────────────────────────────────── */
+.chart-details {
+  margin-top: 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  backdrop-filter: blur(8px);
+}
+
+.detail-conclusion {
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--accent-gold);
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  background: var(--conclusion-bg);
+  border-radius: 6px;
+  border-left: 3px solid var(--accent-gold);
+}
+
+.detail-trends {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.trend-chip {
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-weight: 500;
+}
+.trend-chip.up { background: rgba(232, 56, 79, 0.1); color: var(--color-up); }
+.trend-chip.down { background: rgba(45, 138, 110, 0.1); color: var(--color-down); }
+.trend-chip.flat { background: var(--bg-tertiary); color: var(--text-secondary); }
+
+.detail-highlight {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-gold);
+  background: rgba(196, 162, 78, 0.12);
+  padding: 2px 8px;
+  border-radius: 4px;
+  margin-bottom: 8px;
+}
+
+.ma-trend-chip {
+  display: inline-block;
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  margin-bottom: 8px;
+}
+.ma-trend-chip.up { background: rgba(232, 56, 79, 0.1); color: var(--color-up); }
+.ma-trend-chip.down { background: rgba(45, 138, 110, 0.1); color: var(--color-down); }
+.ma-trend-chip.flat { background: var(--bg-tertiary); color: var(--text-secondary); }
+
+.tf-signals {
+  display: flex;
+  gap: 6px;
+  margin: 8px 0;
+  flex-wrap: wrap;
+}
+.tf-signal-chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 500;
+}
+.tf-signal-chip.buy { background: rgba(232, 163, 62, 0.15); color: var(--signal-buy); }
+.tf-signal-chip.sell { background: rgba(142, 68, 173, 0.15); color: var(--signal-sell); }
+
+.signal-count {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 8px 0 4px;
+}
+
+.signal-item {
+  font-size: 12px;
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.025);
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.signal-item .conf { color: var(--text-muted); font-size: 11px; }
+
+.chart-summary-text {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  line-height: 1.6;
+}

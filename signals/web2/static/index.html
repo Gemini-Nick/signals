@@ -12,6 +12,7 @@
   <link rel="stylesheet" href="/static/css/layout.css">
   <link rel="stylesheet" href="/static/css/pages/cluster.css">
   <link rel="stylesheet" href="/static/css/pages/backtest.css">
+  <link rel="stylesheet" href="/static/css/pages/chart.css">
   <!-- Charts -->
   <script src="https://unpkg.com/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
 </head>
@@ -25,6 +26,10 @@
         <button class="nav-item active" data-page="cluster">
           <span class="nav-icon">📊</span>
           <span class="nav-label">行业聚类</span>
+        </button>
+        <button class="nav-item" data-page="chart">
+          <span class="nav-icon">📈</span>
+          <span class="nav-label">图表</span>
         </button>
         <button class="nav-item" data-page="backtest">
           <span class="nav-icon">⚡</span>
@@ -57,6 +62,33 @@
         <div id="concept-cards" class="cluster-cards stagger-in"></div>
         <div class="section-title">本周趋势</div>
         <div id="cluster-history" class="cluster-history"></div>
+      </div>
+
+      <!-- ── 图表页 ────────────────────────────── -->
+      <div id="page-chart" class="page">
+        <div class="chart-toolbar">
+          <div>
+            <h2 id="chart-title" class="chart-title">选择指数</h2>
+            <div class="chart-index-list" style="margin-top:8px;">
+              <button class="chart-index-btn" data-name="沪深300">沪深300</button>
+              <button class="chart-index-btn" data-name="上证指数">上证指数</button>
+              <button class="chart-index-btn" data-name="创业板指">创业板指</button>
+              <button class="chart-index-btn" data-name="上证50">上证50</button>
+              <button class="chart-index-btn" data-name="科创50">科创50</button>
+              <button class="chart-index-btn" data-name="中证500">中证500</button>
+              <button class="chart-index-btn" data-name="中证1000">中证1000</button>
+            </div>
+          </div>
+          <div class="chart-freq-group">
+            <button class="chart-freq-btn active" data-freq="daily">日线</button>
+            <button class="chart-freq-btn" data-freq="30min">30分</button>
+            <button class="chart-freq-btn" data-freq="15min">15分</button>
+          </div>
+        </div>
+        <div id="chart-main-container" class="chart-main-container chart-enter"></div>
+        <div class="chart-details">
+          <div id="chart-details-body"></div>
+        </div>
       </div>
 
       <!-- ── 信号回测页 ──────────────────────────── -->
@@ -114,6 +146,7 @@
   <!-- Scripts -->
   <script src="/static/js/app.js"></script>
   <script src="/static/js/cluster.js"></script>
+  <script src="/static/js/chart.js"></script>
   <script src="/static/js/backtest.js"></script>
 </body>
 </html>
