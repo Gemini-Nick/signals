@@ -1,0 +1,255 @@
+/* ═══════════════════════════════════════════════════
+   🐲 墨龙设计系统 · 组件
+   按钮 · 输入框 · 卡片 · Badge · KPI · Toast
+   ═══════════════════════════════════════════════════ */
+
+/* ── 按钮 ──────────────────────────────────────────── */
+.btn {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  padding: 7px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: var(--font-body);
+  font-weight: 500;
+  transition: all 0.2s ease;
+  position: relative;
+  overflow: hidden;
+}
+.btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--text-muted);
+}
+.btn:active { transform: scale(0.97); }
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.btn-primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  box-shadow: var(--glow-accent);
+}
+
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+
+.btn-icon {
+  background: none;
+  border: none;
+  font-size: 18px;
+  cursor: pointer;
+  padding: 4px 6px;
+  opacity: 0.6;
+  transition: opacity 0.2s, transform 0.2s;
+}
+.btn-icon:hover { opacity: 1; transform: scale(1.1); }
+
+/* ── 输入框 ────────────────────────────────────────── */
+.input {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  padding: 7px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: var(--font-body);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(var(--accent), 0.15);
+}
+
+.bt-param-input {
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: var(--font-mono);
+  width: 64px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+.bt-param-input:focus { border-color: var(--accent); }
+
+/* ── Preset Chips ──────────────────────────────────── */
+.preset-chips {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.preset-chip, .bt-preset-chip {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.preset-chip:hover, .bt-preset-chip:hover {
+  color: var(--text-primary);
+  border-color: var(--accent);
+  box-shadow: var(--glow-accent);
+}
+
+/* ── KPI 卡片 ──────────────────────────────────────── */
+.bt-kpis {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.kpi-card, .bt-kpi-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  min-width: 110px;
+  text-align: center;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.kpi-card:hover, .bt-kpi-card:hover {
+  border-color: var(--accent);
+}
+
+.kpi-label, .bt-kpi-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+  font-family: var(--font-body);
+}
+.kpi-value {
+  font-size: 20px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+}
+.bt-kpi-value {
+  font-size: 18px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+}
+.kpi-value.positive, .bt-kpi-value.up { color: var(--color-up); }
+.kpi-value.negative, .bt-kpi-value.down { color: var(--color-down); }
+
+/* ── Badge ─────────────────────────────────────────── */
+.badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  font-family: var(--font-mono);
+}
+.badge-macd, .bt-pattern-badge.macd {
+  background: rgba(232, 56, 79, 0.12);
+  color: var(--color-up);
+}
+.badge-czsc, .bt-pattern-badge.czsc {
+  background: rgba(59, 125, 255, 0.12);
+  color: var(--accent-blue);
+}
+
+.source-badge {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+  padding: 1px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+
+/* ── 数据表格 ──────────────────────────────────────── */
+.bt-stats-table,
+.bt-signal-list-wrapper table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.bt-stats-table th, .bt-stats-table td,
+.bt-signal-list-wrapper th, .bt-signal-list-wrapper td {
+  padding: 7px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.bt-stats-table th,
+.bt-signal-list-wrapper th {
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 11px;
+  position: sticky;
+  top: 0;
+  background: var(--bg-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.bt-stats-table .up,
+.bt-signal-list-wrapper .up { color: var(--color-up); }
+.bt-stats-table .down,
+.bt-signal-list-wrapper .down { color: var(--color-down); }
+
+.bt-signal-list-wrapper { overflow-x: auto; }
+
+.signal-row, .bt-signal-row { cursor: pointer; transition: background 0.15s; }
+.signal-row:hover, .bt-signal-row:hover { background: var(--bg-hover); }
+.signal-row.win, .bt-signal-win { background: rgba(45, 138, 110, 0.05); }
+.signal-row.loss, .bt-signal-loss { background: rgba(232, 56, 79, 0.05); }
+
+/* ── KPI by-type table ─────────────────────────────── */
+.kpi-by-type { margin-top: 12px; }
+.kpi-by-type table {
+  width: auto;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.kpi-by-type th, .kpi-by-type td {
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ── Toast ──────────────────────────────────────────── */
+.toast {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-size: 13px;
+  opacity: 0;
+  transform: translateX(40px);
+  transition: none;
+  pointer-events: none;
+  z-index: 999;
+  box-shadow: var(--card-shadow);
+}
+.toast.show {
+  animation: toastSlideIn 0.3s ease-out forwards;
+  pointer-events: auto;
+}
+.toast.hide {
+  animation: toastSlideOut 0.3s ease-in forwards;
+}
+
+/* ── Loading ───────────────────────────────────────── */
+.loading-placeholder {
+  text-align: center;
+  color: var(--text-muted);
+  padding: 60px 0;
+  font-size: 14px;
+  font-family: var(--font-display);
+}

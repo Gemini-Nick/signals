@@ -1,97 +1,117 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="tradingview">
+<html lang="zh-CN" data-theme="bronze">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>隆小侠 Web2</title>
-  <link rel="stylesheet" href="/static/css/themes.css">
-  <link rel="stylesheet" href="/static/css/app.css">
+  <title>隆小侠</title>
+  <!-- 墨龙设计系统 CSS -->
+  <link rel="stylesheet" href="/static/css/variables.css">
+  <link rel="stylesheet" href="/static/css/base.css">
+  <link rel="stylesheet" href="/static/css/animations.css">
+  <link rel="stylesheet" href="/static/css/components.css">
+  <link rel="stylesheet" href="/static/css/layout.css">
+  <link rel="stylesheet" href="/static/css/pages/cluster.css">
+  <link rel="stylesheet" href="/static/css/pages/backtest.css">
+  <!-- Charts -->
   <script src="https://unpkg.com/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
-  <!-- ── 顶栏 ──────────────────────────────────────── -->
-  <header class="header">
-    <div class="header-left">
-      <span class="logo">🐲 隆小侠</span>
-      <nav class="tabs">
-        <button class="tab active" data-page="cluster">行业聚类</button>
-        <button class="tab" data-page="backtest">MACD 回测</button>
-      </nav>
-    </div>
-    <div class="header-right">
-      <button id="theme-toggle" class="btn-icon" title="切换主题">🎨</button>
-    </div>
-  </header>
+  <div class="app-layout">
 
-  <!-- ── 行业聚类页 ────────────────────────────────── -->
-  <div id="page-cluster" class="page active">
-    <div class="page-toolbar">
-      <h2>行业板块聚类分析</h2>
-      <div class="toolbar-actions">
-        <span id="cluster-meta" class="meta-text"></span>
-        <button id="cluster-refresh" class="btn btn-sm">刷新</button>
+    <!-- ── 左侧导航栏 ──────────────────────────────── -->
+    <nav class="nav-rail">
+      <div class="nav-logo">🐲</div>
+      <div class="nav-items">
+        <button class="nav-item active" data-page="cluster">
+          <span class="nav-icon">📊</span>
+          <span class="nav-label">行业聚类</span>
+        </button>
+        <button class="nav-item" data-page="backtest">
+          <span class="nav-icon">⚡</span>
+          <span class="nav-label">信号回测</span>
+        </button>
       </div>
-    </div>
-    <!-- 行业板块聚类（东财数据源） -->
-    <div class="section-label">行业板块 <span class="source-badge" id="industry-source"></span></div>
-    <div id="cluster-cards" class="cluster-cards"></div>
-    <!-- 概念板块聚类（新浪/东财/THS 数据源） -->
-    <div class="section-label">概念板块 <span class="source-badge" id="concept-source"></span></div>
-    <div id="concept-cards" class="cluster-cards"></div>
-    <!-- 本周趋势 -->
-    <div class="section-title">本周趋势</div>
-    <div id="cluster-history" class="cluster-history"></div>
+      <div class="nav-footer">
+        <button id="theme-toggle" class="nav-item" title="切换主题">
+          <span class="nav-icon">🎨</span>
+          <span class="nav-label">切换主题</span>
+        </button>
+      </div>
+    </nav>
+
+    <!-- ── 主内容区 ────────────────────────────────── -->
+    <main class="main-content">
+
+      <!-- ── 行业聚类页 ──────────────────────────── -->
+      <div id="page-cluster" class="page active">
+        <div class="page-toolbar">
+          <h2>行业板块聚类分析</h2>
+          <div class="toolbar-actions">
+            <span id="cluster-meta" class="meta-text"></span>
+            <button id="cluster-refresh" class="btn btn-sm">刷新</button>
+          </div>
+        </div>
+        <div class="section-label">行业板块 <span class="source-badge" id="industry-source"></span></div>
+        <div id="cluster-cards" class="cluster-cards stagger-in"></div>
+        <div class="section-label">概念板块 <span class="source-badge" id="concept-source"></span></div>
+        <div id="concept-cards" class="cluster-cards stagger-in"></div>
+        <div class="section-title">本周趋势</div>
+        <div id="cluster-history" class="cluster-history"></div>
+      </div>
+
+      <!-- ── 信号回测页 ──────────────────────────── -->
+      <div id="page-backtest" class="page">
+        <div class="bt-header">
+          <div class="bt-input-row">
+            <input id="bt-code" type="text" placeholder="股票代码 (如 002759)" class="input">
+            <select id="bt-freq" class="input">
+              <option value="daily">日线</option>
+              <option value="weekly">周线</option>
+            </select>
+            <select id="bt-group" class="input">
+              <option value="all">全部信号</option>
+              <option value="macd">仅 MACD</option>
+              <option value="czsc">仅缠论</option>
+            </select>
+            <button id="bt-run" class="btn btn-primary">运行回测</button>
+            <button id="bt-sim" class="btn btn-simulate">模拟交易</button>
+          </div>
+          <!-- 模拟参数行 -->
+          <div class="bt-input-row" id="bt-sim-params" style="display:none; margin-top:8px;">
+            <label class="meta-text">止损%</label>
+            <input type="number" id="bt-stop-loss" class="bt-param-input" value="5" min="1" max="20" step="0.5">
+            <label class="meta-text">移动止盈回撤%</label>
+            <input type="number" id="bt-trail-stop" class="bt-param-input" value="50" min="10" max="90" step="5">
+            <label class="meta-text">最大持仓日</label>
+            <input type="number" id="bt-max-hold" class="bt-param-input" value="20" min="3" max="60" step="1">
+            <label class="meta-text">滑点%</label>
+            <input type="number" id="bt-slippage" class="bt-param-input" value="0.1" min="0" max="1" step="0.05">
+          </div>
+          <div id="bt-presets" class="preset-chips"></div>
+        </div>
+        <div id="bt-kpis" class="bt-kpis"></div>
+        <div id="bt-chart-container" class="chart-enter" style="height:520px;"></div>
+        <!-- 模拟交易结果 -->
+        <div id="bt-sim-section" style="display:none;">
+          <div class="section-title">模拟交易 KPI</div>
+          <div id="bt-sim-kpis" class="bt-kpis"></div>
+          <div class="section-title">资金曲线</div>
+          <div id="bt-equity-container" style="height:250px; position:relative;"></div>
+          <div class="section-title">交易记录 <span id="bt-trade-count" class="meta-text"></span></div>
+          <div id="bt-trade-list" class="bt-signal-list-wrapper"></div>
+          <div id="bt-skip-reasons" style="margin-top:8px;"></div>
+        </div>
+        <div class="section-title">信号明细</div>
+        <div id="bt-signal-list" class="bt-signal-list-wrapper"></div>
+      </div>
+
+    </main>
   </div>
 
-  <!-- ── MACD 回测页 ──────────────────────────────── -->
-  <div id="page-backtest" class="page">
-    <div class="bt-header">
-      <div class="bt-input-row">
-        <input id="bt-code" type="text" placeholder="股票代码 (如 002759)" class="input">
-        <select id="bt-freq" class="input">
-          <option value="daily">日线</option>
-          <option value="weekly">周线</option>
-        </select>
-        <select id="bt-group" class="input">
-          <option value="all">全部信号</option>
-          <option value="macd">仅 MACD</option>
-          <option value="czsc">仅缠论</option>
-        </select>
-        <button id="bt-run" class="btn btn-primary">运行回测</button>
-        <button id="bt-sim" class="btn" style="background:#e040fb;border-color:#e040fb;color:#fff;">模拟交易</button>
-      </div>
-      <!-- 模拟参数行 -->
-      <div class="bt-input-row" id="bt-sim-params" style="display:none; margin-top:6px;">
-        <label style="font-size:12px;color:var(--text-secondary);">止损%</label>
-        <input type="number" id="bt-stop-loss" class="bt-param-input" value="5" min="1" max="20" step="0.5" />
-        <label style="font-size:12px;color:var(--text-secondary);">移动止盈回撤%</label>
-        <input type="number" id="bt-trail-stop" class="bt-param-input" value="50" min="10" max="90" step="5" />
-        <label style="font-size:12px;color:var(--text-secondary);">最大持仓日</label>
-        <input type="number" id="bt-max-hold" class="bt-param-input" value="20" min="3" max="60" step="1" />
-        <label style="font-size:12px;color:var(--text-secondary);">滑点%</label>
-        <input type="number" id="bt-slippage" class="bt-param-input" value="0.1" min="0" max="1" step="0.05" />
-      </div>
-      <div id="bt-presets" class="preset-chips"></div>
-    </div>
-    <div id="bt-kpis" class="bt-kpis"></div>
-    <div id="bt-chart-container" style="height:520px;"></div>
-    <!-- 模拟交易结果区域 -->
-    <div id="bt-sim-section" style="display:none;">
-      <div class="section-title">模拟交易 KPI</div>
-      <div id="bt-sim-kpis" class="bt-kpis"></div>
-      <div class="section-title">资金曲线</div>
-      <div id="bt-equity-container" style="height:250px; position:relative;"></div>
-      <div class="section-title">交易记录 <span id="bt-trade-count" style="font-size:12px;color:var(--text-muted);font-weight:400;"></span></div>
-      <div id="bt-trade-list" class="bt-signal-list-wrapper"></div>
-      <div id="bt-skip-reasons" style="margin-top:8px;"></div>
-    </div>
-    <div class="section-title">信号明细</div>
-    <div id="bt-signal-list" class="bt-signal-list-wrapper"></div>
-  </div>
-
-  <!-- ── Toast ──────────────────────────────────────── -->
+  <!-- Toast -->
   <div id="toast" class="toast"></div>
 
+  <!-- Scripts -->
   <script src="/static/js/app.js"></script>
   <script src="/static/js/cluster.js"></script>
   <script src="/static/js/backtest.js"></script>

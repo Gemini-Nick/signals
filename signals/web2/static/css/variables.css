@@ -1,0 +1,275 @@
+/* ═══════════════════════════════════════════════════
+   🐲 隆小侠 — 墨龙设计系统 · CSS 变量
+   主题 A: 朱砂 (Cinnabar) — 水墨暖调
+   主题 B: 青铜 (Bronze)   — 金属冷锐
+   ═══════════════════════════════════════════════════ */
+
+/* ── 字体 ──────────────────────────────────────────── */
+@font-face {
+  font-family: 'LXGW WenKai';
+  src: url('https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/files/lxgwwenkai-regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'LXGW WenKai';
+  src: url('https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/files/lxgwwenkai-bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('https://cdn.jsdelivr.net/gh/JetBrains/JetBrainsMono@2.304/fonts/webfonts/JetBrainsMono-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('https://cdn.jsdelivr.net/gh/JetBrains/JetBrainsMono@2.304/fonts/webfonts/JetBrainsMono-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── 主题 A: 朱砂 — 水墨暖调、印章朱红 ──────────── */
+:root[data-theme="cinnabar"] {
+  /* 基底 — 宣纸墨色 */
+  --bg-primary:      #0f0e0c;
+  --bg-secondary:    #18170f;
+  --bg-tertiary:     #242318;
+  --border:          #33312a;
+
+  /* 文字 — 宣纸白 */
+  --text-primary:    #f2efe6;
+  --text-secondary:  #a8a497;
+  --text-muted:      #635f52;
+
+  /* 强调色 — 朱砂 + 古金 */
+  --accent:          #c73e1d;
+  --accent-hover:    #d95438;
+  --accent-blue:     #7a9eb8;
+  --accent-green:    #6b8a4e;
+  --accent-gold:     #c4a24e;
+
+  /* 涨跌 (A股: 红涨绿跌) */
+  --color-up:        #c73e1d;
+  --color-down:      #6b8a4e;
+  --color-flat:      #a8a497;
+
+  /* 信号标记 */
+  --signal-buy:      #c73e1d;
+  --signal-sell:     #7a9eb8;
+  --signal-badge:    #c4a24e;
+
+  /* 建议条 */
+  --banner-bullish:  #1e1510;
+  --banner-bearish:  #101a10;
+  --banner-neutral:  #18170f;
+
+  /* 图表 */
+  --chart-bg:        #0f0e0c;
+  --chart-grid:      #1e1d16;
+  --chart-crosshair: #635f52;
+  --bi-up:           #c73e1d;
+  --bi-down:         #7a9eb8;
+  --zhongshu-fill:   rgba(196, 162, 78, 0.10);
+  --zhongshu-stroke: rgba(196, 162, 78, 0.50);
+
+  /* 成交量 */
+  --vol-up:          rgba(199, 62, 29, 0.45);
+  --vol-down:        rgba(107, 138, 78, 0.45);
+
+  /* MA 均线 */
+  --ma5-color:       #c4a24e;
+  --ma10-color:      #7a9eb8;
+  --ma20-color:      #c73e1d;
+  --ma60-color:      #6b8a4e;
+  --support-color:   #6b8a4e;
+  --resistance-color:#c73e1d;
+  --conclusion-bg:   #1e1a10;
+
+  /* MACD */
+  --macd-dif:        #c4a24e;
+  --macd-dea:        #7a9eb8;
+  --macd-bar-up:     rgba(199, 62, 29, 0.65);
+  --macd-bar-down:   rgba(107, 138, 78, 0.65);
+
+  /* 恐慌 */
+  --panic-high:      #c73e1d;
+  --panic-mid:       #c4a24e;
+
+  /* 卡片 */
+  --card-shadow:     0 2px 8px rgba(0, 0, 0, 0.4);
+
+  /* 交互 */
+  --bg-hover:        rgba(196, 162, 78, 0.06);
+  --border-color:    #33312a;
+
+  /* 发光 */
+  --glow-up:         0 0 8px rgba(199, 62, 29, 0.3);
+  --glow-down:       0 0 8px rgba(107, 138, 78, 0.3);
+  --glow-accent:     0 0 12px rgba(199, 62, 29, 0.2);
+
+  /* 背景纹理 */
+  --bg-spotlight:    radial-gradient(ellipse at 15% 0%, rgba(199, 62, 29, 0.04), transparent 55%);
+  --divider-gradient: linear-gradient(90deg, var(--accent), transparent 80%);
+
+  /* 字体 */
+  --font-display:    'LXGW WenKai', 'STKaiti', 'KaiTi', serif;
+  --font-body:       'Noto Sans SC', 'PingFang SC', -apple-system, sans-serif;
+  --font-mono:       'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  /* compat aliases */
+  --font-family:     var(--font-body);
+}
+
+/* ── 主题 B: 青铜 — 冷靛金属、锐利精确 ──────────── */
+:root[data-theme="bronze"] {
+  /* 基底 — 深靛 */
+  --bg-primary:      #0c0e18;
+  --bg-secondary:    #141824;
+  --bg-tertiary:     #1e2333;
+  --border:          #2c3148;
+
+  /* 文字 */
+  --text-primary:    #d4d8e4;
+  --text-secondary:  #7a8098;
+  --text-muted:      #464d64;
+
+  /* 强调色 — 青铜绿 + 电光蓝 */
+  --accent:          #2d8a6e;
+  --accent-hover:    #39a482;
+  --accent-blue:     #3b7dff;
+  --accent-green:    #2d8a6e;
+  --accent-gold:     #c4a24e;
+
+  /* 涨跌 */
+  --color-up:        #e8384f;
+  --color-down:      #2d8a6e;
+  --color-flat:      #7a8098;
+
+  /* 信号标记 */
+  --signal-buy:      #e8a33e;
+  --signal-sell:     #8e44ad;
+  --signal-badge:    #e8a33e;
+
+  /* 建议条 */
+  --banner-bullish:  #14101e;
+  --banner-bearish:  #0e1a16;
+  --banner-neutral:  #141824;
+
+  /* 图表 */
+  --chart-bg:        #0c0e18;
+  --chart-grid:      #141824;
+  --chart-crosshair: #464d64;
+  --bi-up:           #e8384f;
+  --bi-down:         #2d8a6e;
+  --zhongshu-fill:   rgba(59, 125, 255, 0.10);
+  --zhongshu-stroke: rgba(59, 125, 255, 0.50);
+
+  /* 成交量 */
+  --vol-up:          rgba(232, 56, 79, 0.45);
+  --vol-down:        rgba(45, 138, 110, 0.45);
+
+  /* MA 均线 */
+  --ma5-color:       #e8a33e;
+  --ma10-color:      #3b7dff;
+  --ma20-color:      #e040fb;
+  --ma60-color:      #2d8a6e;
+  --support-color:   #2d8a6e;
+  --resistance-color:#e8384f;
+  --conclusion-bg:   #141a2e;
+
+  /* MACD */
+  --macd-dif:        #e8a33e;
+  --macd-dea:        #3b7dff;
+  --macd-bar-up:     rgba(232, 56, 79, 0.65);
+  --macd-bar-down:   rgba(45, 138, 110, 0.65);
+
+  /* 恐慌 */
+  --panic-high:      #e8384f;
+  --panic-mid:       #e8a33e;
+
+  /* 卡片 */
+  --card-shadow:     0 2px 8px rgba(0, 0, 0, 0.5);
+
+  /* 交互 */
+  --bg-hover:        rgba(59, 125, 255, 0.06);
+  --border-color:    #2c3148;
+
+  /* 发光 */
+  --glow-up:         0 0 8px rgba(232, 56, 79, 0.3);
+  --glow-down:       0 0 8px rgba(45, 138, 110, 0.3);
+  --glow-accent:     0 0 12px rgba(45, 138, 110, 0.2);
+
+  /* 背景纹理 */
+  --bg-spotlight:    radial-gradient(ellipse at 15% 0%, rgba(45, 138, 110, 0.04), transparent 55%);
+  --divider-gradient: linear-gradient(90deg, var(--accent), transparent 80%);
+
+  /* 字体 */
+  --font-display:    'LXGW WenKai', 'STKaiti', 'KaiTi', serif;
+  --font-body:       'Noto Sans SC', 'PingFang SC', -apple-system, sans-serif;
+  --font-mono:       'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --font-family:     var(--font-body);
+}
+
+/* ── 默认主题 = 青铜 ──────────────────────────────── */
+:root {
+  --bg-primary:      #0c0e18;
+  --bg-secondary:    #141824;
+  --bg-tertiary:     #1e2333;
+  --border:          #2c3148;
+  --text-primary:    #d4d8e4;
+  --text-secondary:  #7a8098;
+  --text-muted:      #464d64;
+  --accent:          #2d8a6e;
+  --accent-hover:    #39a482;
+  --accent-blue:     #3b7dff;
+  --accent-green:    #2d8a6e;
+  --accent-gold:     #c4a24e;
+  --color-up:        #e8384f;
+  --color-down:      #2d8a6e;
+  --color-flat:      #7a8098;
+  --signal-buy:      #e8a33e;
+  --signal-sell:     #8e44ad;
+  --signal-badge:    #e8a33e;
+  --banner-bullish:  #14101e;
+  --banner-bearish:  #0e1a16;
+  --banner-neutral:  #141824;
+  --chart-bg:        #0c0e18;
+  --chart-grid:      #141824;
+  --chart-crosshair: #464d64;
+  --bi-up:           #e8384f;
+  --bi-down:         #2d8a6e;
+  --zhongshu-fill:   rgba(59, 125, 255, 0.10);
+  --zhongshu-stroke: rgba(59, 125, 255, 0.50);
+  --vol-up:          rgba(232, 56, 79, 0.45);
+  --vol-down:        rgba(45, 138, 110, 0.45);
+  --ma5-color:       #e8a33e;
+  --ma10-color:      #3b7dff;
+  --ma20-color:      #e040fb;
+  --ma60-color:      #2d8a6e;
+  --support-color:   #2d8a6e;
+  --resistance-color:#e8384f;
+  --conclusion-bg:   #141a2e;
+  --macd-dif:        #e8a33e;
+  --macd-dea:        #3b7dff;
+  --macd-bar-up:     rgba(232, 56, 79, 0.65);
+  --macd-bar-down:   rgba(45, 138, 110, 0.65);
+  --panic-high:      #e8384f;
+  --panic-mid:       #e8a33e;
+  --card-shadow:     0 2px 8px rgba(0, 0, 0, 0.5);
+  --bg-hover:        rgba(59, 125, 255, 0.06);
+  --border-color:    #2c3148;
+  --glow-up:         0 0 8px rgba(232, 56, 79, 0.3);
+  --glow-down:       0 0 8px rgba(45, 138, 110, 0.3);
+  --glow-accent:     0 0 12px rgba(45, 138, 110, 0.2);
+  --bg-spotlight:    radial-gradient(ellipse at 15% 0%, rgba(45, 138, 110, 0.04), transparent 55%);
+  --divider-gradient: linear-gradient(90deg, #2d8a6e, transparent 80%);
+  --font-display:    'LXGW WenKai', 'STKaiti', 'KaiTi', serif;
+  --font-body:       'Noto Sans SC', 'PingFang SC', -apple-system, sans-serif;
+  --font-mono:       'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --font-family:     var(--font-body);
+}

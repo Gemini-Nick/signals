@@ -1,0 +1,234 @@
+/* ═══════════════════════════════════════════════════
+   🐲 墨龙设计系统 · 布局
+   Nav-rail · Page Container · Grid
+   ═══════════════════════════════════════════════════ */
+
+/* ── 整体布局 ──────────────────────────────────────── */
+.app-layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* ── 左侧导航栏 (Nav-rail) ────────────────────────── */
+.nav-rail {
+  width: 56px;
+  min-height: 100vh;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 12px 0;
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 200;
+  transition: width 0.25s ease;
+  overflow: hidden;
+}
+.nav-rail:hover {
+  width: 180px;
+}
+
+.nav-logo {
+  font-family: var(--font-display);
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text-primary);
+  padding: 8px 0 20px;
+  white-space: nowrap;
+  cursor: default;
+  text-shadow: var(--glow-accent);
+  transition: text-shadow 0.3s;
+}
+.nav-logo:hover {
+  text-shadow: 0 0 16px var(--accent);
+}
+
+.nav-items {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 0 8px;
+  flex: 1;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: all 0.2s;
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+}
+.nav-item:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+.nav-item.active {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  font-weight: 600;
+}
+.nav-item.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  width: 3px;
+  height: 24px;
+  background: var(--accent);
+  border-radius: 0 3px 3px 0;
+}
+.nav-item { position: relative; }
+
+.nav-icon {
+  font-size: 18px;
+  min-width: 24px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.nav-label {
+  opacity: 0;
+  transition: opacity 0.2s ease 0.1s;
+}
+.nav-rail:hover .nav-label {
+  opacity: 1;
+}
+
+/* ── 导航底部工具 ──────────────────────────────────── */
+.nav-footer {
+  padding: 8px;
+  width: 100%;
+}
+
+/* ── 主内容区 ──────────────────────────────────────── */
+.main-content {
+  flex: 1;
+  margin-left: 56px;
+  transition: margin-left 0.25s ease;
+}
+
+/* ── 页面容器 ──────────────────────────────────────── */
+.page {
+  display: none;
+  padding: 32px;
+  max-width: 1440px;
+  margin: 0 auto;
+}
+.page.active { display: block; }
+
+.page-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
+.page-toolbar h2 {
+  font-size: 20px;
+  font-weight: 700;
+  font-family: var(--font-display);
+}
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.meta-text {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+/* ── Section 标题 ──────────────────────────────────── */
+.section-title {
+  font-size: 15px;
+  font-weight: 700;
+  font-family: var(--font-display);
+  color: var(--text-secondary);
+  margin: 32px 0 12px;
+  padding-bottom: 8px;
+  border-bottom: none;
+  background-image: var(--divider-gradient);
+  background-size: 100% 1px;
+  background-position: bottom;
+  background-repeat: no-repeat;
+}
+
+.section-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: 20px 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ── 响应式：移动端底部 tab bar ──────────────────── */
+@media (max-width: 768px) {
+  .nav-rail {
+    position: fixed;
+    top: auto;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    width: 100% !important;
+    height: 56px;
+    min-height: auto;
+    flex-direction: row;
+    border-right: none;
+    border-top: 1px solid var(--border);
+    padding: 0;
+    z-index: 200;
+  }
+  .nav-rail:hover { width: 100% !important; }
+
+  .nav-logo { display: none; }
+
+  .nav-items {
+    flex-direction: row;
+    justify-content: space-around;
+    padding: 0;
+    gap: 0;
+  }
+
+  .nav-item {
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 4px;
+    font-size: 10px;
+    align-items: center;
+    justify-content: center;
+  }
+  .nav-item.active::before { display: none; }
+
+  .nav-icon { font-size: 20px; }
+
+  .nav-label {
+    opacity: 1 !important;
+    font-size: 10px;
+  }
+
+  .nav-footer { display: none; }
+
+  .main-content {
+    margin-left: 0;
+    padding-bottom: 64px;
+  }
+
+  .page { padding: 16px; }
+
+  .bt-input-row { flex-direction: column; }
+  .bt-kpis { flex-direction: column; }
+}

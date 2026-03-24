@@ -1,0 +1,108 @@
+/* ═══════════════════════════════════════════════════
+   🐲 墨龙设计系统 · 动效
+   ═══════════════════════════════════════════════════ */
+
+/* ── 页面切换 stagger 入场 ───────────────────────── */
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.stagger-in > * {
+  opacity: 0;
+  animation: slideUp 0.35s ease-out forwards;
+}
+.stagger-in > *:nth-child(1) { animation-delay: 0ms; }
+.stagger-in > *:nth-child(2) { animation-delay: 50ms; }
+.stagger-in > *:nth-child(3) { animation-delay: 100ms; }
+.stagger-in > *:nth-child(4) { animation-delay: 150ms; }
+.stagger-in > *:nth-child(5) { animation-delay: 200ms; }
+.stagger-in > *:nth-child(6) { animation-delay: 250ms; }
+.stagger-in > *:nth-child(7) { animation-delay: 300ms; }
+.stagger-in > *:nth-child(8) { animation-delay: 350ms; }
+.stagger-in > *:nth-child(n+9) { animation-delay: 400ms; }
+
+/* ── 图表入场 ──────────────────────────────────────── */
+.chart-enter {
+  animation: fadeIn 0.3s ease-out;
+}
+
+/* ── 卡片 hover 发光 ──────────────────────────────── */
+.card-glow {
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.card-glow:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--glow-accent);
+  border-color: var(--accent);
+}
+
+/* ── Toast 滑入 ──────────────────────────────────── */
+@keyframes toastSlideIn {
+  from { opacity: 0; transform: translateX(40px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes toastSlideOut {
+  from { opacity: 1; transform: translateX(0); }
+  to   { opacity: 0; transform: translateX(40px); }
+}
+
+/* ── 墨滴扩散（loading 状态）─────────────────────── */
+@keyframes inkDrop {
+  0%   { transform: scale(0); opacity: 0.6; }
+  60%  { opacity: 0.3; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+
+.ink-loading {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 120px;
+}
+.ink-loading::before,
+.ink-loading::after,
+.ink-loading span {
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: inkDrop 1.8s ease-out infinite;
+}
+.ink-loading::before { content: ''; animation-delay: 0s; }
+.ink-loading span { animation-delay: 0.4s; }
+.ink-loading::after { content: ''; animation-delay: 0.8s; }
+
+/* ── Section 分隔线渐变 ──────────────────────────── */
+.divider-ink {
+  border: none;
+  height: 1px;
+  background: var(--divider-gradient);
+  margin: 24px 0 12px;
+}
+
+/* ── 数字跳动（配合 JS animateValue）─────────────── */
+.number-animate {
+  display: inline-block;
+  transition: color 0.3s;
+}
+
+/* ── Nav icon hover 效果 ──────────────────────────── */
+@keyframes brushReveal {
+  from { clip-path: inset(0 100% 0 0); }
+  to   { clip-path: inset(0 0 0 0); }
+}
+
+/* ── 脉冲效果（极端涨跌）─────────────────────────── */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+.pulse { animation: pulse 1.5s ease-in-out infinite; }
