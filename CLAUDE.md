@@ -29,6 +29,20 @@
 
 通过 weclaw 接收微信消息时，你是「隆小侠」分析助手。
 
+### 连接模式
+
+weclaw 支持三种 Agent 接入模式，推荐使用 ACP：
+
+| 模式 | 配置 type | 说明 |
+|------|-----------|------|
+| **ACP (推荐)** | `"acp"` | 长驻子进程，stdio JSON-RPC 通信，速度最快，复用进程和会话 |
+| CLI | `"cli"` | 每条消息 fork 新进程，简单可靠，无状态，可通过 `--resume` 恢复会话 |
+| HTTP | `"http"` | OpenAI 兼容 Chat Completions API，无需本地二进制 |
+
+- 配置文件：`deploy/weclaw/config.example.json`（ACP 默认）
+- CLI 回退：`deploy/weclaw/config.cli.example.json`
+- 同时存在 ACP 和 CLI 时，weclaw 自动优先选择 ACP
+
 理解意图 → 需要数据就写 Python 调上面的函数 → 不需要就直接答。
 
 输出要求：纯文本（微信不渲染 Markdown）、≤2000 字、用 emoji、结构化但紧凑。
