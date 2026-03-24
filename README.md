@@ -5,7 +5,7 @@
 
 ---
 
-## 八大模块
+## 九大模块
 
 | 模块 | 路径 | 功能 |
 |------|------|------|
@@ -16,6 +16,7 @@
 | **Web** | `signals/web/` | 全功能 Web UI — 6 页 SPA + 9 个 API 路由（Dashboard/Chart/Stock/Review/Backtest/Analog） |
 | **Web2** | `signals/web2/` | 精简版 Web — 行业主题聚合 + MACD 回测（独立 FastAPI 应用） |
 | **Research** | `signals/research/` | 研报导入(MD/PDF/图片OCR) + 自动归档(notes/YYYY/MM/) + 时间衰减 |
+| **WeChat** | `signals/wechat/` | 微信 Agent 技能（weclaw + Claude Code CLI 集成） |
 | **Notify** | `signals/notify/` | 飞书推送（分析结果 + 行业聚类报告） |
 
 ---
@@ -139,6 +140,79 @@ backtest 每月运行 ──→ 读取已存档信号（≥20天前）──→ 
 
 ---
 
+## 微信 Agent（weclaw + Claude Code）
+
+通过 weclaw 桥接微信消息到 Claude Code CLI，实现微信端的智能分析助手「隆小侠」。
+
+### 工作流
+
+```
+┌──────────┐       ┌──────────┐       ┌─────────────────────────────────────┐
+│  微信用户  │──────→│  weclaw   │──────→│  Claude Code CLI (Max Plan)         │
+│          │  消息  │ (桥接层)   │ stdin │                                     │
+└──────────┘       └──────────┘       │  读取 CLAUDE.md → 判断消息类型        │
+     ▲                                │                                     │
+     │                                │  ┌─────────────────────────────┐    │
+     │                                │  │ 需要 Web API？              │    │
+     │                                │  │                             │    │
+     │                                │  │  「行业/板块」「复盘/盘后」    │    │
+     │                                │  │         │                   │    │
+     │                                │  │         ▼                   │    │
+     │                                │  │  wechat_run.py              │    │
+     │                                │  │    │                        │    │
+     │                                │  │    ▼                        │    │
+     │                                │  │  Web API (localhost:8000)   │    │
+     │                                │  │  /api/industry/ranking      │    │
+     │                                │  │  /api/review/run → results  │    │
+     │                                │  └──────────┬──────────────────┘    │
+     │                                │             │                      │
+     │                                │  ┌──────────┴──────────────────┐    │
+     │                                │  │ 其他所有消息                 │    │
+     │                                │  │                             │    │
+     │                                │  │  Claude Code 直接回答        │    │
+     │                                │  │  (分析/回测/策略/闲聊...)     │    │
+     │                                │  └──────────┬──────────────────┘    │
+     │                                │             │                      │
+     │                                │             ▼                      │
+     │                                │  纯文本结果 (≤2000字 + emoji)      │
+     │         stdout                 └──────────────┬──────────────────────┘
+     │                                               │
+     └───────────────────────────────────────────────┘
+                        回复
+```
+
+### 两条路径
+
+| 路径 | 触发词 | 数据来源 | 前置条件 |
+|------|--------|----------|----------|
+| **Web API 技能** | 行业/板块/排行、复盘/盘后/review | `python scripts/wechat_run.py` → Web API | 需 `python run.py --mode web` 运行中 |
+| **Claude Code 直答** | 其他所有消息 | Claude Code 自身能力 | 无 |
+
+### 部署
+
+```bash
+# 1. 启动 Web 服务（行业/复盘技能依赖）
+python run.py --mode web --port 8000
+
+# 2. 配置 weclaw
+cp deploy/weclaw/config.example.json ~/.weclaw/config.json
+# 修改 cwd 为 signals 项目路径
+
+# 3. 启动 weclaw（扫码登录微信）
+weclaw serve
+```
+
+### 相关文件
+
+| 文件 | 说明 |
+|------|------|
+| `signals/wechat/skills.py` | 2 个 Web API 技能（行业分析 + 盘后复盘）+ 帮助 |
+| `scripts/wechat_run.py` | Claude Code 调用入口，匹配技能 → 调 API → 输出文本 |
+| `deploy/weclaw/config.example.json` | weclaw CLI 模式配置模板 |
+| `CLAUDE.md` | Agent 行为指令（处理流程 + 输出格式要求） |
+
+---
+
 ## AutoDL 部署
 
 ```bash
@@ -236,6 +310,9 @@ cd deploy && docker-compose up -d
 │   │   ├── app.py          #   FastAPI + lifespan 调度器
 │   │   ├── api/            #   cluster + backtest API
 │   │   └── static/         #   前端 SPA
+│   ├── wechat/             # 微信 Agent
+│   │   ├── skills.py       #   Web API 技能（行业分析 + 盘后复盘）
+│   │   └── __init__.py
 │   ├── research/           # 研报子系统
 │   │   └── research.py     #   多格式导入 + 自动归档
 │   └── notify/             # 消息推送
@@ -245,8 +322,9 @@ cd deploy && docker-compose up -d
 │   ├── docker-compose.yml  # 5 服务编排（Futu + MongoDB + Sync + Web + Redis）
 │   ├── init-mongo.js       # MongoDB 初始化（集合 + 索引 + TTL）
 │   ├── autodl/             # AutoDL 部署（start.sh / stop.sh / gen_cache.py）
+│   ├── weclaw/             # weclaw 微信桥接配置
 │   └── cron/               # 定时任务（盘中扫描 + 同步 + 备份）
-├── scripts/                # 辅助脚本（缓存预生成等）
+├── scripts/                # 辅助脚本（缓存预生成 + wechat_run.py）
 └── notes/                  # 研究笔记归档（YYYY/MM/）
 ```
 
