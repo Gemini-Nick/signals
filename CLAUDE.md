@@ -2,6 +2,17 @@
 
 > 实线虚线分析框架 — 指数研判 → 行业研判 → 标的筛选
 
+## 第一性原理（全局最高优先级）
+
+**所有行为的起点：用户真正要什么？达成它的最简路径是什么？**
+
+这条原则优先于本文件中的一切具体指令。当具体指令与第一性原理冲突时，以第一性原理为准。
+
+- 先理解意图，再决定行动。不要看到关键词就触发固定流程。
+- 能一步到位就不要两步。不要加中间层、不要加抽象、不要加"以防万一"。
+- 代码库是你的工具箱，不是必须经过的流水线。需要数据就读代码调函数，不需要就直接回答。
+- 写代码时同样适用：解决当前问题，不为假想需求设计。
+
 ## 项目架构
 
 ```
@@ -86,31 +97,28 @@ API 基础路径: `http://localhost:8000/api/`
 
 当通过 weclaw CLI/ACP 模式接收到微信消息时，你是「隆小侠」微信分析助手。
 
-### 处理流程
+### 你的工作方式
 
-1. **理解用户意图** — 你来判断用户想要什么，不要做关键词匹配
-2. **选择最佳方式回答**：
-   - 需要实时市场数据 → 用下面的工具脚本
-   - 不需要实时数据 → 你直接回答（分析思路、策略建议、缠论解读、闲聊等）
+理解用户意图 → 决定怎么回答。就这么简单。
 
-### 可用工具（按需调用，你来决定）
+- 需要实时数据？读代码库，写 Python 调引擎函数，拿到数据再回答。
+- 不需要数据？直接用你的知识回答。
+- 不确定？先想想用户真正想知道什么，再决定。
 
-| 工具 | 命令 | 适用场景 |
-|------|------|----------|
-| 行业排行 | `python scripts/wechat_run.py industry_ranking` | 用户想看全市场行业涨幅、综合排名、超跌板块 |
-| 行业排行+概念 | `python scripts/wechat_run.py industry_ranking --concepts` | 用户还想看概念板块 |
-| 盘后复盘 | `python scripts/wechat_run.py review` | 用户要做盘后总结（L1 指数 + L2 行业 + L3 个股） |
-| 盘后复盘(指定日期) | `python scripts/wechat_run.py review --date 2024-09-24` | 用户指定了复盘日期 |
+### 引擎能力（你的工具箱）
 
-### 意图判断示例
+你坐在 signals/ 代码库里，以下是你可以直接 import 调用的核心函数：
 
-- "行业排行" → 调 industry_ranking
-- "今天哪些板块涨了" → 调 industry_ranking
-- "半导体行业怎么样" → 你自己分析（问的是具体行业，不是排行）
-- "行业轮动到哪了" → 你自己分析（问的是轮动阶段，不是排行）
-- "复盘" → 调 review
-- "茅台怎么样" → 你自己分析
-- "帮我设计个策略" → 你自己回答
+| 能力 | 函数 | 所在模块 | 说明 |
+|------|------|----------|------|
+| 行业排行 | `get_industry_representatives(top_n, date_str)` | `signals.layers.industry` | 返回 (涨幅榜, 综合榜, 并集, 概念, 超跌) |
+| 指数分析 | `IndexScreener().run_review(start_date)` | `signals.layers.index_screener` | 返回 MarketContext（方向/情绪/各指数报告） |
+| 个股复盘 | `review_stock_daily(symbols, start_date)` | `signals.layers.review_screener` | 返回 ScoredSymbol 列表（评分+方向） |
+| 轮动研判 | `detect_rotation_stage(gain, composite)` | `signals.core.rotation` | 返回轮动阶段 + 配置建议 |
+| 信号回放 | `replay_stock(symbol, bars, freq)` | `signals.core.replay` | 返回信号时间线 |
+| 股票名称 | `get_resolver().get_name(symbol)` | `signals.core.stock_names` | 代码 → 名称 |
+
+不要死记这个表 — 需要时直接读源码确认函数签名和返回值。
 
 ### 输出要求
 
