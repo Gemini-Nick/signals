@@ -1,0 +1,133 @@
+# -*- coding: utf-8 -*-
+"""盘后复盘 API — 日期选择、触发分析、轮询进度、读取结果（web2 版本）"""
+import asyncio
+from fastapi import APIRouter
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from ..services.market_cache import get_cache
+from ..services.date_utils import resolve_start_date, get_date_label, get_all_presets
+from ..services.serializers import (
+    serialize_index_report,
+    serialize_market_context,
+    serialize_scored_symbol,
+    serialize_signal_change,
+)
+
+router = APIRouter(prefix="/api/review", tags=["review"])
+
+
+class ReviewRequest(BaseModel):
+    start_date: str
+
+
+@router.get("/presets")
+async def review_presets():
+    """返回日期预设列表"""
+    return get_all_presets()
+
+
+@router.post("/run")
+async def review_run(req: ReviewRequest):
+    """提交复盘任务（后台线程执行）"""
+    cache = get_cache()
+    rv = cache.review
+
+    if rv.is_running:
+        return {"ok": False, "message": "复盘正在运行中，请等待"}
+
+    resolved = resolve_start_date(req.start_date)
+    label = get_date_label(req.start_date)
+    asyncio.create_task(cache.refresh_review(resolved, label))
+    return {"ok": True, "start_date": resolved, "label": label}
+
+
+@router.get("/status")
+async def review_status():
+    """轮询复盘进度"""
+    return get_cache().get_review_status()
+
+
+@router.get("/results")
+async def review_results():
+    """获取复盘结果"""
+    rv = get_cache().review
+
+    if not rv.completed:
+        return JSONResponse(status_code=400, content={
+            "error": "复盘尚未完成",
+            "is_running": rv.is_running,
+            "phase": rv.phase,
+        })
+
+    try:
+        banner = {}
+        if rv.market_context:
+            banner = serialize_market_context(rv.market_context)
+
+        index_reports = [serialize_index_report(r) for r in rv.index_reports]
+
+        def _serialize_industry(ind):
+            candidates = []
+            for c in getattr(ind, "candidates", []):
+                candidates.append({
+                    "name": c.name, "code": c.code,
+                    "role": c.role, "detail": getattr(c, "detail", ""),
+                })
+            return {
+                "name": ind.name,
+                "display_name": getattr(ind, "display_name", ind.name),
+                "gain_pct": round(getattr(ind, "gain_pct", 0), 2),
+                "zt_count": getattr(ind, "zt_count", 0),
+                "strong_count": getattr(ind, "strong_count", 0),
+                "composite_score": round(getattr(ind, "composite_score", 0), 1),
+                "composite_rank": getattr(ind, "composite_rank", 0),
+                "source": getattr(ind, "source", ""),
+                "sector_type": getattr(ind, "sector_type", ""),
+                "rotation_line": getattr(ind, "rotation_line", ""),
+                "rhythm_phase": getattr(ind, "rhythm_phase", ""),
+                "rhythm_score": getattr(ind, "rhythm_score", 0),
+                "net_inflow": round(getattr(ind, "net_inflow", 0) or 0, 2),
+                "candidates": candidates,
+            }
+
+        gain_list = [_serialize_industry(i) for i in rv.gain_list]
+        composite_list = [_serialize_industry(i) for i in rv.composite_list]
+
+        concept_list = [
+            {"name": cp.name, "gain_pct": round(getattr(cp, "gain_pct", 0), 2),
+             "sector_type": getattr(cp, "sector_type", "")}
+            for cp in rv.concepts
+        ]
+
+        rotation = {
+            "stage": rv.rotation_stage,
+            "detail": rv.rotation_detail,
+            "allocation": rv.allocation_suggestion,
+        }
+
+        scored_symbols = [serialize_scored_symbol(s) for s in rv.scored_symbols]
+
+        replay_timelines = {}
+        for sym, timeline in getattr(rv, "replay_timelines", {}).items():
+            replay_timelines[sym] = [serialize_signal_change(sc) for sc in timeline]
+
+        return {
+            "start_date": rv.start_date,
+            "start_label": rv.start_label,
+            "banner": banner,
+            "index_reports": index_reports,
+            "gain_list": gain_list,
+            "composite_list": composite_list,
+            "concepts": concept_list,
+            "rotation": rotation,
+            "scored_symbols": scored_symbols,
+            "replay_timelines": replay_timelines,
+            "timing": getattr(rv, "timing", {}),
+        }
+
+    except Exception as e:
+        import traceback
+        return JSONResponse(status_code=500, content={
+            "error": str(e), "detail": traceback.format_exc()
+        })

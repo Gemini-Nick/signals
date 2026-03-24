@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""隆小侠 Web2 — 精简版 FastAPI 应用（行业聚类 + MACD 回测）"""
+"""隆小侠 Web2 — FastAPI 应用（墨龙设计系统）"""
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,6 +11,9 @@ from fastapi.staticfiles import StaticFiles
 
 from .api.cluster import router as cluster_router, start_scheduler, stop_scheduler
 from .api.backtest import router as backtest_router
+from .api.chart import router as chart_router
+from .api.review import router as review_router
+from .api.stock import router as stock_router
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,9 @@ app.add_middleware(
 # 路由
 app.include_router(cluster_router)
 app.include_router(backtest_router)
+app.include_router(chart_router)
+app.include_router(review_router)
+app.include_router(stock_router)
 
 # 静态文件
 _STATIC = Path(__file__).parent / "static"
