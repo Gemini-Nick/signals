@@ -1,0 +1,168 @@
+@import "tailwindcss";
+
+/* ═══════════════════════════════════════════════════
+   🐲 墨龙设计系统 — Tailwind v4 Design Tokens
+   ═══════════════════════════════════════════════════ */
+
+@font-face {
+  font-family: 'LXGW WenKai';
+  src: url('https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/files/lxgwwenkai-regular.woff2') format('woff2');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'LXGW WenKai';
+  src: url('https://cdn.jsdelivr.net/npm/lxgw-wenkai-webfont@1.7.0/files/lxgwwenkai-bold.woff2') format('woff2');
+  font-weight: 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  src: url('https://cdn.jsdelivr.net/gh/JetBrains/JetBrainsMono@2.304/fonts/webfonts/JetBrainsMono-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-display: swap;
+}
+
+/* ── Tailwind v4 Theme ─────────────────────────── */
+@theme {
+  --font-display: 'LXGW WenKai', 'STKaiti', 'KaiTi', serif;
+  --font-body: 'Noto Sans SC', 'PingFang SC', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+  --color-up: var(--c-up);
+  --color-down: var(--c-down);
+  --color-accent: var(--c-accent);
+  --color-accent-gold: var(--c-accent-gold);
+  --color-bg-primary: var(--c-bg-primary);
+  --color-bg-secondary: var(--c-bg-secondary);
+  --color-bg-tertiary: var(--c-bg-tertiary);
+  --color-border: var(--c-border);
+  --color-text-primary: var(--c-text-primary);
+  --color-text-secondary: var(--c-text-secondary);
+  --color-text-muted: var(--c-text-muted);
+}
+
+/* ── 主题 B: 青铜 (默认) ──────────────────────── */
+:root, [data-theme="bronze"] {
+  --c-bg-primary: #0c0e18;
+  --c-bg-secondary: #141824;
+  --c-bg-tertiary: #1e2333;
+  --c-border: #2c3148;
+  --c-text-primary: #d4d8e4;
+  --c-text-secondary: #7a8098;
+  --c-text-muted: #464d64;
+  --c-accent: #2d8a6e;
+  --c-accent-hover: #39a482;
+  --c-accent-blue: #3b7dff;
+  --c-accent-gold: #c4a24e;
+  --c-up: #e8384f;
+  --c-down: #2d8a6e;
+  --c-signal-buy: #e8a33e;
+  --c-signal-sell: #8e44ad;
+  /* chart */
+  --c-chart-bg: #0c0e18;
+  --c-chart-grid: #141824;
+  --c-bi-up: #e8384f;
+  --c-bi-down: #2d8a6e;
+  --c-zhongshu: rgba(59, 125, 255, 0.5);
+  --c-vol-up: rgba(232, 56, 79, 0.45);
+  --c-vol-down: rgba(45, 138, 110, 0.45);
+  --c-macd-dif: #e8a33e;
+  --c-macd-dea: #3b7dff;
+  --c-macd-bar-up: rgba(232, 56, 79, 0.65);
+  --c-macd-bar-down: rgba(45, 138, 110, 0.65);
+  --c-glow: 0 0 12px rgba(45, 138, 110, 0.2);
+  --c-spotlight: radial-gradient(ellipse at 15% 0%, rgba(45, 138, 110, 0.04), transparent 55%);
+}
+
+/* ── 主题 A: 朱砂 ─────────────────────────────── */
+[data-theme="cinnabar"] {
+  --c-bg-primary: #0f0e0c;
+  --c-bg-secondary: #18170f;
+  --c-bg-tertiary: #242318;
+  --c-border: #33312a;
+  --c-text-primary: #f2efe6;
+  --c-text-secondary: #a8a497;
+  --c-text-muted: #635f52;
+  --c-accent: #c73e1d;
+  --c-accent-hover: #d95438;
+  --c-accent-blue: #7a9eb8;
+  --c-accent-gold: #c4a24e;
+  --c-up: #c73e1d;
+  --c-down: #6b8a4e;
+  --c-signal-buy: #c73e1d;
+  --c-signal-sell: #7a9eb8;
+  --c-chart-bg: #0f0e0c;
+  --c-chart-grid: #1e1d16;
+  --c-bi-up: #c73e1d;
+  --c-bi-down: #7a9eb8;
+  --c-zhongshu: rgba(196, 162, 78, 0.5);
+  --c-vol-up: rgba(199, 62, 29, 0.45);
+  --c-vol-down: rgba(107, 138, 78, 0.45);
+  --c-macd-dif: #c4a24e;
+  --c-macd-dea: #7a9eb8;
+  --c-macd-bar-up: rgba(199, 62, 29, 0.65);
+  --c-macd-bar-down: rgba(107, 138, 78, 0.65);
+  --c-glow: 0 0 12px rgba(199, 62, 29, 0.2);
+  --c-spotlight: radial-gradient(ellipse at 15% 0%, rgba(199, 62, 29, 0.04), transparent 55%);
+}
+
+/* ── 全局基础 ──────────────────────────────────── */
+html {
+  transition: background-color 0.4s ease, color 0.3s ease;
+}
+
+body {
+  font-family: var(--font-body);
+  background: var(--c-bg-primary);
+  color: var(--c-text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 噪点纹理 */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 256px;
+}
+
+/* 径向光源 */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: var(--c-spotlight);
+}
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--c-border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--c-text-muted); }
+
+::selection { background: var(--c-accent); color: #fff; }
+
+/* ── 工具类 ────────────────────────────────────── */
+@utility font-display {
+  font-family: var(--font-display);
+}
+@utility font-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+@utility text-up {
+  color: var(--c-up);
+}
+@utility text-down {
+  color: var(--c-down);
+}
+@utility glow-accent {
+  box-shadow: var(--c-glow);
+}
