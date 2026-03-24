@@ -283,8 +283,34 @@ python run.py --mode web --port 8000
 |------|------|
 | `deploy/weclaw/config.example.json` | weclaw 配置模板 — 告诉 weclaw 用 Claude Code CLI 作为 agent |
 | `CLAUDE.md` | Agent 行为指令 — Claude Code 读取后知道自己是微信助手 |
-| `scripts/wechat_run.py` | 技能入口 — 匹配触发词 → 调 Web API → 输出文本 |
-| `signals/wechat/skills.py` | 技能实现 — IndustryAnalysisSkill + ReviewSkill（HTTP 调 Web API） |
+| `scripts/wechat_run.py` | 技能入口 — 匹配触发词 → 直接调引擎 → 输出文本 |
+| `signals/wechat/skills.py` | 技能实现 — IndustryAnalysisSkill + ReviewSkill（直接调引擎） |
+
+### 设计思路：两个界面，两个消费者
+
+```
+                    ┌──────────────┐
+                    │  分析引擎     │  ← 同一套底层函数
+                    │  (core/layers)│
+                    └──────┬───────┘
+                           │
+              ┌────────────┼────────────┐
+              ▼                         ▼
+      ┌──────────────┐         ┌──────────────┐
+      │  Web (API+UI) │         │  Skill (微信)  │
+      │  给人看        │         │  给 AI 用      │
+      └──────────────┘         └──────────────┘
+```
+
+|  | Web UI | Skill (微信 Agent) |
+|---|---|---|
+| **消费者** | 人（浏览器） | AI（Claude Code CLI） |
+| **输出** | HTML/图表/JSON | 纯文本 + emoji（≤2000字） |
+| **需要** | 可视化、交互、实时刷新 | 结构化数据、快速、自包含 |
+| **调引擎方式** | HTTP API（FastAPI 路由） | Python 直接 import 调用 |
+| **常驻服务** | 需要 `python run.py --mode web` | 不需要，每次临时 import |
+
+Web 是给你在浏览器里看 K 线图、热力图、仪表盘的 — AI 不需要看图，它只需要拿到数据，压成微信能读的文本。所以 Skill 直接 import 引擎函数，不绕 HTTP，不依赖 Web 服务。
 
 ---
 
