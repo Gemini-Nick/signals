@@ -1,18 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Skill 注册表 — 定义可被微信 Agent 调用的分析技能
+WeChat Skills — 仅保留需要调用 Web API 的技能
 
-每个 Skill 包含:
-- name: 技能标识
-- triggers: 触发关键词列表
-- execute(params): 执行分析，返回文本结果
+只有两类技能需要通过脚本调用（依赖运行中的 Web 服务）：
+1. 行业板块分析 → GET /api/industry/ranking + /api/industry/concept-ranking
+2. 盘后复盘     → POST /api/review/run → GET /api/review/status → GET /api/review/results
+
+其余所有需求由 Claude Code 直接用自身能力回答。
 """
+import json
 import logging
-import re
+import time
+import urllib.request
+import urllib.error
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 _log = logging.getLogger("signals.wechat.skills")
+
+WEB_BASE = "http://127.0.0.1:8000/api"
 
 
 @dataclass
@@ -32,322 +38,242 @@ class BaseSkill(ABC):
 
     @abstractmethod
     def execute(self, raw_input: str, params: dict) -> SkillResult:
-        """执行技能，返回文本结果"""
         ...
 
     def match(self, text: str) -> tuple[bool, dict]:
-        """
-        判断文本是否匹配该技能。
-        返回 (是否匹配, 提取的参数 dict)
-        """
         for trigger in self.triggers:
             if trigger in text:
-                # 提取 trigger 后面的参数文本
                 idx = text.index(trigger) + len(trigger)
                 remainder = text[idx:].strip()
                 return True, {"query": remainder}
         return False, {}
 
 
+def _api_get(path: str, timeout: int = 30) -> dict | None:
+    """GET 请求 Web API"""
+    url = f"{WEB_BASE}{path}"
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        _log.error("API GET %s 失败: %s", path, e)
+        return None
+
+
+def _api_post(path: str, body: dict | None = None, timeout: int = 30) -> dict | None:
+    """POST 请求 Web API"""
+    url = f"{WEB_BASE}{path}"
+    try:
+        data = json.dumps(body or {}).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        _log.error("API POST %s 失败: %s", path, e)
+        return None
+
+
 # ─────────────────────────────────────────────────────
-# 内置 Skills
+# Skill 1: 行业板块分析（调用 Web API）
 # ─────────────────────────────────────────────────────
 
-class StockAnalyzeSkill(BaseSkill):
-    """个股深度分析"""
-    name = "stock_analyze"
-    description = "深度分析单只股票（缠论结构 + 量价 + 异常检测 + 完全分类）"
-    triggers = ["分析", "看看", "诊股", "analyze"]
-    usage = "分析 茅台 / 分析 600519 / 分析 SZ.002759"
-
-    def execute(self, raw_input: str, params: dict) -> SkillResult:
-        query = params.get("query", "").strip()
-        if not query:
-            return SkillResult(ok=False, text="", error="请提供股票名称或代码，如：分析 茅台")
-
-        symbol = _resolve_symbol(query)
-        if not symbol:
-            return SkillResult(ok=False, text="", error=f"无法识别股票: {query}")
-
-        try:
-            from signals.layers.stock_deep_dive import StockDeepDive
-            dive = StockDeepDive(symbol)
-            return SkillResult(ok=True, text=dive.to_text())
-        except Exception as e:
-            _log.exception("StockDeepDive 失败: %s", symbol)
-            return SkillResult(ok=False, text="", error=f"分析失败: {e}")
-
-
-class MarketOverviewSkill(BaseSkill):
-    """大盘研判"""
-    name = "market_overview"
-    description = "大盘方向 / 情绪周期 / 仓位建议"
-    triggers = ["大盘", "指数", "市场", "行情"]
-    usage = "大盘 / 指数 / 今日行情"
-
-    def execute(self, raw_input: str, params: dict) -> SkillResult:
-        try:
-            from signals.web.services.engine import get_engine
-            engine = get_engine()
-            ctx = engine.get_market_context()
-            if ctx is None:
-                return SkillResult(ok=False, text="", error="引擎未就绪，请先启动 web 服务")
-            return SkillResult(ok=True, text=ctx.to_text())
-        except Exception as e:
-            _log.exception("大盘研判失败")
-            return SkillResult(ok=False, text="", error=f"大盘研判失败: {e}")
-
-
-class IndustryRankingSkill(BaseSkill):
-    """行业排行"""
-    name = "industry_ranking"
-    description = "行业板块强度排行（涨幅 + 综合评分 + 超跌）"
+class IndustryAnalysisSkill(BaseSkill):
+    """行业板块综合分析 — 涨幅榜 + 综合榜 + 超跌 + 概念排行"""
+    name = "industry_analysis"
+    description = "行业板块综合分析（涨幅 + 综合评分 + 超跌 + 概念排行）"
     triggers = ["行业", "板块", "排行"]
-    usage = "行业排行 / 板块"
+    usage = "行业 / 板块排行"
 
     def execute(self, raw_input: str, params: dict) -> SkillResult:
-        try:
-            from signals.layers.industry import run_industry_ranking
-            result = run_industry_ranking()
-            if not result:
-                return SkillResult(ok=False, text="", error="行业数据获取失败")
+        # 行业排行
+        ranking = _api_get("/industry/ranking")
+        if not ranking:
+            return SkillResult(ok=False, text="", error="Web 服务未启动或行业数据未就绪，请确认 python run.py --mode web 正在运行")
 
-            lines = ["📊 行业排行 Top 10\n"]
-            gain_list = sorted(result, key=lambda x: x.gain_pct, reverse=True)[:10]
+        # 如果还在 loading
+        if ranking.get("loading"):
+            return SkillResult(ok=False, text="", error="行业数据正在加载中，请稍后再试")
+
+        lines = []
+
+        # 涨幅榜 Top 10
+        gain_list = ranking.get("gain_list", [])[:10]
+        if gain_list:
+            lines.append("📊 行业涨幅榜 Top 10\n")
             for i, ind in enumerate(gain_list, 1):
-                emoji = "🔴" if ind.gain_pct > 0 else "🟢"
-                lines.append(
-                    f"{i}. {emoji} {ind.display_name}  "
-                    f"{ind.gain_pct:+.2f}%  "
-                    f"综合{ind.composite_score:.0f}"
-                )
+                pct = ind.get("gain_pct", 0)
+                emoji = "🔴" if pct > 0 else "🟢"
+                name = ind.get("display_name") or ind.get("name", "?")
+                zt = ind.get("zt_count", 0)
+                zt_str = f" 涨停{zt}" if zt else ""
+                lines.append(f"{i}. {emoji} {name}  {pct:+.2f}%{zt_str}")
 
-            # 超跌板块
-            oversold = sorted(result, key=lambda x: x.oversold_score, reverse=True)[:5]
-            if oversold and oversold[0].oversold_score > 0:
-                lines.append("\n🔻 超跌反弹候选:")
-                for ind in oversold:
-                    if ind.oversold_score > 0:
-                        lines.append(f"  · {ind.display_name} 超跌分{ind.oversold_score:.0f}")
+        # 综合榜 Top 10
+        comp_list = ranking.get("composite_list", [])[:10]
+        if comp_list:
+            lines.append("\n🏆 综合评分 Top 10\n")
+            for i, ind in enumerate(comp_list, 1):
+                name = ind.get("display_name") or ind.get("name", "?")
+                score = ind.get("composite_score", 0)
+                pct = ind.get("gain_pct", 0)
+                lines.append(f"{i}. {name}  综合{score:.0f}  {pct:+.2f}%")
 
-            return SkillResult(ok=True, text="\n".join(lines))
-        except Exception as e:
-            _log.exception("行业排行失败")
-            return SkillResult(ok=False, text="", error=f"行业排行失败: {e}")
+        # 超跌板块
+        oversold = ranking.get("oversold_list", [])[:5]
+        if oversold:
+            lines.append("\n🔻 超跌反弹候选\n")
+            for ind in oversold:
+                name = ind.get("display_name") or ind.get("name", "?")
+                score = ind.get("oversold_score", 0)
+                if score > 0:
+                    lines.append(f"  · {name}  超跌分{score:.0f}")
 
+        # 市场统计
+        stats = ranking.get("stats", {})
+        if stats:
+            zt = stats.get("zt_total", 0)
+            dt = stats.get("dt_total", 0)
+            red_pct = stats.get("red_pct", 0)
+            lines.append(f"\n📈 涨停{zt}  跌停{dt}  上涨占比{red_pct:.0f}%")
 
-class BacktestSkill(BaseSkill):
-    """信号回测"""
-    name = "backtest"
-    description = "对个股进行信号回测（胜率 / 期望 / MFE-MAE）"
-    triggers = ["回测", "backtest"]
-    usage = "回测 600519 / 回测 茅台 日线"
+        # 概念排行
+        query = params.get("query", "")
+        if "概念" in raw_input or "概念" in query:
+            concepts = _api_get("/industry/concept-ranking")
+            if concepts and isinstance(concepts, list):
+                lines.append("\n🔥 概念板块 Top 10\n")
+                for i, c in enumerate(concepts[:10], 1):
+                    name = c.get("name", "?")
+                    score = c.get("composite_score", 0)
+                    pct = c.get("change_pct", 0)
+                    up_ratio = c.get("up_ratio", 0)
+                    lines.append(
+                        f"{i}. {name}  {pct:+.2f}%  "
+                        f"综合{score:.0f}  上涨{up_ratio:.0%}"
+                    )
 
-    def execute(self, raw_input: str, params: dict) -> SkillResult:
-        query = params.get("query", "").strip()
-        if not query:
-            return SkillResult(ok=False, text="", error="请提供股票代码，如：回测 600519")
+        if not lines:
+            return SkillResult(ok=False, text="", error="未获取到行业数据")
 
-        # 解析频率
-        freq = "daily"
-        for kw, f in [("周线", "weekly"), ("日线", "daily")]:
-            if kw in query:
-                freq = f
-                query = query.replace(kw, "").strip()
-
-        # 解析代码
-        code = _extract_code(query)
-        if not code:
-            return SkillResult(ok=False, text="", error=f"无法识别股票代码: {query}")
-
-        try:
-            from signals.web.api.backtest import _fetch_kline, _detect_market, _build_symbol
-            from signals.core.signal_eval import evaluate_signals
-
-            market = _detect_market(code)
-            symbol = _build_symbol(code, market)
-            df = _fetch_kline(code, market, freq)
-            if df.empty:
-                return SkillResult(ok=False, text="", error=f"无法获取K线数据: {code}")
-
-            # 运行回测
-            from signals.core.backtest_engine import run_signal_backtest
-            result = run_signal_backtest(df, symbol, freq)
-
-            lines = [f"📈 回测报告: {symbol} ({freq})\n"]
-            if hasattr(result, "kpi") and result.kpi:
-                kpi = result.kpi
-                lines.append(f"信号总数: {kpi.get('total_signals', 0)}")
-                lines.append(f"胜率: {kpi.get('win_rate', 0):.1%}")
-                lines.append(f"期望收益: {kpi.get('expectancy', 0):.2%}")
-                lines.append(f"平均T+5: {kpi.get('avg_ret_t5', 0):.2%}")
-                lines.append(f"平均T+10: {kpi.get('avg_ret_t10', 0):.2%}")
-                lines.append(f"MFE均值: {kpi.get('avg_mfe', 0):.2%}")
-                lines.append(f"MAE均值: {kpi.get('avg_mae', 0):.2%}")
-            else:
-                lines.append("未检测到有效信号")
-
-            return SkillResult(ok=True, text="\n".join(lines))
-        except Exception as e:
-            _log.exception("回测失败: %s", code)
-            return SkillResult(ok=False, text="", error=f"回测失败: {e}")
+        return SkillResult(ok=True, text="\n".join(lines))
 
 
-class SocialHeatSkill(BaseSkill):
-    """社交舆情"""
-    name = "social_heat"
-    description = "查询个股社交热度（舆情评分 + 概念标签）"
-    triggers = ["舆情", "热度", "人气"]
-    usage = "舆情 茅台 / 热度 600519"
+# ─────────────────────────────────────────────────────
+# Skill 2: 盘后复盘（调用 Web API，异步轮询）
+# ─────────────────────────────────────────────────────
+
+class ReviewSkill(BaseSkill):
+    """盘后复盘 — 触发三层联动分析，轮询等待完成"""
+    name = "review"
+    description = "盘后复盘（指数 + 行业 + 标的三层联动分析）"
+    triggers = ["复盘", "盘后", "review"]
+    usage = "复盘 / 盘后复盘 / 复盘 yesterday"
 
     def execute(self, raw_input: str, params: dict) -> SkillResult:
         query = params.get("query", "").strip()
-        if not query:
-            return SkillResult(ok=False, text="", error="请提供股票名称或代码")
+        start_date = query if query else "yesterday"
 
-        symbol = _resolve_symbol(query)
-        if not symbol:
-            return SkillResult(ok=False, text="", error=f"无法识别股票: {query}")
+        # 1) 触发复盘任务
+        resp = _api_post("/review/run", {"start_date": start_date})
+        if not resp or not resp.get("ok"):
+            return SkillResult(ok=False, text="", error="复盘任务启动失败，请确认 Web 服务正在运行")
 
-        try:
-            from signals.data.social_fetcher import fetch_social_heat
-            heat = fetch_social_heat(symbol)
-            if not heat:
-                return SkillResult(ok=True, text=f"{symbol} 暂无社交热度数据")
+        label = resp.get("label", start_date)
 
-            lines = [
-                f"🔥 {symbol} 社交舆情",
-                f"热度: {heat.heat_score:.1f} ({heat.heat_grade})",
-                f"评论得分: {heat.comment_score:.1f} ({heat.comment_rank})",
-                f"关注指数: {heat.focus_index:.1f}",
-                f"机构占比: {heat.institution_pct:.1%}",
-            ]
-            if heat.concepts:
-                lines.append(f"概念: {', '.join(heat.concepts[:5])}")
-            if heat.tag:
-                lines.append(f"标签: {heat.tag}")
-            return SkillResult(ok=True, text="\n".join(lines))
-        except Exception as e:
-            _log.exception("舆情查询失败")
-            return SkillResult(ok=False, text="", error=f"舆情查询失败: {e}")
+        # 2) 轮询进度（最多等 5 分钟）
+        max_wait = 300
+        elapsed = 0
+        while elapsed < max_wait:
+            time.sleep(5)
+            elapsed += 5
+            status = _api_get("/review/status")
+            if not status:
+                continue
+            if status.get("error"):
+                return SkillResult(ok=False, text="", error=f"复盘出错: {status['error']}")
+            if status.get("completed"):
+                break
+        else:
+            return SkillResult(ok=False, text="", error="复盘超时（5分钟），请检查 Web 服务日志")
 
+        # 3) 获取结果
+        results = _api_get("/review/results", timeout=60)
+        if not results:
+            return SkillResult(ok=False, text="", error="获取复盘结果失败")
 
-class HotThemesSkill(BaseSkill):
-    """热点主题"""
-    name = "hot_themes"
-    description = "当日热门概念主题 Top 15"
-    triggers = ["热点", "主题", "概念"]
-    usage = "热点 / 今日主题"
-
-    def execute(self, raw_input: str, params: dict) -> SkillResult:
-        try:
-            from signals.core.theme_discovery import get_hot_themes
-            themes = get_hot_themes(top_n=15)
-            if not themes:
-                return SkillResult(ok=True, text="暂无热门主题数据")
-
-            lines = ["🔥 今日热门概念\n"]
-            for i, t in enumerate(themes, 1):
-                emoji = "🔴" if t.change_pct > 0 else "🟢"
-                lines.append(
-                    f"{i}. {emoji} {t.name}  "
-                    f"{t.change_pct:+.2f}%  "
-                    f"({t.stock_count}只)"
-                )
-            return SkillResult(ok=True, text="\n".join(lines))
-        except Exception as e:
-            _log.exception("热门主题获取失败")
-            return SkillResult(ok=False, text="", error=f"热门主题获取失败: {e}")
+        return SkillResult(ok=True, text=_format_review(results, label))
 
 
-class PlanSkill(BaseSkill):
-    """盘前计划"""
-    name = "plan"
-    description = "生成盘前计划（主要指数三情景分析）"
-    triggers = ["计划", "盘前"]
-    usage = "盘前计划 / 计划"
+def _format_review(r: dict, label: str) -> str:
+    """将复盘 API 结果格式化为微信纯文本"""
+    lines = [f"📋 盘后复盘 — {label}\n"]
 
-    def execute(self, raw_input: str, params: dict) -> SkillResult:
-        try:
-            from signals.web.services.engine import get_engine
-            from signals.core.planner import generate_plan
-            engine = get_engine()
-            if not engine.is_ready():
-                return SkillResult(ok=False, text="", error="引擎未就绪，请先启动 web 服务")
+    # 大盘环境
+    banner = r.get("banner", {})
+    if banner:
+        direction = banner.get("direction", "")
+        emotion = banner.get("emotion_stage", "")
+        alloc = banner.get("allocation_suggestion", "")
+        if direction:
+            lines.append(f"🌍 方向: {direction}")
+        if emotion:
+            lines.append(f"🎭 情绪: {emotion}")
+        if alloc:
+            lines.append(f"💰 仓位: {alloc}")
 
-            reports = engine.get_index_reports()
-            main_indices = ["沪深300", "上证50", "创业板指"]
-            lines = ["📋 盘前计划\n"]
+    # 指数摘要（只取主要3个）
+    idx_reports = r.get("index_reports", [])
+    main_names = {"沪深300", "上证50", "创业板指"}
+    main_idx = [x for x in idx_reports if x.get("name") in main_names]
+    if main_idx:
+        lines.append("\n━━ 主要指数 ━━")
+        for idx in main_idx:
+            name = idx.get("name", "?")
+            trend = idx.get("trend", "")
+            change = idx.get("change_pct", 0)
+            emoji = "🔴" if change > 0 else "🟢"
+            lines.append(f"{emoji} {name}  {change:+.2f}%  {trend}")
 
-            for r in reports:
-                if not getattr(r, "data_available", False):
-                    continue
-                if r.name not in main_indices:
-                    continue
-                analyzer = engine.get_symbol_analyzer(r.name, "daily")
-                if analyzer is None:
-                    continue
-                ma_ctx = getattr(r, "ma_context", None)
-                plan = generate_plan(analyzer, ma_ctx)
-                plan.name = r.name
+    # 行业涨幅 Top 5
+    gain_list = r.get("gain_list", [])[:5]
+    if gain_list:
+        lines.append("\n🏭 行业涨幅 Top 5")
+        for ind in gain_list:
+            name = ind.get("display_name") or ind.get("name", "?")
+            pct = ind.get("gain_pct", 0)
+            emoji = "🔴" if pct > 0 else "🟢"
+            lines.append(f"  {emoji} {name} {pct:+.2f}%")
 
-                lines.append(f"━━ {plan.name} ━━")
-                lines.append(f"趋势: {plan.trend}  结构: {plan.structure}")
-                for sc in plan.scenarios:
-                    lines.append(f"  【{sc.name}】({sc.probability_hint})")
-                    lines.append(f"    触发: {sc.trigger}")
-                    lines.append(f"    操作: {sc.action}")
-                lines.append("")
+    # 轮动研判
+    rotation = r.get("rotation", {})
+    if rotation:
+        stage = rotation.get("stage", "")
+        alloc = rotation.get("allocation", "")
+        if stage:
+            lines.append(f"\n🔄 轮动: {stage}")
+        if alloc:
+            lines.append(f"💡 建议: {alloc}")
 
-            return SkillResult(ok=True, text="\n".join(lines))
-        except Exception as e:
-            _log.exception("盘前计划生成失败")
-            return SkillResult(ok=False, text="", error=f"盘前计划生成失败: {e}")
+    # 标的信号 Top 5
+    scored = r.get("scored_symbols", [])[:5]
+    if scored:
+        lines.append("\n🎯 标的信号 Top 5")
+        for s in scored:
+            symbol = s.get("symbol", "?")
+            name = s.get("name", "")
+            score = s.get("total_score", 0)
+            direction = s.get("direction", "")
+            display = f"{name}({symbol})" if name else symbol
+            lines.append(f"  {display}  评分{score:.0f}  {direction}")
+
+    return "\n".join(lines)
 
 
-class WeeklyStrategySkill(BaseSkill):
-    """周策略"""
-    name = "weekly_strategy"
-    description = "生成周末策略（市场展望 + 仓位建议 + 关注/回避板块）"
-    triggers = ["周策略", "周末策略", "本周"]
-    usage = "周策略 / 本周策略"
-
-    def execute(self, raw_input: str, params: dict) -> SkillResult:
-        try:
-            from signals.web.services.engine import get_engine
-            from signals.core.weekly import generate_weekly
-            engine = get_engine()
-            reports = engine.get_index_reports()
-            ctx = engine.get_market_context()
-            rv = engine.review_state
-
-            weekly = generate_weekly(
-                index_reports=reports,
-                market_context=ctx,
-                rotation_stage=getattr(rv, "rotation_stage", "") or
-                               getattr(ctx, "rotation_stage", "") if ctx else "",
-                allocation=getattr(rv, "allocation_suggestion", "") or
-                           getattr(ctx, "allocation_suggestion", "") if ctx else "",
-            )
-
-            lines = [
-                f"📅 {weekly.week_label}\n",
-                f"市场展望: {weekly.market_outlook}",
-                f"仓位建议: {weekly.position_suggestion}",
-                f"风格偏好: {weekly.style_suggestion}",
-            ]
-            if weekly.focus_sectors:
-                lines.append(f"关注板块: {', '.join(weekly.focus_sectors)}")
-            if weekly.avoid_sectors:
-                lines.append(f"回避板块: {', '.join(weekly.avoid_sectors)}")
-            if weekly.rotation_outlook:
-                lines.append(f"轮动研判: {weekly.rotation_outlook}")
-
-            return SkillResult(ok=True, text="\n".join(lines))
-        except Exception as e:
-            _log.exception("周策略生成失败")
-            return SkillResult(ok=False, text="", error=f"周策略生成失败: {e}")
-
+# ─────────────────────────────────────────────────────
+# Skill 3: 帮助
+# ─────────────────────────────────────────────────────
 
 class HelpSkill(BaseSkill):
     """帮助"""
@@ -359,81 +285,20 @@ class HelpSkill(BaseSkill):
     def execute(self, raw_input: str, params: dict) -> SkillResult:
         lines = [
             "🐲 隆小侠 — 可用指令\n",
-            "📊 分析 <股票名/代码>  — 个股深度分析",
-            "📈 回测 <股票代码> [日线/周线]  — 信号回测",
-            "🌍 大盘 / 指数  — 大盘研判",
-            "🏭 行业 / 板块  — 行业排行",
+            "🏭 行业 / 板块  — 行业板块分析（需 Web 服务）",
+            "📋 复盘 / 盘后  — 盘后复盘分析（需 Web 服务）",
+            "",
+            "以下由 AI 直接回答，无需 Web 服务:",
+            "📊 分析 <股票>  — 个股分析",
+            "📈 回测 <代码>  — 信号回测",
             "🔥 热点 / 主题  — 热门概念",
-            "💬 舆情 <股票名>  — 社交热度",
+            "💬 舆情 <股票>  — 社交热度",
             "📋 计划  — 盘前计划",
             "📅 周策略  — 周末策略",
             "❓ 帮助  — 显示本菜单",
-            "\n示例: 分析 茅台、回测 600519 日线、舆情 宁德时代",
+            "\n💡 任何其他问题直接问即可",
         ]
         return SkillResult(ok=True, text="\n".join(lines))
-
-
-# ─────────────────────────────────────────────────────
-# 辅助函数
-# ─────────────────────────────────────────────────────
-
-def _resolve_symbol(query: str) -> str | None:
-    """
-    将用户输入（股票名/代码/Futu代码）解析为 Futu 格式代码。
-    支持: 茅台 / 600519 / SZ.002759
-    """
-    query = query.strip()
-
-    # 已是 Futu 格式
-    if re.match(r"^(SH|SZ|BJ|HK|US)\.\w+$", query, re.IGNORECASE):
-        return query.upper()
-
-    # 纯6位数字
-    if re.match(r"^\d{6}$", query):
-        if query.startswith("6"):
-            return f"SH.{query}"
-        elif query.startswith(("0", "3")):
-            return f"SZ.{query}"
-        elif query.startswith(("8", "4")):
-            return f"BJ.{query}"
-        return f"SZ.{query}"
-
-    # 5位数字 = 港股
-    if re.match(r"^\d{5}$", query):
-        return f"HK.{query}"
-
-    # 中文名称 → 代码
-    try:
-        from signals.layers.industry import _build_name_to_code_map, _code6_to_futu
-        name_map = _build_name_to_code_map()
-
-        # 精确匹配
-        if query in name_map:
-            code6 = name_map[query]
-            return _code6_to_futu(code6)
-
-        # 模糊匹配（包含关键词）
-        for name, code6 in name_map.items():
-            if query in name or name in query:
-                return _code6_to_futu(code6)
-    except Exception:
-        _log.debug("名称映射查询失败: %s", query, exc_info=True)
-
-    return None
-
-
-def _extract_code(query: str) -> str | None:
-    """从文本中提取6位股票代码"""
-    m = re.search(r"\d{6}", query)
-    if m:
-        return m.group()
-
-    # 尝试名称解析
-    symbol = _resolve_symbol(query)
-    if symbol:
-        return symbol.split(".")[-1]
-
-    return None
 
 
 # ─────────────────────────────────────────────────────
@@ -442,14 +307,8 @@ def _extract_code(query: str) -> str | None:
 
 _BUILTIN_SKILLS: list[BaseSkill] = [
     HelpSkill(),
-    StockAnalyzeSkill(),
-    MarketOverviewSkill(),
-    IndustryRankingSkill(),
-    BacktestSkill(),
-    SocialHeatSkill(),
-    HotThemesSkill(),
-    PlanSkill(),
-    WeeklyStrategySkill(),
+    IndustryAnalysisSkill(),
+    ReviewSkill(),
 ]
 
 _custom_skills: list[BaseSkill] = []
