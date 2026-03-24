@@ -1,24 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-WeChat Skills — 仅保留需要调用 Web API 的技能
+WeChat Skills — 直接调用分析引擎，无需 Web 服务
 
-只有两类技能需要通过脚本调用（依赖运行中的 Web 服务）：
-1. 行业板块分析 → GET /api/industry/ranking + /api/industry/concept-ranking
-2. 盘后复盘     → POST /api/review/run → GET /api/review/status → GET /api/review/results
-
-其余所有需求由 Claude Code 直接用自身能力回答。
+行业分析和盘后复盘直接调底层函数，不走 HTTP。
 """
-import json
 import logging
 import time
-import urllib.request
-import urllib.error
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 _log = logging.getLogger("signals.wechat.skills")
-
-WEB_BASE = "http://127.0.0.1:8000/api"
 
 
 @dataclass
@@ -49,34 +40,8 @@ class BaseSkill(ABC):
         return False, {}
 
 
-def _api_get(path: str, timeout: int = 30) -> dict | None:
-    """GET 请求 Web API"""
-    url = f"{WEB_BASE}{path}"
-    try:
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except Exception as e:
-        _log.error("API GET %s 失败: %s", path, e)
-        return None
-
-
-def _api_post(path: str, body: dict | None = None, timeout: int = 30) -> dict | None:
-    """POST 请求 Web API"""
-    url = f"{WEB_BASE}{path}"
-    try:
-        data = json.dumps(body or {}).encode()
-        req = urllib.request.Request(url, data=data, method="POST")
-        req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read())
-    except Exception as e:
-        _log.error("API POST %s 失败: %s", path, e)
-        return None
-
-
 # ─────────────────────────────────────────────────────
-# Skill 1: 行业板块分析（调用 Web API）
+# Skill 1: 行业板块分析（直接调引擎）
 # ─────────────────────────────────────────────────────
 
 class IndustryAnalysisSkill(BaseSkill):
@@ -87,72 +52,79 @@ class IndustryAnalysisSkill(BaseSkill):
     usage = "行业 / 板块排行"
 
     def execute(self, raw_input: str, params: dict) -> SkillResult:
-        # 行业排行
-        ranking = _api_get("/industry/ranking")
-        if not ranking:
-            return SkillResult(ok=False, text="", error="Web 服务未启动或行业数据未就绪，请确认 python run.py --mode web 正在运行")
+        try:
+            from signals.layers.industry import get_industry_representatives
+        except ImportError as e:
+            return SkillResult(ok=False, text="", error=f"导入失败: {e}")
 
-        # 如果还在 loading
-        if ranking.get("loading"):
-            return SkillResult(ok=False, text="", error="行业数据正在加载中，请稍后再试")
+        try:
+            result = get_industry_representatives()
+            # 返回 5 或 6 个值，兼容两种签名
+            if len(result) == 6:
+                gain_list, composite_list, merged_list, concepts, oversold_list, sentiment_stats = result
+            else:
+                gain_list, composite_list, merged_list, concepts, oversold_list = result
+                sentiment_stats = {}
+        except Exception as e:
+            _log.error("行业分析失败: %s", e)
+            return SkillResult(ok=False, text="", error=f"行业数据获取失败: {e}")
 
         lines = []
 
         # 涨幅榜 Top 10
-        gain_list = ranking.get("gain_list", [])[:10]
         if gain_list:
             lines.append("📊 行业涨幅榜 Top 10\n")
-            for i, ind in enumerate(gain_list, 1):
-                pct = ind.get("gain_pct", 0)
+            for i, ind in enumerate(gain_list[:10], 1):
+                pct = ind.gain_pct
                 emoji = "🔴" if pct > 0 else "🟢"
-                name = ind.get("display_name") or ind.get("name", "?")
-                zt = ind.get("zt_count", 0)
-                zt_str = f" 涨停{zt}" if zt else ""
-                lines.append(f"{i}. {emoji} {name}  {pct:+.2f}%{zt_str}")
+                zt_str = f" 涨停{ind.zt_count}" if ind.zt_count else ""
+                lines.append(f"{i}. {emoji} {ind.name}  {pct:+.2f}%{zt_str}")
 
         # 综合榜 Top 10
-        comp_list = ranking.get("composite_list", [])[:10]
-        if comp_list:
+        if composite_list:
             lines.append("\n🏆 综合评分 Top 10\n")
-            for i, ind in enumerate(comp_list, 1):
-                name = ind.get("display_name") or ind.get("name", "?")
-                score = ind.get("composite_score", 0)
-                pct = ind.get("gain_pct", 0)
-                lines.append(f"{i}. {name}  综合{score:.0f}  {pct:+.2f}%")
+            for i, ind in enumerate(composite_list[:10], 1):
+                lines.append(f"{i}. {ind.name}  综合{ind.composite_score:.0f}  {ind.gain_pct:+.2f}%")
 
         # 超跌板块
-        oversold = ranking.get("oversold_list", [])[:5]
-        if oversold:
-            lines.append("\n🔻 超跌反弹候选\n")
-            for ind in oversold:
-                name = ind.get("display_name") or ind.get("name", "?")
-                score = ind.get("oversold_score", 0)
-                if score > 0:
-                    lines.append(f"  · {name}  超跌分{score:.0f}")
+        if oversold_list:
+            oversold_top = [x for x in oversold_list[:5] if x.oversold_score > 0]
+            if oversold_top:
+                lines.append("\n🔻 超跌反弹候选\n")
+                for ind in oversold_top:
+                    lines.append(f"  · {ind.name}  超跌分{ind.oversold_score:.0f}")
 
         # 市场统计
-        stats = ranking.get("stats", {})
-        if stats:
-            zt = stats.get("zt_total", 0)
-            dt = stats.get("dt_total", 0)
-            red_pct = stats.get("red_pct", 0)
+        if isinstance(sentiment_stats, dict) and sentiment_stats:
+            zt = sentiment_stats.get("zt_total", 0)
+            dt = sentiment_stats.get("dt_total", 0)
+            # 计算红盘比例
+            red_pct = 0
+            name_df = sentiment_stats.get("name_df")
+            if name_df is not None:
+                try:
+                    import pandas as pd
+                    for col in ['涨跌幅', '涨跌幅(%)', '涨幅', '涨幅(%)', '最新涨跌幅']:
+                        if col in name_df.columns:
+                            vals = pd.to_numeric(name_df[col], errors='coerce')
+                            total = vals.count()
+                            red = (vals > 0).sum()
+                            red_pct = round(red / total * 100) if total > 0 else 0
+                            break
+                except Exception:
+                    pass
             lines.append(f"\n📈 涨停{zt}  跌停{dt}  上涨占比{red_pct:.0f}%")
 
         # 概念排行
-        query = params.get("query", "")
-        if "概念" in raw_input or "概念" in query:
-            concepts = _api_get("/industry/concept-ranking")
-            if concepts and isinstance(concepts, list):
-                lines.append("\n🔥 概念板块 Top 10\n")
-                for i, c in enumerate(concepts[:10], 1):
-                    name = c.get("name", "?")
-                    score = c.get("composite_score", 0)
-                    pct = c.get("change_pct", 0)
-                    up_ratio = c.get("up_ratio", 0)
-                    lines.append(
-                        f"{i}. {name}  {pct:+.2f}%  "
-                        f"综合{score:.0f}  上涨{up_ratio:.0%}"
-                    )
+        if "概念" in raw_input and concepts:
+            lines.append("\n🔥 概念板块 Top 10\n")
+            for i, c in enumerate(concepts[:10], 1):
+                up_total = c.up_count + c.down_count
+                up_ratio = c.up_count / up_total if up_total > 0 else 0
+                lines.append(
+                    f"{i}. {c.name}  {c.gain_pct:+.2f}%  "
+                    f"综合{c.composite_score:.0f}  上涨{up_ratio:.0%}"
+                )
 
         if not lines:
             return SkillResult(ok=False, text="", error="未获取到行业数据")
@@ -161,114 +133,138 @@ class IndustryAnalysisSkill(BaseSkill):
 
 
 # ─────────────────────────────────────────────────────
-# Skill 2: 盘后复盘（调用 Web API，异步轮询）
+# Skill 2: 盘后复盘（直接调引擎）
 # ─────────────────────────────────────────────────────
 
 class ReviewSkill(BaseSkill):
-    """盘后复盘 — 触发三层联动分析，轮询等待完成"""
+    """盘后复盘 — L1 指数 + L2 行业 + L3 个股三层联动"""
     name = "review"
     description = "盘后复盘（指数 + 行业 + 标的三层联动分析）"
     triggers = ["复盘", "盘后", "review"]
-    usage = "复盘 / 盘后复盘 / 复盘 yesterday"
+    usage = "复盘 / 盘后复盘"
 
     def execute(self, raw_input: str, params: dict) -> SkillResult:
         query = params.get("query", "").strip()
         start_date = query if query else "yesterday"
 
-        # 1) 触发复盘任务
-        resp = _api_post("/review/run", {"start_date": start_date})
-        if not resp or not resp.get("ok"):
-            return SkillResult(ok=False, text="", error="复盘任务启动失败，请确认 Web 服务正在运行")
+        lines = [f"📋 盘后复盘 — {start_date}\n"]
+        timing = {}
 
-        label = resp.get("label", start_date)
+        # ── L1: 指数复盘 ──
+        try:
+            _log.info("[复盘] L1 开始 — 指数分析")
+            t0 = time.monotonic()
+            from signals.layers.index_screener import IndexScreener
+            screener = IndexScreener()
+            ctx = screener.run_review(start_date)
+            timing["L1"] = round(time.monotonic() - t0, 1)
+            _log.info("[复盘] L1 完成 — %.1fs", timing["L1"])
 
-        # 2) 轮询进度（最多等 5 分钟）
-        max_wait = 300
-        elapsed = 0
-        while elapsed < max_wait:
-            time.sleep(5)
-            elapsed += 5
-            status = _api_get("/review/status")
-            if not status:
-                continue
-            if status.get("error"):
-                return SkillResult(ok=False, text="", error=f"复盘出错: {status['error']}")
-            if status.get("completed"):
-                break
-        else:
-            return SkillResult(ok=False, text="", error="复盘超时（5分钟），请检查 Web 服务日志")
+            if ctx:
+                if ctx.direction:
+                    lines.append(f"🌍 方向: {ctx.direction}")
+                if ctx.sentiment_phase:
+                    lines.append(f"🎭 情绪: {ctx.sentiment_phase}")
 
-        # 3) 获取结果
-        results = _api_get("/review/results", timeout=60)
-        if not results:
-            return SkillResult(ok=False, text="", error="获取复盘结果失败")
+                # 主要指数
+                main_names = {"沪深300", "上证50", "创业板指"}
+                main_idx = [r for r in (ctx.reports or []) if r.name in main_names]
+                if main_idx:
+                    lines.append("\n━━ 主要指数 ━━")
+                    for idx in main_idx:
+                        change = getattr(idx, 'change_pct', 0)
+                        trend = getattr(idx, 'trend', '')
+                        emoji = "🔴" if change > 0 else "🟢"
+                        lines.append(f"{emoji} {idx.name}  {change:+.2f}%  {trend}")
+        except Exception as e:
+            _log.error("[复盘] L1 失败: %s", e)
+            lines.append(f"⚠️ 指数分析失败: {e}")
+            ctx = None
 
-        return SkillResult(ok=True, text=_format_review(results, label))
+        # ── L2: 行业排行 + 轮动 ──
+        gain_list, composite_list, merged_list = [], [], []
+        try:
+            _log.info("[复盘] L2 开始 — 行业排行")
+            t0 = time.monotonic()
+            from signals.layers.industry import get_industry_representatives
+            from datetime import datetime
+            import config
+            pool_date = datetime.now().strftime("%Y%m%d")
+            result = get_industry_representatives(config.RANK_TOP_N, date_str=pool_date)
+            if len(result) == 6:
+                gain_list, composite_list, merged_list, concepts, oversold_list, _ = result
+            else:
+                gain_list, composite_list, merged_list, concepts, oversold_list = result
+            timing["L2"] = round(time.monotonic() - t0, 1)
+            _log.info("[复盘] L2 完成 — %.1fs (%d 行业)", timing["L2"], len(merged_list))
 
+            if gain_list:
+                lines.append("\n🏭 行业涨幅 Top 5")
+                for ind in gain_list[:5]:
+                    emoji = "🔴" if ind.gain_pct > 0 else "🟢"
+                    lines.append(f"  {emoji} {ind.name} {ind.gain_pct:+.2f}%")
 
-def _format_review(r: dict, label: str) -> str:
-    """将复盘 API 结果格式化为微信纯文本"""
-    lines = [f"📋 盘后复盘 — {label}\n"]
+            # 轮动研判
+            if ctx and (gain_list or composite_list):
+                try:
+                    from signals.core.rotation import detect_rotation_stage, suggest_allocation
+                    rot = detect_rotation_stage(gain_list, composite_list)
+                    _, alloc_str = suggest_allocation(rot, ctx.sentiment_phase)
+                    if rot.stage:
+                        lines.append(f"\n🔄 轮动: {rot.stage}")
+                    if alloc_str:
+                        lines.append(f"💡 建议: {alloc_str}")
+                except Exception:
+                    pass
+        except Exception as e:
+            _log.error("[复盘] L2 失败: %s", e)
+            lines.append(f"\n⚠️ 行业分析失败: {e}")
 
-    # 大盘环境
-    banner = r.get("banner", {})
-    if banner:
-        direction = banner.get("direction", "")
-        emotion = banner.get("emotion_stage", "")
-        alloc = banner.get("allocation_suggestion", "")
-        if direction:
-            lines.append(f"🌍 方向: {direction}")
-        if emotion:
-            lines.append(f"🎭 情绪: {emotion}")
-        if alloc:
-            lines.append(f"💰 仓位: {alloc}")
+        # ── L3: 个股复盘 ──
+        try:
+            _log.info("[复盘] L3 开始 — 个股分析")
+            t0 = time.monotonic()
+            import config
+            ranking_stocks = []
+            for r in merged_list:
+                ranking_stocks.extend(r.pool_codes)
+            ranking_stocks = list(dict.fromkeys(ranking_stocks))
+            all_symbols = list(dict.fromkeys(config.WHITELIST + ranking_stocks))
+            _log.info("[复盘] L3 标的: %d 只", len(all_symbols))
 
-    # 指数摘要（只取主要3个）
-    idx_reports = r.get("index_reports", [])
-    main_names = {"沪深300", "上证50", "创业板指"}
-    main_idx = [x for x in idx_reports if x.get("name") in main_names]
-    if main_idx:
-        lines.append("\n━━ 主要指数 ━━")
-        for idx in main_idx:
-            name = idx.get("name", "?")
-            trend = idx.get("trend", "")
-            change = idx.get("change_pct", 0)
-            emoji = "🔴" if change > 0 else "🟢"
-            lines.append(f"{emoji} {name}  {change:+.2f}%  {trend}")
+            from signals.layers.review_screener import review_stock_daily
+            scored = review_stock_daily(all_symbols, start_date)
 
-    # 行业涨幅 Top 5
-    gain_list = r.get("gain_list", [])[:5]
-    if gain_list:
-        lines.append("\n🏭 行业涨幅 Top 5")
-        for ind in gain_list:
-            name = ind.get("display_name") or ind.get("name", "?")
-            pct = ind.get("gain_pct", 0)
-            emoji = "🔴" if pct > 0 else "🟢"
-            lines.append(f"  {emoji} {name} {pct:+.2f}%")
+            # 注入名称
+            try:
+                from signals.core.stock_names import get_resolver
+                resolver = get_resolver()
+                if merged_list:
+                    resolver.inject_from_rankings(merged_list)
+                for s in scored:
+                    if not s.name:
+                        s.name = resolver.get_name(s.symbol)
+            except Exception:
+                pass
 
-    # 轮动研判
-    rotation = r.get("rotation", {})
-    if rotation:
-        stage = rotation.get("stage", "")
-        alloc = rotation.get("allocation", "")
-        if stage:
-            lines.append(f"\n🔄 轮动: {stage}")
-        if alloc:
-            lines.append(f"💡 建议: {alloc}")
+            timing["L3"] = round(time.monotonic() - t0, 1)
+            _log.info("[复盘] L3 完成 — %.1fs (%d 个股)", timing["L3"], len(scored))
 
-    # 标的信号 Top 5
-    scored = r.get("scored_symbols", [])[:5]
-    if scored:
-        lines.append("\n🎯 标的信号 Top 5")
-        for s in scored:
-            symbol = s.get("symbol", "?")
-            name = s.get("name", "")
-            score = s.get("total_score", 0)
-            direction = s.get("direction", "")
-            display = f"{name}({symbol})" if name else symbol
-            lines.append(f"  {display}  评分{score:.0f}  {direction}")
+            if scored:
+                lines.append("\n🎯 标的信号 Top 5")
+                for s in scored[:5]:
+                    display = f"{s.name}({s.symbol})" if s.name else s.symbol
+                    direction = getattr(s, 'direction', '')
+                    total_score = getattr(s, 'total_score', 0)
+                    lines.append(f"  {display}  评分{total_score:.0f}  {direction}")
+        except Exception as e:
+            _log.error("[复盘] L3 失败: %s", e)
+            lines.append(f"\n⚠️ 个股分析失败: {e}")
 
-    return "\n".join(lines)
+        total = sum(timing.values())
+        lines.append(f"\n⏱ 耗时 {total:.0f}s (L1:{timing.get('L1', 0):.0f}s L2:{timing.get('L2', 0):.0f}s L3:{timing.get('L3', 0):.0f}s)")
+
+        return SkillResult(ok=True, text="\n".join(lines))
 
 
 # ─────────────────────────────────────────────────────
@@ -285,10 +281,10 @@ class HelpSkill(BaseSkill):
     def execute(self, raw_input: str, params: dict) -> SkillResult:
         lines = [
             "🐲 隆小侠 — 可用指令\n",
-            "🏭 行业 / 板块  — 行业板块分析（需 Web 服务）",
-            "📋 复盘 / 盘后  — 盘后复盘分析（需 Web 服务）",
+            "🏭 行业 / 板块  — 行业板块分析",
+            "📋 复盘 / 盘后  — 盘后复盘分析",
             "",
-            "以下由 AI 直接回答，无需 Web 服务:",
+            "以下由 AI 直接回答:",
             "📊 分析 <股票>  — 个股分析",
             "📈 回测 <代码>  — 信号回测",
             "🔥 热点 / 主题  — 热门概念",

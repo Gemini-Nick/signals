@@ -88,18 +88,18 @@ API 基础路径: `http://localhost:8000/api/`
 
 ### 处理流程
 
-1. **需要 Web API 的技能**：运行 `python scripts/wechat_run.py "<消息原文>"`
-   - 仅「行业/板块」和「复盘/盘后」两类需要调脚本（依赖运行中的 Web 服务）
+1. **内置技能**：运行 `python scripts/wechat_run.py "<消息原文>"`
+   - 「行业/板块」和「复盘/盘后」直接调分析引擎（无需 Web 服务）
    - 退出码 0 = 成功，直接输出结果文本
-   - 退出码 1 = 无匹配或 Web 服务未启动
+   - 退出码 1 = 无匹配
 2. **其他所有需求**：Claude Code 直接用自身能力回答（分析、回测、策略、闲聊等）
 
-### 需要 Web 服务的技能（仅 2 个）
+### 内置技能（直接调引擎，不依赖 Web）
 
 | 技能 | 触发词 | 说明 |
 |------|--------|------|
-| 行业板块分析 | 行业、板块、排行 | 调 `/api/industry/ranking` + `/api/industry/concept-ranking` |
-| 盘后复盘 | 复盘、盘后、review | 调 `/api/review/run` → 轮询 → `/api/review/results` |
+| 行业板块分析 | 行业、板块、排行 | 直接调 `get_industry_representatives()` |
+| 盘后复盘 | 复盘、盘后、review | 直接调 `IndexScreener` + `review_stock_daily()` |
 
 ### 输出要求
 

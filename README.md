@@ -179,16 +179,7 @@ backtest 每月运行 ──→ 读取已存档信号（≥20天前）──→ 
      │                    │  │  ┌─────────────────┐          │             │
      │                    │  │  │ skills.py       │          │             │
      │                    │  │  │ 匹配技能 →      │          │             │
-     │                    │  │  │ HTTP 调 Web API  │          │             │
-     │                    │  │  └────────┬────────┘          │             │
-     │                    │  │           │                    │             │
-     │                    │  │           ▼                    │             │
-     │                    │  │  ┌─────────────────┐          │             │
-     │                    │  │  │ Web 服务         │          │             │
-     │                    │  │  │ localhost:8000   │          │             │
-     │                    │  │  │                  │          │             │
-     │                    │  │  │ /api/industry/*  │          │             │
-     │                    │  │  │ /api/review/*    │          │             │
+     │                    │  │  │ 直接调分析引擎   │          │             │
      │                    │  │  └────────┬────────┘          │             │
      │                    │  │           │                    │             │
      │                    │  │           ▼                    ▼             │
@@ -221,7 +212,7 @@ Step 3  Claude Code 启动，读取 CLAUDE.md
         看到「微信 Agent 模式」章节，知道自己的角色
         │
 Step 4  Claude Code 判断 "行业排行" 包含触发词「行业」
-        决定走 Web API 路径
+        决定走技能路径
         │
 Step 5  Claude Code 用 Bash 工具执行:
         $ python scripts/wechat_run.py "行业排行"
@@ -229,11 +220,10 @@ Step 5  Claude Code 用 Bash 工具执行:
 Step 6  wechat_run.py 加载 skills.py
         IndustryAnalysisSkill.match("行业排行") → 匹配!
         │
-Step 7  skill.execute() 发起 HTTP 请求:
-        GET http://127.0.0.1:8000/api/industry/ranking
-        GET http://127.0.0.1:8000/api/industry/concept-ranking
+Step 7  skill.execute() 直接调引擎:
+        get_industry_representatives() → 涨幅榜/综合榜/超跌/概念
         │
-Step 8  Web 服务返回 JSON，skill 格式化为纯文本:
+Step 8  skill 格式化为纯文本:
         "📊 行业涨幅榜 Top 10\n1. 🔴 半导体 +3.21% ..."
         │
 Step 9  wechat_run.py 打印到 stdout，退出码 0
@@ -263,26 +253,28 @@ Step 6  stdout 输出 → weclaw 发回微信
 
 ```
 常驻进程 (长期运行)
-├── weclaw serve              # 微信桥接，监听消息
-└── python run.py --mode web  # Web 服务，提供 API（行业/复盘技能依赖）
+└── weclaw serve              # 微信桥接，监听消息（仅此一个）
 
 临时进程 (每条消息一个)
 └── claude -p "消息"           # Claude Code，处理完即退出
-     └── python scripts/wechat_run.py "消息"   # 仅行业/复盘时调用
+     └── python scripts/wechat_run.py "消息"   # 行业/复盘时直接调引擎
+
+可选进程 (仅 Web UI 需要)
+└── python run.py --mode web  # 给人看的 UI 界面，微信 Agent 不依赖
 ```
 
 ### 部署
 
 ```bash
-# 1. 启动 Web 服务（行业/复盘技能的数据源）
-python run.py --mode web --port 8000
-
-# 2. 配置 weclaw
+# 1. 配置 weclaw
 cp deploy/weclaw/config.example.json ~/.weclaw/config.json
 # 编辑 config.json，将 cwd 改为 signals 项目实际路径
 
-# 3. 启动 weclaw，扫码登录微信
+# 2. 启动 weclaw，扫码登录微信（只需这一步）
 weclaw serve
+
+# （可选）启动 Web UI — 仅当你需要浏览器界面时
+python run.py --mode web --port 8000
 ```
 
 ### 文件清单
