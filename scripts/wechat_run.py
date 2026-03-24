@@ -1,53 +1,47 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WeChat Skill Runner — 仅运行需要 Web API 的技能
+WeChat Tool Runner — CC 决定调哪个工具，这里只负责执行
 
-仅匹配:
-  - 行业/板块/排行 → 调 Web API /api/industry/*
-  - 复盘/盘后       → 调 Web API /api/review/*
-  - 帮助            → 显示指令列表
-
-其他所有消息返回退出码 1，由 Claude Code 自行回答。
+不做意图理解，不做关键词匹配。CC 理解用户意图后按工具名调用。
 
 用法:
-    python scripts/wechat_run.py "行业排行"
-    python scripts/wechat_run.py "盘后复盘"
-    python scripts/wechat_run.py "帮助"
+    python scripts/wechat_run.py industry_ranking
+    python scripts/wechat_run.py industry_ranking --concepts
+    python scripts/wechat_run.py review
+    python scripts/wechat_run.py review --date 2024-09-24
 """
 import sys
 import os
+import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def run(message: str) -> str:
-    """匹配并执行 Web API 技能，返回结果文本"""
-    from signals.wechat.skills import get_all_skills
-
-    for skill in get_all_skills():
-        matched, params = skill.match(message)
-        if matched:
-            result = skill.execute(message, params)
-            if result.ok:
-                return result.text
-            return f"⚠️ {result.error}"
-
-    return ""
-
-
 def main():
-    if len(sys.argv) < 2:
-        print("用法: python scripts/wechat_run.py <消息>", file=sys.stderr)
+    parser = argparse.ArgumentParser(description="WeChat tool runner")
+    sub = parser.add_subparsers(dest="tool")
+
+    # industry_ranking
+    p_ind = sub.add_parser("industry_ranking", help="全市场行业排行")
+    p_ind.add_argument("--concepts", action="store_true", help="包含概念板块排行")
+
+    # review
+    p_rev = sub.add_parser("review", help="盘后复盘")
+    p_rev.add_argument("--date", default="yesterday", help="复盘日期")
+
+    args = parser.parse_args()
+
+    if not args.tool:
+        parser.print_help()
         sys.exit(1)
 
-    message = " ".join(sys.argv[1:])
-    output = run(message)
+    from signals.wechat.skills import industry_ranking, review
 
-    if output:
-        print(output)
-    else:
-        sys.exit(1)
+    if args.tool == "industry_ranking":
+        print(industry_ranking(include_concepts=args.concepts))
+    elif args.tool == "review":
+        print(review(date=args.date))
 
 
 if __name__ == "__main__":

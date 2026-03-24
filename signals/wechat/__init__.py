@@ -2,9 +2,9 @@
 """
 WeChat Agent — weclaw + Claude Code 集成模块
 
-架构: 微信 → weclaw → Claude Code CLI (Max Plan) → signals 分析引擎 → 回复
+架构: 微信 → weclaw → Claude Code CLI → 理解意图 → 选择工具/自行回答 → 回复
 
-- skills.py: 9 个内置分析技能（个股/大盘/行业/回测/舆情/热点/计划/周策略/帮助）
-- scripts/wechat_run.py: Claude Code 调用入口（匹配技能 → 执行 → 输出文本）
+- skills.py: CC 的工具函数（industry_ranking / review），按名称调用
+- scripts/wechat_run.py: 工具执行入口，CC 决定调哪个工具
 - deploy/weclaw/config.example.json: weclaw CLI 模式配置模板
 """
