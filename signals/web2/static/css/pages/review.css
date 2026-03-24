@@ -1,0 +1,90 @@
+/* ═══════════════════════════════════════════════════
+   🐲 复盘页面样式
+   ═══════════════════════════════════════════════════ */
+
+/* ── 大盘方向横幅 ──────────────────────────────── */
+.rv-banner {
+  padding: 16px 20px;
+  border-radius: 10px;
+  margin-bottom: 20px;
+  border-left: 4px solid var(--accent);
+}
+.rv-banner.up { background: var(--banner-bullish); border-color: var(--color-up); }
+.rv-banner.down { background: var(--banner-bearish); border-color: var(--color-down); }
+.rv-banner.flat { background: var(--banner-neutral); }
+
+.rv-banner-dir {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+.rv-banner-meta { font-size: 13px; color: var(--text-secondary); margin-bottom: 4px; }
+.rv-banner-summary { font-size: 13px; color: var(--text-secondary); line-height: 1.6; }
+
+/* ── 指数卡片 ──────────────────────────────────── */
+.rv-index-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+}
+.rv-index-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  transition: border-color 0.2s;
+}
+.rv-index-card:hover { border-color: var(--accent); }
+.rv-index-name { font-family: var(--font-display); font-size: 14px; font-weight: 600; }
+.rv-index-price { font-family: var(--font-mono); font-size: 18px; font-weight: 700; margin: 4px 0; }
+.rv-index-trend { font-size: 12px; color: var(--text-secondary); }
+
+/* ── 行业列表 ──────────────────────────────────── */
+.rv-industry-list { display: flex; flex-direction: column; gap: 4px; }
+.rv-industry-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 6px 8px; border-radius: 6px;
+  font-size: 13px;
+  transition: background 0.15s;
+}
+.rv-industry-row:hover { background: var(--bg-hover); }
+.rv-ind-rank { font-weight: 700; color: var(--accent-gold); min-width: 20px; font-family: var(--font-mono); }
+.rv-ind-name { flex: 1; font-weight: 500; }
+
+/* ── 轮动研判 ──────────────────────────────────── */
+.rv-rotation {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+.rv-rotation-stage {
+  font-family: var(--font-display);
+  font-weight: 700;
+  color: var(--accent-gold);
+  font-size: 16px;
+  margin-right: 8px;
+}
+.rv-rotation-alloc { font-size: 13px; color: var(--text-secondary); margin-top: 6px; }
+
+/* ── 个股列表 ──────────────────────────────────── */
+.rv-stock-list { display: flex; flex-direction: column; gap: 4px; }
+.rv-stock-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 6px 8px; border-radius: 6px;
+  font-size: 13px;
+  transition: background 0.15s;
+}
+.rv-stock-row:hover { background: var(--bg-hover); }
+.rv-stock-name { flex: 1; font-weight: 500; }
+
+/* ── 进度条 ──────────────────────────────────── */
+.rv-progress {
+  padding: 20px;
+  text-align: center;
+}
+
+@media (max-width: 768px) {
+  .rv-index-cards { grid-template-columns: repeat(2, 1fr); }
+}

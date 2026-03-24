@@ -13,6 +13,8 @@
   <link rel="stylesheet" href="/static/css/pages/cluster.css">
   <link rel="stylesheet" href="/static/css/pages/backtest.css">
   <link rel="stylesheet" href="/static/css/pages/chart.css">
+  <link rel="stylesheet" href="/static/css/pages/review.css">
+  <link rel="stylesheet" href="/static/css/pages/stock.css">
   <!-- Charts -->
   <script src="https://unpkg.com/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
 </head>
@@ -30,6 +32,14 @@
         <button class="nav-item" data-page="chart">
           <span class="nav-icon">📈</span>
           <span class="nav-label">图表</span>
+        </button>
+        <button class="nav-item" data-page="review">
+          <span class="nav-icon">🔍</span>
+          <span class="nav-label">盘后复盘</span>
+        </button>
+        <button class="nav-item" data-page="stock">
+          <span class="nav-icon">🎯</span>
+          <span class="nav-label">个股分析</span>
         </button>
         <button class="nav-item" data-page="backtest">
           <span class="nav-icon">⚡</span>
@@ -91,6 +101,35 @@
         </div>
       </div>
 
+      <!-- ── 盘后复盘页 ──────────────────────────── -->
+      <div id="page-review" class="page">
+        <div class="page-toolbar">
+          <h2>盘后复盘</h2>
+          <div class="toolbar-actions">
+            <input id="rv-date" type="text" placeholder="日期 (如 yesterday)" class="input" style="width:160px;">
+            <button id="rv-run" class="btn btn-primary">开始复盘</button>
+          </div>
+        </div>
+        <div id="rv-presets" class="preset-chips"></div>
+        <div id="rv-progress" class="rv-progress" style="display:none;">
+          <div class="ink-loading"><span></span></div>
+          <div id="rv-phase" class="meta-text" style="margin-top:12px;">准备中...</div>
+        </div>
+        <div id="rv-results"></div>
+      </div>
+
+      <!-- ── 个股分析页 ──────────────────────────── -->
+      <div id="page-stock" class="page">
+        <div class="page-toolbar">
+          <h2>个股深度分析</h2>
+          <div class="toolbar-actions">
+            <input id="stock-code" type="text" placeholder="股票代码 (如 600519)" class="input">
+            <button id="stock-run" class="btn btn-primary">深度分析</button>
+          </div>
+        </div>
+        <div id="stock-results"></div>
+      </div>
+
       <!-- ── 信号回测页 ──────────────────────────── -->
       <div id="page-backtest" class="page">
         <div class="bt-header">
@@ -147,6 +186,8 @@
   <script src="/static/js/app.js"></script>
   <script src="/static/js/cluster.js"></script>
   <script src="/static/js/chart.js"></script>
+  <script src="/static/js/review.js"></script>
+  <script src="/static/js/stock.js"></script>
   <script src="/static/js/backtest.js"></script>
 </body>
 </html>

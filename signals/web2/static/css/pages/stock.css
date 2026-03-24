@@ -1,0 +1,97 @@
+/* ═══════════════════════════════════════════════════
+   🐲 个股分析页面样式
+   ═══════════════════════════════════════════════════ */
+
+.stock-header { margin-bottom: 16px; }
+.stock-header h3 { font-size: 22px; display: inline; margin-right: 8px; }
+
+/* ── 评分卡 ────────────────────────────────────── */
+.stock-score-card {
+  display: flex; gap: 24px; align-items: center;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px;
+  margin-bottom: 20px;
+}
+.stock-score-main { text-align: center; }
+.stock-score-value {
+  font-family: var(--font-mono);
+  font-size: 32px;
+  font-weight: 800;
+}
+.stock-score-label { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.stock-score-meta {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 13px; color: var(--text-secondary);
+}
+
+/* ── 异常检测 ──────────────────────────────────── */
+.stock-anomaly {
+  font-size: 13px; color: var(--text-secondary);
+  padding: 8px 0;
+}
+.stock-anomaly-items { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.stock-anomaly-badge {
+  font-size: 11px; padding: 2px 8px;
+  background: rgba(232, 56, 79, 0.1);
+  color: var(--color-up);
+  border-radius: 4px;
+}
+
+/* ── 融合评分 ──────────────────────────────────── */
+.stock-fused { font-size: 13px; color: var(--text-secondary); padding: 8px 0; line-height: 1.8; }
+
+/* ── 均线关键位 ────────────────────────────────── */
+.stock-levels { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.key-level {
+  font-size: 12px; padding: 3px 8px; border-radius: 4px;
+  font-family: var(--font-mono);
+}
+.key-level.support { background: rgba(45, 138, 110, 0.1); color: var(--color-down); }
+.key-level.resistance { background: rgba(232, 56, 79, 0.1); color: var(--color-up); }
+
+/* ── 多级别分析 ────────────────────────────────── */
+.stock-tf {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 8px;
+}
+.stock-tf-header { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.stock-tf-freq {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 13px;
+  min-width: 48px;
+}
+.stock-tf-signal {
+  font-size: 12px; padding: 2px 0;
+  border-left: 2px solid var(--border);
+  padding-left: 8px;
+  margin-left: 4px;
+}
+.stock-tf-signal.buy { border-color: var(--signal-buy); }
+.stock-tf-signal.sell { border-color: var(--signal-sell); }
+.stock-tf-signal .conf { color: var(--text-muted); font-size: 11px; }
+
+/* ── 场景/风控 ─────────────────────────────────── */
+.stock-scenario {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.stock-scenario-name { font-family: var(--font-display); font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+
+.stock-risk, .stock-layered {
+  font-size: 13px; color: var(--text-secondary); line-height: 1.8;
+}
+
+@media (max-width: 768px) {
+  .stock-score-card { flex-direction: column; align-items: flex-start; }
+}
