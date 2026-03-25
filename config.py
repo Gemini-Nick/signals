@@ -48,6 +48,11 @@ FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
 FEISHU_RECEIVE_ID = os.getenv("FEISHU_RECEIVE_ID", "")
 FEISHU_RECEIVE_TYPE = os.getenv("FEISHU_RECEIVE_TYPE", "chat_id")
 
+# ── WeClaw 微信推送 ──────────────────────────────────────
+WECLAW_API_URL = os.getenv("WECLAW_API_URL", "http://127.0.0.1:18011")
+WECLAW_SEND_TO = os.getenv("WECLAW_SEND_TO", "")  # 微信接收者 ID（filehelper=文件传输助手）
+WECLAW_ENABLED = os.getenv("WECLAW_ENABLED", "false").lower() == "true"
+
 # ── 标的池配置 ────────────────────────────────────────────
 MAX_POOL_SIZE = 50          # 标的池上限
 SCORE_THRESHOLD = 60        # 评分低于此值淘汰

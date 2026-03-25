@@ -29,6 +29,22 @@
       <h2>行业板块聚类分析</h2>
       <button id="cluster-refresh" class="btn btn-sm">刷新</button>
     </div>
+    <!-- 观察池面板 -->
+    <div id="watchlist-panel" class="watchlist-panel">
+      <div class="watchlist-header">
+        <span class="watchlist-title">关注方向</span>
+        <div class="watchlist-input-group">
+          <input id="watchlist-direction" type="text" placeholder="输入方向 (如 上证50、半导体)" class="watchlist-input">
+          <select id="watchlist-mode" class="bt-select" style="width:auto;">
+            <option value="belief">信念</option>
+            <option value="panic">恐慌抄底</option>
+          </select>
+          <button id="watchlist-scan" class="btn btn-sm">扫描</button>
+        </div>
+      </div>
+      <div id="watchlist-results" class="watchlist-results"></div>
+    </div>
+
     <!-- 信息面板：交易日 + 数据源 + 市场状态 -->
     <div id="cluster-meta" class="cluster-info-panel"></div>
     <!-- 行业板块聚类（东财数据源） -->
@@ -66,6 +82,7 @@
         </select>
         <button id="bt-analyze" class="btn btn-analyze">运行分析</button>
         <button id="bt-export" class="btn btn-sm btn-export" title="导出 CSV" style="display:none;">⬇ 导出</button>
+        <button id="bt-push-wx" class="btn btn-sm btn-push" title="推送到微信" style="display:none;">📱 推送</button>
         <span id="bt-status" class="bt-status-text"></span>
       </div>
 

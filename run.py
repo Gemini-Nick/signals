@@ -506,7 +506,7 @@ def run_intraday(args):
     else:
         dash.phase_start("feishu")
         try:
-            from signals.notify.feishu import send_card
+            from signals.notify import send_card
             card = ctx.to_feishu_card()
             send_card(card)
         except Exception as e:
@@ -648,7 +648,7 @@ def run_index_only(args):
         dash.phase_start("feishu")
         if ctx:
             try:
-                from signals.notify.feishu import send_card
+                from signals.notify import send_card
                 card = ctx.to_feishu_card()
                 send_card(card)
             except Exception as e:

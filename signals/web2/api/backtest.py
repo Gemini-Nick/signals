@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 import config
@@ -375,6 +375,22 @@ def _compute_kpi(signal_evals: list) -> dict:
         avg_r = round(sum(info["returns"]) / cnt, 2) if cnt else 0
         by_type_kpi[sig_type] = {"count": cnt, "win_rate": wr_type, "avg_return_t10": avg_r}
 
+    # 按 MA 确认分组
+    ma_confirmed = [s for s in valid if s.get("ma_confirmed")]
+    ma_not = [s for s in valid if not s.get("ma_confirmed")]
+    by_ma = {}
+    for label, subset in [("MA确认", ma_confirmed), ("无MA锚点", ma_not)]:
+        cnt = len(subset)
+        if cnt == 0:
+            continue
+        w = sum(1 for s in subset if s.get("eval", {}).get("direction_correct") == 1)
+        rets = [s["eval"]["return_t10"] for s in subset if s["eval"].get("return_t10") is not None]
+        by_ma[label] = {
+            "count": cnt,
+            "win_rate": round(w / cnt * 100, 1),
+            "avg_return_t10": round(sum(rets) / len(rets), 2) if rets else 0,
+        }
+
     return {
         "total": total,
         "evaluated": valid_count,
@@ -384,6 +400,7 @@ def _compute_kpi(signal_evals: list) -> dict:
         "avg_mfe": avg_mfe,
         "avg_mae": avg_mae,
         "by_type": by_type_kpi,
+        "by_ma": by_ma,
     }
 
 
@@ -650,6 +667,110 @@ def _detect_all_signals(df, symbol, freq_label, signal_group, lookback, factor,
     return all_signals, bi_list, zhongshu, warnings
 
 
+def _annotate_signals_ma_vol(df: pd.DataFrame, signals: list):
+    """
+    给每个信号补充 MA 位置和量能状态标注。
+
+    在信号 dict 中新增:
+    - ma_status: "MA60支撑(+1.2%)" / "MA20阻力" / "多头排列" / ""
+    - volume_status: "放量(2.1σ)" / "缩量(-1.8σ)" / "正常"
+    - ma_confirmed: bool (MA支撑/阻力确认)
+    - vol_confirmed: bool (放量确认)
+    """
+    if not signals or df.empty:
+        return
+
+    # 预计算MA
+    ma_periods = {"MA20": 20, "MA60": 60, "MA120": 120, "MA250": 250}
+    for name, period in ma_periods.items():
+        if len(df) >= period:
+            df[name] = df["close"].rolling(period).mean()
+
+    # 预计算量能z-score (20日滚动)
+    if "vol" in df.columns and len(df) >= 25:
+        vol_mean = df["vol"].rolling(20).mean()
+        vol_std = df["vol"].rolling(20).std()
+        df["vol_z"] = (df["vol"] - vol_mean) / vol_std.replace(0, 1)
+
+    for sig in signals:
+        sig["ma_status"] = ""
+        sig["volume_status"] = ""
+        sig["ma_confirmed"] = False
+        sig["vol_confirmed"] = False
+
+        # 找到信号对应的 df 位置
+        sig_dt = sig.get("dt")
+        if sig_dt is None:
+            continue
+
+        try:
+            from datetime import datetime
+            if isinstance(sig_dt, (int, float)):
+                sig_time = datetime.fromtimestamp(sig_dt)
+            else:
+                sig_time = sig_dt
+
+            idx = df.index.get_indexer([sig_time], method="nearest")[0]
+            if idx < 0 or idx >= len(df):
+                continue
+        except Exception:
+            continue
+
+        row = df.iloc[idx]
+        price = float(row["close"])
+
+        # MA标注: 找最近的MA支撑
+        best_ma = None
+        best_dist = 999
+        for name in ma_periods:
+            if name not in df.columns:
+                continue
+            ma_val = row.get(name)
+            if pd.isna(ma_val):
+                continue
+            dist_pct = (price - ma_val) / ma_val * 100
+            # 在MA附近5%以内 = 有锚点
+            if abs(dist_pct) <= 5.0 and abs(dist_pct) < best_dist:
+                best_dist = abs(dist_pct)
+                position = "支撑" if dist_pct >= 0 else "下方"
+                best_ma = f"{name}{position}({dist_pct:+.1f}%)"
+                sig["ma_confirmed"] = True
+
+        if best_ma:
+            sig["ma_status"] = best_ma
+        else:
+            # 判断均线排列
+            ma_vals = {}
+            for name in ["MA20", "MA60", "MA120"]:
+                if name in df.columns and not pd.isna(row.get(name)):
+                    ma_vals[name] = float(row[name])
+            if len(ma_vals) >= 3:
+                vals = list(ma_vals.values())
+                if vals[0] > vals[1] > vals[2]:
+                    sig["ma_status"] = "多头排列"
+                elif vals[0] < vals[1] < vals[2]:
+                    sig["ma_status"] = "空头排列"
+                else:
+                    sig["ma_status"] = "交织"
+
+        # 量能标注
+        if "vol_z" in df.columns:
+            vol_z = row.get("vol_z")
+            if not pd.isna(vol_z):
+                if vol_z >= 2.0:
+                    sig["volume_status"] = f"放量({vol_z:.1f}σ)"
+                    sig["vol_confirmed"] = True
+                elif vol_z <= -1.5:
+                    sig["volume_status"] = f"缩量({vol_z:.1f}σ)"
+                else:
+                    sig["volume_status"] = "正常"
+
+    # 清理临时列
+    for col in list(ma_periods.keys()) + ["vol_z"]:
+        if col in df.columns:
+            df.drop(columns=[col], inplace=True, errors="ignore")
+
+
 @router.get("/analyze")
 async def backtest_analyze(
     code: str = Query(..., description="股票代码 (如 002759, 09988)"),
@@ -693,6 +814,9 @@ async def backtest_analyze(
             df, symbol, freq_label, signal_group, lookback, factor,
             gap_pct_min, volume_ratio_min, trend_lookback, bb_period, squeeze_threshold,
         )
+
+        # 2.5 MA/量能标注 — 给每个信号补充 ma_status 和 volume_status
+        _annotate_signals_ma_vol(df, all_signals)
 
         # 3. 序列化图表数据
         ohlcv = _serialize_ohlcv(df)
@@ -1091,6 +1215,19 @@ async def backtest_simulate(
             "error": str(e),
             "detail": traceback.format_exc(),
         })
+
+
+@router.post("/push")
+async def backtest_push(request: Request):
+    """将回测结果格式化后推送到微信。"""
+    try:
+        data = await request.json()
+        from signals.notify.backtest_notify import push_backtest_report
+        ok = push_backtest_report(data)
+        return {"ok": ok}
+    except Exception as e:
+        logger.warning("回测推送失败: %s", e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @router.get("/export")

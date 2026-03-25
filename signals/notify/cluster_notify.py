@@ -89,7 +89,7 @@ def push_cluster_result(result: dict = None):
 
     :param result: 聚类结果 dict，为 None 时自动执行聚类。
     """
-    from signals.notify.feishu import send_card
+    from signals.notify import send_card
 
     if result is None:
         from signals.core.clustering import cluster_industries

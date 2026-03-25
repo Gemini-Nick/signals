@@ -494,7 +494,7 @@ def run_profile(args):
                 l2_gain=gain_list[:3] if gain_list else [],
                 l2_composite=composite_list[:3] if composite_list else [],
             )
-            from signals.notify.feishu import send_card
+            from signals.notify import send_card
             send_card(card)
         except Exception as e:
             print(f"  [!] 飞书卡片推送异常: {e}")

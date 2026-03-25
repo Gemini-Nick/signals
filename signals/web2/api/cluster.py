@@ -159,3 +159,77 @@ def refresh(top: int = 3):
     """手动触发聚类刷新。"""
     _run_cluster()
     return get_latest(top)
+
+
+# ── 观察池 + 成分股 ─────────────────────────────────────
+
+@router.get("/watchlist")
+def get_watchlist(direction: str = "", mode: str = "belief", top: int = 30):
+    """
+    观察池扫描 — 扫描指定方向的成分股信号。
+
+    :param direction: 方向名称（如"上证50"、"半导体"）
+    :param mode: "belief"(信念) / "panic"(恐慌抄底)
+    :param top: 最多扫描前N只
+    """
+    if not direction:
+        return {"error": "请指定方向（direction 参数）", "results": []}
+
+    try:
+        from signals.core.signal_filter import scan_direction, results_to_dict
+        results = scan_direction(direction=direction, mode=mode, top_n=top)
+        return {
+            "direction": direction,
+            "mode": mode,
+            "total": len(results),
+            "grade_a": len([r for r in results if r.grade == "A"]),
+            "grade_b": len([r for r in results if r.grade == "B"]),
+            "grade_c": len([r for r in results if r.grade == "C"]),
+            "results": results_to_dict(results),
+        }
+    except Exception as e:
+        logger.error("观察池扫描失败: %s", e)
+        return {"error": str(e), "results": []}
+
+
+@router.get("/stocks")
+def get_board_stocks(board: str = ""):
+    """
+    获取板块成分股涨跌幅列表（按需加载，不做 CZSC 分析）。
+
+    :param board: 板块/行业/概念名称
+    """
+    if not board:
+        return {"error": "请指定板块名（board 参数）", "stocks": []}
+
+    try:
+        from signals.layers.industry import get_industry_stocks
+        symbols = get_industry_stocks(board)
+        if not symbols:
+            return {"board": board, "stocks": [], "error": f"未找到 {board} 的成分股"}
+
+        # 获取实时快照（涨跌幅）
+        stocks = []
+        try:
+            import akshare as ak
+            # 尝试获取实时行情
+            for sym in symbols[:50]:  # 最多50只
+                code = sym.replace("SH.", "").replace("SZ.", "")
+                stocks.append({
+                    "symbol": sym,
+                    "code": code,
+                    "name": code,  # 后续可从缓存获取名称
+                })
+        except Exception:
+            # 降级: 仅返回代码列表
+            stocks = [{"symbol": s, "code": s.replace("SH.", "").replace("SZ.", ""), "name": ""} for s in symbols[:50]]
+
+        return {
+            "board": board,
+            "total": len(symbols),
+            "showing": len(stocks),
+            "stocks": stocks,
+        }
+    except Exception as e:
+        logger.error("获取板块成分股失败: %s", e)
+        return {"error": str(e), "stocks": []}

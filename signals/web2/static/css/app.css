@@ -75,6 +75,8 @@ body {
 }
 .btn-primary:hover { background: var(--accent-hover); }
 .btn-sm { padding: 4px 10px; font-size: 12px; }
+.btn-push { border-color: #26a69a; color: #26a69a; }
+.btn-push:hover { background: rgba(38, 166, 154, 0.15); }
 .btn-icon {
   background: none;
   border: none;
@@ -872,4 +874,138 @@ body {
   .bt-kpis { flex-direction: column; }
   .bt-param-row { flex-direction: column; gap: 8px; }
   .bt-tabs { overflow-x: scroll; -webkit-overflow-scrolling: touch; }
+}
+
+/* ═══════════════════════════════════════════════════
+   观察池面板
+   ═══════════════════════════════════════════════════ */
+.watchlist-panel {
+  margin: 12px 20px;
+  padding: 12px 16px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+}
+.watchlist-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.watchlist-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+.watchlist-input-group {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.watchlist-input {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 13px;
+  width: 200px;
+}
+.watchlist-results { margin-top: 10px; }
+
+/* 观察池表格 */
+.wl-summary {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+.wl-grade-a { color: #26a69a; font-weight: 600; margin: 0 4px; }
+.wl-grade-b { color: #f0b90b; margin: 0 4px; }
+.wl-grade-c { color: var(--text-secondary); margin: 0 4px; }
+.wl-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin: 8px 0 4px;
+  text-transform: uppercase;
+}
+.wl-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.wl-table th {
+  text-align: left;
+  padding: 4px 8px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-color);
+  font-weight: 500;
+}
+.wl-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border-color);
+}
+.wl-row-a { background: rgba(38, 166, 154, 0.08); }
+.wl-row-b { background: rgba(240, 185, 11, 0.05); }
+.btn-xs {
+  padding: 2px 6px;
+  font-size: 11px;
+  border-radius: 3px;
+  cursor: pointer;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+}
+.btn-xs:hover { background: var(--accent-color); color: #fff; }
+
+/* 成分股展开 */
+.member-name { cursor: pointer; }
+.member-name:hover { text-decoration: underline; }
+.member-stocks {
+  padding: 6px 12px;
+  background: var(--bg-primary);
+  border-radius: 4px;
+  margin: 4px 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+.member-stocks-header {
+  width: 100%;
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.stock-chip {
+  display: inline-block;
+  padding: 2px 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  font-size: 11px;
+  cursor: pointer;
+  font-family: monospace;
+}
+.stock-chip:hover {
+  background: var(--accent-color);
+  color: #fff;
+  border-color: var(--accent-color);
+}
+
+/* 持续性标签 */
+.persist-tag {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 600;
+  vertical-align: middle;
+}
+.persist-main {
+  background: rgba(242, 54, 69, 0.15);
+  color: #f23645;
+}
+.persist-new {
+  background: rgba(38, 166, 154, 0.15);
+  color: #26a69a;
 }

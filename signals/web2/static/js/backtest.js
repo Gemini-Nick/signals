@@ -62,6 +62,7 @@ function _initBtEvents() {
   document.getElementById('bt-analyze')?.addEventListener('click', _runAnalyze);
   document.getElementById('bt-scan-run')?.addEventListener('click', _runScan);
   document.getElementById('bt-export')?.addEventListener('click', _exportCSV);
+  document.getElementById('bt-push-wx')?.addEventListener('click', _pushToWeChat);
   document.getElementById('bt-code')?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') _runAnalyze();
   });
@@ -237,6 +238,7 @@ async function _runAnalyze() {
 
     _switchBtTab('perf');
     document.getElementById('bt-export').style.display = '';
+    document.getElementById('bt-push-wx').style.display = '';
 
   } catch (e) {
     console.error('Analyze error:', e);
@@ -781,6 +783,22 @@ function _renderKPI(kpi) {
       </tr>`;
     }
     html += '</tbody></table>';
+
+    // 按 MA 确认分组（如果后端返回了 by_ma）
+    if (kpi.by_ma && Object.keys(kpi.by_ma).length > 0) {
+      html += '<div class="section-title" style="margin-top:12px;">MA确认对比</div>';
+      html += '<table class="bt-stats-table"><thead><tr><th>分组</th><th>数量</th><th>胜率</th><th>平均T+10</th></tr></thead><tbody>';
+      for (const [label, info] of Object.entries(kpi.by_ma)) {
+        html += `<tr>
+          <td><b>${label}</b></td>
+          <td>${info.count}</td>
+          <td class="${info.win_rate >= 50 ? 'up' : 'down'}">${info.win_rate}%</td>
+          <td class="${info.avg_return_t10 >= 0 ? 'up' : 'down'}">${info.avg_return_t10 >= 0 ? '+' : ''}${info.avg_return_t10}%</td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
+    }
+
     byTypeEl.innerHTML = html;
   } else if (byTypeEl) {
     byTypeEl.innerHTML = '';
@@ -871,6 +889,7 @@ function _renderSignalTable(signals, filterGroups) {
   let html = `<table class="bt-stats-table">
     <thead><tr>
       <th>日期</th><th>类型</th><th>组</th><th>价格</th><th>置信度</th>
+      <th>MA位置</th><th>量能</th>
       <th>T+5</th><th>T+10</th><th>T+20</th><th>MFE</th><th>MAE</th>
     </tr></thead><tbody>`;
   for (const s of filtered) {
@@ -880,12 +899,18 @@ function _renderSignalTable(signals, filterGroups) {
     const isLoss = t10 != null && t10 < 0;
     const rowCls = isWin ? 'bt-signal-win' : isLoss ? 'bt-signal-loss' : '';
     const groupBadge = _groupBadge(s.group);
+    const maStatus = s.ma_status || '—';
+    const maCls = s.ma_confirmed ? 'up' : '';
+    const volStatus = s.volume_status || '—';
+    const volCls = s.vol_confirmed ? 'up' : '';
     html += `<tr class="bt-signal-row ${rowCls}" onclick="_btScrollTo(${s.dt})">
       <td>${s.date_str}</td>
       <td><b>${s.type}</b></td>
       <td>${groupBadge}</td>
       <td>${s.price.toFixed(2)}</td>
       <td>${s.confidence != null ? (s.confidence * 100).toFixed(0) + '%' : '—'}</td>
+      <td class="${maCls}" style="font-size:11px;">${maStatus}</td>
+      <td class="${volCls}" style="font-size:11px;">${volStatus}</td>
       <td class="${_retCls(ev.return_t5)}">${_fmtRet(ev.return_t5)}</td>
       <td class="${_retCls(ev.return_t10)}">${_fmtRet(ev.return_t10)}</td>
       <td class="${_retCls(ev.return_t20)}">${_fmtRet(ev.return_t20)}</td>
@@ -1168,6 +1193,32 @@ async function _exportCSV() {
     showToast('导出成功');
   } catch (e) {
     showToast('导出失败: ' + e.message);
+  }
+}
+
+
+async function _pushToWeChat() {
+  if (!_btFullData) { showToast('请先运行分析'); return; }
+  const btn = document.getElementById('bt-push-wx');
+  btn.disabled = true;
+  btn.textContent = '推送中...';
+  try {
+    const resp = await fetch('/api/backtest/push', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_btFullData),
+    });
+    const result = await resp.json();
+    if (result.ok) {
+      showToast('已推送到微信');
+    } else {
+      showToast('推送失败: ' + (result.error || '未知错误'));
+    }
+  } catch (e) {
+    showToast('推送失败: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '📱 推送';
   }
 }
 

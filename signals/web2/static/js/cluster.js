@@ -16,6 +16,11 @@ onPageLoad('cluster', () => {
 // ── 事件绑定 ─────────────────────────────────────────
 function _initClusterEvents() {
   document.getElementById('cluster-refresh')?.addEventListener('click', refreshCluster);
+  document.getElementById('watchlist-scan')?.addEventListener('click', scanWatchlist);
+  // Enter 键触发扫描
+  document.getElementById('watchlist-direction')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter') scanWatchlist();
+  });
 }
 
 // ── 加载最新聚类 ─────────────────────────────────────
@@ -54,7 +59,7 @@ async function loadCluster() {
       if (conceptSrc) conceptSrc.textContent = '';
     }
 
-    loadWeekHistory();
+    loadWeekHistory().then(() => _addPersistenceLabels());
   } catch (e) {
     industryGrid.innerHTML = `<div class="cl-empty">加载失败: ${e.message}</div>`;
     conceptGrid.innerHTML = '';
@@ -250,3 +255,216 @@ async function loadWeekHistory() {
     container.innerHTML = '';
   }
 }
+
+// ── 持续性标签（主线 vs 一日游）────────────────────
+function _addPersistenceLabels() {
+  // 从本周历史表中统计每个板块/概念出现的天数
+  const table = document.querySelector('.cl-history-table');
+  if (!table) return;
+
+  const rows = table.querySelectorAll('tbody tr');
+  const freq = {};  // {板块名: 出现天数}
+  rows.forEach(row => {
+    const cells = row.querySelectorAll('td');
+    // cells: 日期, #1名, #1涨幅, #2名, #2涨幅, #3名, #3涨幅
+    for (let i = 1; i < cells.length; i += 2) {
+      const name = cells[i]?.textContent?.trim();
+      if (name && name !== '—') {
+        freq[name] = (freq[name] || 0) + 1;
+      }
+    }
+  });
+
+  // 给当前聚类卡片的成员添加标签
+  document.querySelectorAll('.member-name').forEach(el => {
+    const name = el.textContent.trim().split(/\s/)[0];
+    const count = freq[name] || 0;
+    // 移除旧标签
+    el.querySelectorAll('.persist-tag').forEach(t => t.remove());
+    if (count >= 3) {
+      el.insertAdjacentHTML('beforeend', ' <span class="persist-tag persist-main">连续${count}天</span>');
+    } else if (count === 0) {
+      // 首次出现（本周历史中没有）
+      el.insertAdjacentHTML('beforeend', ' <span class="persist-tag persist-new">新</span>');
+    }
+  });
+
+  // 也给聚类卡片的 label 加标签
+  document.querySelectorAll('.cluster-label').forEach(el => {
+    const name = el.textContent.trim();
+    const count = freq[name] || 0;
+    el.querySelectorAll('.persist-tag').forEach(t => t.remove());
+    if (count >= 3) {
+      el.insertAdjacentHTML('beforeend', ` <span class="persist-tag persist-main">连续${count}天</span>`);
+    }
+  });
+}
+
+// ── 观察池扫描 ───────────────────────────────────────
+async function scanWatchlist() {
+  const direction = document.getElementById('watchlist-direction')?.value?.trim();
+  const mode = document.getElementById('watchlist-mode')?.value || 'belief';
+  const container = document.getElementById('watchlist-results');
+  const btn = document.getElementById('watchlist-scan');
+
+  if (!direction) {
+    showToast('请输入关注方向');
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = '扫描中...';
+  container.innerHTML = '<div class="cl-loading">扫描中，每只股票约1-3秒...</div>';
+
+  try {
+    const data = await apiFetch(`/api/cluster/watchlist?direction=${encodeURIComponent(direction)}&mode=${mode}&top=30`, 180000);
+
+    if (data.error && !data.results?.length) {
+      container.innerHTML = `<div class="cl-empty">${data.error}</div>`;
+      return;
+    }
+
+    _renderWatchlistResults(data, container, mode);
+  } catch (e) {
+    container.innerHTML = `<div class="cl-empty">扫描失败: ${e.message}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '扫描';
+  }
+}
+
+function _renderWatchlistResults(data, container, mode) {
+  const results = data.results || [];
+  if (results.length === 0) {
+    container.innerHTML = '<div class="cl-empty">无结果</div>';
+    return;
+  }
+
+  const modeLabel = mode === 'panic' ? '恐慌抄底' : '信念方向';
+  const gradeA = results.filter(r => r.grade === 'A');
+  const gradeB = results.filter(r => r.grade === 'B');
+  const gradeC = results.filter(r => r.grade === 'C');
+
+  let html = `<div class="wl-summary">
+    ${modeLabel}: ${data.direction} | 共${data.total}只 |
+    <span class="wl-grade-a">A级 ${data.grade_a}</span>
+    <span class="wl-grade-b">B级 ${data.grade_b}</span>
+    <span class="wl-grade-c">C级 ${data.grade_c}</span>
+  </div>`;
+
+  if (gradeA.length > 0) {
+    html += '<div class="wl-section-title">推荐关注</div>';
+    html += _renderWatchlistTable(gradeA, mode);
+  }
+
+  if (gradeB.length > 0) {
+    html += '<div class="wl-section-title">可观察</div>';
+    html += _renderWatchlistTable(gradeB, mode);
+  }
+
+  if (gradeC.length > 0) {
+    html += `<div class="wl-section-title">暂无信号 (${gradeC.length}只)</div>`;
+    if (gradeC.length <= 10) {
+      html += _renderWatchlistTable(gradeC, mode);
+    } else {
+      html += _renderWatchlistTable(gradeC.slice(0, 5), mode);
+      html += `<div class="cl-empty">... 还有 ${gradeC.length - 5} 只</div>`;
+    }
+  }
+
+  container.innerHTML = html;
+
+  // 绑定跳转回测事件
+  container.querySelectorAll('.wl-goto-bt').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const code = btn.dataset.code;
+      document.getElementById('bt-code').value = code;
+      switchPage('backtest');
+      // 自动触发分析
+      document.getElementById('bt-analyze')?.click();
+    });
+  });
+}
+
+function _renderWatchlistTable(items, mode) {
+  let html = '<table class="wl-table"><thead><tr>';
+  html += '<th>代码</th><th>涨跌%</th><th>MA位置</th><th>缠论信号</th><th>量能</th>';
+  if (mode === 'panic') html += '<th>割肉</th><th>兑现目标</th>';
+  html += '<th></th></tr></thead><tbody>';
+
+  for (const r of items) {
+    const cls = r.change_pct >= 0 ? 'up' : 'down';
+    const sign = r.change_pct >= 0 ? '+' : '';
+    const signals = r.czsc_signals?.join(', ') || '—';
+    const code = r.symbol.replace('SH.', '').replace('SZ.', '');
+    const gradeCls = r.grade === 'A' ? 'wl-row-a' : r.grade === 'B' ? 'wl-row-b' : '';
+
+    html += `<tr class="${gradeCls}">`;
+    html += `<td><b>${r.symbol}</b></td>`;
+    html += `<td class="${cls}">${sign}${r.change_pct}%</td>`;
+    html += `<td>${r.ma_status || '—'}</td>`;
+    html += `<td>${signals}</td>`;
+    html += `<td>${r.volume_status || '—'}</td>`;
+    if (mode === 'panic') {
+      html += `<td>${r.cap_score >= 60 ? '<b>' + r.cap_score + '</b>' : r.cap_score}</td>`;
+      html += `<td>${r.target_price > 0 ? r.target_price : '—'}</td>`;
+    }
+    html += `<td><button class="btn btn-xs wl-goto-bt" data-code="${code}">回测</button></td>`;
+    html += '</tr>';
+  }
+
+  html += '</tbody></table>';
+  return html;
+}
+
+// ── 板块成分股展开（点击聚类卡片的成员板块名） ──────
+// 成员板块名点击 → 获取成分股列表
+document.addEventListener('click', async (e) => {
+  const memberName = e.target.closest('.member-name');
+  if (!memberName) return;
+
+  const name = memberName.textContent.trim().split(/\s/)[0]; // 取板块名（去掉领涨股等后缀）
+  const row = memberName.closest('.member-row');
+  if (!row) return;
+
+  // 检查是否已展开
+  const existing = row.nextElementSibling;
+  if (existing && existing.classList.contains('member-stocks')) {
+    existing.remove();
+    return;
+  }
+
+  // 移除其他展开
+  document.querySelectorAll('.member-stocks').forEach(el => el.remove());
+
+  // 插入加载占位
+  const stocksDiv = document.createElement('div');
+  stocksDiv.className = 'member-stocks';
+  stocksDiv.innerHTML = '<span class="cl-loading">加载成分股...</span>';
+  row.after(stocksDiv);
+
+  try {
+    const data = await apiFetch(`/api/cluster/stocks?board=${encodeURIComponent(name)}`);
+    if (data.stocks && data.stocks.length > 0) {
+      let html = `<div class="member-stocks-header">${name} 成分股 (${data.total}只, 显示前${data.showing})</div>`;
+      html += data.stocks.map(s => {
+        const code = s.code || s.symbol.replace('SH.', '').replace('SZ.', '');
+        return `<span class="stock-chip" data-code="${code}" title="点击去回测">${code}</span>`;
+      }).join('');
+      stocksDiv.innerHTML = html;
+
+      // 点击个股代码 → 跳转回测
+      stocksDiv.querySelectorAll('.stock-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+          document.getElementById('bt-code').value = chip.dataset.code;
+          switchPage('backtest');
+          document.getElementById('bt-analyze')?.click();
+        });
+      });
+    } else {
+      stocksDiv.innerHTML = `<span class="cl-empty">未找到成分股</span>`;
+    }
+  } catch (e) {
+    stocksDiv.innerHTML = `<span class="cl-empty">加载失败</span>`;
+  }
+});
