@@ -17,11 +17,16 @@ import threading
 import warnings
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional, Callable
 
 warnings.filterwarnings("ignore")
+
+
+def _lookback_start(lookback_days: int) -> str:
+    """N 天前的日期字符串 YYYY-MM-DD"""
+    return (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
 
 
 # ─────────────────────────────────────────────────────────
@@ -651,9 +656,8 @@ class FutuSource:
         注意：使用 request_history_kline，每次消耗1个历史K线额度。
         """
         from futu import KLType, AuType, RET_OK
-        from datetime import datetime, timedelta
         if start is None:
-            start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+            start = _lookback_start(lookback_days)
         ktype_map = {"日线": KLType.K_DAY, "周线": KLType.K_WEEK,
                      "60分钟": KLType.K_60M, "30分钟": KLType.K_30M,
                      "15分钟": KLType.K_15M}
@@ -701,8 +705,7 @@ class FutuSource:
         每次消耗1个历史K线额度（1000/天）。
         """
         from futu import KLType, AuType, RET_OK
-        from datetime import datetime, timedelta
-        start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        start = _lookback_start(lookback_days)
         ktype_map = {
             "1分钟": KLType.K_1M, "5分钟": KLType.K_5M,
             "15分钟": KLType.K_15M, "30分钟": KLType.K_30M,
@@ -730,8 +733,7 @@ class FutuSource:
         需要已开通美股行情权限。
         """
         from futu import KLType, AuType, RET_OK
-        from datetime import datetime, timedelta
-        start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        start = _lookback_start(lookback_days)
         ret, df, _ = self._ctx.request_history_kline(
             futu_code, start=start, ktype=KLType.K_DAY,
             autype=AuType.QFQ, max_count=2000
@@ -752,8 +754,7 @@ class FutuSource:
         Futu 支持最多 8 年分钟线历史。
         """
         from futu import KLType, AuType, RET_OK
-        from datetime import datetime, timedelta
-        start = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        start = _lookback_start(lookback_days)
         ktype_map = {
             "1分钟": KLType.K_1M, "5分钟": KLType.K_5M,
             "15分钟": KLType.K_15M, "30分钟": KLType.K_30M,
@@ -902,33 +903,32 @@ class YFinanceSource:
 _FATAL_ERROR_TYPES = ("ImportError", "ModuleNotFoundError")
 
 
+_ERROR_CLASSIFICATIONS = [
+    # (label, type_keywords, message_keywords)
+    ("网络错误",     ("Connection", "Timeout", "Socket", "Network"),
+                    ("refused", "timed out", "reset by peer")),
+    ("认证/权限错误", (),
+                    ("auth", "key", "permission", "forbidden", "401", "403")),
+    ("频率限制",     (),
+                    ("rate limit", "throttl", "pacing", "429")),
+    ("数据不存在",   (),
+                    ("not found", "no data", "404", "invalid symbol")),
+    ("配置缺失",     (),
+                    ("未配置", "not configured", "empty")),
+]
+
+
 def _classify_error(e: Exception) -> str:
     """将异常分类为可读的失败原因，便于溯源"""
     err_type = type(e).__name__
     err_msg = str(e)
-    # 网络类
-    if any(k in err_type for k in ("Connection", "Timeout", "Socket", "Network")):
-        return f"网络错误({err_type}): {err_msg}"
-    if any(k in err_msg.lower() for k in ("refused", "timed out", "reset by peer")):
-        return f"网络错误({err_type}): {err_msg}"
-    # 认证/权限
-    if any(k in err_msg.lower() for k in ("auth", "key", "permission",
-                                           "forbidden", "401", "403")):
-        return f"认证/权限错误({err_type}): {err_msg}"
-    # 频率限制
-    if any(k in err_msg.lower() for k in ("rate limit", "throttl", "pacing", "429")):
-        return f"频率限制({err_type}): {err_msg}"
-    # 数据不存在
-    if any(k in err_msg.lower() for k in ("not found", "no data", "404",
-                                           "invalid symbol")):
-        return f"数据不存在({err_type}): {err_msg}"
-    # 配置缺失
-    if any(k in err_msg.lower() for k in ("未配置", "not configured", "empty")):
-        return f"配置缺失({err_type}): {err_msg}"
-    # 依赖缺失
+    msg_lower = err_msg.lower()
+    for label, type_kws, msg_kws in _ERROR_CLASSIFICATIONS:
+        if (any(k in err_type for k in type_kws) or
+                any(k in msg_lower for k in msg_kws)):
+            return f"{label}({err_type}): {err_msg}"
     if err_type in _FATAL_ERROR_TYPES:
         return f"依赖未安装({err_type}): {err_msg}"
-    # 其他
     return f"未知错误({err_type}): {err_msg}"
 
 

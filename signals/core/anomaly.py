@@ -83,20 +83,23 @@ def _calc_z_score(values: List[float], window: int) -> tuple:
     return round(z, 2), round(mean, 4), round(std, 4)
 
 
-def _is_new_high(closes: List[float], lookback: int = 20) -> bool:
-    """最新收盘价是否为近 lookback 日最高"""
+def _is_extreme(closes: List[float], lookback: int = 20,
+                kind: str = "high") -> bool:
+    """最新收盘价是否为近 lookback 日最高/最低"""
     if len(closes) < lookback:
         return False
     recent = closes[-lookback:]
-    return closes[-1] >= max(recent)
+    if kind == "high":
+        return closes[-1] >= max(recent)
+    return closes[-1] <= min(recent)
+
+
+def _is_new_high(closes: List[float], lookback: int = 20) -> bool:
+    return _is_extreme(closes, lookback, "high")
 
 
 def _is_new_low(closes: List[float], lookback: int = 20) -> bool:
-    """最新收盘价是否为近 lookback 日最低"""
-    if len(closes) < lookback:
-        return False
-    recent = closes[-lookback:]
-    return closes[-1] <= min(recent)
+    return _is_extreme(closes, lookback, "low")
 
 
 # ── 各维度异常检测 ─────────────────────────────────────
