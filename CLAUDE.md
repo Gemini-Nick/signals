@@ -22,6 +22,8 @@
 | 轮动研判 | `detect_rotation_stage(gain, composite)` | `signals.core.rotation` | 轮动阶段 + 配置建议 |
 | 信号回放 | `replay_stock(symbol, bars, freq)` | `signals.core.replay` | 信号时间线 |
 | 股票名称 | `get_resolver().get_name(symbol)` | `signals.core.stock_names` | 代码→名称 |
+| 名称→代码 | `get_resolver().get_code(name)` | `signals.core.stock_names` | 名称→Futu代码（模糊匹配） |
+| 股票搜索 | `get_resolver().search(keyword)` | `signals.core.stock_names` | 关键词→[(code,name),...] |
 
 签名不确定时再读源码。大多数情况下这张表够用。
 
@@ -46,6 +48,36 @@ weclaw 支持三种 Agent 接入模式，推荐使用 ACP：
 理解意图 → 需要数据就写 Python 调上面的函数 → 不需要就直接答。
 
 输出要求：纯文本（微信不渲染 Markdown）、≤2000 字、用 emoji、结构化但紧凑。
+
+### 微信快捷执行（直接 bash，不要先读源码）
+
+| 用户意图关键词 | 直接执行 |
+|----------------|----------|
+| 行业/板块/行业分析/跑一下 | `python run.py --mode intraday` |
+| 指数/大盘/市场 | `python run.py --mode index` |
+| 回测+具体标的（如"回测天际股份"） | 先回复"🔄 正在回测 XXX... 预计30-60秒"，再 `python -m signals.notify.backtest_notify <代码> --dry-run`，读取输出后回复报告+解读 |
+| 回测（无标的） | `python run.py --mode backtest` |
+| 复盘 | `python run.py --mode review` |
+| 重启/restart | 先回复"🔄 正在重启，10秒后恢复"，然后 `nohup sh -c 'sleep 2 && weclaw restart' >/dev/null 2>&1 &` |
+
+**重要**：匹配到上面的意图时，直接执行对应命令，不要先读 run.py 或其他源码。检测到回测等 Signals 相关意图时直接执行，不要让用户重新输入 `/signals` 命令。
+
+### 微信进度反馈规则
+
+**核心原则**：任何需要调用工具（bash/读文件/执行代码）的操作，必须先告诉用户预计耗时，再执行。
+
+判断标准：
+- 纯文本回答（不需要工具）→ 直接回复，不需要进度提示
+- 需要执行命令或读文件 → 先发进度消息，再执行
+
+耗时预估：
+| 操作 | 进度消息 |
+|------|----------|
+| 行业分析 | 🔄 正在执行行业分析... 预计 30-60 秒 |
+| 指数分析 | 🔄 正在拉取指数数据... 预计 15-30 秒 |
+| 回测 | 🔄 正在回测历史信号... 预计 30-90 秒 |
+| 复盘 | 🔄 正在执行盘后复盘... 预计 30-60 秒 |
+| 读文件/加载上下文 | 🔄 正在查阅相关信息... 预计 10-20 秒 |
 
 ## 缠论框架
 

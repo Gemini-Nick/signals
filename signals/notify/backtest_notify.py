@@ -1,161 +1,223 @@
 # -*- coding: utf-8 -*-
-"""回测结果富格式微信推送
+"""回测结果富格式微信推送 V2
+
+对齐 Web2 UI 数据丰富度：交易模拟 KPI、信号分类、最佳/最差交易、
+出场分布、跳过原因、MA/量能确认率、自动诊断。
 
 支持两种调用方式:
-1. Web2 API: push_backtest_report(result_dict) — 传入 /analyze 返回的完整结果
-2. 独立调用: run_and_push("002466") — 自动拉数据、检测信号、模拟、推送
+1. Web2 API: push_backtest_report(result_dict)
+2. 独立调用: run_and_push("002466")
 """
 import logging
 import sys
+from collections import Counter
 
 logger = logging.getLogger(__name__)
 
-SEP = "━" * 20
+SEP = "━" * 25
+
+# 出场原因中→英映射
+EXIT_LABELS = {
+    "stop_loss": "止损", "trail_stop": "移动止盈", "time_exit": "时间",
+    "signal_exit": "信号", "data_end": "终点", "take_profit": "固定止盈",
+    "ma_exit": "均线", "profit_drawdown": "利润回撤", "batch_exit": "分批",
+}
+
+SKIP_LABELS = {
+    "unfilled": "未触发", "zero_volume": "零成交量", "locked_bar": "一字板",
+    "insufficient_data": "数据不足", "date_not_found": "日期未匹配",
+    "overlapping_position": "持仓重叠", "no_exit_data": "无出场数据",
+}
 
 
 def format_backtest_report(data: dict) -> str:
-    """将回测结果 dict 格式化为微信富文本。
-
-    :param data: /analyze 或 /simulate 返回的完整结果 dict
-    :return: 格式化后的纯文本字符串
-    """
+    """将回测结果 dict 格式化为微信富文本报告。"""
     code = data.get("code", "???")
     freq = data.get("freq", "日线")
     stock_name = data.get("stock_name", "")
-
-    # ── 标题 ──
-    title = f"📊 回测报告 — {stock_name} ({code})" if stock_name else f"📊 回测报告 — {code}"
-    parts = [title, SEP]
-
-    # ── 基本信息 ──
     signals = data.get("signals", [])
-    total_signals = len(signals)
+    sim_kpi = data.get("sim_kpi", {})
+    forward_kpi = data.get("forward_kpi", data.get("kpi", {}))
+    sim_trades = data.get("sim_trades", [])
+    sim_config = data.get("sim_config", {})
+    skip_reasons = data.get("sim_skip_reasons", {})
 
-    # 按 group 统计: macd / czsc / entry_factor
+    parts = []
+
+    # ═══ 标题区 ═══
+    title = f"📊 回测报告 — {stock_name} ({code})" if stock_name else f"📊 回测报告 — {code}"
+    parts.append(title)
+    parts.append(SEP)
+
+    # 信号分组统计
     groups = {}
     for s in signals:
         g = s.get("group", "other")
         groups[g] = groups.get(g, 0) + 1
-    group_parts = " / ".join(f"{k} {v}" for k, v in groups.items())
+    group_str = " | ".join(f"{k} {v}" for k, v in groups.items())
 
-    parts.append("📋 基本信息")
-    parts.append(f"标的: {code}  频率: {freq}")
-    parts.append(f"信号数: {total_signals}" + (f" ({group_parts})" if group_parts else ""))
-    parts.append(SEP)
+    parts.append(f"标的: {code} · {freq} · {len(signals)} 个信号")
+    if group_str:
+        parts.append(group_str)
+    parts.append("")
 
-    # ── 交易模拟 ──
-    sim_kpi = data.get("sim_kpi", {})
+    # ═══ 交易模拟 ═══
     if sim_kpi and sim_kpi.get("total_trades", 0) > 0:
+        parts.append(SEP)
+        parts.append("")
         parts.append("💰 交易模拟")
         filled = sim_kpi.get("filled_trades", 0)
-        total_trades = sim_kpi.get("total_trades", 0)
-        parts.append(f"成交: {filled}/{total_trades} 笔")
-        parts.append(f"胜率: {sim_kpi.get('win_rate', 0)}%")
+        total_t = sim_kpi.get("total_trades", 0)
+        wr = sim_kpi.get("win_rate", 0)
+        parts.append(f"成交 {filled}/{total_t} 笔  胜率 {wr}%")
+
+        tr = _sign(sim_kpi.get("total_return_pct", 0))
         pf = sim_kpi.get("profit_factor", 0)
-        parts.append(f"盈亏比: {pf}")
-        parts.append(f"总收益: {_sign(sim_kpi.get('total_return_pct', 0))}%")
-        parts.append(f"期望: {_sign(sim_kpi.get('expectancy', 0))}%/笔")
-        parts.append(f"最大回撤: {sim_kpi.get('max_drawdown_pct', 0)}%")
-        parts.append(f"夏普: {sim_kpi.get('sharpe', 0)}")
-        parts.append(f"平均持仓: {sim_kpi.get('avg_hold_days', 0)} 天")
-        parts.append(SEP)
+        parts.append(f"总收益 {tr}%  盈亏比 {pf}")
 
-    # ── 信号前瞻 ──
-    forward_kpi = data.get("forward_kpi", data.get("kpi", {}))
+        sharpe = sim_kpi.get("sharpe", 0)
+        sortino = sim_kpi.get("sortino", 0)
+        parts.append(f"Sharpe {sharpe}  Sortino {sortino}")
+
+        mdd = sim_kpi.get("max_drawdown_pct", 0)
+        exp = _sign(sim_kpi.get("expectancy", 0))
+        parts.append(f"最大回撤 -{mdd}%  期望 {exp}%/笔")
+
+        hold = sim_kpi.get("avg_hold_days", 0)
+        cost = sim_kpi.get("avg_cost_pct", 0)
+        parts.append(f"平均持仓 {hold}天  成本均 {cost}%")
+        parts.append("")
+
+    # ═══ 信号前瞻 ═══
     t5, t10, t20 = _compute_forward_avg(signals)
-
-    if forward_kpi.get("evaluated", 0) > 0 or any(v is not None for v in [t5, t10, t20]):
+    if any(v is not None for v in [t5, t10, t20]):
         parts.append("📈 信号前瞻")
-        if t5 is not None or t10 is not None or t20 is not None:
-            t_parts = []
-            if t5 is not None:
-                t_parts.append(f"T+5: {_sign(t5)}%")
-            if t10 is not None:
-                t_parts.append(f"T+10: {_sign(t10)}%")
-            if t20 is not None:
-                t_parts.append(f"T+20: {_sign(t20)}%")
-            parts.append("  ".join(t_parts))
+        t_parts = []
+        if t5 is not None:
+            t_parts.append(f"T+5 {_sign(t5)}%")
+        if t10 is not None:
+            t_parts.append(f"T+10 {_sign(t10)}%")
+        if t20 is not None:
+            t_parts.append(f"T+20 {_sign(t20)}%")
+        parts.append("  ".join(t_parts))
 
         avg_mfe = forward_kpi.get("avg_mfe", 0)
         avg_mae = forward_kpi.get("avg_mae", 0)
         if avg_mfe or avg_mae:
-            parts.append(f"MFE: +{avg_mfe}%  MAE: {avg_mae}%")
-        parts.append(SEP)
+            parts.append(f"MFE +{avg_mfe}%  MAE {avg_mae}%")
+        parts.append("")
 
-    # ── 分类表现 ──
+    # ═══ 信号分类 ═══
     by_type = forward_kpi.get("by_type", {})
     if by_type:
-        parts.append("🔍 分类表现")
+        parts.append(SEP)
+        parts.append("")
+        parts.append("🔍 信号分类")
         for sig_type, info in by_type.items():
             cnt = info.get("count", 0)
             wr = info.get("win_rate", 0)
             avg_r = info.get("avg_return_t10", 0)
             label = _short_type(sig_type)
-            parts.append(f"  {label}: {cnt}次 胜率{wr}% 收益{_sign(avg_r)}%")
+            parts.append(f"  {label}  {cnt}次 胜率{wr}% {_sign(avg_r)}%")
+        parts.append("")
 
         # MA 确认对比
         by_ma = forward_kpi.get("by_ma", {})
         if by_ma:
+            ma_parts = []
             for label, info in by_ma.items():
                 cnt = info.get("count", 0)
                 wr = info.get("win_rate", 0)
-                parts.append(f"  {label}: {cnt}次 胜率{wr}%")
-        parts.append(SEP)
+                ma_parts.append(f"{label} {cnt}次 胜率{wr}%")
+            parts.append(" vs ".join(ma_parts))
 
-    # ── 风控参数 ──
-    sim_config = data.get("sim_config", {})
+        # 确认率
+        ma_rate, vol_rate = _confirmation_rates(signals)
+        if ma_rate is not None or vol_rate is not None:
+            cr_parts = []
+            if ma_rate is not None:
+                cr_parts.append(f"MA确认率 {ma_rate}%")
+            if vol_rate is not None:
+                cr_parts.append(f"量能确认率 {vol_rate}%")
+            parts.append("  ".join(cr_parts))
+        parts.append("")
+
+    # ═══ 交易摘要 ═══
+    filled_trades = [t for t in sim_trades if t.get("entry_price") is not None]
+    if filled_trades:
+        parts.append(SEP)
+        parts.append("")
+        parts.append("📝 交易摘要")
+
+        best, worst = _best_worst_trades(filled_trades)
+        if best:
+            parts.append(f"最佳: {_sign(best['ret'])}% {best['type']} {best['entry']}→{best['exit']} ({best['reason']})")
+        if worst:
+            parts.append(f"最差: {_sign(worst['ret'])}% {worst['type']} {worst['entry']}→{worst['exit']} ({worst['reason']})")
+        parts.append("")
+
+        # 出场分布
+        exit_dist = _exit_reason_dist(filled_trades)
+        if exit_dist:
+            parts.append("出场: " + " | ".join(f"{k} {v}" for k, v in exit_dist.items()))
+
+        # 跳过原因
+        if skip_reasons:
+            skip_str = " | ".join(f"{SKIP_LABELS.get(k, k)} {v}" for k, v in skip_reasons.items() if v > 0)
+            if skip_str:
+                parts.append(f"跳过: {skip_str}")
+        parts.append("")
+
+    # ═══ 风控参数（一行） ═══
     if sim_config:
         sl = sim_config.get("stop_loss_pct", 5)
         ts = sim_config.get("trail_stop_pct", 50)
         mh = sim_config.get("max_hold_days", 20)
-        parts.append("⚙️ 风控")
-        parts.append(f"止损{sl}% | 移动止盈{ts}% | 最大持仓{mh}天")
-        # 高级出场
-        advanced = []
+        config_parts = [f"⚙️ 止损{sl}%", f"移动止盈{ts}%", f"最大{mh}天"]
         if sim_config.get("take_profit_pct", 0) > 0:
-            advanced.append(f"固定止盈{sim_config['take_profit_pct']}%")
+            config_parts.append(f"固定止盈{sim_config['take_profit_pct']}%")
         if sim_config.get("ma_exit_period", 0) > 0:
-            advanced.append(f"MA{sim_config['ma_exit_period']}离场")
-        if sim_config.get("batch_exit_enabled"):
-            advanced.append("分批出场")
-        if advanced:
-            parts.append("  ".join(advanced))
-        parts.append(SEP)
+            config_parts.append(f"MA{sim_config['ma_exit_period']}离场")
+        parts.append(" | ".join(config_parts))
+        parts.append("")
 
-    # ── 诊断 ──
-    diags = _auto_diagnose(sim_kpi, forward_kpi, by_type)
+    # ═══ 诊断 ═══
+    diags = _auto_diagnose(sim_kpi, forward_kpi, signals)
     if diags:
+        parts.append(SEP)
+        parts.append("")
         parts.append("💡 诊断")
         for d in diags:
             parts.append(d)
-        parts.append(SEP)
+        parts.append("")
 
-    # ── 署名 ──
+    # ═══ 署名 ═══
+    parts.append(SEP)
     parts.append("🐲 隆小侠 LONG CLAW")
 
     return "\n".join(parts)
 
 
+# ── 辅助函数 ──────────────────────────────────────
+
+
 def _sign(val) -> str:
-    """数字加正号前缀"""
     if val is None:
         return "N/A"
     return f"+{val}" if val > 0 else str(val)
 
 
 def _short_type(sig_type: str) -> str:
-    """缩短信号类型名"""
     replacements = {
         "Pattern A (MACD金叉确认)": "MACD金叉",
         "Pattern B (底背离)": "MACD底背离",
         "Pattern A": "MACD-A",
         "Pattern B": "MACD-B",
     }
-    return replacements.get(sig_type, sig_type[:12])
+    return replacements.get(sig_type, sig_type[:16])
 
 
 def _compute_forward_avg(signals: list):
-    """从信号列表计算 T+5/T+10/T+20 平均收益"""
     t5_vals, t10_vals, t20_vals = [], [], []
     for s in signals:
         ev = s.get("eval", {})
@@ -165,31 +227,67 @@ def _compute_forward_avg(signals: list):
             t10_vals.append(ev["return_t10"])
         if ev.get("return_t20") is not None:
             t20_vals.append(ev["return_t20"])
-
     t5 = round(sum(t5_vals) / len(t5_vals), 2) if t5_vals else None
     t10 = round(sum(t10_vals) / len(t10_vals), 2) if t10_vals else None
     t20 = round(sum(t20_vals) / len(t20_vals), 2) if t20_vals else None
     return t5, t10, t20
 
 
-def _auto_diagnose(sim_kpi: dict, forward_kpi: dict, by_type: dict) -> list:
-    """根据数据自动生成 2-3 条诊断建议"""
+def _confirmation_rates(signals: list):
+    """计算 MA 确认率和量能确认率。"""
+    if not signals:
+        return None, None
+    total = len(signals)
+    ma_confirmed = sum(1 for s in signals if s.get("ma_confirmed"))
+    vol_confirmed = sum(1 for s in signals if s.get("vol_confirmed"))
+    ma_rate = round(ma_confirmed / total * 100) if total > 0 else None
+    vol_rate = round(vol_confirmed / total * 100) if total > 0 else None
+    return ma_rate, vol_rate
+
+
+def _best_worst_trades(trades: list):
+    """提取最佳和最差交易摘要。"""
+    if not trades:
+        return None, None
+
+    best_t = max(trades, key=lambda t: t.get("net_return_pct", 0))
+    worst_t = min(trades, key=lambda t: t.get("net_return_pct", 0))
+
+    def _summarize(t):
+        ret = t.get("net_return_pct", 0)
+        sig_type = t.get("signal_type", "?")[:12]
+        entry = (t.get("entry_date") or "?")[-5:]  # MM-DD
+        exit_d = (t.get("exit_date") or "?")[-5:]
+        reason = EXIT_LABELS.get(t.get("exit_reason", ""), t.get("exit_reason", "?"))
+        return {"ret": ret, "type": sig_type, "entry": entry, "exit": exit_d, "reason": reason}
+
+    return _summarize(best_t), _summarize(worst_t)
+
+
+def _exit_reason_dist(trades: list) -> dict:
+    """统计出场原因分布。"""
+    counter = Counter(t.get("exit_reason", "unknown") for t in trades)
+    return {EXIT_LABELS.get(k, k): v for k, v in counter.most_common()}
+
+
+def _auto_diagnose(sim_kpi: dict, forward_kpi: dict, signals: list) -> list:
+    """根据数据自动生成 2-4 条诊断建议。"""
     diags = []
 
     win_rate = sim_kpi.get("win_rate", 0)
     if win_rate >= 60:
         diags.append("🟢 买入信号质量较高")
-    elif win_rate > 0 and win_rate < 40:
+    elif 0 < win_rate < 40:
         diags.append("🔴 买入信号需优化，胜率偏低")
 
     # MFE vs 实际收益
     avg_mfe = forward_kpi.get("avg_mfe", 0)
     avg_return = sim_kpi.get("avg_return", forward_kpi.get("avg_return_t10", 0))
-    if avg_mfe > 0 and avg_return is not None:
-        capture_ratio = avg_return / avg_mfe if avg_mfe > 0 else 1
-        if capture_ratio < 0.4:
-            diags.append("⚠️ 卖出偏早，可优化止盈位")
-        elif capture_ratio > 0.7:
+    if avg_mfe and avg_mfe > 0 and avg_return is not None:
+        capture = avg_return / avg_mfe if avg_mfe > 0 else 1
+        if capture < 0.4:
+            diags.append(f"⚠️ 卖出偏早，MFE +{avg_mfe}% 但实际 {_sign(avg_return)}%")
+        elif capture > 0.7:
             diags.append("🟢 出场时机良好")
 
     # 最大回撤
@@ -211,15 +309,21 @@ def _auto_diagnose(sim_kpi: dict, forward_kpi: dict, by_type: dict) -> list:
     elif pf >= 2:
         diags.append("🟢 盈亏比优秀")
 
-    return diags[:4]  # 最多 4 条
+    # Sortino
+    sortino = sim_kpi.get("sortino", 0)
+    if sortino and sortino >= 2:
+        diags.append("🟢 下行风险控制优秀 (Sortino≥2)")
+    elif sortino and sortino < 0:
+        diags.append("🔴 下行风险过高 (Sortino<0)")
+
+    return diags[:4]
+
+
+# ── 推送入口 ──────────────────────────────────────
 
 
 def push_backtest_report(data: dict) -> bool:
-    """格式化并推送回测报告到微信。
-
-    :param data: 回测结果 dict
-    :return: 推送是否成功
-    """
+    """格式化并推送回测报告到微信。"""
     text = format_backtest_report(data)
     try:
         from signals.notify.weclaw import send_text
@@ -230,17 +334,10 @@ def push_backtest_report(data: dict) -> bool:
         return False
 
 
-def run_and_push(code: str, freq: str = "daily", **kwargs) -> bool:
-    """独立运行回测并推送 — 不依赖 web2 服务。
-
-    :param code: 股票代码 (如 002466)
-    :param freq: daily / weekly
-    :param kwargs: 可选覆盖参数 (stop_loss, trail_stop, max_hold 等)
-    :return: 推送是否成功
-    """
+def run_and_push(code: str, freq: str = "daily", dry_run: bool = False, **kwargs) -> bool:
+    """独立运行回测并推送 — 不依赖 web2 服务。dry_run=True 时仅打印不推送。"""
     import dataclasses
 
-    # 复用 backtest API 中的核心函数
     from signals.web2.api.backtest import (
         _detect_market, _build_symbol, _fetch_kline,
         _detect_all_signals, _annotate_signals_ma_vol, _compute_kpi,
@@ -252,15 +349,24 @@ def run_and_push(code: str, freq: str = "daily", **kwargs) -> bool:
     symbol = _build_symbol(code, market)
     freq_label = "日线" if freq == "daily" else "周线"
 
-    # 1. 拉取K线
-    print(f"  拉取 {code} {freq_label}数据...")
+    # 查询股票名称（get_name 需要 futu_code 如 SH.002466）
+    stock_name = ""
+    try:
+        from signals.core.stock_names import get_resolver
+        name = get_resolver().get_name(symbol)
+        # 排除 fallback 返回代码本身的情况
+        if name and name != code and name != symbol.split(".")[-1]:
+            stock_name = name
+    except Exception:
+        pass
+
+    print(f"  拉取 {code} ({stock_name or '?'}) {freq_label}数据...")
     df = _fetch_kline(code, market, freq)
     if df.empty:
         print(f"  无法获取 {code} 的{freq_label}数据")
         return False
 
-    # 2. 信号检测
-    print(f"  检测信号...")
+    print("  检测信号...")
     signal_group = kwargs.get("signal_group", "all")
     lookback = kwargs.get("lookback", 999)
     all_signals, bi_list, zhongshu, warnings = _detect_all_signals(
@@ -274,8 +380,7 @@ def run_and_push(code: str, freq: str = "daily", **kwargs) -> bool:
     )
     _annotate_signals_ma_vol(df, all_signals)
 
-    # 3. 交易模拟
-    print(f"  运行交易模拟...")
+    print("  运行交易模拟...")
     sim_kwargs = {
         "stop_loss_pct": kwargs.get("stop_loss", 5.0),
         "trail_stop_pct": kwargs.get("trail_stop", 50.0),
@@ -286,24 +391,27 @@ def run_and_push(code: str, freq: str = "daily", **kwargs) -> bool:
     sim_kwargs = {k: v for k, v in sim_kwargs.items() if k in valid_fields}
     sim = simulate_trades(df, all_signals, SimConfig(**sim_kwargs))
 
-    # 4. 计算 KPI
     forward_kpi = _compute_kpi(all_signals)
 
-    # 5. 组装结果
     result = {
         "symbol": symbol,
         "code": code,
+        "stock_name": stock_name,
         "freq": freq_label,
         "signals": all_signals,
         "forward_kpi": forward_kpi,
         "sim_kpi": sim.kpi,
         "sim_config": sim.config,
         "sim_trades": sim.trades,
+        "sim_skip_reasons": getattr(sim, "skip_reasons", {}),
     }
 
-    # 6. 格式化 + 推送
     text = format_backtest_report(result)
     print(f"\n{text}\n")
+
+    if dry_run:
+        print("  [dry-run] 跳过微信推送")
+        return True
 
     try:
         from signals.notify.weclaw import send_text
@@ -317,12 +425,16 @@ def run_and_push(code: str, freq: str = "daily", **kwargs) -> bool:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    if len(sys.argv) < 2:
-        print("用法: python -m signals.notify.backtest_notify <股票代码> [频率]")
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+
+    if not args:
+        print("用法: python -m signals.notify.backtest_notify <股票代码> [频率] [--dry-run]")
         print("示例: python -m signals.notify.backtest_notify 002466")
-        print("      python -m signals.notify.backtest_notify 002466 weekly")
+        print("      python -m signals.notify.backtest_notify 002466 --dry-run")
         sys.exit(1)
 
-    stock_code = sys.argv[1]
-    frequency = sys.argv[2] if len(sys.argv) > 2 else "daily"
-    run_and_push(stock_code, frequency)
+    stock_code = args[0]
+    frequency = args[1] if len(args) > 1 else "daily"
+    is_dry_run = "--dry-run" in flags
+    run_and_push(stock_code, frequency, dry_run=is_dry_run)

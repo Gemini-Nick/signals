@@ -66,6 +66,26 @@ class StockNameResolver:
         self._lazy_load_fallback()
         return self._code_to_name.get(futu_code, futu_code.split(".")[-1])
 
+    def get_code(self, name: str) -> str:
+        """名称→Futu代码。支持模糊匹配（包含即命中）。未找到返回空字符串。"""
+        self._lazy_load_fallback()
+        # 精确匹配
+        for code, n in self._code_to_name.items():
+            if n == name:
+                return code
+        # 模糊匹配（名称包含查询词）
+        candidates = [(code, n) for code, n in self._code_to_name.items()
+                      if name in n]
+        if len(candidates) == 1:
+            return candidates[0][0]
+        return ""
+
+    def search(self, keyword: str) -> list:
+        """按关键词搜索，返回 [(code, name), ...] 列表。"""
+        self._lazy_load_fallback()
+        return [(code, n) for code, n in self._code_to_name.items()
+                if keyword in n]
+
     def get_industry(self, futu_code: str) -> str:
         """返回行业名。未知则返回空字符串。"""
         if futu_code in self._code_to_industry:
