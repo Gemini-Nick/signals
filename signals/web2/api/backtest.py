@@ -404,24 +404,57 @@ def _compute_kpi(signal_evals: list) -> dict:
     }
 
 
-def _get_date_presets() -> list:
-    """将 config.DATE_PRESETS 转为前端格式"""
+_PRESET_STALE_DAYS = 14  # 最后标签超过此天数视为过期
+
+
+def _get_date_presets(show_sector: bool = False) -> list:
+    """将 config.DATE_PRESETS 转为前端格式。
+    - 历史标签（非当年）及 tier=major 的当年标签始终显示
+    - tier=sector 的当年标签仅在 show_sector=True 时显示
+    - 无 tier 字段的当年标签视为 major
+    """
+    current_year = datetime.now().year
     presets = []
+
     for key, info in config.DATE_PRESETS.items():
         if "date" not in info:
             continue
         date_str = info["date"]
         try:
             dt = datetime.strptime(date_str, "%Y-%m-%d")
-            presets.append({
-                "key": key,
-                "date": date_str,
-                "time": int(dt.timestamp()),
-                "label": info["label"],
-            })
         except ValueError:
-            pass
-    return sorted(presets, key=lambda x: x["time"])
+            continue
+
+        # 当年的 sector 级标签：默认不显示
+        if dt.year == current_year and info.get("tier") == "sector" and not show_sector:
+            continue
+
+        presets.append({
+            "key": key,
+            "date": date_str,
+            "time": int(dt.timestamp()),
+            "label": info["label"],
+            "tier": info.get("tier", "major"),
+        })
+
+    presets = sorted(presets, key=lambda x: x["time"])
+
+    # 如果最后标签距今超过阈值，追加动态"近期行情"标签
+    if presets:
+        last_date = datetime.strptime(presets[-1]["date"], "%Y-%m-%d")
+        gap_days = (datetime.now() - last_date).days
+        if gap_days > _PRESET_STALE_DAYS:
+            recent_dt = last_date + timedelta(days=1)
+            recent_str = recent_dt.strftime("%Y-%m-%d")
+            presets.append({
+                "key": "_recent",
+                "date": recent_str,
+                "time": int(recent_dt.timestamp()),
+                "label": f"近期行情 — 距上次标签{gap_days}天（建议更新事件标签）",
+            })
+            logger.info("日期标签过期 %d 天，已追加动态标签。最后标签: %s",
+                        gap_days, presets[-2]["date"])
+    return presets
 
 
 # ─────────────────────────────────────────────────────
