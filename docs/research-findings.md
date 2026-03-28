@@ -591,3 +591,49 @@ class OmissionRecord:
 | 目标位计算 | 四种方法交叉验证 | TargetCalculator 类 |
 | 错误分类 | A/B/C三类 + 遗漏分析 | TradeReview 数据结构 |
 | 事件预判 | 事件x结构叠加 | 经济日历 + 预案模板 |
+
+---
+
+## 12. Google TurboQuant — KV Cache 极限压缩
+
+> 研究日期：2026-03-28
+> 来源：arXiv 2504.19874，ICLR 2026 录用
+
+### 论文信息
+
+- **标题**: TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate
+- **团队**: Google Research — Amir Zandieh（研究科学家）、Vahab Mirrokni（VP & Google Fellow），合作者来自 KAIST 和 NYU
+- **发表**: 2025年4月首发 arXiv，ICLR 2026 正式发表
+- **官方博客**: https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/
+
+### 核心方法：两阶段压缩
+
+**阶段一 — PolarQuant（AISTATS 2026）**
+
+将数据向量从笛卡尔坐标转换为极坐标，分离半径（幅度）和角度（方向）。角度分布可预测且集中，因此跳过传统量化器需要的逐块归一化步骤。
+
+**阶段二 — QJL: Quantized Johnson-Lindenstrauss（AAAI 2025）**
+
+用 1-bit 误差校正层将残差量化误差投射到低维空间，每个值压缩到单个符号位，消除注意力分数计算中的系统性偏差，额外开销可忽略。
+
+### 关键特性
+
+- **Data-oblivious**: 无需训练或微调，不需要在特定数据集上跑 k-means，即插即用
+- **理论保证**: 蒸馏率接近 Shannon 信息论下界，仅差约 2.7 倍常数因子
+
+### 实验结果
+
+| 指标 | 结果 |
+|------|------|
+| KV Cache 压缩 | 3 bits，零精度损失 |
+| 内存节省 | 6倍以上 |
+| 推理加速 | H100 上 attention logits 计算 8x（4-bit vs 32-bit） |
+| 长文本测试 | Needle-In-A-Haystack 104k tokens 100% 召回率 |
+| 质量中性点 | 3.5 bits/channel 绝对质量无损 |
+| 可接受损失点 | 2.5 bits/channel 边际质量下降 |
+
+### 社区验证与误区澄清
+
+独立开发者已在 Triton、MLX、llama.cpp 实现工作版本（Google 未发布官方代码）。有人在 RTX 4090 上用 Gemma 3 4B 测试自定义 Triton kernel，2-bit 精度下输出与未压缩基线字符级一致。
+
+**重要澄清**: TurboQuant 是 **KV cache 量化**（推理时的注意力缓存压缩），不是**模型权重量化**（如 4-bit GGUF/GPTQ）。社交媒体上的速度演示视频往往混淆了两者——使用 4-bit 量化模型本身就快，跟 TurboQuant 无关。TurboQuant 的真正价值在于**省显存、扩大上下文窗口**，而非让小模型推理更快。
