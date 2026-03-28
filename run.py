@@ -1526,6 +1526,16 @@ def run_sim(args):
 
 
 # ─────────────────────────────────────────────────────────
+# RSS 资讯
+# ─────────────────────────────────────────────────────────
+
+def run_rss(args):
+    """RSS 资讯订阅：抓取 + 推送美股市场分析。"""
+    from signals.data.rss_fetcher import run_rss as _run_rss
+    _run_rss(args)
+
+
+# ─────────────────────────────────────────────────────────
 # 入口
 # ─────────────────────────────────────────────────────────
 
@@ -1560,6 +1570,8 @@ def main():
   python run.py --mode analog --symbol 沪深300                   # 指定单个指数匹配
   python run.py --mode index --push                              # 分析 + 推送到 Vercel
   python run.py --mode intraday --push                           # 盘中 + 推送到 Vercel
+  python run.py --mode rss                                       # RSS 美股资讯
+  python run.py --mode rss --push                                # RSS + 推送到飞书/微信
   python run.py --list-dates                       # 列出所有日期预设
 
 可用日期预设：{preset_keys}
@@ -1568,8 +1580,8 @@ def main():
     parser.add_argument(
         "--mode",
         default="intraday",
-        choices=["intraday", "review", "index", "import", "backtest", "sim", "web", "web2", "analog", "plan", "weekly"],
-        help="运行模式：intraday / review / index / import / backtest / sim / web / web2 / analog / plan / weekly"
+        choices=["intraday", "review", "index", "import", "backtest", "sim", "web", "web2", "analog", "plan", "weekly", "rss"],
+        help="运行模式：intraday / review / index / import / backtest / sim / web / web2 / analog / plan / weekly / rss"
     )
     parser.add_argument(
         "--start",
@@ -1724,6 +1736,7 @@ def main():
         "analog":   run_analog,
         "plan":     run_plan,
         "weekly":   run_weekly,
+        "rss":      run_rss,
     }
     dispatch[args.mode](args)
 
