@@ -575,6 +575,8 @@ def _detect_entry_factors(
         detect_gap_entries,
         detect_trend_breakout_entries,
         detect_volatility_contraction_entries,
+        detect_candle_run_entries,
+        detect_candle_accel_entries,
     )
 
     signals = []
@@ -625,11 +627,41 @@ def _detect_entry_factors(
                 sig["eval"] = {}
         signals.extend(vol_sigs)
 
+    if factor in ("candle_run", "all_factors"):
+        run_sigs = detect_candle_run_entries(
+            df,
+            run_count=int(kwargs.get("run_count", 3)),
+            min_body_ratio=float(kwargs.get("body_ratio", 0.5)),
+            lookback=lookback,
+        )
+        for sig in run_sigs:
+            try:
+                sig_idx = df.index.get_indexer([pd.Timestamp(sig["date_str"])], method="nearest")[0]
+                sig["eval"] = _compute_forward_eval(df, sig_idx)
+            except Exception:
+                sig["eval"] = {}
+        signals.extend(run_sigs)
+
+    if factor in ("candle_accel", "all_factors"):
+        accel_sigs = detect_candle_accel_entries(
+            df,
+            run_count=int(kwargs.get("accel_count", 3)),
+            lookback=lookback,
+        )
+        for sig in accel_sigs:
+            try:
+                sig_idx = df.index.get_indexer([pd.Timestamp(sig["date_str"])], method="nearest")[0]
+                sig["eval"] = _compute_forward_eval(df, sig_idx)
+            except Exception:
+                sig["eval"] = {}
+        signals.extend(accel_sigs)
+
     return signals
 
 
 def _detect_all_signals(df, symbol, freq_label, signal_group, lookback, factor,
-                        gap_pct_min, volume_ratio_min, trend_lookback, bb_period, squeeze_threshold):
+                        gap_pct_min, volume_ratio_min, trend_lookback, bb_period, squeeze_threshold,
+                        run_count=3, body_ratio=0.5, accel_count=3):
     """统一信号检测 — 返回 (signals, bi_list, zhongshu, warnings)"""
     all_signals = []
     bi_list = []
@@ -657,6 +689,7 @@ def _detect_all_signals(df, symbol, freq_label, signal_group, lookback, factor,
                 gap_pct_min=gap_pct_min, volume_ratio_min=volume_ratio_min,
                 trend_lookback=trend_lookback, bb_period=bb_period,
                 squeeze_threshold=squeeze_threshold,
+                run_count=run_count, body_ratio=body_ratio, accel_count=accel_count,
             )
             all_signals.extend(factor_sigs)
         except Exception as factor_err:
@@ -778,9 +811,10 @@ async def backtest_analyze(
     signal_group: str = Query("all", description="macd / czsc / all"),
     lookback: int = Query(999, description="信号回看窗口"),
     # 入场因子
-    factor: str = Query("", description="入场因子: gap / trend_breakout / vol_contraction"),
+    factor: str = Query("", description="入场因子: gap / trend_breakout / vol_contraction / candle_run / candle_accel"),
     gap_pct_min: float = Query(2.0), volume_ratio_min: float = Query(1.5),
     trend_lookback: int = Query(20), bb_period: int = Query(20), squeeze_threshold: float = Query(0.05),
+    run_count: int = Query(3), body_ratio: float = Query(0.5), accel_count: int = Query(3),
     # 基础风控
     stop_loss: float = Query(5.0), trail_stop: float = Query(50.0),
     max_hold: int = Query(20), slippage: float = Query(0.1),
@@ -789,6 +823,8 @@ async def backtest_analyze(
     profit_drawdown: float = Query(0),
     batch_exit: str = Query("0"), batch1_ratio: float = Query(50),
     batch1_target: float = Query(5), batch2_target: float = Query(10),
+    # ATR 追踪止损
+    atr_exit_period: int = Query(0), atr_exit_mult: float = Query(2.0),
 ):
     """
     一体化分析 — 信号检测 + 交易模拟，一次请求返回全部数据。
@@ -813,6 +849,7 @@ async def backtest_analyze(
         all_signals, bi_list, zhongshu, warnings = _detect_all_signals(
             df, symbol, freq_label, signal_group, lookback, factor,
             gap_pct_min, volume_ratio_min, trend_lookback, bb_period, squeeze_threshold,
+            run_count=run_count, body_ratio=body_ratio, accel_count=accel_count,
         )
 
         # 2.5 MA/量能标注 — 给每个信号补充 ma_status 和 volume_status
@@ -832,6 +869,9 @@ async def backtest_analyze(
         if take_profit > 0: sim_kwargs["take_profit_pct"] = take_profit
         if ma_exit_period > 0: sim_kwargs["ma_exit_period"] = ma_exit_period
         if profit_drawdown > 0: sim_kwargs["profit_drawdown_pct"] = profit_drawdown
+        if atr_exit_period > 0:
+            sim_kwargs["atr_exit_period"] = atr_exit_period
+            sim_kwargs["atr_exit_mult"] = atr_exit_mult
         if batch_exit == "1":
             sim_kwargs["batch_exit_enabled"] = True
             sim_kwargs["batch_exit_ratios"] = [batch1_ratio / 100.0, (100 - batch1_ratio) / 100.0]
@@ -867,10 +907,12 @@ async def backtest_scan(
     factor: str = Query(""), gap_pct_min: float = Query(2.0),
     volume_ratio_min: float = Query(1.5), trend_lookback: int = Query(20),
     bb_period: int = Query(20), squeeze_threshold: float = Query(0.05),
+    run_count: int = Query(3), body_ratio: float = Query(0.5), accel_count: int = Query(3),
     stop_loss: float = Query(5.0), trail_stop: float = Query(50.0),
     max_hold: int = Query(20), slippage: float = Query(0.1),
     take_profit: float = Query(0), ma_exit_period: int = Query(0),
     profit_drawdown: float = Query(0),
+    atr_exit_period: int = Query(0), atr_exit_mult: float = Query(2.0),
     scan_param: str = Query(""), scan_values: str = Query(""),
     scan_param2: str = Query(""), scan_values2: str = Query(""),
     scan_metric: str = Query("sharpe"),
@@ -892,6 +934,7 @@ async def backtest_scan(
         all_signals, _, _, _ = _detect_all_signals(
             df, symbol, freq_label, signal_group, lookback, factor,
             gap_pct_min, volume_ratio_min, trend_lookback, bb_period, squeeze_threshold,
+            run_count=run_count, body_ratio=body_ratio, accel_count=accel_count,
         )
 
         sim_kwargs = dict(
@@ -901,6 +944,9 @@ async def backtest_scan(
         if take_profit > 0: sim_kwargs["take_profit_pct"] = take_profit
         if ma_exit_period > 0: sim_kwargs["ma_exit_period"] = ma_exit_period
         if profit_drawdown > 0: sim_kwargs["profit_drawdown_pct"] = profit_drawdown
+        if atr_exit_period > 0:
+            sim_kwargs["atr_exit_period"] = atr_exit_period
+            sim_kwargs["atr_exit_mult"] = atr_exit_mult
 
         valid_fields = {f.name for f in dataclasses.fields(SimConfig)}
         sim_kwargs = {k: v for k, v in sim_kwargs.items() if k in valid_fields}
@@ -1327,6 +1373,176 @@ async def backtest_export(
 
     except Exception as e:
         logger.exception("导出失败: %s", e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@router.post("/batch")
+async def backtest_batch(request: Request):
+    """
+    股票池批量回测 — 对多只股票跑同一套信号+模拟参数，返回汇总对比。
+
+    Body JSON:
+    {
+        "codes": "002759,000001,600519" 或 ["002759", "000001"],
+        "freq": "daily",
+        "signal_group": "all",
+        "factor": "",
+        "stop_loss": 5, "trail_stop": 50, "max_hold": 20, "slippage": 0.1,
+        ...（与 /analyze 相同的参数）
+    }
+    """
+    from signals.core.trade_simulator import SimConfig, simulate_trades
+    import dataclasses
+
+    try:
+        body = await request.json()
+
+        # 解析股票代码列表
+        codes_raw = body.get("codes", "")
+        if isinstance(codes_raw, str):
+            codes = [c.strip() for c in codes_raw.replace("\n", ",").split(",") if c.strip()]
+        elif isinstance(codes_raw, list):
+            codes = [str(c).strip() for c in codes_raw if str(c).strip()]
+        else:
+            return JSONResponse(status_code=400, content={"error": "codes 参数无效"})
+
+        if not codes:
+            return JSONResponse(status_code=400, content={"error": "请提供至少一只股票代码"})
+        if len(codes) > 20:
+            return JSONResponse(status_code=400, content={"error": "最多支持 20 只股票"})
+
+        # 公共参数
+        freq = body.get("freq", "daily")
+        signal_group = body.get("signal_group", "all")
+        lookback = int(body.get("lookback", 999))
+        factor = body.get("factor", "")
+        gap_pct_min = float(body.get("gap_pct_min", 2.0))
+        volume_ratio_min = float(body.get("volume_ratio_min", 1.5))
+        trend_lookback = int(body.get("trend_lookback", 20))
+        bb_period = int(body.get("bb_period", 20))
+        squeeze_threshold = float(body.get("squeeze_threshold", 0.05))
+        run_count = int(body.get("run_count", 3))
+        body_ratio_val = float(body.get("body_ratio", 0.5))
+        accel_count = int(body.get("accel_count", 3))
+
+        # 模拟参数
+        stop_loss = float(body.get("stop_loss", 5.0))
+        trail_stop = float(body.get("trail_stop", 50.0))
+        max_hold = int(body.get("max_hold", 20))
+        slippage_pct = float(body.get("slippage", 0.1))
+        take_profit = float(body.get("take_profit", 0))
+        ma_exit_period = int(body.get("ma_exit_period", 0))
+        profit_drawdown = float(body.get("profit_drawdown", 0))
+        atr_exit_period_val = int(body.get("atr_exit_period", 0))
+        atr_exit_mult_val = float(body.get("atr_exit_mult", 2.0))
+
+        # 构建 SimConfig
+        sim_kwargs = dict(
+            stop_loss_pct=stop_loss, trail_stop_pct=trail_stop,
+            max_hold_days=max_hold, slippage=slippage_pct / 100.0,
+        )
+        if take_profit > 0: sim_kwargs["take_profit_pct"] = take_profit
+        if ma_exit_period > 0: sim_kwargs["ma_exit_period"] = ma_exit_period
+        if profit_drawdown > 0: sim_kwargs["profit_drawdown_pct"] = profit_drawdown
+        if atr_exit_period_val > 0:
+            sim_kwargs["atr_exit_period"] = atr_exit_period_val
+            sim_kwargs["atr_exit_mult"] = atr_exit_mult_val
+
+        valid_fields = {f.name for f in dataclasses.fields(SimConfig)}
+        sim_kwargs = {k: v for k, v in sim_kwargs.items() if k in valid_fields}
+        sim_config = SimConfig(**sim_kwargs)
+
+        # 获取股票名称解析器
+        try:
+            from signals.core.stock_names import get_resolver
+            resolver = get_resolver()
+        except Exception:
+            resolver = None
+
+        # 逐股执行
+        stocks = []
+        total_signals = 0
+        total_trades = 0
+        total_wins = 0
+        total_evaluated = 0
+
+        for code in codes:
+            stock_result = {"code": code, "status": "ok"}
+            try:
+                market = _detect_market(code)
+                symbol = _build_symbol(code, market)
+                freq_label = "日线" if freq == "daily" else "周线"
+
+                # 获取名称
+                if resolver:
+                    try:
+                        stock_result["name"] = resolver.get_name(symbol)
+                    except Exception:
+                        stock_result["name"] = code
+                else:
+                    stock_result["name"] = code
+
+                # K线
+                df = _fetch_kline(code, market, freq)
+                if df.empty:
+                    stock_result["status"] = "error"
+                    stock_result["error"] = "无可用数据"
+                    stocks.append(stock_result)
+                    continue
+
+                # 信号检测
+                all_signals, _, _, _ = _detect_all_signals(
+                    df, symbol, freq_label, signal_group, lookback, factor,
+                    gap_pct_min, volume_ratio_min, trend_lookback, bb_period, squeeze_threshold,
+                    run_count=run_count, body_ratio=body_ratio_val, accel_count=accel_count,
+                )
+
+                # 交易模拟
+                sim = simulate_trades(df, all_signals, sim_config)
+
+                # 提取摘要
+                kpi = sim.kpi
+                stock_result["signal_count"] = len(all_signals)
+                stock_result["trade_count"] = kpi.get("filled_trades", 0)
+                stock_result["win_rate"] = kpi.get("win_rate", 0)
+                stock_result["expectancy"] = kpi.get("expectancy", 0)
+                stock_result["total_return"] = kpi.get("total_return_pct", 0)
+                stock_result["max_drawdown"] = kpi.get("max_drawdown_pct", 0)
+                stock_result["sharpe"] = kpi.get("sharpe", 0)
+                stock_result["avg_hold_days"] = kpi.get("avg_hold_days", 0)
+
+                total_signals += len(all_signals)
+                total_trades += stock_result["trade_count"]
+                wins = int(stock_result["trade_count"] * stock_result["win_rate"] / 100) if stock_result["trade_count"] > 0 else 0
+                total_wins += wins
+                total_evaluated += stock_result["trade_count"]
+
+            except Exception as e:
+                stock_result["status"] = "error"
+                stock_result["error"] = str(e)[:100]
+                logger.warning("批量回测 %s 失败: %s", code, e)
+
+            stocks.append(stock_result)
+
+        # 汇总
+        overall_win_rate = round(total_wins / total_evaluated * 100, 1) if total_evaluated > 0 else 0
+        ok_stocks = [s for s in stocks if s["status"] == "ok" and s.get("trade_count", 0) > 0]
+        overall_expectancy = round(sum(s.get("expectancy", 0) for s in ok_stocks) / len(ok_stocks), 2) if ok_stocks else 0
+
+        return {
+            "summary": {
+                "total_stocks": len(codes),
+                "ok_stocks": len(ok_stocks),
+                "total_signals": total_signals,
+                "total_trades": total_trades,
+                "overall_win_rate": overall_win_rate,
+                "overall_expectancy": overall_expectancy,
+            },
+            "stocks": stocks,
+        }
+
+    except Exception as e:
+        logger.exception("批量回测失败")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 

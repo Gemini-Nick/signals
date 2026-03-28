@@ -67,6 +67,9 @@ function _initBtEvents() {
     if (e.key === 'Enter') _runAnalyze();
   });
 
+  // 批量模式切换
+  document.getElementById('bt-batch-mode')?.addEventListener('change', _onBatchModeChange);
+
   // 信号类型选择联动
   document.getElementById('bt-signal-type')?.addEventListener('change', _onSignalTypeChange);
 
@@ -99,7 +102,7 @@ function _switchBtTab(tabName) {
 }
 
 // ── 信号类型联动 ────────────────────────────────────
-const _FACTOR_TYPES = ['gap', 'trend_breakout', 'vol_contraction'];
+const _FACTOR_TYPES = ['gap', 'trend_breakout', 'vol_contraction', 'candle_run', 'candle_accel'];
 const _CLASSIC_TYPES = ['all', 'macd', 'czsc'];
 
 function _getSignalType() {
@@ -137,6 +140,11 @@ function _collectSignalParams() {
     } else if (st === 'vol_contraction') {
       params.bb_period = document.getElementById('bt-bb-period').value;
       params.squeeze_threshold = document.getElementById('bt-squeeze-thresh').value;
+    } else if (st === 'candle_run') {
+      params.run_count = document.getElementById('bt-run-count').value;
+      params.body_ratio = document.getElementById('bt-body-ratio').value;
+    } else if (st === 'candle_accel') {
+      params.accel_count = document.getElementById('bt-accel-count').value;
     }
   }
   return params;
@@ -156,6 +164,8 @@ function _collectSimParams() {
     batch1_ratio: document.getElementById('bt-batch1-ratio').value,
     batch1_target: document.getElementById('bt-batch1-target').value,
     batch2_target: document.getElementById('bt-batch2-target').value,
+    atr_exit_period: document.getElementById('bt-atr-period').value,
+    atr_exit_mult: document.getElementById('bt-atr-mult').value,
   };
 }
 
@@ -181,6 +191,7 @@ function _collectScanParams() {
 // ═══════════════════════════════════════════════════
 
 async function _runAnalyze() {
+  if (_btBatchMode) return _runBatchAnalyze();
   const code = document.getElementById('bt-code').value.trim();
   if (!code) return;
 
@@ -677,6 +688,8 @@ const _SIGNAL_TYPE_TO_GROUPS = {
   gap: ['gap'],
   trend_breakout: ['trend'],
   vol_contraction: ['vol'],
+  candle_run: ['candle_run'],
+  candle_accel: ['candle_accel'],
 };
 
 function _drawBtSignalMarkers(signals) {
@@ -703,6 +716,10 @@ function _drawBtSignalMarkers(signals) {
         color = '#26a69a'; shape = 'arrowUp'; position = 'belowBar';
       } else if (s.group === 'vol') {
         color = '#e040fb'; shape = 'arrowUp'; position = 'belowBar';
+      } else if (s.group === 'candle_run') {
+        color = '#ff5722'; shape = 'arrowUp'; position = 'belowBar';
+      } else if (s.group === 'candle_accel') {
+        color = '#ff9800'; shape = 'arrowUp'; position = 'belowBar';
       } else {
         const isBuy = s.type.includes('买') || s.type.includes('背驰');
         const isSell = s.type.includes('卖');
@@ -987,11 +1004,16 @@ function _renderTradeTable(trades) {
   for (const t of filled) {
     const retCls = (t.net_return_pct || 0) >= 0 ? 'up' : 'down';
     const rowCls = (t.net_return_pct || 0) >= 0 ? 'signal-row win' : 'signal-row loss';
-    const exitLabel = { 'stop_loss': '止损', 'trail_stop': '移动止盈', 'time_exit': '时间止损',
+    const exitText = { 'stop_loss': '止损', 'trail_stop': '移动止盈', 'time_exit': '时间止损',
       'signal_exit': '信号出场', 'data_end': '数据终点', 'take_profit': '固定止盈',
       'ma_exit': '均线离场', 'profit_drawdown': '利润回撤', 'batch_exit': '分批止盈',
+      'atr_trail': 'ATR追踪',
     }[t.exit_reason] || t.exit_reason || '—';
-    const fillLabel = t.fill_type === 'open_fill' ? '开盘' : t.fill_type === 'trigger_fill' ? '触发' : t.fill_type || '—';
+    const exitCls = (t.exit_reason || '').replace(/_/g, '-');
+    const exitLabel = t.exit_reason ? `<span class="bt-exit-badge ${exitCls}">${exitText}</span>` : '—';
+    const fillText = t.fill_type === 'open_fill' ? '开盘' : t.fill_type === 'trigger_fill' ? '触发' : t.fill_type || '—';
+    const fillCls = (t.fill_type || '').replace(/_/g, '-');
+    const fillLabel = t.fill_type ? `<span class="bt-fill-badge ${fillCls}">${fillText}</span>` : '—';
     html += `<tr class="${rowCls}" onclick="_btScrollTo(${new Date(t.signal_date).getTime() / 1000 | 0})">
       <td>${t.signal_date || '—'}</td>
       <td><b>${t.signal_type}</b></td>
@@ -1244,6 +1266,154 @@ function _groupBadge(group) {
     'gap': '<span class="bt-pattern-badge gap">跳空</span>',
     'trend': '<span class="bt-pattern-badge trend">突破</span>',
     'vol': '<span class="bt-pattern-badge vol">收缩</span>',
+    'candle_run': '<span class="bt-pattern-badge candle-run">连续K</span>',
+    'candle_accel': '<span class="bt-pattern-badge candle-accel">加速K</span>',
   };
   return map[group] || `<span class="bt-pattern-badge">${group}</span>`;
 }
+
+
+// ═══════════════════════════════════════════════════
+// P3: 批量回测模式
+// ═══════════════════════════════════════════════════
+
+let _btBatchMode = false;
+
+function _onBatchModeChange(e) {
+  _btBatchMode = e.target.checked;
+  const codeInput = document.getElementById('bt-code');
+  const batchTab = document.querySelector('.bt-tab-btn[data-tab="batch"]');
+  if (_btBatchMode) {
+    codeInput.placeholder = '多只代码，逗号分隔 (如 002759,000001,600519)';
+    codeInput.style.width = '320px';
+    if (batchTab) batchTab.style.display = '';
+  } else {
+    codeInput.placeholder = '股票代码 (如 002759)';
+    codeInput.style.width = '';
+    if (batchTab) batchTab.style.display = 'none';
+  }
+}
+
+async function _runBatchAnalyze() {
+  const codeStr = document.getElementById('bt-code').value.trim();
+  if (!codeStr) return;
+
+  const btn = document.getElementById('bt-analyze');
+  const statusEl = document.getElementById('bt-status');
+  btn.disabled = true;
+  btn.textContent = '批量分析中...';
+  statusEl.textContent = '正在批量回测...';
+
+  try {
+    const body = { codes: codeStr };
+
+    // 信号参数
+    const sigParams = _collectSignalParams();
+    Object.assign(body, sigParams);
+
+    // 模拟参数
+    const simParams = _collectSimParams();
+    body.freq = document.getElementById('bt-freq').value;
+    body.stop_loss = parseFloat(simParams.stop_loss);
+    body.trail_stop = parseFloat(simParams.trail_stop);
+    body.max_hold = parseInt(simParams.max_hold);
+    body.slippage = parseFloat(simParams.slippage);
+    body.take_profit = parseFloat(simParams.take_profit);
+    body.ma_exit_period = parseInt(simParams.ma_exit_period);
+    body.profit_drawdown = parseFloat(simParams.profit_drawdown);
+    body.atr_exit_period = parseInt(simParams.atr_exit_period);
+    body.atr_exit_mult = parseFloat(simParams.atr_exit_mult);
+
+    const resp = await fetch('/api/backtest/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+
+    if (data.error) {
+      showToast(data.error);
+      statusEl.textContent = '批量失败';
+      return;
+    }
+
+    _renderBatchResults(data);
+    _showResultArea();
+    _switchBtTab('batch');
+
+    const s = data.summary;
+    statusEl.textContent = `${s.total_stocks} 只 | ${s.total_signals} 信号 | ${s.total_trades} 成交 | 胜率 ${s.overall_win_rate}%`;
+    showToast(`批量回测完成: ${s.ok_stocks}/${s.total_stocks} 只成功`);
+
+  } catch (e) {
+    console.error('Batch error:', e);
+    showToast('批量回测失败: ' + e.message);
+    statusEl.textContent = '错误';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '运行分析';
+  }
+}
+
+function _renderBatchResults(data) {
+  const summaryEl = document.getElementById('bt-batch-summary');
+  const tableEl = document.getElementById('bt-batch-table');
+  const s = data.summary;
+
+  // 汇总卡片
+  summaryEl.innerHTML = [
+    { value: s.total_stocks, label: '总股票', cls: '' },
+    { value: s.ok_stocks + '/' + s.total_stocks, label: '成功', cls: '' },
+    { value: s.total_signals, label: '总信号', cls: '' },
+    { value: s.total_trades, label: '总成交', cls: '' },
+    { value: s.overall_win_rate + '%', label: '整体胜率', cls: s.overall_win_rate >= 50 ? 'up' : 'down' },
+    { value: (s.overall_expectancy >= 0 ? '+' : '') + s.overall_expectancy + '%', label: '整体期望', cls: s.overall_expectancy >= 0 ? 'up' : 'down' },
+  ].map(it => `
+    <div class="bt-metric-card">
+      <div class="bt-metric-label">${it.label}</div>
+      <div class="bt-metric-value ${it.cls}">${it.value}</div>
+    </div>
+  `).join('');
+
+  // 股票对比表
+  // 按胜率排序
+  const sorted = [...data.stocks].sort((a, b) => (b.win_rate || 0) - (a.win_rate || 0));
+
+  let html = '<table class="bt-stats-table"><thead><tr>';
+  html += '<th>代码</th><th>名称</th><th>信号</th><th>成交</th><th>胜率</th><th>期望</th><th>总收益</th><th>最大回撤</th><th>Sharpe</th><th>均持日</th>';
+  html += '</tr></thead><tbody>';
+
+  for (const st of sorted) {
+    if (st.status === 'error') {
+      html += `<tr class="bt-batch-error"><td>${st.code}</td><td colspan="9" style="color:var(--text-secondary);">❌ ${st.error || '失败'}</td></tr>`;
+      continue;
+    }
+    html += `<tr class="bt-batch-row" data-code="${st.code}" onclick="_btLoadSingle('${st.code}')">
+      <td><b>${st.code}</b></td>
+      <td>${st.name || ''}</td>
+      <td>${st.signal_count || 0}</td>
+      <td>${st.trade_count || 0}</td>
+      <td class="${(st.win_rate || 0) >= 50 ? 'up' : 'down'}">${st.win_rate || 0}%</td>
+      <td class="${(st.expectancy || 0) >= 0 ? 'up' : 'down'}">${_fmtRet(st.expectancy)}</td>
+      <td class="${(st.total_return || 0) >= 0 ? 'up' : 'down'}">${_fmtRet(st.total_return)}</td>
+      <td class="down">${st.max_drawdown || 0}%</td>
+      <td>${st.sharpe || 0}</td>
+      <td>${st.avg_hold_days || 0}</td>
+    </tr>`;
+  }
+  html += '</tbody></table>';
+  tableEl.innerHTML = html;
+}
+
+/** 批量表格点击 → 切回单股模式加载该股 */
+window._btLoadSingle = function(code) {
+  // 关闭批量模式
+  const checkbox = document.getElementById('bt-batch-mode');
+  if (checkbox) {
+    checkbox.checked = false;
+    _onBatchModeChange({ target: checkbox });
+  }
+  // 填入代码并执行分析
+  document.getElementById('bt-code').value = code;
+  _runAnalyze();
+};

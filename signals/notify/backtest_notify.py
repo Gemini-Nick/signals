@@ -56,7 +56,11 @@ def format_backtest_report(data: dict) -> str:
         groups[g] = groups.get(g, 0) + 1
     group_str = " | ".join(f"{k} {v}" for k, v in groups.items())
 
+    # 回测区间
+    date_range = data.get("date_range", "")
     parts.append(f"标的: {code} · {freq} · {len(signals)} 个信号")
+    if date_range:
+        parts.append(f"区间: {date_range}")
     if group_str:
         parts.append(group_str)
     parts.append("")
@@ -190,6 +194,11 @@ def format_backtest_report(data: dict) -> str:
         for d in diags:
             parts.append(d)
         parts.append("")
+
+    # ═══ 周期提示 ═══
+    parts.append("📅 可选周期：924新政 | DeepSeek行情 | 关税暴跌 | 17连阳 | 近3月 | 近1月")
+    parts.append("回复「回测 XXX 924」可指定起始周期")
+    parts.append("")
 
     # ═══ 署名 ═══
     parts.append(SEP)
@@ -366,6 +375,17 @@ def run_and_push(code: str, freq: str = "daily", dry_run: bool = False, **kwargs
         print(f"  无法获取 {code} 的{freq_label}数据")
         return False
 
+    # 计算回测区间
+    date_range = ""
+    try:
+        dt_col = df.index if df.index.name == "dt" or hasattr(df.index[0], 'strftime') else df.get("dt")
+        if dt_col is not None:
+            start_dt = dt_col.min().strftime("%Y-%m-%d")
+            end_dt = dt_col.max().strftime("%Y-%m-%d")
+            date_range = f"{start_dt} ~ {end_dt}"
+    except Exception:
+        pass
+
     print("  检测信号...")
     signal_group = kwargs.get("signal_group", "all")
     lookback = kwargs.get("lookback", 999)
@@ -398,6 +418,7 @@ def run_and_push(code: str, freq: str = "daily", dry_run: bool = False, **kwargs
         "code": code,
         "stock_name": stock_name,
         "freq": freq_label,
+        "date_range": date_range,
         "signals": all_signals,
         "forward_kpi": forward_kpi,
         "sim_kpi": sim.kpi,
@@ -423,18 +444,56 @@ def run_and_push(code: str, freq: str = "daily", dry_run: bool = False, **kwargs
         return False
 
 
+def _resolve_stock_input(raw: str) -> str:
+    """将各种格式的股票输入统一转为纯数字代码。
+
+    支持格式：
+    - 纯数字: 002759
+    - 带前缀: SZ.002759, SH.600000, HK.09988
+    - 股票名称: 天际股份（通过 get_resolver 模糊匹配）
+    """
+    raw = raw.strip()
+
+    # 已有前缀格式 → 提取纯数字部分
+    if "." in raw:
+        parts = raw.split(".", 1)
+        if parts[0].upper() in ("SZ", "SH", "HK"):
+            return parts[1]
+
+    # 纯数字 → 直接返回
+    if raw.isdigit():
+        return raw
+
+    # 非数字 → 尝试名称解析
+    try:
+        from signals.core.stock_names import get_resolver
+        code = get_resolver().get_code(raw)
+        if code:
+            # get_code 返回 Futu 格式如 SZ.002759，提取纯数字
+            if "." in code:
+                code = code.split(".", 1)[1]
+            print(f"  📌 名称解析: {raw} → {code}")
+            return code
+    except Exception as e:
+        print(f"  ⚠️ 名称解析失败: {e}")
+
+    # fallback: 原样返回
+    return raw
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
 
     if not args:
-        print("用法: python -m signals.notify.backtest_notify <股票代码> [频率] [--dry-run]")
+        print("用法: python -m signals.notify.backtest_notify <股票代码|名称> [频率] [--dry-run]")
         print("示例: python -m signals.notify.backtest_notify 002466")
-        print("      python -m signals.notify.backtest_notify 002466 --dry-run")
+        print("      python -m signals.notify.backtest_notify 天际股份 --dry-run")
+        print("      python -m signals.notify.backtest_notify SZ.002759 --dry-run")
         sys.exit(1)
 
-    stock_code = args[0]
+    stock_code = _resolve_stock_input(args[0])
     frequency = args[1] if len(args) > 1 else "daily"
     is_dry_run = "--dry-run" in flags
     run_and_push(stock_code, frequency, dry_run=is_dry_run)

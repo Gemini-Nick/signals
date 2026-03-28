@@ -63,6 +63,9 @@
     <!-- 控制栏 -->
     <div class="bt-header">
       <div class="bt-input-row">
+        <label class="bt-batch-toggle">
+          <input type="checkbox" id="bt-batch-mode"> 批量
+        </label>
         <input id="bt-code" type="text" placeholder="股票代码 (如 002759)" class="bt-code-input">
         <select id="bt-freq" class="bt-select">
           <option value="daily">日线</option>
@@ -78,6 +81,8 @@
             <option value="gap">跳空缺口</option>
             <option value="trend_breakout">趋势突破</option>
             <option value="vol_contraction">波动收缩</option>
+            <option value="candle_run">连续K线</option>
+            <option value="candle_accel">加速K线</option>
           </optgroup>
         </select>
         <button id="bt-analyze" class="btn btn-analyze">运行分析</button>
@@ -108,6 +113,18 @@
           <input type="number" id="bt-bb-period" class="bt-param-input" value="20" min="10" max="60" step="5">
           <label>挤压阈值</label>
           <input type="number" id="bt-squeeze-thresh" class="bt-param-input" value="0.05" min="0.01" max="0.2" step="0.01">
+        </div>
+        <!-- candle_run 参数 -->
+        <div class="bt-param-group" data-factor="candle_run">
+          <label>连续根数</label>
+          <input type="number" id="bt-run-count" class="bt-param-input" value="3" min="2" max="10" step="1">
+          <label>最小实体比</label>
+          <input type="number" id="bt-body-ratio" class="bt-param-input" value="0.5" min="0.1" max="1" step="0.1">
+        </div>
+        <!-- candle_accel 参数 -->
+        <div class="bt-param-group" data-factor="candle_accel">
+          <label>连续根数</label>
+          <input type="number" id="bt-accel-count" class="bt-param-input" value="3" min="2" max="10" step="1">
         </div>
       </div>
 
@@ -154,6 +171,14 @@
           <div class="bt-param-cell">
             <label>利润回撤%</label>
             <input type="number" id="bt-profit-dd" class="bt-param-input" value="0" min="0" max="30" step="1">
+          </div>
+          <div class="bt-param-cell">
+            <label>ATR追踪周期</label>
+            <input type="number" id="bt-atr-period" class="bt-param-input" value="0" min="0" max="60" step="1">
+          </div>
+          <div class="bt-param-cell">
+            <label>ATR倍数</label>
+            <input type="number" id="bt-atr-mult" class="bt-param-input" value="2.0" min="0.5" max="5" step="0.5">
           </div>
         </div>
         <!-- Row 3: 分批出场 -->
@@ -242,6 +267,7 @@
         <button class="bt-tab-btn" data-tab="trades">📝 交易明细</button>
         <button class="bt-tab-btn" data-tab="signals">🔍 信号详情</button>
         <button class="bt-tab-btn" data-tab="scan">🔎 参数扫描</button>
+        <button class="bt-tab-btn" data-tab="batch" style="display:none;">📋 批量对比</button>
       </div>
 
       <!-- Tab 1: 绩效总览（双栏：信号质量 + 交易模拟） -->
@@ -288,14 +314,20 @@
         <div id="bt-scan-heatmap" class="bt-heatmap"></div>
         <div id="bt-scan-table" class="bt-signal-list-wrapper"></div>
       </div>
+
+      <!-- Tab 6: 批量对比 -->
+      <div class="bt-tab-panel" data-tab="batch">
+        <div id="bt-batch-summary" class="bt-kpis"></div>
+        <div id="bt-batch-table" class="bt-signal-list-wrapper"></div>
+      </div>
     </div>
   </div>
 
   <!-- ── Toast ──────────────────────────────────────── -->
   <div id="toast" class="toast"></div>
 
-  <script src="/static/js/app.js?v=7"></script>
-  <script src="/static/js/cluster.js?v=7"></script>
-  <script src="/static/js/backtest.js?v=6"></script>
+  <script src="/static/js/app.js?v=8"></script>
+  <script src="/static/js/cluster.js?v=8"></script>
+  <script src="/static/js/backtest.js?v=8"></script>
 </body>
 </html>

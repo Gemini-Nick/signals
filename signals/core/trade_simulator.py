@@ -39,6 +39,9 @@ class SimConfig:
     batch_exit_enabled: bool = False  # 分批出场
     batch_exit_ratios: list = field(default_factory=lambda: [0.5, 0.5])
     batch_exit_targets: list = field(default_factory=lambda: [5.0, 10.0])
+    # ATR 追踪止损
+    atr_exit_period: int = 0          # ATR 周期 (0=禁用)
+    atr_exit_mult: float = 2.0        # ATR 倍数
 
 
 @dataclass
@@ -189,7 +192,26 @@ def check_exit(
                 exit_price = day_close * (1.0 - config.slippage)
                 return exit_price, "profit_drawdown"
 
-    # 4. 均线离场 (Phase 3)
+    # 4. ATR 追踪止损
+    if config.atr_exit_period > 0 and holding_days >= 2:
+        atr_start = max(0, current_idx - config.atr_exit_period)
+        atr_slice = df.iloc[atr_start:current_idx + 1]
+        if len(atr_slice) >= 2:
+            tr_vals = []
+            for k in range(1, len(atr_slice)):
+                h = float(atr_slice.iloc[k]["high"])
+                l = float(atr_slice.iloc[k]["low"])
+                prev_c = float(atr_slice.iloc[k - 1]["close"])
+                tr_vals.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
+            if tr_vals:
+                atr = sum(tr_vals) / len(tr_vals)
+                atr_stop = max_high - atr * config.atr_exit_mult
+                if atr_stop > entry_price and day_low <= atr_stop:
+                    actual_exit = max(atr_stop, float(bar["open"]))
+                    actual_exit *= (1.0 - config.slippage)
+                    return actual_exit, "atr_trail"
+
+    # 5. 均线离场 (Phase 3)
     if config.ma_exit_period > 0 and holding_days >= 3:
         ma_start = max(0, current_idx - config.ma_exit_period + 1)
         ma_slice = df.iloc[ma_start:current_idx + 1]["close"]
@@ -199,7 +221,7 @@ def check_exit(
                 exit_price = day_close * (1.0 - config.slippage)
                 return exit_price, "ma_exit"
 
-    # 5. 移动止盈 (最高浮盈回撤 N%)
+    # 6. 移动止盈 (最高浮盈回撤 N%)
     if max_high > entry_price:
         max_profit = (max_high - entry_price) / entry_price * 100.0
         current_profit = (day_close - entry_price) / entry_price * 100.0
@@ -209,7 +231,7 @@ def check_exit(
                 exit_price = day_close * (1.0 - config.slippage)
                 return exit_price, "trail_stop"
 
-    # 6. 时间止损
+    # 7. 时间止损
     if holding_days >= config.max_hold_days:
         exit_price = day_close * (1.0 - config.slippage)
         return exit_price, "time_exit"

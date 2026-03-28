@@ -55,7 +55,7 @@ weclaw 支持三种 Agent 接入模式，推荐使用 ACP：
 |----------------|----------|
 | 行业/板块/行业分析/跑一下 | `python run.py --mode intraday` |
 | 指数/大盘/市场 | `python run.py --mode index` |
-| 回测+具体标的（如"回测天际股份"） | 先回复"🔄 正在回测 XXX... 预计30-60秒"，再 `python -m signals.notify.backtest_notify <代码> --dry-run`，读取输出后回复报告+解读 |
+| 回测+具体标的（如"回测天际股份"） | **先询问回测周期**（展示选项：默认2年/924新政/DeepSeek行情/关税暴跌/17连阳/近3月/近1月），用户选择后回复进度消息，再 `python -m signals.notify.backtest_notify <代码或名称> --dry-run`（支持名称/前缀/纯数字自动转换），读取输出后回复报告+解读。用户已指定周期时跳过询问 |
 | 回测（无标的） | `python run.py --mode backtest` |
 | 复盘 | `python run.py --mode review` |
 | 重启/restart | 先回复"🔄 正在重启，10秒后恢复"，然后 `nohup sh -c 'sleep 2 && weclaw restart' >/dev/null 2>&1 &` |

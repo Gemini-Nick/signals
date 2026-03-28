@@ -1009,3 +1009,50 @@ body {
   background: rgba(38, 166, 154, 0.15);
   color: #26a69a;
 }
+
+/* ── 批量模式 ────────────────────────────────────── */
+.bt-batch-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.bt-batch-toggle input[type="checkbox"] { margin: 0; }
+
+.bt-batch-row { cursor: pointer; transition: background 0.15s; }
+.bt-batch-row:hover { background: var(--bg-hover, rgba(255,255,255,0.05)); }
+.bt-batch-error { opacity: 0.6; }
+
+/* ── 新因子 badge ────────────────────────────────── */
+.bt-pattern-badge.candle-run { background: rgba(255,87,34,0.2); color: #ff5722; }
+.bt-pattern-badge.candle-accel { background: rgba(255,152,0,0.2); color: #ff9800; }
+
+/* ── exit reason badge ───────────────────────────── */
+.bt-exit-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 500;
+}
+.bt-exit-badge.stop-loss { background: rgba(242,54,69,0.2); color: #f23645; }
+.bt-exit-badge.take-profit { background: rgba(38,166,154,0.2); color: #26a69a; }
+.bt-exit-badge.trail-stop { background: rgba(255,152,0,0.2); color: #ff9800; }
+.bt-exit-badge.atr-trail { background: rgba(156,39,176,0.2); color: #9c27b0; }
+.bt-exit-badge.time-exit { background: rgba(120,139,148,0.2); color: #78909c; }
+.bt-exit-badge.ma-exit { background: rgba(41,98,255,0.2); color: #2962ff; }
+.bt-exit-badge.profit-drawdown { background: rgba(255,87,34,0.2); color: #ff5722; }
+.bt-exit-badge.data-end { background: rgba(120,139,148,0.15); color: #78909c; }
+
+.bt-fill-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.bt-fill-badge.open-fill { background: rgba(38,166,154,0.15); color: #26a69a; }
+.bt-fill-badge.trigger-fill { background: rgba(41,98,255,0.15); color: #2962ff; }
+.bt-fill-badge.unfilled { background: rgba(242,54,69,0.15); color: #f23645; }

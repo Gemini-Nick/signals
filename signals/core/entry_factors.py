@@ -182,3 +182,136 @@ def detect_volatility_contraction_entries(
             in_squeeze = False
 
     return signals
+
+
+def detect_candle_run_entries(
+    df: pd.DataFrame,
+    run_count: int = 3,
+    min_body_ratio: float = 0.5,
+    lookback: int = 999,
+) -> list[dict]:
+    """
+    连续K线入场因子 (参考 trend-backtest candle_run):
+    - N 根连续同向阳线（close > open）
+    - 每根K线实体占比 ≥ min_body_ratio（实体 / 振幅）
+    """
+    if len(df) < run_count + 5:
+        return []
+
+    signals = []
+    closes = df["close"].values
+    opens = df["open"].values
+    highs = df["high"].values
+    lows = df["low"].values
+
+    start = max(run_count, len(df) - lookback)
+    for i in range(start, len(df)):
+        # 检查连续 run_count 根阳线
+        valid = True
+        for j in range(run_count):
+            idx = i - run_count + 1 + j
+            if idx < 0:
+                valid = False
+                break
+            c, o, h, l = closes[idx], opens[idx], highs[idx], lows[idx]
+            # 必须是阳线
+            if c <= o:
+                valid = False
+                break
+            # 实体占比检查
+            amplitude = h - l
+            if amplitude <= 0:
+                valid = False
+                break
+            body = c - o
+            if body / amplitude < min_body_ratio:
+                valid = False
+                break
+
+        if not valid:
+            continue
+
+        # 确保前一根不是阳线（避免连续触发）
+        prev_idx = i - run_count
+        if prev_idx >= 0 and closes[prev_idx] > opens[prev_idx]:
+            continue
+
+        dt_idx = df.index[i]
+        total_gain = (closes[i] - opens[i - run_count + 1]) / opens[i - run_count + 1] * 100
+        confidence = min(total_gain / 8.0, 1.0)
+
+        signals.append({
+            "dt": int(pd.Timestamp(dt_idx).timestamp()),
+            "date_str": dt_idx.strftime("%Y-%m-%d") if hasattr(dt_idx, "strftime") else str(dt_idx)[:10],
+            "type": f"CandleRun_{run_count}",
+            "group": "candle_run",
+            "price": round(float(closes[i]), 4),
+            "confidence": round(max(confidence, 0.1), 2),
+            "details": f"{run_count}根连续阳线, 涨幅{total_gain:.1f}%, 实体比≥{min_body_ratio}",
+        })
+
+    return signals
+
+
+def detect_candle_accel_entries(
+    df: pd.DataFrame,
+    run_count: int = 3,
+    lookback: int = 999,
+) -> list[dict]:
+    """
+    加速K线入场因子 (参考 trend-backtest candle_accel):
+    - N 根连续同向阳线
+    - 实体不递减（后一根实体 ≥ 前一根实体）
+    """
+    if len(df) < run_count + 5:
+        return []
+
+    signals = []
+    closes = df["close"].values
+    opens = df["open"].values
+
+    start = max(run_count, len(df) - lookback)
+    for i in range(start, len(df)):
+        valid = True
+        prev_body = 0.0
+        for j in range(run_count):
+            idx = i - run_count + 1 + j
+            if idx < 0:
+                valid = False
+                break
+            c, o = closes[idx], opens[idx]
+            if c <= o:
+                valid = False
+                break
+            body = c - o
+            if j > 0 and body < prev_body:
+                valid = False
+                break
+            prev_body = body
+
+        if not valid:
+            continue
+
+        # 避免连续触发
+        prev_idx = i - run_count
+        if prev_idx >= 0 and closes[prev_idx] > opens[prev_idx]:
+            continue
+
+        dt_idx = df.index[i]
+        total_gain = (closes[i] - opens[i - run_count + 1]) / opens[i - run_count + 1] * 100
+        last_body = closes[i] - opens[i]
+        first_body = closes[i - run_count + 1] - opens[i - run_count + 1]
+        accel_ratio = last_body / first_body if first_body > 0 else 1.0
+        confidence = min(accel_ratio / 3.0, 1.0)
+
+        signals.append({
+            "dt": int(pd.Timestamp(dt_idx).timestamp()),
+            "date_str": dt_idx.strftime("%Y-%m-%d") if hasattr(dt_idx, "strftime") else str(dt_idx)[:10],
+            "type": f"CandleAccel_{run_count}",
+            "group": "candle_accel",
+            "price": round(float(closes[i]), 4),
+            "confidence": round(max(confidence, 0.1), 2),
+            "details": f"{run_count}根加速阳线, 涨幅{total_gain:.1f}%, 加速比{accel_ratio:.1f}x",
+        })
+
+    return signals
