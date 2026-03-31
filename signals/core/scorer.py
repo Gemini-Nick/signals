@@ -146,7 +146,8 @@ def score_signals(symbol: str, signals: List[SignalEvent],
                   ma_context=None,
                   sentiment_phase: str = "未知",
                   volume_ratio: float = 0.0,
-                  social_score=None) -> ScoredSymbol:
+                  social_score=None,
+                  consensus_risk_level: str = "低") -> ScoredSymbol:
     """
     对单个标的的所有信号计算综合评分。
     enable_decay=True 时启用时间衰减（默认开启，按级别差异化半衰期）。
@@ -300,6 +301,19 @@ def score_signals(symbol: str, signals: List[SignalEvent],
         elif sell_total > buy_total:
             if heat >= 75:  # 爆热+卖出 → FOMO警告
                 details_lines.append(f"  [舆情⚠] 卖出信号+社交爆热({heat:.0f})，散户FOMO风险")
+
+    # ── 共识风险惩罚（流动性=分歧理论）──
+    # 当市场策略高度趋同时，追涨信号打折，逆向信号加分
+    _CONSENSUS_MULT = {"高": 0.75, "中": 0.90, "低": 1.00}
+    consensus_mult = _CONSENSUS_MULT.get(consensus_risk_level, 1.00)
+    if consensus_mult < 1.0 and total != 0:
+        # 顺势信号打折（共识方向的信号不可靠，对手盘不足）
+        old_total = total
+        total = total * consensus_mult
+        details_lines.append(
+            f"  [共识风险×{consensus_mult:.2f}] 市场策略趋同({consensus_risk_level})，"
+            f"信号打折 {old_total:.1f}→{total:.1f}"
+        )
 
     return ScoredSymbol(
         symbol=symbol,

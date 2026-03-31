@@ -59,6 +59,15 @@ async function loadCluster() {
       if (conceptSrc) conceptSrc.textContent = '';
     }
 
+    // 数据过期提示
+    if (data.data_warning) {
+      const warnEl = document.createElement('div');
+      warnEl.className = 'cl-warning';
+      warnEl.style.cssText = 'color:#f59e0b;background:#292524;padding:8px 12px;border-radius:6px;margin-bottom:10px;font-size:13px;';
+      warnEl.textContent = '⚠ ' + data.data_warning;
+      industryGrid.parentElement?.insertBefore(warnEl, industryGrid);
+    }
+
     loadWeekHistory().then(() => _addPersistenceLabels());
   } catch (e) {
     industryGrid.innerHTML = `<div class="cl-empty">加载失败: ${e.message}</div>`;

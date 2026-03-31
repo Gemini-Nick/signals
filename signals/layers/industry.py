@@ -1666,6 +1666,31 @@ def _save_concept_cache(results: List[ConceptRanking], source: str = "em"):
         pass
 
 
+def _save_concept_to_mongo(results: List[ConceptRanking], source: str = "sina"):
+    """实时拉取的概念数据写入 MongoDB，下次非交易日可直接用。"""
+    try:
+        from signals.data.mongo_fallback import save_snapshot, get_last_trading_day
+        trading_day = get_last_trading_day()
+        col_name = f"concept_{source}"
+        docs = []
+        for c in results:
+            docs.append({
+                "board_name": c.name,
+                "change_pct": c.gain_pct,
+                "leader_name": c.leading_stock,
+                "leader_change_pct": c.leading_gain,
+                "up_count": c.up_count,
+                "down_count": c.down_count,
+                "turnover_pct": c.turnover_rate,
+                "dt": trading_day,
+            })
+        if docs:
+            save_snapshot(col_name, docs, dedup={"dt": trading_day})
+            _detail(f"  [MongoDB] 概念数据已存入 {col_name} ({len(docs)} 条, dt={trading_day})")
+    except Exception as e:
+        _detail(f"  [MongoDB] 概念数据存储失败: {e}")
+
+
 def _load_concept_cache(max_age: float = 86400) -> List[ConceptRanking]:
     """从磁盘缓存加载概念排行（默认24h过期）。校验数据有效性。"""
     import json, time
@@ -1897,9 +1922,10 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
     if top_n is None:
         top_n = getattr(_cfg, "CONCEPT_TOP_N", 15)
 
-    # ── 非交易日/盘后：MongoDB 多源优先 ──
+    # ── 非交易日/盘后：MongoDB 多源优先（数据必须是最近交易日） ──
     if not is_any_market_live():
-        from signals.data.mongo_fallback import get_latest_docs
+        from signals.data.mongo_fallback import get_latest_docs, get_last_trading_day
+        trading_day = get_last_trading_day()
         # 优先读新集合 (concept_sina > concept_ths > concept_em)，兜底 concept_ranking
         for col_name, src_tag in [
             ("concept_sina", "sina"), ("concept_ths", "ths"),
@@ -1907,6 +1933,11 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
         ]:
             mongo_docs = get_latest_docs(col_name)
             if not mongo_docs:
+                continue
+            # 检查数据日期，落后于最近交易日则跳过，走实时源
+            doc_dt = str(mongo_docs[0].get("dt", ""))
+            if doc_dt < trading_day:
+                _detail(f"  [非交易日] {col_name} 数据({doc_dt})落后于最近交易日({trading_day})，跳过")
                 continue
             results = []
             for item in mongo_docs:
@@ -1944,6 +1975,7 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
     sina_results = _get_concepts_sina(top_n)
     if sina_results:
         _save_concept_cache(sina_results, source="sina")
+        _save_concept_to_mongo(sina_results, source="sina")
         return sina_results
 
     # ── 1. 东财备选（468概念, 上涨/下跌/换手率等丰富字段）──
@@ -2004,6 +2036,7 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
         results = results[:top_n]
         _detail(f"  [✓] 概念板块 top {len(results)} 条（已过滤噪音+综合评分排序）")
         _save_concept_cache(results, source="em")
+        _save_concept_to_mongo(results, source="em")
         return results
 
     # ── 2. 同花顺降级（全局超时 25s，防止 THS K线拉取太慢）──
@@ -2016,6 +2049,7 @@ def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
             _ths_pool.shutdown(wait=False, cancel_futures=True)
         if ths_results:
             _save_concept_cache(ths_results, source="ths")
+            _save_concept_to_mongo(ths_results, source="ths")
             return ths_results
     except (FutureTimeout, TimeoutError):
         _detail("  [!] THS 概念板块超时（>25s），跳过")

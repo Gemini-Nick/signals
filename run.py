@@ -480,6 +480,8 @@ def run_intraday(args):
             l3_results = screener_l3.scan_once(
                 l3_pool,
                 sentiment_phase=ctx.sentiment_phase,
+                consensus_risk_level=(ctx.consensus_risk.level
+                                      if ctx.consensus_risk else "低"),
             )
 
             above_cnt = sum(1 for r in l3_results

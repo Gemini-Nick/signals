@@ -213,8 +213,27 @@ def _load_industry_df() -> tuple:
     trading_day = get_last_trading_day()
     update_time = _dt.now().strftime("%m-%d %H:%M")
 
-    # 盘中：先尝试实时源，成功的 normalize 后存入对应集合
-    if live:
+    # 检查 MongoDB 数据是否已是最新交易日
+    need_fetch = live  # 盘中始终拉取
+    if not need_fetch:
+        # 盘后/周末：只要有一个源已是最新交易日就不拉取
+        from signals.data.mongo_fallback import get_db
+        db = get_db()
+        has_current = False
+        if db is not None:
+            for col_name in ["board_ths", "board_sina", "board_em"]:
+                try:
+                    latest = db[col_name].find_one({}, sort=[("dt", -1)])
+                    if latest and str(latest.get("dt", "")) >= trading_day:
+                        has_current = True
+                        break
+                except Exception:
+                    continue
+        if not has_current:
+            need_fetch = True
+            logger.info("聚类：所有行业数据源均落后于最近交易日(%s)，触发实时拉取", trading_day)
+
+    if need_fetch:
         _try_realtime_fetch("board_em", _fetch_em_for_cluster, normalize_em_industry)
         _try_realtime_fetch("board_ths", _fetch_ths_for_cluster, normalize_ths_industry)
         _try_realtime_fetch("board_sina", _fetch_sina_industry, normalize_sina_industry)
@@ -222,23 +241,26 @@ def _load_industry_df() -> tuple:
     # 从 MongoDB 读各源最新数据
     dfs = {}
     sources_used = []
-    source_details = []  # 记录具体来源：api/mongodb
+    source_details = []
+    actual_dates = []
 
     for src, col in [("em", "board_em"), ("ths", "board_ths"), ("sina", "board_sina")]:
         df = get_latest_df(col)
         if df is not None and not df.empty:
             dfs[src] = df
-            # 判断是实时还是历史
+            if "dt" in df.columns:
+                actual_dates.append(str(df["dt"].iloc[0]))
             src_label = {"em": "东财", "ths": "THS", "sina": "新浪"}[src]
-            if live:
+            if need_fetch:
                 source_details.append(f"{src_label}(实时API)")
             else:
                 source_details.append(f"{src_label}(MongoDB历史)")
             sources_used.append(src)
 
+    actual_date = max(actual_dates) if actual_dates else trading_day
     meta = {
         "source": " + ".join(source_details) if source_details else "无数据",
-        "data_date": trading_day,
+        "data_date": actual_date,
         "update_time": update_time,
     }
 
@@ -660,14 +682,27 @@ def cluster_concepts(top_n: int = 3, **_kw) -> dict:
     ranked = _rank_clusters(cluster_stats)
     now = datetime.now()
 
-    from signals.data.mongo_fallback import get_last_trading_day
+    from signals.data.mongo_fallback import get_last_trading_day, get_db
     trading_day = get_last_trading_day()
+
+    # 从 MongoDB 取概念数据的实际日期
+    actual_concept_date = trading_day
+    db = get_db()
+    if db is not None:
+        for col_name in ["concept_sina", "concept_ths", "concept_em"]:
+            try:
+                latest = db[col_name].find_one({}, sort=[("dt", -1)])
+                if latest and "dt" in latest:
+                    actual_concept_date = str(latest["dt"])
+                    break
+            except Exception:
+                continue
 
     return {
         "top": ranked[:top_n],
         "all_clusters": ranked,
         "meta": {
-            "date": trading_day,
+            "date": actual_concept_date,
             "timestamp": now.isoformat(),
             "update_time": now.strftime("%m-%d %H:%M"),
             "total_concepts": len(df),

@@ -135,6 +135,141 @@ def get_position_suggestion(direction: str, phase: SentimentPhase) -> str:
 
 
 # ─────────────────────────────────────────────────────────
+# 共识风险检测（流动性=分歧理论）
+# ─────────────────────────────────────────────────────────
+# 核心理念：流动性的本质不是成交量，是分歧。
+# 对手盘的多寡由市场策略的丰富性和生态的复杂性决定。
+# 当策略高度趋同时，表象上的"流动性好"都是假的——
+# 想进的时候进不去，想出去的时候根本出不去。
+# 共识越强，踩踏越近；分歧越健康，趋势越可持续。
+# ─────────────────────────────────────────────────────────
+
+@dataclass
+class ConsensusRisk:
+    """共识风险评估结果"""
+    level: str = "低"              # "高" / "中" / "低"
+    score: float = 0.0             # 0-100，越高越危险
+    direction: str = ""            # 共识方向："偏多共识" / "偏空共识" / ""
+    detail: str = ""               # 人类可读描述
+    warning: str = ""              # 操作建议
+    trend_uniformity: float = 0.0  # 趋势一致性 0-1
+    signal_uniformity: float = 0.0 # 信号一致性 0-1
+
+
+def detect_consensus_risk(
+    reports: List["IndexReport"],
+    sentiment_phase: str = "未知",
+    direction_strength: float = 0.0,
+) -> ConsensusRisk:
+    """
+    共识风险检测：衡量市场观点趋同程度。
+
+    原理：当全市场指数趋势、信号、情绪高度一致时，
+    意味着所有参与者站在同一侧，对手盘稀缺，
+    真实流动性枯竭，反转概率急剧上升。
+
+    三个维度：
+    1. 趋势一致性：多少指数趋势方向相同
+    2. 信号一致性：买/卖信号是否集中在同一侧
+    3. 情绪极端度：情绪是否处于极端状态（亢奋/恐慌）
+    """
+    available = [r for r in reports if r.data_available]
+    n = len(available)
+    if n < 3:
+        return ConsensusRisk()
+
+    # ── 维度1：趋势一致性 ──
+    bullish_count = sum(1 for r in available if r.daily_trend == "上涨趋势")
+    bearish_count = sum(1 for r in available if r.daily_trend == "下跌趋势")
+    dominant_trend_count = max(bullish_count, bearish_count)
+    trend_uniformity = dominant_trend_count / n
+    trend_direction = "多" if bullish_count > bearish_count else "空"
+
+    # ── 维度2：信号一致性 ──
+    buy_count = sum(1 for r in available if r.has_buy_signal)
+    sell_count = sum(1 for r in available if r.has_sell_signal)
+    signal_total = buy_count + sell_count
+    if signal_total > 0:
+        signal_uniformity = max(buy_count, sell_count) / signal_total
+        signal_direction = "买" if buy_count > sell_count else "卖"
+    else:
+        signal_uniformity = 0.0
+        signal_direction = ""
+
+    # ── 维度3：情绪极端度 ──
+    sentiment_extreme = 1.0 if sentiment_phase in ("亢奋", "恐慌") else 0.0
+    sentiment_moderate = 0.5 if sentiment_phase in ("修复", "回落") else 0.0
+    sentiment_factor = sentiment_extreme or sentiment_moderate
+
+    # ── 综合评分 ──
+    # 趋势一致性权重最高（40%），信号一致性次之（30%），情绪极端度（30%）
+    raw_score = (
+        trend_uniformity * 40
+        + signal_uniformity * 30
+        + sentiment_factor * 30
+    )
+
+    # 方向强度放大：当方向强度本身极端时，加重共识风险
+    abs_strength = abs(direction_strength)
+    if abs_strength > 0.6:
+        raw_score *= 1.2
+    elif abs_strength > 0.4:
+        raw_score *= 1.1
+
+    score = min(100.0, raw_score)
+
+    # ── 判定等级 ──
+    if score >= 70:
+        level = "高"
+    elif score >= 45:
+        level = "中"
+    else:
+        level = "低"
+
+    # ── 共识方向 ──
+    if trend_direction == "多" and (not signal_direction or signal_direction == "买"):
+        consensus_dir = "偏多共识"
+    elif trend_direction == "空" and (not signal_direction or signal_direction == "卖"):
+        consensus_dir = "偏空共识"
+    else:
+        consensus_dir = ""
+
+    # ── 生成描述 ──
+    detail_parts = []
+    if trend_uniformity >= 0.7:
+        pct = int(trend_uniformity * 100)
+        detail_parts.append(f"{pct}%指数趋势{trend_direction}头一致")
+    if signal_uniformity >= 0.8 and signal_total >= 3:
+        detail_parts.append(f"信号集中在{signal_direction}侧")
+    if sentiment_extreme:
+        detail_parts.append(f"情绪{sentiment_phase}")
+    detail = "，".join(detail_parts) if detail_parts else ""
+
+    # ── 操作建议 ──
+    if level == "高":
+        if consensus_dir == "偏多共识":
+            warning = "⚠️ 多头拥挤，对手盘稀缺，谨防获利盘踩踏→控制仓位，勿追高"
+        elif consensus_dir == "偏空共识":
+            warning = "⚠️ 空头拥挤，恐慌充分释放后反弹猛烈→准备抄底清单，分批埋伏"
+        else:
+            warning = "⚠️ 市场策略趋同，流动性虚假→降低仓位，等待分歧重现"
+    elif level == "中":
+        warning = "观点偏集中，留意流动性变化"
+    else:
+        warning = ""
+
+    return ConsensusRisk(
+        level=level,
+        score=round(score, 1),
+        direction=consensus_dir,
+        detail=detail,
+        warning=warning,
+        trend_uniformity=round(trend_uniformity, 2),
+        signal_uniformity=round(signal_uniformity, 2),
+    )
+
+
+# ─────────────────────────────────────────────────────────
 # P3-5: 高低风格切换检测
 # ─────────────────────────────────────────────────────────
 
@@ -268,6 +403,8 @@ class MarketContext:
     rotation_velocity: str = ""
     rotation_peak_warning: bool = False
     rotation_peak_detail: str = ""
+    # 共识风险（流动性=分歧理论）
+    consensus_risk: Optional[ConsensusRisk] = None
 
     # ─────────────────────────────────────────────────────
     # 情绪周期更新（L2 数据可用后调用）
@@ -366,6 +503,17 @@ class MarketContext:
             analog_ref=analog_ref,
         )
 
+        # 共识风险
+        consensus_data = None
+        if self.consensus_risk and self.consensus_risk.level != "低":
+            consensus_data = {
+                "level": self.consensus_risk.level,
+                "score": self.consensus_risk.score,
+                "direction": self.consensus_risk.direction,
+                "detail": self.consensus_risk.detail,
+                "warning": self.consensus_risk.warning,
+            }
+
         return {
             "date": datetime.now().strftime("%Y-%m-%d"),
             "direction": self.overall_direction,
@@ -378,6 +526,7 @@ class MarketContext:
             "rhythm_alerts": rhythm_alerts or [],
             "analog_ref": analog_ref,
             "action_items": action_items,
+            "consensus_risk": consensus_data,
         }
 
     def _generate_action_items(
@@ -411,7 +560,11 @@ class MarketContext:
             candidates = "、".join(self.bottom_candidates[:3])
             items.append(f"超跌关注: {candidates} (恐慌释放后分批)")
 
-        # 5. 历史匹配参考
+        # 5. 共识风险预警
+        if self.consensus_risk and self.consensus_risk.level == "高":
+            items.append(self.consensus_risk.warning or "共识风险高，控制仓位")
+
+        # 6. 历史匹配参考
         if analog_ref and isinstance(analog_ref, dict):
             results = analog_ref.get("results", {})
             for idx_name, analogs in results.items():
@@ -626,6 +779,16 @@ class MarketContext:
         if self.theme_summary:
             lines.append(f"  🏷 {self.theme_summary}")
 
+        # 共识风险（流动性=分歧）
+        if self.consensus_risk and self.consensus_risk.level != "低":
+            cr = self.consensus_risk
+            risk_emoji = {"高": "🚨", "中": "⚡"}.get(cr.level, "")
+            lines.append(f"  {risk_emoji} 共识风险: {cr.level}({cr.score:.0f}/100) {cr.direction}")
+            if cr.detail:
+                lines.append(f"     {cr.detail}")
+            if cr.warning:
+                lines.append(f"     {cr.warning}")
+
         # 三级共振（最强信号）
         aligned = [r.name for r in self.reports
                    if r.data_available and r.three_level_aligned]
@@ -720,6 +883,15 @@ class MarketContext:
                 lines.append(f"抄底候选: {'、'.join(self.bottom_candidates[:5])}")
         if self.theme_summary:
             lines.append(f"主题: {self.theme_summary}")
+
+        # 共识风险
+        if self.consensus_risk and self.consensus_risk.level != "低":
+            cr = self.consensus_risk
+            lines.append(f"共识风险: {cr.level}({cr.score:.0f}/100) {cr.direction}")
+            if cr.detail:
+                lines.append(f"  {cr.detail}")
+            if cr.warning:
+                lines.append(cr.warning)
 
         # 三级共振
         aligned = [r.name for r in self.reports
@@ -830,6 +1002,14 @@ class MarketContext:
             if self.sword_sectors:
                 parts.append(f"⚔进攻: {', '.join(self.sword_sectors[:3])}")
             l1_lines.append(" | ".join(parts))
+
+        # 共识风险
+        if self.consensus_risk and self.consensus_risk.level != "低":
+            cr = self.consensus_risk
+            risk_emoji = {"高": "🚨", "中": "⚡"}.get(cr.level, "")
+            l1_lines.append(f"{risk_emoji} **共识风险: {cr.level}**({cr.score:.0f}/100) {cr.direction}")
+            if cr.warning:
+                l1_lines.append(f"  {cr.warning}")
 
         aligned = [r.name for r in self.reports
                    if r.data_available and r.three_level_aligned]
@@ -1143,6 +1323,13 @@ def build_market_context(
     except Exception:
         pass
 
+    # 共识风险检测（流动性=分歧理论）
+    consensus = detect_consensus_risk(
+        reports=reports,
+        sentiment_phase=phase.value,
+        direction_strength=direction_strength,
+    )
+
     return MarketContext(
         reports=reports,
         overall_direction=overall_direction,
@@ -1163,4 +1350,5 @@ def build_market_context(
         shield_sectors=shield,
         sword_sectors=sword,
         style_switch=style_sw,
+        consensus_risk=consensus,
     )

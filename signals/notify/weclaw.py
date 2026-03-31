@@ -3,6 +3,10 @@
 
 weclaw 运行在 127.0.0.1:18011，提供 /api/send 端点。
 未运行时静默跳过，不影响主流程。
+
+新版特性（weclaw ≥ main 2026-03-28）：
+- /api/send 自动提取 text 中的 ![](url) 并作为图片消息发送
+- 语音消息自动转文字（agent 端收到纯文本）
 """
 import json
 import logging

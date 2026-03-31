@@ -106,11 +106,6 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
     from signals.data.fetcher import _no_proxy
     from signals.data.mongo_fallback import get_kline_docs, save_kline
 
-    days = 730 if freq == "daily" else 1460
-    sdt = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-    edt = datetime.now().strftime("%Y%m%d")
-    period = "daily" if freq == "daily" else "weekly"
-
     _NETWORK_ERRORS = (
         "RemoteDisconnected", "ConnectionReset", "Connection aborted",
         "ConnectionError", "timeout", "Max retries exceeded",
@@ -118,6 +113,42 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
     )
 
     df = None
+
+    # ── 30 分钟 K 线（东财分钟接口）────────────────────
+    if freq == "30m":
+        days = 60
+        sdt = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d 09:30:00")
+        edt = datetime.now().strftime("%Y%m%d 15:00:00")
+        try:
+            with _no_proxy():
+                if market == "A":
+                    df = ak.stock_zh_a_hist_min_em(
+                        symbol=code, period="30",
+                        start_date=sdt, end_date=edt, adjust="qfq")
+                else:
+                    logger.warning("30分钟K线暂不支持港股: %s", code)
+                    return pd.DataFrame()
+            if df is not None and not df.empty:
+                df = df.rename(columns={
+                    "时间": "dt", "开盘": "open", "最高": "high",
+                    "最低": "low", "收盘": "close", "成交量": "vol",
+                })
+                df["dt"] = pd.to_datetime(df["dt"])
+                df = df.set_index("dt")
+                return df
+        except Exception as e:
+            err_msg = str(e)
+            is_network = any(k in err_msg for k in _NETWORK_ERRORS)
+            logger.warning("30分钟K线失败: %s — %s", code, err_msg[:80])
+            if not is_network:
+                return pd.DataFrame()
+        return pd.DataFrame()
+
+    # ── 日线 / 周线 ──────────────────────────────────
+    days = 730 if freq == "daily" else 1460
+    sdt = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    edt = datetime.now().strftime("%Y%m%d")
+    period = "daily" if freq == "daily" else "weekly"
 
     # ── 源 1: 东财 ──────────────────────────────────
     try:

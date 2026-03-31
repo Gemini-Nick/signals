@@ -195,8 +195,13 @@ def format_backtest_report(data: dict) -> str:
             parts.append(d)
         parts.append("")
 
-    # ═══ 周期提示 ═══
-    parts.append("📅 可选周期：924新政 | DeepSeek行情 | 关税暴跌 | 17连阳 | 近3月 | 近1月")
+    # ═══ 周期提示（从 DATE_PRESETS 动态生成）═══
+    try:
+        from config import DATE_PRESETS
+        preset_labels = [v["label"].split(" — ")[0] for v in DATE_PRESETS.values()]
+        parts.append(f"📅 可选周期：{'｜'.join(preset_labels)}")
+    except Exception:
+        parts.append("📅 可选周期：见 config.py DATE_PRESETS")
     parts.append("回复「回测 XXX 924」可指定起始周期")
     parts.append("")
 
@@ -343,8 +348,10 @@ def push_backtest_report(data: dict) -> bool:
         return False
 
 
-def run_and_push(code: str, freq: str = "daily", dry_run: bool = False, **kwargs) -> bool:
-    """独立运行回测并推送 — 不依赖 web2 服务。dry_run=True 时仅打印不推送。"""
+def run_and_push(code: str, freq: str = "daily", dry_run: bool = False, start_date: str | None = None, **kwargs) -> bool:
+    """独立运行回测并推送 — 不依赖 web2 服务。dry_run=True 时仅打印不推送。
+    start_date: 可选，DATE_PRESETS 别名或 YYYY-MM-DD 格式日期，过滤 K 线起始日期。
+    """
     import dataclasses
 
     from signals.web2.api.backtest import (
@@ -356,7 +363,8 @@ def run_and_push(code: str, freq: str = "daily", dry_run: bool = False, **kwargs
     code = code.strip()
     market = _detect_market(code)
     symbol = _build_symbol(code, market)
-    freq_label = "日线" if freq == "daily" else "周线"
+    _FREQ_LABELS = {"daily": "日线", "weekly": "周线", "30m": "30分钟"}
+    freq_label = _FREQ_LABELS.get(freq, "日线")
 
     # 查询股票名称（get_name 需要 futu_code 如 SH.002466）
     stock_name = ""
@@ -374,6 +382,29 @@ def run_and_push(code: str, freq: str = "daily", dry_run: bool = False, **kwargs
     if df.empty:
         print(f"  无法获取 {code} 的{freq_label}数据")
         return False
+
+    # 按 --start 过滤起始日期
+    if start_date:
+        from datetime import datetime, timedelta
+        import config as _cfg
+        preset = _cfg.DATE_PRESETS.get(start_date.lower())
+        if preset:
+            if "date" in preset:
+                resolved = preset["date"]
+            elif preset["offset"] == "ytd":
+                resolved = f"{datetime.now().year}-01-01"
+            else:
+                resolved = (datetime.now() - timedelta(days=preset["offset"])).strftime("%Y-%m-%d")
+            print(f"  过滤起始日期：{resolved}（{preset['label']}）")
+        else:
+            resolved = start_date
+            print(f"  过滤起始日期：{resolved}")
+        dt_col = df.index if df.index.name == "dt" or hasattr(df.index[0], 'strftime') else df.get("dt")
+        if dt_col is not None:
+            df = df[dt_col >= resolved]
+            if df.empty:
+                print(f"  过滤后无数据（起始日期 {resolved} 超出范围）")
+                return False
 
     # 计算回测区间
     date_range = ""
@@ -486,14 +517,25 @@ if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
 
+    # 解析 --start 参数
+    start_date = None
+    for f in flags:
+        if f.startswith("--start="):
+            start_date = f.split("=", 1)[1]
+        elif f == "--start":
+            idx = sys.argv.index("--start")
+            if idx + 1 < len(sys.argv):
+                start_date = sys.argv[idx + 1]
+
     if not args:
-        print("用法: python -m signals.notify.backtest_notify <股票代码|名称> [频率] [--dry-run]")
+        print("用法: python -m signals.notify.backtest_notify <股票代码|名称> [频率:daily|weekly|30m] [--dry-run] [--start <别名|日期>]")
         print("示例: python -m signals.notify.backtest_notify 002466")
-        print("      python -m signals.notify.backtest_notify 天际股份 --dry-run")
-        print("      python -m signals.notify.backtest_notify SZ.002759 --dry-run")
+        print("      python -m signals.notify.backtest_notify 天际股份 --dry-run --start iran")
+        print("      python -m signals.notify.backtest_notify 天际股份 30m --dry-run --start ytd")
+        print("      python -m signals.notify.backtest_notify SZ.002759 --dry-run --start 2026-02-28")
         sys.exit(1)
 
     stock_code = _resolve_stock_input(args[0])
     frequency = args[1] if len(args) > 1 else "daily"
     is_dry_run = "--dry-run" in flags
-    run_and_push(stock_code, frequency, dry_run=is_dry_run)
+    run_and_push(stock_code, frequency, dry_run=is_dry_run, start_date=start_date)

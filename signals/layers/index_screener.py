@@ -155,7 +155,7 @@ class IndexScreener:
         try:
             from py_mini_racer import MiniRacer
             _v8 = MiniRacer(); _v8.eval("1"); del _v8
-        except ImportError:
+        except Exception:
             pass
 
         with ThreadPoolExecutor(max_workers=4) as pool:

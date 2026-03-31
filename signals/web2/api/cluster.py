@@ -7,7 +7,7 @@ from datetime import datetime
 from fastapi import APIRouter
 
 from signals.core.clustering import cluster_industries, cluster_concepts
-from signals.core.cluster_store import save_result, load_result, load_week
+from signals.core.cluster_store import save_result, load_result, load_latest, load_week
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,14 @@ def _schedule_next():
 
 def start_scheduler():
     """启动盘中定时聚类（由 app lifespan 调用）。"""
+    global _latest_industry
     logger.info("聚类定时器启动（每 %d 分钟）", _INTERVAL // 60)
+    # 先从历史缓存预加载，确保启动即有数据
+    if not _latest_industry:
+        stored = load_latest()
+        if stored:
+            _latest_industry = stored
+            logger.info("从历史缓存预加载聚类数据: %s", stored.get("meta", {}).get("date"))
     # 首次在后台线程执行（不阻塞 app 启动）
     t = threading.Thread(target=_run_cluster, daemon=True)
     t.start()
@@ -98,9 +105,12 @@ def get_latest(top: int = 3):
         industry = _latest_industry.copy()
         industry["top"] = industry["all_clusters"][:top]
     else:
-        # 尝试加载今日历史
-        today = datetime.now().strftime("%Y-%m-%d")
-        stored = load_result(today)
+        # 尝试加载最近交易日历史
+        from signals.data.mongo_fallback import get_last_trading_day
+        trading_day = get_last_trading_day()
+        stored = load_result(trading_day)
+        if not stored:
+            stored = load_latest()  # 兜底：取最近的文件
         if stored:
             _latest_industry = stored
             industry = stored.copy()
@@ -134,11 +144,27 @@ def get_latest(top: int = 3):
     except Exception:
         market_status = {"session_label": "未知", "a_live": False, "markets": {}}
 
-    return {
+    # 数据过期检测：比对实际数据日期与最近交易日
+    data_warning = None
+    try:
+        from signals.data.mongo_fallback import get_last_trading_day
+        expected_day = get_last_trading_day()
+        actual_day = None
+        if industry and industry.get("meta", {}).get("date"):
+            actual_day = industry["meta"]["date"]
+        if actual_day and actual_day < expected_day:
+            data_warning = f"数据日期为 {actual_day}，最近交易日为 {expected_day}，数据未更新"
+    except Exception:
+        pass
+
+    result = {
         "industry": industry or {"top": [], "all_clusters": [], "meta": {"error": "行业数据加载中"}},
         "concept": concept or {"top": [], "all_clusters": [], "meta": {}},
         "market_status": market_status,
     }
+    if data_warning:
+        result["data_warning"] = data_warning
+    return result
 
 
 @router.get("/history")

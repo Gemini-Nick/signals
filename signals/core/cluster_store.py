@@ -49,6 +49,17 @@ def load_week(ref_date: str = None) -> list:
     return results
 
 
+def load_latest() -> dict | None:
+    """加载最近一次的聚类结果（按文件名日期排序）。"""
+    if not _HISTORY_DIR.exists():
+        return None
+    files = sorted(_HISTORY_DIR.glob("*.json"), reverse=True)
+    if not files:
+        return None
+    with open(files[0], "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def cleanup(keep_days: int = 30):
     """清理超过 keep_days 天的历史文件。"""
     if not _HISTORY_DIR.exists():

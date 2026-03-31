@@ -339,7 +339,8 @@ class IntraDayScreener:
     # ─────────────────────────────────────────────────────
     def scan_once(self, symbols: Optional[List[str]] = None,
                   market_direction: str = "分化",
-                  sentiment_phase: str = "未知") -> List[ScoredSymbol]:
+                  sentiment_phase: str = "未知",
+                  consensus_risk_level: str = "低") -> List[ScoredSymbol]:
         """
         对所有（或指定）标的运行信号检测，返回按评分降序排列的结果。
         sentiment_phase: P3-1 情绪感知评分参数。
@@ -360,7 +361,8 @@ class IntraDayScreener:
                 sigs = detect_all_signals(analyzer.czsc, sym)
                 all_signals.extend(sigs)
             results.append(score_signals(sym, all_signals,
-                                         sentiment_phase=sentiment_phase))
+                                         sentiment_phase=sentiment_phase,
+                                         consensus_risk_level=consensus_risk_level))
             if dash:
                 dash.task_done("L3.scan", sym)
 
