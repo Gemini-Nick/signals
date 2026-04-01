@@ -313,6 +313,7 @@ cd deploy && docker-compose up -d
 
 | Tag | 说明 |
 |-----|------|
+| `v0.7.0` | 大盘上下文层 + 聚类增强 + 日期标签升级 + RSS 资讯抓取 + 回测工作台升级 |
 | `v0.6.0` | MongoDB 多源降级优化 + 微信 Agent 架构完善 + weclaw ACP 模式升级 |
 | `v0.5.0` | MongoDB 数据降级链首选源 + 交易模拟引擎 + 市场状态面板 |
 | `v0.4.0` | MongoDB 数据同步引擎 + 跳空缺口检测 + Docker 微服务编排 |
