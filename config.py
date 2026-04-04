@@ -173,6 +173,13 @@ MINUTE_CACHE_MAX_DAYS = 60                 # 缓存保留天数
 RISK_PER_TRADE_PCT = 2.0                   # 单笔最大亏损占账户 %
 MAX_POSITION_PCT = 25.0                    # 单标的最大仓位 %
 
+# ── 恐慌波浪参数（最后一跌检测）────────────────────────────
+PANIC_WAVE_GAP_DAYS = 5                    # 恐慌间隔超过此天数重置波浪计数
+PANIC_EXHAUSTION_DECAY = 0.8               # velocity 衰减比例阈值（<前一波×0.8=衰竭）
+BOTTOM_SIGNAL_MIN_WAVES = 2                # 最少恐慌波数才触发抄底信号
+BOTTOM_SIGNAL_MIN_PANIC = 60               # 恐慌分数门槛
+BOTTOM_SIGNAL_BASE_CONFIDENCE = 0.60       # 抄底信号基础置信度
+
 BACKTEST_DB_PATH = ".data/backtest.db"     # 信号存档 SQLite 路径
 BACKTEST_EVAL_WINDOWS = [5, 10, 20]        # 前瞻评估窗口（交易日）
 BACKTEST_MIN_AGE_DAYS = 20                 # 信号满多少天后才评估

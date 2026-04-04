@@ -57,16 +57,32 @@ weclaw 支持三种 Agent 接入模式，推荐使用 ACP：
 
 输出要求：纯文本为主（微信不渲染 Markdown）、≤2000 字、用 emoji、结构化但紧凑。需要发图片时用 `![](url)` 嵌入，weclaw 会自动提取并作为图片消息发送。
 
-### 微信快捷执行（直接 bash，不要先读源码）
+### 微信快捷执行（语义意图匹配，直接 bash，不要先读源码）
 
-| 用户意图关键词 | 直接执行 |
-|----------------|----------|
-| 行业/板块/行业分析/跑一下 | `python run.py --mode intraday` |
-| 指数/大盘/市场 | `python run.py --mode index` |
-| 回测+具体标的（如"回测天际股份"） | **先询问回测周期**：执行 `python -c "from config import DATE_PRESETS; [print(f'{k}: {v[\"label\"]}') for k,v in DATE_PRESETS.items()]"` 获取最新周期列表展示给用户。用户选择后直接执行 `python -m signals.notify.backtest_notify <代码或名称> [频率] --dry-run --start <周期别名>`（支持名称/前缀/纯数字自动转换），读取输出后回复报告+解读。用户已指定周期时跳过询问。**频率参数**：`daily`（日线，默认）、`weekly`（周线）、`30m`（30分钟）。用户提到"日线/30分钟/周线"时传对应频率，未指定默认用 daily |
-| 回测（无标的） | `python run.py --mode backtest` |
-| 复盘 | `python run.py --mode review` |
-| 重启/restart | 先回复"🔄 正在重启，10秒后恢复"，然后 `nohup sh -c 'sleep 2 && weclaw restart' >/dev/null 2>&1 &` |
+用你的语言理解能力匹配用户意图，不要死扣关键词。以下每个意图给出典型表达和对应命令：
+
+**盘中全景（intraday）** → `python run.py --mode intraday`
+典型表达：跑一下、行业分析、板块怎么样、帮我看看盘面、现在什么情况、盘中监测、扫一下、哪些板块强
+也包括：恐慌到什么程度了、现在适合抄底吗、恐慌检测、波浪到第几波了、最后一跌了吗
+（恐慌评分+波浪追踪+抄底信号都在 intraday 模式里）
+
+**指数研判（index）** → `python run.py --mode index`
+典型表达：大盘怎么样、指数分析、市场方向、沪深300啥情况、上证怎么看、仓位建议
+
+**回测+具体标的** → 先询问回测周期（执行 `python -c "from config import DATE_PRESETS; [print(f'{k}: {v[\"label\"]}') for k,v in DATE_PRESETS.items()]"` 获取周期列表），用户选择后执行 `python -m signals.notify.backtest_notify <代码或名称> [频率] --dry-run --start <周期别名>`
+典型表达：回测天际股份、跑一下002759、看看茅台的信号、这只票怎么样+代码
+频率参数：`daily`（默认）、`weekly`（周线）、`30m`（30分钟）。用户已指定周期时跳过询问
+
+**回测（无标的）** → `python run.py --mode backtest`
+典型表达：跑个全量回测、回测所有
+
+**盘后复盘（review）** → `python run.py --mode review`
+典型表达：复盘、今天信号怎么样、收盘分析、盘后总结
+
+**重启** → 先回复"🔄 正在重启，10秒后恢复"，然后 `nohup sh -c 'sleep 2 && weclaw restart' >/dev/null 2>&1 &`
+典型表达：重启、restart
+
+**判断原则**：用户的意图可能模糊（如"看看"），优先匹配最可能的模式。盘中时段偏向 intraday，收盘后偏向 review。如果实在无法判断，直接问用户"你想看大盘指数还是行业板块？"。
 
 **重要**：匹配到上面的意图时，直接执行对应命令，不要先读 run.py 或其他源码。检测到回测等 Signals 相关意图时直接执行，不要让用户重新输入 `/signals` 命令。
 

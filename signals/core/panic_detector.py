@@ -26,6 +26,9 @@ from typing import List, Optional
 import pandas as pd
 
 from signals.layers.index_report import IndexReport
+from config import (PANIC_WAVE_GAP_DAYS, PANIC_EXHAUSTION_DECAY,
+                    BOTTOM_SIGNAL_MIN_WAVES, BOTTOM_SIGNAL_MIN_PANIC,
+                    BOTTOM_SIGNAL_BASE_CONFIDENCE)
 
 
 # 焦点指数：代表市场风险偏好的成长型指数
@@ -56,6 +59,116 @@ class PanicAssessment:
     acceleration: float = 0.0   # 速率变化 (正=加速下跌, 负=减速)
     is_stabilizing: bool = False  # 是否正在企稳
     market_state: str = "平稳"    # "急跌"/"缓跌"/"企稳"/"反弹"/"平稳"
+    # 波浪追踪 + 抄底信号（assess_intraday_panic 末尾填充）
+    wave_state: Optional["PanicWaveState"] = None
+    bottom_signal: Optional["BottomSignal"] = None
+
+
+@dataclass
+class PanicWaveState:
+    """跨调用的恐慌波浪状态（模块级单例）"""
+    wave_count: int = 0
+    last_panic_date: str = ""
+    peak_velocity: float = 0.0
+    consecutive_panic_days: int = 0
+    velocities: list = field(default_factory=list)
+    is_exhausting: bool = False
+
+
+@dataclass
+class BottomSignal:
+    """最后一跌抄底信号"""
+    triggered: bool = False
+    confidence: float = 0.0
+    wave_count: int = 0
+    is_exhausting: bool = False
+    daily_er_mai: list = field(default_factory=list)
+    detail: str = ""
+
+
+# 模块级单例，ACP 长驻进程内跨调用保持状态
+_wave_state = PanicWaveState()
+
+
+def _update_wave_tracking(score: float, velocity: float, market_state: str):
+    """更新恐慌波浪追踪状态"""
+    global _wave_state
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if score >= BOTTOM_SIGNAL_MIN_PANIC:
+        if today != _wave_state.last_panic_date:
+            if _wave_state.last_panic_date:
+                try:
+                    last = datetime.strptime(_wave_state.last_panic_date, "%Y-%m-%d")
+                    gap = (datetime.strptime(today, "%Y-%m-%d") - last).days
+                    if gap > PANIC_WAVE_GAP_DAYS:
+                        _wave_state.wave_count = 0
+                        _wave_state.velocities = []
+                except ValueError:
+                    pass
+            _wave_state.wave_count += 1
+            _wave_state.consecutive_panic_days += 1
+            _wave_state.last_panic_date = today
+            _wave_state.velocities.append(velocity)
+        _wave_state.peak_velocity = max(_wave_state.peak_velocity, velocity)
+    else:
+        if today != _wave_state.last_panic_date:
+            _wave_state.consecutive_panic_days = 0
+            _wave_state.peak_velocity = 0.0
+
+    vels = _wave_state.velocities
+    _wave_state.is_exhausting = (
+        len(vels) >= 2
+        and vels[-1] < vels[-2] * PANIC_EXHAUSTION_DECAY
+        and market_state in ("企稳", "缓跌")
+    )
+
+
+def detect_bottom_signal(
+    panic: PanicAssessment,
+    index_reports: List[IndexReport],
+) -> BottomSignal:
+    """
+    最后一跌检测：恐慌 + 日线二买共振。
+
+    触发条件（ALL required）:
+    1. panic_score >= BOTTOM_SIGNAL_MIN_PANIC
+    2. 至少1个焦点指数出现日线二买
+    3. wave_count >= BOTTOM_SIGNAL_MIN_WAVES
+    """
+    er_mai_indices = []
+    for r in index_reports:
+        if r.name in _FOCUS_INDICES:
+            sig = getattr(r, 'daily_latest_signal', '')
+            if sig and '二买' in sig:
+                er_mai_indices.append(r.name)
+
+    if (panic.score < BOTTOM_SIGNAL_MIN_PANIC
+            or not er_mai_indices
+            or _wave_state.wave_count < BOTTOM_SIGNAL_MIN_WAVES):
+        return BottomSignal()
+
+    conf = BOTTOM_SIGNAL_BASE_CONFIDENCE
+    if _wave_state.is_exhausting:
+        conf += 0.15
+    if _wave_state.wave_count >= 3:
+        conf += 0.10
+    if panic.is_stabilizing:
+        conf += 0.05
+    conf = min(conf, 0.95)
+
+    detail = (f"第{_wave_state.wave_count}波恐慌"
+              f"{'[衰竭]' if _wave_state.is_exhausting else ''}"
+              f" + 日线二买({','.join(er_mai_indices)})"
+              f" → 置信度{conf:.0%}")
+
+    return BottomSignal(
+        triggered=True, confidence=conf,
+        wave_count=_wave_state.wave_count,
+        is_exhausting=_wave_state.is_exhausting,
+        daily_er_mai=er_mai_indices,
+        detail=detail,
+    )
 
 
 def _get_today_bars(analyzers: dict):
@@ -448,7 +561,9 @@ def assess_intraday_panic(
         detail_parts.append("📊企稳中")
     detail = "  |  ".join(detail_parts)
 
-    return PanicAssessment(
+    # 波浪追踪 + 抄底检测
+    _update_wave_tracking(total, velocity, market_state)
+    result = PanicAssessment(
         score=round(total, 1),
         level=level,
         detail=detail,
@@ -462,4 +577,15 @@ def assess_intraday_panic(
         acceleration=acceleration,
         is_stabilizing=is_stabilizing,
         market_state=market_state,
+        wave_state=_wave_state,
+        bottom_signal=detect_bottom_signal(
+            PanicAssessment(
+                score=round(total, 1), level=level, detail=detail,
+                decline_score=decline_score, breadth_score=breadth_score,
+                volume_score=volume_score, support_score=support_score,
+                is_stabilizing=is_stabilizing, market_state=market_state,
+            ),
+            index_reports,
+        ),
     )
+    return result

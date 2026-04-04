@@ -372,6 +372,15 @@ def run_intraday(args):
             if panic.level == "恐慌":
                 print(f"  💡 恐慌=底部信号 → 关注超跌+支撑位的反弹机会")
 
+            # 抄底信号（最后一跌检测）
+            if panic.bottom_signal and panic.bottom_signal.triggered:
+                bs = panic.bottom_signal
+                print(f"  >>> ⚡ 抄底信号: {bs.detail}")
+            elif panic.wave_state and panic.wave_state.wave_count > 0:
+                ws = panic.wave_state
+                print(f"      📊 恐慌波浪: 第{ws.wave_count}波"
+                      f"{'[衰竭]' if ws.is_exhausting else ''}")
+
             # ② 偏弱/恐慌时显示抄底候选
             if panic.score >= 40:
                 from signals.layers.industry import get_bottom_fishing_candidates

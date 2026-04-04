@@ -126,12 +126,68 @@ def detect_sentiment_phase(
     return SentimentPhase.REPAIR
 
 
+@dataclass
+class PositionAdvice:
+    """量化仓位建议"""
+    base_pct: int          # 底仓比例 (防守板块, 0-100)
+    attack_pct: int        # 进攻仓比例 (弹性板块, 0-100)
+    cash_pct: int          # 现金比例 (0-100)
+    base_direction: str    # 底仓方向
+    attack_direction: str  # 进攻方向
+    transition_trigger: str  # 仓位转换触发条件
+    text: str              # 向后兼容文字
+
+_POSITION_ADVICE_MAP = {
+    ("偏空", "恐慌"):  PositionAdvice(30, 0, 70, "银行/高股息", "等待释放后再配置",
+                        "恐慌衰竭+日线二买 → 进攻加至20%",
+                        "3成底仓防守🛡+7成现金💰 恐慌=底部信号，准备抄底清单"),
+    ("偏空", "修复"):  PositionAdvice(30, 20, 50, "银行/高股息", "超跌反弹板块",
+                        "反弹至阻力位 → 高抛进攻仓",
+                        "3成底仓🛡+2成进攻⚔+5成现金💰 跷跷板切换关注防守"),
+    ("偏空", "回落"):  PositionAdvice(30, 0, 70, "银行/高股息", "暂不配置",
+                        "恐慌触发 → 准备抄底",
+                        "3成底仓防守🛡+7成现金💰 回落阶段守住底仓"),
+    ("偏空", "亢奋"):  PositionAdvice(30, 10, 60, "银行/高股息", "题材高抛",
+                        "亢奋减退 → 清空进攻仓",
+                        "3成底仓🛡+1成高抛进攻⚔ 偏空+亢奋=反弹卖点"),
+    ("偏多", "恐慌"):  PositionAdvice(30, 20, 50, "银行/高股息", "恐慌抄底弹性标的",
+                        "恐慌衰竭 → 进攻加至30%",
+                        "3成底仓🛡+2成进攻⚔ 偏多+恐慌=黄金坑"),
+    ("偏多", "修复"):  PositionAdvice(30, 30, 40, "银行/高股息", "超跌反弹/科技弹性",
+                        "板块轮动 → 调整进攻方向",
+                        "3成底仓🛡+3成进攻⚔+4成现金 修复期逢低加仓"),
+    ("偏多", "回落"):  PositionAdvice(30, 20, 50, "银行/高股息", "持仓等待",
+                        "回调到位 → 恢复进攻",
+                        "3成底仓🛡+2成进攻⚔ 正常回调持仓等待"),
+    ("偏多", "亢奋"):  PositionAdvice(30, 20, 50, "银行/高股息", "高抛题材/弹性仓",
+                        "亢奋减退 → 进攻仓高抛锁利",
+                        "3成底仓🛡+2成进攻⚔(高抛)+5成现金 亢奋=离场信号"),
+    ("分化", "恐慌"):  PositionAdvice(30, 10, 60, "银行/高股息", "观察谁先企稳",
+                        "方向明确 → 按偏多/偏空调整",
+                        "3成底仓🛡+1成试探⚔+6成现金 分化中观察企稳方向"),
+    ("分化", "修复"):  PositionAdvice(30, 20, 50, "银行/高股息", "均衡轮动",
+                        "轮动加速 → 跟随强势线",
+                        "3成底仓🛡+2成进攻⚔ 均衡配置关注跷跷板"),
+    ("分化", "回落"):  PositionAdvice(30, 10, 60, "银行/高股息", "跷跷板轮动",
+                        "方向明确 → 调整配置",
+                        "3成底仓🛡+1成进攻⚔ 分化回落关注轮动"),
+    ("分化", "亢奋"):  PositionAdvice(30, 10, 60, "银行/高股息", "锁利减仓",
+                        "亢奋减退 → 清空进攻仓",
+                        "3成底仓🛡+1成进攻⚔(减仓) 亢奋分化=轮动加速"),
+}
+
+_DEFAULT_ADVICE = PositionAdvice(30, 10, 60, "银行/高股息", "均衡",
+                                "关注市场变化", "均衡配置 → 关注市场变化")
+
+
+def get_position_advice(direction: str, phase: SentimentPhase) -> PositionAdvice:
+    """返回结构化仓位建议。"""
+    return _POSITION_ADVICE_MAP.get((direction, phase.value), _DEFAULT_ADVICE)
+
+
 def get_position_suggestion(direction: str, phase: SentimentPhase) -> str:
-    """根据大市方向+情绪周期返回仓位建议。"""
-    return _POSITION_MAP.get(
-        (direction, phase.value),
-        "均衡配置 → 关注市场变化"
-    )
+    """根据大市方向+情绪周期返回仓位建议（向后兼容）。"""
+    return get_position_advice(direction, phase).text
 
 
 # ─────────────────────────────────────────────────────────
@@ -405,6 +461,8 @@ class MarketContext:
     rotation_peak_detail: str = ""
     # 共识风险（流动性=分歧理论）
     consensus_risk: Optional[ConsensusRisk] = None
+    # 量化仓位建议
+    position_advice: Optional[PositionAdvice] = None
 
     # ─────────────────────────────────────────────────────
     # 情绪周期更新（L2 数据可用后调用）
@@ -434,6 +492,8 @@ class MarketContext:
         )
         self.sentiment_phase = phase.value
         self.position_suggestion = get_position_suggestion(
+            self.overall_direction, phase)
+        self.position_advice = get_position_advice(
             self.overall_direction, phase)
         if shield_sectors is not None:
             self.shield_sectors = shield_sectors
@@ -748,7 +808,13 @@ class MarketContext:
             lines.append(f"  🔀 结构: {self.structural_divergence}")
 
         # 仓位建议
-        if self.position_suggestion:
+        if self.position_advice:
+            pa = self.position_advice
+            lines.append(f"  💡 底仓{pa.base_pct}%({pa.base_direction}) | "
+                         f"进攻{pa.attack_pct}%({pa.attack_direction}) | "
+                         f"现金{pa.cash_pct}%")
+            lines.append(f"  🔄 转换: {pa.transition_trigger}")
+        elif self.position_suggestion:
             lines.append(f"  💡 {self.position_suggestion}")
 
         # 轮动阶段 + 配置建议
@@ -864,7 +930,11 @@ class MarketContext:
         lines.append("─" * 36)
 
         # 仓位建议
-        if self.position_suggestion:
+        if self.position_advice:
+            pa = self.position_advice
+            lines.append(f"仓位: 底仓{pa.base_pct}% | 进攻{pa.attack_pct}% | 现金{pa.cash_pct}%")
+            lines.append(f"转换: {pa.transition_trigger}")
+        elif self.position_suggestion:
             lines.append(f"仓位: {self.position_suggestion}")
 
         # 轮动阶段 + 配置建议
@@ -982,7 +1052,13 @@ class MarketContext:
         l1_lines.append(f"{dir_emoji} **综合: {self.overall_direction}** ({strength_str})  |  风格: {self.growth_vs_value}{struct_str}{phase_str}")
 
         # 仓位建议
-        if self.position_suggestion:
+        if self.position_advice:
+            pa = self.position_advice
+            l1_lines.append(f"💡 底仓{pa.base_pct}%({pa.base_direction}) | "
+                            f"进攻{pa.attack_pct}%({pa.attack_direction}) | "
+                            f"现金{pa.cash_pct}%")
+            l1_lines.append(f"🔄 转换: {pa.transition_trigger}")
+        elif self.position_suggestion:
             l1_lines.append(f"💡 {self.position_suggestion}")
 
         # 轮动阶段 + 配置建议
@@ -1285,6 +1361,7 @@ def build_market_context(
         bank_avg_gain=bank_avg_gain,
     )
     pos_suggestion = get_position_suggestion(overall_direction, phase)
+    pos_advice = get_position_advice(overall_direction, phase)
 
     # 生成综合摘要
     summary_parts = [
@@ -1351,4 +1428,5 @@ def build_market_context(
         sword_sectors=sword,
         style_switch=style_sw,
         consensus_risk=consensus,
+        position_advice=pos_advice,
     )
