@@ -140,15 +140,15 @@ backtest 每月运行 ──→ 读取已存档信号（≥20天前）──→ 
 
 ---
 
-## 微信 Agent — weclaw + Claude Code
+## 微信 Agent — weclaw + Codex/Claude（双 Agent 灾备）
 
-通过 weclaw 桥接微信消息到 Claude Code CLI，实现微信端的智能分析助手「隆小侠」。
+通过 weclaw 桥接微信消息到 Agent（默认 Codex，Claude 作为备份），实现微信端的智能分析助手「隆小侠」。
 
 ### 工作流
 
 ```
 ┌────────┐       ┌──────────┐       ┌──────────────────────────┐
-│  微信    │──────→│  weclaw   │──────→│  Claude Code CLI          │
+│  微信    │──────→│  weclaw   │──────→│  Codex / Claude Agent     │
 │  用户    │  消息  │  serve    │ fork  │                          │
 └────────┘       └──────────┘       │  ① 读 CLAUDE.md           │
      ▲                               │  ② 理解用户意图            │
@@ -160,14 +160,14 @@ backtest 每月运行 ──→ 读取已存档信号（≥20天前）──→ 
      └────────────────────────────────────────────┘
 ```
 
-没有中间层。CC 读 CLAUDE.md 知道自己的角色和引擎能力，然后自己决定怎么回答。
+没有中间层。Agent 读项目内指令（如 `CLAUDE.md`）后自行理解意图并执行。
 
 ### 部署
 
 ```bash
 # 1. 配置 weclaw
 cp deploy/weclaw/config.example.json ~/.weclaw/config.json
-# 编辑 cwd 为 signals 项目路径
+# 编辑 cwd 为 signals 项目路径（默认 signals_codex，signals_claude 备用）
 
 # 2. 启动（只需这一步）
 weclaw serve

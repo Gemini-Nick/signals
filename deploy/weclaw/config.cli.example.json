@@ -1,8 +1,14 @@
 {
-  "default_agent": "signals",
+  "default_agent": "signals_codex",
   "api_addr": "127.0.0.1:18011",
   "agents": {
-    "signals": {
+    "signals_codex": {
+      "type": "cli",
+      "command": "codex",
+      "cwd": "/path/to/signals",
+      "args": ["exec", "--dangerously-bypass-approvals-and-sandbox"]
+    },
+    "signals_claude": {
       "type": "cli",
       "command": "claude",
       "cwd": "/path/to/signals",

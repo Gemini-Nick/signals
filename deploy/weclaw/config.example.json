@@ -1,8 +1,14 @@
 {
-  "default_agent": "signals",
+  "default_agent": "signals_codex",
   "api_addr": "127.0.0.1:18011",
   "agents": {
-    "signals": {
+    "signals_codex": {
+      "type": "acp",
+      "command": "codex",
+      "cwd": "/path/to/signals",
+      "args": ["app-server", "--listen", "stdio://"]
+    },
+    "signals_claude": {
       "type": "acp",
       "command": "claude",
       "cwd": "/path/to/signals",
