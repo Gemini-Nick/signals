@@ -30,6 +30,36 @@ def get_dashboard() -> Optional["Dashboard"]:
     return _dashboard
 
 
+def make_logger(name: str):
+    """
+    生成 dashboard 感知的 (detail, log) 函数对。
+
+    用法:
+        from signals.dashboard import make_logger
+        _detail, _log = make_logger("signals.xxx")
+    """
+    import logging
+    file_log = logging.getLogger(name)
+
+    def detail(msg: str):
+        dash = get_dashboard()
+        if dash:
+            dash.detail(msg)
+        else:
+            print(msg, flush=True)
+        file_log.info(msg)
+
+    def log(msg: str):
+        dash = get_dashboard()
+        if dash:
+            dash.log(msg)
+        else:
+            print(msg, flush=True)
+        file_log.info(msg)
+
+    return detail, log
+
+
 class Dashboard:
     """
     线程安全的实时监控面板。

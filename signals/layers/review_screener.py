@@ -19,34 +19,44 @@ from signals.data.bar_cache import get_cache, DiskBarCache
 # Dashboard-aware logging
 # ─────────────────────────────────────────────────────────
 
-import logging as _logging
-_file_log = _logging.getLogger("signals.review_screener")
-
-def _log(msg: str):
-    from signals.dashboard import get_dashboard
-    dash = get_dashboard()
-    if dash:
-        dash.log(msg)
-    else:
-        print(msg, flush=True)
-    _file_log.info(msg)
+from signals.dashboard import make_logger as _make_logger
+_, _log = _make_logger("signals.review_screener")
 
 
 # ─────────────────────────────────────────────────────────
-# Thread-safe 降级计数器（模块级）
+# Thread-safe 降级熔断器
 # ─────────────────────────────────────────────────────────
 
 _counter_lock = threading.Lock()
 
-# 东财 SSL 连续失败计数器
-_em_ssl_fails: int = 0
-_EM_SKIP_THRESHOLD: int = 3
-_em_switched: bool = False
 
-# Sina 连续失败计数器
-_sina_fails: int = 0
-_SINA_SKIP_THRESHOLD: int = 3
-_sina_switched: bool = False
+class _CircuitBreaker:
+    """Thread-safe 连续失败计数器，达阈值后自动熔断。"""
+
+    def __init__(self, name: str, threshold: int = 3):
+        self.name = name
+        self.threshold = threshold
+        self.fails = 0
+        self.switched = False
+
+    def reset(self):
+        self.fails = 0
+        self.switched = False
+
+    def bump(self, context: str = ""):
+        self.fails += 1
+        if self.fails >= self.threshold and not self.switched:
+            self.switched = True
+            label = f"{self.name}{context}" if context else self.name
+            _log(f"  [!] {label}接口连续{self.fails}次失败，自动切换")
+
+    @property
+    def tripped(self) -> bool:
+        return self.fails >= self.threshold
+
+
+_em_breaker = _CircuitBreaker("东财", threshold=3)
+_sina_breaker = _CircuitBreaker("Sina", threshold=3)
 
 
 def _is_ssl_error(e: Exception) -> bool:
@@ -55,51 +65,11 @@ def _is_ssl_error(e: Exception) -> bool:
     return "SSL" in err_str or "SSLError" in type(e).__name__
 
 
-def _reset_em_counter():
-    """东财请求成功时重置计数器"""
-    global _em_ssl_fails, _em_switched
-    with _counter_lock:
-        _em_ssl_fails = 0
-        _em_switched = False
-
-
-def _bump_em_fail(context: str = "日线"):
-    """东财 SSL 失败时递增计数，达阈值时输出一次切换提示"""
-    global _em_ssl_fails, _em_switched
-    with _counter_lock:
-        _em_ssl_fails += 1
-        if _em_ssl_fails >= _EM_SKIP_THRESHOLD and not _em_switched:
-            _em_switched = True
-            _log(f"  [!] 东财{context}接口连续{_em_ssl_fails}次SSL失败，"
-                 f"自动切换 Sina 源")
-
-
-def _reset_sina_counter():
-    """Sina 请求成功时重置计数器"""
-    global _sina_fails, _sina_switched
-    with _counter_lock:
-        _sina_fails = 0
-        _sina_switched = False
-
-
-def _bump_sina_fail():
-    """Sina 失败时递增计数，达阈值时输出一次提示"""
-    global _sina_fails, _sina_switched
-    with _counter_lock:
-        _sina_fails += 1
-        if _sina_fails >= _SINA_SKIP_THRESHOLD and not _sina_switched:
-            _sina_switched = True
-            _log(f"  [!] Sina接口连续{_sina_fails}次失败，跳过 Sina 源")
-
-
 def _reset_all_counters():
     """重置所有熔断计数器（每次 review 入口调用，防多轮残留）"""
-    global _em_ssl_fails, _em_switched, _sina_fails, _sina_switched
     with _counter_lock:
-        _em_ssl_fails = 0
-        _em_switched = False
-        _sina_fails = 0
-        _sina_switched = False
+        _em_breaker.reset()
+        _sina_breaker.reset()
 
 
 # ─────────────────────────────────────────────────────────
@@ -169,8 +139,8 @@ def _load_stock_daily_bars(futu_code: str, start_date: str,
     # ── A股路径 ──
     ak_src = AKShareSource()
 
-    # 1. 东财源（SSL 计数器未超限时尝试，8s 超时保护）
-    if _em_ssl_fails < _EM_SKIP_THRESHOLD:
+    # 1. 东财源（熔断器未触发时尝试，8s 超时保护）
+    if not _em_breaker.tripped:
         try:
             bars = ak_src._call_with_timeout(
                 lambda: ak_src.get_a_daily(futu_code, sdt=start_date, edt=edt,
@@ -178,28 +148,32 @@ def _load_stock_daily_bars(futu_code: str, start_date: str,
                 timeout=8.0,
             )
             if bars:
-                _reset_em_counter()
+                with _counter_lock:
+                    _em_breaker.reset()
                 cache.set(cache_key, _bars_to_records(bars))
                 return bars, ""
         except Exception as e:
             if _is_ssl_error(e) or isinstance(e, TimeoutError):
-                _bump_em_fail("日线")
+                with _counter_lock:
+                    _em_breaker.bump("日线")
             else:
                 err_msg = f"{type(e).__name__}: {e}"
                 if len(err_msg) > 80:
                     err_msg = err_msg[:80] + "..."
                 _log(f"  [✗] {futu_code} 东财日线失败：{err_msg}")
 
-    # 2. Sina 源（降级，受连续失败计数器控制）
-    if _sina_fails < _SINA_SKIP_THRESHOLD:
+    # 2. Sina 源（降级，受熔断器控制）
+    if not _sina_breaker.tripped:
         try:
             bars = ak_src.get_a_daily_sina(futu_code, sdt=start_date, edt=edt)
             if bars:
-                _reset_sina_counter()
+                with _counter_lock:
+                    _sina_breaker.reset()
                 cache.set(cache_key, _bars_to_records(bars))
                 return bars, ""
         except Exception as e:
-            _bump_sina_fail()
+            with _counter_lock:
+                _sina_breaker.bump()
             err_msg = f"{type(e).__name__}: {e}"
             if len(err_msg) > 80:
                 err_msg = err_msg[:80] + "..."
@@ -262,26 +236,30 @@ def _load_stock_minute_bars(futu_code: str, freq: Freq) -> List[RawBar]:
         return []  # 暂只支持A股
     ak_src = AKShareSource()
 
-    # 1. Sina 源（优先，受连续失败计数器控制）
-    if _sina_fails < _SINA_SKIP_THRESHOLD:
+    # 1. Sina 源（优先，受熔断器控制）
+    if not _sina_breaker.tripped:
         try:
             bars = ak_src.get_a_minute(futu_code, freq, timeout=10.0)
             if bars:
-                _reset_sina_counter()
+                with _counter_lock:
+                    _sina_breaker.reset()
                 return bars
         except Exception:
-            _bump_sina_fail()
+            with _counter_lock:
+                _sina_breaker.bump()
 
-    # 2. 东财源（SSL 计数器控制）
-    if _em_ssl_fails < _EM_SKIP_THRESHOLD:
+    # 2. 东财源（熔断器控制）
+    if not _em_breaker.tripped:
         try:
             bars = ak_src.get_a_minute_em(futu_code, freq, max_retries=1)
             if bars:
-                _reset_em_counter()
+                with _counter_lock:
+                    _em_breaker.reset()
                 return bars
         except Exception as e:
             if _is_ssl_error(e):
-                _bump_em_fail("分钟线")
+                with _counter_lock:
+                    _em_breaker.bump("分钟线")
 
     return []
 
@@ -370,7 +348,7 @@ def review_stock_daily(symbols: List[str], start_date: str,
 
         if not bars:
             with _result_lock:
-                if err_type != "no_data" or _em_ssl_fails == 0:
+                if err_type != "no_data" or _em_breaker.fails == 0:
                     _log(f"  [✗] {sym}: 无数据 (加载{load_sec:.1f}s)")
                 fail_count += 1
                 _done += 1
@@ -488,11 +466,11 @@ def review_stock_daily(symbols: List[str], start_date: str,
                        detail=f"成功{ok_count} 失败{fail_count}")
 
     # 降级统计
-    if _em_switched:
-        _log(f"  [i] 东财→Sina 降级: SSL失败{_em_ssl_fails}次, "
+    if _em_breaker.switched:
+        _log(f"  [i] 东财→Sina 降级: SSL失败{_em_breaker.fails}次, "
              f"成功{ok_count}只, 失败{fail_count}只")
-    if _sina_switched:
-        _log(f"  [i] Sina 降级: 连续失败{_sina_fails}次, "
+    if _sina_breaker.switched:
+        _log(f"  [i] Sina 降级: 连续失败{_sina_breaker.fails}次, "
              f"成功{ok_count}只, 失败{fail_count}只")
 
     # ── 异常检测 + 信号融合（对齐盘中 screener 完整流水线）──

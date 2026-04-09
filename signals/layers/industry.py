@@ -22,33 +22,9 @@ from typing import List, Optional, Tuple
 import pandas as pd
 
 from signals.data.fetcher import no_proxy as _no_proxy, em_call_with_retry as _em_retry
-from signals.dashboard import get_dashboard as _get_dashboard
+from signals.dashboard import get_dashboard as _get_dashboard, make_logger as _make_logger
 
-
-# ─────────────────────────────────────────────────────────
-# Dashboard 辅助（detail = 细节，log = 重要状态变更）
-# ─────────────────────────────────────────────────────────
-
-import logging as _logging
-_file_log = _logging.getLogger("signals.industry")
-
-def _detail(msg: str):
-    """任务级详情输出（per-task status, 线程池回调等）"""
-    dash = _get_dashboard()
-    if dash:
-        dash.detail(msg)
-    else:
-        print(msg, flush=True)
-    _file_log.info(msg)
-
-def _log(msg: str):
-    """重要状态变更输出（熔断、模式切换等）"""
-    dash = _get_dashboard()
-    if dash:
-        dash.log(msg)
-    else:
-        print(msg, flush=True)
-    _file_log.info(msg)
+_detail, _log = _make_logger("signals.industry")
 
 
 # ─────────────────────────────────────────────────────────
