@@ -214,13 +214,14 @@ class WebEngine:
     def review_state(self) -> ReviewState:
         return self._review
 
-    def run_l1(self):
+    def run_l1(self, manage_state: bool = True):
         """运行 Layer 1 指数分析（同步，阻塞）"""
-        with self._lock:
-            if self._state.is_running:
-                return
-            self._state.is_running = True
-            self._state.error = ""
+        if manage_state:
+            with self._lock:
+                if self._state.is_running:
+                    return
+                self._state.is_running = True
+                self._state.error = ""
 
         try:
             from signals.layers.index_screener import IndexScreener
@@ -241,8 +242,9 @@ class WebEngine:
                 self._state.error = str(e)
             raise
         finally:
-            with self._lock:
-                self._state.is_running = False
+            if manage_state:
+                with self._lock:
+                    self._state.is_running = False
 
     def run_l2(self, session=None):
         """运行 Layer 2 行业分析（同步，阻塞）"""
@@ -1042,7 +1044,13 @@ class WebEngine:
         from signals.core.market_hours import get_session_mode
 
         session = get_session_mode()
-        self._state.session_mode = session
+        with self._lock:
+            if self._state.is_running:
+                return
+            self._state.is_running = True
+            self._state.error = ""
+            self._state.loading_phase = "L1"
+            self._state.session_mode = session
 
         def _worker():
             import logging
@@ -1076,7 +1084,7 @@ class WebEngine:
                 # L1 在主 worker 线程中运行
                 log.info("后台加载: L1 指数分析...")
                 print("   [后台] 运行 Layer 1 指数分析...")
-                self.run_l1()
+                self.run_l1(manage_state=False)
                 t1 = _time.monotonic() - t0
                 print(f"   [后台] L1 完成 ({t1:.1f}s)")
 
@@ -1112,6 +1120,11 @@ class WebEngine:
                 log.error("后台加载失败: %s", e, exc_info=True)
                 self._state.error = str(e)
                 self._state.loading_phase = ""
+            finally:
+                with self._lock:
+                    self._state.is_running = False
+                    if self._state.loading_phase:
+                        self._state.loading_phase = ""
 
         t = threading.Thread(target=_worker, daemon=True, name="engine-loader")
         t.start()

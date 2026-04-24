@@ -6,6 +6,11 @@
 WORK=${SIGNALS_WORK:-$(cd "$(dirname "$0")/../.." && pwd)}
 cd "$WORK"
 
+if [ ! -x "$WORK/.venv/bin/python" ]; then
+    echo "  Python 虚拟环境缺失，先执行 bootstrap..."
+    bash "$WORK/scripts/bootstrap-dev.sh"
+fi
+
 echo "$(date +'%Y-%m-%d %H:%M:%S') 开始同步..."
 
 # 拉取最新代码
@@ -24,9 +29,9 @@ echo "  更新: ${OLD_HEAD:0:7} → ${NEW_HEAD:0:7}"
 git log --oneline "$OLD_HEAD".."$NEW_HEAD"
 
 # 检查依赖是否变化
-if git diff "$OLD_HEAD".."$NEW_HEAD" --name-only | grep -q requirements.txt; then
+if git diff "$OLD_HEAD".."$NEW_HEAD" --name-only | grep -Eq '(^requirements\.txt$|^pyproject\.toml$)'; then
     echo "  依赖变化，重新安装..."
-    pip install -r requirements.txt
+    bash scripts/bootstrap-dev.sh
 fi
 
 # 检查东财缓存是否随代码更新

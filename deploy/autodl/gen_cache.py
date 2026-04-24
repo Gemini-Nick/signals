@@ -6,8 +6,8 @@
 缓存通过 git 同步到 AutoDL 云端，避免云端直连东财超时。
 
 用法:
-    python deploy/autodl/gen_cache.py          # 生成所有缓存
-    python deploy/autodl/gen_cache.py --push   # 生成 + git commit & push
+    bash scripts/python.sh deploy/autodl/gen_cache.py          # 生成所有缓存
+    bash scripts/python.sh deploy/autodl/gen_cache.py --push   # 生成 + git commit & push
 
 缓存文件:
     .cache/name_to_code.json     — 股票名称→代码映射（~5000只）

@@ -24,17 +24,23 @@
 ## 运行模式
 
 ```bash
-python run.py                                      # 盘中监测（默认）
-python run.py --mode index                          # 仅指数报告（快速）
-python run.py --mode review --start 2024-09-24      # 盘后复盘（指定日期）
-python run.py --mode review --start 924             # 盘后复盘（日期预设）
-python run.py --mode backtest                       # 信号回测评估
-python run.py --mode import --file 研报.pdf          # 导入研究笔记
-python run.py --mode web --port 8000                # Web 全功能版
-python run.py --mode web2 --port 8001               # Web2 精简版（行业聚类+回测）
-python -m signals.sync --once                       # 数据同步（一次性全量）
-python -m signals.sync --once --module index_daily   # 数据同步（单模块）
-python -m signals.sync --daemon                      # 同步守护进程
+bash scripts/python.sh run.py                                      # 盘中监测（默认）
+bash scripts/python.sh run.py --mode index                         # 仅指数报告（快速）
+bash scripts/python.sh run.py --mode review --start 2024-09-24     # 盘后复盘（指定日期）
+bash scripts/python.sh run.py --mode review --start 924            # 盘后复盘（日期预设）
+bash scripts/python.sh run.py --mode backtest                      # 信号回测评估
+bash scripts/python.sh run.py --mode import --file 研报.pdf         # 导入研究笔记
+bash scripts/python.sh run.py --mode web --port 8000               # Web 全功能版
+bash scripts/python.sh run.py --mode web2 --port 8001              # Web2 精简版（行业聚类+回测）
+bash scripts/python.sh -m signals.sync --once                      # 数据同步（一次性全量）
+bash scripts/python.sh -m signals.sync --once --module index_daily # 数据同步（单模块）
+bash scripts/python.sh -m signals.sync --daemon                    # 同步守护进程
+```
+
+本仓统一使用 Python `3.11`，见 [`.python-version`](.python-version)。先执行：
+
+```bash
+bash scripts/bootstrap-dev.sh
 ```
 
 ### 模式定位
@@ -330,16 +336,16 @@ cd deploy && docker-compose up -d
 git clone https://github.com/Gemini-Nick/signals.git
 cd signals
 
-# 2. 安装依赖
-pip install -r requirements.txt
+# 2. 初始化 Python 3.11 虚拟环境
+bash scripts/bootstrap-dev.sh
 
 # 3. 配置凭证（从模板创建 .env）
 cp .env.example .env
 # 编辑 .env，填入你的 Futu OpenD 地址等（可选，不填用 AKShare 免费源）
 
 # 4. 运行
-python run.py --mode index             # 看指数大盘
-python run.py --mode web2 --port 8001  # 启动精简版 Web
+bash scripts/python.sh run.py --mode index             # 看指数大盘
+bash scripts/python.sh run.py --mode web2 --port 8001  # 启动精简版 Web
 ```
 
 ---

@@ -22,8 +22,8 @@ else
 fi
 
 # ── 2. Python 依赖 ──────────────────────────────
-echo ">>> 安装 Python 依赖..."
-pip install -r requirements.txt
+echo ">>> 初始化 Python 3.11 环境..."
+bash scripts/bootstrap-dev.sh
 
 # ── 3. Futu OpenD ──────────────────────────────
 FUTU_DIR=${FUTU_DIR:-/root/futu}
@@ -55,8 +55,8 @@ if [ -f .cache/name_to_code.json ] && [ -f .cache/board_industry.csv ]; then
     echo "  东财缓存已存在（随 git 同步）"
 else
     echo ">>> 东财缓存缺失，尝试生成..."
-    python deploy/autodl/gen_cache.py || echo "  ⚠️  缓存生成失败（云端东财不通属正常）"
-    echo "  💡 可在本地运行: python deploy/autodl/gen_cache.py --push"
+    bash scripts/python.sh deploy/autodl/gen_cache.py || echo "  ⚠️  缓存生成失败（云端东财不通属正常）"
+    echo "  💡 可在本地运行: bash scripts/python.sh deploy/autodl/gen_cache.py --push"
 fi
 
 # ── 6. cron 定时任务 ──────────────────────────────

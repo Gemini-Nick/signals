@@ -42,6 +42,8 @@ _LAZY_IMPORTS = {
     "ConceptRanking":      "signals.layers.industry",
     "IntraDayScreener":    "signals.layers.screener",
     "review_stock_daily":  "signals.layers.review_screener",
+    # domain pack
+    "SignalsPack":         "signals.domain_pack",
 }
 
 

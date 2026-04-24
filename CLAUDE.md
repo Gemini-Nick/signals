@@ -12,6 +12,12 @@
 - 写代码时同样适用：解决当前问题，不为假想需求设计。
 - 成本敏感：每次 session 消耗 token。能不读源码就不读，能少读就少读。下面的引擎能力表就是为了省这个成本。
 
+## Python 环境
+
+- 本仓固定使用 Python `3.11`
+- 运行仓内代码时，优先使用 `bash scripts/python.sh ...`
+- 首次进入仓库先执行 `bash scripts/bootstrap-dev.sh`
+
 ## 引擎能力（核心函数速查）
 
 | 能力 | 函数 | 模块 | 返回 |
@@ -61,22 +67,22 @@ weclaw 支持三种 Agent 接入模式，推荐使用 ACP：
 
 用你的语言理解能力匹配用户意图，不要死扣关键词。以下每个意图给出典型表达和对应命令：
 
-**盘中全景（intraday）** → `python run.py --mode intraday`
+**盘中全景（intraday）** → `bash scripts/python.sh run.py --mode intraday`
 典型表达：跑一下、行业分析、板块怎么样、帮我看看盘面、现在什么情况、盘中监测、扫一下、哪些板块强
 也包括：恐慌到什么程度了、现在适合抄底吗、恐慌检测、波浪到第几波了、最后一跌了吗
 （恐慌评分+波浪追踪+抄底信号都在 intraday 模式里）
 
-**指数研判（index）** → `python run.py --mode index`
+**指数研判（index）** → `bash scripts/python.sh run.py --mode index`
 典型表达：大盘怎么样、指数分析、市场方向、沪深300啥情况、上证怎么看、仓位建议
 
-**回测+具体标的** → 先询问回测周期（执行 `python -c "from config import DATE_PRESETS; [print(f'{k}: {v[\"label\"]}') for k,v in DATE_PRESETS.items()]"` 获取周期列表），用户选择后执行 `python -m signals.notify.backtest_notify <代码或名称> [频率] --dry-run --start <周期别名>`
+**回测+具体标的** → 先询问回测周期（执行 `bash scripts/python.sh -c "from config import DATE_PRESETS; [print(f'{k}: {v[\"label\"]}') for k,v in DATE_PRESETS.items()]"` 获取周期列表），用户选择后执行 `bash scripts/python.sh -m signals.notify.backtest_notify <代码或名称> [频率] --dry-run --start <周期别名>`
 典型表达：回测天际股份、跑一下002759、看看茅台的信号、这只票怎么样+代码
 频率参数：`daily`（默认）、`weekly`（周线）、`30m`（30分钟）。用户已指定周期时跳过询问
 
-**回测（无标的）** → `python run.py --mode backtest`
+**回测（无标的）** → `bash scripts/python.sh run.py --mode backtest`
 典型表达：跑个全量回测、回测所有
 
-**盘后复盘（review）** → `python run.py --mode review`
+**盘后复盘（review）** → `bash scripts/python.sh run.py --mode review`
 典型表达：复盘、今天信号怎么样、收盘分析、盘后总结
 
 **重启** → 先回复"🔄 正在重启，10秒后恢复"，然后 `nohup sh -c 'sleep 2 && weclaw restart' >/dev/null 2>&1 &`

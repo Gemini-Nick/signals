@@ -3,32 +3,32 @@
 
 # ── A股/港股 盘中扫描 ──────────────────────────
 # 开盘前仅指数快报 (9:25)
-25 9 * * 1-5  cd /app && python run.py --mode index >> /app/logs/cron.log 2>&1
+25 9 * * 1-5  cd /app && bash scripts/python.sh run.py --mode index >> /app/logs/cron.log 2>&1
 
 # 盘中全量扫描 (9:45, 10:30, 11:15, 13:30, 14:30)
-45 9 * * 1-5   cd /app && python run.py >> /app/logs/cron.log 2>&1
-30 10 * * 1-5  cd /app && python run.py >> /app/logs/cron.log 2>&1
-15 11 * * 1-5  cd /app && python run.py >> /app/logs/cron.log 2>&1
-30 13 * * 1-5  cd /app && python run.py >> /app/logs/cron.log 2>&1
-30 14 * * 1-5  cd /app && python run.py >> /app/logs/cron.log 2>&1
+45 9 * * 1-5   cd /app && bash scripts/python.sh run.py >> /app/logs/cron.log 2>&1
+30 10 * * 1-5  cd /app && bash scripts/python.sh run.py >> /app/logs/cron.log 2>&1
+15 11 * * 1-5  cd /app && bash scripts/python.sh run.py >> /app/logs/cron.log 2>&1
+30 13 * * 1-5  cd /app && bash scripts/python.sh run.py >> /app/logs/cron.log 2>&1
+30 14 * * 1-5  cd /app && bash scripts/python.sh run.py >> /app/logs/cron.log 2>&1
 
 # 盘后复盘 (15:15)
-15 15 * * 1-5  cd /app && python run.py --mode review >> /app/logs/cron.log 2>&1
+15 15 * * 1-5  cd /app && bash scripts/python.sh run.py --mode review >> /app/logs/cron.log 2>&1
 
 # ── 美股扫描 (北京时间, 夏令时 EST+13) ────────
-30 22 * * 1-5  cd /app && python run.py --market us >> /app/logs/cron.log 2>&1
-0  0  * * 2-6  cd /app && python run.py --market us >> /app/logs/cron.log 2>&1
+30 22 * * 1-5  cd /app && bash scripts/python.sh run.py --market us >> /app/logs/cron.log 2>&1
+0  0  * * 2-6  cd /app && bash scripts/python.sh run.py --market us >> /app/logs/cron.log 2>&1
 
 # ── 行业聚类飞书推送 (10:00, 14:00) ──────────
-0 10 * * 1-5  cd /app && python -m signals.notify.cluster_notify >> /app/logs/cron.log 2>&1
-0 14 * * 1-5  cd /app && python -m signals.notify.cluster_notify >> /app/logs/cron.log 2>&1
+0 10 * * 1-5  cd /app && bash scripts/python.sh -m signals.notify.cluster_notify >> /app/logs/cron.log 2>&1
+0 14 * * 1-5  cd /app && bash scripts/python.sh -m signals.notify.cluster_notify >> /app/logs/cron.log 2>&1
 
 # ── 数据同步 (盘后 + 周末) ───────────────────
 # 盘后全量同步 (16:30, 交易日结束后)
-30 16 * * 1-5  cd /app && python -m signals.sync --once >> /app/logs/sync-cron.log 2>&1
+30 16 * * 1-5  cd /app && bash scripts/python.sh -m signals.sync --once >> /app/logs/sync-cron.log 2>&1
 
 # 周日成分股全量更新 (10:00)
-0 10 * * 0  cd /app && python -m signals.sync --once --module board_cons >> /app/logs/sync-cron.log 2>&1
+0 10 * * 0  cd /app && bash scripts/python.sh -m signals.sync --once --module board_cons >> /app/logs/sync-cron.log 2>&1
 
 # ── MongoDB 备份 (每日凌晨 3:00) ────────────
 0 3 * * *  docker exec signals-mongo mongodump --uri="mongodb://signals:${MONGO_PASSWORD}@localhost:27017/signals?authSource=admin" --gzip --out=/data/db/backup/$(date +\%Y\%m\%d) 2>/dev/null; find /data/db/backup -maxdepth 1 -mtime +30 -exec rm -rf {} \; 2>/dev/null

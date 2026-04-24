@@ -91,7 +91,7 @@ services:
       mongo:
         condition: service_healthy
     restart: unless-stopped
-    command: python -m signals.sync.engine --daemon
+    command: bash scripts/python.sh -m signals.sync.engine --daemon
     volumes:
       - signals-data:/app/.data
       - signals-logs:/app/logs

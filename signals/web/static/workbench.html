@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="tradingview">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LONG CLAW Terminal</title>
+  <link rel="stylesheet" href="/static/css/themes.css">
+  <link rel="stylesheet" href="/static/css/workbench.css">
+</head>
+<body class="workbench-body">
+  <div class="wb-grid-bg"></div>
+
+  <header class="wb-header">
+    <div class="wb-brand-group">
+      <div class="wb-brand-mark">LC</div>
+      <div class="wb-brand-copy">
+        <div class="wb-brand-title">LONG CLAW</div>
+        <div class="wb-brand-subtitle">Chart-First Signals Terminal</div>
+      </div>
+    </div>
+
+    <div class="wb-header-center">
+      <div class="wb-session-strip">
+        <span class="wb-session-badge" id="wb-session-badge">启动中</span>
+        <span class="wb-session-meta" id="wb-session-meta">正在加载市场上下文…</span>
+      </div>
+      <form class="wb-search-form" id="wb-search-form">
+        <input
+          class="wb-search-input"
+          id="wb-search-input"
+          type="text"
+          placeholder="输入指数 / 行业 / 股票代码或名称"
+          autocomplete="off"
+        />
+        <button class="wb-search-btn" type="submit">切换</button>
+      </form>
+    </div>
+
+    <div class="wb-header-actions">
+      <div class="wb-freq-switch" id="wb-freq-switch">
+        <button class="wb-freq-btn active" data-freq="daily">日线</button>
+        <button class="wb-freq-btn" data-freq="30min">30M</button>
+        <button class="wb-freq-btn" data-freq="15min">15M</button>
+        <button class="wb-freq-btn" data-freq="weekly">周线</button>
+      </div>
+      <button class="wb-icon-btn" id="wb-refresh-btn" title="刷新引擎">↻</button>
+      <button class="wb-icon-btn" id="wb-theme-toggle" title="切换主题">◐</button>
+      <a class="wb-legacy-link" href="/legacy" target="_blank" rel="noreferrer">Legacy</a>
+    </div>
+  </header>
+
+  <div class="wb-notices" id="wb-notices"></div>
+
+  <main class="wb-main">
+    <aside class="wb-sidebar wb-sidebar-left">
+      <section class="wb-panel">
+        <div class="wb-panel-header">
+          <span>主观察列表</span>
+          <span class="wb-panel-meta" id="wb-default-target-label">默认</span>
+        </div>
+        <div class="wb-chip-list" id="wb-quick-targets"></div>
+      </section>
+
+      <section class="wb-panel">
+        <div class="wb-panel-header">
+          <span>高分候选</span>
+          <span class="wb-panel-meta" id="wb-candidate-count">0</span>
+        </div>
+        <div class="wb-list" id="wb-candidates"></div>
+      </section>
+
+      <section class="wb-panel">
+        <div class="wb-panel-header">
+          <span>行业聚类</span>
+          <span class="wb-panel-meta">web2</span>
+        </div>
+        <div class="wb-cluster-list" id="wb-industry-clusters"></div>
+      </section>
+
+      <section class="wb-panel">
+        <div class="wb-panel-header">
+          <span>概念方向</span>
+          <span class="wb-panel-meta">热点</span>
+        </div>
+        <div class="wb-cluster-list" id="wb-concept-clusters"></div>
+      </section>
+
+      <section class="wb-panel">
+        <div class="wb-panel-header">
+          <span>观察池扫描</span>
+          <span class="wb-panel-meta">belief / panic</span>
+        </div>
+        <div class="wb-watch-form">
+          <input class="wb-watch-input" id="wb-watch-direction" type="text" placeholder="方向，如 半导体 / 上证50">
+          <select class="wb-watch-select" id="wb-watch-mode">
+            <option value="belief">信念</option>
+            <option value="panic">恐慌抄底</option>
+          </select>
+          <button class="wb-watch-btn" id="wb-watch-btn" type="button">扫描</button>
+        </div>
+        <div class="wb-list wb-watch-results" id="wb-watch-results"></div>
+      </section>
+    </aside>
+
+    <section class="wb-stage">
+      <div class="wb-target-bar">
+        <div class="wb-target-copy">
+          <div class="wb-target-kind" id="wb-target-kind">INDEX</div>
+          <div class="wb-target-title" id="wb-target-title">等待目标载入…</div>
+          <div class="wb-target-subtitle" id="wb-target-subtitle"></div>
+        </div>
+        <div class="wb-target-stats" id="wb-target-stats"></div>
+      </div>
+
+      <div class="wb-chart-shell">
+        <div class="wb-chart-main" id="wb-chart"></div>
+        <div class="wb-chart-statusbar">
+          <span id="wb-chart-range-label">未选择区间</span>
+          <span id="wb-chart-hint">拖拽缩放 / Shift+拖选区间 / 1 2 3 4 切周期 / / 聚焦搜索</span>
+        </div>
+      </div>
+
+      <div class="wb-bottom">
+        <div class="wb-bottom-tabs" id="wb-bottom-tabs">
+          <button class="wb-tab-btn active" data-tab="backtest">回测工作台</button>
+          <button class="wb-tab-btn" data-tab="review">复盘时间线</button>
+          <button class="wb-tab-btn" data-tab="trades">交易记录</button>
+        </div>
+
+        <div class="wb-tab-panel active" data-tab="backtest">
+          <div class="wb-tab-toolbar">
+            <div class="wb-tab-title">增强回测</div>
+            <div class="wb-tab-meta" id="wb-backtest-target"></div>
+          </div>
+          <div class="wb-kpi-grid" id="wb-backtest-kpis"></div>
+          <div class="wb-subgrid">
+            <div class="wb-subpanel">
+              <div class="wb-subpanel-header">模拟绩效</div>
+              <div class="wb-kpi-grid wb-kpi-grid-compact" id="wb-sim-kpis"></div>
+            </div>
+            <div class="wb-subpanel">
+              <div class="wb-subpanel-header">参数与警告</div>
+              <div class="wb-codebox" id="wb-backtest-config"></div>
+            </div>
+          </div>
+          <div class="wb-table-wrap">
+            <table class="wb-table">
+              <thead>
+                <tr>
+                  <th>信号</th>
+                  <th>日期</th>
+                  <th>价格</th>
+                  <th>频率</th>
+                  <th>置信度</th>
+                </tr>
+              </thead>
+              <tbody id="wb-backtest-signals"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="wb-tab-panel" data-tab="review">
+          <div class="wb-tab-toolbar">
+            <div class="wb-tab-title">复盘上下文</div>
+            <div class="wb-tab-meta" id="wb-review-meta"></div>
+          </div>
+          <div class="wb-review-cards" id="wb-review-cards"></div>
+          <div class="wb-timeline" id="wb-review-timeline"></div>
+        </div>
+
+        <div class="wb-tab-panel" data-tab="trades">
+          <div class="wb-tab-toolbar">
+            <div class="wb-tab-title">交易与遗漏</div>
+            <div class="wb-tab-meta" id="wb-trade-meta"></div>
+          </div>
+          <div class="wb-kpi-grid wb-kpi-grid-compact" id="wb-trade-kpis"></div>
+          <div class="wb-subgrid">
+            <div class="wb-subpanel">
+              <div class="wb-subpanel-header">相关交易</div>
+              <div class="wb-table-wrap">
+                <table class="wb-table">
+                  <thead>
+                    <tr>
+                      <th>标的</th>
+                      <th>入场</th>
+                      <th>出场</th>
+                      <th>盈亏%</th>
+                      <th>评分</th>
+                    </tr>
+                  </thead>
+                  <tbody id="wb-related-trades"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="wb-subpanel">
+              <div class="wb-subpanel-header">遗漏信号</div>
+              <div class="wb-table-wrap">
+                <table class="wb-table">
+                  <thead>
+                    <tr>
+                      <th>标的</th>
+                      <th>信号</th>
+                      <th>日期</th>
+                      <th>潜在收益</th>
+                    </tr>
+                  </thead>
+                  <tbody id="wb-missed-trades"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="wb-sidebar wb-sidebar-right">
+      <section class="wb-panel wb-hero-panel">
+        <div class="wb-panel-header">
+          <span>当前结论</span>
+          <span class="wb-panel-meta" id="wb-summary-kind">分析优先</span>
+        </div>
+        <div class="wb-hero-title" id="wb-hero-title">等待数据</div>
+        <div class="wb-hero-text" id="wb-hero-text">图表加载后，这里会给出当前标的的主结论、趋势和关键位。</div>
+      </section>
+
+      <section class="wb-panel">
+        <div class="wb-panel-header">
+          <span>关键位</span>
+          <span class="wb-panel-meta">levels</span>
+        </div>
+        <div class="wb-level-list" id="wb-key-levels"></div>
+      </section>
+
+      <section class="wb-panel">
+        <div class="wb-panel-header">
+          <span>信号解释</span>
+          <span class="wb-panel-meta" id="wb-signal-count">0</span>
+        </div>
+        <div class="wb-list" id="wb-signal-list"></div>
+      </section>
+
+      <section class="wb-panel">
+        <div class="wb-panel-header">
+          <span>计划与预案</span>
+          <span class="wb-panel-meta">plan</span>
+        </div>
+        <div class="wb-plan-list" id="wb-plan-list"></div>
+      </section>
+
+      <section class="wb-panel">
+        <div class="wb-panel-header">
+          <span>风险提示</span>
+          <span class="wb-panel-meta">risk</span>
+        </div>
+        <div class="wb-risk-list" id="wb-risk-list"></div>
+      </section>
+    </aside>
+  </main>
+
+  <div class="wb-toast" id="wb-toast"></div>
+
+  <script src="/static/vendor/echarts.min.js"></script>
+  <script src="/static/js/workbench.js"></script>
+</body>
+</html>

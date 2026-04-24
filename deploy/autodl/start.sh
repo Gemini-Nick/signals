@@ -18,6 +18,11 @@ set +a
 export DEPLOY_MODE=cloud
 export TZ=Asia/Shanghai
 
+if [ ! -x "$WORK/.venv/bin/python" ]; then
+    echo "  Python 虚拟环境缺失，先执行 bootstrap..."
+    bash "$WORK/scripts/bootstrap-dev.sh"
+fi
+
 echo "🐲 隆小侠 AutoDL 启动..."
 echo "  时区: $(date +'%Z %Y-%m-%d %H:%M:%S')"
 
@@ -62,7 +67,7 @@ start_web() {
         kill $(cat logs/web.pid) 2>/dev/null || true
         rm -f logs/web.pid
     fi
-    nohup python run.py --mode web --port "$port" > logs/web.log 2>&1 &
+    nohup bash "$WORK/scripts/python.sh" run.py --mode web --port "$port" > logs/web.log 2>&1 &
     echo $! > logs/web.pid
     echo "  🌐 Web  服务: PID=$(cat logs/web.pid), port=$port"
 }
@@ -73,7 +78,7 @@ start_web2() {
         kill $(cat logs/web2.pid) 2>/dev/null || true
         rm -f logs/web2.pid
     fi
-    nohup python run.py --mode web2 --port "$port" > logs/web2.log 2>&1 &
+    nohup bash "$WORK/scripts/python.sh" run.py --mode web2 --port "$port" > logs/web2.log 2>&1 &
     echo $! > logs/web2.pid
     echo "  🐲 Web2 服务: PID=$(cat logs/web2.pid), port=$port"
 }
@@ -102,7 +107,7 @@ start_sync() {
         kill $(cat logs/sync.pid) 2>/dev/null || true
         rm -f logs/sync.pid
     fi
-    nohup python -m signals.sync --daemon > logs/sync.log 2>&1 &
+    nohup bash "$WORK/scripts/python.sh" -m signals.sync --daemon > logs/sync.log 2>&1 &
     echo $! > logs/sync.pid
     echo "  🔄 Sync Worker: PID=$(cat logs/sync.pid)"
 }

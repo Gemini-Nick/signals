@@ -22,4 +22,4 @@ COPY deploy/scripts/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["python", "run.py"]
+CMD ["bash", "scripts/python.sh", "run.py"]
