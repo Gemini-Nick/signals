@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import uuid
@@ -225,31 +226,221 @@ class SignalsPack:
         runs = await self.list_runs()
         recent_runs = runs[:recent_limit]
         review_runs = [run for run in recent_runs if run.get("capability") == "review"][:10]
+        connector_health = self._connector_health()
+        diagnostics = self._diagnostics(connector_health)
+        backtest_summary = self._backtest_summary()
+        pending_backlog = self._pending_backlog_preview(backlog_limit)
+        backtest_jobs = self._backtest_jobs(recent_runs)
+        status = self._dashboard_status(connector_health)
+        overview = self._overview(backtest_summary)
         return {
             "pack_id": "signals",
             "title": "Signals",
+            "status": status,
+            "notice": self._dashboard_notice(status, connector_health),
+            "diagnostics": diagnostics,
+            "overview": overview,
             "recent_runs": recent_runs,
             "review_runs": review_runs,
-            "backtest_summary": self._backtest_summary(),
-            "pending_backlog_preview": self._pending_backlog_preview(backlog_limit),
-            "connector_health": self._connector_health(),
-            "operator_actions": [
-                {
-                    "action_id": "pack:signals:run:review",
-                    "run_id": "signals:dashboard",
-                    "kind": "run_pack",
-                    "label": "Run Review",
-                    "payload": {"pack_id": "signals", "capability": "review", "input": {"mode": "review"}},
-                },
-                {
-                    "action_id": "pack:signals:run:backtest",
-                    "run_id": "signals:dashboard",
-                    "kind": "run_pack",
-                    "label": "Run Backtest",
-                    "payload": {"pack_id": "signals", "capability": "backtest", "input": {"mode": "backtest"}},
-                },
-            ],
+            "buy_candidates": [],
+            "sell_warnings": [],
+            "chart_context": None,
+            "backtest_summary": backtest_summary,
+            "backtest_jobs": backtest_jobs,
+            "pending_backlog_preview": pending_backlog,
+            "connector_health": connector_health,
+            "deep_links": self._deep_links(),
+            "operator_actions": self._operator_actions(),
         }
+
+    def _operator_actions(self) -> List[Dict[str, Any]]:
+        actions = [
+            {
+                "action_id": "pack:signals:run:review",
+                "run_id": "signals:dashboard",
+                "kind": "run_pack",
+                "label": "Run Review",
+                "payload": {"pack_id": "signals", "capability": "review", "input": {"mode": "review"}},
+                "metadata": {},
+            },
+            {
+                "action_id": "pack:signals:run:backtest",
+                "run_id": "signals:dashboard",
+                "kind": "run_pack",
+                "label": "Run Backtest",
+                "payload": {"pack_id": "signals", "capability": "backtest", "input": {"mode": "backtest"}},
+                "metadata": {},
+            },
+        ]
+        web_url = os.environ.get("LONGCLAW_SIGNALS_WEB_BASE_URL", "").rstrip("/")
+        web2_url = os.environ.get("LONGCLAW_SIGNALS_WEB2_BASE_URL", "").rstrip("/")
+        if web_url:
+            actions.append({
+                "action_id": "pack:signals:web:url",
+                "run_id": "signals:dashboard",
+                "kind": "open_url",
+                "label": "Open Signals Terminal",
+                "payload": {"url": web_url},
+                "metadata": {},
+            })
+        if web2_url:
+            actions.append({
+                "action_id": "pack:signals:web2:url",
+                "run_id": "signals:dashboard",
+                "kind": "open_url",
+                "label": "Open Signals Web2",
+                "payload": {"url": web2_url},
+                "metadata": {},
+            })
+        return actions
+
+    def _deep_links(self) -> List[Dict[str, Any]]:
+        web_url = os.environ.get("LONGCLAW_SIGNALS_WEB_BASE_URL", "").rstrip("/")
+        web2_url = os.environ.get("LONGCLAW_SIGNALS_WEB2_BASE_URL", "").rstrip("/")
+        links = []
+        if web_url:
+            links.extend([
+                {
+                    "link_id": "signals-terminal",
+                    "label": "Signals Terminal",
+                    "url": web_url,
+                    "kind": "web",
+                },
+                {
+                    "link_id": "signals-legacy",
+                    "label": "Signals Legacy",
+                    "url": f"{web_url}/legacy",
+                    "kind": "web",
+                },
+            ])
+        if web2_url:
+            links.append({
+                "link_id": "signals-web2",
+                "label": "Signals Web2",
+                "url": web2_url,
+                "kind": "web",
+            })
+        return links
+
+    def _diagnostics(self, connector_health: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "diagnostic_id": f"signals-{item['connector_id']}",
+                "status": item.get("status", "unknown"),
+                "label": item.get("connector_id", ""),
+                "detail": item.get("summary", ""),
+                "metadata": item.get("details", {}),
+            }
+            for item in connector_health
+        ]
+
+    def _dashboard_status(self, connector_health: List[Dict[str, Any]]) -> str:
+        statuses = {item.get("status") for item in connector_health}
+        if "critical" in statuses:
+            return "degraded"
+        if "warning" in statuses:
+            return "degraded"
+        return "healthy"
+
+    def _dashboard_notice(self, status: str, connector_health: List[Dict[str, Any]]) -> str:
+        if status == "healthy":
+            return ""
+        bad = [
+            item.get("connector_id", "")
+            for item in connector_health
+            if item.get("status") in {"critical", "warning"}
+        ]
+        return "Degraded connectors: " + ", ".join([item for item in bad if item])
+
+    def _overview(self, backtest_summary: Dict[str, int]) -> Dict[str, Any]:
+        board_resp = self._rank_snapshot("board")
+        concept_resp = self._rank_snapshot("concept")
+        cluster_summary = {
+            "industry_top": board_resp.get("items", []),
+            "concept_top": concept_resp.get("items", []),
+            "sources": {
+                "board": board_resp.get("source", ""),
+                "concept": concept_resp.get("source", ""),
+            },
+            "freshness": {
+                "board": board_resp.get("freshness", ""),
+                "concept": concept_resp.get("freshness", ""),
+            },
+        }
+        data_warnings = [
+            warning
+            for warning in [
+                board_resp.get("warning", ""),
+                concept_resp.get("warning", ""),
+            ]
+            if warning
+        ]
+        return {
+            "market_regime": {},
+            "cluster_summary": cluster_summary,
+            "review_summary": {
+                "backtest_total": backtest_summary.get("total", 0),
+                "backtest_pending": backtest_summary.get("pending", 0),
+            },
+            "data_warning": " ".join(data_warnings),
+        }
+
+    def _rank_snapshot(self, domain: str) -> Dict[str, Any]:
+        try:
+            from signals.data.gateway import get_board_rank, get_concept_rank
+            from signals.data.models import DataRequest
+
+            fn = get_board_rank if domain == "board" else get_concept_rank
+            resp = fn(DataRequest(
+                domain=domain,
+                mode="realtime",
+                market="A",
+                purpose="cluster",
+                allow_stale=True,
+            ))
+            df = resp.data
+            items: List[Dict[str, Any]] = []
+            if df is not None and not getattr(df, "empty", True):
+                sort_col = "change_pct" if "change_pct" in df.columns else None
+                if sort_col:
+                    df = df.sort_values(sort_col, ascending=False)
+                for _, row in df.head(5).iterrows():
+                    items.append({
+                        "label": str(row.get("board_name") or row.get("name") or ""),
+                        "change_pct": float(row.get("change_pct", 0) or 0),
+                        "leader": str(row.get("leader_name", "") or ""),
+                    })
+            return {
+                "items": items,
+                "source": resp.source,
+                "freshness": resp.freshness,
+                "warning": "" if items else f"{domain}_snapshot_empty",
+            }
+        except Exception as exc:
+            return {
+                "items": [],
+                "source": "gateway",
+                "freshness": "empty",
+                "warning": f"{domain}_snapshot_error:{exc.__class__.__name__}",
+            }
+
+    def _backtest_jobs(self, recent_runs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        jobs = []
+        for run in recent_runs:
+            if run.get("capability") != "backtest":
+                continue
+            metadata = dict(run.get("metadata") or {})
+            jobs.append({
+                "job_id": run.get("run_id", ""),
+                "status": run.get("status", "idle"),
+                "symbol": str(metadata.get("symbol") or ""),
+                "freq": str(metadata.get("freq") or ""),
+                "summary": run.get("summary", ""),
+                "updated_at": run.get("finished_at") or run.get("created_at"),
+                "source": "state_root",
+                "metadata": metadata,
+            })
+        return jobs[:10]
 
     async def push_report(
         self,
@@ -370,25 +561,33 @@ class SignalsPack:
     def _backtest_summary(self) -> Dict[str, int]:
         from signals.core.backtest import SignalJournal
 
-        journal = SignalJournal()
+        journal = None
         try:
+            journal = SignalJournal()
             summary = journal.summary()
             return {
                 "total": int(summary.get("total") or 0),
                 "evaluated": int(summary.get("evaluated") or 0),
                 "pending": int(summary.get("pending") or 0),
             }
+        except Exception:
+            return {"total": 0, "evaluated": 0, "pending": 0}
         finally:
-            journal.close()
+            if journal is not None:
+                journal.close()
 
     def _pending_backlog_preview(self, limit: int) -> List[Dict[str, Any]]:
         from signals.core.backtest import SignalJournal
 
-        journal = SignalJournal()
+        journal = None
         try:
+            journal = SignalJournal()
             return [dict(item) for item in journal.get_pending()[:limit]]
+        except Exception:
+            return []
         finally:
-            journal.close()
+            if journal is not None:
+                journal.close()
 
     def _connector_health(self) -> List[Dict[str, Any]]:
         return [
