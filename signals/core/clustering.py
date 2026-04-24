@@ -187,7 +187,7 @@ def _fetch_sina_industry() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _load_industry_df() -> tuple:
+def _load_industry_df(mode: str = "auto", as_of: str = None) -> tuple:
     """
     获取行业数据 — 多源合并模式。
 
@@ -200,78 +200,38 @@ def _load_industry_df() -> tuple:
     Returns:
         (DataFrame, fetch_meta) — fetch_meta 包含 source/data_date/update_time
     """
-    from signals.data.mongo_fallback import (
-        get_latest_df, get_last_trading_day, is_any_market_live, save_snapshot,
-    )
-    from signals.data.board_normalizer import (
-        merge_industry_sources, normalize_ths_industry,
-        normalize_em_industry, normalize_sina_industry,
-    )
+    from signals.data.gateway import get_board_rank
+    from signals.data.models import DataRequest
+    from signals.data.mongo_fallback import get_last_trading_day
     from datetime import datetime as _dt
 
-    live = is_any_market_live()
     trading_day = get_last_trading_day()
     update_time = _dt.now().strftime("%m-%d %H:%M")
 
-    # 检查 MongoDB 数据是否已是最新交易日
-    need_fetch = live  # 盘中始终拉取
-    if not need_fetch:
-        # 盘后/周末：只要有一个源已是最新交易日就不拉取
-        from signals.data.mongo_fallback import get_db
-        db = get_db()
-        has_current = False
-        if db is not None:
-            for col_name in ["board_ths", "board_sina", "board_em"]:
-                try:
-                    latest = db[col_name].find_one({}, sort=[("dt", -1)])
-                    if latest and str(latest.get("dt", "")) >= trading_day:
-                        has_current = True
-                        break
-                except Exception:
-                    continue
-        if not has_current:
-            need_fetch = True
-            logger.info("聚类：所有行业数据源均落后于最近交易日(%s)，触发实时拉取", trading_day)
-
-    if need_fetch:
-        _try_realtime_fetch("board_em", _fetch_em_for_cluster, normalize_em_industry)
-        _try_realtime_fetch("board_ths", _fetch_ths_for_cluster, normalize_ths_industry)
-        _try_realtime_fetch("board_sina", _fetch_sina_industry, normalize_sina_industry)
-
-    # 从 MongoDB 读各源最新数据
-    dfs = {}
-    sources_used = []
-    source_details = []
-    actual_dates = []
-
-    for src, col in [("em", "board_em"), ("ths", "board_ths"), ("sina", "board_sina")]:
-        df = get_latest_df(col)
-        if df is not None and not df.empty:
-            dfs[src] = df
-            if "dt" in df.columns:
-                actual_dates.append(str(df["dt"].iloc[0]))
-            src_label = {"em": "东财", "ths": "THS", "sina": "新浪"}[src]
-            if need_fetch:
-                source_details.append(f"{src_label}(实时API)")
-            else:
-                source_details.append(f"{src_label}(MongoDB历史)")
-            sources_used.append(src)
-
-    actual_date = max(actual_dates) if actual_dates else trading_day
+    response = get_board_rank(DataRequest(
+        domain="board",
+        mode=mode,  # realtime uses source snapshots, historical uses canonical.
+        market="A",
+        as_of=as_of,
+        purpose="cluster" if mode == "realtime" else "",
+    ))
     meta = {
-        "source": " + ".join(source_details) if source_details else "无数据",
-        "data_date": actual_date,
+        "source": response.source or "无数据",
+        "data_date": response.as_of or trading_day,
         "update_time": update_time,
+        "mode_used": response.mode_used,
+        "freshness": response.freshness,
+        "is_stale": response.is_stale,
+        "errors": response.errors,
     }
-
-    if not dfs:
+    df = response.data
+    if df is None or (isinstance(df, pd.DataFrame) and df.empty):
         logger.warning("聚类：所有数据源均无数据")
         return pd.DataFrame(), meta
 
-    # 合并多源
-    merged = merge_industry_sources(dfs)
-    logger.info("聚类：获取到 %d 个行业 (源: %s)", len(merged), meta["source"])
-    return merged, meta
+    logger.info("聚类：获取到 %d 个行业 (源: %s, mode=%s)",
+                len(df), meta["source"], meta["mode_used"])
+    return df, meta
 
 
 def _fetch_em_for_cluster():
@@ -403,7 +363,7 @@ def _rank_clusters(cluster_stats: list) -> list:
 
 # ── 行业板块主题聚合 ──────────────────────────────────────
 
-def cluster_industries(top_n: int = 3, **_kw) -> dict:
+def cluster_industries(top_n: int = 3, mode: str = "auto", as_of: str = None, **_kw) -> dict:
     """
     行业板块主题聚合分析。
 
@@ -413,7 +373,7 @@ def cluster_industries(top_n: int = 3, **_kw) -> dict:
     :param top_n: 返回 Top N 强势主题
     :return: {top: [...], all_clusters: [...], meta: {...}}
     """
-    df_result = _load_industry_df()
+    df_result = _load_industry_df(mode=mode, as_of=as_of)
     # _load_industry_df 返回 (df, fetch_meta) 元组
     if isinstance(df_result, tuple):
         df, fetch_meta = df_result
@@ -555,7 +515,7 @@ def cluster_industries(top_n: int = 3, **_kw) -> dict:
 
 # ── 概念板块主题聚合 ──────────────────────────────────────
 
-def cluster_concepts(top_n: int = 3, **_kw) -> dict:
+def cluster_concepts(top_n: int = 3, mode: str = "auto", as_of: str = None, **_kw) -> dict:
     """
     概念板块主题聚合分析（数据源：新浪/东财/THS 降级链）。
 
@@ -568,7 +528,7 @@ def cluster_concepts(top_n: int = 3, **_kw) -> dict:
     from signals.layers.industry import get_concept_rankings
 
     try:
-        rankings = get_concept_rankings(top_n=80)
+        rankings = get_concept_rankings(top_n=80, mode=mode, as_of=as_of)
     except Exception as e:
         logger.error("概念聚类：获取数据失败: %s", e)
         return {"top": [], "all_clusters": [], "meta": {"error": f"概念数据获取失败: {e}"}}

@@ -21,7 +21,7 @@ import logging
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, time as dt_time
 
 from .db import get_db, close as close_db
 
@@ -51,6 +51,7 @@ class SyncEngine:
         # 延迟导入避免循环
         from .modules import ALL_MODULES
         self.modules = ALL_MODULES
+        self.module_map = {name: (fn, schedule) for name, fn, schedule in self.modules}
 
     def run_module(self, name: str, module_fn) -> dict:
         """
@@ -138,49 +139,88 @@ class SyncEngine:
 
     def run_one(self, module_name: str) -> dict:
         """执行指定模块"""
-        for name, fn, _ in self.modules:
-            if name == module_name:
-                return self.run_module(name, fn)
+        if module_name in self.module_map:
+            fn, _ = self.module_map[module_name]
+            return self.run_module(module_name, fn)
         raise ValueError(f"未知模块: {module_name}，"
                          f"可选: {[m[0] for m in self.modules]}")
+
+    def _has_run_today(self, module_name: str, today: str) -> bool:
+        doc = self.db["sync_log"].find_one(
+            {"_id": f"{module_name}:_meta"},
+            {"last_run": 1, "status": 1},
+        )
+        if not doc:
+            return False
+        last_run = doc.get("last_run")
+        if not last_run:
+            return False
+        if isinstance(last_run, str):
+            ran_today = last_run[:10] == today
+        else:
+            ran_today = last_run.strftime("%Y-%m-%d") == today
+        return ran_today
+
+    @staticmethod
+    def _parse_schedule_time(schedule: str) -> dt_time:
+        for token in schedule.split():
+            if ":" in token:
+                hour, minute = token.split(":", 1)
+                return dt_time(int(hour), int(minute))
+        return dt_time(0, 0)
+
+    @classmethod
+    def _schedule_due(cls, schedule: str, now: datetime) -> bool:
+        weekday = now.weekday()
+        if "weekday" in schedule and weekday >= 5:
+            return False
+        if "Sunday" in schedule and weekday != 6:
+            return False
+        return now.time() >= cls._parse_schedule_time(schedule)
+
+    def bootstrap_preheat(self) -> list[dict]:
+        """Run conservative startup preheat for empty critical collections."""
+        checks = [
+            ("cache_preheat", "bars"),
+            ("board_ranking", "board_ranking"),
+            ("board_cons", "board_constituents"),
+            ("index_daily", "bars"),
+        ]
+        results = []
+        for module_name, collection in checks:
+            if module_name not in self.module_map:
+                continue
+            try:
+                count = self.db[collection].estimated_document_count()
+            except Exception:
+                count = 0
+            if count > 0:
+                continue
+            logger.info("bootstrap preheat: %s empty, running %s", collection, module_name)
+            results.append(self.run_one(module_name))
+        return results
 
     def run_daemon(self, check_interval: int = 60):
         """
         常驻调度模式（--daemon）。
 
-        每分钟检查一次，在预设时间点触发对应模块。
-        生产环境建议用 cron 替代。
+        每分钟检查一次。到达预设时间且当天未成功运行时触发对应模块；
+        daemon 重启或错过精确分钟后仍可补跑。
         """
         logger.info("🐲 同步守护进程启动")
-        last_run_date = {}
+        self.bootstrap_preheat()
 
         while True:
             now = datetime.now()
             today = now.strftime("%Y-%m-%d")
-            weekday = now.weekday()  # 0=Monday, 6=Sunday
-            hhmm = now.strftime("%H:%M")
 
             for name, fn, schedule in self.modules:
-                run_key = f"{name}:{today}"
-                if run_key in last_run_date:
+                if self._has_run_today(name, today):
                     continue
 
-                should_run = False
-
-                if "weekday" in schedule and weekday < 5:
-                    sched_time = schedule.split()[0]
-                    if hhmm == sched_time:
-                        should_run = True
-
-                if "Sunday" in schedule and weekday == 6:
-                    sched_time = schedule.split()[-1]
-                    if hhmm == sched_time:
-                        should_run = True
-
-                if should_run:
+                if self._schedule_due(schedule, now):
                     logger.info(f"⏰ 触发 {name} (schedule: {schedule})")
                     self.run_module(name, fn)
-                    last_run_date[run_key] = now
 
             time.sleep(check_interval)
 

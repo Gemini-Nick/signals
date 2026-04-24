@@ -35,14 +35,12 @@ db.sync_log.createIndex({ module: 1, status: 1 });
 print("✅ sync_log collection created");
 
 // ── 行业排行快照 ──────────────────────────────────────────────
-// 每日快照，不同数据源(ths/em/sina)独立存储
+// 历史收盘 canonical；不同实时源写 board_em/board_ths/board_sina
 db.createCollection("board_ranking");
 db.board_ranking.createIndex({ dt: -1, source: 1 });
 db.board_ranking.createIndex({ dt: -1, board_name: 1 });
-// TTL: 90天自动清理历史排行
-db.board_ranking.createIndex({ dt: 1 }, { expireAfterSeconds: 7776000 });
 
-print("✅ board_ranking collection created (TTL: 90d)");
+print("✅ board_ranking canonical collection created (no TTL)");
 
 // ── 行业成分股 ────────────────────────────────────────────────
 // _id = board_name，如 "半导体"
@@ -59,10 +57,85 @@ print("✅ board_constituents collection created (TTL: 30d)");
 // ── 概念排行快照 ──────────────────────────────────────────────
 db.createCollection("concept_ranking");
 db.concept_ranking.createIndex({ dt: -1, source: 1 });
-// TTL: 90天自动清理
-db.concept_ranking.createIndex({ dt: 1 }, { expireAfterSeconds: 7776000 });
 
-print("✅ concept_ranking collection created (TTL: 90d)");
+print("✅ concept_ranking canonical collection created (no TTL)");
+
+// ── 实时源级快照（短 TTL，不作为历史事实源）──────────────────
+[
+  "board_em", "board_ths", "board_sina",
+  "concept_em", "concept_ths", "concept_sina"
+].forEach(function(name) {
+  db.createCollection(name);
+  db[name].createIndex({ dt: -1 });
+  db[name].createIndex({ dt: -1, board_name: 1 });
+  db[name].createIndex({ dt: 1 }, { expireAfterSeconds: 604800 });
+  print("✅ " + name + " source snapshot collection created (TTL: 7d)");
+});
+
+// ── Provider/Data health metadata ───────────────────────────
+db.createCollection("provider_health");
+db.provider_health.createIndex(
+  { provider: 1, endpoint: 1, domain: 1 },
+  { unique: true }
+);
+db.provider_health.createIndex({ status: 1, last_success_at: -1 });
+print("✅ provider_health collection created");
+
+db.createCollection("data_freshness");
+db.data_freshness.createIndex(
+  { domain: 1, market: 1, mode: 1, collection: 1 },
+  { unique: true }
+);
+db.data_freshness.createIndex({ latest_dt: -1 });
+print("✅ data_freshness collection created");
+
+// ── 运行时缓存集合 ───────────────────────────────────────────
+db.createCollection("stock_names");
+db.stock_names.createIndex({ code: 1 });
+db.stock_names.createIndex({ name: 1 });
+db.stock_names.createIndex({ updated_at: 1 }, { expireAfterSeconds: 2592000 });
+print("✅ stock_names collection created (TTL: 30d)");
+
+db.createCollection("concept_constituents");
+db.concept_constituents.createIndex({ concept_name: 1 });
+db.concept_constituents.createIndex({ updated_at: 1 }, { expireAfterSeconds: 2592000 });
+print("✅ concept_constituents collection created (TTL: 30d)");
+
+[
+  "social_comment", "social_weibo", "social_heat"
+].forEach(function(name) {
+  db.createCollection(name);
+  db[name].createIndex({ dt: -1 });
+  db[name].createIndex({ updated_at: 1 }, { expireAfterSeconds: 604800 });
+  print("✅ " + name + " collection created (TTL: 7d)");
+});
+
+db.createCollection("index_bars");
+db.index_bars.createIndex({ "meta.symbol": 1, "meta.freq": 1, "dt": -1 });
+print("✅ index_bars collection created");
+
+db.createCollection("quote_snapshots");
+db.quote_snapshots.createIndex({ symbol: 1, dt: -1 });
+db.quote_snapshots.createIndex({ dt: 1 }, { expireAfterSeconds: 259200 });
+print("✅ quote_snapshots collection created (TTL: 3d)");
+
+db.createCollection("market_pools");
+db.market_pools.createIndex({ pool: 1, dt: -1 });
+db.market_pools.createIndex({ updated_at: 1 }, { expireAfterSeconds: 604800 });
+print("✅ market_pools collection created (TTL: 7d)");
+
+db.createCollection("rotation_history");
+db.rotation_history.createIndex({ dt: -1 });
+print("✅ rotation_history collection created");
+
+db.createCollection("cluster_history");
+db.cluster_history.createIndex({ dt: -1 });
+print("✅ cluster_history collection created");
+
+db.createCollection("refresh_requests");
+db.refresh_requests.createIndex({ status: 1, created_at: -1 });
+db.refresh_requests.createIndex({ created_at: 1 }, { expireAfterSeconds: 604800 });
+print("✅ refresh_requests collection created (TTL: 7d)");
 
 // ── Bar Cache（替代 DiskBarCache，TTL 自动过期）────────────────
 db.createCollection("bar_cache");

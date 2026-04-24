@@ -25,6 +25,7 @@ from .api.plan import router as plan_router
 from .api.trade import router as trade_router
 from .api.prediction import router as prediction_router
 from .api.workbench import router as workbench_router
+from .api.health import router as health_router
 from signals.web2.api.cluster import start_scheduler as start_cluster_scheduler
 from signals.web2.api.cluster import stop_scheduler as stop_cluster_scheduler
 from .services.engine import get_engine
@@ -62,6 +63,7 @@ def create_app() -> FastAPI:
     app.include_router(trade_router)
     app.include_router(prediction_router)
     app.include_router(workbench_router)
+    app.include_router(health_router)
 
     # 静态文件服务
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

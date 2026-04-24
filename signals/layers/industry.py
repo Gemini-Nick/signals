@@ -74,8 +74,8 @@ def _build_name_to_code_map() -> dict:
     """
     股票名称→6位代码映射（三级缓存）：
     1. 内存（_NAME_TO_CODE 非空直接返回）
-    2. 本地 JSON（.cache/name_to_code.json，7天有效）
-    3. AKShare API（兜底，~60s）
+    2. 本地 JSON（.cache/name_to_code.json）
+    3. Mongo stock_names（sync/cache_preheat 写入）
     """
     global _NAME_TO_CODE
     if _NAME_TO_CODE:
@@ -99,27 +99,22 @@ def _build_name_to_code_map() -> dict:
     except Exception:
         pass
 
-    # API 拉取（东财 stock_info_a_code_name）
-    import akshare as ak
+    # Mongo stock_names: sync/cache_preheat owns external refresh.
     try:
-        df = ak.stock_info_a_code_name()
-        if df is not None and not df.empty:
-            for _, row in df.iterrows():
+        from signals.data.mongo_fallback import get_db
+
+        db = get_db()
+        if db is not None:
+            for row in db["stock_names"].find({}, {"_id": 0, "name": 1, "code": 1, "symbol": 1}):
                 name = str(row.get("name", "")).strip()
-                code = str(row.get("code", "")).strip().zfill(6)
+                code = str(row.get("code") or row.get("symbol") or "").strip().zfill(6)
                 if name and code:
                     _NAME_TO_CODE[name] = code
-            # 写入本地缓存
-            try:
-                os.makedirs(os.path.dirname(_NAME_CACHE_PATH), exist_ok=True)
-                with open(_NAME_CACHE_PATH, "w", encoding="utf-8") as f:
-                    json.dump(_NAME_TO_CODE, f, ensure_ascii=False)
-            except Exception:
-                pass
-            _detail(f"  [✓] 名称映射已加载（{len(_NAME_TO_CODE)} 只，已缓存）")
-            return _NAME_TO_CODE
+            if _NAME_TO_CODE:
+                _detail(f"  [✓] 名称映射从 Mongo 加载（{len(_NAME_TO_CODE)} 只）")
+                return _NAME_TO_CODE
     except Exception as e:
-        _detail(f"  [!] 股票名称映射加载失败（{e.__class__.__name__}）")
+        _detail(f"  [!] 股票名称映射缓存加载失败（{e.__class__.__name__}）")
 
     # 过期缓存兜底（API 失败时仍可使用旧数据）
     try:
@@ -873,70 +868,39 @@ def get_industry_stocks(industry: str) -> List[str]:
     """
     获取指定行业的成分股，返回 Futu 格式代码列表。
 
-    降级链：MongoDB → THS cons_ths → 东财 cons_em → pytdx block.dat → 磁盘缓存
-    MongoDB 优先（云端同步数据），THS 次之（10jqka.com 不封 IP）。
+    Runtime 只读 gateway/Mongo/disk cache；sync/backfill 负责外部成分股刷新。
 
     :param industry: 行业名称，如 "有色金属"、"半导体"
     :return: ["SH.600489", "SZ.002460", ...]
     """
-    import akshare as ak
     _cache_key = f"stocks_{industry}"
 
-    # ── 0. MongoDB 优先（云端同步数据）─────────────
+    # ── 0. DataGateway/Mongo 优先 ─────────────
     try:
-        from signals.data.db_source import get_mongo_source
-        mongo = get_mongo_source()
-        if mongo:
-            codes = mongo.get_board_constituents(industry)
-            if codes:
-                _detail(f"  [MongoDB] {industry} 成分股命中 ({len(codes)}只)")
-                _save_cache(_cache_key, codes)
-                return codes
+        from signals.data.gateway import get_board_constituents
+        from signals.data.models import DataRequest
+
+        resp = get_board_constituents(DataRequest(
+            domain="constituents",
+            mode="historical",
+            market="A",
+            board_name=industry,
+            purpose="review",
+            allow_stale=True,
+        ))
+        codes = resp.data if isinstance(resp.data, list) else []
+        if codes:
+            _detail(f"  [Gateway] {industry} 成分股命中 ({len(codes)}只, source={resp.source})")
+            _save_cache(_cache_key, codes)
+            return codes
     except Exception:
         pass
 
-    # ── 1. THS 成分股（优先，云端可用）───────────────
-    try:
-        df_ths = ak.stock_board_industry_cons_ths(symbol=industry)
-        if df_ths is not None and not df_ths.empty:
-            codes = _extract_stock_codes(df_ths, industry)
-            if codes:
-                _save_cache(_cache_key, codes)
-                return codes
-    except Exception as e:
-        _detail(f"  [!] {industry} THS成分股失败（{e.__class__.__name__}）")
-
-    # ── 2. 东财 cons_em（备选）───────────────────────
-    try:
-        df_em = _em_retry(ak.stock_board_industry_cons_em, symbol=industry, retries=2, delay=1.0)
-        if df_em is not None and not df_em.empty:
-            codes = _extract_stock_codes(df_em, industry)
-            if codes:
-                _save_cache(_cache_key, codes)
-                return codes
-    except Exception as e:
-        _detail(f"  [!] {industry} 东财成分股失败（{e.__class__.__name__}）")
-
-    # ── 3. pytdx block.dat 降级 ──────────────────────
-    pytdx_codes = _fetch_pytdx_industry_stocks(industry)
-    if pytdx_codes:
-        _save_cache(_cache_key, pytdx_codes)
-        return pytdx_codes
-
-    # ── 4. MongoDB 前一交易日 ────────────────────────
-    from signals.data.mongo_fallback import get_latest_docs
-    mongo_docs = get_latest_docs("board_constituents", {"board_name": industry})
-    if mongo_docs:
-        stocks = []
-        for doc in mongo_docs:
-            if "stocks" in doc:
-                stocks = doc["stocks"]
-                break
-            elif "code" in doc:
-                stocks.append(doc["code"])
-        if stocks:
-            _detail(f"  [MongoDB] {industry} 成分股 {len(stocks)} 只（前一交易日）")
-            return stocks
+    # ── 1. 磁盘兼容缓存 ────────────────────────
+    cached = _load_cache(_cache_key, max_age_hours=24 * 30)
+    if isinstance(cached, list) and cached:
+        _detail(f"  [disk] {industry} 成分股命中 ({len(cached)}只)")
+        return cached
     return []
 
 
@@ -1206,7 +1170,7 @@ def get_industry_bars(industry: str,
                       start_date: str = None):
     """
     获取行业板块日线 K 线。
-    降级链：MongoDB → 同花顺(12s) → 东财(6s) → 磁盘缓存(24h) → 空
+    Runtime 只读 MongoDB/disk cache；sync/backfill 负责 THS/东财补数。
 
     :param industry:     行业名称，如 "有色金属"
     :param lookback_days: 盘中模式：近 N 自然日（默认180）
@@ -1237,25 +1201,7 @@ def get_industry_bars(industry: str,
     except Exception:
         pass
 
-    # 1. 同花顺优先（云端不封）
-    df = _get_industry_bars_ths(industry, s_date, e_date)
-    if df is not None:
-        bars = _to_raw_bars(df, industry, Freq.D,
-                            "dt", "open", "high", "low", "close", "vol", "amount")
-        if bars:
-            _save_bars_cache(industry, bars, source="ths")
-            return bars
-
-    # 2. 东财备选
-    df = _get_industry_bars_em(industry, s_date, e_date)
-    if df is not None:
-        bars = _to_raw_bars(df, industry, Freq.D,
-                            "dt", "open", "high", "low", "close", "vol", "amount")
-        if bars:
-            _save_bars_cache(industry, bars, source="em")
-            return bars
-
-    # 3. 磁盘缓存
+    # 1. 磁盘兼容缓存
     cached = _load_bars_cache(industry)
     if cached:
         return cached
@@ -1476,14 +1422,9 @@ def get_top_industries_by_gain(top_n: int = 10, period: str = "今日") -> list:
 _KNOWN_INDUSTRY_NAMES: Optional[set] = None
 
 def _get_known_industry_names() -> set:
-    """返回已知东财行业名称集合，优先从接口加载，失败则返回内置集合。"""
+    """返回已知行业名称集合，不在 runtime 同步请求外部接口。"""
     global _KNOWN_INDUSTRY_NAMES
     if _KNOWN_INDUSTRY_NAMES is not None:
-        return _KNOWN_INDUSTRY_NAMES
-
-    df = _fetch_board_industry_name_em()
-    if df is not None and not df.empty and "板块名称" in df.columns:
-        _KNOWN_INDUSTRY_NAMES = set(df["板块名称"].tolist())
         return _KNOWN_INDUSTRY_NAMES
 
     # 内置常用东财行业名（保底）
@@ -1907,68 +1848,86 @@ def _get_concepts_sina(top_n: int = 10) -> List[ConceptRanking]:
     return results
 
 
-def get_concept_rankings(top_n: int = None) -> List[ConceptRanking]:
+def _concept_rankings_from_df(df, top_n: int, tag: str = "gateway") -> List[ConceptRanking]:
+    """Gateway DataFrame → ConceptRanking list."""
+    if df is None or df.empty:
+        return []
+    results = []
+    for _, item in df.iterrows():
+        name = str(
+            item.get("board_name")
+            or item.get("concept_name")
+            or item.get("concept")
+            or item.get("name")
+            or ""
+        ).strip()
+        if not name or _is_noise_concept(name):
+            continue
+        gain = float(item.get("change_pct", item.get("gain_pct", 0)) or 0)
+        leading_gain = float(item.get("leader_change_pct", item.get("leading_gain", 0)) or 0)
+        up_count = int(item.get("up_count", 0) or 0)
+        down_count = int(item.get("down_count", 0) or 0)
+        turnover = float(item.get("turnover_pct", item.get("turnover_rate", 0)) or 0)
+        stype = _classify_concept(name)
+        score = _compute_concept_score(
+            gain, up_count, down_count, turnover, leading_gain, stype)
+        results.append(ConceptRanking(
+            name=name,
+            code=str(item.get("board_code", item.get("concept_code", item.get("code", ""))) or ""),
+            gain_pct=gain,
+            leading_stock=str(item.get("leader_name", item.get("leading_stock", "")) or ""),
+            leading_gain=leading_gain,
+            sector_type=stype,
+            tag=tag,
+            up_count=up_count,
+            down_count=down_count,
+            turnover_rate=turnover,
+            composite_score=score,
+            related_industries=_map_concept_to_industries(name),
+        ))
+    results.sort(key=lambda x: x.composite_score, reverse=True)
+    return results[:top_n]
+
+
+def get_concept_rankings(top_n: int = None,
+                         mode: str = "auto",
+                         as_of: str = None) -> List[ConceptRanking]:
     """
     获取概念板块综合排行 top N（过滤噪音 + 多维评分）。
 
-    交易日盘中 → 新浪/东财/THS 实时（第一序列平等）→ MongoDB
-    非交易日/盘后 → MongoDB 前一交易日 → 实时源兜底
+    Runtime 只读 DataGateway 缓存/snapshot。外部源预热由 sync/backfill 负责。
     """
-    import akshare as ak
     import config as _cfg
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-    from signals.data.mongo_fallback import is_any_market_live
+    from signals.data.gateway import get_concept_rank
+    from signals.data.models import DataRequest
 
     if top_n is None:
         top_n = getattr(_cfg, "CONCEPT_TOP_N", 15)
 
-    # ── 非交易日/盘后：MongoDB 多源优先（数据必须是最近交易日） ──
-    if not is_any_market_live():
-        from signals.data.mongo_fallback import get_latest_docs, get_last_trading_day
-        trading_day = get_last_trading_day()
-        # 优先读新集合 (concept_sina > concept_ths > concept_em)，兜底 concept_ranking
-        for col_name, src_tag in [
-            ("concept_sina", "sina"), ("concept_ths", "ths"),
-            ("concept_em", "em"), ("concept_ranking", "mongo"),
-        ]:
-            mongo_docs = get_latest_docs(col_name)
-            if not mongo_docs:
-                continue
-            # 检查数据日期，落后于最近交易日则跳过，走实时源
-            doc_dt = str(mongo_docs[0].get("dt", ""))
-            if doc_dt < trading_day:
-                _detail(f"  [非交易日] {col_name} 数据({doc_dt})落后于最近交易日({trading_day})，跳过")
-                continue
-            results = []
-            for item in mongo_docs:
-                # 兼容新 (board_name/change_pct) 和旧 (name/gain_pct) 字段
-                name = item.get("board_name") or item.get("name", "")
-                gain = item.get("change_pct") or item.get("gain_pct", 0)
-                if not name:
-                    continue
-                gain = float(gain) if gain else 0.0
-                stype = _classify_concept(name)
-                score = _compute_concept_score(gain, 0, 0, 0, 0, stype)
-                results.append(ConceptRanking(
-                    name=name,
-                    code=item.get("leader_code", item.get("code", "")),
-                    gain_pct=gain,
-                    leading_stock=item.get("leader_name", item.get("leading_stock", "")),
-                    leading_gain=float(item.get("leader_change_pct", item.get("leading_gain", 0)) or 0),
-                    sector_type=stype,
-                    tag=src_tag,
-                    up_count=int(item.get("up_count", 0) or 0),
-                    down_count=int(item.get("down_count", 0) or 0),
-                    turnover_rate=float(item.get("turnover_pct", item.get("turnover_rate", 0)) or 0),
-                    composite_score=score,
-                    related_industries=_map_concept_to_industries(name),
-                ))
-            if results:
-                results.sort(key=lambda x: x.composite_score, reverse=True)
-                src_label = {"sina": "新浪(MongoDB历史)", "ths": "THS(MongoDB历史)", "em": "东财(MongoDB历史)", "mongo": "MongoDB"}[src_tag]
-                _detail(f"  [非交易日] 概念板块从 {col_name} 读取 {len(results)} 条 (源: {src_label})")
-                return results[:top_n]
-        _detail("  [非交易日] MongoDB 无概念数据，尝试实时源")
+    # Explicit gateway routing is the source of truth. Historical requests read
+    # concept_ranking first; realtime requests refresh/read concept_* snapshots.
+    try:
+        response = get_concept_rank(DataRequest(
+            domain="concept",
+            mode=mode,
+            market="A",
+            as_of=as_of,
+            purpose="intraday" if mode == "realtime" else "",
+        ))
+        gateway_results = _concept_rankings_from_df(
+            response.data, top_n, tag=response.source or response.mode_used)
+        if gateway_results:
+            _detail(
+                f"  [DataGateway] 概念板块 {len(gateway_results)} 条 "
+                f"(mode={response.mode_used}, source={response.source}, "
+                f"freshness={response.freshness})"
+            )
+            return gateway_results
+    except Exception as e:
+        _detail(f"  [DataGateway] 概念板块读取失败: {e}")
+
+    _detail("  [DataGateway] 概念板块缓存缺失，返回空结果；等待 sync/backfill 预热")
+    return []
 
     # ── 盘中/MongoDB 无数据：实时源 ──────────
     # 0. 新浪优先（2.4s, 175概念, 云端不封）
@@ -2116,6 +2075,25 @@ def _match_concepts_to_industries(
 # ─────────────────────────────────────────────────────────
 # 数据加载函数（涨停池、强势股、融资等）
 # ─────────────────────────────────────────────────────────
+
+def _load_runtime_pool_cache(pool_name: str, date_str: str) -> dict:
+    """Read preheated market-pool data without calling external providers."""
+    try:
+        from signals.data.mongo_fallback import get_db
+
+        db = get_db()
+        if db is None:
+            return {}
+        doc = db["market_pools"].find_one(
+            {"pool": pool_name, "dt": date_str},
+            {"_id": 0, "data": 1},
+            sort=[("updated_at", -1)],
+        )
+        data = (doc or {}).get("data")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
 
 def _load_zt_pool(date_str: str) -> dict:
     """
@@ -2663,7 +2641,9 @@ def compute_historical_composite_scores(
 # ─────────────────────────────────────────────────────────
 
 def get_industry_representatives(top_n: int = None,
-                                  date_str: str = None) -> Tuple[
+                                  date_str: str = None,
+                                  mode: str = "auto",
+                                  as_of: str = None) -> Tuple[
         List[IndustryRanking], List[IndustryRanking],
         List[IndustryRanking], List[ConceptRanking],
         List[IndustryRanking]]:
@@ -2688,23 +2668,27 @@ def get_industry_representatives(top_n: int = None,
              concepts       — 概念板块涨幅排行（带分类标签）
              oversold_list  — 超跌行业（评分>=40，盘后模式为空）
     """
-    import akshare as ak
     import config as _cfg
     from datetime import datetime
+    from signals.data.gateway import get_board_rank
+    from signals.data.models import DataRequest, resolve_mode
 
     if top_n is None:
         top_n = getattr(_cfg, "RANK_TOP_N", 10)
     max_per_ind = getattr(_cfg, "RANK_MAX_STOCKS_PER_IND", 5)
-    target_date = date_str or datetime.now().strftime("%Y%m%d")
-    is_historical = date_str is not None  # 盘后模式标志
+    target_date = date_str or as_of or datetime.now().strftime("%Y%m%d")
+    gateway_request = DataRequest(
+        domain="board",
+        mode="historical" if date_str else mode,
+        market="A",
+        as_of=as_of or date_str,
+        purpose="review" if date_str else ("intraday" if mode == "realtime" else ""),
+    )
+    resolved_mode = resolve_mode(gateway_request)
+    is_historical = resolved_mode == "historical"
 
-    # ── 0. 东财健康预检（3s 快速探测，失败则全局熔断跳过所有东财调用）──
     import time as _time
     _l2_start = _time.monotonic()
-
-    _t0 = _time.monotonic()
-    _em_health_probe(timeout=3.0)
-    _detail(f"  [⏱] 东财健康预检 — {_time.monotonic() - _t0:.1f}s (熔断={_EM_CIRCUIT_OPEN})")
 
     # ── 1. 加载所有数据源 ────────────────────────────────
     _t0 = _time.monotonic()
@@ -2714,37 +2698,30 @@ def get_industry_representatives(top_n: int = None,
     change_df = None
     name_df = None
 
-    # 并行加载所有独立数据源（ThreadPool，IO密集型）
-    # 盘中模式：change_em + name_em 也并入并行池
+    # 并行加载本地缓存/已预热数据。runtime 不触发外部行情接口。
     from concurrent.futures import ThreadPoolExecutor, as_completed
     _pool_tasks = {
-        "zt_pool":      lambda: _load_zt_pool(target_date),
-        "strong_pool":  lambda: _load_strong_pool(target_date),
-        "margin_map":   lambda: _load_margin_map(target_date),
-        "dt_count":     lambda: _load_dt_pool(target_date),
-        "zbgc_count":   lambda: _load_zbgc_pool(target_date),
+        "zt_pool":      lambda: _load_runtime_pool_cache("zt_pool", target_date),
+        "strong_pool":  lambda: _load_runtime_pool_cache("strong_pool", target_date),
+        "margin_map":   lambda: _load_runtime_pool_cache("margin_map", target_date),
+        "dt_count":     lambda: _load_runtime_pool_cache("dt_pool", target_date),
+        "zbgc_count":   lambda: _load_runtime_pool_cache("zbgc_pool", target_date),
         "name_to_code": lambda: _build_name_to_code_map(),
     }
     # 概念板块排行（盘中/盘后均可）
-    _pool_tasks["concepts"] = lambda: get_concept_rankings()
+    _pool_tasks["concepts"] = lambda: get_concept_rankings(
+        mode=resolved_mode, as_of=as_of or date_str)
 
     if not is_historical:
-        def _load_change_em():
-            try:
-                df = ak.stock_board_change_em()
-                if df is not None and not df.empty:
-                    _detail(f"  [✓] 全板块异动 {len(df)} 条")
-                    return df
-            except Exception as e:
-                _detail(f"  [!] 全板块异动接口失败（{e.__class__.__name__}）")
-            return None
-        _pool_tasks["change_df"] = _load_change_em
-        _pool_tasks["name_df"] = lambda: _fetch_industry_ranking_with_fallback()
-        _pool_tasks["concepts"] = lambda: get_concept_rankings()
+        _pool_tasks["name_df"] = lambda: get_board_rank(gateway_request).data
+        _pool_tasks["concepts"] = lambda: get_concept_rankings(
+            mode=resolved_mode, as_of=as_of or date_str)
+        _detail("  [i] 实时模式：行业排行读取 source snapshot，跳过 change_em 实时接口")
     else:
-        _detail("  [i] 盘后模式：跳过 change_em / name_em（仅实时接口）")
+        _pool_tasks["name_df"] = lambda: get_board_rank(gateway_request).data
+        _detail("  [i] 历史/收盘模式：跳过 change_em（实时接口），行业排行走 canonical")
     _pool_results = {}
-    with _no_proxy(), ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(fn): key for key, fn in _pool_tasks.items()}
         for f in as_completed(futures):
             key = futures[f]
@@ -2765,7 +2742,21 @@ def get_industry_representatives(top_n: int = None,
     if name_df is not None and not isinstance(name_df, pd.DataFrame):
         name_df = None
     if name_df is not None and not name_df.empty:
+        # Gateway returns canonical columns; legacy L2 scoring still expects
+        # AKShare-style Chinese columns in several branches.
+        legacy_cols = {
+            "board_name": "板块名称",
+            "change_pct": "涨跌幅",
+            "leader_name": "领涨股票",
+            "leader_change_pct": "领涨股票-涨跌幅",
+        }
+        for src_col, dst_col in legacy_cols.items():
+            if src_col in name_df.columns and dst_col not in name_df.columns:
+                name_df[dst_col] = name_df[src_col]
+    if name_df is not None and not name_df.empty:
         _detail(f"  [✓] 行业板块行情 {len(name_df)} 条")
+    if not is_historical and (change_df is None or change_df.empty) and name_df is not None and not name_df.empty:
+        change_df = name_df
     concepts: List[ConceptRanking] = _pool_results.get("concepts") or []
     _detail(f"  [⏱] 数据源并行加载 — {_time.monotonic() - _t0:.1f}s")
 

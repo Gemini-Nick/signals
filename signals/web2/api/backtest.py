@@ -258,6 +258,79 @@ def _attach_kline_meta(df: pd.DataFrame, source: str, detail: str, **meta: Any) 
     return df
 
 
+def _eastmoney_secid(code: str, market: str) -> str:
+    if market == "HK":
+        return f"116.{code}"
+    prefix = "1" if code.startswith(("5", "6", "9")) else "0"
+    return f"{prefix}.{code}"
+
+
+def _fetch_eastmoney_push2his(
+    code: str,
+    market: str,
+    freq: str,
+    start_date: str,
+    end_date: str,
+    timeout: int = 8,
+) -> pd.DataFrame:
+    """
+    Fetch Eastmoney push2his K lines without AKShare.
+
+    AKShare's wrapper is unstable on the local Clash Verge TUN/fake-ip route.
+    This native request preserves the working system proxy path and only parses
+    the K-line fields Signals needs.
+    """
+    import requests
+
+    klt = {"daily": "101", "weekly": "102", "monthly": "103"}.get(freq)
+    if not klt:
+        return pd.DataFrame()
+
+    session = requests.Session()
+    session.trust_env = True
+    response = session.get(
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+        params={
+            "secid": _eastmoney_secid(code, market),
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": klt,
+            "fqt": "1",
+            "beg": start_date,
+            "end": end_date,
+        },
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            "Referer": "https://quote.eastmoney.com/",
+            "Accept": "application/json,text/plain,*/*",
+        },
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    klines = (payload.get("data") or {}).get("klines") or []
+    rows = []
+    for item in klines:
+        parts = item.split(",")
+        if len(parts) < 6:
+            continue
+        rows.append({
+            "dt": parts[0],
+            "open": parts[1],
+            "close": parts[2],
+            "high": parts[3],
+            "low": parts[4],
+            "vol": parts[5],
+        })
+    df = _records_to_df(rows)
+    if not df.empty:
+        df.attrs["eastmoney_rc"] = payload.get("rc")
+    return df
+
+
 def _kline_meta(df: pd.DataFrame, freq: str) -> dict[str, Any]:
     as_of = None
     if not df.empty:
@@ -291,10 +364,10 @@ def _kline_meta(df: pd.DataFrame, freq: str) -> dict[str, Any]:
     }
 
 
-def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
+def _fetch_kline_legacy(code: str, market: str, freq: str) -> pd.DataFrame:
     """
     拉取 K 线数据，降级链：
-      东财 ak.stock_zh_a_hist → 新浪 ak.stock_zh_a_daily → MongoDB 历史数据
+      Mongo bars → 磁盘缓存 → 东财 push2his 原生请求 → 新浪 → AKShare/MongoDB 兜底
     返回带 datetime index 的 DataFrame。
     """
     import akshare as ak
@@ -357,9 +430,22 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
     edt = datetime.now().strftime("%Y%m%d")
     period = {"daily": "daily", "weekly": "weekly", "monthly": "monthly"}.get(freq, "weekly")
 
-    # ── 源 1: 新浪日线 + 本地聚合 ─────────────────────
-    # push2his 在 Clash TUN/fake-ip 环境下不稳定；A 股日/周/月线先走
-    # 新浪日线，再由日线聚合周线/月线，避免东财故障拖垮产品主链路。
+    # ── 源 1: 东财 push2his 原生请求 ─────────────────
+    try:
+        if market in {"A", "HK"} and freq in {"daily", "weekly", "monthly"}:
+            df_em = _fetch_eastmoney_push2his(code, market, freq, sdt, edt)
+            if not df_em.empty:
+                _attach_kline_meta(df_em, "eastmoney_push2his", f"{code} {freq} 东财 push2his")
+                logger.info("东财 push2his K线成功: %s %s (%d 根)", code, freq, len(df_em))
+                _save_kline_cache(df_em, code, freq)
+                save_kline("kline_cache", code, freq, _df_to_records(df_em))
+                return df_em
+    except Exception as e:
+        err_msg = str(e)
+        errors.append(f"eastmoney_push2his: {err_msg[:120]}")
+        logger.warning("东财 push2his 原生请求失败: %s %s — %s", code, freq, err_msg[:120])
+
+    # ── 源 2: 新浪日线 + 本地聚合 ─────────────────────
     if market == "A" and freq in {"daily", "weekly", "monthly"}:
         sina_attempted = True
         try:
@@ -401,7 +487,7 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
             errors.append(f"sina: {str(e)[:120]}")
             logger.warning("新浪优先K线失败: %s %s — %s", code, freq, str(e)[:80])
 
-    # ── 源 2: 东财 ──────────────────────────────────
+    # ── 源 3: AKShare 东财封装兜底 ──────────────────
     try:
         with _no_proxy():
             if market == "A":
@@ -472,6 +558,34 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
         f"所有数据源均失败（Mongo bars/磁盘缓存/东财/新浪/MongoDB kline_cache），{code} 无可用数据。"
         + (f" 最近错误: {' | '.join(errors[-3:])}" if errors else "")
     )
+
+
+def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
+    """Fetch backtest K-lines through the Data Gateway as historical data."""
+    from signals.data.gateway import get_kline
+    from signals.data.models import DataRequest
+
+    request = DataRequest(
+        domain="kline",
+        mode="historical",
+        market=market,
+        freq=_normalize_freq(freq),
+        symbol=code,
+        purpose="backtest",
+    )
+    response = get_kline(
+        request,
+        legacy_fetcher=lambda: _fetch_kline_legacy(code, market, freq),
+    )
+    if response.data is None or response.data.empty:
+        raise ConnectionError(
+            f"历史K线不可用: {code} {freq}; "
+            f"source={response.source}; errors={' | '.join(response.errors)}"
+        )
+    response.data.attrs.setdefault("data_source", response.source)
+    response.data.attrs["gateway_mode"] = response.mode_used
+    response.data.attrs["gateway_freshness"] = response.freshness
+    return response.data
 
 
 def _df_to_records(df: pd.DataFrame) -> list:
@@ -1255,14 +1369,49 @@ async def backtest_analyze(
 async def push2his_health(
     code: str = Query("002759"),
     timeout: int = Query(8, ge=1, le=30),
+    live: bool = Query(False, description="显式 live=true 时才直连东财做人工诊断"),
 ):
     """
     独立探测东财 push2his K 线链路。
-    不再用行业/概念接口健康替代 K 线接口健康。
+    默认只读 provider_health，避免 web2 runtime 请求时同步打外部源。
     """
     import time
-    import akshare as ak
-    from signals.data.fetcher import _no_proxy
+
+    if not live:
+        try:
+            from signals.data.mongo_fallback import get_db
+
+            db = get_db()
+            if db is None:
+                return {
+                    "status": "pending",
+                    "mode": "cached",
+                    "live_check": False,
+                    "checked_at": datetime.now().isoformat(timespec="seconds"),
+                    "checks": [],
+                    "error": "mongo_disabled",
+                }
+            docs = list(db["provider_health"].find(
+                {"provider": {"$in": ["eastmoney", "em"]}},
+                {"_id": 0},
+            ).sort("last_success_at", -1).limit(10))
+            status = "healthy" if any(doc.get("status") == "ok" for doc in docs) else "pending"
+            return {
+                "status": status,
+                "mode": "cached",
+                "live_check": False,
+                "checked_at": datetime.now().isoformat(timespec="seconds"),
+                "checks": docs,
+            }
+        except Exception as exc:
+            return {
+                "status": "degraded",
+                "mode": "cached",
+                "live_check": False,
+                "checked_at": datetime.now().isoformat(timespec="seconds"),
+                "checks": [],
+                "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+            }
 
     checks = []
     overall_ok = True
@@ -1272,15 +1421,14 @@ async def push2his_health(
         rows = 0
         error = ""
         try:
-            with _no_proxy():
-                df = ak.stock_zh_a_hist(
-                    symbol=code,
-                    period=period,
-                    start_date=(datetime.now() - timedelta(days=120)).strftime("%Y%m%d"),
-                    end_date=datetime.now().strftime("%Y%m%d"),
-                    adjust="qfq",
-                    timeout=timeout,
-                )
+            df = _fetch_eastmoney_push2his(
+                code=code,
+                market=_detect_market(code),
+                freq=period,
+                start_date=(datetime.now() - timedelta(days=120)).strftime("%Y%m%d"),
+                end_date=datetime.now().strftime("%Y%m%d"),
+                timeout=timeout,
+            )
             rows = 0 if df is None else len(df)
             ok = rows > 0
         except Exception as exc:

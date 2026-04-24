@@ -136,76 +136,32 @@ def _load_stock_daily_bars(futu_code: str, start_date: str,
     加载个股日线，供盘后复盘使用。
     返回 (bars, error_type): bars 为空时 error_type 标识失败原因。
 
-    优先级: 磁盘缓存(当日) → 东财(stock_zh_a_hist) → Sina(stock_zh_a_daily)
-    美股路径: USDataSource（独立降级链）
+    Runtime path is cache-only. sync/backfill owns external provider refresh.
     """
-    from signals.data.fetcher import AKShareSource, detect_market
-    from signals.data.us_factory import create_us_source
-    edt = end_date or datetime.now().strftime("%Y-%m-%d")
+    from signals.data.fetcher import detect_market
+    from signals.data.gateway import get_kline
+    from signals.data.models import DataRequest
+
     market = detect_market(futu_code)
-
-    # ── 缓存命中（A股，当日有效）──
-    if market == "A":
-        today = datetime.now().strftime("%Y%m%d")
-        cache_key = f"{futu_code.replace('.', '_')}_{today}"
-        cache = get_cache()
-        cached = cache.get(cache_key)
-        if cached is not None:
-            bars = _records_to_rawbars(cached, futu_code)
-            if bars:
-                return bars, ""
-
-    # ── 美股路径 ──
-    if market == "US":
-        try:
-            us = create_us_source("review")
-            bars = us.get_us_daily(futu_code)
-            return (bars, "") if bars else ([], "no_data")
-        except Exception as e:
-            err = f"{type(e).__name__}"
-            _log(f"  [✗] {futu_code} 美股日线失败：{err}")
-            return [], "us_error"
-
-    # ── A股路径 ──
-    ak_src = AKShareSource()
-
-    # 1. 东财源（SSL 计数器未超限时尝试，8s 超时保护）
-    if _em_ssl_fails < _EM_SKIP_THRESHOLD:
-        try:
-            bars = ak_src._call_with_timeout(
-                lambda: ak_src.get_a_daily(futu_code, sdt=start_date, edt=edt,
-                                            max_retries=1),
-                timeout=8.0,
-            )
-            if bars:
-                _reset_em_counter()
-                cache.set(cache_key, _bars_to_records(bars))
-                return bars, ""
-        except Exception as e:
-            if _is_ssl_error(e) or isinstance(e, TimeoutError):
-                _bump_em_fail("日线")
-            else:
-                err_msg = f"{type(e).__name__}: {e}"
-                if len(err_msg) > 80:
-                    err_msg = err_msg[:80] + "..."
-                _log(f"  [✗] {futu_code} 东财日线失败：{err_msg}")
-
-    # 2. Sina 源（降级，受连续失败计数器控制）
-    if _sina_fails < _SINA_SKIP_THRESHOLD:
-        try:
-            bars = ak_src.get_a_daily_sina(futu_code, sdt=start_date, edt=edt)
-            if bars:
-                _reset_sina_counter()
-                cache.set(cache_key, _bars_to_records(bars))
-                return bars, ""
-        except Exception as e:
-            _bump_sina_fail()
-            err_msg = f"{type(e).__name__}: {e}"
-            if len(err_msg) > 80:
-                err_msg = err_msg[:80] + "..."
-            _log(f"  [✗] {futu_code} Sina日线也失败：{err_msg}")
-
-    return [], "no_data"
+    resp = get_kline(DataRequest(
+        domain="kline",
+        mode="historical",
+        market=market,
+        symbol=futu_code,
+        freq="daily",
+        as_of=end_date,
+        purpose="review",
+        allow_stale=True,
+    ))
+    df = resp.data
+    if df is None or df.empty:
+        return [], "cache_miss"
+    df = df.reset_index().rename(columns={"index": "dt"})
+    if start_date:
+        df = df[pd.to_datetime(df["dt"]) >= pd.to_datetime(start_date)]
+    records = df.to_dict("records")
+    bars = _records_to_rawbars(records, futu_code)
+    return (bars, "") if bars else ([], "cache_miss")
 
 
 # ─────────────────────────────────────────────────────────
@@ -253,37 +209,45 @@ def resample_daily_to_weekly(bars: List[RawBar], symbol: str) -> List[RawBar]:
 def _load_stock_minute_bars(futu_code: str, freq: Freq) -> List[RawBar]:
     """
     加载个股分钟线（最近5天），供盘后复盘的"当下补充"。
-    A股降级链: Sina(stock_zh_a_minute) → 东财(stock_zh_a_hist_min_em)
-    双熔断：Sina 连续失败时跳过 Sina，东财 SSL 连续失败时跳过东财。
+    Runtime path is cache-only.
     """
-    from signals.data.fetcher import AKShareSource, detect_market
+    from signals.data.fetcher import detect_market
+    from signals.data.gateway import get_kline
+    from signals.data.models import DataRequest
+
     market = detect_market(futu_code)
     if market != "A":
         return []  # 暂只支持A股
-    ak_src = AKShareSource()
-
-    # 1. Sina 源（优先，受连续失败计数器控制）
-    if _sina_fails < _SINA_SKIP_THRESHOLD:
-        try:
-            bars = ak_src.get_a_minute(futu_code, freq, timeout=10.0)
-            if bars:
-                _reset_sina_counter()
-                return bars
-        except Exception:
-            _bump_sina_fail()
-
-    # 2. 东财源（SSL 计数器控制）
-    if _em_ssl_fails < _EM_SKIP_THRESHOLD:
-        try:
-            bars = ak_src.get_a_minute_em(futu_code, freq, max_retries=1)
-            if bars:
-                _reset_em_counter()
-                return bars
-        except Exception as e:
-            if _is_ssl_error(e):
-                _bump_em_fail("分钟线")
-
-    return []
+    freq_value = "30m" if freq == Freq.F30 else "15m"
+    resp = get_kline(DataRequest(
+        domain="kline",
+        mode="historical",
+        market=market,
+        symbol=futu_code,
+        freq=freq_value,
+        purpose="review",
+        allow_stale=True,
+    ))
+    df = resp.data
+    if df is None or df.empty:
+        return []
+    df = df.reset_index().rename(columns={"index": "dt"})
+    records = df.to_dict("records")
+    bars = _records_to_rawbars(records, futu_code)
+    for i, bar in enumerate(bars):
+        bars[i] = RawBar(
+            symbol=bar.symbol,
+            dt=bar.dt,
+            id=bar.id,
+            freq=freq,
+            open=bar.open,
+            high=bar.high,
+            low=bar.low,
+            close=bar.close,
+            vol=bar.vol,
+            amount=bar.amount,
+        )
+    return bars
 
 
 # ─────────────────────────────────────────────────────────

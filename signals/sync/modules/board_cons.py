@@ -24,17 +24,28 @@ _CALL_INTERVAL = 1.0  # 成分股接口限速更严格
 
 
 def _get_board_list(db: Database) -> list:
-    """获取行业列表（从今日 board_ranking 中提取）"""
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    """获取行业列表（优先最新 canonical board_ranking）。"""
 
-    # 优先从 MongoDB 已有排行中获取
+    latest = db["board_ranking"].find_one(
+        {"source": "canonical"}, {"dt": 1}, sort=[("dt", -1)])
+    query = {"source": "canonical"}
+    if latest and latest.get("dt"):
+        query["dt"] = latest["dt"]
     docs = db["board_ranking"].find(
-        {"source": "ths"},
-        {"board_name": 1}
+        query,
+        {"board_name": 1, "rank_idx": 1},
     ).sort("rank_idx", 1)
     boards = [d["board_name"] for d in docs if d.get("board_name")]
     if boards:
         return boards
+
+    # 兼容旧数据：取最新 board_ths source snapshot。
+    latest = db["board_ths"].find_one({}, {"dt": 1}, sort=[("dt", -1)])
+    if latest and latest.get("dt"):
+        docs = db["board_ths"].find({"dt": latest["dt"]}, {"board_name": 1})
+        boards = [d["board_name"] for d in docs if d.get("board_name")]
+        if boards:
+            return boards
 
     # 兜底：从 AKShare 获取
     try:

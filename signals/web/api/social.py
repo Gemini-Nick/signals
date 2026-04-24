@@ -7,26 +7,68 @@ router = APIRouter(prefix="/api/social", tags=["social"])
 _log = logging.getLogger("signals.web.social")
 
 
+def _hot_themes_from_gateway(top_n: int = 10) -> list[dict]:
+    """Read dashboard themes from local canonical/snapshot data only."""
+    from signals.data.gateway import get_concept_rank
+    from signals.data.models import DataRequest
+
+    resp = get_concept_rank(DataRequest(
+        domain="concept",
+        mode="historical",
+        market="A",
+        freq="daily",
+        purpose="review",
+        allow_stale=True,
+    ))
+    df = resp.data
+    if df is None or df.empty:
+        return []
+    if "change_pct" in df.columns:
+        df = df.sort_values("change_pct", ascending=False)
+    out = []
+    for _, row in df.head(top_n).iterrows():
+        out.append({
+            "name": str(row.get("board_name", row.get("concept", ""))),
+            "change_pct": round(float(row.get("change_pct", 0) or 0), 2),
+            "stock_count": int(row.get("stock_count", row.get("成份股数量", 0)) or 0),
+            "source": resp.source,
+            "freshness": resp.freshness,
+            "is_stale": resp.is_stale,
+        })
+    return out
+
+
 @router.get("/heat/{symbol}")
 def get_social_heat(symbol: str):
     """单股社交热度详情"""
     try:
-        from signals.data.social_fetcher import fetch_social_heat
-        heat = fetch_social_heat(symbol)
+        from signals.data.gateway import get_social_heat as gateway_get_social_heat
+        from signals.data.models import DataRequest
+
+        response = gateway_get_social_heat(DataRequest(
+            domain="social",
+            mode="historical",
+            market="A",
+            symbol=symbol,
+            purpose="review",
+            allow_stale=True,
+        ))
+        heat = response.data
         if not heat:
-            return {"symbol": symbol, "heat": None}
+            return {"symbol": symbol, "heat": None, "meta": response.to_meta()}
         return {
             "symbol": symbol,
             "heat": {
-                "heat_score": round(heat.heat_score, 1),
-                "heat_grade": heat.heat_grade,
-                "comment_score": heat.comment_score,
-                "comment_rank": heat.comment_rank,
-                "focus_index": heat.focus_index,
-                "institution_pct": heat.institution_pct,
-                "concepts": heat.concepts,
-                "tag": heat.tag,
+                "heat_score": round(float(heat.get("heat_score", 0) or 0), 1),
+                "heat_grade": heat.get("heat_grade", ""),
+                "comment_score": heat.get("comment_score"),
+                "comment_rank": heat.get("comment_rank"),
+                "focus_index": heat.get("focus_index"),
+                "institution_pct": heat.get("institution_pct"),
+                "concepts": heat.get("concepts", []),
+                "tag": heat.get("tag", ""),
             },
+            "meta": response.to_meta(),
         }
     except Exception as e:
         _log.warning("社交热度查询失败 [%s]: %s", symbol, e)
@@ -97,28 +139,13 @@ def get_social_brief():
 
     # 热门主题
     try:
-        from signals.core.theme_discovery import get_hot_themes
-        themes = get_hot_themes(top_n=10)
-        result["hot_themes"] = [
-            {"name": t.name, "change_pct": round(t.change_pct, 2),
-             "stock_count": t.stock_count}
-            for t in themes
-        ]
+        result["hot_themes"] = _hot_themes_from_gateway(top_n=10)
     except Exception as e:
         _log.warning("热门主题获取失败: %s", e)
 
     # 飙升标的
-    try:
-        from signals.core.theme_discovery import get_surge_stocks
-        surges = get_surge_stocks(top_n=10)
-        result["surge_stocks"] = [
-            {"symbol": s["symbol"], "name": s["name"],
-             "score": round(s["score"], 1),
-             "focus_index": round(s["focus_index"], 1),
-             "change_pct": round(s["change_pct"], 2)}
-            for s in surges
-        ]
-    except Exception as e:
-        _log.warning("飙升标的获取失败: %s", e)
+    # Avoid live external calls here; the dashboard should remain available when
+    # Eastmoney/Sina are slow or blocked. A later gateway social cache can fill
+    # this from canonical snapshots.
 
     return result

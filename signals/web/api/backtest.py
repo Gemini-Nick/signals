@@ -40,7 +40,7 @@ def _build_symbol(code: str, market: str) -> str:
     return f"SZ.{code}"
 
 
-def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
+def _fetch_kline_legacy(code: str, market: str, freq: str) -> pd.DataFrame:
     """通过 akshare 拉取 K 线，返回带 datetime index 的 DataFrame"""
     import akshare as ak
     from signals.data.fetcher import _no_proxy
@@ -69,6 +69,25 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
     })
     df["dt"] = pd.to_datetime(df["dt"])
     return df.set_index("dt")
+
+
+def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
+    """Fetch web backtest K-lines through the gateway as historical data."""
+    from signals.data.gateway import get_kline
+    from signals.data.models import DataRequest
+
+    response = get_kline(
+        DataRequest(
+            domain="kline",
+            mode="historical",
+            market=market,
+            freq=freq,
+            symbol=code,
+            purpose="backtest",
+        ),
+        legacy_fetcher=lambda: _fetch_kline_legacy(code, market, freq),
+    )
+    return response.data if response.data is not None else pd.DataFrame()
 
 
 def _dt_to_unix(dt) -> int:
@@ -608,3 +627,15 @@ async def backtest_simulate(
 async def backtest_presets():
     """返回日期预设列表"""
     return _get_date_presets()
+
+
+@router.get("/summary")
+async def backtest_summary():
+    """轻量回测状态摘要，避免 Dashboard 加载时触发外部行情请求。"""
+    return {
+        "total": 0,
+        "status": "ready",
+        "mode": "historical",
+        "data_source": "gateway",
+        "date_presets": len(_get_date_presets()),
+    }

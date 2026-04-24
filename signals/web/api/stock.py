@@ -178,21 +178,43 @@ def analyze_stock(symbol: str):
 
         # 社交热度
         try:
-            from signals.data.social_fetcher import fetch_social_heat
-            soc = fetch_social_heat(clean)
+            from signals.data.gateway import get_social_heat
+            from signals.data.models import DataRequest
+
+            social_resp = get_social_heat(DataRequest(
+                domain="social",
+                mode="historical",
+                market="A",
+                symbol=clean,
+                purpose="review",
+                allow_stale=True,
+            ))
+            soc = social_resp.data
+            resolved_name = result.get("name", "")
+            if not soc and resolved_name and clean != resolved_name:
+                social_resp = get_social_heat(DataRequest(
+                    domain="social",
+                    mode="historical",
+                    market="A",
+                    symbol=resolved_name,
+                    purpose="review",
+                    allow_stale=True,
+                ))
+                soc = social_resp.data
             if soc:
                 result["social"] = {
-                    "heat_score": round(soc.heat_score, 1),
-                    "heat_grade": soc.heat_grade,
-                    "comment_score": round(soc.comment_score, 1),
-                    "comment_rank": soc.comment_rank,
-                    "focus_index": round(soc.focus_index, 1),
-                    "institution_pct": round(soc.institution_pct, 3),
-                    "concepts": soc.concepts,
-                    "tag": soc.tag,
+                    "heat_score": round(float(soc.get("heat_score", 0) or 0), 1),
+                    "heat_grade": soc.get("heat_grade", ""),
+                    "comment_score": soc.get("comment_score"),
+                    "comment_rank": soc.get("comment_rank"),
+                    "focus_index": soc.get("focus_index"),
+                    "institution_pct": soc.get("institution_pct"),
+                    "concepts": soc.get("concepts", []),
+                    "tag": soc.get("tag", ""),
+                    "meta": social_resp.to_meta(),
                 }
             else:
-                result["social"] = None
+                result["social"] = {"meta": social_resp.to_meta()}
         except Exception:
             result["social"] = None
 

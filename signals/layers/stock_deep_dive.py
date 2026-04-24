@@ -29,7 +29,7 @@ from signals.core.risk import (
     compute_layered_position, LayeredPosition,
     format_layered_position,
 )
-from signals.data.fetcher import AKShareSource, detect_market
+from signals.data.fetcher import AKShareSource, _to_raw_bars, detect_market
 
 
 # ─────────────────────────────────────────────────────────
@@ -152,84 +152,91 @@ class StockDeepDive:
             return []
 
     def _fetch_daily_a(self, sdt: str, edt: str):
-        """A股日线: 东财 → Sina 降级。"""
-        try:
-            bars = self._ak.get_a_daily(self.symbol, sdt, edt)
-            if bars:
-                self._data_sources["日线"] = "东财"
-                self._daily_vol_scale = 100  # 东财成交量单位是"手"，×100转"股"
-                return bars
-        except Exception as e:
-            self._errors.append("日线(东财)失败: {}".format(e.__class__.__name__))
-
-        try:
-            bars = self._ak.get_a_daily_sina(self.symbol, sdt, edt)
-            if bars:
-                self._data_sources["日线"] = "Sina(降级)"
-                self._daily_vol_scale = 1  # Sina成交量单位是"股"
-                return bars
-        except Exception as e:
-            self._errors.append("日线(Sina)也失败: {}".format(e.__class__.__name__))
-
+        """A股日线: runtime only reads gateway cache."""
+        bars = self._fetch_gateway_bars(Freq.D, "daily", sdt=sdt)
+        if bars:
+            self._data_sources["日线"] = "Gateway/Mongo"
+            self._daily_vol_scale = 1
+            return bars
+        self._errors.append("日线缓存暂不可用")
         return []
 
     def _fetch_daily_hk(self, sdt: str):
-        """港股日线: AKShare 全量历史 → 按日期截取。"""
-        try:
-            bars = self._ak.get_hk_daily(self.symbol)
-            if bars:
-                cutoff = datetime.strptime(sdt, "%Y-%m-%d")
-                bars = [b for b in bars if b.dt >= cutoff]
-                self._data_sources["日线"] = "AKShare(港股)"
-                self._daily_vol_scale = 1
-                return bars
-        except Exception as e:
-            self._errors.append("港股日线失败: {}".format(e.__class__.__name__))
+        """港股日线: runtime only reads gateway cache."""
+        bars = self._fetch_gateway_bars(Freq.D, "daily", sdt=sdt)
+        if bars:
+            self._data_sources["日线"] = "Gateway/Mongo"
+            self._daily_vol_scale = 1
+            return bars
+        self._errors.append("港股日线缓存暂不可用")
         return []
 
     def _fetch_daily_us(self, sdt: str):
-        """美股日线: AKShare 全量历史 → 按日期截取。"""
-        try:
-            bars = self._ak.get_us_daily(self.symbol)
-            if bars:
-                cutoff = datetime.strptime(sdt, "%Y-%m-%d")
-                bars = [b for b in bars if b.dt >= cutoff]
-                self._data_sources["日线"] = "AKShare(美股)"
-                self._daily_vol_scale = 1
-                return bars
-        except Exception as e:
-            self._errors.append("美股日线失败: {}".format(e.__class__.__name__))
+        """美股日线: runtime only reads gateway cache."""
+        bars = self._fetch_gateway_bars(Freq.D, "daily", sdt=sdt)
+        if bars:
+            self._data_sources["日线"] = "Gateway/Mongo"
+            self._daily_vol_scale = 1
+            return bars
+        self._errors.append("美股日线缓存暂不可用")
         return []
 
     def _fetch_minute(self, freq: Freq):
-        """分钟线: A股 Sina→东财降级，港美股暂不支持。
-        只有当所有数据源都失败时才报错给用户，中间降级不展示。"""
-        import logging
-        _log = logging.getLogger(__name__)
+        """分钟线: runtime only reads gateway cache."""
         label = freq.value
         if self.market != "A":
             self._errors.append("{}线暂不支持{}市场".format(label, self.market))
             return []
 
-        try:
-            bars = self._ak.get_a_minute(self.symbol, freq)
-            if bars:
-                self._data_sources[label] = "Sina"
-                return bars
-        except Exception as e:
-            _log.debug("%s(Sina)失败: %s — %s", label, e.__class__.__name__, e)
-
-        try:
-            bars = self._ak.get_a_minute_em(self.symbol, freq, max_retries=2)
-            if bars:
-                self._data_sources[label] = "东财(降级)"
-                return bars
-        except Exception as e:
-            _log.debug("%s(东财)也失败: %s — %s", label, e.__class__.__name__, e)
-
-        # 所有数据源都失败，才报错给用户
-        self._errors.append("{}数据暂不可用".format(label))
+        freq_value = "30m" if freq == Freq.F30 else "15m"
+        bars = self._fetch_gateway_bars(freq, freq_value)
+        if bars:
+            self._data_sources[label] = "Gateway/Mongo"
+            return bars
+        self._errors.append("{}缓存暂不可用".format(label))
         return []
+
+    def _fetch_gateway_bars(self, czsc_freq: Freq, gateway_freq: str,
+                            sdt: str = None):
+        try:
+            from signals.data.gateway import get_kline
+            from signals.data.models import DataRequest
+
+            resp = get_kline(DataRequest(
+                domain="kline",
+                mode="historical",
+                market=self.market,
+                symbol=self.symbol,
+                freq=gateway_freq,
+                purpose="review",
+                allow_stale=True,
+            ))
+            df = resp.data
+            if df is None or df.empty:
+                return []
+            df = df.reset_index().rename(columns={"index": "dt"})
+            if sdt:
+                cutoff = datetime.strptime(sdt, "%Y-%m-%d")
+                df = df[df["dt"] >= cutoff]
+            if df.empty:
+                return []
+            if "amount" not in df.columns:
+                df["amount"] = 0
+            return _to_raw_bars(
+                df,
+                self.symbol,
+                czsc_freq,
+                "dt",
+                "open",
+                "high",
+                "low",
+                "close",
+                "vol",
+                "amount",
+            )
+        except Exception as e:
+            self._errors.append("{}缓存读取失败: {}".format(czsc_freq.value, e.__class__.__name__))
+            return []
 
     # ─────────────────────────────────────────────────────
     # CZSC 分析 + 评分 + 风控
