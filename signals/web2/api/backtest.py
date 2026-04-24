@@ -8,6 +8,7 @@ import logging
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from fastapi import APIRouter, Query, Request
@@ -41,12 +42,33 @@ def _build_symbol(code: str, market: str) -> str:
     return f"SZ.{code}"
 
 
+def _normalize_freq(freq: str) -> str:
+    value = (freq or "daily").strip().lower()
+    if value in {"d", "day", "daily", "日线"}:
+        return "daily"
+    if value in {"w", "week", "weekly", "周线"}:
+        return "weekly"
+    if value in {"m", "month", "monthly", "月线"}:
+        return "monthly"
+    if value in {"30", "30m", "30min", "30分钟"}:
+        return "30m"
+    return value
+
+
+def _freq_label(freq: str) -> str:
+    return {
+        "daily": "日线",
+        "weekly": "周线",
+        "monthly": "月线",
+        "30m": "30分钟",
+    }.get(freq, freq)
+
+
 def _kline_cache_path(code: str, freq: str) -> Path:
     """K线缓存文件路径"""
     cache_dir = Path(__file__).resolve().parent.parent.parent.parent / ".data" / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    # 统一 freq 命名: D/daily → daily, W/weekly → weekly
-    freq_norm = "daily" if freq in ("D", "daily") else "weekly"
+    freq_norm = _normalize_freq(freq)
     return cache_dir / f"kline_{code}_{freq_norm}.json"
 
 
@@ -88,12 +110,185 @@ def _load_kline_cache(code: str, freq: str) -> pd.DataFrame:
         records = json.loads(path.read_text(encoding="utf-8"))
         df = pd.DataFrame(records)
         df["dt"] = pd.to_datetime(df["dt"])
+        future_mask = df["dt"].dt.date > datetime.now().date()
+        if future_mask.any():
+            logger.info("K线缓存含未来日期，忽略并重建: %s", path.name)
+            return pd.DataFrame()
         df = df.set_index("dt")
         logger.info("K线从磁盘缓存加载: %s (%d 根)", path.name, len(df))
         return df
     except Exception as e:
         logger.warning("K线缓存加载失败: %s", e)
         return pd.DataFrame()
+
+
+def _resample_daily(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """用日线缓存聚合周线/月线，作为上游不可用时的本地兜底。"""
+    if df.empty:
+        return pd.DataFrame()
+    required = {"open", "high", "low", "close"}
+    if not required.issubset(set(df.columns)):
+        return pd.DataFrame()
+    period_freq = {"weekly": "W", "monthly": "M"}.get(freq)
+    if not period_freq:
+        return pd.DataFrame()
+    resampled = df.copy()
+    if not isinstance(resampled.index, pd.DatetimeIndex):
+        resampled.index = pd.to_datetime(resampled.index)
+    for col in ["open", "high", "low", "close", "vol"]:
+        if col in resampled.columns:
+            resampled[col] = pd.to_numeric(resampled[col], errors="coerce")
+    if "vol" not in resampled.columns:
+        resampled["vol"] = 0
+    resampled = resampled.sort_index()
+    groups = resampled.groupby(resampled.index.to_period(period_freq), sort=True)
+    rows = []
+    indexes = []
+    for _, group in groups:
+        group = group.dropna(subset=["open", "high", "low", "close"])
+        if group.empty:
+            continue
+        rows.append({
+            "open": group["open"].iloc[0],
+            "high": group["high"].max(),
+            "low": group["low"].min(),
+            "close": group["close"].iloc[-1],
+            "vol": group["vol"].sum(),
+        })
+        indexes.append(group.index[-1])
+    if not rows:
+        return pd.DataFrame()
+    resampled = pd.DataFrame(rows, index=pd.DatetimeIndex(indexes))
+    return resampled.dropna(subset=["open", "high", "low", "close"])
+
+
+def _resample_daily_to_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    return _resample_daily(df, "weekly")
+
+
+def _records_to_df(records: list[dict[str, Any]]) -> pd.DataFrame:
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    if "dt" not in df.columns:
+        return pd.DataFrame()
+    df["dt"] = pd.to_datetime(df["dt"])
+    df = df.set_index("dt").sort_index()
+    for col in ["open", "high", "low", "close", "vol"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "vol" not in df.columns:
+        df["vol"] = 0
+    return df.dropna(subset=["open", "high", "low", "close"])
+
+
+def _load_mongo_bars(code: str, market: str, freq: str) -> pd.DataFrame:
+    from signals.data.mongo_fallback import get_db
+
+    db = get_db()
+    if db is None:
+        return pd.DataFrame()
+    symbol = _build_symbol(code, market)
+    freq_candidates = {
+        "daily": ["daily", "D", "日线"],
+        "weekly": ["weekly", "W", "周线"],
+        "monthly": ["monthly", "M", "月线"],
+        "30m": ["30m", "30分钟"],
+    }.get(freq, [freq])
+    symbol_candidates = [code, symbol, symbol.lower(), symbol.replace(".", "").lower()]
+    try:
+        docs = list(db.bars.find({
+            "$or": [
+                {"meta.symbol": {"$in": symbol_candidates}, "meta.freq": {"$in": freq_candidates}},
+                {"symbol": {"$in": symbol_candidates}, "freq": {"$in": freq_candidates}},
+            ],
+        }, {"_id": 0}).sort("dt", 1))
+    except Exception as e:
+        logger.warning("Mongo bars 读取失败: %s %s — %s", code, freq, str(e)[:80])
+        return pd.DataFrame()
+    df = _records_to_df(docs)
+    if df.empty:
+        return pd.DataFrame()
+    df.attrs["data_source"] = "mongodb_bars"
+    df.attrs["data_source_detail"] = f"{code} {freq} MongoDB bars"
+    return df
+
+
+def _load_mongo_direct_or_derived(code: str, market: str, freq: str) -> pd.DataFrame:
+    direct = _load_mongo_bars(code, market, freq)
+    if not direct.empty:
+        return direct
+    if freq in {"weekly", "monthly"}:
+        daily = _load_mongo_bars(code, market, "daily")
+        derived = _resample_daily(daily, freq)
+        if not derived.empty:
+            derived.attrs["data_source"] = f"mongodb_daily_resampled_{freq}"
+            derived.attrs["data_source_detail"] = f"{code} {freq} 由 MongoDB 日线聚合"
+            derived.attrs["derived_from"] = "mongodb_bars_daily"
+            return derived
+    return pd.DataFrame()
+
+
+def _load_cached_kline_or_daily_derived(code: str, freq: str) -> pd.DataFrame:
+    cached = _load_kline_cache(code, freq)
+    if not cached.empty:
+        logger.info("K线使用磁盘缓存: %s %s (%d 根)", code, freq, len(cached))
+        cached.attrs["data_source"] = "disk_cache"
+        cached.attrs["data_source_detail"] = f"{code} {freq} 磁盘缓存"
+        return cached
+    if freq in {"weekly", "monthly"}:
+        daily = _load_kline_cache(code, "daily")
+        derived = _resample_daily(daily, freq)
+        if not derived.empty:
+            logger.info("%s 由日线缓存聚合: %s (%d 根)", freq, code, len(derived))
+            derived.attrs["data_source"] = f"daily_cache_resampled_{freq}"
+            derived.attrs["data_source_detail"] = f"{code} {freq} 由日线磁盘缓存聚合"
+            derived.attrs["derived_from"] = "disk_cache_daily"
+            _save_kline_cache(derived, code, freq)
+            return derived
+    return pd.DataFrame()
+
+
+def _attach_kline_meta(df: pd.DataFrame, source: str, detail: str, **meta: Any) -> pd.DataFrame:
+    df.attrs["data_source"] = source
+    df.attrs["data_source_detail"] = detail
+    for key, value in meta.items():
+        if value is not None:
+            df.attrs[key] = value
+    return df
+
+
+def _kline_meta(df: pd.DataFrame, freq: str) -> dict[str, Any]:
+    as_of = None
+    if not df.empty:
+        try:
+            as_of = pd.Timestamp(df.index.max()).strftime("%Y-%m-%d")
+        except Exception:
+            as_of = None
+    freshness = "empty"
+    if as_of:
+        try:
+            age_days = (pd.Timestamp(datetime.now().date()) - pd.Timestamp(as_of)).days
+            freshness = "fresh" if age_days <= 3 else "stale"
+        except Exception:
+            freshness = "unknown"
+    partial = False
+    if as_of and freq in {"weekly", "monthly"}:
+        now = pd.Timestamp(datetime.now().date())
+        last = pd.Timestamp(as_of)
+        partial = (freq == "weekly" and last.isocalendar().week == now.isocalendar().week and last.date() < now.date()) or (
+            freq == "monthly" and last.year == now.year and last.month == now.month and last.date() < now.date()
+        )
+    return {
+        "data_source": df.attrs.get("data_source", ""),
+        "data_source_detail": df.attrs.get("data_source_detail", ""),
+        "as_of": as_of,
+        "bar_count": int(len(df)),
+        "freshness": freshness,
+        "derived_from": df.attrs.get("derived_from", ""),
+        "partial": partial,
+        "last_upstream_error": df.attrs.get("last_upstream_error", ""),
+    }
 
 
 def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
@@ -112,7 +307,17 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
         "SSLError", "SSL",
     )
 
+    freq = _normalize_freq(freq)
+    errors = []
+
+    mongo_cached = _load_mongo_direct_or_derived(code, market, freq)
+    if not mongo_cached.empty:
+        return mongo_cached
+
     df = None
+    cached = _load_cached_kline_or_daily_derived(code, freq)
+    if not cached.empty:
+        return cached
 
     # ── 30 分钟 K 线（东财分钟接口）────────────────────
     if freq == "30m":
@@ -135,9 +340,10 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
                 })
                 df["dt"] = pd.to_datetime(df["dt"])
                 df = df.set_index("dt")
-                return df
+                return _attach_kline_meta(df, "eastmoney_minute", f"{code} 30m 东财分钟线")
         except Exception as e:
             err_msg = str(e)
+            errors.append(f"eastmoney_minute: {err_msg[:120]}")
             is_network = any(k in err_msg for k in _NETWORK_ERRORS)
             logger.warning("30分钟K线失败: %s — %s", code, err_msg[:80])
             if not is_network:
@@ -148,7 +354,7 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
     days = 730 if freq == "daily" else 1460
     sdt = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
     edt = datetime.now().strftime("%Y%m%d")
-    period = "daily" if freq == "daily" else "weekly"
+    period = {"daily": "daily", "weekly": "weekly", "monthly": "monthly"}.get(freq, "weekly")
 
     # ── 源 1: 东财 ──────────────────────────────────
     try:
@@ -168,11 +374,13 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
             })
             df["dt"] = pd.to_datetime(df["dt"])
             df = df.set_index("dt")
+            _attach_kline_meta(df, "eastmoney", f"{code} {freq} 东财")
             _save_kline_cache(df, code, freq)
             save_kline("kline_cache", code, freq, _df_to_records(df))
             return df
     except Exception as e:
         err_msg = str(e)
+        errors.append(f"eastmoney: {err_msg[:120]}")
         is_network = any(k in err_msg for k in _NETWORK_ERRORS)
         if is_network:
             logger.warning("东财K线失败: %s %s — %s", code, freq, err_msg[:80])
@@ -194,11 +402,13 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
                 })
                 df2 = df2[["dt", "open", "high", "low", "close", "vol"]]
                 df2 = df2.set_index("dt")
+                _attach_kline_meta(df2, "sina", f"{code} {freq} 新浪")
                 logger.info("新浪K线成功: %s %s (%d 根)", code, freq, len(df2))
                 _save_kline_cache(df2, code, freq)
                 save_kline("kline_cache", code, freq, _df_to_records(df2))
                 return df2
         except Exception as e:
+            errors.append(f"sina: {str(e)[:120]}")
             logger.warning("新浪K线失败: %s — %s", code, str(e)[:80])
 
     # ── 源 3: MongoDB 历史数据 ──────────────────────
@@ -210,10 +420,12 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
         for col in ["open", "high", "low", "close", "vol"]:
             if col in df3.columns:
                 df3[col] = pd.to_numeric(df3[col], errors="coerce")
+        _attach_kline_meta(df3, "mongodb", f"{code} {freq} MongoDB kline_cache")
         return df3
 
     raise ConnectionError(
-        f"所有数据源均失败（东财/新浪/MongoDB），{code} 无可用数据。"
+        f"所有数据源均失败（Mongo bars/磁盘缓存/东财/新浪/MongoDB kline_cache），{code} 无可用数据。"
+        + (f" 最近错误: {' | '.join(errors[-3:])}" if errors else "")
     )
 
 
@@ -871,7 +1083,7 @@ def _annotate_signals_ma_vol(df: pd.DataFrame, signals: list):
 @router.get("/analyze")
 async def backtest_analyze(
     code: str = Query(..., description="股票代码 (如 002759, 09988)"),
-    freq: str = Query("daily", description="daily / weekly"),
+    freq: str = Query("daily", description="daily / weekly / monthly"),
     signal_group: str = Query("all", description="macd / czsc / all"),
     lookback: int = Query(999, description="信号回看窗口"),
     # 入场因子
@@ -898,16 +1110,27 @@ async def backtest_analyze(
 
     try:
         code = code.strip()
+        freq = _normalize_freq(freq)
+        if freq not in {"daily", "weekly", "monthly", "30m"}:
+            return JSONResponse(status_code=400, content={
+                "error": f"不支持的周期: {freq}",
+                "supported_freqs": ["daily", "weekly", "monthly", "30m"],
+            })
         market = _detect_market(code)
         symbol = _build_symbol(code, market)
-        freq_label = "日线" if freq == "daily" else "周线"
+        freq_label = _freq_label(freq)
 
         # 1. 拉取K线
         df = _fetch_kline(code, market, freq)
         if df.empty:
             return JSONResponse(status_code=404, content={
-                "error": f"无法获取 {code} 的{freq_label}数据"
+                "error": f"无法获取 {code} 的{freq_label}数据",
+                "data_source": df.attrs.get("data_source", ""),
+                "last_upstream_error": df.attrs.get("last_upstream_error", ""),
             })
+        meta = _kline_meta(df, freq)
+        data_source = meta["data_source"]
+        data_source_detail = meta["data_source_detail"]
 
         # 2. 信号检测
         all_signals, bi_list, zhongshu, warnings = _detect_all_signals(
@@ -947,6 +1170,7 @@ async def backtest_analyze(
 
         result = {
             "symbol": symbol, "code": code, "freq": freq_label,
+            **meta,
             "ohlcv": ohlcv, "macd": macd_data, "ma_lines": ma_lines,
             "signals": all_signals, "kpi": kpi,
             "date_presets": _get_date_presets(),
@@ -955,13 +1179,81 @@ async def backtest_analyze(
             "sim_kpi": sim.kpi, "sim_config": sim.config,
             "sim_skip_reasons": sim.skip_reasons,
         }
+        if data_source in {
+            "disk_cache",
+            "daily_cache_resampled_weekly",
+            "daily_cache_resampled_monthly",
+            "mongodb",
+            "mongodb_bars",
+            "mongodb_daily_resampled_weekly",
+            "mongodb_daily_resampled_monthly",
+        }:
+            warnings.append(f"数据源: {data_source_detail or data_source}")
+        if not all_signals:
+            warnings.append(f"{code} {freq_label} 有K线但暂无命中信号")
         if warnings:
             result["warnings"] = warnings
         return result
 
     except Exception as e:
         logger.exception("分析失败: code=%s freq=%s", code, freq)
-        return JSONResponse(status_code=500, content={"error": str(e), "detail": traceback.format_exc()})
+        return JSONResponse(status_code=500, content={
+            "error": str(e),
+            "last_upstream_error": str(e),
+            "detail": traceback.format_exc(),
+        })
+
+
+@router.get("/health/push2his")
+async def push2his_health(
+    code: str = Query("002759"),
+    timeout: int = Query(8, ge=1, le=30),
+):
+    """
+    独立探测东财 push2his K 线链路。
+    不再用行业/概念接口健康替代 K 线接口健康。
+    """
+    import time
+    import akshare as ak
+    from signals.data.fetcher import _no_proxy
+
+    checks = []
+    overall_ok = True
+    for freq, period in [("daily", "daily"), ("weekly", "weekly")]:
+        started = time.perf_counter()
+        ok = False
+        rows = 0
+        error = ""
+        try:
+            with _no_proxy():
+                df = ak.stock_zh_a_hist(
+                    symbol=code,
+                    period=period,
+                    start_date=(datetime.now() - timedelta(days=120)).strftime("%Y%m%d"),
+                    end_date=datetime.now().strftime("%Y%m%d"),
+                    adjust="qfq",
+                    timeout=timeout,
+                )
+            rows = 0 if df is None else len(df)
+            ok = rows > 0
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {str(exc)[:240]}"
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        overall_ok = overall_ok and ok
+        checks.append({
+            "source": "eastmoney_push2his",
+            "code": code,
+            "freq": freq,
+            "ok": ok,
+            "rows": rows,
+            "duration_ms": duration_ms,
+            "error": error,
+        })
+    return {
+        "status": "healthy" if overall_ok else "degraded",
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+        "checks": checks,
+    }
 
 
 @router.get("/scan")
