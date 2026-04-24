@@ -467,14 +467,9 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
 
 
 async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str, Any]:
-    effective_freq = freq if freq in {"daily", "weekly"} else "daily"
+    effective_freq = freq if freq in {"daily", "weekly", "monthly"} else "daily"
     chart = _unwrap_response(
-        await web2_backtest_run(
-            code=raw_code,
-            freq=effective_freq,
-            signal_group="all",
-            lookback=360,
-        )
+        await _call_web2_backtest_run(raw_code, effective_freq, lookback=360)
     )
     stock = _unwrap_response(analyze_stock(symbol))
     engine = _ensure_engine()
@@ -485,7 +480,7 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
             "symbol": symbol,
             "requested_freq": freq,
             "effective_freq": effective_freq,
-            "available_freqs": ["daily", "weekly"],
+            "available_freqs": ["daily", "weekly", "monthly"],
         },
         "chart": chart,
         "summary": _summary_from_stock(symbol, stock, chart),
@@ -545,6 +540,52 @@ def _filter_backtest_payload(payload: Dict[str, Any], start: Optional[str], end:
     return filtered
 
 
+async def _call_web2_backtest_run(code: str, freq: str, lookback: int = 360) -> Any:
+    return await web2_backtest_run(
+        code=code,
+        freq=freq,
+        signal_group="all",
+        lookback=lookback,
+        factor="",
+        gap_pct_min=2.0,
+        volume_ratio_min=1.5,
+        trend_lookback=20,
+        bb_period=20,
+        squeeze_threshold=0.05,
+    )
+
+
+async def _call_web2_backtest_analyze(code: str, freq: str, lookback: int = 180) -> Any:
+    return await web2_backtest_analyze(
+        code=code,
+        freq=freq,
+        signal_group="all",
+        lookback=lookback,
+        factor="",
+        gap_pct_min=2.0,
+        volume_ratio_min=1.5,
+        trend_lookback=20,
+        bb_period=20,
+        squeeze_threshold=0.05,
+        run_count=3,
+        body_ratio=0.5,
+        accel_count=3,
+        stop_loss=5.0,
+        trail_stop=50.0,
+        max_hold=20,
+        slippage=0.1,
+        take_profit=0,
+        ma_exit_period=0,
+        profit_drawdown=0,
+        batch_exit="0",
+        batch1_ratio=50,
+        batch1_target=5,
+        batch2_target=10,
+        atr_exit_period=0,
+        atr_exit_mult=2.0,
+    )
+
+
 @router.get("/shell")
 async def get_workbench_shell():
     engine = _ensure_engine()
@@ -598,7 +639,7 @@ async def get_workbench_symbol(
 @router.get("/backtest")
 async def get_workbench_backtest(
     symbol: str = Query(..., description="股票代码或 Futu symbol"),
-    freq: str = Query("daily", description="daily / weekly"),
+    freq: str = Query("daily", description="daily / weekly / monthly"),
     start_ts: Optional[int] = Query(None, description="选区开始秒级时间戳"),
     end_ts: Optional[int] = Query(None, description="选区结束秒级时间戳"),
 ):
@@ -607,10 +648,9 @@ async def get_workbench_backtest(
         raise HTTPException(status_code=404, detail=f"无法识别股票: {symbol}")
 
     payload = _unwrap_response(
-        await web2_backtest_analyze(
-            code=raw_code,
-            freq=freq if freq in {"daily", "weekly"} else "daily",
-            signal_group="all",
+        await _call_web2_backtest_analyze(
+            raw_code,
+            freq if freq in {"daily", "weekly", "monthly"} else "daily",
             lookback=360,
         )
     )
@@ -620,6 +660,6 @@ async def get_workbench_backtest(
         "symbol": normalized,
         "code": raw_code,
         "requested_freq": freq,
-        "effective_freq": freq if freq in {"daily", "weekly"} else "daily",
+        "effective_freq": freq if freq in {"daily", "weekly", "monthly"} else "daily",
     }
     return filtered

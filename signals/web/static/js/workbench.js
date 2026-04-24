@@ -12,7 +12,7 @@ const WB_STATE = {
   retryTimer: null,
 };
 
-const WB_FREQS = ['daily', '30min', '15min', 'weekly'];
+const WB_FREQS = ['daily', '30min', '15min', 'weekly', 'monthly'];
 
 function wbCssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -916,7 +916,7 @@ async function wbLoadBacktest(symbol, freq) {
   if (!symbol) return;
   const query = new URLSearchParams({
     symbol,
-    freq: ['daily', 'weekly'].includes(freq) ? freq : 'daily',
+    freq: ['daily', 'weekly', 'monthly'].includes(freq) ? freq : 'daily',
   });
   if (WB_STATE.range?.start && WB_STATE.range?.end) {
     query.set('start_ts', String(Math.floor(WB_STATE.range.start / 1000)));
@@ -1017,6 +1017,7 @@ function wbBindEvents() {
     if (event.key === '2') document.querySelector('.wb-freq-btn[data-freq="30min"]')?.click();
     if (event.key === '3') document.querySelector('.wb-freq-btn[data-freq="15min"]')?.click();
     if (event.key === '4') document.querySelector('.wb-freq-btn[data-freq="weekly"]')?.click();
+    if (event.key === '5') document.querySelector('.wb-freq-btn[data-freq="monthly"]')?.click();
   });
 }
 

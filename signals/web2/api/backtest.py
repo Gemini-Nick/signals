@@ -315,6 +315,7 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
         return mongo_cached
 
     df = None
+    sina_attempted = False
     cached = _load_cached_kline_or_daily_derived(code, freq)
     if not cached.empty:
         return cached
@@ -356,7 +357,51 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
     edt = datetime.now().strftime("%Y%m%d")
     period = {"daily": "daily", "weekly": "weekly", "monthly": "monthly"}.get(freq, "weekly")
 
-    # ── 源 1: 东财 ──────────────────────────────────
+    # ── 源 1: 新浪日线 + 本地聚合 ─────────────────────
+    # push2his 在 Clash TUN/fake-ip 环境下不稳定；A 股日/周/月线先走
+    # 新浪日线，再由日线聚合周线/月线，避免东财故障拖垮产品主链路。
+    if market == "A" and freq in {"daily", "weekly", "monthly"}:
+        sina_attempted = True
+        try:
+            sina_code = f"sz{code}" if code.startswith(("0", "3")) else f"sh{code}"
+            with _no_proxy():
+                df2 = ak.stock_zh_a_daily(symbol=sina_code, adjust="qfq")
+            if df2 is not None and not df2.empty:
+                cutoff = datetime.now() - timedelta(days=days)
+                df2["date"] = pd.to_datetime(df2["date"])
+                df2 = df2[df2["date"] >= cutoff]
+                df2 = df2.rename(columns={
+                    "date": "dt", "volume": "vol",
+                })
+                df2 = df2[["dt", "open", "high", "low", "close", "vol"]]
+                df2 = df2.set_index("dt")
+                for col in ["open", "high", "low", "close", "vol"]:
+                    df2[col] = pd.to_numeric(df2[col], errors="coerce")
+                if freq == "daily":
+                    _attach_kline_meta(df2, "sina", f"{code} daily 新浪")
+                    logger.info("新浪K线成功: %s daily (%d 根)", code, len(df2))
+                    _save_kline_cache(df2, code, "daily")
+                    save_kline("kline_cache", code, "daily", _df_to_records(df2))
+                    return df2
+                derived = _resample_daily(df2, freq)
+                if not derived.empty:
+                    _attach_kline_meta(
+                        derived,
+                        f"sina_daily_resampled_{freq}",
+                        f"{code} {freq} 由新浪日线聚合",
+                        derived_from="sina_daily",
+                    )
+                    logger.info("新浪日线聚合成功: %s %s (%d 根)", code, freq, len(derived))
+                    _save_kline_cache(df2, code, "daily")
+                    _save_kline_cache(derived, code, freq)
+                    save_kline("kline_cache", code, "daily", _df_to_records(df2))
+                    save_kline("kline_cache", code, freq, _df_to_records(derived))
+                    return derived
+        except Exception as e:
+            errors.append(f"sina: {str(e)[:120]}")
+            logger.warning("新浪优先K线失败: %s %s — %s", code, freq, str(e)[:80])
+
+    # ── 源 2: 东财 ──────────────────────────────────
     try:
         with _no_proxy():
             if market == "A":
@@ -387,8 +432,8 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
         else:
             logger.warning("东财K线异常: %s %s — %s", code, freq, err_msg[:80])
 
-    # ── 源 2: 新浪（仅 A 股日线）────────────────────
-    if market == "A" and freq == "daily":
+    # ── 源 3: 新浪重试（仅 A 股日线）────────────────
+    if market == "A" and freq == "daily" and not sina_attempted:
         try:
             sina_code = f"sz{code}" if code.startswith(("0", "3")) else f"sh{code}"
             with _no_proxy():
@@ -411,7 +456,7 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
             errors.append(f"sina: {str(e)[:120]}")
             logger.warning("新浪K线失败: %s — %s", code, str(e)[:80])
 
-    # ── 源 3: MongoDB 历史数据 ──────────────────────
+    # ── 源 4: MongoDB 历史数据 ──────────────────────
     mongo_docs = get_kline_docs("kline_cache", code, freq)
     if mongo_docs:
         df3 = pd.DataFrame(mongo_docs)
@@ -1187,6 +1232,8 @@ async def backtest_analyze(
             "mongodb_bars",
             "mongodb_daily_resampled_weekly",
             "mongodb_daily_resampled_monthly",
+            "sina_daily_resampled_weekly",
+            "sina_daily_resampled_monthly",
         }:
             warnings.append(f"数据源: {data_source_detail or data_source}")
         if not all_signals:
@@ -1334,7 +1381,7 @@ async def backtest_scan(
 @router.get("/run")
 async def backtest_run(
     code: str = Query(..., description="股票代码 (如 002759, 09988)"),
-    freq: str = Query("daily", description="daily / weekly"),
+    freq: str = Query("daily", description="daily / weekly / monthly"),
     signal_group: str = Query("all", description="macd / czsc / all"),
     lookback: int = Query(999, description="信号回看窗口"),
     # Phase 2: 入场因子
@@ -1350,16 +1397,20 @@ async def backtest_run(
     """
     try:
         code = code.strip()
+        freq = _normalize_freq(freq)
         market = _detect_market(code)
         symbol = _build_symbol(code, market)
-        freq_label = "日线" if freq == "daily" else "周线"
+        freq_label = _freq_label(freq)
 
         # 1. 拉取K线
         df = _fetch_kline(code, market, freq)
         if df.empty:
             return JSONResponse(status_code=404, content={
-                "error": f"无法获取 {code} 的{freq_label}数据"
+                "error": f"无法获取 {code} 的{freq_label}数据",
+                "data_source": df.attrs.get("data_source", ""),
+                "last_upstream_error": df.attrs.get("last_upstream_error", ""),
             })
+        meta = _kline_meta(df, freq)
 
         # 2. 信号检测
         all_signals = []
@@ -1415,6 +1466,7 @@ async def backtest_run(
             "symbol": symbol,
             "code": code,
             "freq": freq_label,
+            **meta,
             "ohlcv": ohlcv,
             "macd": macd_data,
             "ma_lines": ma_lines,
@@ -1424,6 +1476,19 @@ async def backtest_run(
             "bi_list": bi_list,
             "zhongshu": zhongshu,
         }
+        data_source = meta.get("data_source", "")
+        if data_source in {
+            "disk_cache",
+            "daily_cache_resampled_weekly",
+            "daily_cache_resampled_monthly",
+            "mongodb",
+            "mongodb_bars",
+            "mongodb_daily_resampled_weekly",
+            "mongodb_daily_resampled_monthly",
+            "sina_daily_resampled_weekly",
+            "sina_daily_resampled_monthly",
+        }:
+            warnings.append(f"数据源: {meta.get('data_source_detail') or data_source}")
         if warnings:
             result["warnings"] = warnings
         return result
