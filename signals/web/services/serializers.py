@@ -179,6 +179,10 @@ def _serialize_ma_context(ma_ctx) -> Optional[dict]:
                 "value": round(lv.value, 2),
                 "distance_pct": lv.distance_pct,
                 "position": lv.position,
+                "timeframe": getattr(lv, "timeframe", ""),
+                "period": getattr(lv, "period", 0),
+                "direction": getattr(lv, "direction", ""),
+                "role": getattr(lv, "role", ""),
             }
             for lv in ma_ctx.levels
         ],
@@ -187,6 +191,11 @@ def _serialize_ma_context(ma_ctx) -> Optional[dict]:
                 "name": lv.name,
                 "value": round(lv.value, 2),
                 "distance_pct": lv.distance_pct,
+                "position": getattr(lv, "position", ""),
+                "timeframe": getattr(lv, "timeframe", ""),
+                "period": getattr(lv, "period", 0),
+                "direction": getattr(lv, "direction", ""),
+                "role": getattr(lv, "role", ""),
             }
             for lv in ma_ctx.support_levels[:3]
         ],
@@ -195,6 +204,11 @@ def _serialize_ma_context(ma_ctx) -> Optional[dict]:
                 "name": lv.name,
                 "value": round(lv.value, 2),
                 "distance_pct": lv.distance_pct,
+                "position": getattr(lv, "position", ""),
+                "timeframe": getattr(lv, "timeframe", ""),
+                "period": getattr(lv, "period", 0),
+                "direction": getattr(lv, "direction", ""),
+                "role": getattr(lv, "role", ""),
             }
             for lv in ma_ctx.resistance_levels[:3]
         ],
@@ -204,6 +218,10 @@ def _serialize_ma_context(ma_ctx) -> Optional[dict]:
                 "value": round(lv.value, 2),
                 "distance_pct": lv.distance_pct,
                 "position": lv.position,
+                "timeframe": getattr(lv, "timeframe", ""),
+                "period": getattr(lv, "period", 0),
+                "direction": getattr(lv, "direction", ""),
+                "role": getattr(lv, "role", ""),
             }
             for lv in ma_ctx.key_levels
         ],

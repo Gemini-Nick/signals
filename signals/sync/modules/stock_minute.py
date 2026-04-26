@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-A股分钟线同步 — 活跃标的 30M/15M 增量同步
+A股分钟线同步 — 活跃标的 5M/15M/30M 增量同步
 
 数据源: AKShare stock_zh_a_hist_min_em（东财分钟线接口）
 策略: 增量同步，仅白名单 + 最近入池标的（~200只上限）
@@ -8,6 +8,7 @@ A股分钟线同步 — 活跃标的 30M/15M 增量同步
 注意: 东财分钟线 API 仅返回最近 5 个交易日数据
 """
 import logging
+import os
 import time
 from datetime import datetime
 
@@ -21,13 +22,47 @@ from ..retry import sync_retry
 logger = logging.getLogger("signals.sync.stock_minute")
 
 _CALL_INTERVAL = 0.5  # 分钟线限速更严格
+_MINUTE_FREQS = ["5分钟", "15分钟", "30分钟"]
+
+
+def _pure_a_code(symbol: object) -> str:
+    raw = str(symbol or "").strip().upper()
+    if not raw:
+        return ""
+    pure = raw.split(".", 1)[-1] if "." in raw else raw
+    pure = pure.replace("SH", "").replace("SZ", "").replace("BJ", "")
+    if pure.isdigit() and len(pure) == 6:
+        return pure
+    return ""
 
 
 def _get_active_symbols(db: Database) -> list:
     """获取需要同步分钟线的活跃标的列表"""
     import config
 
-    symbols = list(config.WHITELIST)
+    symbols: list[str] = []
+
+    def add(value: object) -> None:
+        code = _pure_a_code(value)
+        if code and code not in symbols:
+            symbols.append(code)
+
+    for symbol in getattr(config, "WHITELIST", []):
+        add(symbol)
+
+    pool = db["market_pools"].find_one(
+        {"pool": "active"},
+        {"symbols": 1, "items": 1},
+        sort=[("dt", -1), ("updated_at", -1)],
+    ) or {}
+    for symbol in pool.get("symbols") or []:
+        add(symbol)
+    for item in pool.get("items") or []:
+        if isinstance(item, dict):
+            add(item.get("symbol") or item.get("code"))
+
+    for doc in db["signals"].find({}, {"symbol": 1}).sort("signal_date", -1).limit(300):
+        add(doc.get("symbol"))
 
     # 从 sync_log 获取最近有日线同步的标的（取前200）
     recent = db["sync_log"].find(
@@ -36,16 +71,15 @@ def _get_active_symbols(db: Database) -> list:
     ).sort("last_run", -1).limit(200)
 
     for doc in recent:
-        sym = doc.get("symbol", "")
-        if sym and sym not in symbols:
-            symbols.append(sym)
+        add(doc.get("symbol"))
 
-    return symbols[:200]
+    max_symbols = int(os.getenv("STOCK_MINUTE_MAX_CODES", "200"))
+    return symbols[:max_symbols] if max_symbols > 0 else symbols
 
 
 def _sync_one_minute(code: str, freq: str, proxy_url: str = None) -> list:
     """同步单只股票分钟线"""
-    period_map = {"30分钟": "30", "15分钟": "15"}
+    period_map = {"5分钟": "5", "15分钟": "15", "30分钟": "30"}
     period = period_map.get(freq, "30")
 
     with em_proxy(proxy_url):
@@ -75,7 +109,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
     """
     A 股分钟线增量同步。
 
-    仅同步白名单 + 最近活跃标的的 30M 和 15M 数据。
+        仅同步白名单 + 最近活跃标的的 5M、15M 和 30M 数据。
     东财分钟线 API 仅返回最近 5 天，直接全量写入（小数据量）。
     """
     bars_col = db["bars"]
@@ -88,7 +122,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
     errors = []
 
     for code in symbols:
-        for freq in ["30分钟", "15分钟"]:
+        for freq in _MINUTE_FREQS:
             try:
                 docs = _sync_one_minute(code, freq, proxy_url)
                 time.sleep(_CALL_INTERVAL)

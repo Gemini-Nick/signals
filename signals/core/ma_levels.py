@@ -2,8 +2,8 @@
 """
 均线关键位系统 (MA Levels)
 
-从日线 RawBar 数据计算多周期均线，输出关键支撑/阻力位。
-只做日线级别以上（日/周/月），小级别继续纯缠论。
+从日线 RawBar 数据计算日线 + 周线嵌套均线，输出关键支撑/阻力位。
+小级别继续纯缠论，均线只承担成本锚与趋势转折提示。
 
 均线用途：给出"稳定的市场共识价位锚点"，与缠论互补。
 - 缠论 → 方向（二买=结构向上）
@@ -27,6 +27,10 @@ class MALevel:
     value: float        # 均线值
     distance_pct: float # 当前价距该均线 %（正=上方，负=下方）
     position: str       # "上方" / "下方" / "贴合"
+    timeframe: str = "" # "daily" / "weekly"
+    period: int = 0
+    direction: str = "未知"  # "向上" / "走平" / "向下"
+    role: str = ""
 
 @dataclass
 class MAContext:
@@ -62,7 +66,9 @@ def _compute_ma(closes: pd.Series, period: int) -> Optional[float]:
 
 
 def _make_level(name: str, ma_val: Optional[float],
-                price: float) -> Optional[MALevel]:
+                price: float, closes: Optional[pd.Series] = None,
+                period: int = 0, timeframe: str = "",
+                role: str = "") -> Optional[MALevel]:
     """构建 MALevel，ma_val 为 None 则跳过"""
     if ma_val is None:
         return None
@@ -76,6 +82,9 @@ def _make_level(name: str, ma_val: Optional[float],
     return MALevel(
         name=name, value=ma_val,
         distance_pct=round(dist, 2), position=position,
+        timeframe=timeframe, period=period,
+        direction=_ma_direction(closes, period),
+        role=role,
     )
 
 
@@ -84,9 +93,8 @@ def compute_ma_levels(bars: List[RawBar], symbol: str) -> Optional[MAContext]:
     从日线 RawBar 计算多周期均线关键位。
 
     计算均线：
-    - 日线: MA5, MA10, MA20, MA60
-    - 周线: MA5(5周线), MA10, MA20（日线 resample 周线后计算）
-    - 月线: MA10(10月线)（日线 resample 月线后计算）
+    - 日线: MA5, MA10, MA20, MA50, MA60, MA200
+    - 周线: MA5, MA10, MA20, MA50（日线 resample 周线后计算）
 
     :param bars: 日线 RawBar 列表（建议 >= 200 根）
     :param symbol: 标的代码
@@ -101,9 +109,31 @@ def compute_ma_levels(bars: List[RawBar], symbol: str) -> Optional[MAContext]:
     levels: List[MALevel] = []
 
     # ── 日线均线 ──
-    for period, label in [(5, "5日线"), (10, "10日线"),
-                          (20, "20日线"), (60, "60日线")]:
-        lv = _make_level(label, _compute_ma(df["close"], period), price)
+    daily_roles = {
+        5: "短线趋势/止损线",
+        10: "第一次回踩买点/弱势反弹阻力",
+        20: "中期趋势转折线",
+        50: "阶段性大底/恐慌加仓参考",
+        60: "做多防守线",
+        200: "长期趋势压力/止盈区",
+    }
+    for period, label in [
+        (5, "5日线"),
+        (10, "10日线"),
+        (20, "20日线"),
+        (50, "50日线"),
+        (60, "60日线"),
+        (200, "200日线"),
+    ]:
+        lv = _make_level(
+            label,
+            _compute_ma(df["close"], period),
+            price,
+            closes=df["close"],
+            period=period,
+            timeframe="daily",
+            role=daily_roles.get(period, ""),
+        )
         if lv:
             levels.append(lv)
 
@@ -113,20 +143,24 @@ def compute_ma_levels(bars: List[RawBar], symbol: str) -> Optional[MAContext]:
         "close": "last", "vol": "sum",
     }).dropna()
     if len(weekly) >= 5:
-        for period, label in [(5, "5周线"), (10, "10周线"), (20, "20周线")]:
-            lv = _make_level(label, _compute_ma(weekly["close"], period), price)
+        weekly_roles = {
+            5: "持股信心线",
+            10: "中期底部反抽目标",
+            20: "熊市反弹压力位",
+            50: "牛熊分界/夹板下沿",
+        }
+        for period, label in [(5, "5周线"), (10, "10周线"), (20, "20周线"), (50, "50周线")]:
+            lv = _make_level(
+                label,
+                _compute_ma(weekly["close"], period),
+                price,
+                closes=weekly["close"],
+                period=period,
+                timeframe="weekly",
+                role=weekly_roles.get(period, ""),
+            )
             if lv:
                 levels.append(lv)
-
-    # ── 月线均线（日线 resample 月线）──
-    monthly = df.resample("ME").agg({
-        "open": "first", "high": "max", "low": "min",
-        "close": "last", "vol": "sum",
-    }).dropna()
-    if len(monthly) >= 10:
-        lv = _make_level("10月线", _compute_ma(monthly["close"], 10), price)
-        if lv:
-            levels.append(lv)
 
     if not levels:
         return None
@@ -145,7 +179,7 @@ def compute_ma_levels(bars: List[RawBar], symbol: str) -> Optional[MAContext]:
     key = _extract_key_levels(supports, resistances, levels)
 
     # ── 趋势判断（日线 MA5 > MA20 > MA60 → 多头排列）──
-    trend = _judge_ma_trend(df["close"])
+    trend = _judge_ma_trend(df["close"], levels)
 
     return MAContext(
         symbol=symbol,
@@ -162,44 +196,61 @@ def _extract_key_levels(supports: List[MALevel],
                         resistances: List[MALevel],
                         all_levels: List[MALevel]) -> List[MALevel]:
     """
-    提炼最关键的2-3个价位：
-    1. 最近支撑（优先大级别：周线 > 日线）
-    2. 最近阻力（优先大级别）
-    3. 10月线（如果存在且不与前两个重复）
+    提炼交易员右栏要看的关键价位。
+    周线优先，日线补充；距离近的支撑/阻力必须保留。
     """
     key: List[MALevel] = []
     used_names: set = set()
 
     # 大级别优先排序
-    _PRIORITY = {"10月线": 0, "20周线": 1, "10周线": 2, "5周线": 3,
-                 "60日线": 4, "20日线": 5, "10日线": 6, "5日线": 7}
+    _PRIORITY = {
+        "50周线": 0,
+        "20周线": 1,
+        "10周线": 2,
+        "5周线": 3,
+        "200日线": 4,
+        "60日线": 5,
+        "50日线": 6,
+        "20日线": 7,
+        "10日线": 8,
+        "5日线": 9,
+    }
 
-    # 最近支撑（大级别优先）
-    if supports:
-        # 取距离最近的3个，然后按大级别优先选1个
-        candidates = supports[:3]
-        candidates.sort(key=lambda l: _PRIORITY.get(l.name, 99))
-        key.append(candidates[0])
-        used_names.add(candidates[0].name)
+    def add(level: Optional[MALevel]) -> None:
+        if level and level.name not in used_names:
+            key.append(level)
+            used_names.add(level.name)
 
-    # 最近阻力（大级别优先）
-    if resistances:
-        candidates = [r for r in resistances[:3] if r.name not in used_names]
-        if candidates:
-            candidates.sort(key=lambda l: _PRIORITY.get(l.name, 99))
-            key.append(candidates[0])
-            used_names.add(candidates[0].name)
+    add(supports[0] if supports else None)
+    add(resistances[0] if resistances else None)
 
-    # 10月线（长期锚点，如果不重复）
-    for lv in all_levels:
-        if lv.name == "10月线" and lv.name not in used_names:
-            key.append(lv)
+    near_levels = [lv for lv in all_levels if abs(lv.distance_pct) <= 8.0]
+    near_levels.sort(key=lambda lv: (_PRIORITY.get(lv.name, 99), abs(lv.distance_pct)))
+    for lv in near_levels:
+        add(lv)
+        if len(key) >= 8:
             break
 
     return key
 
 
-def _judge_ma_trend(closes: pd.Series) -> str:
+def _ma_direction(closes: Optional[pd.Series], period: int) -> str:
+    if closes is None or period <= 0 or len(closes) < period + 3:
+        return "未知"
+    ma = closes.rolling(period).mean().dropna()
+    if len(ma) < 4:
+        return "未知"
+    current = float(ma.iloc[-1])
+    previous = float(ma.iloc[-4])
+    if previous == 0:
+        return "未知"
+    slope_pct = (current - previous) / previous * 100
+    if abs(slope_pct) < 0.2:
+        return "走平"
+    return "向上" if slope_pct > 0 else "向下"
+
+
+def _judge_ma_trend(closes: pd.Series, levels: List[MALevel]) -> str:
     """
     日线均线排列判断：
     - MA5 > MA20 > MA60 → 多头排列
@@ -214,11 +265,25 @@ def _judge_ma_trend(closes: pd.Series) -> str:
         return "未知"
 
     if ma5 > ma20 > ma60:
-        return "多头排列"
+        base = "多头排列"
     elif ma5 < ma20 < ma60:
-        return "空头排列"
+        base = "空头排列"
     else:
-        return "交织"
+        base = "交织"
+
+    level_by_name = {lv.name: lv for lv in levels}
+    weekly_20 = level_by_name.get("20周线")
+    weekly_50 = level_by_name.get("50周线")
+    if weekly_20 and weekly_50:
+        lower = min(weekly_20.value, weekly_50.value)
+        upper = max(weekly_20.value, weekly_50.value)
+        latest = closes.iloc[-1]
+        if lower <= latest <= upper:
+            return f"{base} · 20周/50周夹板区"
+    ma20_direction = _ma_direction(closes, 20)
+    if ma20_direction in {"向上", "走平", "向下"}:
+        return f"{base} · 20日线{ma20_direction}"
+    return base
 
 
 # ─────────────────────────────────────────────────────────

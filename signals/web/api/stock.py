@@ -61,7 +61,11 @@ def _serialize_ma(ma) -> dict:
         "trend_summary": ma.trend_summary,
         "key_levels": [
             {"name": lv.name, "value": round(lv.value, 2),
-             "position": lv.position, "distance_pct": round(lv.distance_pct, 2)}
+             "position": lv.position, "distance_pct": round(lv.distance_pct, 2),
+             "timeframe": getattr(lv, "timeframe", ""),
+             "period": getattr(lv, "period", 0),
+             "direction": getattr(lv, "direction", ""),
+             "role": getattr(lv, "role", "")}
             for lv in (ma.key_levels or [])
         ],
     }

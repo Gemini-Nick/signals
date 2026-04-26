@@ -105,6 +105,7 @@ class StockDeepDive:
         self.daily_bars = []
         self.f30_bars = []
         self.f15_bars = []
+        self.f5_bars = []
 
         # 分析结果
         self.tf_analyses: Dict[str, TimeframeAnalysis] = {}
@@ -138,6 +139,7 @@ class StockDeepDive:
         self.daily_bars = self._fetch_daily(sdt, edt)
         self.f30_bars = self._fetch_minute(Freq.F30)
         self.f15_bars = self._fetch_minute(Freq.F15)
+        self.f5_bars = self._fetch_minute(Freq.F5)
 
     def _fetch_daily(self, sdt: str, edt: str):
         """日线数据获取，根据市场类型路由，含降级链。"""
@@ -188,7 +190,7 @@ class StockDeepDive:
             self._errors.append("{}线暂不支持{}市场".format(label, self.market))
             return []
 
-        freq_value = "30m" if freq == Freq.F30 else "15m"
+        freq_value = "30m" if freq == Freq.F30 else ("15m" if freq == Freq.F15 else "5m")
         bars = self._fetch_gateway_bars(freq, freq_value)
         if bars:
             self._data_sources[label] = "Gateway/Mongo"
@@ -257,6 +259,7 @@ class StockDeepDive:
             (Freq.D,   self.daily_bars, "日线"),
             (Freq.F30, self.f30_bars,   "30分钟"),
             (Freq.F15, self.f15_bars,   "15分钟"),
+            (Freq.F5,  self.f5_bars,    "5分钟"),
         ]:
             if not bars:
                 continue
