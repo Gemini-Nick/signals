@@ -349,44 +349,55 @@ def push_backtest_report(data: dict) -> bool:
 
 
 def run_and_push(code: str, freq: str = "daily", dry_run: bool = False, start_date: str | None = None, **kwargs) -> bool:
-    """独立运行回测并推送 — 不依赖 web2 服务。dry_run=True 时仅打印不推送。
+    """独立运行回测并推送。dry_run=True 时仅打印不推送。
     start_date: 可选，DATE_PRESETS 别名或 YYYY-MM-DD 格式日期，过滤 K 线起始日期。
     """
-    import dataclasses
-
-    from signals.web2.api.backtest import (
-        _detect_market, _build_symbol, _fetch_kline,
-        _detect_all_signals, _annotate_signals_ma_vol, _compute_kpi,
-    )
-    from signals.core.trade_simulator import SimConfig, simulate_trades
+    import asyncio
+    import json
+    from fastapi.responses import JSONResponse
+    from signals.services.backtest import backtest_analyze
 
     code = code.strip()
-    market = _detect_market(code)
-    symbol = _build_symbol(code, market)
-    _FREQ_LABELS = {"daily": "日线", "weekly": "周线", "30m": "30分钟"}
-    freq_label = _FREQ_LABELS.get(freq, "日线")
-
-    # 查询股票名称（get_name 需要 futu_code 如 SH.002466）
-    stock_name = ""
-    try:
-        from signals.core.stock_names import get_resolver
-        name = get_resolver().get_name(symbol)
-        # 排除 fallback 返回代码本身的情况
-        if name and name != code and name != symbol.split(".")[-1]:
-            stock_name = name
-    except Exception:
-        pass
-
-    print(f"  拉取 {code} ({stock_name or '?'}) {freq_label}数据...")
-    df = _fetch_kline(code, market, freq)
-    if df.empty:
-        print(f"  无法获取 {code} 的{freq_label}数据")
+    print(f"  读取 {code} {freq} 历史缓存并运行回测...")
+    payload = dict(
+        code=code,
+        freq=freq,
+        signal_group=kwargs.get("signal_group", "all"),
+        lookback=kwargs.get("lookback", 999),
+        factor=kwargs.get("factor", ""),
+        gap_pct_min=kwargs.get("gap_pct_min", 2.0),
+        volume_ratio_min=kwargs.get("volume_ratio_min", 1.5),
+        trend_lookback=kwargs.get("trend_lookback", 20),
+        bb_period=kwargs.get("bb_period", 20),
+        squeeze_threshold=kwargs.get("squeeze_threshold", 0.05),
+        run_count=kwargs.get("run_count", 3),
+        body_ratio=kwargs.get("body_ratio", 0.5),
+        accel_count=kwargs.get("accel_count", 3),
+        stop_loss=kwargs.get("stop_loss", 5.0),
+        trail_stop=kwargs.get("trail_stop", 50.0),
+        max_hold=kwargs.get("max_hold", 20),
+        slippage=kwargs.get("slippage", 0.1),
+        take_profit=kwargs.get("take_profit", 0),
+        ma_exit_period=kwargs.get("ma_exit_period", 0),
+        profit_drawdown=kwargs.get("profit_drawdown", 0),
+        batch_exit=kwargs.get("batch_exit", "0"),
+        batch1_ratio=kwargs.get("batch1_ratio", 50),
+        batch1_target=kwargs.get("batch1_target", 5),
+        batch2_target=kwargs.get("batch2_target", 10),
+        atr_exit_period=kwargs.get("atr_exit_period", 0),
+        atr_exit_mult=kwargs.get("atr_exit_mult", 2.0),
+    )
+    data = asyncio.run(backtest_analyze(**payload))
+    if isinstance(data, JSONResponse):
+        data = json.loads(data.body.decode("utf-8"))
+    if not isinstance(data, dict) or data.get("error"):
+        print(f"  回测失败: {(data or {}).get('error') if isinstance(data, dict) else data}")
         return False
-
-    # 按 --start 过滤起始日期
+    result = data
     if start_date:
         from datetime import datetime, timedelta
         import config as _cfg
+
         preset = _cfg.DATE_PRESETS.get(start_date.lower())
         if preset:
             if "date" in preset:
@@ -395,68 +406,17 @@ def run_and_push(code: str, freq: str = "daily", dry_run: bool = False, start_da
                 resolved = f"{datetime.now().year}-01-01"
             else:
                 resolved = (datetime.now() - timedelta(days=preset["offset"])).strftime("%Y-%m-%d")
-            print(f"  过滤起始日期：{resolved}（{preset['label']}）")
         else:
             resolved = start_date
-            print(f"  过滤起始日期：{resolved}")
-        dt_col = df.index if df.index.name == "dt" or hasattr(df.index[0], 'strftime') else df.get("dt")
-        if dt_col is not None:
-            df = df[dt_col >= resolved]
-            if df.empty:
-                print(f"  过滤后无数据（起始日期 {resolved} 超出范围）")
-                return False
-
-    # 计算回测区间
-    date_range = ""
-    try:
-        dt_col = df.index if df.index.name == "dt" or hasattr(df.index[0], 'strftime') else df.get("dt")
-        if dt_col is not None:
-            start_dt = dt_col.min().strftime("%Y-%m-%d")
-            end_dt = dt_col.max().strftime("%Y-%m-%d")
-            date_range = f"{start_dt} ~ {end_dt}"
-    except Exception:
-        pass
-
-    print("  检测信号...")
-    signal_group = kwargs.get("signal_group", "all")
-    lookback = kwargs.get("lookback", 999)
-    all_signals, bi_list, zhongshu, warnings = _detect_all_signals(
-        df, symbol, freq_label, signal_group, lookback,
-        kwargs.get("factor", ""),
-        kwargs.get("gap_pct_min", 2.0),
-        kwargs.get("volume_ratio_min", 1.5),
-        kwargs.get("trend_lookback", 20),
-        kwargs.get("bb_period", 20),
-        kwargs.get("squeeze_threshold", 0.05),
-    )
-    _annotate_signals_ma_vol(df, all_signals)
-
-    print("  运行交易模拟...")
-    sim_kwargs = {
-        "stop_loss_pct": kwargs.get("stop_loss", 5.0),
-        "trail_stop_pct": kwargs.get("trail_stop", 50.0),
-        "max_hold_days": kwargs.get("max_hold", 20),
-        "slippage": kwargs.get("slippage", 0.001),
-    }
-    valid_fields = {f.name for f in dataclasses.fields(SimConfig)}
-    sim_kwargs = {k: v for k, v in sim_kwargs.items() if k in valid_fields}
-    sim = simulate_trades(df, all_signals, SimConfig(**sim_kwargs))
-
-    forward_kpi = _compute_kpi(all_signals)
-
-    result = {
-        "symbol": symbol,
-        "code": code,
-        "stock_name": stock_name,
-        "freq": freq_label,
-        "date_range": date_range,
-        "signals": all_signals,
-        "forward_kpi": forward_kpi,
-        "sim_kpi": sim.kpi,
-        "sim_config": sim.config,
-        "sim_trades": sim.trades,
-        "sim_skip_reasons": getattr(sim, "skip_reasons", {}),
-    }
+        result["signals"] = [
+            item for item in result.get("signals", [])
+            if str(item.get("date_str") or item.get("signal_date") or item.get("dt_str") or "")[:10] >= resolved
+        ]
+        result["sim_trades"] = [
+            item for item in result.get("sim_trades", [])
+            if str(item.get("entry_date") or "")[:10] >= resolved
+        ]
+        result["date_range"] = f"{resolved} 起"
 
     text = format_backtest_report(result)
     print(f"\n{text}\n")

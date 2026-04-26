@@ -27,9 +27,12 @@ from .api.prediction import router as prediction_router
 from .api.workbench import router as workbench_router
 from .api.health import router as health_router
 from .api.pack import router as pack_router
-from signals.web2.api.cluster import start_scheduler as start_cluster_scheduler
-from signals.web2.api.cluster import stop_scheduler as stop_cluster_scheduler
-from .services.engine import get_engine
+from .api.strategy import router as strategy_router
+from signals.web2.api.cluster import (
+    router as cluster_router,
+    start_scheduler as start_cluster_scheduler,
+    stop_scheduler as stop_cluster_scheduler,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -66,14 +69,20 @@ def create_app() -> FastAPI:
     app.include_router(workbench_router)
     app.include_router(health_router)
     app.include_router(pack_router)
+    app.include_router(strategy_router)
+    app.include_router(cluster_router)
 
     # 静态文件服务
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
     @app.on_event("startup")
     async def startup_event():
-        get_engine().run_all_async()
-        start_cluster_scheduler()
+        if os.environ.get("SIGNALS_WEB_AUTOSTART_ENGINE", "false").lower() == "true":
+            from .services.engine import get_engine
+
+            get_engine().run_all_async()
+        if os.environ.get("SIGNALS_WEB_CLUSTER_SCHEDULER", "false").lower() == "true":
+            start_cluster_scheduler()
 
     @app.on_event("shutdown")
     async def shutdown_event():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query
@@ -8,15 +9,9 @@ from fastapi.responses import JSONResponse
 
 from signals.core.stock_names import get_resolver
 from signals.core.trade_log import get_trade_log
-from signals.web2.api.backtest import (
-    backtest_analyze as web2_backtest_analyze,
-    backtest_run as web2_backtest_run,
-)
-from signals.web2.api.cluster import (
-    get_history as web2_cluster_history,
-    get_latest as web2_cluster_latest,
-    get_watchlist as web2_cluster_watchlist,
-)
+from signals.services import backtest as backtest_service
+from signals.services import cluster as cluster_service
+from signals.strategy.snapshot import get_strategy_snapshot
 
 from ..services.engine import get_engine
 from ..services.serializers import (
@@ -41,7 +36,11 @@ def _unwrap_response(value: Any) -> Any:
 
 def _ensure_engine():
     engine = get_engine()
-    if not engine.is_ready() and not engine.state.is_running:
+    if (
+        os.environ.get("SIGNALS_WEB_AUTOSTART_ENGINE", "false").lower() == "true"
+        and not engine.is_ready()
+        and not engine.state.is_running
+    ):
         engine.run_all_async()
     return engine
 
@@ -279,17 +278,24 @@ def _plan_for_index(engine, name: str) -> Optional[Dict[str, Any]]:
 def _build_shell_payload(engine) -> Dict[str, Any]:
     status = engine.get_status()
     session = _serialize_session(status)
+    strategy_snapshot = _safe_strategy_snapshot()
     market_context = serialize_market_context(engine.get_market_context()) if engine.get_market_context() else None
     reports = [
         serialize_index_report(report)
         for report in engine.get_index_reports()
         if getattr(report, "data_available", False)
     ]
-    scored = [serialize_scored_symbol(item) for item in engine.get_scored_symbols()[:8]]
-    cluster = _unwrap_response(web2_cluster_latest(top=4))
+    strategy_candidates = [
+        dict(item)
+        for item in strategy_snapshot.get("candidates", [])
+        if isinstance(item, dict)
+    ]
+    scored = strategy_candidates or [serialize_scored_symbol(item) for item in engine.get_scored_symbols()[:8]]
+    cluster = _unwrap_response(cluster_service.get_latest(top=4))
 
-    industry_top = (cluster.get("industry") or {}).get("top") or []
-    concept_top = (cluster.get("concept") or {}).get("top") or []
+    snapshot_cluster = _cluster_from_strategy_snapshot(strategy_snapshot)
+    industry_top = snapshot_cluster.get("industry_top") or (cluster.get("industry") or {}).get("top") or []
+    concept_top = snapshot_cluster.get("concept_top") or (cluster.get("concept") or {}).get("top") or []
 
     watchlist_directions: List[str] = []
     for report in reports[:5]:
@@ -310,12 +316,17 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
         "market": market_context,
         "indices": reports[:8],
         "buy_candidates": scored,
+        "sell_warnings": strategy_snapshot.get("warnings", []),
         "cluster_summary": {
             "industry_top": industry_top,
             "concept_top": concept_top,
             "market_status": cluster.get("market_status") or {},
             "data_warning": cluster.get("data_warning", ""),
         },
+        "daily_brief": strategy_snapshot.get("daily_brief", {}),
+        "decision_queue": strategy_snapshot.get("decision_queue", []),
+        "strategy_kpis": strategy_snapshot.get("strategy_kpis", {}),
+        "source_confidence": strategy_snapshot.get("source_confidence", {}),
         "watchlist_directions": watchlist_directions[:10],
         "default_target": {
             "kind": "index",
@@ -324,6 +335,51 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
         },
         "legacy_url": "/legacy",
         "notices": notices,
+    }
+
+
+def _safe_strategy_snapshot() -> Dict[str, Any]:
+    try:
+        snapshot = get_strategy_snapshot()
+        return dict(snapshot) if isinstance(snapshot, dict) else {}
+    except Exception as exc:
+        return {
+            "daily_brief": {"summary": f"strategy_snapshot_error:{exc.__class__.__name__}"},
+            "candidates": [],
+            "warnings": [],
+            "themes": [],
+            "decision_queue": [],
+            "strategy_kpis": {},
+            "source_confidence": {"overall": 0, "sources": []},
+        }
+
+
+def _cluster_from_strategy_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    themes = [
+        item for item in snapshot.get("themes", [])
+        if isinstance(item, dict)
+    ]
+    return {
+        "industry_top": [
+            {
+                "label": item.get("name", ""),
+                "change_pct": item.get("change_pct", item.get("strength", 0)),
+                "leader": item.get("leader", ""),
+                "phase": item.get("phase", ""),
+            }
+            for item in themes
+            if item.get("domain") == "board"
+        ][:6],
+        "concept_top": [
+            {
+                "label": item.get("name", ""),
+                "change_pct": item.get("change_pct", item.get("strength", 0)),
+                "leader": item.get("leader", ""),
+                "phase": item.get("phase", ""),
+            }
+            for item in themes
+            if item.get("domain") == "concept"
+        ][:6],
     }
 
 
@@ -469,7 +525,7 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
 async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str, Any]:
     effective_freq = freq if freq in {"daily", "weekly", "monthly"} else "daily"
     chart = _unwrap_response(
-        await _call_web2_backtest_run(raw_code, effective_freq, lookback=360)
+        await _call_backtest_run(raw_code, effective_freq, lookback=360)
     )
     stock = _unwrap_response(analyze_stock(symbol))
     engine = _ensure_engine()
@@ -540,8 +596,8 @@ def _filter_backtest_payload(payload: Dict[str, Any], start: Optional[str], end:
     return filtered
 
 
-async def _call_web2_backtest_run(code: str, freq: str, lookback: int = 360) -> Any:
-    return await web2_backtest_run(
+async def _call_backtest_run(code: str, freq: str, lookback: int = 360) -> Any:
+    return await backtest_service.backtest_run(
         code=code,
         freq=freq,
         signal_group="all",
@@ -555,8 +611,8 @@ async def _call_web2_backtest_run(code: str, freq: str, lookback: int = 360) -> 
     )
 
 
-async def _call_web2_backtest_analyze(code: str, freq: str, lookback: int = 180) -> Any:
-    return await web2_backtest_analyze(
+async def _call_backtest_analyze(code: str, freq: str, lookback: int = 180) -> Any:
+    return await backtest_service.backtest_analyze(
         code=code,
         freq=freq,
         signal_group="all",
@@ -599,11 +655,11 @@ async def get_workbench_cluster(
     mode: str = Query("belief", description="belief / panic"),
     scan_top: int = Query(20, ge=1, le=60),
 ):
-    latest = _unwrap_response(web2_cluster_latest(top=top))
-    history = _unwrap_response(web2_cluster_history())
+    latest = _unwrap_response(cluster_service.get_latest(top=top))
+    history = _unwrap_response(cluster_service.get_history())
     scan = None
     if direction.strip():
-        scan = _unwrap_response(web2_cluster_watchlist(direction=direction.strip(), mode=mode, top=scan_top))
+        scan = _unwrap_response(cluster_service.get_watchlist(direction=direction.strip(), mode=mode, top=scan_top))
     return {
         "latest": latest,
         "history": history,
@@ -648,7 +704,7 @@ async def get_workbench_backtest(
         raise HTTPException(status_code=404, detail=f"无法识别股票: {symbol}")
 
     payload = _unwrap_response(
-        await _call_web2_backtest_analyze(
+        await _call_backtest_analyze(
             raw_code,
             freq if freq in {"daily", "weekly", "monthly"} else "daily",
             lookback=360,

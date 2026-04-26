@@ -344,7 +344,7 @@ def get_latest_docs(
             cursor = cursor.limit(limit)
 
         docs = list(cursor)
-        logger.info(
+        logger.debug(
             f"[MongoDB 降级] 从 {collection} 读取 {len(docs)} 条 "
             f"(日期: {latest_dt})"
         )
@@ -416,7 +416,7 @@ def get_kline_docs(
 
         docs = list(cursor)
         if docs:
-            logger.info(
+            logger.debug(
                 f"[MongoDB 降级] 从 {collection} 读取 {code} "
                 f"{freq} K线 {len(docs)} 根"
             )

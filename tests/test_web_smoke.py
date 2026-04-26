@@ -106,6 +106,55 @@ class TestBacktestAPI:
         data = r.json()
         assert "total" in data or "error" in data
 
+    def test_analyze_canonical_contract(self, client, monkeypatch):
+        from signals.services import backtest as backtest_service
+
+        async def fake_analyze(**kwargs):
+            return {
+                "symbol": "SZ.002759",
+                "code": kwargs["code"],
+                "freq": "日线",
+                "data_source": "bars",
+                "ohlcv": [],
+                "signals": [],
+                "sim_kpi": {},
+            }
+
+        monkeypatch.setattr(backtest_service, "backtest_analyze", fake_analyze)
+
+        r = client.get("/api/backtest/analyze?code=002759&freq=daily")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["code"] == "002759"
+        assert data["data_source"] == "bars"
+        assert "ohlcv" in data
+        assert "signals" in data
+        assert "sim_kpi" in data
+
+
+class TestStrategyAPI:
+    """策略快照端点"""
+
+    def test_snapshot(self, client, monkeypatch):
+        from signals.web.api import strategy as strategy_api
+
+        monkeypatch.setattr(strategy_api, "get_strategy_snapshot", lambda persist=False: {
+            "as_of": "2026-04-24",
+            "daily_brief": {"summary": "今日关注半导体", "changed_since_last": {}},
+            "candidates": [{"symbol": "SZ.002759"}],
+            "warnings": [],
+            "decision_queue": [{"symbol": "SZ.002759", "action": "review_entry"}],
+            "strategy_kpis": {"signals_total": 1},
+            "source_confidence": {"overall": 0.9, "sources": []},
+        })
+
+        r = client.get("/api/strategy/snapshot")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["daily_brief"]["summary"] == "今日关注半导体"
+        assert data["decision_queue"][0]["symbol"] == "SZ.002759"
+        assert data["strategy_kpis"]["signals_total"] == 1
+
 
 class TestPlanAPI:
     """计划端点"""

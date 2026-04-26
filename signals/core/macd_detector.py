@@ -383,15 +383,20 @@ def _check_fibonacci_support(df: pd.DataFrame, idx: int) -> Optional[Tuple[str, 
     if idx < 30:
         return None
 
-    # 找最近的高点（前30根内最高价）
-    recent_highs = df["high"].iloc[max(0, idx - 30):idx]
+    # 找最近的高点（前30根内最高价）。使用位置索引，避免重复日期索引时
+    # DatetimeIndex.get_loc 返回 slice 导致后续 iloc 切片失败。
+    recent_start = max(0, idx - 30)
+    recent_highs = df["high"].iloc[recent_start:idx]
     if recent_highs.empty:
         return None
-    peak_idx_relative = recent_highs.idxmax()
-    peak_price = recent_highs.max()
+    recent_values = recent_highs.fillna(float("-inf")).to_numpy()
+    if not np.isfinite(recent_values).any():
+        return None
+    peak_offset = int(np.argmax(recent_values))
+    peak_price = float(recent_values[peak_offset])
 
     # 找高点之前的低点（再往前30根的最低价）
-    peak_abs_idx = df.index.get_loc(peak_idx_relative)
+    peak_abs_idx = recent_start + peak_offset
     prior_lows = df["low"].iloc[max(0, peak_abs_idx - 40):peak_abs_idx]
     if prior_lows.empty:
         return None

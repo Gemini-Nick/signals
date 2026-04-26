@@ -12,6 +12,7 @@
 """
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -390,16 +391,18 @@ def fetch_concept_stocks(concept_name: str) -> ConceptTheme:
         _log.info(f"概念成分股 [{concept_name}] 获取成功: {len(stocks)} 只")
         return result
     except Exception as e:
-        _log.warning(f"概念成分股 [{concept_name}] 获取失败: {e}")
         # 扩大缓存时效到 7 天作为兜底
         cached = _load_cache(cache_key, max_age=86400 * 7)
         if cached and "stocks" in cached:
+            if os.getenv("SIGNALS_LOG_CACHE_FALLBACKS") == "1":
+                _log.info("概念成分股 [%s] 实时获取失败，使用缓存: %s", concept_name, type(e).__name__)
             return ConceptTheme(
                 name=concept_name,
                 code=cached.get("code", ""),
                 stocks=cached["stocks"],
                 stock_count=len(cached["stocks"]),
             )
+        _log.warning(f"概念成分股 [{concept_name}] 获取失败且无可用缓存: {e}")
         return ConceptTheme(name=concept_name)
 
 

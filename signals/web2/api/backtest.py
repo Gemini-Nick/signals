@@ -179,7 +179,8 @@ def _records_to_df(records: list[dict[str, Any]]) -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     if "vol" not in df.columns:
         df["vol"] = 0
-    return df.dropna(subset=["open", "high", "low", "close"])
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    return df[~df.index.duplicated(keep="last")]
 
 
 def _load_mongo_bars(code: str, market: str, freq: str) -> pd.DataFrame:
@@ -610,6 +611,21 @@ def _dt_to_unix(dt) -> int:
     return int(pd.Timestamp(dt).timestamp())
 
 
+def _position_for_index_label(index: pd.Index, label) -> int:
+    loc = index.get_loc(label)
+    if isinstance(loc, slice):
+        start = loc.start or 0
+        stop = loc.stop or start + 1
+        return max(start, stop - 1)
+    if isinstance(loc, (list, tuple)):
+        return int(loc[-1])
+    if hasattr(loc, "nonzero"):
+        positions = loc.nonzero()[0]
+        if len(positions):
+            return int(positions[-1])
+    return int(loc)
+
+
 def _serialize_ohlcv(df: pd.DataFrame) -> list:
     """DataFrame → [{time, open, high, low, close, volume}]"""
     result = []
@@ -637,14 +653,15 @@ def _compute_macd_data(df: pd.DataFrame) -> list:
     hist = (dif - dea) * 2
 
     result = []
-    for dt_idx in df.index:
-        if pd.isna(dea[dt_idx]):
+    for i, dt_idx in enumerate(df.index):
+        dea_value = dea.iloc[i]
+        if pd.isna(dea_value):
             continue
         result.append({
             "time": _dt_to_unix(dt_idx),
-            "dif": round(float(dif[dt_idx]), 4),
-            "dea": round(float(dea[dt_idx]), 4),
-            "bar": round(float(hist[dt_idx]), 4),
+            "dif": round(float(dif.iloc[i]), 4),
+            "dea": round(float(dea_value), 4),
+            "bar": round(float(hist.iloc[i]), 4),
         })
     return result
 
@@ -870,7 +887,7 @@ def _detect_macd(df: pd.DataFrame, symbol: str, freq_label: str, lookback: int) 
     signals = detect_macd_signals(df, symbol, freq_label, lookback=lookback)
     result = []
     for sig in signals:
-        sig_idx = df.index.get_loc(sig.dt)
+        sig_idx = _position_for_index_label(df.index, sig.dt)
         eval_data = _compute_forward_eval(df, sig_idx)
 
         result.append({

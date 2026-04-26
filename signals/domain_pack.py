@@ -223,6 +223,8 @@ class SignalsPack:
         recent_limit: int = 20,
         backlog_limit: int = 10,
     ) -> Dict[str, Any]:
+        strategy_snapshot = self._strategy_snapshot()
+        self._record_strategy_snapshot_run(strategy_snapshot)
         runs = await self.list_runs()
         recent_runs = runs[:recent_limit]
         review_runs = [run for run in recent_runs if run.get("capability") == "review"][:10]
@@ -232,7 +234,7 @@ class SignalsPack:
         pending_backlog = self._pending_backlog_preview(backlog_limit)
         backtest_jobs = self._backtest_jobs(recent_runs)
         status = self._dashboard_status(connector_health)
-        overview = self._overview(backtest_summary)
+        overview = self._overview(backtest_summary, strategy_snapshot)
         return {
             "pack_id": "signals",
             "title": "Signals",
@@ -242,15 +244,19 @@ class SignalsPack:
             "overview": overview,
             "recent_runs": recent_runs,
             "review_runs": review_runs,
-            "buy_candidates": [],
-            "sell_warnings": [],
-            "chart_context": None,
+            "buy_candidates": strategy_snapshot.get("candidates", []),
+            "sell_warnings": strategy_snapshot.get("warnings", []),
+            "chart_context": strategy_snapshot.get("chart_context"),
             "backtest_summary": backtest_summary,
             "backtest_jobs": backtest_jobs,
             "pending_backlog_preview": pending_backlog,
             "connector_health": connector_health,
             "deep_links": self._deep_links(),
             "operator_actions": self._operator_actions(),
+            "daily_brief": strategy_snapshot.get("daily_brief", {}),
+            "decision_queue": strategy_snapshot.get("decision_queue", []),
+            "strategy_kpis": strategy_snapshot.get("strategy_kpis", {}),
+            "source_confidence": strategy_snapshot.get("source_confidence", {}),
         }
 
     def _operator_actions(self) -> List[Dict[str, Any]]:
@@ -273,7 +279,6 @@ class SignalsPack:
             },
         ]
         web_url = os.environ.get("LONGCLAW_SIGNALS_WEB_BASE_URL", "").rstrip("/")
-        web2_url = os.environ.get("LONGCLAW_SIGNALS_WEB2_BASE_URL", "").rstrip("/")
         if web_url:
             actions.append({
                 "action_id": "pack:signals:web:url",
@@ -283,20 +288,10 @@ class SignalsPack:
                 "payload": {"url": web_url},
                 "metadata": {},
             })
-        if web2_url:
-            actions.append({
-                "action_id": "pack:signals:web2:url",
-                "run_id": "signals:dashboard",
-                "kind": "open_url",
-                "label": "Open Signals Web2",
-                "payload": {"url": web2_url},
-                "metadata": {},
-            })
         return actions
 
     def _deep_links(self) -> List[Dict[str, Any]]:
         web_url = os.environ.get("LONGCLAW_SIGNALS_WEB_BASE_URL", "").rstrip("/")
-        web2_url = os.environ.get("LONGCLAW_SIGNALS_WEB2_BASE_URL", "").rstrip("/")
         links = []
         if web_url:
             links.extend([
@@ -313,13 +308,6 @@ class SignalsPack:
                     "kind": "web",
                 },
             ])
-        if web2_url:
-            links.append({
-                "link_id": "signals-web2",
-                "label": "Signals Web2",
-                "url": web2_url,
-                "kind": "web",
-            })
         return links
 
     def _diagnostics(self, connector_health: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -352,38 +340,141 @@ class SignalsPack:
         ]
         return "Degraded connectors: " + ", ".join([item for item in bad if item])
 
-    def _overview(self, backtest_summary: Dict[str, int]) -> Dict[str, Any]:
-        board_resp = self._rank_snapshot("board")
-        concept_resp = self._rank_snapshot("concept")
-        cluster_summary = {
-            "industry_top": board_resp.get("items", []),
-            "concept_top": concept_resp.get("items", []),
-            "sources": {
-                "board": board_resp.get("source", ""),
-                "concept": concept_resp.get("source", ""),
-            },
-            "freshness": {
-                "board": board_resp.get("freshness", ""),
-                "concept": concept_resp.get("freshness", ""),
-            },
-        }
-        data_warnings = [
-            warning
-            for warning in [
-                board_resp.get("warning", ""),
-                concept_resp.get("warning", ""),
-            ]
-            if warning
+    def _overview(
+        self,
+        backtest_summary: Dict[str, int],
+        strategy_snapshot: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        strategy_snapshot = dict(strategy_snapshot or {})
+        themes = [
+            dict(item)
+            for item in strategy_snapshot.get("themes", [])
+            if isinstance(item, Mapping)
         ]
+        board_themes = [item for item in themes if item.get("domain") == "board"][:5]
+        concept_themes = [item for item in themes if item.get("domain") == "concept"][:5]
+
+        if board_themes or concept_themes:
+            cluster_summary = {
+                "industry_top": [
+                    {
+                        "label": item.get("name", ""),
+                        "change_pct": item.get("change_pct", item.get("strength", 0)),
+                        "leader": item.get("leader", ""),
+                        "phase": item.get("phase", ""),
+                        "confidence": item.get("confidence"),
+                    }
+                    for item in board_themes
+                ],
+                "concept_top": [
+                    {
+                        "label": item.get("name", ""),
+                        "change_pct": item.get("change_pct", item.get("strength", 0)),
+                        "leader": item.get("leader", ""),
+                        "phase": item.get("phase", ""),
+                        "confidence": item.get("confidence"),
+                    }
+                    for item in concept_themes
+                ],
+                "sources": {"board": "strategy_snapshot", "concept": "strategy_snapshot"},
+                "freshness": {
+                    "board": self._snapshot_source_freshness(strategy_snapshot, "board"),
+                    "concept": self._snapshot_source_freshness(strategy_snapshot, "concept"),
+                },
+            }
+            data_warnings = []
+        else:
+            board_resp = self._rank_snapshot("board")
+            concept_resp = self._rank_snapshot("concept")
+            cluster_summary = {
+                "industry_top": board_resp.get("items", []),
+                "concept_top": concept_resp.get("items", []),
+                "sources": {
+                    "board": board_resp.get("source", ""),
+                    "concept": concept_resp.get("source", ""),
+                },
+                "freshness": {
+                    "board": board_resp.get("freshness", ""),
+                    "concept": concept_resp.get("freshness", ""),
+                },
+            }
+            data_warnings = [
+                warning
+                for warning in [
+                    board_resp.get("warning", ""),
+                    concept_resp.get("warning", ""),
+                ]
+                if warning
+            ]
+        strategy_kpis = dict(strategy_snapshot.get("strategy_kpis") or {})
         return {
-            "market_regime": {},
+            "market_regime": strategy_snapshot.get("market_regime", {}),
             "cluster_summary": cluster_summary,
             "review_summary": {
                 "backtest_total": backtest_summary.get("total", 0),
                 "backtest_pending": backtest_summary.get("pending", 0),
+                "signals_total": strategy_kpis.get("signals_total", 0),
+                "signals_pending": strategy_kpis.get("signals_pending", 0),
             },
             "data_warning": " ".join(data_warnings),
         }
+
+    def _strategy_snapshot(self) -> Dict[str, Any]:
+        try:
+            from signals.strategy.snapshot import get_strategy_snapshot
+
+            snapshot = get_strategy_snapshot()
+            return dict(snapshot) if isinstance(snapshot, Mapping) else {}
+        except Exception as exc:
+            return {
+                "daily_brief": {
+                    "title": "Signals 策略简报暂不可用",
+                    "summary": f"strategy_snapshot_error:{exc.__class__.__name__}",
+                    "changed_since_last": {},
+                },
+                "candidates": [],
+                "warnings": [],
+                "decision_queue": [],
+                "strategy_kpis": {},
+                "source_confidence": {"overall": 0, "sources": []},
+            }
+
+    def _snapshot_source_freshness(self, snapshot: Mapping[str, Any], source_name: str) -> str:
+        confidence = snapshot.get("source_confidence") or {}
+        for item in confidence.get("sources", []) if isinstance(confidence, Mapping) else []:
+            if item.get("name") == source_name:
+                return str(item.get("freshness") or "")
+        return ""
+
+    def _record_strategy_snapshot_run(self, snapshot: Mapping[str, Any]) -> None:
+        as_of = str(snapshot.get("as_of") or datetime.now().date().isoformat())[:10]
+        run_id = f"strategy-snapshot-{as_of}"
+        path = self.state_root / "runs" / run_id / "run.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            brief = dict(snapshot.get("daily_brief") or {})
+            generated_at = str(snapshot.get("generated_at") or utc_now().isoformat())
+            metadata = {
+                "run_id": run_id,
+                "domain": "financial_analysis",
+                "capability": "strategy_snapshot",
+                "status": "completed",
+                "requested_by": "signals.dashboard",
+                "summary": brief.get("summary", "Signals strategy snapshot"),
+                "created_at": generated_at,
+                "started_at": generated_at,
+                "finished_at": generated_at,
+                "metadata": {
+                    "as_of": as_of,
+                    "candidate_count": len(snapshot.get("candidates") or []),
+                    "warning_count": len(snapshot.get("warnings") or []),
+                    "theme_count": len(snapshot.get("themes") or []),
+                    "source_confidence": snapshot.get("source_confidence", {}),
+                },
+            }
+            self._write_run_metadata(path, metadata)
+        except Exception:
+            return
 
     def _rank_snapshot(self, domain: str) -> Dict[str, Any]:
         try:
@@ -590,11 +681,34 @@ class SignalsPack:
                 journal.close()
 
     def _connector_health(self) -> List[Dict[str, Any]]:
+        mongo_status = "not_configured"
+        mongo_details: Dict[str, Any] = {"configured": bool(config.MONGO_URL)}
+        if config.MONGO_URL:
+            try:
+                from signals.data.mongo_fallback import get_db
+
+                db = get_db()
+                if db is not None:
+                    db.command("ping")
+                    mongo_status = "ok"
+                    mongo_details["database"] = db.name
+                else:
+                    mongo_status = "warning"
+            except Exception as exc:
+                mongo_status = "warning"
+                mongo_details["error"] = f"{exc.__class__.__name__}: {exc}"
+
         return [
             {
+                "connector_id": "mongodb",
+                "status": mongo_status,
+                "summary": "MongoDB cache/read model",
+                "details": mongo_details,
+            },
+            {
                 "connector_id": "tushare",
-                "status": "ok" if config.TUSHARE_TOKEN else "critical",
-                "summary": "Tushare market data token",
+                "status": "ok" if config.TUSHARE_TOKEN else "info",
+                "summary": "Tushare market data token (optional when MongoDB cache is healthy)",
                 "details": {"configured": bool(config.TUSHARE_TOKEN)},
             },
             {

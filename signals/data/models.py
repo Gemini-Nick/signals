@@ -7,7 +7,17 @@ from datetime import date, datetime
 from typing import Any, Literal, Optional
 
 
-DataDomain = Literal["kline", "board", "concept", "constituents", "social"]
+DataDomain = Literal[
+    "kline",
+    "board",
+    "concept",
+    "constituents",
+    "social",
+    "index",
+    "quote",
+    "market_pool",
+    "signal",
+]
 DataMode = Literal["historical", "realtime", "auto"]
 ResolvedMode = Literal["historical", "realtime"]
 Market = Literal["A", "HK", "US", "all"]
@@ -66,9 +76,15 @@ HISTORICAL_PURPOSES = {"backtest", "review", "analog"}
 REALTIME_PURPOSES = {"intraday", "cluster", "live", "quote"}
 
 
-def normalize_as_of(as_of: Optional[str]) -> str:
-    """Return YYYY-MM-DD, treating empty/today as the local current date."""
+def normalize_as_of(as_of: Optional[str], market: str = "A") -> str:
+    """Return YYYY-MM-DD, treating empty/today as the latest trading day."""
     if not as_of or str(as_of).lower() == "today":
+        try:
+            from signals.data.mongo_fallback import get_last_trading_day
+
+            return get_last_trading_day(market)
+        except Exception:
+            pass
         return date.today().isoformat()
     value = str(as_of)
     if len(value) == 8 and value.isdigit():
@@ -96,7 +112,7 @@ def resolve_mode(request: DataRequest) -> ResolvedMode:
     if purpose in REALTIME_PURPOSES:
         return "realtime"
 
-    as_of = normalize_as_of(request.as_of)
+    as_of = normalize_as_of(request.as_of, request.market)
     today = date.today().isoformat()
     if as_of < today:
         return "historical"

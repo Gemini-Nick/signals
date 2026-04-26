@@ -1,0 +1,111 @@
+# -*- coding: utf-8 -*-
+"""Mongo storage contracts for the Signals data plane."""
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+
+from pymongo import ASCENDING
+from pymongo.database import Database
+from pymongo.errors import OperationFailure, PyMongoError
+
+logger = logging.getLogger("signals.sync.storage")
+
+
+def _safe_create_index(collection, keys, **kwargs) -> None:
+    try:
+        collection.create_index(keys, **kwargs)
+    except OperationFailure as exc:
+        if getattr(exc, "code", None) in {85, 86}:
+            logger.debug("index already exists for %s: %s", collection.name, exc)
+            return
+        logger.warning("create index skipped for %s: %s", collection.name, exc)
+    except PyMongoError as exc:
+        logger.warning("create index failed for %s: %s", collection.name, exc)
+
+
+def _drop_ttl_indexes(collection) -> None:
+    """Canonical collections must not expire; remove old TTL indexes if present."""
+    try:
+        for name, spec in collection.index_information().items():
+            if name == "_id_":
+                continue
+            if "expireAfterSeconds" in spec:
+                collection.drop_index(name)
+                logger.info("dropped TTL index %s on %s", name, collection.name)
+    except OperationFailure as exc:
+        if getattr(exc, "code", None) == 27:
+            logger.debug("ttl index already dropped for %s", collection.name)
+            return
+        logger.warning("drop ttl indexes failed for %s: %s", collection.name, exc)
+    except PyMongoError as exc:
+        logger.warning("drop ttl indexes failed for %s: %s", collection.name, exc)
+
+
+def _cleanup_legacy_freshness_docs(db: Database) -> None:
+    """Remove module-name freshness rows that duplicate the canonical domains."""
+    legacy_pairs = [
+        ("quote_snapshots", "quote_snapshots"),
+        ("market_pools", "market_pools"),
+        ("signal_pool", "signals"),
+        ("stock_daily", "bars"),
+        ("cache_preheat", "bars"),
+        ("index_daily", "index_bars"),
+        ("index_minute", "index_bars"),
+    ]
+    try:
+        db["data_freshness"].delete_many({
+            "$or": [{"domain": domain, "collection": collection} for domain, collection in legacy_pairs]
+        })
+    except PyMongoError as exc:
+        logger.warning("legacy freshness cleanup skipped: %s", exc)
+
+
+def ensure_storage_model(db: Database) -> None:
+    """Create/update indexes for the unified cache model.
+
+    This function is intentionally idempotent and safe to run at daemon start.
+    """
+    now = datetime.now()
+
+    for name in ("board_ranking", "concept_ranking", "bars", "index_bars"):
+        _drop_ttl_indexes(db[name])
+
+    _safe_create_index(db["bars"], [("meta.symbol", ASCENDING), ("meta.freq", ASCENDING), ("dt", ASCENDING)])
+    _safe_create_index(db["kline_cache"], [("code", ASCENDING), ("freq", ASCENDING), ("dt", ASCENDING)])
+    _safe_create_index(db["index_bars"], [("meta.symbol", ASCENDING), ("meta.freq", ASCENDING), ("dt", ASCENDING)])
+    _safe_create_index(db["board_ranking"], [("source", ASCENDING), ("dt", ASCENDING)])
+    _safe_create_index(db["concept_ranking"], [("source", ASCENDING), ("dt", ASCENDING)])
+
+    for name in ("board_em", "board_ths", "board_sina", "concept_em", "concept_ths", "concept_sina"):
+        _safe_create_index(db[name], [("expires_at", ASCENDING)], expireAfterSeconds=0)
+
+    _safe_create_index(db["quote_snapshots"], [("symbol", ASCENDING), ("snapshot_at", ASCENDING)])
+    _safe_create_index(db["quote_snapshots"], [("expires_at", ASCENDING)], expireAfterSeconds=0)
+    _safe_create_index(db["market_pools"], [("pool", ASCENDING), ("dt", ASCENDING)])
+    _safe_create_index(db["market_pools"], [("expires_at", ASCENDING)], expireAfterSeconds=0)
+    _safe_create_index(db["signals"], [("dedupe_key", ASCENDING)], unique=True, sparse=True)
+    _safe_create_index(db["signals"], [("symbol", ASCENDING), ("signal_date", ASCENDING), ("freq", ASCENDING)])
+    _safe_create_index(db["strategy_snapshots"], [("as_of", ASCENDING)], unique=True, sparse=True)
+    _safe_create_index(db["strategy_snapshots"], [("updated_at", ASCENDING)])
+    _safe_create_index(db["trade_pairs"], [("dedupe_key", ASCENDING)], unique=True, sparse=True)
+    _safe_create_index(db["sync_log"], [("module", ASCENDING), ("last_run", ASCENDING)])
+    _safe_create_index(db["provider_health"], [("provider", ASCENDING), ("endpoint", ASCENDING), ("domain", ASCENDING)])
+    _safe_create_index(db["data_freshness"], [("domain", ASCENDING), ("mode", ASCENDING), ("collection", ASCENDING)])
+    _cleanup_legacy_freshness_docs(db)
+
+    db["data_freshness"].update_one(
+        {"domain": "storage", "market": "all", "mode": "system", "collection": "mongo_indexes"},
+        {"$set": {
+            "domain": "storage",
+            "market": "all",
+            "mode": "system",
+            "collection": "mongo_indexes",
+            "freshness": "fresh",
+            "latest_dt": now.date().isoformat(),
+            "as_of": now.date().isoformat(),
+            "updated_at": now,
+            "stale_reason": "",
+        }},
+        upsert=True,
+    )

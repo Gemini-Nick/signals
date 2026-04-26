@@ -90,6 +90,12 @@ def _symbol_candidates(symbol: Optional[str]) -> list[str]:
         f"SH.{pure}" if pure.startswith(("5", "6", "9")) else f"SZ.{pure}",
         f"sh{pure}" if pure.startswith(("5", "6", "9")) else f"sz{pure}",
     ]
+    if "." in raw:
+        prefix, code = raw.split(".", 1)
+        if prefix.upper() in {"SH", "SZ", "BJ"}:
+            candidates.extend([f"{prefix.lower()}{code}", f"{prefix.upper()}.{code}"])
+    if len(raw) >= 8 and raw[:2].upper() in {"SH", "SZ", "BJ"}:
+        candidates.append(f"{raw[:2].upper()}.{raw[2:]}")
     return list(dict.fromkeys(candidates))
 
 
@@ -112,11 +118,11 @@ def _bars_df_from_docs(docs: list[dict], source: str) -> pd.DataFrame:
     return df
 
 
-def _load_bars_from_mongo(symbol: Optional[str], freq: Optional[str]) -> tuple[pd.DataFrame, str]:
+def _load_bars_from_collection(collection: str, symbol: Optional[str], freq: Optional[str]) -> tuple[pd.DataFrame, str]:
     if not symbol:
         return pd.DataFrame(), ""
     try:
-        from signals.data.mongo_fallback import get_db, get_kline_docs
+        from signals.data.mongo_fallback import get_db
 
         db = get_db()
         if db is None:
@@ -124,14 +130,30 @@ def _load_bars_from_mongo(symbol: Optional[str], freq: Optional[str]) -> tuple[p
 
         symbols = _symbol_candidates(symbol)
         freqs = _freq_candidates(freq)
-        docs = list(db["bars"].find(
+        docs = list(db[collection].find(
             {"meta.symbol": {"$in": symbols}, "meta.freq": {"$in": freqs}},
             {"_id": 0},
         ).sort("dt", 1))
-        df = _bars_df_from_docs(docs, "bars")
+        df = _bars_df_from_docs(docs, collection)
         if not df.empty:
-            return df, "bars"
+            return df, collection
+    except Exception:
+        logger.debug("%s read failed", collection, exc_info=True)
+    return pd.DataFrame(), ""
 
+
+def _load_bars_from_mongo(symbol: Optional[str], freq: Optional[str]) -> tuple[pd.DataFrame, str]:
+    if not symbol:
+        return pd.DataFrame(), ""
+    try:
+        from signals.data.mongo_fallback import get_kline_docs
+
+        df, source = _load_bars_from_collection("bars", symbol, freq)
+        if not df.empty:
+            return df, source
+
+        symbols = _symbol_candidates(symbol)
+        freqs = _freq_candidates(freq)
         for code in symbols:
             for freq_candidate in freqs:
                 docs = get_kline_docs("kline_cache", code, freq_candidate)
@@ -289,7 +311,8 @@ def _write_provider_health(provider: str, endpoint: str, domain: str,
 
 
 def _write_data_freshness(domain: str, mode: str, collection: str,
-                          latest_dt: Optional[str], stale_reason: str = ""):
+                          latest_dt: Optional[str], stale_reason: str = "",
+                          freshness: Optional[str] = None):
     try:
         from signals.data.mongo_fallback import get_db
 
@@ -305,6 +328,7 @@ def _write_data_freshness(domain: str, mode: str, collection: str,
                 "as_of": latest_dt,
                 "collection": collection,
                 "latest_dt": latest_dt,
+                "freshness": freshness or ("stale" if stale_reason else "fresh"),
                 "stale_reason": stale_reason,
                 "updated_at": datetime.now(),
             }},
@@ -327,7 +351,7 @@ def _get_rank(request: DataRequest, domain: str) -> DataResponse:
     start = time.monotonic()
     mode = resolve_mode(request)
     errors: list[str] = []
-    target = normalize_as_of(request.as_of)
+    target = normalize_as_of(request.as_of, request.market)
 
     if mode == "historical":
         collection = CANONICAL_COLLECTIONS[domain]
@@ -461,7 +485,7 @@ def get_kline(request: DataRequest, legacy_fetcher: Optional[Callable[[], pd.Dat
         df, source = _load_bars_from_disk(request.symbol, request.freq)
     if not df.empty:
         as_of = getattr(df, "attrs", {}).get("as_of") or str(df.index.max().date())
-        target = normalize_as_of(request.as_of)
+        target = normalize_as_of(request.as_of, request.market)
         stale = bool(mode == "historical" and as_of and as_of < target)
         _write_data_freshness("kline", mode, source, as_of, "older_than_request" if stale else "")
         return DataResponse(
@@ -491,7 +515,118 @@ def get_stock_bars(request: DataRequest) -> DataResponse:
 
 
 def get_index_bars(request: DataRequest) -> DataResponse:
-    return get_kline(request)
+    start = time.monotonic()
+    mode = resolve_mode(request)
+    df, source = _load_bars_from_collection("index_bars", request.symbol, request.freq)
+    if not df.empty:
+        as_of = getattr(df, "attrs", {}).get("as_of") or str(df.index.max().date())
+        target = normalize_as_of(request.as_of, request.market)
+        stale = bool(mode == "historical" and as_of and as_of < target)
+        _write_data_freshness("index", mode, source, as_of, "older_than_request" if stale else "")
+        return DataResponse(
+            df,
+            mode_used=mode,
+            source=source,
+            as_of=as_of,
+            freshness="stale" if stale else "fresh",
+            is_stale=stale,
+            latency_ms=_elapsed_ms(start),
+        )
+    response = get_kline(request)
+    response.source = response.source if response.source == "bars" else f"index_bars->{response.source}"
+    response.latency_ms = _elapsed_ms(start)
+    if response.source == "bars":
+        _write_data_freshness("index", mode, "bars", response.as_of, "index_bars_empty_bars_compat")
+    return response
+
+
+def get_quote_snapshot(request: DataRequest) -> DataResponse:
+    start = time.monotonic()
+    mode = resolve_mode(request)
+    try:
+        from signals.data.mongo_fallback import get_db
+
+        db = get_db()
+        if db is None:
+            return DataResponse(None, mode, "quote_snapshots", freshness="empty", is_stale=True,
+                                latency_ms=_elapsed_ms(start), errors=["mongo_disabled"])
+        query = {}
+        if request.symbol:
+            query["symbol"] = {"$in": _symbol_candidates(request.symbol)}
+        if request.as_of and str(request.as_of).lower() != "today":
+            query["dt"] = {"$lte": normalize_as_of(request.as_of, request.market)}
+        if request.symbol:
+            doc = db["quote_snapshots"].find_one(query, {"_id": 0}, sort=[("snapshot_at", -1), ("dt", -1)])
+            data = doc
+            docs = [doc] if doc else []
+        else:
+            docs = list(db["quote_snapshots"].find(query, {"_id": 0}).sort("snapshot_at", -1).limit(200))
+            data = docs
+        if not docs:
+            _write_data_freshness("quote", mode, "quote_snapshots", None, "quote_snapshot_empty", "empty")
+            return DataResponse(data, mode, "quote_snapshots", freshness="pending", is_stale=True,
+                                latency_ms=_elapsed_ms(start), errors=["quote_snapshot_empty"])
+        as_of = str((docs[0].get("dt") or docs[0].get("snapshot_at") or ""))[:10] or None
+        is_stale = any(bool(doc.get("is_stale")) or doc.get("freshness") == "stale" for doc in docs)
+        _write_data_freshness("quote", mode, "quote_snapshots", as_of, "stale_snapshot" if is_stale else "")
+        return DataResponse(data, mode, "quote_snapshots", as_of=as_of,
+                            freshness="stale" if is_stale else "fresh", is_stale=is_stale,
+                            latency_ms=_elapsed_ms(start))
+    except Exception as e:
+        return DataResponse(None, mode, "quote_snapshots", freshness="empty", is_stale=True,
+                            latency_ms=_elapsed_ms(start), errors=[str(e)])
+
+
+def get_market_pool(request: DataRequest) -> DataResponse:
+    start = time.monotonic()
+    mode = resolve_mode(request)
+    try:
+        from signals.data.mongo_fallback import get_db
+
+        db = get_db()
+        if db is None:
+            return DataResponse(None, mode, "market_pools", freshness="empty", is_stale=True,
+                                latency_ms=_elapsed_ms(start), errors=["mongo_disabled"])
+        doc = db["market_pools"].find_one({"pool": "active"}, {"_id": 0}, sort=[("dt", -1), ("updated_at", -1)])
+        if not doc:
+            _write_data_freshness("market_pool", mode, "market_pools", None, "market_pool_empty", "empty")
+            return DataResponse(None, mode, "market_pools", freshness="pending", is_stale=True,
+                                latency_ms=_elapsed_ms(start), errors=["market_pool_empty"])
+        as_of = str(doc.get("dt") or doc.get("updated_at") or "")[:10] or None
+        return DataResponse(doc, mode, "market_pools", as_of=as_of, freshness=doc.get("freshness", "fresh"),
+                            is_stale=doc.get("freshness") == "stale", latency_ms=_elapsed_ms(start))
+    except Exception as e:
+        return DataResponse(None, mode, "market_pools", freshness="empty", is_stale=True,
+                            latency_ms=_elapsed_ms(start), errors=[str(e)])
+
+
+def get_signal_pool(request: DataRequest) -> DataResponse:
+    start = time.monotonic()
+    mode = resolve_mode(request)
+    try:
+        from signals.data.mongo_fallback import get_db
+
+        db = get_db()
+        if db is None:
+            return DataResponse([], mode, "signals", freshness="empty", is_stale=True,
+                                latency_ms=_elapsed_ms(start), errors=["mongo_disabled"])
+        query = {}
+        if request.symbol:
+            query["symbol"] = {"$in": _symbol_candidates(request.symbol)}
+        if request.as_of and str(request.as_of).lower() != "today":
+            query["signal_date"] = {"$lte": normalize_as_of(request.as_of, request.market)}
+        docs = list(db["signals"].find(query, {"_id": 0}).sort("signal_date", -1).limit(200))
+        if not docs:
+            _write_data_freshness("signal", mode, "signals", None, "signal_pool_empty", "empty")
+            return DataResponse([], mode, "signals", freshness="empty", is_stale=True,
+                                latency_ms=_elapsed_ms(start), errors=["signal_pool_empty"])
+        as_of = str(docs[0].get("signal_date") or docs[0].get("updated_at") or "")[:10] or None
+        _write_data_freshness("signal", mode, "signals", as_of)
+        return DataResponse(docs, mode, "signals", as_of=as_of, freshness="fresh",
+                            latency_ms=_elapsed_ms(start))
+    except Exception as e:
+        return DataResponse([], mode, "signals", freshness="empty", is_stale=True,
+                            latency_ms=_elapsed_ms(start), errors=[str(e)])
 
 
 def get_concept_constituents(request: DataRequest) -> DataResponse:

@@ -1853,6 +1853,7 @@ def _concept_rankings_from_df(df, top_n: int, tag: str = "gateway") -> List[Conc
     if df is None or df.empty:
         return []
     results = []
+    skipped_dirty = 0
     for _, item in df.iterrows():
         name = str(
             item.get("board_name")
@@ -1863,11 +1864,17 @@ def _concept_rankings_from_df(df, top_n: int, tag: str = "gateway") -> List[Conc
         ).strip()
         if not name or _is_noise_concept(name):
             continue
-        gain = float(item.get("change_pct", item.get("gain_pct", 0)) or 0)
-        leading_gain = float(item.get("leader_change_pct", item.get("leading_gain", 0)) or 0)
-        up_count = int(item.get("up_count", 0) or 0)
-        down_count = int(item.get("down_count", 0) or 0)
-        turnover = float(item.get("turnover_pct", item.get("turnover_rate", 0)) or 0)
+        try:
+            gain = float(item.get("change_pct", item.get("gain_pct", 0)) or 0)
+            leading_gain = float(item.get("leader_change_pct", item.get("leading_gain", 0)) or 0)
+            up_count = int(item.get("up_count", 0) or 0)
+            down_count = int(item.get("down_count", 0) or 0)
+            turnover = float(item.get("turnover_pct", item.get("turnover_rate", 0)) or 0)
+            if any(pd.isna(value) for value in [gain, leading_gain, turnover]):
+                raise ValueError("concept ranking numeric field is NaN")
+        except (TypeError, ValueError):
+            skipped_dirty += 1
+            continue
         stype = _classify_concept(name)
         score = _compute_concept_score(
             gain, up_count, down_count, turnover, leading_gain, stype)
@@ -1885,6 +1892,8 @@ def _concept_rankings_from_df(df, top_n: int, tag: str = "gateway") -> List[Conc
             composite_score=score,
             related_industries=_map_concept_to_industries(name),
         ))
+    if skipped_dirty:
+        _detail(f"  [DataGateway] 概念板块跳过脏数据 {skipped_dirty} 条 (source={tag})")
     results.sort(key=lambda x: x.composite_score, reverse=True)
     return results[:top_n]
 

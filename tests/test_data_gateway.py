@@ -142,6 +142,35 @@ def test_kline_prefers_bars_before_legacy(monkeypatch):
     assert calls["legacy"] == 0
 
 
+def test_index_bars_prefers_index_collection(monkeypatch):
+    from signals.data import gateway
+
+    calls = []
+    df = pd.DataFrame([
+        {"dt": "2026-04-23", "open": 1, "high": 2, "low": 1, "close": 2, "vol": 100}
+    ])
+    df["dt"] = pd.to_datetime(df["dt"])
+    df = df.set_index("dt")
+    df.attrs["as_of"] = "2026-04-23"
+
+    def fake_load(collection, symbol, freq):
+        calls.append(collection)
+        if collection == "index_bars":
+            return df, "index_bars"
+        return pd.DataFrame(), ""
+
+    monkeypatch.setattr(gateway, "_load_bars_from_collection", fake_load)
+    monkeypatch.setattr(gateway, "_write_data_freshness", lambda *a, **k: None)
+
+    response = gateway.get_index_bars(
+        DataRequest(domain="index", mode="historical", symbol="sz399001", freq="daily", as_of="2026-04-23")
+    )
+
+    assert response.source == "index_bars"
+    assert response.freshness == "fresh"
+    assert calls == ["index_bars"]
+
+
 def test_runtime_concept_rankings_do_not_fallback_to_providers(monkeypatch):
     from signals.data.models import DataResponse
     from signals.data import gateway

@@ -9,6 +9,7 @@
 全部未配置时行为与重构前一致（yfinance 兜底）。
 """
 
+import socket
 from typing import Optional
 
 from .fetcher import USDataSource, FutuSource
@@ -22,6 +23,14 @@ def _log(msg: str):
         dash.detail(msg)
     else:
         print(msg, flush=True)
+
+
+def _port_open(host: str, port: int, timeout: float = 0.3) -> bool:
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def create_us_source(mode: str = "intraday",
@@ -59,18 +68,21 @@ def create_us_source(mode: str = "intraday",
 
     if mode == "intraday":
         # ── 1. IB（盘中优先）──────────────────────────────
-        try:
-            from .ib_source import IBSource
-            ib = IBSource(config.IB_HOST, config.IB_PORT, config.IB_CLIENT_ID)
-            ib.connect()
-            providers.append(ib)
-            _log(f"  [IBSource] 连接成功 ({config.IB_HOST}:{config.IB_PORT})")
-        except ImportError:
-            _log("  [IBSource] 跳过: ib_async 未安装")
-        except ConnectionRefusedError:
-            _log(f"  [IBSource] 跳过: IB Gateway 未运行")
-        except Exception as e:
-            _log(f"  [IBSource] 跳过: {type(e).__name__}")
+        if not _port_open(config.IB_HOST, config.IB_PORT):
+            _log(f"  [IBSource] 跳过: IB Gateway 未运行 ({config.IB_HOST}:{config.IB_PORT})")
+        else:
+            try:
+                from .ib_source import IBSource
+                ib = IBSource(config.IB_HOST, config.IB_PORT, config.IB_CLIENT_ID)
+                ib.connect()
+                providers.append(ib)
+                _log(f"  [IBSource] 连接成功 ({config.IB_HOST}:{config.IB_PORT})")
+            except ImportError:
+                _log("  [IBSource] 跳过: ib_async 未安装")
+            except ConnectionRefusedError:
+                _log(f"  [IBSource] 跳过: IB Gateway 未运行")
+            except Exception as e:
+                _log(f"  [IBSource] 跳过: {type(e).__name__}")
 
         # ── 2. Futu（盘中备选）────────────────────────────
         if futu_source:

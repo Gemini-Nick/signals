@@ -19,10 +19,24 @@ from ..retry import sync_retry
 logger = logging.getLogger("signals.sync.index_minute")
 
 
+def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict]) -> int:
+    if not docs:
+        return 0
+    prepared = []
+    for doc in docs:
+        item = dict(doc)
+        item["meta"] = {**item.get("meta", {}), "symbol": symbol, "freq": freq, "asset_type": "index"}
+        prepared.append(item)
+    for collection in ("index_bars", "bars"):
+        col = db[collection]
+        col.delete_many({"meta.symbol": symbol, "meta.freq": freq})
+        col.insert_many([dict(item) for item in prepared], ordered=False)
+    return len(prepared)
+
+
 def _sync_a_index_minute(db: Database, ak_codes: dict,
                          proxy_url: str = None) -> int:
     """A 股指数分钟线"""
-    bars_col = db["bars"]
     sync_col = db["sync_log"]
     inserted = 0
 
@@ -48,7 +62,7 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
                 for _, row in df.iterrows():
                     docs.append({
                         "dt": pd.to_datetime(row[dt_col]),
-                        "meta": {"symbol": symbol, "freq": freq},
+                        "meta": {"symbol": symbol, "freq": freq, "asset_type": "index"},
                         "open": float(row["开盘"]),
                         "high": float(row["最高"]),
                         "low": float(row["最低"]),
@@ -58,12 +72,8 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
                     })
 
                 if docs:
-                    bars_col.delete_many({
-                        "meta.symbol": symbol,
-                        "meta.freq": freq,
-                    })
-                    bars_col.insert_many(docs, ordered=False)
-                    inserted += len(docs)
+                    written = _write_index_docs(db, symbol, freq, docs)
+                    inserted += written
 
                     sync_col.update_one(
                         {"_id": f"index_minute:{symbol}:{freq}"},
@@ -73,11 +83,11 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
                             "last_dt": docs[-1]["dt"],
                             "last_run": datetime.now(),
                             "status": "ok",
-                            "bar_count": len(docs),
+                            "bar_count": written,
                         }},
                         upsert=True,
                     )
-                    logger.info(f"  ✓ {name} {freq}: {len(docs)} bars")
+                    logger.info(f"  ✓ {name} {freq}: {written} bars")
 
             except Exception as e:
                 logger.error(f"  ✗ {name} {freq}: {e}")

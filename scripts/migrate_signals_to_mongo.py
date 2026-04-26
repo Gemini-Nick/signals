@@ -16,6 +16,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+from pymongo import UpdateOne
 
 
 def _read_sqlite(db_path: str, table: str) -> list[dict]:
@@ -31,9 +32,31 @@ def _read_sqlite(db_path: str, table: str) -> list[dict]:
 def _get_mongo_db():
     """获取 MongoDB 数据库实例。"""
     from signals.sync.db import get_db
+    from signals.sync.storage import ensure_storage_model
+
     db = get_db()
     db.command("ping")
+    ensure_storage_model(db)
     return db
+
+
+def _signal_dedupe_key(record: dict) -> str:
+    return "|".join([
+        str(record.get("symbol") or ""),
+        str(record.get("signal_date") or ""),
+        str(record.get("signal_type") or ""),
+        str(record.get("freq") or ""),
+    ])
+
+
+def _trade_pair_dedupe_key(record: dict) -> str:
+    return "|".join([
+        str(record.get("symbol") or ""),
+        str(record.get("buy_date") or ""),
+        str(record.get("sell_date") or ""),
+        str(record.get("buy_signal_type") or ""),
+        str(record.get("sell_signal_type") or ""),
+    ])
 
 
 def migrate_signals(db, records: list[dict], dry_run: bool = False) -> int:
@@ -43,26 +66,28 @@ def migrate_signals(db, records: list[dict], dry_run: bool = False) -> int:
         return 0
 
     col = db["signals"]
-    docs = []
+    ops = []
     for r in records:
         doc = {k: v for k, v in r.items() if k != "id"}
+        doc["sqlite_id"] = r.get("id")
+        doc["dedupe_key"] = _signal_dedupe_key(r)
+        doc["source"] = "sqlite.backtest.signal_records"
         # SQLite 的 NULL 映射为 None，MongoDB 原生支持
-        docs.append(doc)
+        ops.append(UpdateOne(
+            {"dedupe_key": doc["dedupe_key"]},
+            {"$set": doc},
+            upsert=True,
+        ))
 
     if dry_run:
-        print(f"  [DRY RUN] 将迁移 {len(docs)} 条信号记录")
-        return len(docs)
+        print(f"  [DRY RUN] 将 upsert {len(ops)} 条信号记录")
+        return len(ops)
 
-    from pymongo.errors import BulkWriteError
-    try:
-        result = col.insert_many(docs, ordered=False)
-        inserted = len(result.inserted_ids)
-    except BulkWriteError as e:
-        inserted = e.details.get("nInserted", 0)
-        dupes = len(e.details.get("writeErrors", []))
-        print(f"  跳过 {dupes} 条重复记录")
+    result = col.bulk_write(ops, ordered=False)
+    inserted = int(result.upserted_count)
+    modified = int(result.modified_count)
 
-    print(f"  已迁移 {inserted} 条信号记录")
+    print(f"  已 upsert {len(ops)} 条信号记录（新增 {inserted}，更新 {modified}）")
     return inserted
 
 
@@ -73,23 +98,27 @@ def migrate_trade_pairs(db, records: list[dict], dry_run: bool = False) -> int:
         return 0
 
     col = db["trade_pairs"]
-    docs = []
+    ops = []
     for r in records:
         doc = {k: v for k, v in r.items() if k != "id"}
-        docs.append(doc)
+        doc["sqlite_id"] = r.get("id")
+        doc["dedupe_key"] = _trade_pair_dedupe_key(r)
+        doc["source"] = "sqlite.backtest.trade_pairs"
+        ops.append(UpdateOne(
+            {"dedupe_key": doc["dedupe_key"]},
+            {"$set": doc},
+            upsert=True,
+        ))
 
     if dry_run:
-        print(f"  [DRY RUN] 将迁移 {len(docs)} 条交易配对")
-        return len(docs)
+        print(f"  [DRY RUN] 将 upsert {len(ops)} 条交易配对")
+        return len(ops)
 
-    from pymongo.errors import BulkWriteError
-    try:
-        result = col.insert_many(docs, ordered=False)
-        inserted = len(result.inserted_ids)
-    except BulkWriteError as e:
-        inserted = e.details.get("nInserted", 0)
+    result = col.bulk_write(ops, ordered=False)
+    inserted = int(result.upserted_count)
+    modified = int(result.modified_count)
 
-    print(f"  已迁移 {inserted} 条交易配对")
+    print(f"  已 upsert {len(ops)} 条交易配对（新增 {inserted}，更新 {modified}）")
     return inserted
 
 

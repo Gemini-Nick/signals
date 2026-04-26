@@ -21,11 +21,42 @@ import logging
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 
 from .db import get_db, close as close_db
 
 logger = logging.getLogger("signals.sync")
+
+
+MODULE_TARGETS = {
+    "cache_preheat": ("bars",),
+    "signal_pool": ("signals",),
+    "market_pools": ("market_pools",),
+    "quote_snapshots": ("quote_snapshots",),
+    "strategy_snapshot": ("strategy_snapshots",),
+    "stock_daily": ("bars",),
+    "index_daily": ("index_bars",),
+    "stock_minute": ("bars",),
+    "index_minute": ("index_bars",),
+    "board_ranking": ("board_ranking", "concept_ranking"),
+    "board_cons": ("board_constituents", "concept_constituents"),
+}
+
+COLLECTION_DOMAINS = {
+    "bars": "kline",
+    "kline_cache": "kline",
+    "index_bars": "index",
+    "board_ranking": "board",
+    "concept_ranking": "concept",
+    "board_constituents": "constituents",
+    "concept_constituents": "constituents",
+    "quote_snapshots": "quote",
+    "market_pools": "market_pool",
+    "signals": "signal",
+    "strategy_snapshots": "strategy",
+}
+
+REALTIME_MODULES = {"market_pools", "quote_snapshots", "stock_minute", "index_minute"}
 
 
 class SyncEngine:
@@ -47,11 +78,44 @@ class SyncEngine:
         self.proxy_url = proxy_url
         self.max_workers = max_workers
         atexit.register(close_db)
+        from .storage import ensure_storage_model
+
+        ensure_storage_model(self.db)
+        self.mark_stale_running_modules()
 
         # 延迟导入避免循环
         from .modules import ALL_MODULES
         self.modules = ALL_MODULES
         self.module_map = {name: (fn, schedule) for name, fn, schedule in self.modules}
+
+    def mark_stale_running_modules(self, max_age: timedelta = timedelta(hours=2)) -> int:
+        """Release modules stuck in `running` so the daemon can retry them."""
+        sync_log = self.db["sync_log"]
+        cutoff = datetime.now() - max_age
+        stale_docs = list(sync_log.find(
+            {"_id": {"$regex": ":_meta$"}, "status": "running", "last_run": {"$lt": cutoff}},
+            {"_id": 1, "module": 1, "last_run": 1},
+        ))
+        if not stale_docs:
+            return 0
+
+        now = datetime.now()
+        for doc in stale_docs:
+            last_run = doc.get("last_run")
+            elapsed = None
+            if isinstance(last_run, datetime):
+                elapsed = (now - last_run).total_seconds()
+            sync_log.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {
+                    "status": "degraded",
+                    "last_checked_at": now,
+                    "elapsed_seconds": elapsed,
+                    "error_msg": "stale_running_timeout",
+                }},
+            )
+        logger.warning("released %d stale running sync modules", len(stale_docs))
+        return len(stale_docs)
 
     def run_module(self, name: str, module_fn) -> dict:
         """
@@ -75,19 +139,26 @@ class SyncEngine:
             result = module_fn(self.db, proxy_url=self.proxy_url)
             elapsed = (datetime.now() - start_time).total_seconds()
 
+            status, error_msg = self._classify_result(name, result)
+
             # 标记完成
             sync_log.update_one(
                 {"_id": f"{name}:_meta"},
                 {"$set": {
-                    "status": "ok",
+                    "status": status,
                     "last_run": datetime.now(),
                     "elapsed_seconds": elapsed,
-                    "error_msg": None,
+                    "error_msg": error_msg,
+                    "result": result,
                 }},
             )
 
-            logger.info(f"✓ {name} 完成 ({elapsed:.1f}s)")
-            return {"module": name, "status": "ok", "elapsed": elapsed,
+            self._write_module_freshness(name, status, error_msg)
+            if status == "ok":
+                logger.info(f"✓ {name} 完成 ({elapsed:.1f}s)")
+            else:
+                logger.warning("! %s degraded (%.1fs): %s", name, elapsed, error_msg)
+            return {"module": name, "status": status, "elapsed": elapsed,
                     "result": result}
 
         except Exception as e:
@@ -117,10 +188,15 @@ class SyncEngine:
                      f"{self.max_workers} 并发)")
         results = []
 
+        parallel_modules = [
+            module for module in self.modules
+            if module[0] != "strategy_snapshot"
+        ]
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {
                 executor.submit(self.run_module, name, fn): name
-                for name, fn, _ in self.modules
+                for name, fn, _ in parallel_modules
             }
             for future in as_completed(futures):
                 name = futures[future]
@@ -132,6 +208,9 @@ class SyncEngine:
                     results.append({
                         "module": name, "status": "error", "error": str(e)
                     })
+
+        if "strategy_snapshot" in self.module_map:
+            results.append(self.run_one("strategy_snapshot"))
 
         ok = sum(1 for r in results if r["status"] == "ok")
         logger.info(f"🏁 同步完成: {ok}/{len(results)} 成功")
@@ -152,6 +231,13 @@ class SyncEngine:
         )
         if not doc:
             return False
+        status = doc.get("status")
+        if status != "ok":
+            if status == "running":
+                last_run = doc.get("last_run")
+                if isinstance(last_run, datetime) and datetime.now() - last_run < timedelta(hours=2):
+                    return True
+            return False
         last_run = doc.get("last_run")
         if not last_run:
             return False
@@ -160,6 +246,79 @@ class SyncEngine:
         else:
             ran_today = last_run.strftime("%Y-%m-%d") == today
         return ran_today
+
+    @staticmethod
+    def _result_inserted(result: object) -> int:
+        if isinstance(result, dict):
+            value = result.get("inserted", 0)
+            try:
+                return int(value or 0)
+            except Exception:
+                return 0
+        return 0
+
+    def _target_counts(self, module_name: str) -> dict[str, int]:
+        counts = {}
+        for collection in MODULE_TARGETS.get(module_name, ()):
+            try:
+                counts[collection] = int(self.db[collection].estimated_document_count())
+            except Exception:
+                counts[collection] = 0
+        return counts
+
+    def _classify_result(self, module_name: str, result: object) -> tuple[str, str | None]:
+        counts = self._target_counts(module_name)
+        if not counts:
+            return "ok", None
+        inserted = self._result_inserted(result)
+        if inserted == 0 and all(count <= 0 for count in counts.values()):
+            return "degraded", "target_empty_after_zero_insert"
+        if isinstance(result, dict) and result.get("errors"):
+            return "degraded", f"errors={result.get('errors')}"
+        return "ok", None
+
+    def _write_module_freshness(self, module_name: str, status: str, error_msg: str | None) -> None:
+        now = datetime.now()
+        mode = "realtime" if module_name in REALTIME_MODULES else "historical"
+        for collection, count in self._target_counts(module_name).items():
+            domain = COLLECTION_DOMAINS.get(collection, module_name)
+            latest_dt = None
+            try:
+                latest = self.db[collection].find_one(
+                    {},
+                    {"dt": 1, "latest_dt": 1, "updated_at": 1, "signal_date": 1, "snapshot_at": 1, "freshness": 1, "stale_reason": 1},
+                    sort=[("dt", -1), ("latest_dt", -1), ("signal_date", -1), ("snapshot_at", -1), ("updated_at", -1)],
+                ) or {}
+                value = latest.get("dt") or latest.get("latest_dt") or latest.get("signal_date") or latest.get("snapshot_at") or latest.get("updated_at")
+                latest_dt = str(value.date()) if hasattr(value, "date") else (str(value)[:10] if value else None)
+            except Exception:
+                latest_dt = None
+                latest = {}
+            if count <= 0:
+                freshness = "empty"
+            elif status != "ok":
+                freshness = "stale"
+            elif latest.get("freshness") in {"fresh", "stale", "partial", "empty", "pending", "unknown"}:
+                freshness = latest["freshness"]
+            else:
+                freshness = "fresh"
+            stale_reason = error_msg or latest.get("stale_reason") or ""
+            self.db["data_freshness"].update_one(
+                {"domain": domain, "market": "A", "mode": mode, "collection": collection},
+                {"$set": {
+                    "domain": domain,
+                    "market": "A",
+                    "mode": mode,
+                    "collection": collection,
+                    "freshness": freshness,
+                    "latest_dt": latest_dt,
+                    "as_of": latest_dt,
+                    "updated_at": now,
+                    "stale_reason": stale_reason,
+                    "count": count,
+                }},
+                upsert=True,
+            )
 
     @staticmethod
     def _parse_schedule_time(schedule: str) -> dt_time:
@@ -182,9 +341,13 @@ class SyncEngine:
         """Run conservative startup preheat for empty critical collections."""
         checks = [
             ("cache_preheat", "bars"),
+            ("signal_pool", "signals"),
+            ("market_pools", "market_pools"),
+            ("quote_snapshots", "quote_snapshots"),
             ("board_ranking", "board_ranking"),
             ("board_cons", "board_constituents"),
-            ("index_daily", "bars"),
+            ("index_daily", "index_bars"),
+            ("strategy_snapshot", "strategy_snapshots"),
         ]
         results = []
         for module_name, collection in checks:

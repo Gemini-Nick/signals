@@ -9,7 +9,7 @@ import traceback
 from datetime import datetime, timedelta
 
 import pandas as pd
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 import config
@@ -623,6 +623,132 @@ async def backtest_simulate(
         })
 
 
+@router.get("/analyze")
+async def backtest_analyze(
+    code: str = Query(..., description="股票代码 (如 002759, 09988)"),
+    freq: str = Query("daily", description="daily / weekly / monthly"),
+    signal_group: str = Query("all", description="macd / czsc / all"),
+    lookback: int = Query(999, description="信号回看窗口"),
+    factor: str = Query("", description="入场因子: gap / trend_breakout / vol_contraction / candle_run / candle_accel"),
+    gap_pct_min: float = Query(2.0),
+    volume_ratio_min: float = Query(1.5),
+    trend_lookback: int = Query(20),
+    bb_period: int = Query(20),
+    squeeze_threshold: float = Query(0.05),
+    run_count: int = Query(3),
+    body_ratio: float = Query(0.5),
+    accel_count: int = Query(3),
+    stop_loss: float = Query(5.0),
+    trail_stop: float = Query(50.0),
+    max_hold: int = Query(20),
+    slippage: float = Query(0.1),
+    take_profit: float = Query(0),
+    ma_exit_period: int = Query(0),
+    profit_drawdown: float = Query(0),
+    batch_exit: str = Query("0"),
+    batch1_ratio: float = Query(50),
+    batch1_target: float = Query(5),
+    batch2_target: float = Query(10),
+    atr_exit_period: int = Query(0),
+    atr_exit_mult: float = Query(2.0),
+):
+    """Canonical Signals 回测分析入口。"""
+    from signals.services.backtest import backtest_analyze as _backtest_analyze
+
+    return await _backtest_analyze(
+        code=code,
+        freq=freq,
+        signal_group=signal_group,
+        lookback=lookback,
+        factor=factor,
+        gap_pct_min=gap_pct_min,
+        volume_ratio_min=volume_ratio_min,
+        trend_lookback=trend_lookback,
+        bb_period=bb_period,
+        squeeze_threshold=squeeze_threshold,
+        run_count=run_count,
+        body_ratio=body_ratio,
+        accel_count=accel_count,
+        stop_loss=stop_loss,
+        trail_stop=trail_stop,
+        max_hold=max_hold,
+        slippage=slippage,
+        take_profit=take_profit,
+        ma_exit_period=ma_exit_period,
+        profit_drawdown=profit_drawdown,
+        batch_exit=batch_exit,
+        batch1_ratio=batch1_ratio,
+        batch1_target=batch1_target,
+        batch2_target=batch2_target,
+        atr_exit_period=atr_exit_period,
+        atr_exit_mult=atr_exit_mult,
+    )
+
+
+@router.get("/scan")
+async def backtest_scan(
+    code: str = Query(...),
+    freq: str = Query("daily"),
+    signal_group: str = Query("all"),
+    lookback: int = Query(999),
+    factor: str = Query(""),
+    gap_pct_min: float = Query(2.0),
+    volume_ratio_min: float = Query(1.5),
+    trend_lookback: int = Query(20),
+    bb_period: int = Query(20),
+    squeeze_threshold: float = Query(0.05),
+    run_count: int = Query(3),
+    body_ratio: float = Query(0.5),
+    accel_count: int = Query(3),
+    stop_loss: float = Query(5.0),
+    trail_stop: float = Query(50.0),
+    max_hold: int = Query(20),
+    slippage: float = Query(0.1),
+    take_profit: float = Query(0),
+    ma_exit_period: int = Query(0),
+    profit_drawdown: float = Query(0),
+    atr_exit_period: int = Query(0),
+    atr_exit_mult: float = Query(2.0),
+    scan_param: str = Query(""),
+    scan_values: str = Query(""),
+    scan_param2: str = Query(""),
+    scan_values2: str = Query(""),
+    scan_metric: str = Query("sharpe"),
+):
+    """Canonical Signals 参数扫描入口。"""
+    from signals.services.backtest import backtest_scan as _backtest_scan
+
+    return await _backtest_scan(
+        code=code,
+        freq=freq,
+        signal_group=signal_group,
+        lookback=lookback,
+        factor=factor,
+        gap_pct_min=gap_pct_min,
+        volume_ratio_min=volume_ratio_min,
+        trend_lookback=trend_lookback,
+        bb_period=bb_period,
+        squeeze_threshold=squeeze_threshold,
+        run_count=run_count,
+        body_ratio=body_ratio,
+        accel_count=accel_count,
+        stop_loss=stop_loss,
+        trail_stop=trail_stop,
+        max_hold=max_hold,
+        slippage=slippage,
+        take_profit=take_profit,
+        ma_exit_period=ma_exit_period,
+        profit_drawdown=profit_drawdown,
+        atr_exit_period=atr_exit_period,
+        atr_exit_mult=atr_exit_mult,
+        scan_param=scan_param,
+        scan_values=scan_values,
+        scan_param2=scan_param2,
+        scan_values2=scan_values2,
+        scan_metric=scan_metric,
+    )
+
+
 @router.get("/presets")
 async def backtest_presets():
     """返回日期预设列表"""
@@ -639,3 +765,79 @@ async def backtest_summary():
         "data_source": "gateway",
         "date_presets": len(_get_date_presets()),
     }
+
+
+@router.get("/health/push2his")
+async def push2his_health(
+    code: str = Query("002759"),
+    timeout: int = Query(8, ge=1, le=30),
+    live: bool = Query(False, description="显式 live=true 时才直连东财做人工诊断"),
+):
+    from signals.web2.api.backtest import push2his_health as _impl
+
+    return await _impl(code=code, timeout=timeout, live=live)
+
+
+@router.post("/push")
+async def backtest_push(request: Request):
+    from signals.web2.api.backtest import backtest_push as _impl
+
+    return await _impl(request)
+
+
+@router.get("/export")
+async def backtest_export(
+    code: str = Query(...),
+    freq: str = Query("daily"),
+    signal_group: str = Query("all"),
+    lookback: int = Query(999),
+    stop_loss: float = Query(5.0),
+    trail_stop: float = Query(50.0),
+    max_hold: int = Query(20),
+    slippage: float = Query(0.1),
+    factor: str = Query(""),
+    gap_pct_min: float = Query(2.0),
+    volume_ratio_min: float = Query(1.5),
+    trend_lookback: int = Query(20),
+    bb_period: int = Query(20),
+    squeeze_threshold: float = Query(0.05),
+    take_profit: float = Query(0),
+    ma_exit_period: int = Query(0),
+    profit_drawdown: float = Query(0),
+    batch_exit: str = Query("0"),
+    batch1_ratio: float = Query(50),
+    batch1_target: float = Query(5),
+    batch2_target: float = Query(10),
+):
+    from signals.web2.api.backtest import backtest_export as _impl
+
+    return await _impl(
+        code=code,
+        freq=freq,
+        signal_group=signal_group,
+        lookback=lookback,
+        stop_loss=stop_loss,
+        trail_stop=trail_stop,
+        max_hold=max_hold,
+        slippage=slippage,
+        factor=factor,
+        gap_pct_min=gap_pct_min,
+        volume_ratio_min=volume_ratio_min,
+        trend_lookback=trend_lookback,
+        bb_period=bb_period,
+        squeeze_threshold=squeeze_threshold,
+        take_profit=take_profit,
+        ma_exit_period=ma_exit_period,
+        profit_drawdown=profit_drawdown,
+        batch_exit=batch_exit,
+        batch1_ratio=batch1_ratio,
+        batch1_target=batch1_target,
+        batch2_target=batch2_target,
+    )
+
+
+@router.post("/batch")
+async def backtest_batch(request: Request):
+    from signals.web2.api.backtest import backtest_batch as _impl
+
+    return await _impl(request)
