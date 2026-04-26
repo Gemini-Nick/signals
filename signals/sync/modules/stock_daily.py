@@ -19,6 +19,7 @@ from pymongo.database import Database
 
 from ..proxy import em_proxy
 from ..retry import sync_retry
+from .daily_sources import fetch_tencent_daily
 
 logger = logging.getLogger("signals.sync.stock_daily")
 
@@ -54,6 +55,55 @@ def _pure_a_code(symbol: object) -> str:
     return ""
 
 
+def _iter_strategy_snapshot_symbols() -> list[str]:
+    symbols: list[str] = []
+    try:
+        from signals.strategy.snapshot import get_strategy_snapshot
+
+        snapshot = get_strategy_snapshot()
+    except Exception:
+        return symbols
+
+    for key in ("buy_candidates", "sell_warnings", "decision_queue"):
+        rows = snapshot.get(key) or []
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for field in ("symbol", "code", "raw_code"):
+                value = row.get(field)
+                if value:
+                    symbols.append(str(value))
+
+    rows = snapshot.get("themes") or []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for field in ("leader_symbol", "leader_code", "representative_symbol", "representative_code"):
+                value = row.get(field)
+                if value:
+                    symbols.append(str(value))
+    return symbols
+
+
+def _iter_configured_extra_symbols() -> list[str]:
+    symbols: list[str] = []
+    raw = os.getenv("STOCK_DAILY_EXTRA_CODES", "")
+    for value in raw.replace(";", ",").split(","):
+        value = value.strip()
+        if value:
+            symbols.append(value)
+    try:
+        from signals.core.concept_carriers import preferred_carrier_symbols
+
+        symbols.extend(preferred_carrier_symbols())
+    except Exception:
+        pass
+    return symbols
+
+
 def _get_all_stock_codes() -> list:
     """获取全量 A 股代码列表"""
     try:
@@ -80,7 +130,19 @@ def _get_active_stock_codes(db: Database) -> list[str]:
         if code and code not in codes:
             codes.append(code)
 
+    only_codes = os.getenv("STOCK_DAILY_ONLY_CODES", "")
+    if only_codes.strip():
+        for symbol in only_codes.replace(";", ",").split(","):
+            add(symbol)
+        return codes
+
     for symbol in getattr(config, "WHITELIST", []):
+        add(symbol)
+
+    for symbol in _iter_strategy_snapshot_symbols():
+        add(symbol)
+
+    for symbol in _iter_configured_extra_symbols():
         add(symbol)
 
     pool = db["market_pools"].find_one(
@@ -158,7 +220,28 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
                 "amount": "amount",
             }
         except Exception as sina_exc:
-            raise RuntimeError(f"eastmoney={str(em_exc)[:160]}; sina={str(sina_exc)[:160]}") from sina_exc
+            source = "tencent"
+            try:
+                df = fetch_tencent_daily(
+                    code,
+                    start_date=start,
+                    end_date=end_date,
+                    timeout=float(os.getenv("STOCK_DAILY_TENCENT_TIMEOUT", "8")),
+                )
+                column_map = {
+                    "dt": "日期",
+                    "open": "开盘",
+                    "high": "最高",
+                    "low": "最低",
+                    "close": "收盘",
+                    "vol": "成交量",
+                    "amount": "成交额",
+                }
+            except Exception as tencent_exc:
+                raise RuntimeError(
+                    f"eastmoney={str(em_exc)[:160]}; sina={str(sina_exc)[:160]}; "
+                    f"tencent={str(tencent_exc)[:160]}"
+                ) from tencent_exc
     if df is None or df.empty:
         return []
 

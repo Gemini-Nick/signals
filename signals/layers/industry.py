@@ -1535,6 +1535,7 @@ _CONCEPT_INDUSTRY_HINTS = {
     "电池": ["能源金属", "光伏设备"],
     "锂电": ["能源金属", "化学原料"],
     "锂矿": ["能源金属", "小金属"],
+    "锂": ["能源金属", "小金属", "盐湖提锂", "锂矿概念"],
     "光伏": ["光伏设备", "电网设备"],
     "风电": ["风电设备", "电网设备"],
     "芯片": ["半导体", "消费电子"],
@@ -1556,21 +1557,36 @@ _CONCEPT_INDUSTRY_HINTS = {
 
 
 def _map_concept_to_industries(concept_name: str) -> List[str]:
-    """概念名关键词匹配行业名。优先用提示表，再用 ROTATION_LINE_MAP。"""
+    """概念名关键词匹配行业名。优先用产业链语义层，再用提示表和 ROTATION_LINE_MAP。"""
     import config as _cfg
 
-    # 先用提示表精确匹配
+    matched: List[str] = []
+
+    def extend(rows: List[str]) -> None:
+        for row in rows:
+            if row and row not in matched:
+                matched.append(row)
+
+    try:
+        from signals.core.concept_carriers import industry_hints_for_concept
+
+        extend(industry_hints_for_concept(concept_name, limit=5))
+    except Exception:
+        pass
+
+    # 再用提示表精确匹配，保留人工修正入口。
     for keyword, industries in _CONCEPT_INDUSTRY_HINTS.items():
         if keyword in concept_name:
-            return industries[:3]
+            extend(industries)
+            if matched:
+                return matched[:5]
 
     # 回退到 ROTATION_LINE_MAP 子串匹配
     rot_map = getattr(_cfg, "ROTATION_LINE_MAP", {})
-    matched = []
     kw = concept_name.replace("概念", "").replace("板块", "").strip()
     for ind_name in sorted(rot_map.keys(), key=len, reverse=True):
         if ind_name in concept_name or (kw and len(kw) >= 2 and kw in ind_name):
-            matched.append(ind_name)
+            extend([ind_name])
         if len(matched) >= 3:
             break
     return matched

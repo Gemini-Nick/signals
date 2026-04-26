@@ -2,11 +2,12 @@
 """
 指数分钟线同步 — 11 只指数 5M/15M/30M
 
-数据源: AKShare stock_zh_index_hist_min_em（东财指数分钟线）
+数据源: Sina/Tencent 公共分钟线；东财指数分钟线可显式开启为最后兜底
 策略: 全量覆盖（数据量小，近 5 天窗口）
 频率: 工作日 16:00
 """
 import logging
+import os
 from datetime import datetime
 
 import akshare as ak
@@ -15,8 +16,11 @@ from pymongo.database import Database
 
 from ..proxy import em_proxy
 from ..retry import sync_retry
+from .minute_sources import fetch_public_minute
 
 logger = logging.getLogger("signals.sync.index_minute")
+_ENABLE_EASTMONEY_FALLBACK = os.getenv("INDEX_MINUTE_EASTMONEY_FALLBACK", "false").lower() == "true"
+_PUBLIC_TIMEOUT = float(os.getenv("INDEX_MINUTE_TIMEOUT", "5"))
 
 
 def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict]) -> int:
@@ -48,9 +52,21 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
 
         for freq, period in period_map.items():
             try:
-                with em_proxy(proxy_url):
-                    df = ak.stock_zh_index_hist_min_em(
-                        symbol=pure_code, period=period)
+                try:
+                    df, source = fetch_public_minute(symbol, period, timeout=_PUBLIC_TIMEOUT)
+                except Exception as public_error:
+                    if not _ENABLE_EASTMONEY_FALLBACK:
+                        logger.warning("公共指数分钟线失败，跳过东财兜底 %s %s: %s", symbol, freq, public_error)
+                        continue
+                    logger.warning("公共指数分钟线失败，显式尝试东财兜底 %s %s: %s", symbol, freq, public_error)
+                    source = "eastmoney"
+                    with em_proxy(proxy_url):
+                        fetch_index_minute = getattr(ak, "index_zh_a_hist_min_em", None)
+                        if fetch_index_minute is None:
+                            fetch_index_minute = getattr(ak, "stock_zh_index_hist_min_em", None)
+                        if fetch_index_minute is None:
+                            raise AttributeError("akshare has no index minute kline API")
+                        df = fetch_index_minute(symbol=pure_code, period=period)
 
                 if df is None or df.empty:
                     logger.warning(f"  ✗ {name} {freq}: 无数据")
@@ -62,7 +78,7 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
                 for _, row in df.iterrows():
                     docs.append({
                         "dt": pd.to_datetime(row[dt_col]),
-                        "meta": {"symbol": symbol, "freq": freq, "asset_type": "index"},
+                        "meta": {"symbol": symbol, "freq": freq, "asset_type": "index", "source": source},
                         "open": float(row["开盘"]),
                         "high": float(row["最高"]),
                         "low": float(row["最低"]),
@@ -84,6 +100,7 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
                             "last_run": datetime.now(),
                             "status": "ok",
                             "bar_count": written,
+                            "source": source,
                         }},
                         upsert=True,
                     )
