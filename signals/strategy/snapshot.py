@@ -412,6 +412,7 @@ def _candidate_from_signal(
     status = "warning" if _signal_status(signal) == "warning" else "open"
     direction = "sell" if status == "warning" else "buy"
     price = _float(signal.get("price") or quote.get("price") or quote.get("latest_price") or quote.get("close"))
+    name = str(signal.get("name") or quote.get("name") or _resolved_stock_name(symbol) or "")
     thesis = _thesis_for(symbol, signal_type, theme)
     risk = _risk_for(status, signal, theme)
     next_action = "复核风险并设置退出条件" if status == "warning" else "打开图表复核，确认买点和止损位"
@@ -432,7 +433,9 @@ def _candidate_from_signal(
     }
     return {
         "symbol": symbol,
-        "name": str(signal.get("name") or quote.get("name") or ""),
+        "name": name,
+        "display_name": name or symbol,
+        "kind": "stock",
         "score": round(score, 2),
         "direction": direction,
         "reason": signal_type,
@@ -461,11 +464,14 @@ def _candidate_from_pool(
 ) -> dict[str, Any]:
     symbol = _normalize_symbol(pool_item.get("symbol"))
     sources = list(pool_item.get("sources") or ["market_pools"])
+    name = str(quote.get("name") or _resolved_stock_name(symbol) or "")
     thesis = f"{symbol} 位于活跃池，优先观察是否与 {theme.get('name') or '当前市场主线'} 共振"
     next_action = "等待明确技术信号，避免仅因入池直接行动"
     return {
         "symbol": symbol,
-        "name": str(quote.get("name") or ""),
+        "name": name,
+        "display_name": name or symbol,
+        "kind": "stock",
         "score": round(45 + overall_confidence * 20, 2),
         "direction": "watch",
         "reason": "active_pool",
@@ -594,26 +600,49 @@ def _build_decision_queue(
     queue = []
     for idx, item in enumerate(warnings[:5]):
         metadata = _as_dict(item.get("metadata"))
+        title = item.get("display_name") or item.get("name") or item.get("symbol", "")
         queue.append({
             "action_id": f"signals:warning:{item.get('symbol')}:{idx}",
             "symbol": item.get("symbol", ""),
+            "name": item.get("name", ""),
+            "title": f"卖出复核 · {title}",
             "action": "review_exit",
+            "action_label": "复核卖点",
             "priority": "high",
+            "summary": "检查是否跌破5日/20日或周线信心线，决定减仓、清仓或保留。",
             "reason": item.get("reason", ""),
+            "recommended_action": "先处理风险，再看新买点",
             "next_action": metadata.get("next_action", "复核风险"),
+            "operator_actions": [
+                "打开图表",
+                "核对5日线、20日线、5周线与最近低点",
+                "写入减仓/退出条件",
+            ],
             "status": "open",
             "metadata": metadata,
         })
     for idx, item in enumerate(candidates[:8]):
         metadata = _as_dict(item.get("metadata"))
+        title = item.get("display_name") or item.get("name") or item.get("symbol", "")
+        status = item.get("status", "open")
         queue.append({
             "action_id": f"signals:candidate:{item.get('symbol')}:{idx}",
             "symbol": item.get("symbol", ""),
+            "name": item.get("name", ""),
+            "title": f"买入复核 · {title}",
             "action": "review_entry",
-            "priority": "medium" if item.get("status") == "watch" else "high",
+            "action_label": "复合买点",
+            "priority": "medium" if status == "watch" else "high",
+            "summary": "打开图表确认买点、关键均线方向和止损位；虚线阶段只观察不重仓。",
             "reason": item.get("reason", ""),
+            "recommended_action": "满足买点与风险线后再进入执行",
             "next_action": metadata.get("next_action", "打开图表复核"),
-            "status": item.get("status", "open"),
+            "operator_actions": [
+                "打开图表",
+                "核对10日线/20日线/5周线位置",
+                "填写买入价、止损线和仓位上限",
+            ],
+            "status": status,
             "metadata": metadata,
         })
     return queue[:12]
@@ -815,6 +844,16 @@ def _risk_for(status: str, signal: Mapping[str, Any], theme: Mapping[str, Any]) 
     if confidence is not None and confidence < 0.5:
         return "信号置信度偏低，需要等待二次确认"
     return "按图表确认止损位后再行动"
+
+
+def _resolved_stock_name(symbol: str) -> str:
+    try:
+        from signals.core.stock_names import get_resolver
+
+        name = get_resolver().get_name(symbol)
+        return "" if name == _symbol_digits(symbol) else name
+    except Exception:
+        return ""
 
 
 def _normalize_symbol(value: Any) -> str:

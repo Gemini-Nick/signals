@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-指数分钟线同步 — 11 只指数 30M/15M
+指数分钟线同步 — 11 只指数 5M/15M/30M
 
 数据源: AKShare stock_zh_index_hist_min_em（东财指数分钟线）
 策略: 全量覆盖（数据量小，近 5 天窗口）
@@ -40,7 +40,7 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
     sync_col = db["sync_log"]
     inserted = 0
 
-    period_map = {"30分钟": "30", "15分钟": "15"}
+    period_map = {"5分钟": "5", "15分钟": "15", "30分钟": "30"}
 
     for name, symbol in ak_codes.items():
         # AKShare 指数分钟线需要纯代码（去掉 sh/sz 前缀）
@@ -100,7 +100,7 @@ def sync_index_minute(db: Database, proxy_url: str = None) -> dict:
     """指数分钟线全量同步"""
     import config
 
-    logger.info("指数分钟线同步: A股指数 30M/15M")
+    logger.info("指数分钟线同步: A股指数 5M/15M/30M")
     total = _sync_a_index_minute(db, config.INDEX_AK_CODES, proxy_url)
 
     logger.info(f"指数分钟线完成: {total} bars")

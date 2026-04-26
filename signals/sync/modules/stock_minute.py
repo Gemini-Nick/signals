@@ -109,7 +109,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
     """
     A 股分钟线增量同步。
 
-        仅同步白名单 + 最近活跃标的的 5M、15M 和 30M 数据。
+    仅同步白名单 + 最近活跃标的的 5M、15M 和 30M 数据。
     东财分钟线 API 仅返回最近 5 天，直接全量写入（小数据量）。
     """
     bars_col = db["bars"]
