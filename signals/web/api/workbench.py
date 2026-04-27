@@ -35,6 +35,28 @@ router = APIRouter(prefix="/api/workbench", tags=["workbench"])
 UI_FREQS = ["5min", "15min", "30min", "daily", "weekly"]
 MINUTE_FREQS = {"5min", "5m", "15min", "15m", "30min", "30m"}
 BUY_FREQS = ["daily", "30min", "15min", "5min"]
+SECOND_SCREEN_LANES = {
+    "quote_lane": {
+        "label": "实时观察",
+        "cadence": "15-60s",
+        "purpose": "关键指数、当前标的和关注池轻量 quote。",
+    },
+    "signal_lane": {
+        "label": "信号确认",
+        "cadence": "5m close",
+        "purpose": "5m/15m/30m/日/周闭合结构确认。",
+    },
+    "workbench_lane": {
+        "label": "工作台重算",
+        "cadence": "10m",
+        "purpose": "主观察列表、候选池、风险预警和策略快照。",
+    },
+    "board_lane": {
+        "label": "板块异动",
+        "cadence": "20-30m",
+        "purpose": "行业/概念排行、leader、产业链承接。",
+    },
+}
 FREQ_ALIASES = {
     "5m": "5min",
     "5min": "5min",
@@ -55,15 +77,44 @@ GATEWAY_FREQS = {
     "monthly": "monthly",
 }
 MINGDAO_INDEX_THEMES = {
+    "上证指数": ["全市场", "权重", "政策温度"],
     "上证50": ["权重", "大金融", "消费"],
     "沪深300": ["核心资产", "权重", "大金融"],
     "深证成指": ["成长", "先进制造", "消费电子"],
     "创业板指": ["CPO", "电新", "成长链"],
     "科创50": ["芯片", "半导体", "硬科技"],
+    "科创综指": ["硬科技", "半导体", "创新成长"],
     "超大盘": ["央国企", "红利", "权重"],
     "中证500": ["中盘成长", "制造业", "弹性成长"],
     "中证1000": ["小盘成长", "主题弹性", "交易活跃"],
+    "中证银行": ["大金融", "红利", "顺周期"],
+    "国证2000": ["小微盘", "题材弹性", "市场广度"],
+    "恒生科技ETF": ["港股科技", "互联网", "风险偏好"],
+    "30年国债ETF": ["利率", "避险", "股债跷跷板"],
+    "中国石油": ["资源", "央企", "红利"],
 }
+
+MINGDAO_MACRO_WATCHLIST = [
+    {"name": "上证指数", "symbol": "sh000001", "kind": "index"},
+    {"name": "深证成指", "symbol": "sz399001", "kind": "index"},
+    {"name": "沪深300", "symbol": "sh000300", "kind": "index"},
+    {"name": "创业板指", "symbol": "sz399006", "kind": "index"},
+    {"name": "科创50", "symbol": "sh000688", "kind": "index"},
+    {"name": "科创综指", "symbol": "sh000680", "kind": "index"},
+    {"name": "上证50", "symbol": "sh000016", "kind": "index"},
+    {"name": "超大盘", "symbol": "sh000043", "kind": "index"},
+    {"name": "中证500", "symbol": "sh000905", "kind": "index"},
+    {"name": "中证1000", "symbol": "sh000852", "kind": "index"},
+    {"name": "中证银行", "symbol": "sz399986", "kind": "index"},
+    {"name": "国证2000", "symbol": "sz399303", "kind": "index"},
+    {"name": "恒生科技ETF", "symbol": "SH.513130", "kind": "stock"},
+    {"name": "30年国债ETF", "symbol": "SH.511090", "kind": "stock"},
+    {"name": "中国石油", "symbol": "SH.601857", "kind": "stock"},
+]
+
+for _name, _symbol in config.INDEX_AK_CODES.items():
+    if not any(item["name"] == _name for item in MINGDAO_MACRO_WATCHLIST):
+        MINGDAO_MACRO_WATCHLIST.append({"name": _name, "symbol": _symbol, "kind": "index"})
 BUY_SIGNAL_TOKENS = ("buy", "long", "entry", "候选", "买", "突破", "启动", "三买", "一买", "二买")
 SELL_SIGNAL_TOKENS = ("sell", "short", "exit", "预警", "卖", "跌破", "止损", "风险")
 
@@ -383,6 +434,43 @@ def _compute_day_change_pct(df: pd.DataFrame) -> Optional[float]:
     return round((latest - previous) / previous * 100, 2)
 
 
+def _ma_signal_from_df(df: pd.DataFrame) -> str:
+    if df is None or df.empty or "close" not in df.columns:
+        return "数据待预热"
+    closes = pd.to_numeric(df.sort_index()["close"], errors="coerce").dropna()
+    if len(closes) < 22:
+        return "数据待预热"
+    latest = float(closes.iloc[-1])
+    ma5 = float(closes.tail(5).mean())
+    ma10 = float(closes.tail(10).mean())
+    ma20 = float(closes.tail(20).mean())
+    prev_ma20 = float(closes.iloc[-21:-1].tail(20).mean())
+    if latest >= ma5 >= ma10 >= ma20 and ma20 >= prev_ma20:
+        return "多头上行"
+    if latest < ma5 and latest < ma10:
+        return "跌破短均"
+    if latest >= ma20 and ma20 >= prev_ma20:
+        return "站上20日线"
+    if abs(latest - ma20) / ma20 <= 0.015:
+        return "贴近20日线"
+    if ma20 < prev_ma20:
+        return "20日线下行"
+    return "震荡观察"
+
+
+def _signal_or_fallback(row: dict[str, Any], df: pd.DataFrame) -> str:
+    for key in ("daily_latest_signal", "latest_signal", "signal"):
+        value = _text(row.get(key))
+        if value and value.lower() not in {"none", "n/a"} and value != "无":
+            return value
+    f30 = _text(row.get("f30_latest_signal"))
+    f15 = _text(row.get("f15_latest_signal"))
+    minute_signals = [value for value in (f30, f15) if value and value != "无"]
+    if minute_signals:
+        return "/".join(minute_signals[:2])
+    return _ma_signal_from_df(df)
+
+
 def _unwrap_response(value: Any) -> Any:
     if isinstance(value, JSONResponse):
         return json.loads(value.body.decode("utf-8"))
@@ -410,6 +498,10 @@ def _serialize_session(status: Dict[str, Any]) -> Dict[str, Any]:
         "a_live": status.get("a_live", False),
         "hk_live": status.get("hk_live", False),
         "us_live": status.get("us_live", False),
+        "active_markets": status.get("active_markets", []),
+        "refresh_interval": status.get("refresh_interval", 0),
+        "next_check_seconds": status.get("next_check_seconds", 0),
+        "next_refresh_at": status.get("next_refresh_at", ""),
         "data_as_of": status.get("data_as_of", ""),
         "error": status.get("error", ""),
     }
@@ -437,9 +529,9 @@ def _normalize_stock_symbol(raw: str) -> Tuple[Optional[str], Optional[str]]:
         if len(value) == 5:
             return f"HK.{value}", value
         if len(value) == 6:
-            if value.startswith("6"):
+            if value.startswith(("5", "6", "9")):
                 return f"SH.{value}", value
-            if value.startswith(("0", "3")):
+            if value.startswith(("0", "1", "2", "3")):
                 return f"SZ.{value}", value
             if value.startswith(("8", "4")):
                 return f"BJ.{value}", value
@@ -566,6 +658,8 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         or (float(df["close"].iloc[-1]) if df is not None and not df.empty and "close" in df.columns else None)
     )
     enriched = dict(row)
+    day_change_pct = row.get("day_change_pct") or row.get("daily_change_pct") or row.get("change_pct") or row.get("gain_pct") or _compute_day_change_pct(df)
+    latest_signal = _text(row.get("latest_signal") or row.get("signal") or row.get("reason") or row.get("direction"))
     enriched.update({
         "kind": "stock",
         "label": normalized,
@@ -574,7 +668,9 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "raw_code": raw_code or normalized.split(".")[-1],
         "name": _stock_name(normalized, row),
         "latest_price": latest_price,
-        "day_change_pct": row.get("day_change_pct") or row.get("change_pct") or row.get("gain_pct") or _compute_day_change_pct(df),
+        "day_change_pct": day_change_pct,
+        "daily_change_pct": day_change_pct,
+        "latest_signal": latest_signal or _ma_signal_from_df(df),
         "range_returns": _compute_range_returns(df, range_columns),
         "range_return_source": source,
         "available_freqs": UI_FREQS,
@@ -588,6 +684,7 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
 def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) -> dict[str, Any]:
     symbol = str(row.get("symbol") or row.get("code") or row.get("label") or row.get("name") or "").strip()
     df, source = _index_df(symbol, "daily") if symbol else (pd.DataFrame(), "")
+    day_change_pct = row.get("day_change_pct") or row.get("daily_change_pct") or row.get("change_pct") or row.get("gain_pct") or row.get("intraday_change") or _compute_day_change_pct(df)
     enriched = dict(row)
     enriched.update({
         "kind": "index",
@@ -595,7 +692,9 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "name": row.get("name") or row.get("label") or symbol,
         "code": symbol,
         "latest_price": row.get("latest_price") or (float(df["close"].iloc[-1]) if df is not None and not df.empty and "close" in df.columns else None),
-        "day_change_pct": row.get("day_change_pct") or row.get("change_pct") or row.get("gain_pct") or _compute_day_change_pct(df),
+        "day_change_pct": day_change_pct,
+        "daily_change_pct": day_change_pct,
+        "latest_signal": _signal_or_fallback(row, df),
         "range_returns": _compute_range_returns(df, range_columns),
         "range_return_source": source,
         "available_freqs": ["daily", "weekly", "30min", "15min"],
@@ -609,13 +708,15 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
 def _enrich_cluster_row(row: dict[str, Any], kind: str) -> dict[str, Any]:
     enriched = dict(row)
     label = str(enriched.get("label") or enriched.get("name") or "").strip()
+    day_change_pct = enriched.get("day_change_pct") or enriched.get("daily_change_pct") or enriched.get("change_pct") or enriched.get("gain_pct") or enriched.get("strength")
     enriched.update({
         "kind": kind,
         "label": label,
         "name": label,
         "code": str(enriched.get("code") or enriched.get("board_code") or ""),
         "latest_price": enriched.get("latest_price") or enriched.get("value"),
-        "day_change_pct": enriched.get("change_pct") or enriched.get("gain_pct") or enriched.get("strength"),
+        "day_change_pct": day_change_pct,
+        "daily_change_pct": day_change_pct,
         "range_returns": enriched.get("range_returns") or {},
         "target_kind": kind,
         "target_label": label,
@@ -636,6 +737,11 @@ def _is_buy_signal(signal: dict[str, Any]) -> bool:
     if any(token in text for token in SELL_SIGNAL_TOKENS):
         return False
     return any(token in text for token in BUY_SIGNAL_TOKENS)
+
+
+def _is_sell_signal(signal: dict[str, Any]) -> bool:
+    text = _signal_text(signal)
+    return any(token in text for token in SELL_SIGNAL_TOKENS)
 
 
 def _signal_date(signal: dict[str, Any]) -> str:
@@ -659,32 +765,40 @@ def _load_signal_pool_rows(limit: int = 200) -> list[dict[str, Any]]:
         return []
 
 
-def _add_timeframe_signal(target: dict[str, Any], signal: dict[str, Any]) -> None:
+def _add_timeframe_signal(target: dict[str, Any], signal: dict[str, Any], *, side: str = "buy") -> None:
     metadata = target.get("metadata") if isinstance(target.get("metadata"), dict) else {}
     freq = _freq_bucket(signal.get("freq") or signal.get("timeframe") or metadata.get("freq"))
     if freq not in BUY_FREQS:
         return
-    signals = target.setdefault("timeframe_signals", {})
-    current = signals.get(freq)
+    side = "sell" if side == "sell" else "buy"
+    stack = target.setdefault("timeframe_signal_stack", {})
+    freq_stack = stack.setdefault(freq, {})
+    current = freq_stack.get(side)
     next_score = _float(signal.get("total_score") or signal.get("score") or signal.get("confidence"), 0) or 0
     current_score = _float((current or {}).get("score"), -1) if isinstance(current, dict) else -1
     if current and current_score is not None and current_score >= next_score:
         return
-    signal_type = _text(signal.get("signal_type") or signal.get("type") or signal.get("reason")) or "买点"
-    signals[freq] = {
+    signal_type = _text(signal.get("signal_type") or signal.get("type") or signal.get("reason"))
+    if not signal_type:
+        signal_type = "卖出预警" if side == "sell" else "买点"
+    payload = {
         "freq": freq,
         "badge": _freq_badge(freq),
+        "side": side,
         "signal_type": signal_type,
         "score": next_score,
         "confidence": _float(signal.get("confidence")),
         "signal_date": _signal_date(signal),
         "price": _float(signal.get("price")),
     }
+    freq_stack[side] = payload
+    target.setdefault("timeframe_signals" if side == "buy" else "sell_timeframe_signals", {})[freq] = payload
 
 
 def _build_focus_stock_rows(
     *,
     buy_rows: list[dict[str, Any]],
+    sell_rows: Optional[list[dict[str, Any]]] = None,
     decision_rows: list[dict[str, Any]],
     range_columns: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -704,7 +818,10 @@ def _build_focus_stock_rows(
                 "kind": "stock",
             }, range_columns)
             rows_by_symbol[key]["timeframe_signals"] = {}
+            rows_by_symbol[key]["sell_timeframe_signals"] = {}
+            rows_by_symbol[key]["timeframe_signal_stack"] = {}
             rows_by_symbol[key]["focus_reasons"] = []
+            rows_by_symbol[key]["source_tags"] = []
         else:
             rows_by_symbol[key].update({
                 "score": max(
@@ -715,6 +832,9 @@ def _build_focus_stock_rows(
         reason = _text(row.get("reason") or row.get("summary") or row.get("direction"))
         if reason and reason not in rows_by_symbol[key]["focus_reasons"]:
             rows_by_symbol[key]["focus_reasons"].append(reason)
+        source = _text(row.get("source") or row.get("data_source"))
+        if source and source not in rows_by_symbol[key]["source_tags"]:
+            rows_by_symbol[key]["source_tags"].append(source)
         return rows_by_symbol[key]
 
     for row in buy_rows:
@@ -731,10 +851,29 @@ def _build_focus_stock_rows(
             "price": row.get("latest_price") or row.get("price") or metadata.get("price"),
         }
         if _is_buy_signal(signal) or not signal.get("signal_type"):
-            _add_timeframe_signal(item, signal)
+            _add_timeframe_signal(item, signal, side="buy")
+            item["action_status"] = item.get("action_status") or "buy_candidate"
+
+    for row in sell_rows or []:
+        item = ensure(dict(row))
+        if not item:
+            continue
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        signal = {
+            "signal_type": row.get("reason") or metadata.get("trigger") or row.get("signal_type") or "卖出预警",
+            "freq": metadata.get("freq") or row.get("freq"),
+            "score": row.get("score") or row.get("risk_score"),
+            "confidence": row.get("confidence") or metadata.get("confidence"),
+            "signal_date": metadata.get("signal_date") or row.get("signal_date"),
+            "price": row.get("latest_price") or row.get("price") or metadata.get("price"),
+        }
+        if _is_sell_signal(signal) or signal.get("signal_type"):
+            _add_timeframe_signal(item, signal, side="sell")
+            item["action_status"] = "exit_review"
 
     for signal in _load_signal_pool_rows():
-        if not _is_buy_signal(signal):
+        side = "sell" if _is_sell_signal(signal) else "buy" if _is_buy_signal(signal) else ""
+        if not side:
             continue
         symbol = _normalize_stock_symbol(str(signal.get("symbol") or ""))[0]
         if not symbol:
@@ -747,26 +886,71 @@ def _build_focus_stock_rows(
             "price": signal.get("price"),
         })
         if item:
-            _add_timeframe_signal(item, signal)
+            _add_timeframe_signal(item, signal, side=side)
+            if side == "sell":
+                item["action_status"] = "exit_review"
+            else:
+                item["action_status"] = item.get("action_status") or "buy_candidate"
 
     for row in decision_rows:
         if row.get("symbol"):
             item = ensure(dict(row))
             if item:
                 item["decision_status"] = row.get("action") or row.get("action_label")
+                if item.get("action_status") != "exit_review":
+                    item["action_status"] = "manual_review"
 
     output = list(rows_by_symbol.values())
     for row in output:
         signals = row.get("timeframe_signals") if isinstance(row.get("timeframe_signals"), dict) else {}
+        sell_signals = row.get("sell_timeframe_signals") if isinstance(row.get("sell_timeframe_signals"), dict) else {}
         row["buy_timeframes"] = [
             signals[freq]
             for freq in BUY_FREQS
             if freq in signals
         ]
+        row["sell_timeframes"] = [
+            sell_signals[freq]
+            for freq in BUY_FREQS
+            if freq in sell_signals
+        ]
+        row["signal_stack"] = {
+            freq: row.get("timeframe_signal_stack", {}).get(freq)
+            for freq in BUY_FREQS
+            if isinstance(row.get("timeframe_signal_stack"), dict) and row.get("timeframe_signal_stack", {}).get(freq)
+        }
         row["reason"] = " · ".join(row.get("focus_reasons", [])[:2]) or row.get("reason") or row.get("direction") or ""
+        if row.get("sell_timeframes") or row.get("buy_timeframes"):
+            sell_badges = [f"卖{item.get('badge') or item.get('freq') or ''}" for item in row.get("sell_timeframes", []) if isinstance(item, dict)]
+            buy_badges = [item.get("badge") or item.get("freq") or "" for item in row.get("buy_timeframes", []) if isinstance(item, dict)]
+            row["latest_signal"] = "/".join([badge for badge in sell_badges + buy_badges if badge])
+        elif row.get("reason"):
+            row["latest_signal"] = row["reason"]
+        if row.get("action_status") == "exit_review":
+            trader_action = "减仓/止盈"
+            invalidates_when = "重新站回关键均线且卖出信号解除"
+        elif any(item.get("badge") == "5m" for item in row.get("buy_timeframes", []) if isinstance(item, dict)):
+            trader_action = "可试仓"
+            invalidates_when = "5m 买点失效或跌破短线防守位"
+        elif row.get("buy_timeframes"):
+            trader_action = "等待5m确认"
+            invalidates_when = "5m 无法确认或上级周期转弱"
+        elif row.get("action_status") == "manual_review":
+            trader_action = "观察"
+            invalidates_when = "人工复核条件不再成立"
+        else:
+            trader_action = "观察"
+            invalidates_when = "异动消退或跌破对应周期关键位"
+        row.update({
+            "lane": "signal_lane",
+            "second_screen_role": "actionable_focus_stock",
+            "trader_action": trader_action,
+            "invalidates_when": invalidates_when,
+        })
     output.sort(
         key=lambda item: (
-            len(item.get("buy_timeframes") or []),
+            3 if item.get("action_status") == "exit_review" else 2 if item.get("action_status") == "manual_review" else 1 if item.get("buy_timeframes") else 0,
+            len(item.get("sell_timeframes") or []) + len(item.get("buy_timeframes") or []),
             _float(item.get("score") or item.get("total_score") or item.get("fused_total"), 0) or 0,
         ),
         reverse=True,
@@ -780,30 +964,67 @@ def _build_macro_index_rows(
     range_columns: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     reports_by_name = {str(report.get("name") or report.get("label") or ""): report for report in reports}
+    reports_by_symbol = {str(report.get("symbol") or report.get("code") or "").lower(): report for report in reports}
     rows: list[dict[str, Any]] = []
-    for name, symbol in config.INDEX_AK_CODES.items():
-        row = dict(reports_by_name.get(name) or {"name": name, "label": name, "symbol": symbol, "code": symbol})
+    seen: set[str] = set()
+    for item in MINGDAO_MACRO_WATCHLIST:
+        name = _text(item.get("name"))
+        symbol = _text(item.get("symbol"))
+        kind = _text(item.get("kind")) or "index"
+        if not name or not symbol:
+            continue
+        key = f"{kind}:{symbol.lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        row = dict(reports_by_name.get(name) or reports_by_symbol.get(symbol.lower()) or {
+            "name": name,
+            "label": name,
+            "symbol": symbol,
+            "code": symbol,
+        })
         row.setdefault("name", name)
         row.setdefault("label", name)
         row.setdefault("symbol", symbol)
-        enriched = _enrich_index_row(row, range_columns)
+        if kind == "stock":
+            enriched = _enrich_stock_row({
+                **row,
+                "name": name,
+                "label": symbol,
+                "symbol": symbol,
+                "kind": "stock",
+            }, range_columns)
+            if not enriched.get("latest_price"):
+                continue
+            target_kind = "stock"
+            target_label = enriched.get("symbol") or symbol
+            target_symbol = enriched.get("symbol") or symbol
+        else:
+            enriched = _enrich_index_row(row, range_columns)
+            if not enriched.get("latest_price"):
+                continue
+            target_kind = "index"
+            target_label = name
+            target_symbol = symbol
         enriched.update({
             "group": "macro_indices",
+            "lane": "quote_lane",
+            "second_screen_role": "market_direction_anchor",
+            "action_status": "观察",
+            "trader_action": "观察关键指数方向和主题共振",
+            "invalidates_when": "指数跌破对应周期防守均线或主题扩散失败",
             "theme_tags": MINGDAO_INDEX_THEMES.get(name, []),
             "latest_signal": (
-                row.get("daily_latest_signal")
-                or row.get("latest_signal")
-                or row.get("signal")
-                or ""
+                _signal_or_fallback(row, _index_df(symbol, "daily")[0] if kind != "stock" else _stock_df(str(target_symbol), "daily")[0])
             ),
             "signal_stack": {
                 "daily": row.get("daily_latest_signal") or "",
                 "30min": row.get("f30_latest_signal") or "",
                 "15min": row.get("f15_latest_signal") or "",
             },
-            "target_kind": "index",
-            "target_label": name,
-            "target_symbol": symbol,
+            "target_kind": target_kind,
+            "target_label": target_label,
+            "target_symbol": target_symbol,
             "target_freq": "daily",
         })
         rows.append(enriched)
@@ -927,13 +1148,60 @@ def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
             representatives = _concept_representative_groups(candidates)
         else:
             candidates = _industry_carrier_candidates(label, leader)
-    carrier = _preview_carrier(candidates)
+    carrier = _cached_daily_carrier(candidates) or _preview_carrier(candidates)
     carrier_payload = _representative_payload(carrier) if carrier else {}
+    carrier_range_returns: dict[str, Optional[float]] = {}
+    carrier_latest_price: Optional[float] = None
+    carrier_day_change: Optional[float] = None
+    carrier_range_source = ""
+    if carrier_payload.get("symbol"):
+        carrier_df, carrier_range_source = _stock_df(str(carrier_payload["symbol"]), "daily")
+        carrier_range_returns = _compute_range_returns(carrier_df, _watchlist_range_columns())
+        carrier_latest_price = (
+            float(carrier_df["close"].iloc[-1])
+            if carrier_df is not None and not carrier_df.empty and "close" in carrier_df.columns
+            else None
+        )
+        carrier_day_change = _compute_day_change_pct(carrier_df)
+    board_day_change = (
+        enriched.get("day_change_pct")
+        or enriched.get("daily_change_pct")
+        or enriched.get("change_pct")
+        or enriched.get("gain_pct")
+        or enriched.get("strength")
+    )
+    board_range_returns = enriched.get("range_returns") or {}
+    carrier_name = carrier_payload.get("name") or carrier_payload.get("symbol") or ""
+    action_status = "观察" if carrier_payload else "退出复盘"
+    explanation_parts = [
+        f"{label} 异动" if label else "",
+        f"leader {leader}" if leader else "",
+        f"承接 {carrier_name}" if carrier_name else "暂无链主承接",
+    ]
     enriched.update({
         "group": "sector_boards",
         "domain": "concept" if kind == "concept" else "board",
+        "lane": "board_lane",
+        "second_screen_role": "hot_sector_explanation",
+        "action_status": action_status,
+        "trader_action": "观察板块扩散和代表股承接" if carrier_payload else "退出复盘",
+        "invalidates_when": "leader 走弱、板块排名回落或链主代表跌破短线防守位",
+        "explanation": " · ".join([part for part in explanation_parts if part]),
         "leader": leader,
         "source": enriched.get("source") or enriched.get("data_source") or "",
+        "latest_price": enriched.get("latest_price"),
+        "day_change_pct": board_day_change,
+        "daily_change_pct": board_day_change,
+        "range_returns": board_range_returns,
+        "range_return_source": enriched.get("range_return_source") or "",
+        "range_return_status": "board_kline" if board_range_returns else "board_kline_missing",
+        "carrier_latest_price": carrier_latest_price,
+        "carrier_day_change_pct": carrier_day_change,
+        "carrier_range_returns": carrier_range_returns,
+        "carrier_range_return_source": "carrier_stock" if carrier_range_returns else "",
+        "carrier_range_return_symbol": carrier_payload.get("symbol") or "",
+        "chart_target_status": "carrier_stock" if carrier_payload else "unmapped",
+        "latest_signal": enriched.get("latest_signal") or (f"承接{carrier_payload.get('name')}" if carrier_payload.get("name") else "待映射"),
         "target_kind": kind,
         "target_label": label,
         "target_symbol": label,
@@ -972,6 +1240,86 @@ def _build_sector_board_rows(
             rows.append(item)
     rows.sort(key=lambda item: _float(item.get("day_change_pct") or item.get("change_pct") or item.get("gain_pct"), 0) or 0, reverse=True)
     return rows[:16]
+
+
+def _build_trader_task_queue(
+    *,
+    decision_rows: list[dict[str, Any]],
+    focus_stocks: list[dict[str, Any]],
+    sector_boards: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+
+    def add(task: dict[str, Any]) -> None:
+        if not task.get("title"):
+            return
+        task.setdefault("decision_id", f"task-{len(tasks) + 1}")
+        task.setdefault("source", "second_screen")
+        task.setdefault("action_label", task.get("trader_action") or task.get("action") or "观察")
+        task.setdefault("invalidates_when", "触发条件失效或关键位被破坏")
+        tasks.append(task)
+
+    for row in focus_stocks:
+        action = _text(row.get("trader_action")) or "观察"
+        if action == "观察" and not row.get("latest_signal"):
+            continue
+        add({
+            "decision_id": f"focus:{row.get('symbol') or row.get('label')}",
+            "title": f"{action} · {row.get('name') or row.get('symbol')}",
+            "symbol": row.get("symbol"),
+            "name": row.get("name"),
+            "action": action,
+            "action_label": action,
+            "priority": "high" if action in {"减仓/止盈", "可试仓"} else "medium",
+            "summary": row.get("reason") or row.get("latest_signal") or "",
+            "trigger_reason": row.get("latest_signal") or row.get("reason") or "",
+            "chart_target": {"kind": "stock", "label": row.get("symbol"), "freq": "5min"},
+            "invalidates_when": row.get("invalidates_when"),
+        })
+
+    for row in sector_boards[:6]:
+        add({
+            "decision_id": f"sector:{row.get('domain')}:{row.get('label')}",
+            "title": f"观察 · {row.get('label')}",
+            "symbol": row.get("carrier", {}).get("symbol") if isinstance(row.get("carrier"), dict) else "",
+            "name": row.get("label"),
+            "action": "观察",
+            "action_label": "观察",
+            "priority": "medium",
+            "summary": row.get("explanation") or row.get("latest_signal") or "",
+            "trigger_reason": row.get("explanation") or "",
+            "chart_target": {
+                "kind": row.get("target_kind") or row.get("domain") or "industry",
+                "label": row.get("target_label") or row.get("label"),
+                "freq": "daily",
+                "fallback_target": row.get("fallback_target") or {},
+            },
+            "invalidates_when": row.get("invalidates_when"),
+        })
+
+    for row in decision_rows:
+        if not isinstance(row, dict):
+            continue
+        action = _text(row.get("action_label") or row.get("recommended_action") or row.get("action")) or "观察"
+        add({
+            **row,
+            "action": action,
+            "action_label": action,
+            "title": _text(row.get("title")) or f"{action} · {_text(row.get('symbol') or row.get('decision_id'))}",
+            "trigger_reason": _text(row.get("summary") or row.get("reason") or row.get("recommended_action")),
+            "chart_target": row.get("chart_target") or {"kind": "stock", "label": row.get("symbol"), "freq": "daily"},
+            "invalidates_when": row.get("invalidates_when") or "复核条件解除或关键位被破坏",
+        })
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for task in tasks:
+        key = _text(task.get("decision_id") or task.get("title"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(task)
+    return deduped[:12]
 
 
 def _build_watchlist_rows(
@@ -1136,6 +1484,7 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
     session = _serialize_session(status)
     strategy_snapshot = _safe_strategy_snapshot()
     range_columns = _watchlist_range_columns()
+    sync_lanes = _sync_lane_status()
     market_context = serialize_market_context(engine.get_market_context()) if engine.get_market_context() else None
     reports_raw = [
         serialize_index_report(report)
@@ -1159,7 +1508,7 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
         for item in strategy_snapshot.get("warnings", [])
         if isinstance(item, dict)
     ]
-    decision_queue = [
+    decision_rows_raw = [
         dict(item)
         for item in strategy_snapshot.get("decision_queue", [])
         if isinstance(item, dict)
@@ -1175,8 +1524,23 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
     )
     focus_stocks = _build_focus_stock_rows(
         buy_rows=scored,
-        decision_rows=decision_queue,
+        sell_rows=sell_warnings,
+        decision_rows=decision_rows_raw,
         range_columns=range_columns,
+    )
+    for rows, lane in (
+        (macro_indices, "quote_lane"),
+        (sector_boards, "board_lane"),
+        (focus_stocks, "signal_lane"),
+    ):
+        for row in rows:
+            row["lane_status"] = sync_lanes.get(lane, {})
+            row["freshness"] = row["lane_status"].get("freshness", "unknown")
+
+    decision_queue = _build_trader_task_queue(
+        decision_rows=decision_rows_raw,
+        focus_stocks=focus_stocks,
+        sector_boards=sector_boards,
     )
 
     watchlist_directions: List[str] = []
@@ -1221,6 +1585,7 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
         },
         "watchlist": watchlist,
         "watchlist_range_columns": range_columns,
+        "sync_lanes": sync_lanes,
         "daily_brief": strategy_snapshot.get("daily_brief", {}),
         "decision_queue": decision_queue,
         "strategy_kpis": strategy_snapshot.get("strategy_kpis", {}),
@@ -1326,6 +1691,59 @@ def _mongo_db():
     from signals.sync.db import get_db
 
     return get_db()
+
+
+def _serialize_dt(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat(timespec="seconds")
+        except TypeError:
+            return value.isoformat()
+    return str(value)
+
+
+def _sync_lane_status() -> dict[str, dict[str, Any]]:
+    status = {
+        lane: {
+            "lane": lane,
+            **meta,
+            "status": "unknown",
+            "freshness": "unknown",
+            "last_success_at": "",
+            "last_run_at": "",
+            "next_due_at": "",
+            "degraded_reason": "",
+            "modules": [],
+        }
+        for lane, meta in SECOND_SCREEN_LANES.items()
+    }
+    try:
+        db = _mongo_db()
+        docs = list(db["sync_log"].find(
+            {"lane": {"$in": list(SECOND_SCREEN_LANES)}},
+            {"_id": 0, "module": 1, "market": 1, "lane": 1, "status": 1, "last_run": 1, "next_due_at": 1, "degraded_reason": 1, "error_msg": 1},
+        ).sort("last_run", -1).limit(80))
+    except Exception:
+        return status
+    for doc in docs:
+        lane = _text(doc.get("lane"))
+        if lane not in status:
+            continue
+        item = status[lane]
+        module = _text(doc.get("module"))
+        if module and module not in item["modules"]:
+            item["modules"].append(module)
+        if not item["last_run_at"]:
+            item["last_run_at"] = _serialize_dt(doc.get("last_run"))
+            item["next_due_at"] = _serialize_dt(doc.get("next_due_at"))
+            item["status"] = _text(doc.get("status")) or "unknown"
+            item["freshness"] = "fresh" if item["status"] == "ok" else "stale" if item["status"] in {"degraded", "error"} else item["status"]
+            item["degraded_reason"] = _text(doc.get("degraded_reason") or doc.get("error_msg"))
+        if doc.get("status") == "ok" and not item["last_success_at"]:
+            item["last_success_at"] = _serialize_dt(doc.get("last_run"))
+    return status
 
 
 def _stock_symbol_from_code_or_name(code: Any = "", name: Any = "") -> tuple[str, str]:
@@ -1510,6 +1928,38 @@ def _available_daily_carrier(
             continue
         if item.get("source") in {"semantic_preferred_carrier", "semantic_industry_chain", "industry_leader_map"}:
             _ensure_daily_bars(symbol, raw_code)
+        df, source = _stock_df(symbol, "daily")
+        if df is None or df.empty:
+            continue
+        available.append({
+            **item,
+            "symbol": symbol,
+            "raw_code": raw_code or symbol.split(".", 1)[-1],
+            "name": _text(item.get("name")) or _stock_name(symbol),
+            "bar_count": int(len(df)),
+            "bar_source": source,
+        })
+    if not available:
+        return None
+    if preserve_order:
+        return available[0]
+    available.sort(key=lambda item: (int(item.get("priority") or 0), int(item.get("bar_count") or 0)), reverse=True)
+    return available[0]
+
+
+def _cached_daily_carrier(
+    candidates: list[dict[str, Any]],
+    *,
+    preserve_order: bool = False,
+) -> Optional[dict[str, Any]]:
+    available: list[dict[str, Any]] = []
+    for item in candidates:
+        symbol = _text(item.get("symbol"))
+        raw_code = _text(item.get("raw_code"))
+        if not symbol:
+            symbol, raw_code = _stock_symbol_from_code_or_name(item.get("code"), item.get("name"))
+        if not symbol:
+            continue
         df, source = _stock_df(symbol, "daily")
         if df is None or df.empty:
             continue

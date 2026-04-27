@@ -9,11 +9,15 @@
 频率: 工作日 16:30
 """
 import logging
+import math
+import time
 from datetime import datetime
 
 import akshare as ak
 import pandas as pd
+import requests
 from pymongo.database import Database
+from signals.core.market_hours import TZ_BEIJING
 
 from signals.data.board_normalizer import (
     merge_industry_sources,
@@ -30,9 +34,117 @@ from ..retry import sync_retry
 
 logger = logging.getLogger("signals.sync.board_ranking")
 
+_EM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Connection": "close",
+}
+
+_EM_TIMEOUT = 10
+_EM_PAGE_SIZE = 100
+_EM_MAX_ATTEMPTS = 8
+
+
+def _em_clist_params(kind: str, page: int) -> dict[str, str]:
+    if kind == "industry":
+        return {
+            "pn": str(page),
+            "pz": str(_EM_PAGE_SIZE),
+            "po": "1",
+            "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f3",
+            "fs": "m:90 t:2 f:!50",
+            "fields": (
+                "f2,f3,f4,f8,f12,f14,f20,f104,f105,f128,f136"
+            ),
+        }
+    return {
+        "pn": str(page),
+        "pz": str(_EM_PAGE_SIZE),
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f12",
+        "fs": "m:90 t:3 f:!50",
+        "fields": (
+            "f2,f3,f4,f8,f12,f14,f20,f104,f105,f128,f136"
+        ),
+    }
+
+
+def _fetch_em_clist_page(kind: str, page: int) -> tuple[int, list[dict]]:
+    url = "https://17.push2.eastmoney.com/api/qt/clist/get" if kind == "industry" else "https://79.push2.eastmoney.com/api/qt/clist/get"
+    last_error: Exception | None = None
+    for attempt in range(_EM_MAX_ATTEMPTS):
+        try:
+            response = requests.get(
+                url,
+                params=_em_clist_params(kind, page),
+                headers=_EM_HEADERS,
+                timeout=_EM_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data") or {}
+            rows = data.get("diff") or []
+            total = int(data.get("total") or 0)
+            return total, rows
+        except Exception as exc:
+            last_error = exc
+            if attempt < _EM_MAX_ATTEMPTS - 1:
+                time.sleep(min(2.0, 0.8 * (attempt + 1)))
+    raise RuntimeError(f"eastmoney {kind} page {page} failed: {last_error}")
+
+
+def _fetch_em_board_names(kind: str) -> pd.DataFrame:
+    total, rows = _fetch_em_clist_page(kind, 1)
+    page_count = max(1, math.ceil(total / _EM_PAGE_SIZE))
+    for page in range(2, page_count + 1):
+        _, page_rows = _fetch_em_clist_page(kind, page)
+        rows.extend(page_rows)
+    docs = []
+    for idx, row in enumerate(rows, start=1):
+        docs.append({
+            "排名": idx,
+            "板块名称": row.get("f14") or "",
+            "板块代码": row.get("f12") or "",
+            "最新价": row.get("f2"),
+            "涨跌额": row.get("f4"),
+            "涨跌幅": row.get("f3"),
+            "总市值": row.get("f20"),
+            "换手率": row.get("f8"),
+            "上涨家数": row.get("f104"),
+            "下跌家数": row.get("f105"),
+            "领涨股票": row.get("f128"),
+            "领涨股票-涨跌幅": row.get("f136"),
+        })
+    return pd.DataFrame(docs)
+
+
+def _fetch_em_board_names_resilient(kind: str) -> pd.DataFrame:
+    last_error: Exception | None = None
+    for round_idx in range(2):
+        try:
+            return _fetch_em_board_names(kind)
+        except Exception as exc:
+            last_error = exc
+            if round_idx == 0:
+                time.sleep(8)
+    raise RuntimeError(f"eastmoney {kind} failed after retry round: {last_error}")
+
 
 def _today():
-    return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return datetime.now(TZ_BEIJING).replace(
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+    )
 
 
 def _replace_docs(db: Database, collection: str, docs: list[dict],
@@ -138,7 +250,7 @@ def _sync_em_ranking(db: Database, proxy_url: str = None) -> int:
 
     try:
         with em_proxy(proxy_url):
-            df = ak.stock_board_industry_name_em()
+            df = _fetch_em_board_names_resilient("industry")
         if df is None or df.empty:
             _health(db, "em", "stock_board_industry_name_em", "board", False, "empty")
             return 0
@@ -224,7 +336,7 @@ def _sync_concept_ranking(db: Database, proxy_url: str = None) -> int:
     # 东财实时源，独立写 source snapshot；失败不影响新浪结果
     try:
         with em_proxy(proxy_url):
-            df = ak.stock_board_concept_name_em()
+            df = _fetch_em_board_names_resilient("concept")
         if df is not None and not df.empty:
             _save_source_df(db, "concept_em", normalize_em_concept(df), "em")
             docs = []

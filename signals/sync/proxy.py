@@ -24,11 +24,23 @@ def em_proxy(proxy_url: str = None):
 
     :param proxy_url: 兼容旧调用签名；传入也会被忽略。
     """
-    keys = ("http_proxy", "https_proxy", "all_proxy",
-            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
-    saved = {k: os.environ.pop(k) for k in keys if k in os.environ}
+    keys = (
+        "http_proxy", "https_proxy", "all_proxy",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "no_proxy", "NO_PROXY",
+    )
+    saved = {k: os.environ.get(k) for k in keys}
+    for key in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        os.environ.pop(key, None)
+    # requests on macOS can still read system proxy settings when env proxies
+    # are empty. NO_PROXY=* forces urllib/requests to bypass those settings.
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
     try:
         yield
     finally:
-        for k, v in saved.items():
-            os.environ[k] = v
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value

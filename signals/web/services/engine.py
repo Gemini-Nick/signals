@@ -1012,6 +1012,21 @@ class WebEngine:
     def get_status(self) -> dict:
         """返回引擎状态摘要（含时段信息）"""
         session = self._state.session_mode
+        try:
+            from signals.core.market_hours import get_session_mode
+            current_session = get_session_mode()
+            if (
+                not self._state.is_running
+                and (
+                    session is None
+                    or session.name != current_session.name
+                    or getattr(session, "active_markets", ()) != getattr(current_session, "active_markets", ())
+                )
+            ):
+                session = current_session
+                self._state.session_mode = current_session
+        except Exception:
+            pass
         result = {
             "ready": self.is_ready(),
             "running": self._state.is_running,
@@ -1033,7 +1048,10 @@ class WebEngine:
                 "a_live": session.a_live,
                 "hk_live": session.hk_live,
                 "us_live": session.us_live,
+                "active_markets": list(getattr(session, "active_markets", ()) or ()),
                 "refresh_interval": session.refresh_interval,
+                "next_check_seconds": getattr(session, "next_check_seconds", 0),
+                "next_refresh_at": getattr(session, "next_refresh_at", ""),
                 "data_as_of": data_as_of,
             })
         return result
@@ -1113,8 +1131,9 @@ class WebEngine:
                 print(f"   [后台] ✅ 全部分析完成 (总计 {total:.1f}s)")
 
                 # ── 自动刷新定时器 ──
-                if session.refresh_interval > 0:
-                    self._schedule_refresh(session.refresh_interval)
+                next_interval = getattr(session, "next_check_seconds", 0) or session.refresh_interval
+                if next_interval > 0:
+                    self._schedule_refresh(next_interval)
 
             except Exception as e:
                 log.error("后台加载失败: %s", e, exc_info=True)
@@ -1132,13 +1151,16 @@ class WebEngine:
     def _schedule_refresh(self, interval: int):
         """盘中自动刷新：等待 interval 秒后重新检测时段并刷新。"""
         def _tick():
-            time.sleep(interval)
+            time.sleep(max(1, int(interval)))
             from signals.core.market_hours import get_session_mode
             new_session = get_session_mode()
             self._state.session_mode = new_session
             if new_session.refresh_interval > 0 and not self._state.is_running:
                 print(f"   [自动刷新] {new_session.label} — 重新加载...")
                 self.run_all_async()
+            elif not self._state.is_running and getattr(new_session, "next_check_seconds", 0) > 0:
+                print(f"   [自动刷新] {new_session.label} — 等待下一市场窗口")
+                self._schedule_refresh(getattr(new_session, "next_check_seconds", 0))
             else:
                 print(f"   [自动刷新] {new_session.label} — 已停止刷新")
 

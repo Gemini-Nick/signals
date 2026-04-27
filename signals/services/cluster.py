@@ -17,6 +17,9 @@ def _market_status() -> dict[str, Any]:
             "a_live": session.a_live,
             "hk_live": session.hk_live,
             "us_live": session.us_live,
+            "active_markets": list(getattr(session, "active_markets", ()) or ()),
+            "next_check_seconds": getattr(session, "next_check_seconds", 0),
+            "next_refresh_at": getattr(session, "next_refresh_at", ""),
             "markets": get_market_detail(),
         }
     except Exception:

@@ -149,7 +149,11 @@ def _get_active_symbols(db: Database) -> list:
     for doc in recent:
         add(doc.get("symbol"))
 
-    max_symbols = int(os.getenv("STOCK_MINUTE_MAX_CODES", "200"))
+    lane = os.getenv("SIGNALS_CURRENT_SYNC_LANE", "")
+    if lane == "signal_lane":
+        max_symbols = int(os.getenv("STOCK_MINUTE_SIGNAL_MAX_CODES", "24"))
+    else:
+        max_symbols = int(os.getenv("STOCK_MINUTE_MAX_CODES", "200"))
     return symbols[:max_symbols] if max_symbols > 0 else symbols
 
 

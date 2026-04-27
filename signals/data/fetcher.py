@@ -46,12 +46,22 @@ def _get_timeout_pool() -> ThreadPoolExecutor:
 def no_proxy():
     """临时清除代理环境变量（国内数据源不走代理）"""
     proxy_keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-                  "http_proxy", "https_proxy", "all_proxy"]
-    saved = {k: os.environ.pop(k) for k in proxy_keys if k in os.environ}
+                  "http_proxy", "https_proxy", "all_proxy",
+                  "NO_PROXY", "no_proxy"]
+    saved = {k: os.environ.get(k) for k in proxy_keys}
+    for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy"]:
+        os.environ.pop(key, None)
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
     try:
         yield
     finally:
-        os.environ.update(saved)
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 # 兼容内部引用
 _no_proxy = no_proxy

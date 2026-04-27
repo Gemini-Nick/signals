@@ -89,9 +89,9 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["strategy_snapshots"], [("as_of", ASCENDING)], unique=True, sparse=True)
     _safe_create_index(db["strategy_snapshots"], [("updated_at", ASCENDING)])
     _safe_create_index(db["trade_pairs"], [("dedupe_key", ASCENDING)], unique=True, sparse=True)
-    _safe_create_index(db["sync_log"], [("module", ASCENDING), ("last_run", ASCENDING)])
+    _safe_create_index(db["sync_log"], [("module", ASCENDING), ("market", ASCENDING), ("lane", ASCENDING), ("last_run", ASCENDING)])
     _safe_create_index(db["provider_health"], [("provider", ASCENDING), ("endpoint", ASCENDING), ("domain", ASCENDING)])
-    _safe_create_index(db["data_freshness"], [("domain", ASCENDING), ("mode", ASCENDING), ("collection", ASCENDING)])
+    _safe_create_index(db["data_freshness"], [("domain", ASCENDING), ("market", ASCENDING), ("mode", ASCENDING), ("lane", ASCENDING), ("collection", ASCENDING)])
     _cleanup_legacy_freshness_docs(db)
 
     db["data_freshness"].update_one(

@@ -192,7 +192,7 @@ function wbRenderClusters(clusterSummary) {
   `).join('') : wbEmpty('聚类结果加载中');
 
   conceptEl.innerHTML = conceptTop.length ? conceptTop.map((item, idx) => `
-    <div class="wb-cluster-card" data-kind="industry" data-label="${wbEscapeHtml(item.label)}">
+    <div class="wb-cluster-card" data-kind="concept" data-label="${wbEscapeHtml(item.label)}">
       <div class="wb-cluster-row">
         <span class="wb-cluster-rank">C${idx + 1}</span>
         <span class="wb-cluster-title">${wbEscapeHtml(item.label)}</span>

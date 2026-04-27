@@ -22,8 +22,9 @@
   session = get_session_mode()           # 精细时段
   if session.a_live: ...                 # A股可拉分钟线
 """
+import os
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from enum import Enum
 from typing import Set
 from zoneinfo import ZoneInfo
@@ -42,11 +43,74 @@ TZ_BEIJING = ZoneInfo("Asia/Shanghai")
 TZ_US_EAST = ZoneInfo("America/New_York")
 
 # ── 交易时段（本地时间）──────────────────────────────────
-_AH_OPEN = time(9, 0)
-_AH_CLOSE = time(16, 0)
+_A_MORNING_OPEN = time(9, 30)
+_A_MORNING_CLOSE = time(11, 30)
+_A_AFTERNOON_OPEN = time(13, 0)
+_A_AFTERNOON_CLOSE = time(15, 0)
+
+_HK_MORNING_OPEN = time(9, 30)
+_HK_MORNING_CLOSE = time(12, 0)
+_HK_AFTERNOON_OPEN = time(13, 0)
+_HK_AFTERNOON_CLOSE = time(16, 0)
 
 _US_OPEN = time(9, 30)
 _US_CLOSE = time(16, 0)
+
+
+def _live_refresh_interval() -> int:
+    minutes = int(os.getenv("SIGNALS_LIVE_REFRESH_MINUTES", "1"))
+    return max(60, minutes * 60)
+
+
+def _is_a_live(now_bj: datetime) -> bool:
+    if now_bj.weekday() >= 5:
+        return False
+    t = now_bj.time()
+    return (_A_MORNING_OPEN <= t < _A_MORNING_CLOSE) or (_A_AFTERNOON_OPEN <= t < _A_AFTERNOON_CLOSE)
+
+
+def _is_hk_live(now_bj: datetime) -> bool:
+    if now_bj.weekday() >= 5:
+        return False
+    t = now_bj.time()
+    return (_HK_MORNING_OPEN <= t < _HK_MORNING_CLOSE) or (_HK_AFTERNOON_OPEN <= t < _HK_AFTERNOON_CLOSE)
+
+
+def _is_us_live(now_et: datetime) -> bool:
+    return now_et.weekday() < 5 and _US_OPEN <= now_et.time() < _US_CLOSE
+
+
+def _seconds_until(target: datetime, now_utc: datetime) -> int:
+    return max(0, int((target.astimezone(TZ_UTC) - now_utc).total_seconds()))
+
+
+def _next_weekday_start(now_local: datetime, tz: ZoneInfo, start_time: time) -> datetime:
+    candidate = datetime.combine(now_local.date(), start_time, tzinfo=tz)
+    if candidate <= now_local or now_local.weekday() >= 5:
+        candidate = candidate + timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate = candidate + timedelta(days=1)
+    return candidate
+
+
+def next_live_check_seconds(now_utc: datetime = None) -> int:
+    """Seconds until the next regular-session A/H/US open boundary."""
+    if now_utc is None:
+        now_utc = datetime.now(TZ_UTC)
+    now_bj = now_utc.astimezone(TZ_BEIJING)
+    now_et = now_utc.astimezone(TZ_US_EAST)
+    candidates: list[datetime] = []
+
+    if now_bj.weekday() < 5:
+        for start in (_A_MORNING_OPEN, _HK_MORNING_OPEN, _A_AFTERNOON_OPEN, _HK_AFTERNOON_OPEN):
+            candidate = datetime.combine(now_bj.date(), start, tzinfo=TZ_BEIJING)
+            if candidate > now_bj:
+                candidates.append(candidate)
+    candidates.append(_next_weekday_start(now_bj, TZ_BEIJING, _A_MORNING_OPEN))
+    candidates.append(_next_weekday_start(now_bj, TZ_BEIJING, _HK_MORNING_OPEN))
+    candidates.append(_next_weekday_start(now_et, TZ_US_EAST, _US_OPEN))
+
+    return min(_seconds_until(candidate, now_utc) for candidate in candidates if candidate.astimezone(TZ_UTC) > now_utc)
 
 
 def get_active_markets(now_utc: datetime = None) -> Set[Market]:
@@ -61,15 +125,14 @@ def get_active_markets(now_utc: datetime = None) -> Set[Market]:
 
     active: Set[Market] = set()
 
-    # A+H: 北京时间 09:00-16:00 工作日
     now_bj = now_utc.astimezone(TZ_BEIJING)
-    if now_bj.weekday() < 5 and _AH_OPEN <= now_bj.time() <= _AH_CLOSE:
+    if _is_a_live(now_bj):
         active.add(Market.A)
+    if _is_hk_live(now_bj):
         active.add(Market.HK)
 
-    # US: Eastern 09:30-16:00 工作日（zoneinfo 自动处理 DST）
     now_et = now_utc.astimezone(TZ_US_EAST)
-    if now_et.weekday() < 5 and _US_OPEN <= now_et.time() <= _US_CLOSE:
+    if _is_us_live(now_et):
         active.add(Market.US)
 
     return active
@@ -85,8 +148,10 @@ def describe_sessions(now_utc: datetime = None) -> str:
         return "无市场开盘"
 
     parts = []
-    if Market.A in active or Market.HK in active:
-        parts.append("A+H 开盘中 (09:00-16:00 北京)")
+    if Market.A in active:
+        parts.append("A股 开盘中 (09:30-11:30/13:00-15:00 北京)")
+    if Market.HK in active:
+        parts.append("港股 开盘中 (09:30-12:00/13:00-16:00 北京)")
     if Market.US in active:
         now_et = now_utc.astimezone(TZ_US_EAST)
         dst_label = "夏令时" if now_et.dst() else "冬令时"
@@ -383,17 +448,53 @@ class SessionMode:
     label: str          # 中文标签: "盘前"|"A+H盘中"|"H股尾盘"|"盘后复盘"|"美股盘中"|"深夜"
     refresh_interval: int   # 自动刷新间隔(秒)，0=不刷新
     use_daily_l3: bool      # True → L3 用 review_screener (日线)
+    active_markets: tuple[str, ...] = ()
+    next_check_seconds: int = 0
+    next_refresh_at: str = ""
 
 
 # 六时段定义 (name, a_live, hk_live, us_live, label, refresh, daily_l3)
 _SESSIONS = {
     "pre_market":   SessionMode("pre_market",   False, False, False, "盘前",     0,   True),
-    "ah_intraday":  SessionMode("ah_intraday",  True,  True,  False, "A+H盘中",  300, False),
-    "hk_tail":      SessionMode("hk_tail",      False, True,  False, "H股尾盘",  300, True),
+    "ah_intraday":  SessionMode("ah_intraday",  True,  True,  False, "A+H盘中",  _live_refresh_interval(), False),
+    "a_intraday":   SessionMode("a_intraday",   True,  False, False, "A股盘中",  _live_refresh_interval(), False),
+    "hk_tail":      SessionMode("hk_tail",      False, True,  False, "H股盘中",  _live_refresh_interval(), True),
+    "market_lunch": SessionMode("market_lunch", False, False, False, "午休",     0,   True),
+    "market_break": SessionMode("market_break", False, False, False, "盘间休息", 0,   True),
     "ah_post":      SessionMode("ah_post",      False, False, False, "盘后复盘", 0,   True),
-    "us_intraday":  SessionMode("us_intraday",  False, False, True,  "美股盘中", 300, True),
+    "us_intraday":  SessionMode("us_intraday",  False, False, True,  "美股盘中", _live_refresh_interval(), True),
     "overnight":    SessionMode("overnight",    False, False, False, "深夜",     0,   True),
 }
+
+
+def _session_with_timing(
+    name: str,
+    a_live: bool,
+    hk_live: bool,
+    us_live: bool,
+    label: str,
+    refresh_interval: int,
+    use_daily_l3: bool,
+    now_utc: datetime,
+    active_markets: tuple[str, ...] = (),
+    next_check_seconds: int = 0,
+) -> SessionMode:
+    next_seconds = next_check_seconds or refresh_interval
+    next_refresh_at = ""
+    if next_seconds > 0:
+        next_refresh_at = (now_utc + timedelta(seconds=next_seconds)).astimezone(TZ_BEIJING).isoformat(timespec="seconds")
+    return SessionMode(
+        name,
+        a_live,
+        hk_live,
+        us_live,
+        label,
+        refresh_interval,
+        use_daily_l3,
+        active_markets,
+        next_seconds,
+        next_refresh_at,
+    )
 
 
 def get_session_mode(now_utc: datetime = None) -> SessionMode:
@@ -414,36 +515,54 @@ def get_session_mode(now_utc: datetime = None) -> SessionMode:
         now_utc = datetime.now(TZ_UTC)
 
     now_bj = now_utc.astimezone(TZ_BEIJING)
-    now_et = now_utc.astimezone(TZ_US_EAST)
     bj_t = now_bj.time()
-    et_t = now_et.time()
     bj_wd = now_bj.weekday()   # 0=Mon ... 6=Sun
-    et_wd = now_et.weekday()
+    active = get_active_markets(now_utc)
+    active_values = tuple(market.value for market in sorted(active, key=lambda item: item.value))
+    live_interval = _live_refresh_interval()
 
-    # ── 美股检测（优先，因为跨日：北京 21:30→次日04:00）──
-    us_open = et_wd < 5 and _US_OPEN <= et_t <= _US_CLOSE
-    if us_open:
-        return _SESSIONS["us_intraday"]
+    if Market.US in active:
+        return _session_with_timing(
+            "us_intraday", False, False, True, "美股盘中", live_interval, True, now_utc, active_values
+        )
+
+    if Market.A in active or Market.HK in active:
+        a_live = Market.A in active
+        hk_live = Market.HK in active
+        if a_live and hk_live:
+            label = "A+H盘中"
+            name = "ah_intraday"
+        elif a_live:
+            label = "A股盘中"
+            name = "a_intraday"
+        else:
+            label = "H股盘中"
+            name = "hk_tail"
+        return _session_with_timing(
+            name, a_live, hk_live, False, label, live_interval, not a_live, now_utc, active_values
+        )
+
+    next_check = next_live_check_seconds(now_utc)
 
     # ── 周末（美股也不开）→ 盘后复盘 ──
     if bj_wd >= 5:
-        return _SESSIONS["ah_post"]
+        return _session_with_timing("ah_post", False, False, False, "盘后复盘", 0, True, now_utc, (), next_check)
 
     # ── 工作日，按北京时间分段 ──
     _T_0700 = time(7, 0)
     _T_0930 = time(9, 30)
-    _T_1500 = time(15, 0)
+    _T_1300 = time(13, 0)
     _T_1600 = time(16, 0)
 
     if bj_t < _T_0700:
         # 00:00-07:00: 美股已收盘（上面已排除美股开盘），深夜或盘后
-        return _SESSIONS["overnight"]
+        return _session_with_timing("overnight", False, False, False, "深夜", 0, True, now_utc, (), next_check)
     elif bj_t < _T_0930:
-        return _SESSIONS["pre_market"]
-    elif bj_t < _T_1500:
-        return _SESSIONS["ah_intraday"]
+        return _session_with_timing("pre_market", False, False, False, "盘前", 0, True, now_utc, (), next_check)
+    elif bj_t < _T_1300:
+        return _session_with_timing("market_lunch", False, False, False, "午休", 0, True, now_utc, (), next_check)
     elif bj_t < _T_1600:
-        return _SESSIONS["hk_tail"]
+        return _session_with_timing("market_break", False, False, False, "盘间休息", 0, True, now_utc, (), next_check)
     else:
         # 16:00+ 到美股开盘前（上面已排除美股开盘）
-        return _SESSIONS["ah_post"]
+        return _session_with_timing("ah_post", False, False, False, "盘后复盘", 0, True, now_utc, (), next_check)
