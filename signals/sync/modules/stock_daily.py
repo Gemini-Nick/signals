@@ -241,10 +241,48 @@ def _get_stock_codes(db: Database) -> tuple[list[str], str]:
     return _get_all_stock_codes(), "all_fallback"
 
 
+def _docs_from_daily_df(code: str, df: pd.DataFrame, column_map: dict[str, str], source: str) -> list:
+    if df is None or df.empty:
+        return []
+    docs = []
+    for _, row in df.iterrows():
+        dt = row[column_map["dt"]]
+        docs.append({
+            "dt": pd.to_datetime(dt),
+            "meta": {"symbol": code, "freq": "日线", "market": "A", "source": source},
+            "open": float(row[column_map["open"]]),
+            "high": float(row[column_map["high"]]),
+            "low": float(row[column_map["low"]]),
+            "close": float(row[column_map["close"]]),
+            "vol": int(row[column_map["vol"]]) if pd.notna(row[column_map["vol"]]) else 0,
+            "amount": int(float(row[column_map["amount"]])) if pd.notna(row[column_map["amount"]]) else 0,
+            "source": source,
+        })
+    return docs
+
+
 def _sync_one_stock(code: str, last_dt: str, end_date: str,
                     proxy_url: str = None) -> list:
     """同步单只股票日线，返回文档列表"""
     start = last_dt or "19900101"
+    primary_source = os.getenv("STOCK_DAILY_PRIMARY_SOURCE", "tencent").lower()
+    if primary_source == "tencent":
+        df = fetch_tencent_daily(
+            code,
+            start_date=start,
+            end_date=end_date,
+            timeout=float(os.getenv("STOCK_DAILY_TENCENT_TIMEOUT", "8")),
+        )
+        return _docs_from_daily_df(code, df, {
+            "dt": "日期",
+            "open": "开盘",
+            "high": "最高",
+            "low": "最低",
+            "close": "收盘",
+            "vol": "成交量",
+            "amount": "成交额",
+        }, "tencent")
+
     source = "eastmoney"
     try:
         with em_proxy(proxy_url):
@@ -308,24 +346,7 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
                     f"eastmoney={str(em_exc)[:160]}; sina={str(sina_exc)[:160]}; "
                     f"tencent={str(tencent_exc)[:160]}"
                 ) from tencent_exc
-    if df is None or df.empty:
-        return []
-
-    docs = []
-    for _, row in df.iterrows():
-        dt = row[column_map["dt"]]
-        docs.append({
-            "dt": pd.to_datetime(dt),
-            "meta": {"symbol": code, "freq": "日线", "market": "A", "source": source},
-            "open": float(row[column_map["open"]]),
-            "high": float(row[column_map["high"]]),
-            "low": float(row[column_map["low"]]),
-            "close": float(row[column_map["close"]]),
-            "vol": int(row[column_map["vol"]]) if pd.notna(row[column_map["vol"]]) else 0,
-            "amount": int(float(row[column_map["amount"]])) if pd.notna(row[column_map["amount"]]) else 0,
-            "source": source,
-        })
-    return docs
+    return _docs_from_daily_df(code, df, column_map, source)
 
 
 @sync_retry
