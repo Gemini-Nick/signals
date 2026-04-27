@@ -118,10 +118,42 @@ def _import_constituents(db: Database, root: Path) -> int:
         }
         board_ops.append(UpdateOne({"board_name": name}, {"$set": doc}, upsert=True))
         concept_ops.append(UpdateOne({"concept_name": name}, {"$set": doc}, upsert=True))
+    for path in (root / ".data" / "cache").glob("social_concept_stocks_*.json"):
+        name = path.stem[len("social_concept_stocks_"):]
+        try:
+            payload = _load_json(path)
+        except Exception as e:
+            logger.warning("skip social concept constituents cache %s: %s", path, e)
+            continue
+        stocks = payload.get("stocks") if isinstance(payload, dict) else []
+        symbols = []
+        stock_names = {}
+        for item in stocks or []:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("code") or "").strip()
+            if not code:
+                continue
+            symbols.append(code)
+            stock_names[code] = str(item.get("name") or "").strip()
+        if not symbols:
+            continue
+        doc = {
+            "concept_name": name,
+            "symbols": symbols,
+            "stock_names": stock_names,
+            "stock_count": len(symbols),
+            "dt": datetime.now().strftime("%Y-%m-%d"),
+            "updated_at": datetime.now(),
+            "source": "disk_social_concept_stocks",
+            "source_code": payload.get("code") if isinstance(payload, dict) else "",
+        }
+        concept_ops.append(UpdateOne({"concept_name": name}, {"$set": doc}, upsert=True))
     if board_ops:
         db["board_constituents"].bulk_write(board_ops, ordered=False)
+    if concept_ops:
         db["concept_constituents"].bulk_write(concept_ops, ordered=False)
-    return len(board_ops)
+    return len(board_ops) + max(0, len(concept_ops) - len(board_ops))
 
 
 def _import_social(db: Database, root: Path) -> int:

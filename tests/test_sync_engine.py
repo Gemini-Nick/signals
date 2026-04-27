@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from signals.core.market_hours import Market
 from signals.sync.engine import SyncEngine
 
 
@@ -153,3 +154,100 @@ def test_mark_market_unavailable_is_explicit():
     doc = freshness.docs["live_bundle"]
     assert doc["market"] == "HK"
     assert doc["freshness"] == "unavailable"
+
+
+def test_lane_filtered_daemon_only_runs_matching_live_plans():
+    engine = object.__new__(SyncEngine)
+    engine.enabled_lanes = {"quote_lane"}
+    engine.db = _FakeDb({"sync_log": _FakeCollection()})
+    calls = []
+
+    def quote_fn(db, proxy_url=None):
+        calls.append("quote_snapshots")
+        return {"inserted": 1}
+
+    def index_fn(db, proxy_url=None):
+        calls.append("index_minute")
+        return {"inserted": 1}
+
+    engine.module_map = {
+        "quote_snapshots": (quote_fn, ""),
+        "index_minute": (index_fn, ""),
+    }
+    engine.proxy_url = None
+
+    results = engine._run_intraday_bundle({Market.A}, datetime(2026, 4, 27, 10, 0))
+
+    assert calls == ["quote_snapshots"]
+    assert [item["module"] for item in results] == ["quote_snapshots"]
+
+
+def test_lane_unavailable_state_is_throttled_per_lane():
+    sync_log = _FakeCollection()
+    freshness = _FakeCollection()
+    engine = object.__new__(SyncEngine)
+    engine.enabled_lanes = {"quote_lane"}
+    engine.db = _FakeDb({"sync_log": sync_log, "data_freshness": freshness})
+    now = datetime(2026, 4, 27, 15, 20)
+
+    engine._run_intraday_bundle({Market.HK}, now)
+
+    key = "live_bundle:quote_lane:HK:_meta"
+    assert sync_log.docs[key]["module"] == "live_bundle:quote_lane"
+    assert sync_log.docs[key]["status"] == "unavailable"
+    assert engine._has_run_recent("live_bundle:quote_lane", "HK", now + timedelta(seconds=60)) is True
+
+
+def test_workbench_lane_runs_scheduled_daily_maintenance():
+    engine = object.__new__(SyncEngine)
+    engine.enabled_lanes = {"workbench_lane"}
+    engine.db = _FakeDb({
+        "sync_log": _FakeCollection(),
+        "data_freshness": _FakeCollection(),
+        "bars": _FakeCollection(count=1, doc={"dt": datetime(2026, 4, 24)}),
+    })
+    engine.proxy_url = None
+    calls = []
+
+    def stock_daily(db, proxy_url=None):
+        calls.append("stock_daily")
+        return {"inserted": 1}
+
+    def board_cons(db, proxy_url=None):
+        calls.append("board_cons")
+        return {"status": "partial", "inserted": 0}
+
+    engine.modules = [
+        ("stock_daily", stock_daily, "16:30 weekday"),
+        ("board_cons", board_cons, "16:30 weekday"),
+    ]
+    engine.module_map = {name: (fn, schedule) for name, fn, schedule in engine.modules}
+
+    results = engine._run_scheduled_modules(datetime(2026, 4, 27, 16, 45), "2026-04-27")
+
+    assert calls == ["stock_daily"]
+    assert results[0]["lane"] == "workbench_lane"
+    assert engine.db["sync_log"].docs["stock_daily:_meta"]["lane"] == "workbench_lane"
+
+
+def test_board_lane_runs_board_cons_as_partial_status():
+    engine = object.__new__(SyncEngine)
+    engine.enabled_lanes = {"board_lane"}
+    engine.db = _FakeDb({
+        "sync_log": _FakeCollection(),
+        "data_freshness": _FakeCollection(),
+        "board_constituents": _FakeCollection(count=12, doc={"updated_at": datetime(2026, 4, 27)}),
+    })
+    engine.proxy_url = None
+
+    def board_cons(db, proxy_url=None):
+        return {"status": "partial", "remaining": 10, "error_msg": "remaining=10"}
+
+    engine.modules = [("board_cons", board_cons, "16:30 weekday")]
+    engine.module_map = {"board_cons": (board_cons, "16:30 weekday")}
+
+    results = engine._run_scheduled_modules(datetime(2026, 4, 27, 16, 45), "2026-04-27")
+
+    assert results[0]["status"] == "partial"
+    assert results[0]["lane"] == "board_lane"
+    assert engine.db["sync_log"].docs["board_cons:_meta"]["status"] == "partial"

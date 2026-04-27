@@ -146,6 +146,10 @@ def main() -> int:
         "retired_launchd_signals_web_absent": _launchd_absent("com.zhangqilong.ai.signals.web"),
         "retired_launchd_signals_sync_absent": _launchd_absent("com.zhangqilong.ai.signals.sync"),
         "retired_launchd_signals_web2_absent": _launchd_absent("com.zhangqilong.ai.signals.web2"),
+        "retired_launchd_signals_quote_absent": _launchd_absent("com.zhangqilong.ai.signals.quote"),
+        "retired_launchd_signals_signal_absent": _launchd_absent("com.zhangqilong.ai.signals.signal"),
+        "retired_launchd_signals_workbench_absent": _launchd_absent("com.zhangqilong.ai.signals.workbench"),
+        "retired_launchd_signals_board_absent": _launchd_absent("com.zhangqilong.ai.signals.board"),
     }
 
     endpoints = {
@@ -169,6 +173,10 @@ def main() -> int:
             "retired_launchd_signals_web_absent",
             "retired_launchd_signals_sync_absent",
             "retired_launchd_signals_web2_absent",
+            "retired_launchd_signals_quote_absent",
+            "retired_launchd_signals_signal_absent",
+            "retired_launchd_signals_workbench_absent",
+            "retired_launchd_signals_board_absent",
             "pack_dashboard",
             "cache_health",
             "cluster_latest",

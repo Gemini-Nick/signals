@@ -4,19 +4,30 @@ CZSC 对象 → JSON 序列化工具
 
 将 czsc 库的 BI / FX / RawBar 等 C/Rust 加速对象转换为可 JSON 序列化的 dict。
 """
-from datetime import datetime
 from typing import List, Optional
 
 from czsc import Direction
+from signals.core.market_time import infer_market, to_unix_seconds
 
 
-def _dt_to_unix(dt) -> int:
+def _dt_to_unix(dt, *, market: str = "", symbol: str = "", source: str = "") -> int:
     """datetime / Timestamp → UNIX timestamp (秒级，Lightweight Charts 要求)"""
-    if dt is None:
-        return 0
-    if hasattr(dt, 'timestamp'):
-        return int(dt.timestamp())
-    return 0
+    return to_unix_seconds(dt, market=market, symbol=symbol, source=source)
+
+
+def _analyzer_symbol(analyzer) -> str:
+    bars = getattr(analyzer, "bars_raw", []) or []
+    first_bar = bars[0] if bars else None
+    return str(
+        getattr(analyzer, "symbol", "")
+        or getattr(first_bar, "symbol", "")
+        or ""
+    )
+
+
+def _time_context(*, market: str = "", symbol: str = "", source: str = "") -> dict:
+    resolved = infer_market(market, symbol=symbol, source=source)
+    return {"market": resolved, "symbol": symbol, "source": source}
 
 
 def _dt_to_str(dt) -> str:
@@ -28,15 +39,16 @@ def _dt_to_str(dt) -> str:
     return str(dt)
 
 
-def serialize_bars(analyzer) -> list:
+def serialize_bars(analyzer, *, market: str = "", symbol: str = "", source: str = "") -> list:
     """
     SymbolAnalyzer.bars_raw → Lightweight Charts OHLCV 格式
     [{time: unix_ts, open, high, low, close, volume}, ...]
     """
     bars = []
+    ctx = _time_context(market=market, symbol=symbol or _analyzer_symbol(analyzer), source=source)
     for bar in analyzer.bars_raw:
         bars.append({
-            "time": _dt_to_unix(bar.dt),
+            "time": _dt_to_unix(bar.dt, **ctx),
             "open": round(bar.open, 4),
             "high": round(bar.high, 4),
             "low": round(bar.low, 4),
@@ -46,20 +58,21 @@ def serialize_bars(analyzer) -> list:
     return bars
 
 
-def serialize_bi_list(analyzer) -> list:
+def serialize_bi_list(analyzer, *, market: str = "", symbol: str = "", source: str = "") -> list:
     """
     SymbolAnalyzer.bi_list → 笔端点列表
     [{sdt, edt, high, low, direction, power}, ...]
     """
     bis = []
+    ctx = _time_context(market=market, symbol=symbol or _analyzer_symbol(analyzer), source=source)
     for bi in analyzer.finished_bis:
         try:
             direction = "up" if bi.direction == Direction.Up else "down"
         except Exception:
             direction = "unknown"
         bis.append({
-            "sdt": _dt_to_unix(bi.sdt if hasattr(bi, 'sdt') else bi.fx_a.dt),
-            "edt": _dt_to_unix(bi.edt if hasattr(bi, 'edt') else bi.fx_b.dt),
+            "sdt": _dt_to_unix(bi.sdt if hasattr(bi, 'sdt') else bi.fx_a.dt, **ctx),
+            "edt": _dt_to_unix(bi.edt if hasattr(bi, 'edt') else bi.fx_b.dt, **ctx),
             "high": round(bi.high, 4),
             "low": round(bi.low, 4),
             "direction": direction,
@@ -68,12 +81,13 @@ def serialize_bi_list(analyzer) -> list:
     return bis
 
 
-def serialize_fx_list(analyzer) -> list:
+def serialize_fx_list(analyzer, *, market: str = "", symbol: str = "", source: str = "") -> list:
     """
     SymbolAnalyzer.fx_list → 分型标记
     [{dt, fx, mark}, ...]
     """
     fxs = []
+    ctx = _time_context(market=market, symbol=symbol or _analyzer_symbol(analyzer), source=source)
     for fx in analyzer.fx_list:
         try:
             mark_str = str(fx.mark).lower()  # Rust enum: "顶" / "底" or "Top" / "Bottom"
@@ -86,14 +100,14 @@ def serialize_fx_list(analyzer) -> list:
         except Exception:
             mark = "unknown"
         fxs.append({
-            "dt": _dt_to_unix(fx.dt),
+            "dt": _dt_to_unix(fx.dt, **ctx),
             "fx": round(fx.fx, 4),
             "mark": mark,
         })
     return fxs
 
 
-def serialize_zhongshu(analyzer) -> list:
+def serialize_zhongshu(analyzer, *, market: str = "", symbol: str = "", source: str = "") -> list:
     """
     从 finished_bis 中提取所有可识别的中枢。
     中枢定义：至少 3 笔有重叠区间。
@@ -102,6 +116,7 @@ def serialize_zhongshu(analyzer) -> list:
     bis = analyzer.finished_bis
     if len(bis) < 3:
         return []
+    ctx = _time_context(market=market, symbol=symbol or _analyzer_symbol(analyzer), source=source)
 
     result = []
     i = 0
@@ -118,10 +133,12 @@ def serialize_zhongshu(analyzer) -> list:
                 else:
                     break
             start_dt = _dt_to_unix(
-                bis[i].sdt if hasattr(bis[i], 'sdt') else bis[i].fx_a.dt)
+                bis[i].sdt if hasattr(bis[i], 'sdt') else bis[i].fx_a.dt,
+                **ctx)
             end_dt = _dt_to_unix(
                 bis[end_idx].edt if hasattr(bis[end_idx], 'edt')
-                else bis[end_idx].fx_b.dt)
+                else bis[end_idx].fx_b.dt,
+                **ctx)
             result.append({
                 "zd": round(zd, 4),
                 "zg": round(zg, 4),
@@ -135,10 +152,11 @@ def serialize_zhongshu(analyzer) -> list:
     return result
 
 
-def serialize_signal_change(sc) -> dict:
+def serialize_signal_change(sc, *, market: str = "", symbol: str = "", source: str = "") -> dict:
     """SignalChange → JSON dict（信号回放时间线）"""
+    ctx = _time_context(market=market, symbol=symbol, source=source)
     return {
-        "dt": _dt_to_unix(sc.dt),
+        "dt": _dt_to_unix(sc.dt, **ctx),
         "dt_str": _dt_to_str(sc.dt),
         "signal_type": sc.signal_type,
         "action": sc.action,
@@ -148,14 +166,15 @@ def serialize_signal_change(sc) -> dict:
     }
 
 
-def serialize_signals(signals: list) -> list:
+def serialize_signals(signals: list, *, market: str = "", symbol: str = "", source: str = "") -> list:
     """
     SignalEvent 列表 → JSON
     [{dt, type, freq, price, confidence, details}, ...]
     """
+    ctx = _time_context(market=market, symbol=symbol, source=source)
     return [
         {
-            "dt": _dt_to_unix(s.dt),
+            "dt": _dt_to_unix(s.dt, **ctx),
             "type": s.signal_type,
             "freq": s.freq,
             "price": round(s.price, 4),

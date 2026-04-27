@@ -8,12 +8,12 @@
 """
 import logging
 import os
-from datetime import datetime
 
 import akshare as ak
 import pandas as pd
 from pymongo.database import Database
 
+from signals.core.market_time import naive_market_now
 from ..proxy import em_proxy
 from ..retry import sync_retry
 from .minute_sources import fetch_public_minute
@@ -29,7 +29,7 @@ def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict]) ->
     prepared = []
     for doc in docs:
         item = dict(doc)
-        item["meta"] = {**item.get("meta", {}), "symbol": symbol, "freq": freq, "asset_type": "index"}
+        item["meta"] = {**item.get("meta", {}), "symbol": symbol, "freq": freq, "asset_type": "index", "market": "A"}
         prepared.append(item)
     for collection in ("index_bars", "bars"):
         col = db[collection]
@@ -78,7 +78,7 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
                 for _, row in df.iterrows():
                     docs.append({
                         "dt": pd.to_datetime(row[dt_col]),
-                        "meta": {"symbol": symbol, "freq": freq, "asset_type": "index", "source": source},
+                        "meta": {"symbol": symbol, "freq": freq, "asset_type": "index", "source": source, "market": "A"},
                         "open": float(row["开盘"]),
                         "high": float(row["最高"]),
                         "low": float(row["最低"]),
@@ -97,7 +97,7 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
                             "module": "index_minute",
                             "symbol": symbol,
                             "last_dt": docs[-1]["dt"],
-                            "last_run": datetime.now(),
+                            "last_run": naive_market_now("A"),
                             "status": "ok",
                             "bar_count": written,
                             "source": source,

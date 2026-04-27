@@ -1038,17 +1038,24 @@ class WebEngine:
         }
         if session:
             from datetime import datetime as _dt
+            from signals.core.market_hours import TZ_UTC
+            from signals.core.market_time import market_timezone, market_timezone_name
+
+            active_markets = list(getattr(session, "active_markets", ()) or ())
+            primary_market = active_markets[0] if active_markets else "A"
+            display_tz = market_timezone(primary_market)
             data_as_of = ""
             if self._state.last_update:
                 data_as_of = _dt.fromtimestamp(
-                    self._state.last_update).strftime("%H:%M")
+                    self._state.last_update, TZ_UTC).astimezone(display_tz).strftime("%H:%M")
             result.update({
                 "session_mode": session.name,
                 "session_label": session.label,
                 "a_live": session.a_live,
                 "hk_live": session.hk_live,
                 "us_live": session.us_live,
-                "active_markets": list(getattr(session, "active_markets", ()) or ()),
+                "active_markets": active_markets,
+                "market_timezone": market_timezone_name(primary_market),
                 "refresh_interval": session.refresh_interval,
                 "next_check_seconds": getattr(session, "next_check_seconds", 0),
                 "next_refresh_at": getattr(session, "next_refresh_at", ""),

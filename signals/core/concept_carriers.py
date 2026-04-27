@@ -44,6 +44,38 @@ _BROAD_TERMS_NO_CARRIER_BOOST = {
     "电新",
 }
 
+NON_CHAIN_THEME_TERMS = {
+    "本月解禁": "事件/时间维度主题，不对应稳定产业链。",
+    "昨日涨停": "交易行为主题，不对应稳定产业链。",
+    "昨日连板": "交易行为主题，不对应稳定产业链。",
+    "近期强势": "交易行为主题，不对应稳定产业链。",
+    "融资融券": "交易制度主题，不对应稳定产业链。",
+    "转债标的": "交易工具主题，不对应稳定产业链。",
+}
+
+NON_CHAIN_THEME_KEYWORDS = {
+    "科创50": "指数样本主题，不对应单一产业链。",
+    "沪深300": "指数样本主题，不对应单一产业链。",
+    "中证500": "指数样本主题，不对应单一产业链。",
+    "上证50": "指数样本主题，不对应单一产业链。",
+    "解禁": "事件/时间维度主题，不对应稳定产业链。",
+    "ST": "风险状态主题，不对应稳定产业链。",
+}
+
+
+def non_chain_reason(name: str) -> str:
+    """Return a reason when a market theme should not be forced into a chain."""
+
+    text = _text(name)
+    if not text:
+        return ""
+    if text in NON_CHAIN_THEME_TERMS:
+        return NON_CHAIN_THEME_TERMS[text]
+    for keyword, reason in NON_CHAIN_THEME_KEYWORDS.items():
+        if keyword and keyword in text:
+            return reason
+    return ""
+
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
@@ -379,6 +411,7 @@ def build_mapping_coverage(
 ) -> dict[str, Any]:
     mapped: list[dict[str, Any]] = []
     low_confidence: list[dict[str, Any]] = []
+    non_chain: list[dict[str, str]] = []
     unmapped: list[str] = []
     duplicate_alias: dict[str, list[str]] = {}
     normalized_seen: dict[str, list[str]] = {}
@@ -387,6 +420,10 @@ def build_mapping_coverage(
     for name in unique_names:
         norm = _norm(name)
         normalized_seen.setdefault(norm, []).append(name)
+        reason = non_chain_reason(name)
+        if reason:
+            non_chain.append({"name": name, "reason": reason})
+            continue
         matches = match_industry_chains(name)
         if not matches:
             unmapped.append(name)
@@ -414,17 +451,20 @@ def build_mapping_coverage(
         if norm and len(values) > 1
     }
     accounted = len(mapped) + len(low_confidence) + len(unmapped)
+    accounted += len(non_chain)
     return {
         "counts": {
             "total": len(unique_names),
             "mapped": len(mapped),
             "low_confidence": len(low_confidence),
+            "non_chain": len(non_chain),
             "unmapped": len(unmapped),
             "duplicate_alias": len(duplicate_alias),
             "accounted": accounted,
         },
         "mapped": mapped,
         "low_confidence": low_confidence,
+        "non_chain": non_chain,
         "unmapped": unmapped,
         "duplicate_alias": duplicate_alias,
     }

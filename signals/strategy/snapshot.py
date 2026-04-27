@@ -7,11 +7,17 @@ Raw facts stay in the data gateway; dashboards consume this strategy layer.
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import datetime
 from typing import Any, Mapping, Optional
+
+from signals.core.market_time import naive_market_now
 
 
 WARNING_TOKENS = ("卖", "顶", "风险", "死叉", "减仓", "跌破", "预警")
+
+
+def _now_bj() -> datetime:
+    return naive_market_now("A")
 
 
 def get_strategy_snapshot(*, db: Any = None, persist: bool = False) -> dict[str, Any]:
@@ -34,7 +40,7 @@ def build_strategy_snapshot(
     `responses` is injectable so unit tests can exercise the business rules
     without a live MongoDB or external data provider.
     """
-    now = datetime.now()
+    now = _now_bj()
     responses = dict(responses or _fetch_gateway_responses())
     db = db if db is not None else _get_db_or_none()
 
@@ -131,8 +137,8 @@ def persist_strategy_snapshot(snapshot: Mapping[str, Any], *, db: Any = None) ->
     if db is None:
         return {"ok": False, "reason": "mongo_unavailable"}
 
-    now = datetime.now()
-    as_of = str(snapshot.get("as_of") or date.today().isoformat())[:10]
+    now = _now_bj()
+    as_of = str(snapshot.get("as_of") or now.date().isoformat())[:10]
     doc = {
         "_id": f"strategy:{as_of}",
         "as_of": as_of,

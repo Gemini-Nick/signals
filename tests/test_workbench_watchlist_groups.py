@@ -1,3 +1,4 @@
+import asyncio
 from datetime import date
 
 import pandas as pd
@@ -47,6 +48,37 @@ def test_macro_indices_have_day_and_range_returns(monkeypatch):
     assert "theme_tags" in rows[0]
 
 
+def test_static_index_alias_resolves_shanghai_composite():
+    from signals.web.api import workbench
+
+    assert workbench._resolve_static_index("上证综指") == ("上证指数", "sh000001")
+    assert workbench._resolve_static_index("SH.000001") == ("上证指数", "sh000001")
+
+
+def test_chart_merges_custom_signal_pool_rows(monkeypatch):
+    from signals.web.api import workbench
+
+    df = _bars()
+    chart = workbench._chart_from_df(df, symbol="SZ.002759", freq="daily", source="test_bars")
+    monkeypatch.setattr(workbench, "_load_signal_pool_rows", lambda limit=200, symbol=None: [
+        {
+            "symbol": "SZ.002759",
+            "signal_date": "2026-03-15",
+            "signal_type": "自定义三买: MACD 0轴上方确认",
+            "freq": "日线",
+            "confidence": 0.88,
+            "price": 120.5,
+            "source": "sqlite.backtest.signal_records",
+        }
+    ])
+
+    merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002759", "daily")
+
+    assert merged["signals"]
+    assert merged["signals"][-1]["type"] == "自定义三买: MACD 0轴上方确认"
+    assert merged["signals"][-1]["source"] == "sqlite.backtest.signal_records"
+
+
 def test_focus_stocks_aggregate_buy_points_by_timeframe(monkeypatch):
     from signals.web.api import workbench
 
@@ -77,7 +109,7 @@ def test_focus_stocks_aggregate_buy_points_by_timeframe(monkeypatch):
     assert badges == ["D", "30m", "15m", "5m"]
 
 
-def test_focus_stocks_keep_sell_warning_timeframes(monkeypatch):
+def test_focus_stocks_do_not_create_sell_only_rows(monkeypatch):
     from signals.web.api import workbench
 
     df = _bars()
@@ -99,9 +131,44 @@ def test_focus_stocks_keep_sell_warning_timeframes(monkeypatch):
         range_columns=workbench._watchlist_range_columns(date(2026, 4, 26)),
     )
 
-    assert rows[0]["action_status"] == "exit_review"
+    assert rows == []
+
+
+def test_focus_stocks_attach_sell_warning_to_existing_buy_row(monkeypatch):
+    from signals.web.api import workbench
+
+    df = _bars()
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (df, "test_bars"))
+    monkeypatch.setattr(workbench, "_load_signal_pool_rows", lambda: [])
+
+    rows = workbench._build_focus_stock_rows(
+        buy_rows=[
+            {
+                "symbol": "SZ.002759",
+                "name": "天际股份",
+                "reason": "5m 买点",
+                "score": 90,
+                "metadata": {"freq": "5m"},
+            }
+        ],
+        sell_rows=[
+            {
+                "symbol": "SZ.002759",
+                "name": "天际股份",
+                "reason": "日线预警: 跌破二十日均线",
+                "score": 88,
+                "metadata": {"freq": "日线"},
+            }
+        ],
+        decision_rows=[],
+        range_columns=workbench._watchlist_range_columns(date(2026, 4, 26)),
+    )
+
+    assert rows[0]["action_status"] == "risk_review"
     assert [item["badge"] for item in rows[0]["sell_timeframes"]] == ["D"]
-    assert rows[0]["latest_signal"] == "卖D"
+    assert [item["badge"] for item in rows[0]["buy_timeframes"]] == ["5m"]
+    assert rows[0]["latest_signal"] == "卖D/5m"
+    assert rows[0]["trader_action"] == "风险复核"
 
 
 def test_concept_sector_preview_returns_explicit_chain_carrier(monkeypatch):
@@ -126,7 +193,110 @@ def test_concept_sector_preview_returns_explicit_chain_carrier(monkeypatch):
     assert row["carrier_range_return_source"] == "carrier_stock"
     assert row["lane"] == "board_lane"
     assert row["second_screen_role"] == "hot_sector_explanation"
-    assert "承接" in row["explanation"]
+    assert "链主代表" in row["explanation"]
+
+
+def test_sector_boards_expose_chain_aggregation_candidate_groups(monkeypatch):
+    from signals.web.api import workbench
+
+    df = _bars()
+    monkeypatch.setattr(workbench, "_concept_theme_candidates", lambda name: [])
+    monkeypatch.setattr(workbench, "_concept_rank_rows", lambda name, themes: [])
+    monkeypatch.setattr(workbench, "_industry_constituent_symbols", lambda name: [])
+    monkeypatch.setattr(workbench, "_concept_constituent_symbols", lambda name, themes: [])
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (df, "test_carrier_bars"))
+
+    rows = workbench._build_sector_board_rows(
+        industry_top=[{"label": "半导体设备", "change_pct": 4.1, "source": "board_em"}],
+        concept_top=[
+            {"label": "华为海思", "change_pct": 5.2, "source": "concept_em"},
+            {"label": "HBM", "change_pct": 4.8, "source": "concept_ths"},
+        ],
+    )
+
+    semiconductor_rows = [row for row in rows if row.get("chain_id") == "semiconductor"]
+    assert semiconductor_rows
+    assert {row["node_id"] for row in semiconductor_rows} >= {
+        "semiconductor_equipment",
+        "chip_design",
+        "memory_chip",
+    }
+    for row in semiconductor_rows:
+        assert row["integrated_domains"]
+        assert row["candidate_groups"]["leaders"]
+        assert row["focus_stocks_preview"]
+        assert row["focus_stocks_preview"][0]["attention_score"] >= 0
+
+
+def test_non_chain_sector_preview_is_not_forced_to_carrier(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_concept_theme_candidates", lambda name: [])
+    monkeypatch.setattr(workbench, "_concept_rank_rows", lambda name, themes: [])
+    monkeypatch.setattr(workbench, "_concept_constituent_symbols", lambda name, themes: [])
+
+    row = workbench._sector_board_preview({"label": "本月解禁", "change_pct": 3.2}, "concept")
+
+    assert row["non_chain_reason"]
+    assert row["chart_target_status"] == "non_chain"
+    assert row["carrier"] == {}
+    assert row["fallback_target"] == {}
+    assert row["action_status"] == "非产业链观察"
+
+
+def test_concept_target_returns_scored_candidate_groups(monkeypatch):
+    from signals.web.api import workbench
+
+    class FakeEngine:
+        def get_concepts(self):
+            return []
+
+    df = _bars()
+
+    async def fake_stock_target(symbol, raw_code, freq):
+        return {
+            "target": {
+                "kind": "stock",
+                "label": symbol,
+                "symbol": symbol,
+                "requested_freq": freq,
+                "effective_freq": freq,
+            },
+            "chart": {
+                "ohlcv": [{"date": "2026-01-01", "open": 1, "high": 2, "low": 1, "close": 2, "volume": 100}],
+                "meta": {"source": "test_stock_bars", "freq": freq},
+            },
+            "summary": {"title": "天赐材料"},
+            "signals": [],
+            "plan": None,
+            "review": {},
+            "trade": {},
+        }
+
+    monkeypatch.setattr(workbench, "_concept_theme_candidates", lambda name: [])
+    monkeypatch.setattr(workbench, "_concept_rank_rows", lambda name, themes: [])
+    monkeypatch.setattr(workbench, "_concept_constituent_symbols", lambda name, themes: [])
+    monkeypatch.setattr(workbench, "_industry_constituent_symbols", lambda name: [])
+    monkeypatch.setattr(workbench, "_ensure_daily_bars", lambda symbol, raw_code: None)
+    monkeypatch.setattr(workbench, "_ensure_minute_bars", lambda symbol, raw_code, freq: None)
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (df, "test_carrier_bars"))
+    monkeypatch.setattr(workbench, "_build_stock_target", fake_stock_target)
+
+    payload = asyncio.run(workbench._build_concept_target(FakeEngine(), "电解液", "daily"))
+
+    assert payload["target"]["kind"] == "concept"
+    assert payload["target"]["mapping_status"] == "mapped"
+    assert payload["candidate_groups"]["leaders"]
+    assert payload["candidate_groups"]["elastic"]
+    assert payload["candidate_stocks"]
+    leader = payload["candidate_groups"]["leaders"][0]
+    assert leader["leader_tier"] == "龙头"
+    assert leader["chain_role"]
+    assert leader["weight_score"] >= 0
+    assert leader["elasticity_score"] >= 0
+    assert leader["attention_score"] >= 0
+    assert leader["why_watch"]
+    assert isinstance(leader["risk_flags"], list)
 
 
 def test_trader_task_queue_is_action_oriented():

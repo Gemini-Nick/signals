@@ -13,6 +13,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 import config
+from signals.core.market_time import market_now, to_unix_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +47,9 @@ def _fetch_kline_legacy(code: str, market: str, freq: str) -> pd.DataFrame:
     from signals.data.fetcher import _no_proxy
 
     days = 730 if freq == "daily" else 1460
-    sdt = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
-    edt = datetime.now().strftime("%Y%m%d")
+    now = market_now(market, symbol=_build_symbol(code, market))
+    sdt = (now - timedelta(days=days)).strftime("%Y%m%d")
+    edt = now.strftime("%Y%m%d")
     period = "daily" if freq == "daily" else "weekly"
 
     with _no_proxy():
@@ -90,19 +92,17 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
     return response.data if response.data is not None else pd.DataFrame()
 
 
-def _dt_to_unix(dt) -> int:
+def _dt_to_unix(dt, *, market: str = "", symbol: str = "") -> int:
     """datetime / Timestamp → unix seconds"""
-    if hasattr(dt, "timestamp"):
-        return int(dt.timestamp())
-    return int(pd.Timestamp(dt).timestamp())
+    return to_unix_seconds(dt, market=market, symbol=symbol)
 
 
-def _serialize_ohlcv(df: pd.DataFrame) -> list:
+def _serialize_ohlcv(df: pd.DataFrame, *, market: str = "", symbol: str = "") -> list:
     """DataFrame → [{time, open, high, low, close, volume}]"""
     result = []
     for dt_idx, row in df.iterrows():
         result.append({
-            "time": _dt_to_unix(dt_idx),
+            "time": _dt_to_unix(dt_idx, market=market, symbol=symbol),
             "open": round(float(row["open"]), 4),
             "high": round(float(row["high"]), 4),
             "low": round(float(row["low"]), 4),
@@ -112,7 +112,7 @@ def _serialize_ohlcv(df: pd.DataFrame) -> list:
     return result
 
 
-def _compute_macd_data(df: pd.DataFrame) -> list:
+def _compute_macd_data(df: pd.DataFrame, *, market: str = "", symbol: str = "") -> list:
     """计算 MACD 指标，返回图表格式 [{time, dif, dea, bar}]"""
     closes = df["close"]
     if len(closes) < 26:
@@ -128,7 +128,7 @@ def _compute_macd_data(df: pd.DataFrame) -> list:
         if pd.isna(dea[dt_idx]):
             continue
         result.append({
-            "time": _dt_to_unix(dt_idx),
+            "time": _dt_to_unix(dt_idx, market=market, symbol=symbol),
             "dif": round(float(dif[dt_idx]), 4),
             "dea": round(float(dea[dt_idx]), 4),
             "bar": round(float(hist[dt_idx]), 4),
@@ -136,7 +136,7 @@ def _compute_macd_data(df: pd.DataFrame) -> list:
     return result
 
 
-def _compute_ma_lines(df: pd.DataFrame) -> list:
+def _compute_ma_lines(df: pd.DataFrame, *, market: str = "", symbol: str = "") -> list:
     """计算 MA 均线，返回 [{label, color, data: [{time, value}]}]"""
     closes = df["close"]
     ma_lines = []
@@ -152,7 +152,7 @@ def _compute_ma_lines(df: pd.DataFrame) -> list:
         line_data = []
         for dt_idx, val in ma_vals.dropna().items():
             line_data.append({
-                "time": _dt_to_unix(dt_idx),
+                "time": _dt_to_unix(dt_idx, market=market, symbol=symbol),
                 "value": round(float(val), 4),
             })
         ma_lines.append({"label": label, "color": color, "data": line_data})
@@ -286,7 +286,7 @@ def _get_date_presets() -> list:
             presets.append({
                 "key": key,
                 "date": date_str,
-                "time": int(dt.timestamp()),
+                "time": to_unix_seconds(dt, market="A"),
                 "label": info["label"],
             })
         except ValueError:
@@ -298,7 +298,7 @@ def _get_date_presets() -> list:
 # MACD 信号检测
 # ─────────────────────────────────────────────────────
 
-def _detect_macd(df: pd.DataFrame, symbol: str, freq_label: str, lookback: int) -> list:
+def _detect_macd(df: pd.DataFrame, symbol: str, freq_label: str, lookback: int, *, market: str = "") -> list:
     """运行 MACD 信号检测，返回信号列表"""
     from signals.core.macd_detector import detect_macd_signals
 
@@ -309,7 +309,7 @@ def _detect_macd(df: pd.DataFrame, symbol: str, freq_label: str, lookback: int) 
         eval_data = _compute_forward_eval(df, sig_idx)
 
         result.append({
-            "dt": _dt_to_unix(sig.dt),
+            "dt": _dt_to_unix(sig.dt, market=market, symbol=symbol),
             "date_str": sig.dt.strftime("%Y-%m-%d"),
             "type": sig.pattern,
             "group": "macd",
@@ -325,7 +325,7 @@ def _detect_macd(df: pd.DataFrame, symbol: str, freq_label: str, lookback: int) 
 # 缠论信号检测
 # ─────────────────────────────────────────────────────
 
-def _detect_czsc(df: pd.DataFrame, symbol: str, freq_label: str) -> tuple:
+def _detect_czsc(df: pd.DataFrame, symbol: str, freq_label: str, *, market: str = "") -> tuple:
     """
     运行缠论信号检测，返回 (signals_list, bi_list, zhongshu_list)。
     从 DataFrame 构建 CZSC 对象，然后调用 detect_all_signals。
@@ -367,7 +367,7 @@ def _detect_czsc(df: pd.DataFrame, symbol: str, freq_label: str) -> tuple:
         eval_data = _compute_forward_eval(df, sig_idx)
 
         signals.append({
-            "dt": _dt_to_unix(ev.dt),
+            "dt": _dt_to_unix(ev.dt, market=market, symbol=symbol),
             "date_str": ev.dt.strftime("%Y-%m-%d") if hasattr(ev.dt, "strftime") else str(ev.dt)[:10],
             "type": ev.signal_type,
             "group": "czsc",
@@ -381,8 +381,8 @@ def _detect_czsc(df: pd.DataFrame, symbol: str, freq_label: str) -> tuple:
     bi_list = []
     for bi in czsc_obj.bi_list:
         bi_list.append({
-            "sdt": _dt_to_unix(bi.fx_a.dt),
-            "edt": _dt_to_unix(bi.fx_b.dt),
+            "sdt": _dt_to_unix(bi.fx_a.dt, market=market, symbol=symbol),
+            "edt": _dt_to_unix(bi.fx_b.dt, market=market, symbol=symbol),
             "high": round(bi.high, 4),
             "low": round(bi.low, 4),
             "direction": "up" if bi.direction.value == "向上" else "down",
@@ -390,12 +390,12 @@ def _detect_czsc(df: pd.DataFrame, symbol: str, freq_label: str) -> tuple:
         })
 
     # 序列化中枢（从笔中提取）
-    zhongshu = _extract_zhongshu(czsc_obj)
+    zhongshu = _extract_zhongshu(czsc_obj, market=market, symbol=symbol)
 
     return signals, bi_list, zhongshu
 
 
-def _extract_zhongshu(czsc_obj) -> list:
+def _extract_zhongshu(czsc_obj, *, market: str = "", symbol: str = "") -> list:
     """从 CZSC 对象提取中枢"""
     bis = czsc_obj.bi_list
     if len(bis) < 3:
@@ -418,8 +418,8 @@ def _extract_zhongshu(czsc_obj) -> list:
             result.append({
                 "zd": round(zd, 4),
                 "zg": round(zg, 4),
-                "start_dt": _dt_to_unix(bis[i].fx_a.dt),
-                "end_dt": _dt_to_unix(bis[end_idx].fx_b.dt),
+                "start_dt": _dt_to_unix(bis[i].fx_a.dt, market=market, symbol=symbol),
+                "end_dt": _dt_to_unix(bis[end_idx].fx_b.dt, market=market, symbol=symbol),
                 "bi_count": end_idx - i + 1,
             })
             i = end_idx + 1
@@ -464,20 +464,20 @@ async def backtest_run(
 
         if signal_group in ("macd", "all"):
             macd_lookback = min(lookback, len(df) - 35)
-            macd_sigs = _detect_macd(df, symbol, freq_label, macd_lookback)
+            macd_sigs = _detect_macd(df, symbol, freq_label, macd_lookback, market=market)
             all_signals.extend(macd_sigs)
 
         if signal_group in ("czsc", "all"):
-            czsc_sigs, bi_list, zhongshu = _detect_czsc(df, symbol, freq_label)
+            czsc_sigs, bi_list, zhongshu = _detect_czsc(df, symbol, freq_label, market=market)
             all_signals.extend(czsc_sigs)
 
         # 3. 按时间排序
         all_signals.sort(key=lambda s: s["dt"])
 
         # 4. 序列化图表数据
-        ohlcv = _serialize_ohlcv(df)
-        macd_data = _compute_macd_data(df)
-        ma_lines = _compute_ma_lines(df)
+        ohlcv = _serialize_ohlcv(df, market=market, symbol=symbol)
+        macd_data = _compute_macd_data(df, market=market, symbol=symbol)
+        ma_lines = _compute_ma_lines(df, market=market, symbol=symbol)
 
         # 5. KPI
         kpi = _compute_kpi(all_signals)
@@ -547,11 +547,11 @@ async def backtest_simulate(
 
         if signal_group in ("macd", "all"):
             macd_lookback = min(lookback, len(df) - 35)
-            macd_sigs = _detect_macd(df, symbol, freq_label, macd_lookback)
+            macd_sigs = _detect_macd(df, symbol, freq_label, macd_lookback, market=market)
             all_signals.extend(macd_sigs)
 
         if signal_group in ("czsc", "all"):
-            czsc_sigs, bi_list, zhongshu = _detect_czsc(df, symbol, freq_label)
+            czsc_sigs, bi_list, zhongshu = _detect_czsc(df, symbol, freq_label, market=market)
             all_signals.extend(czsc_sigs)
 
         all_signals.sort(key=lambda s: s["dt"])
@@ -583,9 +583,9 @@ async def backtest_simulate(
         sim = simulate_trades(df, all_signals, sim_config)
 
         # 6. 序列化图表数据
-        ohlcv = _serialize_ohlcv(df)
-        macd_data = _compute_macd_data(df)
-        ma_lines = _compute_ma_lines(df)
+        ohlcv = _serialize_ohlcv(df, market=market, symbol=symbol)
+        macd_data = _compute_macd_data(df, market=market, symbol=symbol)
+        ma_lines = _compute_ma_lines(df, market=market, symbol=symbol)
 
         # 7. 原始 KPI (前瞻评估)
         forward_kpi = _compute_kpi(all_signals)

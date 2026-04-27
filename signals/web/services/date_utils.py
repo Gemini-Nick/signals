@@ -2,9 +2,14 @@
 """
 日期解析工具 — 从 run.py 提取的可复用函数
 """
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import config
+from signals.core.market_time import market_now
+
+
+def _today_bj():
+    return market_now("A")
 
 
 def resolve_start_date(raw: str) -> str:
@@ -15,8 +20,8 @@ def resolve_start_date(raw: str) -> str:
             return preset["date"]
         offset = preset["offset"]
         if offset == "ytd":
-            return f"{datetime.now().year}-01-01"
-        return (datetime.now() - timedelta(days=offset)).strftime("%Y-%m-%d")
+            return f"{_today_bj().year}-01-01"
+        return (_today_bj() - timedelta(days=offset)).strftime("%Y-%m-%d")
     if len(raw) == 8 and raw.isdigit():
         return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
     return raw
@@ -37,7 +42,7 @@ def get_all_presets() -> list:
         if "date" in info:
             date_str = info["date"]
         elif info["offset"] == "ytd":
-            date_str = f"{datetime.now().year}-01-01"
+            date_str = f"{_today_bj().year}-01-01"
         else:
             date_str = f"T-{info['offset']}天"
         result.append({

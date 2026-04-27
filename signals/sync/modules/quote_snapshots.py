@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 
 from pymongo.database import Database
 
+from signals.core.market_time import naive_market_now
+
 logger = logging.getLogger("signals.sync.quote_snapshots")
 _EM_ENDPOINT = "https://push2delay.eastmoney.com/api/qt/stock/get"
 _EM_FIELDS = "f43,f44,f45,f46,f47,f48,f49,f50,f57,f58,f60,f116,f117,f168,f169,f170,f171"
@@ -45,28 +47,66 @@ def _latest_bars(db: Database, symbol: str, limit: int = 2) -> list[dict]:
     return docs
 
 
+def _iter_strategy_snapshot_symbols() -> list[str]:
+    symbols: list[str] = []
+    try:
+        from signals.strategy.snapshot import get_strategy_snapshot
+
+        snapshot = get_strategy_snapshot()
+    except Exception:
+        return symbols
+
+    for key in ("candidates", "warnings", "decision_queue", "buy_candidates", "sell_warnings"):
+        rows = snapshot.get(key) or []
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for field in ("symbol", "code", "raw_code"):
+                value = row.get(field)
+                if value:
+                    symbols.append(str(value))
+            metadata = row.get("metadata")
+            if isinstance(metadata, dict):
+                for field in ("symbol", "code", "raw_code"):
+                    value = metadata.get(field)
+                    if value:
+                        symbols.append(str(value))
+    return symbols
+
+
 def _latest_pool_symbols(db: Database) -> list[str]:
+    symbols = []
+
+    def add(value: object) -> None:
+        symbol = str(value or "").strip()
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+
     doc = db["market_pools"].find_one({"pool": "active"}, {"symbols": 1}, sort=[("dt", -1), ("updated_at", -1)])
     if doc and doc.get("symbols"):
-        return [str(item) for item in doc["symbols"] if item]
-    symbols = []
+        for item in doc["symbols"]:
+            add(item)
+
+    for item in _iter_strategy_snapshot_symbols():
+        add(item)
+
     for item in db["signals"].find({}, {"symbol": 1}).sort("signal_date", -1).limit(50):
-        if item.get("symbol"):
-            symbols.append(str(item["symbol"]))
+        add(item.get("symbol"))
     if symbols:
-        return list(dict.fromkeys(symbols))
+        return symbols
     for item in db["bars"].aggregate([
         {"$sort": {"dt": -1}},
         {"$group": {"_id": "$meta.symbol", "latest_dt": {"$first": "$dt"}}},
         {"$limit": 50},
     ]):
-        if item.get("_id"):
-            symbols.append(str(item["_id"]))
-    return list(dict.fromkeys(symbols))
+        add(item.get("_id"))
+    return symbols
 
 
 def _write_provider_health(db: Database, ok: bool, latency_ms: float, error: str = "") -> None:
-    now = datetime.now()
+    now = naive_market_now("A")
     db["provider_health"].update_one(
         {"provider": "eastmoney", "endpoint": "push2delay.stock.get", "domain": "quote"},
         {"$set": {
@@ -85,7 +125,7 @@ def _write_provider_health(db: Database, ok: bool, latency_ms: float, error: str
 
 
 def _write_data_freshness(db: Database, count: int, latest_dt: str | None, live_count: int, stale_count: int) -> None:
-    now = datetime.now()
+    now = naive_market_now("A")
     if count <= 0:
         freshness = "empty"
         stale_reason = "quote_snapshot_empty"
@@ -254,7 +294,7 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
     isolated here inside sync/backfill, with local bars as stale fallback.
     """
     del proxy_url
-    now = datetime.now()
+    now = naive_market_now("A")
     try:
         from signals.data.mongo_fallback import get_last_trading_day
 

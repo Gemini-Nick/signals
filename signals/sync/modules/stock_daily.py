@@ -17,18 +17,21 @@ import akshare as ak
 import pandas as pd
 from pymongo.database import Database
 
+from signals.core.market_time import naive_market_now
 from ..proxy import em_proxy
 from ..retry import sync_retry
 from .daily_sources import fetch_tencent_daily
 
 logger = logging.getLogger("signals.sync.stock_daily")
 
-# 每批次并行拉取股票数
-_BATCH_WORKERS = 8
+# Keep the default serial. AKShare's Eastmoney daily path can native-crash when
+# multiple MiniRacer initializations happen in parallel on macOS.
+_BATCH_WORKERS = max(1, int(os.getenv("STOCK_DAILY_WORKERS", "1")))
 # 每只股票间隔（秒），避免被东财限速
 _CALL_INTERVAL = 0.3
 _PROVIDER_TIMEOUT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="stock-daily-provider")
 atexit.register(_PROVIDER_TIMEOUT_POOL.shutdown, wait=False, cancel_futures=True)
+_DEFAULT_PRIORITY_CODES = "688802,300575"
 
 
 def _provider_timeout() -> float:
@@ -36,6 +39,11 @@ def _provider_timeout() -> float:
 
 
 def _call_provider(fn):
+    # AKShare's Eastmoney path can initialize libmini_racer. On macOS it has
+    # crashed the interpreter when called from worker timeout threads, so the
+    # safe default is a direct provider call; use thread mode only when needed.
+    if os.getenv("STOCK_DAILY_PROVIDER_TIMEOUT_MODE", "direct").lower() != "thread":
+        return fn()
     future = _PROVIDER_TIMEOUT_POOL.submit(fn)
     try:
         return future.result(timeout=_provider_timeout())
@@ -64,7 +72,7 @@ def _iter_strategy_snapshot_symbols() -> list[str]:
     except Exception:
         return symbols
 
-    for key in ("buy_candidates", "sell_warnings", "decision_queue"):
+    for key in ("candidates", "warnings", "decision_queue", "buy_candidates", "sell_warnings"):
         rows = snapshot.get(key) or []
         if not isinstance(rows, list):
             continue
@@ -75,6 +83,12 @@ def _iter_strategy_snapshot_symbols() -> list[str]:
                 value = row.get(field)
                 if value:
                     symbols.append(str(value))
+            metadata = row.get("metadata")
+            if isinstance(metadata, dict):
+                for field in ("symbol", "code", "raw_code"):
+                    value = metadata.get(field)
+                    if value:
+                        symbols.append(str(value))
 
     rows = snapshot.get("themes") or []
     if isinstance(rows, list):
@@ -104,6 +118,32 @@ def _iter_configured_extra_symbols() -> list[str]:
     return symbols
 
 
+def _env_symbol_values(*names: str, default: str = "") -> list[str]:
+    values: list[str] = []
+    raw = default
+    for name in names:
+        configured = os.getenv(name, "")
+        if configured.strip():
+            raw = configured
+            break
+    for value in raw.replace(";", ",").split(","):
+        value = value.strip()
+        if value:
+            values.append(value)
+    return values
+
+
+def _select_codes_with_priority(codes: list[str], priority: set[str], max_codes: int) -> tuple[list[str], list[str]]:
+    if max_codes <= 0 or len(codes) <= max_codes:
+        return codes, []
+    priority_codes = [code for code in codes if code in priority]
+    normal_codes = [code for code in codes if code not in priority]
+    selected = [*priority_codes, *normal_codes[:max(0, max_codes - len(priority_codes))]]
+    selected_set = set(selected)
+    skipped = [code for code in codes if code not in selected_set]
+    return selected, skipped
+
+
 def _get_all_stock_codes() -> list:
     """获取全量 A 股代码列表"""
     try:
@@ -120,30 +160,40 @@ def _get_active_stock_codes(db: Database) -> list[str]:
     import config
 
     codes: list[str] = []
+    priority_codes: set[str] = set()
     index_codes = {_pure_a_code(symbol) for symbol in getattr(config, "INDEX_AK_CODES", {}).values()}
     index_codes.discard("")
 
-    def add(value: object) -> None:
+    def add(value: object, *, priority: bool = False) -> None:
         code = _pure_a_code(value)
         if code in index_codes:
             return
+        if priority and code:
+            priority_codes.add(code)
         if code and code not in codes:
             codes.append(code)
 
     only_codes = os.getenv("STOCK_DAILY_ONLY_CODES", "")
     if only_codes.strip():
         for symbol in only_codes.replace(";", ",").split(","):
-            add(symbol)
+            add(symbol, priority=True)
         return codes
 
+    for symbol in _env_symbol_values(
+        "STOCK_DAILY_PRIORITY_CODES",
+        "SIGNALS_PRIORITY_STOCK_CODES",
+        default=os.getenv("STOCK_DAILY_DEFAULT_PRIORITY_CODES", _DEFAULT_PRIORITY_CODES),
+    ):
+        add(symbol, priority=True)
+
     for symbol in getattr(config, "WHITELIST", []):
-        add(symbol)
+        add(symbol, priority=True)
 
     for symbol in _iter_strategy_snapshot_symbols():
-        add(symbol)
+        add(symbol, priority=True)
 
     for symbol in _iter_configured_extra_symbols():
-        add(symbol)
+        add(symbol, priority=True)
 
     pool = db["market_pools"].find_one(
         {"pool": "active"},
@@ -158,7 +208,23 @@ def _get_active_stock_codes(db: Database) -> list[str]:
 
     max_codes = int(os.getenv("STOCK_DAILY_MAX_CODES", str(getattr(config, "MAX_POOL_SIZE", 50) or 50)))
     if max_codes > 0:
-        codes = codes[:max_codes]
+        codes, skipped = _select_codes_with_priority(codes, priority_codes, max_codes)
+        if skipped:
+            db["sync_log"].update_one(
+                {"_id": "stock_daily:selection:_meta"},
+                {"$set": {
+                    "module": "stock_daily",
+                    "status": "partial",
+                    "last_run": naive_market_now("A"),
+                    "selected_symbols": codes,
+                    "priority_symbols": [code for code in codes if code in priority_codes],
+                    "skipped_symbols": skipped[:80],
+                    "skipped_count": len(skipped),
+                    "max_codes": max_codes,
+                    "candidate_count": len(codes) + len(skipped),
+                }},
+                upsert=True,
+            )
     return codes
 
 
@@ -250,7 +316,7 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
         dt = row[column_map["dt"]]
         docs.append({
             "dt": pd.to_datetime(dt),
-            "meta": {"symbol": code, "freq": "日线"},
+            "meta": {"symbol": code, "freq": "日线", "market": "A", "source": source},
             "open": float(row[column_map["open"]]),
             "high": float(row[column_map["high"]]),
             "low": float(row[column_map["low"]]),
@@ -275,7 +341,8 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
     """
     bars_col = db["bars"]
     sync_col = db["sync_log"]
-    end_date = datetime.now().strftime("%Y%m%d")
+    now = naive_market_now("A")
+    end_date = now.strftime("%Y%m%d")
 
     # 默认只补活跃池；全市场补仓库需要显式设置 STOCK_DAILY_SCOPE=all。
     codes, scope = _get_stock_codes(db)
@@ -308,7 +375,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
                 return code, [], "skip"
         else:
             # 全量：近 2 年
-            inc_start = (datetime.now() - timedelta(days=730)).strftime("%Y%m%d")
+            inc_start = (now - timedelta(days=730)).strftime("%Y%m%d")
 
         try:
             docs = _sync_one_stock(code, inc_start, end_date, proxy_url)
@@ -353,7 +420,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
                             "module": "stock_daily",
                             "symbol": code,
                             "last_dt": last,
-                            "last_run": datetime.now(),
+                            "last_run": naive_market_now("A"),
                             "status": "ok",
                             "bar_count": len(docs),
                             "written": written,

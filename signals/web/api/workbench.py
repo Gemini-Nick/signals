@@ -2,14 +2,26 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 import config
+from signals.core.market_time import (
+    infer_market,
+    market_timezone_name,
+    market_today,
+    naive_market_now,
+    timestamp_range_to_dates,
+    to_unix_seconds,
+)
+from signals.core.concept_carriers import non_chain_reason
 from signals.core.stock_names import get_resolver
 from signals.data.gateway import get_index_bars, get_kline
 from signals.data.models import DataRequest
@@ -112,6 +124,28 @@ MINGDAO_MACRO_WATCHLIST = [
     {"name": "中国石油", "symbol": "SH.601857", "kind": "stock"},
 ]
 
+INDEX_NAME_ALIASES = {
+    "上证综指": ("上证指数", "sh000001"),
+    "上证指数": ("上证指数", "sh000001"),
+    "上证综合指数": ("上证指数", "sh000001"),
+    "沪指": ("上证指数", "sh000001"),
+    "sh000001": ("上证指数", "sh000001"),
+    "SH.000001": ("上证指数", "sh000001"),
+    "000001.SH": ("上证指数", "sh000001"),
+    "深证综指": ("深证成指", "sz399001"),
+    "深成指": ("深证成指", "sz399001"),
+    "sz399001": ("深证成指", "sz399001"),
+    "SZ.399001": ("深证成指", "sz399001"),
+    "创业板": ("创业板指", "sz399006"),
+    "创业板指数": ("创业板指", "sz399006"),
+    "sz399006": ("创业板指", "sz399006"),
+    "SZ.399006": ("创业板指", "sz399006"),
+}
+
+_SHELL_CACHE_TTL_SECONDS = 120.0
+_SHELL_CACHE_LOCK = threading.Lock()
+_SHELL_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None, "refreshed_at": 0.0}
+
 for _name, _symbol in config.INDEX_AK_CODES.items():
     if not any(item["name"] == _name for item in MINGDAO_MACRO_WATCHLIST):
         MINGDAO_MACRO_WATCHLIST.append({"name": _name, "symbol": _symbol, "kind": "index"})
@@ -164,8 +198,28 @@ def _freq_bucket(freq: Any) -> str:
     return _canonical_freq(value or "daily")
 
 
-def _dt_to_unix(value: Any) -> int:
-    return int(pd.Timestamp(value).timestamp())
+def _market_now(market: str = "A") -> datetime:
+    return naive_market_now(market)
+
+
+def _market_today(market: str = "A") -> date:
+    return market_today(market)
+
+
+def _sync_now() -> datetime:
+    """Naive Beijing timestamp for Mongo collections that still store local time."""
+    return naive_market_now("A")
+
+
+def _dt_to_unix(value: Any, *, market: Any = "", symbol: Any = "", source: Any = "") -> int:
+    return to_unix_seconds(value, market=market, symbol=symbol, source=source)
+
+
+def _signal_ts(value: Any, *, market: Any = "", symbol: Any = "", source: Any = "") -> int:
+    numeric = _float(value)
+    if numeric is not None and numeric > 0:
+        return int(numeric / 1000) if numeric > 10_000_000_000 else int(numeric)
+    return _dt_to_unix(value, market=market, symbol=symbol, source=source)
 
 
 def _float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -191,7 +245,14 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
-def _serialize_ohlcv_df(df: pd.DataFrame, *, limit: int = 720) -> list[dict[str, Any]]:
+def _serialize_ohlcv_df(
+    df: pd.DataFrame,
+    *,
+    limit: int = 720,
+    market: Any = "",
+    symbol: Any = "",
+    source: Any = "",
+) -> list[dict[str, Any]]:
     if df is None or df.empty:
         return []
     working = df.copy().sort_index()
@@ -206,7 +267,7 @@ def _serialize_ohlcv_df(df: pd.DataFrame, *, limit: int = 720) -> list[dict[str,
         high = _float(row.get("high"), max(open_, close))
         low = _float(row.get("low"), min(open_, close))
         rows.append({
-            "time": _dt_to_unix(dt_idx),
+            "time": _dt_to_unix(dt_idx, market=market, symbol=symbol, source=source),
             "open": round(open_, 4),
             "high": round(high, 4),
             "low": round(low, 4),
@@ -217,15 +278,21 @@ def _serialize_ohlcv_df(df: pd.DataFrame, *, limit: int = 720) -> list[dict[str,
 
 
 def _chart_from_df(df: pd.DataFrame, *, symbol: str, freq: str, source: str = "gateway") -> dict[str, Any]:
+    market = infer_market(symbol=symbol, source=source)
+    limit = 900 if _canonical_freq(freq) in {"5min", "15min", "30min"} else 720
     return {
         "symbol": symbol,
         "freq": _freq_label(freq),
         "meta": {
             "freq": _canonical_freq(freq),
             "source": source,
+            "market": market,
+            "market_timezone": market_timezone_name(market, symbol=symbol, source=source),
+            "time_semantics": "bar_close_market_time",
+            "time_unit": "s",
             "bars": int(len(df)) if df is not None else 0,
         },
-        "ohlcv": _serialize_ohlcv_df(df, limit=900 if _canonical_freq(freq) in {"5min", "15min", "30min"} else 720),
+        "ohlcv": _serialize_ohlcv_df(df, limit=limit, market=market, symbol=symbol, source=source),
         "signals": [],
         "ma_lines": [],
     }
@@ -233,6 +300,14 @@ def _chart_from_df(df: pd.DataFrame, *, symbol: str, freq: str, source: str = "g
 
 def _chart_has_ohlcv(chart: dict[str, Any]) -> bool:
     return bool(chart.get("ohlcv"))
+
+
+def _target_time_fields(*, market: str = "", symbol: str = "", source: str = "") -> dict[str, str]:
+    resolved_market = infer_market(market, symbol=symbol, source=source)
+    return {
+        "market": resolved_market,
+        "market_timezone": market_timezone_name(resolved_market, symbol=symbol, source=source),
+    }
 
 
 def _fallback_chart_when_empty(
@@ -339,6 +414,101 @@ def _index_df(symbol: str, freq: str) -> tuple[pd.DataFrame, str]:
     return pd.DataFrame(), response.source
 
 
+def _probe_symbol_candidates(symbol: str, *, kind: str = "stock") -> list[str]:
+    raw = _text(symbol)
+    if not raw:
+        return []
+    candidates = [raw]
+    lower = raw.lower()
+    upper = raw.upper()
+    for value in (lower, upper):
+        if value not in candidates:
+            candidates.append(value)
+    if kind == "index":
+        compact = lower.replace(".", "")
+        if compact.startswith(("sh", "sz")) and len(compact) == 8:
+            market = compact[:2].upper()
+            code = compact[2:]
+            for value in (compact, f"{market}.{code}", f"{code}.{market}"):
+                if value not in candidates:
+                    candidates.append(value)
+    else:
+        normalized, raw_code = _normalize_stock_symbol(raw)
+        for value in (normalized, raw_code):
+            if value and value not in candidates:
+                candidates.append(value)
+    return candidates
+
+
+def _cache_probe(symbol: str, *, kind: str, requested_freq: str) -> dict[str, Any]:
+    freq_labels = {
+        "daily": "日线",
+        "weekly": "周线",
+        "monthly": "月线",
+        "5min": "5分钟",
+        "15min": "15分钟",
+        "30min": "30分钟",
+    }
+    freqs = ["日线", "5分钟", "15分钟", "30分钟"]
+    requested_label = freq_labels.get(_canonical_freq(requested_freq), _gateway_freq(requested_freq))
+    if requested_label not in freqs:
+        freqs.insert(0, requested_label)
+    candidates = _probe_symbol_candidates(symbol, kind=kind)
+    collections = ["index_bars", "bars"] if kind == "index" else ["bars"]
+    rows: list[dict[str, Any]] = []
+    try:
+        db = _mongo_db()
+        for collection in collections:
+            for candidate in candidates:
+                for freq in freqs:
+                    query = {"meta.symbol": candidate, "meta.freq": freq}
+                    count = db[collection].count_documents(query)
+                    if not count:
+                        continue
+                    latest = db[collection].find_one(
+                        query,
+                        {"dt": 1, "meta.source": 1, "close": 1},
+                        sort=[("dt", -1)],
+                    ) or {}
+                    rows.append({
+                        "collection": collection,
+                        "symbol": candidate,
+                        "freq": freq,
+                        "count": int(count),
+                        "latest_dt": _serialize_dt(latest.get("dt")),
+                        "source": (latest.get("meta") or {}).get("source", ""),
+                        "close": latest.get("close"),
+                    })
+        return {
+            "status": "hit" if rows else "miss",
+            "kind": kind,
+            "requested_freq": _canonical_freq(requested_freq),
+            "requested_freq_label": requested_label,
+            "symbol_candidates": candidates,
+            "rows": rows[:24],
+        }
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "kind": kind,
+            "requested_freq": _canonical_freq(requested_freq),
+            "symbol_candidates": candidates,
+            "error": exc.__class__.__name__,
+        }
+
+
+def _target_diagnostics(kind: str, symbol: str, requested_freq: str, *, probe_symbol: str = "") -> dict[str, Any]:
+    actual_symbol = probe_symbol or symbol
+    return {
+        "requested_symbol_candidates": _probe_symbol_candidates(actual_symbol, kind="index" if kind == "index" else "stock"),
+        "cache_probe": _cache_probe(
+            actual_symbol,
+            kind="index" if kind == "index" else "stock",
+            requested_freq=requested_freq,
+        ),
+    }
+
+
 def _preset_start_date(info: dict[str, Any], today: date) -> Optional[date]:
     if "date" in info:
         try:
@@ -354,7 +524,7 @@ def _preset_start_date(info: dict[str, Any], today: date) -> Optional[date]:
 
 
 def _watchlist_range_columns(today: Optional[date] = None) -> list[dict[str, Any]]:
-    today = today or date.today()
+    today = today or _market_today("A")
     columns: list[dict[str, Any]] = []
     relative: list[tuple[int, date, str, dict[str, Any]]] = []
     absolute: list[tuple[date, str, dict[str, Any]]] = []
@@ -372,24 +542,30 @@ def _watchlist_range_columns(today: Optional[date] = None) -> list[dict[str, Any
 
     relative.sort(key=lambda item: item[0])
     for _, start, key, info in relative:
+        base_label = str(info.get("label") or key)
+        if key == "ytd":
+            label = f"{today.year}今年以来"
+        else:
+            label = f"{base_label}({start.strftime('%Y-%m-%d')})"
         columns.append({
             "key": key,
-            "label": str(info.get("label") or key),
+            "label": label,
             "start_date": start.isoformat(),
-            "aliases": [key, str(info.get("label") or ""), start.isoformat()],
+            "aliases": [key, base_label, label, start.isoformat()],
             "tier": info.get("tier", "relative"),
         })
 
     absolute.sort(key=lambda item: item[0], reverse=True)
 
     for start, key, info in absolute:
-        mmdd = start.strftime("%m%d")
-        label = f"{mmdd}至今"
+        event_label = str(info.get("label") or key)
+        event_title = event_label.split("—", 1)[0].strip()
+        label = f"{start.strftime('%Y-%m-%d')} {event_title}"
         columns.append({
             "key": key,
             "label": label,
             "start_date": start.isoformat(),
-            "aliases": [key, mmdd, start.isoformat(), str(info.get("label") or "")],
+            "aliases": [key, start.strftime("%m%d"), start.isoformat(), event_label, event_title, label],
             "tier": info.get("tier", "event"),
         })
     return columns
@@ -489,6 +665,8 @@ def _ensure_engine():
 
 
 def _serialize_session(status: Dict[str, Any]) -> Dict[str, Any]:
+    active_markets = status.get("active_markets", [])
+    primary_market = active_markets[0] if isinstance(active_markets, list) and active_markets else "A"
     return {
         "ready": status.get("ready", False),
         "running": status.get("running", False),
@@ -498,7 +676,8 @@ def _serialize_session(status: Dict[str, Any]) -> Dict[str, Any]:
         "a_live": status.get("a_live", False),
         "hk_live": status.get("hk_live", False),
         "us_live": status.get("us_live", False),
-        "active_markets": status.get("active_markets", []),
+        "active_markets": active_markets,
+        "market_timezone": market_timezone_name(primary_market),
         "refresh_interval": status.get("refresh_interval", 0),
         "next_check_seconds": status.get("next_check_seconds", 0),
         "next_refresh_at": status.get("next_refresh_at", ""),
@@ -574,6 +753,9 @@ def _resolve_target(raw: str, kind: str, engine) -> Dict[str, str]:
         return {"kind": "concept", "label": value}
 
     if forced_kind == "index":
+        static_index = _resolve_static_index(value)
+        if static_index is not None:
+            return {"kind": "index", "label": static_index[0]}
         return {"kind": "index", "label": value}
 
     reports = engine.get_index_reports()
@@ -614,10 +796,34 @@ def _resolve_static_index(raw: str) -> Optional[tuple[str, str]]:
     value = str(raw or "").strip()
     if not value:
         value = "沪深300"
+    alias = INDEX_NAME_ALIASES.get(value) or INDEX_NAME_ALIASES.get(value.lower())
+    if alias is not None:
+        return alias
     value_lower = value.lower()
-    value_digits = value_lower.replace("sh", "").replace("sz", "")
-    for name, symbol in config.INDEX_AK_CODES.items():
-        if value == name or value_lower == symbol.lower() or value_digits == symbol.lower().replace("sh", "").replace("sz", ""):
+    value_digits = value_lower.replace(".", "").replace("sh", "").replace("sz", "")
+    entries: list[tuple[str, str]] = []
+    for item in MINGDAO_MACRO_WATCHLIST:
+        if _text(item.get("kind")) == "index":
+            entries.append((_text(item.get("name")), _text(item.get("symbol"))))
+    entries.extend((name, symbol) for name, symbol in config.INDEX_AK_CODES.items())
+    seen: set[tuple[str, str]] = set()
+    for name, symbol in entries:
+        if not name or not symbol:
+            continue
+        key = (name, symbol.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        symbol_lower = symbol.lower()
+        compact_symbol = symbol_lower.replace(".", "")
+        dot_symbol = f"{symbol_lower[:2]}.{symbol_lower[2:]}" if len(symbol_lower) >= 8 else symbol_lower
+        if (
+            value == name
+            or value_lower == symbol_lower
+            or value_lower == compact_symbol
+            or value_lower == dot_symbol
+            or value_digits == compact_symbol.replace("sh", "").replace("sz", "")
+        ):
             return name, symbol
     return None
 
@@ -748,7 +954,7 @@ def _signal_date(signal: dict[str, Any]) -> str:
     return str(signal.get("signal_date") or signal.get("date_str") or signal.get("updated_at") or "")[:10]
 
 
-def _load_signal_pool_rows(limit: int = 200) -> list[dict[str, Any]]:
+def _load_signal_pool_rows(limit: int = 200, symbol: Optional[str] = None) -> list[dict[str, Any]]:
     try:
         from signals.data.gateway import get_signal_pool
 
@@ -756,6 +962,7 @@ def _load_signal_pool_rows(limit: int = 200) -> list[dict[str, Any]]:
             domain="signal",
             mode="historical",
             market="A",
+            symbol=symbol,
             purpose="review",
             allow_stale=True,
         ))
@@ -763,6 +970,84 @@ def _load_signal_pool_rows(limit: int = 200) -> list[dict[str, Any]]:
         return [dict(item) for item in rows[:limit] if isinstance(item, dict)]
     except Exception:
         return []
+
+
+def _signal_details(signal: dict[str, Any]) -> str:
+    details = signal.get("details_json")
+    if isinstance(details, dict):
+        reasons = details.get("reasons")
+        if isinstance(reasons, list) and reasons:
+            return ",".join(str(item) for item in reasons[:4])
+        return json.dumps(details, ensure_ascii=False, default=str)[:240]
+    return _text(signal.get("details") or signal.get("summary") or signal.get("reason"))
+
+
+def _signal_pool_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) -> list[dict[str, Any]]:
+    chart_meta = chart.get("meta") if isinstance(chart.get("meta"), dict) else {}
+    effective_freq = _freq_bucket(chart_meta.get("freq") or freq)
+    market = _text(chart_meta.get("market")) or infer_market(symbol=symbol, source=_text(chart_meta.get("source")))
+    source = _text(chart_meta.get("source")) or "signals"
+    ohlcv = chart.get("ohlcv") if isinstance(chart.get("ohlcv"), list) else []
+    start_ts = int(ohlcv[0]["time"]) if ohlcv and isinstance(ohlcv[0], dict) and ohlcv[0].get("time") else None
+    end_ts = int(ohlcv[-1]["time"]) if ohlcv and isinstance(ohlcv[-1], dict) and ohlcv[-1].get("time") else None
+    rows = _load_signal_pool_rows(limit=200, symbol=symbol)
+    output: list[dict[str, Any]] = []
+    for signal in rows:
+        signal_freq = _freq_bucket(signal.get("freq") or signal.get("timeframe"))
+        if effective_freq not in {"daily", "weekly"} and signal_freq not in {effective_freq, ""}:
+            continue
+        signal_type = _text(signal.get("signal_type") or signal.get("type") or signal.get("reason"))
+        if not signal_type:
+            continue
+        signal_dt = signal.get("signal_date") or signal.get("dt") or signal.get("updated_at")
+        ts = _signal_ts(signal_dt, market=market, symbol=symbol, source=source)
+        if start_ts and ts < start_ts:
+            continue
+        if end_ts and ts > end_ts + 86400:
+            continue
+        details = signal.get("details_json") if isinstance(signal.get("details_json"), dict) else {}
+        price = _float(signal.get("price") or signal.get("close") or details.get("close"))
+        output.append({
+            "dt": ts,
+            "date_str": str(signal_dt)[:10] if signal_dt else "",
+            "type": signal_type,
+            "price": price,
+            "confidence": _float(signal.get("confidence")),
+            "freq": signal_freq or _canonical_freq(freq),
+            "details": _signal_details(signal),
+            "source": signal.get("source") or "signals.signal_pool",
+            "pool_status": signal.get("pool_status"),
+        })
+    return output
+
+
+def _merge_signal_pool_into_chart(chart: dict[str, Any], symbol: str, freq: str) -> dict[str, Any]:
+    pool_signals = _signal_pool_chart_signals(symbol, freq, chart)
+    if not pool_signals:
+        return chart
+    existing = chart.get("signals") if isinstance(chart.get("signals"), list) else []
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in [*existing, *pool_signals]:
+        if not isinstance(item, dict):
+            continue
+        ts = _signal_ts(item.get("dt") or item.get("time") or item.get("timestamp") or item.get("date_str") or item.get("signal_date"))
+        signal_type = _text(item.get("type") or item.get("signal_type") or item.get("reason"))
+        if not ts or not signal_type:
+            continue
+        key = f"{ts}:{signal_type}:{_freq_bucket(item.get('freq'))}"
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized = dict(item)
+        normalized["dt"] = ts
+        normalized["type"] = signal_type
+        normalized.setdefault("date_str", str(item.get("date_str") or item.get("signal_date") or "")[:10])
+        merged.append(normalized)
+    merged.sort(key=lambda item: int(item.get("dt") or 0))
+    updated = dict(chart)
+    updated["signals"] = merged[-300:]
+    return updated
 
 
 def _add_timeframe_signal(target: dict[str, Any], signal: dict[str, Any], *, side: str = "buy") -> None:
@@ -855,6 +1140,9 @@ def _build_focus_stock_rows(
             item["action_status"] = item.get("action_status") or "buy_candidate"
 
     for row in sell_rows or []:
+        normalized = _normalize_stock_symbol(str(row.get("symbol") or row.get("code") or row.get("label") or ""))[0]
+        if not normalized or normalized.upper() not in rows_by_symbol:
+            continue
         item = ensure(dict(row))
         if not item:
             continue
@@ -869,7 +1157,7 @@ def _build_focus_stock_rows(
         }
         if _is_sell_signal(signal) or signal.get("signal_type"):
             _add_timeframe_signal(item, signal, side="sell")
-            item["action_status"] = "exit_review"
+            item["action_status"] = "risk_review" if item.get("timeframe_signals") else "exit_review"
 
     for signal in _load_signal_pool_rows():
         side = "sell" if _is_sell_signal(signal) else "buy" if _is_buy_signal(signal) else ""
@@ -877,6 +1165,8 @@ def _build_focus_stock_rows(
             continue
         symbol = _normalize_stock_symbol(str(signal.get("symbol") or ""))[0]
         if not symbol:
+            continue
+        if side == "sell" and symbol.upper() not in rows_by_symbol:
             continue
         item = ensure({
             "symbol": symbol,
@@ -888,7 +1178,7 @@ def _build_focus_stock_rows(
         if item:
             _add_timeframe_signal(item, signal, side=side)
             if side == "sell":
-                item["action_status"] = "exit_review"
+                item["action_status"] = "risk_review" if item.get("timeframe_signals") else "exit_review"
             else:
                 item["action_status"] = item.get("action_status") or "buy_candidate"
 
@@ -929,6 +1219,9 @@ def _build_focus_stock_rows(
         if row.get("action_status") == "exit_review":
             trader_action = "减仓/止盈"
             invalidates_when = "重新站回关键均线且卖出信号解除"
+        elif row.get("action_status") == "risk_review":
+            trader_action = "风险复核"
+            invalidates_when = "买点延续但卖出/风险信号解除"
         elif any(item.get("badge") == "5m" for item in row.get("buy_timeframes", []) if isinstance(item, dict)):
             trader_action = "可试仓"
             invalidates_when = "5m 买点失效或跌破短线防守位"
@@ -947,9 +1240,10 @@ def _build_focus_stock_rows(
             "trader_action": trader_action,
             "invalidates_when": invalidates_when,
         })
+    output = [row for row in output if row.get("action_status") != "exit_review"]
     output.sort(
         key=lambda item: (
-            3 if item.get("action_status") == "exit_review" else 2 if item.get("action_status") == "manual_review" else 1 if item.get("buy_timeframes") else 0,
+            3 if item.get("action_status") == "exit_review" else 2 if item.get("buy_timeframes") else 1 if item.get("action_status") == "manual_review" else 0,
             len(item.get("sell_timeframes") or []) + len(item.get("buy_timeframes") or []),
             _float(item.get("score") or item.get("total_score") or item.get("fused_total"), 0) or 0,
         ),
@@ -1093,6 +1387,217 @@ def _industry_carrier_candidates(name: str, leader_name: str = "") -> list[dict[
     return candidates
 
 
+def _candidate_symbol_fields(item: dict[str, Any]) -> tuple[str, str]:
+    symbol = _text(item.get("symbol"))
+    raw_code = _text(item.get("raw_code"))
+    if not symbol:
+        symbol, raw_code = _stock_symbol_from_code_or_name(item.get("code"), item.get("name"))
+    if symbol and not raw_code:
+        raw_code = symbol.split(".", 1)[-1]
+    return symbol, raw_code
+
+
+def _score_0_100(value: Any, default: float = 0) -> float:
+    number = _float(value)
+    if number is None:
+        return default
+    if 0 <= number <= 1:
+        return round(number * 100, 2)
+    return round(max(0, min(100, number)), 2)
+
+
+def _board_heat_score(change_pct: Any) -> float:
+    value = _float(change_pct, 0) or 0
+    return round(max(0, min(100, value * 12.5)), 2)
+
+
+def _source_confidence_score(item: dict[str, Any]) -> float:
+    if item.get("confidence") is not None:
+        return _score_0_100(item.get("confidence"), 65)
+    source = _text(item.get("source"))
+    rep_type = _text(item.get("representative_type"))
+    if source == "semantic_industry_chain" or rep_type in {"core", "elastic"}:
+        return 90
+    if source in {"concept_rank", "concept_sina", "concept_em", "concept_ths", "strategy_snapshot"}:
+        return 78
+    if source in {"industry_leader_map", "industry_candidates"}:
+        return 72
+    return 58
+
+
+def _role_score(item: dict[str, Any], leader_rank: int = 0) -> float:
+    rep_type = _text(item.get("representative_type"))
+    source = _text(item.get("source"))
+    if rep_type == "core":
+        return max(82, 102 - leader_rank * 6)
+    if source == "industry_leader_map" or rep_type == "industry_leader":
+        return 86
+    if rep_type == "elastic":
+        return 74
+    if rep_type == "source_leader":
+        return 80
+    if rep_type in {"industry_constituent", "industry_candidate"}:
+        return 48
+    return 55
+
+
+def _trend_score_for_candidate(item: dict[str, Any], symbol: str) -> tuple[float, Optional[float], str]:
+    explicit = _float(item.get("score") or item.get("total_score") or item.get("fused_total"))
+    if explicit is not None:
+        return _score_0_100(explicit, 50), _float(item.get("day_change_pct")), _text(item.get("latest_signal"))
+    day_change = _float(item.get("day_change_pct") or item.get("daily_change_pct") or item.get("change_pct"))
+    latest_signal = _text(item.get("latest_signal") or item.get("signal") or item.get("reason"))
+    if day_change is None and symbol:
+        df, _ = _stock_df(symbol, "daily")
+        day_change = _compute_day_change_pct(df)
+        if not latest_signal:
+            latest_signal = _ma_signal_from_df(df)
+    if latest_signal:
+        if any(token in latest_signal for token in ("买", "突破", "多头", "站上", "强")):
+            base = 72
+        elif any(token in latest_signal for token in ("卖", "跌破", "走弱", "退潮")):
+            base = 32
+        else:
+            base = 55
+    else:
+        base = 50
+    if day_change is not None:
+        base += max(-20, min(25, day_change * 4))
+    return round(max(0, min(100, base)), 2), day_change, latest_signal
+
+
+def _candidate_leader_tier(item: dict[str, Any], leader_rank: int) -> str:
+    rep_type = _text(item.get("representative_type"))
+    source = _text(item.get("source"))
+    if rep_type == "core":
+        return ["龙头", "龙二", "龙三"][min(max(leader_rank - 1, 0), 2)]
+    if source == "industry_leader_map" or rep_type == "industry_leader":
+        return "行业龙头"
+    if rep_type == "elastic":
+        return "弹性"
+    if rep_type == "source_leader":
+        return "当日领涨"
+    if rep_type in {"industry_constituent", "industry_candidate"}:
+        return "成分候选"
+    return "观察"
+
+
+def _scored_candidate_payload(
+    item: dict[str, Any],
+    *,
+    heat_score: float,
+    leader_rank: int = 0,
+) -> Optional[dict[str, Any]]:
+    symbol, raw_code = _candidate_symbol_fields(item)
+    if not symbol:
+        return None
+    trend_score, day_change, latest_signal = _trend_score_for_candidate(item, symbol)
+    role_score = _role_score(item, leader_rank)
+    confidence = _source_confidence_score(item)
+    weight_score = round(max(role_score, _score_0_100(item.get("priority"), 0)), 2)
+    elasticity_score = round(
+        max(
+            82 if _text(item.get("representative_type")) == "elastic" else 0,
+            min(100, 50 + (day_change or 0) * 6),
+        ),
+        2,
+    )
+    attention_score = round(
+        heat_score * 0.35 + trend_score * 0.35 + role_score * 0.2 + confidence * 0.1,
+        2,
+    )
+    leader_tier = _candidate_leader_tier(item, leader_rank)
+    chain_role = _text(item.get("relation") or item.get("node_name") or item.get("representative_type"))
+    risk_flags = []
+    if not _text(item.get("bar_source")):
+        df, source = _stock_df(symbol, "daily")
+        if source:
+            item = {**item, "bar_source": source, "bar_count": len(df)}
+        else:
+            risk_flags.append("K线未预热")
+    if _text(item.get("source")) in {"industry_constituents", "industry_candidates"}:
+        risk_flags.append("仅成分股证据")
+    return {
+        **_representative_payload({**item, "symbol": symbol, "raw_code": raw_code}),
+        "code": symbol,
+        "leader_tier": leader_tier,
+        "chain_role": chain_role,
+        "weight_score": weight_score,
+        "elasticity_score": elasticity_score,
+        "attention_score": attention_score,
+        "trend_score": trend_score,
+        "heat_score": heat_score,
+        "source_confidence": confidence,
+        "day_change_pct": day_change,
+        "latest_signal": latest_signal,
+        "why_watch": " · ".join([
+            leader_tier,
+            chain_role,
+            _text(item.get("source_note") or item.get("source")),
+        ]).strip(" ·"),
+        "risk_flags": risk_flags,
+        "invalidates_when": "板块热度回落、当日领涨股走弱或标的跌破短线防守位",
+    }
+
+
+def _candidate_groups(
+    candidates: list[dict[str, Any]],
+    *,
+    heat_value: Any = None,
+) -> dict[str, list[dict[str, Any]]]:
+    heat_score = _board_heat_score(heat_value)
+    groups: dict[str, list[dict[str, Any]]] = {
+        "leaders": [],
+        "weighted": [],
+        "elastic": [],
+        "source_leaders": [],
+        "constituents": [],
+    }
+    core_rank = 0
+    for item in candidates:
+        rep_type = _text(item.get("representative_type"))
+        source = _text(item.get("source"))
+        leader_rank = 0
+        if rep_type == "core":
+            core_rank += 1
+            leader_rank = core_rank
+        payload = _scored_candidate_payload(item, heat_score=heat_score, leader_rank=leader_rank)
+        if not payload:
+            continue
+        if rep_type == "core":
+            groups["leaders"].append(payload)
+            groups["weighted"].append(payload)
+        elif source == "industry_leader_map" or rep_type == "industry_leader":
+            groups["leaders"].append(payload)
+            groups["weighted"].append(payload)
+        elif rep_type == "elastic":
+            groups["elastic"].append(payload)
+        elif rep_type == "source_leader":
+            groups["source_leaders"].append(payload)
+        else:
+            groups["constituents"].append(payload)
+    for key, rows in groups.items():
+        rows.sort(key=lambda item: _float(item.get("attention_score"), 0) or 0, reverse=True)
+        groups[key] = rows[:8 if key != "leaders" else 3]
+    return groups
+
+
+def _flatten_candidate_groups(groups: dict[str, list[dict[str, Any]]], limit: int = 20) -> list[dict[str, Any]]:
+    ordered_keys = ["leaders", "weighted", "elastic", "source_leaders", "constituents"]
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for key in ordered_keys:
+        for item in groups.get(key) or []:
+            symbol = _text(item.get("symbol")).upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            output.append(item)
+            if len(output) >= limit:
+                return output
+    return output
+
+
 def _mapping_chain_from_carrier(name: str, carrier: Optional[dict[str, Any]], *, kind: str) -> dict[str, Any]:
     if not carrier:
         return {
@@ -1124,6 +1629,7 @@ def _mapping_chain_from_carrier(name: str, carrier: Optional[dict[str, Any]], *,
 def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
     enriched = _enrich_cluster_row(row, kind)
     label = str(enriched.get("label") or enriched.get("name") or "").strip()
+    non_chain = non_chain_reason(label) if kind == "concept" else ""
     leader = _text(
         enriched.get("leader")
         or enriched.get("leader_name")
@@ -1148,8 +1654,10 @@ def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
             representatives = _concept_representative_groups(candidates)
         else:
             candidates = _industry_carrier_candidates(label, leader)
-    carrier = _cached_daily_carrier(candidates) or _preview_carrier(candidates)
+    carrier = None if non_chain else (_cached_daily_carrier(candidates) or _preview_carrier(candidates))
     carrier_payload = _representative_payload(carrier) if carrier else {}
+    candidate_groups = _candidate_groups(candidates, heat_value=enriched.get("change_pct") or enriched.get("gain_pct") or enriched.get("strength"))
+    focus_stocks_preview = _flatten_candidate_groups(candidate_groups, limit=6)
     carrier_range_returns: dict[str, Optional[float]] = {}
     carrier_latest_price: Optional[float] = None
     carrier_day_change: Optional[float] = None
@@ -1175,17 +1683,39 @@ def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
     action_status = "观察" if carrier_payload else "退出复盘"
     explanation_parts = [
         f"{label} 异动" if label else "",
-        f"leader {leader}" if leader else "",
-        f"承接 {carrier_name}" if carrier_name else "暂无链主承接",
+        f"当日领涨 {leader}" if leader else "",
+        f"链主代表 {carrier_name}" if carrier_name else "暂无链主代表",
     ]
+    latest_signal = (
+        enriched.get("latest_signal")
+        or non_chain
+        or (f"链主{carrier_payload.get('name')}" if carrier_payload.get("name") else "待映射")
+    )
     enriched.update({
         "group": "sector_boards",
         "domain": "concept" if kind == "concept" else "board",
+        "chain_id": carrier_payload.get("chain_id") or "",
+        "chain_name": carrier_payload.get("chain_name") or "",
+        "node_id": carrier_payload.get("node_id") or "",
+        "node_name": carrier_payload.get("node_name") or "",
+        "integrated_domains": [{
+            "kind": kind,
+            "domain": "concept" if kind == "concept" else "board",
+            "label": label,
+            "change_pct": board_day_change,
+            "leader": leader,
+            "source": enriched.get("source") or enriched.get("data_source") or "",
+        }],
+        "evidence_sources": list(dict.fromkeys([
+            *(_representative_payload(carrier).get("evidence_sources") if carrier else []),
+            _text(enriched.get("source") or enriched.get("data_source")),
+        ])),
+        "non_chain_reason": non_chain,
         "lane": "board_lane",
         "second_screen_role": "hot_sector_explanation",
-        "action_status": action_status,
-        "trader_action": "观察板块扩散和代表股承接" if carrier_payload else "退出复盘",
-        "invalidates_when": "leader 走弱、板块排名回落或链主代表跌破短线防守位",
+        "action_status": "非产业链观察" if non_chain else action_status,
+        "trader_action": "仅观察事件/指数主题" if non_chain else ("观察板块扩散和链主/弹性代表" if carrier_payload else "退出复盘"),
+        "invalidates_when": "事件窗口结束或指数样本主题热度回落" if non_chain else "当日领涨股走弱、板块排名回落或链主代表跌破短线防守位",
         "explanation": " · ".join([part for part in explanation_parts if part]),
         "leader": leader,
         "source": enriched.get("source") or enriched.get("data_source") or "",
@@ -1200,8 +1730,8 @@ def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
         "carrier_range_returns": carrier_range_returns,
         "carrier_range_return_source": "carrier_stock" if carrier_range_returns else "",
         "carrier_range_return_symbol": carrier_payload.get("symbol") or "",
-        "chart_target_status": "carrier_stock" if carrier_payload else "unmapped",
-        "latest_signal": enriched.get("latest_signal") or (f"承接{carrier_payload.get('name')}" if carrier_payload.get("name") else "待映射"),
+        "chart_target_status": "non_chain" if non_chain else ("carrier_stock" if carrier_payload else "unmapped"),
+        "latest_signal": latest_signal,
         "target_kind": kind,
         "target_label": label,
         "target_symbol": label,
@@ -1215,9 +1745,91 @@ def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
         } if carrier_payload else {},
         "carrier": carrier_payload,
         "representatives": representatives,
+        "candidate_groups": candidate_groups,
+        "focus_stocks_preview": focus_stocks_preview,
         "mapping_chain": _mapping_chain_from_carrier(label, carrier, kind=kind),
     })
     return enriched
+
+
+def _merge_candidate_groups(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {
+        "leaders": [],
+        "weighted": [],
+        "elastic": [],
+        "source_leaders": [],
+        "constituents": [],
+    }
+    for row in rows:
+        source_groups = row.get("candidate_groups") if isinstance(row.get("candidate_groups"), dict) else {}
+        for key in groups:
+            for item in source_groups.get(key) or []:
+                if isinstance(item, dict):
+                    groups[key].append(item)
+    for key, values in groups.items():
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in sorted(values, key=lambda value: _float(value.get("attention_score"), 0) or 0, reverse=True):
+            symbol = _text(item.get("symbol")).upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            deduped.append(item)
+        groups[key] = deduped[:8 if key != "leaders" else 3]
+    return groups
+
+
+def _sector_group_key(item: dict[str, Any]) -> str:
+    chain_id = _text(item.get("chain_id"))
+    node_id = _text(item.get("node_id"))
+    if chain_id:
+        return f"chain:{chain_id}:{node_id or 'default'}"
+    return f"{item.get('target_kind') or item.get('kind')}:{item.get('target_label') or item.get('label')}"
+
+
+def _aggregate_sector_board_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for item in rows:
+        buckets.setdefault(_sector_group_key(item), []).append(item)
+
+    aggregated: list[dict[str, Any]] = []
+    for items in buckets.values():
+        items.sort(key=lambda item: _float(item.get("day_change_pct") or item.get("change_pct") or item.get("gain_pct"), 0) or 0, reverse=True)
+        base = dict(items[0])
+        chain_name = _text(base.get("chain_name"))
+        node_name = _text(base.get("node_name"))
+        if chain_name:
+            base["label"] = f"{chain_name} · {node_name}" if node_name else chain_name
+            base["name"] = base["label"]
+        integrated_domains: list[dict[str, Any]] = []
+        evidence_sources: list[str] = []
+        leaders: list[str] = []
+        for item in items:
+            domains = item.get("integrated_domains") if isinstance(item.get("integrated_domains"), list) else []
+            integrated_domains.extend([dict(domain) for domain in domains if isinstance(domain, dict)])
+            evidence_sources.extend([_text(source) for source in item.get("evidence_sources") or []])
+            leader = _text(item.get("leader"))
+            if leader and leader not in leaders:
+                leaders.append(leader)
+        candidate_groups = _merge_candidate_groups(items)
+        base["integrated_domains"] = integrated_domains
+        base["evidence_sources"] = [item for item in dict.fromkeys(evidence_sources) if item]
+        base["focus_stocks_preview"] = _flatten_candidate_groups(candidate_groups, limit=6)
+        base["candidate_groups"] = candidate_groups
+        base["integrated_count"] = len(integrated_domains)
+        base["leader"] = " / ".join(leaders[:2]) if leaders else base.get("leader", "")
+        if chain_name:
+            source_labels = [_text(item.get("label")) for item in integrated_domains]
+            source_labels = [item for item in dict.fromkeys(source_labels) if item]
+            base["explanation"] = " · ".join([
+                f"{chain_name} 聚合",
+                f"节点 {node_name}" if node_name else "",
+                f"来源 {'/'.join(source_labels[:3])}" if source_labels else "",
+            ]).strip(" ·")
+            base["trader_action"] = "观察产业链共振和链主/弹性代表"
+        aggregated.append(base)
+    aggregated.sort(key=lambda item: _float(item.get("day_change_pct") or item.get("change_pct") or item.get("gain_pct"), 0) or 0, reverse=True)
+    return aggregated
 
 
 def _build_sector_board_rows(
@@ -1238,8 +1850,7 @@ def _build_sector_board_rows(
                 continue
             seen.add(key)
             rows.append(item)
-    rows.sort(key=lambda item: _float(item.get("day_change_pct") or item.get("change_pct") or item.get("gain_pct"), 0) or 0, reverse=True)
-    return rows[:16]
+    return _aggregate_sector_board_rows(rows)[:16]
 
 
 def _build_trader_task_queue(
@@ -1479,7 +2090,7 @@ def _plan_for_index(engine, name: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _build_shell_payload(engine) -> Dict[str, Any]:
+def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     status = engine.get_status()
     session = _serialize_session(status)
     strategy_snapshot = _safe_strategy_snapshot()
@@ -1513,11 +2124,17 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
         for item in strategy_snapshot.get("decision_queue", [])
         if isinstance(item, dict)
     ]
-    cluster = _unwrap_response(cluster_service.get_latest(top=8))
-
     snapshot_cluster = _cluster_from_strategy_snapshot(strategy_snapshot)
-    industry_top = snapshot_cluster.get("industry_top") or (cluster.get("industry") or {}).get("top") or []
-    concept_top = snapshot_cluster.get("concept_top") or (cluster.get("concept") or {}).get("top") or []
+    industry_top = snapshot_cluster.get("industry_top") or _gateway_rank_rows("board", top=8)
+    concept_top = snapshot_cluster.get("concept_top") or _gateway_rank_rows("concept", top=8)
+    cluster: dict[str, Any] = {}
+    if not industry_top or not concept_top:
+        try:
+            cluster = _unwrap_response(cluster_service.get_latest(top=8))
+        except Exception:
+            cluster = {}
+        industry_top = industry_top or (cluster.get("industry") or {}).get("top") or []
+        concept_top = concept_top or (cluster.get("concept") or {}).get("top") or []
     sector_boards = _build_sector_board_rows(
         industry_top=industry_top,
         concept_top=concept_top,
@@ -1601,7 +2218,84 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
     }
 
 
+def _build_shell_payload(engine) -> Dict[str, Any]:
+    now = time.monotonic()
+    cached_payload = _SHELL_CACHE.get("payload")
+    if cached_payload is not None and now < float(_SHELL_CACHE.get("expires_at") or 0):
+        payload = dict(cached_payload)
+        payload["cache"] = {
+            "status": "hit",
+            "age_seconds": round(now - float(_SHELL_CACHE.get("refreshed_at") or now), 2),
+            "ttl_seconds": _SHELL_CACHE_TTL_SECONDS,
+        }
+        return payload
+
+    acquired = _SHELL_CACHE_LOCK.acquire(blocking=False)
+    if not acquired:
+        if cached_payload is not None:
+            payload = dict(cached_payload)
+            payload["cache"] = {
+                "status": "stale_refreshing",
+                "age_seconds": round(now - float(_SHELL_CACHE.get("refreshed_at") or now), 2),
+                "ttl_seconds": _SHELL_CACHE_TTL_SECONDS,
+            }
+            return payload
+        with _SHELL_CACHE_LOCK:
+            cached_payload = _SHELL_CACHE.get("payload")
+            if cached_payload is not None:
+                payload = dict(cached_payload)
+                payload["cache"] = {
+                    "status": "waited_hit",
+                    "age_seconds": round(time.monotonic() - float(_SHELL_CACHE.get("refreshed_at") or time.monotonic()), 2),
+                    "ttl_seconds": _SHELL_CACHE_TTL_SECONDS,
+                }
+                return payload
+
+    try:
+        refreshed_now = time.monotonic()
+        cached_payload = _SHELL_CACHE.get("payload")
+        if cached_payload is not None and refreshed_now < float(_SHELL_CACHE.get("expires_at") or 0):
+            payload = dict(cached_payload)
+            payload["cache"] = {
+                "status": "hit_after_lock",
+                "age_seconds": round(refreshed_now - float(_SHELL_CACHE.get("refreshed_at") or refreshed_now), 2),
+                "ttl_seconds": _SHELL_CACHE_TTL_SECONDS,
+            }
+            return payload
+        payload = _build_shell_payload_uncached(engine)
+        _SHELL_CACHE.update({
+            "payload": dict(payload),
+            "refreshed_at": refreshed_now,
+            "expires_at": refreshed_now + _SHELL_CACHE_TTL_SECONDS,
+        })
+        payload["cache"] = {
+            "status": "refreshed",
+            "age_seconds": 0,
+            "ttl_seconds": _SHELL_CACHE_TTL_SECONDS,
+        }
+        return payload
+    finally:
+        if acquired:
+            _SHELL_CACHE_LOCK.release()
+
+
 def _safe_strategy_snapshot() -> Dict[str, Any]:
+    try:
+        from signals.data.mongo_fallback import get_db
+
+        db = get_db()
+        if db is not None:
+            doc = db["strategy_snapshots"].find_one(
+                {"snapshot": {"$exists": True}},
+                {"_id": 0, "snapshot": 1},
+                sort=[("updated_at", -1), ("as_of", -1)],
+            )
+            if doc and isinstance(doc.get("snapshot"), dict):
+                snapshot = dict(doc["snapshot"])
+                snapshot.setdefault("read_model_source", "mongodb.strategy_snapshots")
+                return snapshot
+    except Exception:
+        pass
     try:
         snapshot = get_strategy_snapshot()
         return dict(snapshot) if isinstance(snapshot, dict) else {}
@@ -1615,6 +2309,56 @@ def _safe_strategy_snapshot() -> Dict[str, Any]:
             "strategy_kpis": {},
             "source_confidence": {"overall": 0, "sources": []},
         }
+
+
+def _gateway_rank_rows(domain: str, top: int = 8) -> list[dict[str, Any]]:
+    try:
+        from signals.data.gateway import get_board_rank, get_concept_rank
+
+        fn = get_concept_rank if domain == "concept" else get_board_rank
+        response = fn(DataRequest(
+            domain="concept" if domain == "concept" else "board",
+            mode="realtime",
+            market="A",
+            purpose="cluster",
+            allow_stale=True,
+        ))
+        data = response.data
+        if isinstance(data, pd.DataFrame):
+            records = data.head(top).to_dict("records")
+        elif isinstance(data, list):
+            records = data[:top]
+        else:
+            records = []
+        rows: list[dict[str, Any]] = []
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            label = _text(
+                item.get("board_name")
+                or item.get("concept_name")
+                or item.get("name")
+                or item.get("label")
+                or item.get("板块名称")
+            )
+            if not label:
+                continue
+            rows.append({
+                "label": label,
+                "name": label,
+                "kind": "concept" if domain == "concept" else "industry",
+                "domain": domain,
+                "source": response.source or item.get("source") or "gateway_rank",
+                "change_pct": item.get("change_pct") or item.get("gain_pct") or item.get("涨跌幅"),
+                "leader": item.get("leader_name") or item.get("leader") or item.get("leading_stock") or item.get("领涨股票"),
+                "leader_change_pct": item.get("leader_change_pct") or item.get("leading_gain"),
+                "turnover_pct": item.get("turnover_pct"),
+                "up_count": item.get("up_count"),
+                "down_count": item.get("down_count"),
+            })
+        return rows
+    except Exception:
+        return []
 
 
 def _cluster_from_strategy_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -1766,10 +2510,11 @@ def _ensure_daily_bars(symbol: str, raw_code: str) -> bool:
     try:
         from signals.sync.modules.stock_daily import _sync_one_stock
 
+        now = _sync_now()
         docs = _sync_one_stock(
             code,
-            (datetime.now() - timedelta(days=730)).strftime("%Y%m%d"),
-            datetime.now().strftime("%Y%m%d"),
+            (now - timedelta(days=730)).strftime("%Y%m%d"),
+            now.strftime("%Y%m%d"),
         )
         if not docs:
             return False
@@ -1794,7 +2539,7 @@ def _ensure_daily_bars(symbol: str, raw_code: str) -> bool:
                 "module": "stock_daily",
                 "symbol": code,
                 "last_dt": docs[-1]["dt"],
-                "last_run": datetime.now(),
+                "last_run": _sync_now(),
                 "status": "ok",
                 "bar_count": len(docs),
                 "written": len(new_docs),
@@ -1837,7 +2582,7 @@ def _ensure_minute_bars(symbol: str, raw_code: str, freq: str) -> bool:
                 "module": "stock_minute",
                 "symbol": code,
                 "last_dt": docs[-1]["dt"],
-                "last_run": datetime.now(),
+                "last_run": _sync_now(),
                 "status": "ok",
                 "bar_count": len(docs),
                 "source": docs[-1].get("meta", {}).get("source"),
@@ -1879,11 +2624,31 @@ def _industry_constituent_symbols(industry_name: str) -> list[str]:
         db = _mongo_db()
     except Exception:
         return symbols
-    query = {"$or": [{"board_name": industry_name}, {"concept_name": industry_name}]}
+    query = {"$or": [{"_id": industry_name}, {"board_name": industry_name}, {"concept_name": industry_name}]}
     for collection in ("board_constituents", "concept_constituents"):
         if collection not in db.list_collection_names():
             continue
         for row in db[collection].find(query).sort("updated_at", -1).limit(4):
+            for symbol in row.get("symbols") or []:
+                normalized, _ = _normalize_stock_symbol(str(symbol))
+                if normalized and normalized not in symbols:
+                    symbols.append(normalized)
+    return symbols
+
+
+def _concept_constituent_symbols(concept_name: str, theme_candidates: list[dict[str, Any]]) -> list[str]:
+    names = [concept_name] + [_text(item.get("name")) for item in theme_candidates]
+    names = [name for index, name in enumerate(names) if name and name not in names[:index]]
+    symbols: list[str] = []
+    try:
+        db = _mongo_db()
+    except Exception:
+        return symbols
+    if "concept_constituents" not in db.list_collection_names():
+        return symbols
+    for name in names:
+        query = {"$or": [{"_id": name}, {"concept_name": name}, {"board_name": name}, {"concept": name}]}
+        for row in db["concept_constituents"].find(query).sort("updated_at", -1).limit(4):
             for symbol in row.get("symbols") or []:
                 normalized, _ = _normalize_stock_symbol(str(symbol))
                 if normalized and normalized not in symbols:
@@ -1985,6 +2750,7 @@ def _concept_carrier_candidates(
     related_industries: list[str],
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
+    non_chain = bool(non_chain_reason(concept_name))
 
     def add(
         symbol: str = "",
@@ -2016,28 +2782,29 @@ def _concept_carrier_candidates(
         if extra:
             candidates[-1].update(extra)
 
-    for item in _preferred_concept_carriers(concept_name, theme_candidates, related_industries):
-        add(
-            symbol=_text(item.get("symbol")),
-            name=_text(item.get("name")),
-            source=_text(item.get("source")),
-            relation=_text(item.get("relation")),
-            extra={
-                "priority": item.get("priority"),
-                "base_priority": item.get("base_priority"),
-                "chain_id": item.get("chain_id"),
-                "chain_name": item.get("chain_name"),
-                "node_id": item.get("node_id"),
-                "node_name": item.get("node_name"),
-                "layer": item.get("layer"),
-                "stage": item.get("stage"),
-                "representative_type": item.get("representative_type"),
-                "source_note": item.get("source_note"),
-                "confidence": item.get("confidence"),
-                "hit_terms": item.get("hit_terms"),
-                "evidence_sources": item.get("evidence_sources"),
-            },
-        )
+    if not non_chain:
+        for item in _preferred_concept_carriers(concept_name, theme_candidates, related_industries):
+            add(
+                symbol=_text(item.get("symbol")),
+                name=_text(item.get("name")),
+                source=_text(item.get("source")),
+                relation=_text(item.get("relation")),
+                extra={
+                    "priority": item.get("priority"),
+                    "base_priority": item.get("base_priority"),
+                    "chain_id": item.get("chain_id"),
+                    "chain_name": item.get("chain_name"),
+                    "node_id": item.get("node_id"),
+                    "node_name": item.get("node_name"),
+                    "layer": item.get("layer"),
+                    "stage": item.get("stage"),
+                    "representative_type": item.get("representative_type"),
+                    "source_note": item.get("source_note"),
+                    "confidence": item.get("confidence"),
+                    "hit_terms": item.get("hit_terms"),
+                    "evidence_sources": item.get("evidence_sources"),
+                },
+            )
 
     for row in _concept_rank_rows(concept_name, theme_candidates):
         add(
@@ -2059,27 +2826,36 @@ def _concept_carrier_candidates(
             extra={"representative_type": "source_leader"},
         )
 
-    for industry in related_industries:
-        leader = _industry_leader_candidate(industry)
-        if leader:
-            before = len(candidates)
-            add(
-                symbol=_text(leader.get("symbol")),
-                raw_code=_text(leader.get("raw_code")),
-                name=_text(leader.get("name")),
-                source=_text(leader.get("source")),
-                relation=_text(leader.get("relation")),
-                extra={"representative_type": "industry_leader"},
-            )
-            if len(candidates) > before:
-                candidates[-1]["priority"] = leader.get("priority")
-        for symbol in _industry_constituent_symbols(industry):
-            add(
-                symbol=symbol,
-                source="industry_constituents",
-                relation=industry,
-                extra={"representative_type": "industry_constituent"},
-            )
+    for symbol in _concept_constituent_symbols(concept_name, theme_candidates):
+        add(
+            symbol=symbol,
+            source="concept_constituents",
+            relation=concept_name,
+            extra={"representative_type": "concept_constituent"},
+        )
+
+    if not non_chain:
+        for industry in related_industries:
+            leader = _industry_leader_candidate(industry)
+            if leader:
+                before = len(candidates)
+                add(
+                    symbol=_text(leader.get("symbol")),
+                    raw_code=_text(leader.get("raw_code")),
+                    name=_text(leader.get("name")),
+                    source=_text(leader.get("source")),
+                    relation=_text(leader.get("relation")),
+                    extra={"representative_type": "industry_leader"},
+                )
+                if len(candidates) > before:
+                    candidates[-1]["priority"] = leader.get("priority")
+            for symbol in _industry_constituent_symbols(industry):
+                add(
+                    symbol=symbol,
+                    source="industry_constituents",
+                    relation=industry,
+                    extra={"representative_type": "industry_constituent"},
+                )
     return candidates
 
 
@@ -2091,6 +2867,7 @@ def _representative_payload(item: dict[str, Any]) -> dict[str, Any]:
         "relation": item.get("relation"),
         "source": item.get("source"),
         "source_note": item.get("source_note"),
+        "representative_type": item.get("representative_type"),
         "priority": item.get("priority"),
         "base_priority": item.get("base_priority"),
         "chain_id": item.get("chain_id"),
@@ -2102,16 +2879,20 @@ def _representative_payload(item: dict[str, Any]) -> dict[str, Any]:
         "confidence": item.get("confidence"),
         "hit_terms": item.get("hit_terms") or [],
         "evidence_sources": item.get("evidence_sources") or [],
+        "bar_source": item.get("bar_source"),
+        "bar_count": item.get("bar_count"),
     }
 
 
 def _concept_representative_groups(candidates: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    groups: dict[str, list[dict[str, Any]]] = {"core": [], "elastic": [], "source_leader": []}
+    groups: dict[str, list[dict[str, Any]]] = {"core": [], "elastic": [], "source_leader": [], "constituent": []}
     seen: dict[str, set[str]] = {key: set() for key in groups}
     for item in candidates:
         rep_type = _text(item.get("representative_type"))
         if rep_type not in groups:
-            if item.get("source") in {"concept_rank", "strategy_snapshot", "concept_sina", "concept_em", "concept_ths"}:
+            if item.get("source") in {"concept_constituents", "industry_constituents"}:
+                rep_type = "constituent"
+            elif item.get("source") in {"concept_rank", "strategy_snapshot", "concept_sina", "concept_em", "concept_ths"}:
                 rep_type = "source_leader"
             else:
                 continue
@@ -2123,21 +2904,13 @@ def _concept_representative_groups(candidates: list[dict[str, Any]]) -> dict[str
     return {key: value[:8] for key, value in groups.items()}
 
 
-def _ordered_candidate_stocks(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    groups = _concept_representative_groups(candidates)
-    ordered: list[dict[str, Any]] = [
-        *groups.get("core", []),
-        *groups.get("elastic", []),
-        *groups.get("source_leader", []),
-    ]
-    seen = {_text(item.get("symbol")).upper() for item in ordered if item.get("symbol")}
-    for item in candidates:
-        symbol = _text(item.get("symbol")).upper()
-        if not symbol or symbol in seen:
-            continue
-        seen.add(symbol)
-        ordered.append(_representative_payload(item))
-    return ordered[:12]
+def _ordered_candidate_stocks(
+    candidates: list[dict[str, Any]],
+    *,
+    heat_value: Any = None,
+) -> list[dict[str, Any]]:
+    groups = _candidate_groups(candidates, heat_value=heat_value)
+    return _flatten_candidate_groups(groups, limit=20)
 
 
 def _summary_from_index(report: Dict[str, Any], chart: Dict[str, Any]) -> Dict[str, Any]:
@@ -2255,9 +3028,11 @@ async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
             "kind": "index",
             "label": name,
             "symbol": report.get("symbol", ""),
+            **_target_time_fields(market="A", symbol=report.get("symbol", ""), source=chart.get("meta", {}).get("source", "")),
             "requested_freq": requested_freq,
             "effective_freq": chart.get("meta", {}).get("freq", requested_freq),
             "available_freqs": UI_FREQS,
+            **_target_diagnostics("index", str(report.get("symbol") or name), requested_freq),
         },
         "chart": chart,
         "summary": _summary_from_index(report, chart),
@@ -2280,17 +3055,21 @@ async def _build_static_index_target(name: str, symbol: str, freq: str) -> Dict[
         requested_freq=requested_freq,
         loader=lambda fallback_freq: _index_df(symbol, fallback_freq),
     )
+    summary = _summary_from_static_index(name, symbol, chart)
+    summary["latest_signal"] = summary.get("latest_signal") or _ma_signal_from_df(df)
     return {
         "target": {
             "kind": "index",
             "label": name,
             "symbol": symbol,
+            **_target_time_fields(market="A", symbol=symbol, source=chart.get("meta", {}).get("source", "")),
             "requested_freq": requested_freq,
             "effective_freq": chart.get("meta", {}).get("freq", requested_freq),
             "available_freqs": UI_FREQS,
+            **_target_diagnostics("index", symbol, requested_freq),
         },
         "chart": chart,
-        "summary": _summary_from_static_index(name, symbol, chart),
+        "summary": summary,
         "signals": chart.get("signals", []),
         "plan": None,
         "review": {},
@@ -2321,6 +3100,25 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
 
     leader_name = candidate_stocks[0]["name"] if candidate_stocks else ""
     carrier_candidates = _industry_carrier_candidates(name, leader_name)
+    ranking_candidate_items: list[dict[str, Any]] = []
+    for candidate in candidate_stocks:
+        symbol, raw_code = _stock_symbol_from_code_or_name(candidate.get("code"), candidate.get("name"))
+        if not symbol:
+            continue
+        ranking_candidate_items.append({
+            "symbol": symbol,
+            "raw_code": raw_code,
+            "name": candidate.get("name"),
+            "relation": candidate.get("role") or f"{name} 成分候选",
+            "source": "industry_candidates",
+            "representative_type": "industry_candidate",
+            "priority": candidate.get("priority"),
+            "detail": candidate.get("detail"),
+        })
+    all_candidates = carrier_candidates + ranking_candidate_items
+    heat_value = getattr(ranking, "gain_pct", None) if ranking else None
+    candidate_groups = _candidate_groups(all_candidates, heat_value=heat_value)
+    ordered_candidates = _flatten_candidate_groups(candidate_groups, limit=20)
     carrier = _preview_carrier(carrier_candidates)
 
     async def fallback_to_carrier(reason: str) -> Dict[str, Any]:
@@ -2348,9 +3146,13 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
             "kind": "industry",
             "label": name,
             "symbol": fallback["symbol"],
+            **_target_time_fields(symbol=fallback["symbol"], source=payload.get("chart", {}).get("meta", {}).get("source", "")),
             "requested_freq": requested_freq,
             "carrier_kind": "stock",
             "carrier_symbol": fallback["symbol"],
+            "mapping_status": "mapped",
+            "unmapped_reason": "",
+            **_target_diagnostics("stock", fallback["symbol"], requested_freq),
         }
         payload["summary"] = {
             **payload.get("summary", {}),
@@ -2362,7 +3164,8 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
             "mapping_chain": mapping_chain,
             "fallback_reason": reason,
         }
-        payload["candidate_stocks"] = candidate_stocks or [_representative_payload(item) for item in carrier_candidates[:10]]
+        payload["candidate_groups"] = candidate_groups
+        payload["candidate_stocks"] = ordered_candidates
         payload["analysis_target"] = fallback["symbol"]
         return payload
 
@@ -2378,9 +3181,12 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
             "kind": "industry",
             "label": name,
             "symbol": name,
+            **_target_time_fields(market="A", symbol=name, source="industry"),
             "requested_freq": requested_freq,
             "effective_freq": "daily",
             "available_freqs": ["daily"],
+            "mapping_status": "direct_industry_kline",
+            "unmapped_reason": "",
         },
         "chart": detail,
         "summary": _summary_from_industry(name, detail, ranking),
@@ -2389,7 +3195,8 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
         "review": _review_context(engine, "industry", name),
         "trade": _trade_context(analysis_target or None),
         "analysis_target": analysis_target,
-        "candidate_stocks": candidate_stocks or [_representative_payload(item) for item in carrier_candidates[:10]],
+        "candidate_groups": candidate_groups,
+        "candidate_stocks": ordered_candidates,
     }
 
 
@@ -2412,6 +3219,20 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
 
     carrier_candidates = _concept_carrier_candidates(name, theme_candidates, related)
     representatives = _concept_representative_groups(carrier_candidates)
+    heat_value = getattr(concept, "gain_pct", None) or theme.get("change_pct") or theme.get("strength")
+    candidate_groups = _candidate_groups(carrier_candidates, heat_value=heat_value)
+    ordered_candidates = _ordered_candidate_stocks(carrier_candidates, heat_value=heat_value)
+    non_chain = non_chain_reason(name)
+    constituent_candidates = [
+        item for item in carrier_candidates
+        if item.get("source") in {"concept_constituents", "industry_constituents"}
+        or item.get("representative_type") in {"concept_constituent", "industry_constituent"}
+    ]
+    source_leader_candidates = [
+        item for item in carrier_candidates
+        if item.get("representative_type") in {"source_leader", "industry_leader"}
+        or item.get("source") in {"concept_rank", "concept_ranking", "concept_sina", "concept_em", "concept_ths", "strategy_snapshot", "industry_leader_map"}
+    ]
     core_candidates = [
         item for item in carrier_candidates
         if item.get("representative_type") == "core"
@@ -2420,9 +3241,16 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
         item for item in carrier_candidates
         if item.get("source") == "semantic_industry_chain"
     ]
-    carrier = (
+    elastic_candidates = [
+        item for item in carrier_candidates
+        if item.get("representative_type") == "elastic"
+    ]
+    carrier = None if non_chain else (
         _available_daily_carrier(core_candidates, preserve_order=True)
         or _available_daily_carrier(semantic_candidates)
+        or _available_daily_carrier(elastic_candidates)
+        or _available_daily_carrier(source_leader_candidates)
+        or _available_daily_carrier(constituent_candidates, preserve_order=True)
     )
     if carrier:
         _ensure_minute_bars(carrier["symbol"], carrier["raw_code"], requested_freq)
@@ -2480,15 +3308,28 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
                 "bar_source": carrier.get("bar_source"),
                 "bar_count": carrier.get("bar_count"),
             },
+            "mapping_status": "mapped",
+            "unmapped_reason": "",
+            "candidate_count": len(carrier_candidates),
+            "carrier_source_order": [
+                "constituents",
+                "ranking_or_source_leader",
+                "semantic_core",
+                "semantic_industry_chain",
+            ],
         }
         payload["target"] = {
             **payload.get("target", {}),
             "kind": "concept",
             "label": name,
             "symbol": getattr(concept, "code", "") or name,
+            **_target_time_fields(symbol=carrier["symbol"], source=payload.get("chart", {}).get("meta", {}).get("source", "")),
             "requested_freq": requested_freq,
             "carrier_kind": "stock",
             "carrier_symbol": carrier["symbol"],
+            "mapping_status": "mapped",
+            "unmapped_reason": "",
+            **_target_diagnostics("stock", carrier["symbol"], requested_freq),
         }
         payload["summary"] = {
             **payload.get("summary", {}),
@@ -2499,20 +3340,29 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
             "composite_score": getattr(concept, "composite_score", None) or theme.get("strength"),
             "carrier": mapping_chain["carrier"],
             "representatives": representatives,
+            "candidate_groups": candidate_groups,
             "mapping_chain": mapping_chain,
+            "mapping_status": "mapped",
+            "unmapped_reason": "",
         }
         payload["analysis_target"] = carrier["symbol"]
-        payload["candidate_stocks"] = _ordered_candidate_stocks(carrier_candidates)
+        payload["candidate_groups"] = candidate_groups
+        payload["candidate_stocks"] = ordered_candidates
         return payload
 
+    unmapped_reason = non_chain or ("no_carrier_with_daily_cache" if carrier_candidates else "carrier_candidates_empty")
     return {
         "target": {
             "kind": "concept",
             "label": name,
             "symbol": getattr(concept, "code", "") or name,
+            **_target_time_fields(market="A", symbol=getattr(concept, "code", "") or name, source="concept"),
             "requested_freq": requested_freq,
             "effective_freq": "daily",
             "available_freqs": ["daily"],
+            "mapping_status": "non_chain" if non_chain else "unmapped",
+            "unmapped_reason": unmapped_reason,
+            **_target_diagnostics("stock", name, requested_freq),
         },
         "chart": _chart_from_df(pd.DataFrame(), symbol=name, freq="daily", source="concept_unmapped"),
         "summary": {
@@ -2522,6 +3372,8 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
             "conclusion": "暂未找到可映射行业或领涨股，等待概念成分/板块 K 线预热。",
             "key_levels": [],
             "representatives": representatives,
+            "candidate_groups": candidate_groups,
+            "non_chain_reason": non_chain,
             "mapping_chain": {
                 "query": name,
                 "concepts": [name],
@@ -2533,14 +3385,20 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
                 "layer": "",
                 "confidence": 0,
                 "evidence_sources": [],
+                "mapping_status": "non_chain" if non_chain else "unmapped",
+                "unmapped_reason": unmapped_reason,
+                "candidate_count": len(carrier_candidates),
             },
+            "mapping_status": "non_chain" if non_chain else "unmapped",
+            "unmapped_reason": unmapped_reason,
         },
         "signals": [],
         "plan": None,
         "review": _review_context(engine, "concept", name),
         "trade": _trade_context(None),
         "analysis_target": "",
-        "candidate_stocks": _ordered_candidate_stocks(carrier_candidates),
+        "candidate_groups": candidate_groups,
+        "candidate_stocks": ordered_candidates,
     }
 
 
@@ -2562,6 +3420,7 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
         requested_freq=requested_freq,
         loader=lambda fallback_freq: _stock_df(symbol, fallback_freq),
     )
+    chart = _merge_signal_pool_into_chart(chart, symbol, chart.get("meta", {}).get("freq", requested_freq))
     try:
         stock = _unwrap_response(analyze_stock(symbol))
     except Exception as exc:
@@ -2581,9 +3440,11 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
             "kind": "stock",
             "label": stock.get("name") or symbol,
             "symbol": symbol,
+            **_target_time_fields(symbol=symbol, source=chart.get("meta", {}).get("source", "")),
             "requested_freq": requested_freq,
             "effective_freq": chart.get("meta", {}).get("freq", requested_freq),
             "available_freqs": UI_FREQS,
+            **_target_diagnostics("stock", symbol, requested_freq),
         },
         "chart": chart,
         "summary": _summary_from_stock(symbol, stock, chart),
@@ -2600,17 +3461,15 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
     }
 
 
-def _timestamp_range_to_dates(start: Optional[int], end: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
-    if not start or not end:
-        return None, None
-    start_dt = start if start < end else end
-    end_dt = end if end > start else start
-    from datetime import datetime
-
-    return (
-        datetime.fromtimestamp(start_dt).strftime("%Y-%m-%d"),
-        datetime.fromtimestamp(end_dt).strftime("%Y-%m-%d"),
-    )
+def _timestamp_range_to_dates(
+    start: Optional[int],
+    end: Optional[int],
+    *,
+    market: Any = "",
+    symbol: Any = "",
+    source: Any = "",
+) -> Tuple[Optional[str], Optional[str]]:
+    return timestamp_range_to_dates(start, end, market=market, symbol=symbol, source=source)
 
 
 def _in_date_range(date_str: str, start: Optional[str], end: Optional[str]) -> bool:
@@ -2692,7 +3551,7 @@ async def _call_backtest_analyze(code: str, freq: str, lookback: int = 180) -> A
 @router.get("/shell")
 async def get_workbench_shell():
     engine = _ensure_engine()
-    return _build_shell_payload(engine)
+    return await run_in_threadpool(_build_shell_payload, engine)
 
 
 @router.get("/cluster")
@@ -2762,11 +3621,12 @@ async def get_workbench_backtest(
             lookback=360,
         )
     )
-    start, end = _timestamp_range_to_dates(start_ts, end_ts)
+    start, end = _timestamp_range_to_dates(start_ts, end_ts, symbol=normalized)
     filtered = _filter_backtest_payload(payload, start, end)
     filtered["target"] = {
         "symbol": normalized,
         "code": raw_code,
+        **_target_time_fields(symbol=normalized),
         "requested_freq": freq,
         "effective_freq": freq if freq in {"daily", "weekly", "monthly"} else "daily",
     }

@@ -2,7 +2,7 @@ version: 1
 chains:
   - chain_id: lithium_battery
     name: 电新/锂电池产业链
-    aliases: [锂, 锂矿, 盐湖提锂, 锂电, 锂电池, 动力电池, 固态电池, 钠电池]
+    aliases: [锂, 锂矿, 盐湖提锂, 锂电, 锂电池, 动力电池, 固态电池, 钠电池, 复合集流体]
     industries: [能源金属, 小金属, 电池, 化学原料, 化学制品, 汽车整车, 其他电源设备]
     default_node_id: lithium_resource
     nodes:
@@ -50,11 +50,12 @@ chains:
       - node_id: battery_cell
         name: 电池
         layer: downstream
-        keywords: [电池, 动力电池, 储能电池, 固态电池, 钠电池, 锂电池]
+        keywords: [电池, 动力电池, 储能电池, 固态电池, 钠电池, 锂电池, 复合集流体]
         core_representatives:
           - {symbol: SZ.300750, name: 宁德时代, relation: 动力电池/储能电池链主, source_note: 电池链主代表, priority: 100}
           - {symbol: SZ.300014, name: 亿纬锂能, relation: 动力电池/储能, source_note: 电池链主代表, priority: 92}
         elastic_representatives:
+          - {symbol: SH.688530, name: 欧莱新材, relation: 复合集流体弹性标的, source_note: 复合集流体当期弹性代表, priority: 88}
           - {symbol: SZ.002074, name: 国轩高科, relation: 动力电池弹性标的, source_note: 电池弹性代表, priority: 86}
       - node_id: storage_inverter
         name: 储能/逆变器
@@ -127,7 +128,7 @@ chains:
 
   - chain_id: semiconductor
     name: 半导体产业链
-    aliases: [半导体, 芯片, 集成电路, 华为海思]
+    aliases: [半导体, 芯片, 集成电路, 华为海思, 高带宽内存, HBM]
     industries: [半导体, 元件, 电子化学品, 消费电子, 其他电子]
     default_node_id: wafer_foundry
     nodes:
@@ -141,7 +142,7 @@ chains:
       - node_id: chip_design
         name: 芯片设计
         layer: downstream
-        keywords: [设计, 芯片设计, CIS, MCU]
+        keywords: [设计, 芯片设计, CIS, MCU, 华为海思]
         core_representatives:
           - {symbol: SH.603501, name: 韦尔股份, relation: 芯片设计/CIS, source_note: 半导体设计链主代表, priority: 92}
           - {symbol: SH.603986, name: 兆易创新, relation: 存储芯片/MCU, source_note: 半导体设计链主代表, priority: 90}
@@ -149,7 +150,7 @@ chains:
       - node_id: memory_chip
         name: 存储芯片
         layer: downstream
-        keywords: [存储芯片, 存储, DRAM, NAND, MCU]
+        keywords: [存储芯片, 存储, DRAM, NAND, MCU, 高带宽内存, HBM]
         core_representatives:
           - {symbol: SH.603986, name: 兆易创新, relation: 存储芯片/MCU链主, source_note: 存储芯片链主代表, priority: 100}
         elastic_representatives:

@@ -11,13 +11,12 @@
 import logging
 import math
 import time
-from datetime import datetime
 
 import akshare as ak
 import pandas as pd
 import requests
 from pymongo.database import Database
-from signals.core.market_hours import TZ_BEIJING
+from signals.core.market_time import naive_market_now
 
 from signals.data.board_normalizer import (
     merge_industry_sources,
@@ -46,6 +45,7 @@ _EM_HEADERS = {
 _EM_TIMEOUT = 10
 _EM_PAGE_SIZE = 100
 _EM_MAX_ATTEMPTS = 8
+_EM_CLIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 
 
 def _em_clist_params(kind: str, page: int) -> dict[str, str]:
@@ -81,26 +81,27 @@ def _em_clist_params(kind: str, page: int) -> dict[str, str]:
 
 
 def _fetch_em_clist_page(kind: str, page: int) -> tuple[int, list[dict]]:
-    url = "https://17.push2.eastmoney.com/api/qt/clist/get" if kind == "industry" else "https://79.push2.eastmoney.com/api/qt/clist/get"
     last_error: Exception | None = None
-    for attempt in range(_EM_MAX_ATTEMPTS):
-        try:
-            response = requests.get(
-                url,
-                params=_em_clist_params(kind, page),
-                headers=_EM_HEADERS,
-                timeout=_EM_TIMEOUT,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            data = payload.get("data") or {}
-            rows = data.get("diff") or []
-            total = int(data.get("total") or 0)
-            return total, rows
-        except Exception as exc:
-            last_error = exc
-            if attempt < _EM_MAX_ATTEMPTS - 1:
-                time.sleep(min(2.0, 0.8 * (attempt + 1)))
+    with requests.Session() as session:
+        session.trust_env = False
+        for attempt in range(_EM_MAX_ATTEMPTS):
+            try:
+                response = session.get(
+                    _EM_CLIST_URL,
+                    params=_em_clist_params(kind, page),
+                    headers=_EM_HEADERS,
+                    timeout=_EM_TIMEOUT,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                data = payload.get("data") or {}
+                rows = data.get("diff") or []
+                total = int(data.get("total") or 0)
+                return total, rows
+            except Exception as exc:
+                last_error = exc
+                if attempt < _EM_MAX_ATTEMPTS - 1:
+                    time.sleep(min(2.0, 0.8 * (attempt + 1)))
     raise RuntimeError(f"eastmoney {kind} page {page} failed: {last_error}")
 
 
@@ -142,9 +143,7 @@ def _fetch_em_board_names_resilient(kind: str) -> pd.DataFrame:
 
 
 def _today():
-    return datetime.now(TZ_BEIJING).replace(
-        hour=0, minute=0, second=0, microsecond=0, tzinfo=None
-    )
+    return naive_market_now("A").replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def _replace_docs(db: Database, collection: str, docs: list[dict],
@@ -176,7 +175,7 @@ def _save_source_df(db: Database, collection: str, df: pd.DataFrame,
             "collection": collection,
             "latest_dt": _today(),
             "stale_reason": "",
-            "updated_at": datetime.now(),
+            "updated_at": naive_market_now("A"),
             "source": source,
         }},
         upsert=True,
@@ -193,8 +192,8 @@ def _health(db: Database, provider: str, endpoint: str, domain: str,
             "endpoint": endpoint,
             "domain": domain,
             "status": "ok" if ok else "degraded",
-            "last_success_at": datetime.now() if ok else None,
-            "last_error_at": None if ok else datetime.now(),
+            "last_success_at": naive_market_now("A") if ok else None,
+            "last_error_at": None if ok else naive_market_now("A"),
             "last_error_type": None if ok else error[:200],
         }},
         upsert=True,
@@ -400,7 +399,7 @@ def _rebuild_board_canonical(db: Database) -> int:
             "domain": "board", "market": "A", "mode": "historical",
             "as_of": _today(), "collection": "board_ranking",
             "latest_dt": _today(), "stale_reason": "",
-            "updated_at": datetime.now(),
+            "updated_at": naive_market_now("A"),
         }},
         upsert=True,
     )
@@ -433,7 +432,7 @@ def _rebuild_concept_canonical(db: Database) -> int:
             "domain": "concept", "market": "A", "mode": "historical",
             "as_of": _today(), "collection": "concept_ranking",
             "latest_dt": _today(), "stale_reason": "",
-            "updated_at": datetime.now(),
+            "updated_at": naive_market_now("A"),
         }},
         upsert=True,
     )

@@ -14,6 +14,9 @@
 
     # 常驻调度模式（cron 外的备选方案）
     python -m signals.sync.engine --daemon
+
+    # 第二屏低延时 lane：独立进程运行，避免 stock_minute 阻塞 quote
+    python -m signals.sync.engine --daemon --lane quote_lane
 """
 import argparse
 import atexit
@@ -132,6 +135,27 @@ LIVE_PLAN_BY_MODULE = {
     for plan in plans
 }
 
+LANE_MAINTENANCE_PLANS = {
+    "cache_preheat": LiveSyncPlan("cache_preheat", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 180, 10),
+    "signal_pool": LiveSyncPlan("signal_pool", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 20),
+    "stock_daily": LiveSyncPlan("stock_daily", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 900, 30),
+    "index_daily": LiveSyncPlan("index_daily", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 40),
+    "strategy_snapshot": LiveSyncPlan("strategy_snapshot", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 120, 50),
+    "board_ranking": LiveSyncPlan("board_ranking", "board_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 60),
+    "board_cons": LiveSyncPlan("board_cons", "board_lane", 24 * 60 * 60, 6 * 60 * 60, 900, 70),
+}
+
+BOOTSTRAP_LANE_MODULES = {
+    "quote_snapshots": {"quote_lane"},
+    "market_pools": {"workbench_lane"},
+    "cache_preheat": {"workbench_lane"},
+    "signal_pool": {"workbench_lane"},
+    "index_daily": {"workbench_lane"},
+    "strategy_snapshot": {"workbench_lane"},
+    "board_ranking": {"board_lane"},
+    "board_cons": {"board_lane"},
+}
+
 
 class SyncEngine:
     """
@@ -146,11 +170,17 @@ class SyncEngine:
     - board_cons:    行业成分股（周日全量）
     """
 
-    def __init__(self, mongo_url: str = None, proxy_url: str = None,
-                 max_workers: int = 4):
+    def __init__(
+        self,
+        mongo_url: str = None,
+        proxy_url: str = None,
+        max_workers: int = 4,
+        enabled_lanes: set[str] | None = None,
+    ):
         self.db = get_db(mongo_url)
         self.proxy_url = proxy_url
         self.max_workers = max_workers
+        self.enabled_lanes = set(enabled_lanes or []) or None
         atexit.register(close_db)
         from .storage import ensure_storage_model
 
@@ -329,6 +359,8 @@ class SyncEngine:
             self._write_module_freshness(name, status, error_msg, market=market, lane=lane)
             if status == "ok":
                 logger.info("✓ %s%s 完成 (%.1fs)", name, f"[{market}]" if market else "", elapsed)
+            elif status == "partial":
+                logger.warning("~ %s%s partial (%.1fs): %s", name, f"[{market}]" if market else "", elapsed, error_msg)
             else:
                 logger.warning("! %s%s degraded (%.1fs): %s", name, f"[{market}]" if market else "", elapsed, error_msg)
             return {"module": name, "status": status, "elapsed": elapsed,
@@ -489,6 +521,10 @@ class SyncEngine:
 
     def _classify_result(self, module_name: str, result: object) -> tuple[str, str | None]:
         counts = self._target_counts(module_name)
+        if isinstance(result, dict):
+            result_status = str(result.get("status") or "").lower()
+            if result_status in {"partial", "degraded", "error"}:
+                return result_status, str(result.get("error_msg") or result.get("degraded_reason") or result.get("reason") or "")
         if not counts:
             return "ok", None
         inserted = self._result_inserted(result)
@@ -497,6 +533,15 @@ class SyncEngine:
         if isinstance(result, dict) and result.get("errors"):
             return "degraded", f"errors={result.get('errors')}"
         return "ok", None
+
+    def _module_allowed_for_lanes(self, module_name: str) -> bool:
+        if self.enabled_lanes is None:
+            return True
+        allowed = BOOTSTRAP_LANE_MODULES.get(module_name)
+        if not allowed:
+            plan = LIVE_PLAN_BY_MODULE.get(module_name) or LANE_MAINTENANCE_PLANS.get(module_name)
+            allowed = {plan.lane} if plan else set()
+        return bool(allowed & self.enabled_lanes)
 
     def _write_module_freshness(
         self,
@@ -526,6 +571,8 @@ class SyncEngine:
                 latest = {}
             if count <= 0:
                 freshness = "empty"
+            elif status == "partial":
+                freshness = "partial"
             elif status != "ok":
                 freshness = "stale"
             elif latest.get("freshness") in {"fresh", "stale", "partial", "empty", "pending", "unknown"}:
@@ -551,11 +598,11 @@ class SyncEngine:
                 upsert=True,
             )
 
-    def _mark_market_unavailable(self, market: str, reason: str, now: datetime) -> None:
+    def _mark_market_unavailable(self, market: str, reason: str, now: datetime, *, module: str = "live_bundle") -> None:
         self.db["sync_log"].update_one(
-            {"_id": self._meta_id("live_bundle", market)},
+            {"_id": self._meta_id(module, market)},
             {"$set": {
-                "module": "live_bundle",
+                "module": module,
                 "market": market,
                 "lane": "unavailable",
                 "status": "unavailable",
@@ -587,11 +634,16 @@ class SyncEngine:
         for market in sorted(active_markets, key=lambda item: item.value):
             market_key = market.value
             plans = LIVE_SYNC_PLANS.get(market, ())
+            if self.enabled_lanes is not None:
+                plans = tuple(plan for plan in plans if plan.lane in self.enabled_lanes)
             if not plans:
-                if not self._has_run_recent("live_bundle", market_key, now):
+                unavailable_id = "live_bundle"
+                if self.enabled_lanes is not None:
+                    unavailable_id = f"live_bundle:{','.join(sorted(self.enabled_lanes))}"
+                if not self._has_run_recent(unavailable_id, market_key, now):
                     reason = f"{market_key} live data source unavailable"
                     logger.warning("%s live bundle unavailable: %s", market_key, reason)
-                    self._mark_market_unavailable(market_key, reason, now)
+                    self._mark_market_unavailable(market_key, reason, now, module=unavailable_id)
                 continue
 
             for plan in sorted(plans, key=lambda item: item.priority):
@@ -611,6 +663,29 @@ class SyncEngine:
                 fn, _ = self.module_map[module_name]
                 logger.info("⏱ %s trigger %s[%s]", plan.lane, module_name, market_key)
                 results.append(self.run_module(module_name, fn, market=market_key, plan=plan))
+        return results
+
+    def _run_scheduled_modules(self, now: datetime, today: str) -> list[dict]:
+        results: list[dict] = []
+        for name, fn, schedule in self.modules:
+            if not self._module_allowed_for_lanes(name):
+                continue
+            plan = LANE_MAINTENANCE_PLANS.get(name)
+            if name in REALTIME_MODULES and self._has_run_recent(
+                name,
+                Market.A.value,
+                now,
+                interval_seconds=plan.interval_seconds if plan else INTRADAY_INTERVAL_SECONDS,
+                stale_seconds=plan.stale_seconds if plan else INTRADAY_STALE_SECONDS,
+            ):
+                continue
+            if self._has_run_today(name, today):
+                continue
+
+            if self._schedule_due(schedule, now):
+                lane_label = f" lane={plan.lane}" if plan else ""
+                logger.info("⏰ 触发 %s%s (schedule: %s)", name, lane_label, schedule)
+                results.append(self.run_module(name, fn, plan=plan))
         return results
 
     @staticmethod
@@ -644,6 +719,8 @@ class SyncEngine:
         ]
         results = []
         for module_name, collection in checks:
+            if not self._module_allowed_for_lanes(module_name):
+                continue
             if module_name not in self.module_map:
                 continue
             try:
@@ -663,7 +740,8 @@ class SyncEngine:
         每分钟检查一次。到达预设时间且当天未成功运行时触发对应模块；
         daemon 重启或错过精确分钟后仍可补跑。
         """
-        logger.info("🐲 同步守护进程启动")
+        lanes_label = ",".join(sorted(self.enabled_lanes)) if self.enabled_lanes else "all"
+        logger.info("🐲 同步守护进程启动 lane=%s", lanes_label)
         self.bootstrap_preheat()
 
         while True:
@@ -671,22 +749,7 @@ class SyncEngine:
             today = now.strftime("%Y-%m-%d")
             active_markets = get_active_markets(self._now_utc())
 
-            for name, fn, schedule in self.modules:
-                plan = LIVE_PLAN_BY_MODULE.get(name)
-                if name in REALTIME_MODULES and self._has_run_recent(
-                    name,
-                    Market.A.value,
-                    now,
-                    interval_seconds=plan.interval_seconds if plan else INTRADAY_INTERVAL_SECONDS,
-                    stale_seconds=plan.stale_seconds if plan else INTRADAY_STALE_SECONDS,
-                ):
-                    continue
-                if self._has_run_today(name, today):
-                    continue
-
-                if self._schedule_due(schedule, now):
-                    logger.info(f"⏰ 触发 {name} (schedule: {schedule})")
-                    self.run_module(name, fn)
+            self._run_scheduled_modules(now, today)
 
             if active_markets:
                 active_label = ",".join(market.value for market in sorted(active_markets, key=lambda item: item.value))
@@ -713,6 +776,8 @@ def main():
                         help="常驻调度模式")
     parser.add_argument("--module", type=str, default=None,
                         help="只执行指定模块（配合 --once）")
+    parser.add_argument("--lane", action="append", default=[],
+                        help="只运行指定第二屏 lane，可重复或逗号分隔：quote_lane/signal_lane/workbench_lane/board_lane")
     parser.add_argument("--workers", type=int, default=4,
                         help="并行工人数（默认 4）")
     parser.add_argument("--log-level", type=str, default="INFO",
@@ -726,10 +791,28 @@ def main():
         logger.error("MONGO_URL 未配置，请设置环境变量 MONGO_URL")
         sys.exit(1)
 
+    allowed_lanes = {
+        "quote_lane",
+        "signal_lane",
+        "workbench_lane",
+        "board_lane",
+    }
+    enabled_lanes: set[str] = set()
+    for raw_lane in args.lane or []:
+        for lane in str(raw_lane).split(","):
+            lane = lane.strip()
+            if lane:
+                enabled_lanes.add(lane)
+    unknown_lanes = enabled_lanes - allowed_lanes
+    if unknown_lanes:
+        logger.error("未知 lane: %s，可选: %s", sorted(unknown_lanes), sorted(allowed_lanes))
+        sys.exit(2)
+
     engine = SyncEngine(
         mongo_url=config.MONGO_URL,
         proxy_url=config.EM_PROXY_URL if config.EM_PROXY_ENABLED else None,
         max_workers=args.workers,
+        enabled_lanes=enabled_lanes or None,
     )
 
     if args.once:

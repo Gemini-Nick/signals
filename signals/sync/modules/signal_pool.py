@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-from datetime import datetime
 from pathlib import Path
 from statistics import mean
 
 from pymongo import UpdateOne
 from pymongo.database import Database
+
+from signals.core.market_time import naive_market_now
 
 logger = logging.getLogger("signals.sync.signal_pool")
 
@@ -64,7 +65,7 @@ def _to_doc(record: dict) -> dict:
     doc["dedupe_key"] = _dedupe_key(record)
     doc["pool_status"] = _pool_status(str(record.get("signal_type") or ""))
     doc["source"] = "sqlite.backtest.signal_records"
-    doc["updated_at"] = datetime.now()
+    doc["updated_at"] = naive_market_now("A")
     details = doc.get("details")
     if isinstance(details, str) and details:
         try:
@@ -116,7 +117,7 @@ def _float(value: object) -> float | None:
 
 def _generated_signal_docs(db: Database) -> list[dict]:
     docs: list[dict] = []
-    now = datetime.now()
+    now = naive_market_now("A")
     for symbol in _latest_pool_symbols(db):
         bars = _latest_daily_bars(db, symbol)
         if len(bars) < 5:
@@ -191,7 +192,7 @@ def _generated_signal_docs(db: Database) -> list[dict]:
 
 
 def _write_data_freshness(db: Database, count: int, latest_dt: str | None) -> None:
-    now = datetime.now()
+    now = naive_market_now("A")
     db["data_freshness"].update_one(
         {"domain": "signal", "market": "A", "mode": "historical", "collection": "signals"},
         {"$set": {
@@ -234,7 +235,7 @@ def sync_signal_pool(db: Database, proxy_url: str = None) -> dict:
             latest_dt = max(latest_dt or signal_date, signal_date)
         ops.append(UpdateOne(
             {"dedupe_key": doc["dedupe_key"]},
-            {"$set": doc, "$setOnInsert": {"created_from_sync_at": datetime.now()}},
+            {"$set": doc, "$setOnInsert": {"created_from_sync_at": naive_market_now("A")}},
             upsert=True,
         ))
 
@@ -245,7 +246,7 @@ def sync_signal_pool(db: Database, proxy_url: str = None) -> dict:
             latest_dt = max(latest_dt or signal_date, signal_date)
         ops.append(UpdateOne(
             {"dedupe_key": doc["dedupe_key"]},
-            {"$set": doc, "$setOnInsert": {"created_from_sync_at": datetime.now()}},
+            {"$set": doc, "$setOnInsert": {"created_from_sync_at": naive_market_now("A")}},
             upsert=True,
         ))
 

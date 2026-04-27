@@ -8,13 +8,14 @@
 频率: 工作日 16:30
 """
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import akshare as ak
 import pandas as pd
 from pymongo import UpdateOne
 from pymongo.database import Database
 
+from signals.core.market_time import naive_market_now
 from ..proxy import em_proxy
 from ..retry import sync_retry
 
@@ -74,7 +75,7 @@ def _sync_a_index(db: Database, ak_codes: dict, start_date: str,
             for _, row in df.iterrows():
                 docs.append({
                     "dt": row["date"],
-                    "meta": {"symbol": symbol, "freq": "日线", "asset_type": "index"},
+                        "meta": {"symbol": symbol, "freq": "日线", "asset_type": "index", "market": "A", "source": "akshare"},
                     "open": float(row["open"]),
                     "high": float(row["high"]),
                     "low": float(row["low"]),
@@ -93,7 +94,7 @@ def _sync_a_index(db: Database, ak_codes: dict, start_date: str,
                         "module": "index_daily",
                         "symbol": symbol,
                         "last_dt": docs[-1]["dt"],
-                        "last_run": datetime.now(),
+                        "last_run": naive_market_now("A"),
                         "status": "ok",
                         "bar_count": written,
                     }},
@@ -141,7 +142,7 @@ def _sync_us_index(db: Database, us_codes: dict):
             for _, row in data.iterrows():
                 docs.append({
                     "dt": pd.to_datetime(scalar(row["Date"])),
-                    "meta": {"symbol": futu_code, "freq": "日线", "asset_type": "index"},
+                    "meta": {"symbol": futu_code, "freq": "日线", "asset_type": "index", "market": "US", "source": "yfinance"},
                     "open": float(scalar(row["Open"])),
                     "high": float(scalar(row["High"])),
                     "low": float(scalar(row["Low"])),
@@ -160,7 +161,7 @@ def _sync_us_index(db: Database, us_codes: dict):
                         "module": "index_daily",
                         "symbol": futu_code,
                         "last_dt": docs[-1]["dt"],
-                        "last_run": datetime.now(),
+                        "last_run": naive_market_now("US"),
                         "status": "ok",
                         "bar_count": written,
                     }},
@@ -214,7 +215,7 @@ def sync_index_daily(db: Database, proxy_url: str = None) -> dict:
     """
     import config
 
-    start_date = (datetime.now() - timedelta(
+    start_date = (naive_market_now("A") - timedelta(
         days=config.INDEX_MA_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
 
     logger.info(f"指数日线同步: 11 只指数, 起始 {start_date}")
