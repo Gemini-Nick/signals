@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from pymongo import ASCENDING
+from pymongo import ASCENDING, DESCENDING
 from pymongo.database import Database
 from pymongo.errors import OperationFailure, PyMongoError
 
@@ -72,8 +72,10 @@ def ensure_storage_model(db: Database) -> None:
         _drop_ttl_indexes(db[name])
 
     _safe_create_index(db["bars"], [("meta.symbol", ASCENDING), ("meta.freq", ASCENDING), ("dt", ASCENDING)])
+    _safe_create_index(db["bars"], [("meta.freq", ASCENDING), ("dt", DESCENDING), ("meta.symbol", ASCENDING)])
     _safe_create_index(db["kline_cache"], [("code", ASCENDING), ("freq", ASCENDING), ("dt", ASCENDING)])
     _safe_create_index(db["index_bars"], [("meta.symbol", ASCENDING), ("meta.freq", ASCENDING), ("dt", ASCENDING)])
+    _safe_create_index(db["index_bars"], [("meta.freq", ASCENDING), ("dt", DESCENDING), ("meta.symbol", ASCENDING)])
     _safe_create_index(db["board_ranking"], [("source", ASCENDING), ("dt", ASCENDING)])
     _safe_create_index(db["concept_ranking"], [("source", ASCENDING), ("dt", ASCENDING)])
     _safe_create_index(db["board_heat_ticks"], [("kind", ASCENDING), ("name", ASCENDING), ("trade_minute", ASCENDING)])

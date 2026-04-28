@@ -522,28 +522,50 @@ class SignalsPack:
     def _cache_mongo_stock_cache(self, db, trade_date: str) -> Dict[str, Any]:
         freqs = ["日线", "周线", "5分钟", "15分钟", "30分钟", "60分钟"]
         rows: List[Dict[str, Any]] = []
-        trade_start, trade_end = self._trade_date_bounds(trade_date)
         stock_daily_progress = self._find_one(db, "sync_log", {"_id": "stock_daily:progress:_meta"}) or {}
+        stock_minute_doc = (
+            self._find_one(db, "sync_log", {"_id": "stock_minute:selection:_meta"})
+            or self._find_one(db, "sync_log", {"_id": "stock_minute:_meta"})
+            or {}
+        )
+        minute_result = dict(stock_minute_doc.get("result") or {})
+        minute_symbols = len(stock_minute_doc.get("selected_symbols") or []) or int(minute_result.get("selected") or 0)
+        tail_counts = dict(stock_minute_doc.get("tail_counts") or minute_result.get("tail_counts") or {})
+        daily_latest = None
         for freq in freqs:
             query = {"meta.freq": freq}
             latest = self._find_one(db, "bars", query, {"dt": 1, "meta.symbol": 1}, sort=[("dt", -1)])
-            today_query = dict(query)
-            if trade_start and trade_end:
-                today_query["dt"] = {"$gte": trade_start, "$lt": trade_end}
-            today_symbols = self._distinct_count(db, "bars", "meta.symbol", today_query) if trade_start else 0
-            symbols = self._distinct_count(db, "bars", "meta.symbol", query)
             if freq == "日线":
+                daily_latest = latest
                 progress_total = int(stock_daily_progress.get("total") or stock_daily_progress.get("expected_codes") or 0)
-                symbols = max(symbols, progress_total, today_symbols)
-            elif symbols == 0:
-                symbols = today_symbols
+                processed = int(stock_daily_progress.get("processed") or 0)
+                symbols = progress_total
+                today_symbols = processed
+                total_bars = int(stock_daily_progress.get("inserted") or 0)
+                latest_symbol = str(stock_daily_progress.get("latest_symbol") or (latest or {}).get("meta", {}).get("symbol", ""))
+                source = "sync_log:stock_daily:progress"
+            elif freq in {"5分钟", "15分钟", "30分钟"}:
+                symbols = minute_symbols
+                today_symbols = minute_symbols
+                total_bars = int(minute_symbols * int(tail_counts.get(freq) or 0))
+                latest_symbol = str((latest or {}).get("meta", {}).get("symbol", ""))
+                source = "sync_log:stock_minute:selection"
+            else:
+                symbols = 1 if latest else 0
+                today_symbols = 0
+                total_bars = 0
+                latest_symbol = str((latest or {}).get("meta", {}).get("symbol", ""))
+                source = "latest_probe"
+            if freq == "日线":
+                symbols = max(symbols, today_symbols)
             rows.append({
                 "freq": freq,
                 "symbols": symbols,
                 "today_symbols": today_symbols,
-                "total_bars": self._count(db, "bars", query),
+                "total_bars": total_bars,
                 "latest_dt": self._iso(latest.get("dt") if latest else None),
-                "latest_symbol": (latest or {}).get("meta", {}).get("symbol", ""),
+                "latest_symbol": latest_symbol,
+                "source": source,
             })
 
         daily = next((item for item in rows if item.get("freq") == "日线"), {})
@@ -552,7 +574,7 @@ class SignalsPack:
             "summary": {
                 "daily_symbols": daily.get("symbols", 0),
                 "daily_today_symbols": daily.get("today_symbols", 0),
-                "latest_daily_dt": daily.get("latest_dt", ""),
+                "latest_daily_dt": daily.get("latest_dt") or self._iso((daily_latest or {}).get("dt") if daily_latest else None),
             },
         }
 
