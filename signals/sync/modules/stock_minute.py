@@ -232,32 +232,23 @@ def _latest_stock_minute_runs(db: Database, symbols: list[str]) -> dict[str, obj
 
 
 def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
-    """获取需要同步分钟线的活跃标的列表"""
-    import config
+    """获取需要同步分钟线的活跃标的列表。
 
-    symbols: list[str] = []
+    The trading terminal's whitebox pool is the single source of truth for
+    intraday stock minute refreshes. Other sources feed terminal_stock_pool in
+    the post-market builder instead of being read ad hoc here.
+    """
     priority_symbols: set[str] = set()
     pinned_symbols: set[str] = set()
-    source_counts: dict[str, int] = {}
     index_codes = _index_codes()
-
-    def add(value: object, source: str, *, priority: bool = False, pinned: bool = False) -> None:
-        code = _pure_a_code(value)
-        if code in index_codes:
-            return
-        if priority and code:
-            priority_symbols.add(code)
-        if pinned and code:
-            pinned_symbols.add(code)
-            priority_symbols.add(code)
-        if code and code not in symbols:
-            symbols.append(code)
-            source_counts[source] = source_counts.get(source, 0) + 1
 
     only_codes = os.getenv("STOCK_MINUTE_ONLY_CODES", "")
     if only_codes.strip():
+        symbols: list[str] = []
         for symbol in only_codes.replace(";", ",").split(","):
-            add(symbol, "only_codes", priority=True, pinned=True)
+            code = _pure_a_code(symbol)
+            if code and code not in index_codes and code not in symbols:
+                symbols.append(code)
         return symbols, {
             "priority_symbols": symbols,
             "pinned_symbols": symbols,
@@ -267,54 +258,56 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
             "rotation_enabled": False,
         }
 
-    for symbol in _env_symbol_values(
-        "STOCK_MINUTE_PRIORITY_CODES",
-        "SIGNALS_PRIORITY_STOCK_CODES",
-        default=os.getenv("STOCK_MINUTE_DEFAULT_PRIORITY_CODES", _DEFAULT_PRIORITY_CODES),
-    ):
-        add(symbol, "priority_codes", priority=True, pinned=True)
-
-    terminal_pool = db["terminal_realtime_pool"].find_one(
-        {"pool": "terminal_realtime", "market": "A"},
-        {"stocks": 1},
+    terminal_pool = db["terminal_stock_pool"].find_one(
+        {"pool": "terminal_stock_pool", "market": "A"},
+        {"stocks": 1, "skipped_stocks": 1, "candidate_count": 1, "reason_counts": 1, "stock_limit": 1},
         sort=[("updated_at", -1)],
     ) or {}
-    for symbol in terminal_pool.get("stocks") or []:
-        add(symbol, "terminal_realtime_pool", priority=True)
+    symbols = []
+    source_counts: dict[str, int] = {}
+    for row in terminal_pool.get("stocks") or []:
+        if isinstance(row, dict):
+            code = _pure_a_code(row.get("raw_code") or row.get("symbol") or row.get("code"))
+            reasons = row.get("inclusion_reasons") if isinstance(row.get("inclusion_reasons"), list) else []
+            reason_types = {str(reason.get("reason_type") or "") for reason in reasons if isinstance(reason, dict)}
+            if "user_pinned" in reason_types:
+                pinned_symbols.add(code)
+            if reason_types:
+                priority_symbols.add(code)
+            for reason_type in reason_types:
+                if reason_type:
+                    source_counts[reason_type] = source_counts.get(reason_type, 0) + 1
+        else:
+            code = _pure_a_code(row)
+            priority_symbols.add(code)
+            source_counts["terminal_stock_pool"] = source_counts.get("terminal_stock_pool", 0) + 1
+        if code and code not in index_codes and code not in symbols:
+            symbols.append(code)
 
-    for symbol in getattr(config, "WHITELIST", []):
-        add(symbol, "whitelist", priority=True, pinned=True)
+    if not symbols:
+        return [], {
+            "priority_symbols": [],
+            "pinned_symbols": [],
+            "skipped_symbols": [],
+            "source_counts": {},
+            "max_symbols": 0,
+            "candidate_count": 0,
+            "rotation_enabled": False,
+            "rotation_policy": "terminal_stock_pool_required",
+            "not_ready_reason": "terminal_stock_pool_empty",
+        }
 
-    for symbol in _iter_strategy_snapshot_symbols():
-        add(symbol, "strategy_snapshot", priority=True)
-
-    for symbol in _iter_configured_extra_symbols():
-        add(symbol, "configured_extra")
-
-    pool = db["market_pools"].find_one(
-        {"pool": "active"},
-        {"symbols": 1, "items": 1},
-        sort=[("dt", -1), ("updated_at", -1)],
-    ) or {}
-    for symbol in pool.get("symbols") or []:
-        add(symbol, "active_pool")
-    for item in pool.get("items") or []:
-        if isinstance(item, dict):
-            add(item.get("symbol") or item.get("code"), "active_pool")
-
-    for doc in db["signals"].find({}, {"symbol": 1}).sort("signal_date", -1).limit(300):
-        add(doc.get("symbol"), "signals")
-
-    # Keep recently requested/synced symbols warm so UI-visible names do not fall
-    # out of the signal lane just because the active pool rotated.
-    recent = db["sync_log"].find(
-        {"module": {"$in": ["stock_minute", "stock_daily"]}, "status": "ok"},
-        {"symbol": 1, "module": 1},
-    ).sort("last_run", -1).limit(200)
-
-    for doc in recent:
-        add(doc.get("symbol"), f"recent_{doc.get('module') or 'sync'}")
-
+    skipped_pool = []
+    for row in terminal_pool.get("skipped_stocks") or []:
+        if not isinstance(row, dict):
+            continue
+        code = _pure_a_code(row.get("raw_code") or row.get("symbol") or row.get("code"))
+        if code:
+            skipped_pool.append({
+                "symbol": code,
+                "reason": "terminal_stock_pool_cap",
+                "next_due_hint": row.get("signal_origin") or "whitebox pool rank rotation",
+            })
     max_symbols = _selection_cap()
     last_runs = _latest_stock_minute_runs(db, symbols)
     selected, skipped = _select_symbols_with_priority(
@@ -327,18 +320,19 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
     return selected, {
         "priority_symbols": [code for code in selected if code in priority_symbols],
         "pinned_symbols": [code for code in selected if code in pinned_symbols],
-        "skipped_symbols": skipped,
+        "skipped_symbols": skipped + skipped_pool,
         "source_counts": source_counts,
         "max_symbols": max_symbols,
-        "candidate_count": len(symbols),
+        "candidate_count": int(terminal_pool.get("candidate_count") or len(symbols)),
         "rotation_enabled": True,
-        "rotation_policy": "pinned_then_priority_stale_first",
+        "rotation_policy": "terminal_stock_pool_rank_then_stale_first",
         "tier_counts": {
             "selected_pinned": sum(1 for code in selected if code in pinned_symbols),
             "selected_priority": sum(1 for code in selected if code in priority_symbols and code not in pinned_symbols),
             "selected_normal": sum(1 for code in selected if code not in priority_symbols),
             "candidate_priority": len(priority_symbols),
             "candidate_pinned": len(pinned_symbols),
+            "pool_skipped": len(skipped_pool),
         },
     }
 

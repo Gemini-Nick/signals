@@ -232,6 +232,10 @@ def test_board_lane_intraday_runs_heat_not_board_cons():
         calls.append("concept_heat_minute")
         return {"inserted": 1}
 
+    def chain_heat(db, proxy_url=None):
+        calls.append("chain_heat_snapshots")
+        return {"inserted": 1}
+
     def board_cons(db, proxy_url=None):
         calls.append("board_cons")
         return {"inserted": 1}
@@ -239,13 +243,14 @@ def test_board_lane_intraday_runs_heat_not_board_cons():
     engine.module_map = {
         "board_heat_minute": (board_heat, ""),
         "concept_heat_minute": (concept_heat, ""),
+        "chain_heat_snapshots": (chain_heat, ""),
         "board_cons": (board_cons, ""),
     }
     engine.proxy_url = None
 
     results = engine._run_intraday_bundle({Market.A}, datetime(2026, 4, 27, 10, 0))
 
-    assert calls == ["board_heat_minute", "concept_heat_minute"]
+    assert calls == ["board_heat_minute", "concept_heat_minute", "chain_heat_snapshots"]
     assert [item["module"] for item in results] == calls
 
 

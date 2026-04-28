@@ -186,12 +186,13 @@ def _get_active_stock_codes(db: Database) -> list[str]:
     ):
         add(symbol, priority=True)
 
-    terminal_pool = db["terminal_realtime_pool"].find_one(
-        {"pool": "terminal_realtime", "market": "A"},
+    terminal_pool = db["terminal_stock_pool"].find_one(
+        {"pool": "terminal_stock_pool", "market": "A"},
         {"stocks": 1},
         sort=[("updated_at", -1)],
     ) or {}
-    for symbol in terminal_pool.get("stocks") or []:
+    for item in terminal_pool.get("stocks") or []:
+        symbol = item.get("raw_code") or item.get("symbol") if isinstance(item, dict) else item
         add(symbol, priority=True)
 
     for symbol in getattr(config, "WHITELIST", []):

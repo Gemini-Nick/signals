@@ -7,6 +7,7 @@ from .stock_minute import sync_stock_minute
 from .index_minute import sync_index_minute
 from .board_ranking import sync_board_ranking
 from .board_heat_minute import sync_board_heat_minute, sync_concept_heat_minute
+from .chain_heat import sync_chain_heat_snapshots
 from .board_cons import sync_board_cons
 from .cache_preheat import sync_cache_preheat
 from .market_pools import sync_market_pools
@@ -24,6 +25,7 @@ ALL_MODULES = [
     ("index_minute",  sync_index_minute,  "15:05 weekday"),
     ("board_heat_minute", sync_board_heat_minute, "15:05 weekday"),
     ("concept_heat_minute", sync_concept_heat_minute, "15:05 weekday"),
+    ("chain_heat_snapshots", sync_chain_heat_snapshots, "15:06 weekday"),
     ("minute_readiness_probe", sync_minute_readiness_probe, "15:10 weekday"),
     ("stock_daily",   sync_stock_daily,   "16:00-17:30 weekday"),
     ("index_daily",   sync_index_daily,   "16:00-17:30 weekday"),

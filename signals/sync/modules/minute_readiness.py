@@ -51,18 +51,16 @@ def _stock_symbols(db: Database) -> list[str]:
     for symbol in meta.get("priority_symbols") or []:
         if symbol not in symbols:
             symbols.append(symbol)
-    terminal_pool = db["terminal_realtime_pool"].find_one(
-        {"pool": "terminal_realtime", "market": "A"},
+    terminal_pool = db["terminal_stock_pool"].find_one(
+        {"pool": "terminal_stock_pool", "market": "A"},
         {"stocks": 1},
         sort=[("updated_at", -1)],
     ) or {}
-    for symbol in terminal_pool.get("stocks") or []:
+    for item in terminal_pool.get("stocks") or []:
+        symbol = item.get("raw_code") or item.get("symbol") if isinstance(item, dict) else item
         if symbol not in symbols:
             symbols.append(symbol)
-    if symbols:
-        return symbols[:120]
-    pool = db["market_pools"].find_one({"pool": "active"}, {"symbols": 1}, sort=[("dt", -1), ("updated_at", -1)]) or {}
-    return list(pool.get("symbols") or [])[:120]
+    return symbols[:120]
 
 
 def _index_symbols() -> list[str]:

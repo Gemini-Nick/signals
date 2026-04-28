@@ -48,9 +48,10 @@ MODULE_TARGETS = {
     "board_ranking": ("board_ranking", "concept_ranking"),
     "board_heat_minute": ("board_heat_ticks",),
     "concept_heat_minute": ("board_heat_ticks",),
+    "chain_heat_snapshots": ("chain_heat_snapshots",),
     "minute_readiness_probe": ("minute_readiness",),
     "weekly_rollup": ("bars", "index_bars"),
-    "terminal_realtime_pool": ("terminal_realtime_pool",),
+    "terminal_realtime_pool": ("terminal_realtime_pool", "terminal_stock_pool"),
     "board_cons": ("board_constituents", "concept_constituents"),
 }
 
@@ -61,8 +62,10 @@ COLLECTION_DOMAINS = {
     "board_ranking": "board",
     "concept_ranking": "concept",
     "board_heat_ticks": "board_heat",
+    "chain_heat_snapshots": "chain_heat",
     "minute_readiness": "readiness",
     "terminal_realtime_pool": "terminal_pool",
+    "terminal_stock_pool": "terminal_pool",
     "board_constituents": "constituents",
     "concept_constituents": "constituents",
     "quote_snapshots": "quote",
@@ -78,6 +81,7 @@ REALTIME_MODULES = {
     "index_minute",
     "board_heat_minute",
     "concept_heat_minute",
+    "chain_heat_snapshots",
     "minute_readiness_probe",
     "board_ranking",
     "strategy_snapshot",
@@ -131,6 +135,7 @@ LIVE_SYNC_PLANS = {
         LiveSyncPlan("strategy_snapshot", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 90, 50),
         LiveSyncPlan("board_heat_minute", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 180, 60),
         LiveSyncPlan("concept_heat_minute", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 180, 65),
+        LiveSyncPlan("chain_heat_snapshots", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 90, 70),
     ),
     # HK/US slots are explicit and independently throttled. Data-source modules
     # can be plugged in here without affecting the A-share live bundle.
@@ -153,6 +158,7 @@ LANE_MAINTENANCE_PLANS = {
     "index_minute": LiveSyncPlan("index_minute", "signal_lane", 24 * 60 * 60, 60 * 60, 120, 6),
     "board_heat_minute": LiveSyncPlan("board_heat_minute", "board_lane", 24 * 60 * 60, 60 * 60, 180, 7),
     "concept_heat_minute": LiveSyncPlan("concept_heat_minute", "board_lane", 24 * 60 * 60, 60 * 60, 180, 8),
+    "chain_heat_snapshots": LiveSyncPlan("chain_heat_snapshots", "board_lane", 24 * 60 * 60, 60 * 60, 90, 9),
     "minute_readiness_probe": LiveSyncPlan("minute_readiness_probe", "signal_lane", 24 * 60 * 60, 60 * 60, 60, 9),
     "stock_daily": LiveSyncPlan("stock_daily", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 900, 30),
     "index_daily": LiveSyncPlan("index_daily", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 40),
@@ -177,6 +183,7 @@ BOOTSTRAP_LANE_MODULES = {
     "board_ranking": {"board_lane"},
     "board_heat_minute": {"board_lane"},
     "concept_heat_minute": {"board_lane"},
+    "chain_heat_snapshots": {"board_lane"},
     "minute_readiness_probe": {"signal_lane"},
     "board_cons": {"board_lane"},
 }

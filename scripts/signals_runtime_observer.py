@@ -34,6 +34,7 @@ MODULES = [
     "strategy_snapshot",
     "board_heat_minute",
     "concept_heat_minute",
+    "chain_heat_snapshots",
     "board_ranking",
     "stock_daily",
     "index_daily",
@@ -200,6 +201,17 @@ def _board_heat_probe(db) -> dict[str, Any]:
             "latest_dt": latest.get("trade_minute"),
             "source": latest.get("source", ""),
         })
+    latest = db["chain_heat_snapshots"].find_one(
+        {"market": "A"},
+        {"trade_minute": 1, "source": 1},
+        sort=[("trade_minute", -1)],
+    ) or {}
+    rows.append({
+        "kind": "chain_heat",
+        "count": db["chain_heat_snapshots"].count_documents({"market": "A"}),
+        "latest_dt": latest.get("trade_minute"),
+        "source": latest.get("source", ""),
+    })
     return {"rows": rows}
 
 
@@ -230,6 +242,17 @@ def _normalize_stock_symbol(symbol: str) -> list[str]:
 def _symbol_probe(db, symbols: list[str]) -> list[dict[str, Any]]:
     active = db["market_pools"].find_one({"pool": "active"}, {"symbols": 1}, sort=[("dt", -1), ("updated_at", -1)]) or {}
     active_symbols = set(active.get("symbols") or [])
+    terminal_pool = db["terminal_stock_pool"].find_one(
+        {"pool": "terminal_stock_pool", "market": "A"},
+        {"stocks.symbol": 1, "stocks.raw_code": 1},
+        sort=[("updated_at", -1)],
+    ) or {}
+    terminal_symbols = set()
+    for item in terminal_pool.get("stocks") or []:
+        if isinstance(item, dict):
+            for value in (item.get("symbol"), item.get("raw_code")):
+                if value:
+                    terminal_symbols.add(str(value))
     snapshot = db["strategy_snapshots"].find_one(
         {"snapshot": {"$exists": True}},
         {"snapshot.candidates.symbol": 1, "snapshot.decision_queue.symbol": 1},
@@ -265,6 +288,7 @@ def _symbol_probe(db, symbols: list[str]) -> list[dict[str, Any]]:
             "input": symbol,
             "normalized_candidates": candidates,
             "active_pool_member": bool(set(candidates) & active_symbols),
+            "terminal_stock_pool_member": bool(set(candidates) & terminal_symbols),
             "strategy_candidate": bool(set(candidates) & strategy_symbols),
             "freqs": freq_rows,
         })
@@ -332,7 +356,7 @@ def print_human(snapshot: dict[str, Any]) -> None:
     print("\nsymbol probe:")
     for item in mongo.get("symbol_probe", []):
         freqs = ", ".join(f"{row['collection']}:{row['symbol']}:{row['freq']}@{_json_default(row.get('latest_dt'))}" for row in item.get("freqs", []))
-        print(f"- {item['input']} active={item['active_pool_member']} strategy={item['strategy_candidate']} {freqs or 'MISS'}")
+        print(f"- {item['input']} terminal_pool={item.get('terminal_stock_pool_member')} active={item['active_pool_member']} strategy={item['strategy_candidate']} {freqs or 'MISS'}")
     print("\nreadiness:")
     for domain, item in (mongo.get("readiness") or {}).get("summary", {}).items():
         print(f"- {domain}: ready={item.get('ready', 0)} not_ready={item.get('not_ready', 0)}")

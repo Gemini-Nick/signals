@@ -1999,6 +1999,159 @@ def _build_sector_board_rows(
     return _aggregate_sector_board_rows(rows)[:16]
 
 
+def _candidate_groups_from_representatives(row: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {
+        "leaders": [],
+        "weighted": [],
+        "elastic": [],
+        "source_leaders": [],
+        "constituents": [],
+    }
+    heat_score = _float(row.get("heat_score"), 0) or 0
+    for rep in row.get("representatives") or []:
+        if not isinstance(rep, dict):
+            continue
+        item = {
+            "symbol": rep.get("symbol"),
+            "name": rep.get("name"),
+            "relation": rep.get("relation"),
+            "source": "chain_heat_snapshots",
+            "representative_type": rep.get("representative_type"),
+            "attention_score": heat_score + _float(rep.get("priority"), 0) * 0.1,
+            "chain_id": row.get("chain_id"),
+            "chain_name": row.get("chain_name"),
+            "node_id": row.get("node_id"),
+            "node_name": row.get("node_name"),
+            "layer": row.get("layer"),
+            "stage": row.get("stage"),
+        }
+        if rep.get("representative_type") == "core":
+            groups["leaders"].append(item)
+            groups["weighted"].append(item)
+        else:
+            groups["elastic"].append(item)
+    return groups
+
+
+def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
+    try:
+        db = _mongo_db()
+        latest = db["chain_heat_snapshots"].find_one({"market": "A"}, {"trade_minute": 1}, sort=[("trade_minute", -1)])
+        if not latest or latest.get("trade_minute") is None:
+            return []
+        docs = list(db["chain_heat_snapshots"].find(
+            {"market": "A", "trade_minute": latest["trade_minute"]},
+            {"_id": 0},
+        ).sort("rank", 1).limit(limit))
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for doc in docs:
+        integrated = doc.get("integrated_domains") if isinstance(doc.get("integrated_domains"), list) else []
+        primary = integrated[0] if integrated and isinstance(integrated[0], dict) else {}
+        target_kind = _text(primary.get("kind")) or "industry"
+        target_label = _text(primary.get("name")) or _text(doc.get("node_name") or doc.get("chain_name"))
+        label = " · ".join([item for item in [_text(doc.get("chain_name")), _text(doc.get("node_name"))] if item])
+        candidate_groups = _candidate_groups_from_representatives(doc)
+        carrier = (candidate_groups.get("leaders") or candidate_groups.get("elastic") or [{}])[0]
+        row = {
+            **doc,
+            "group": "sector_boards",
+            "domain": "chain_heat",
+            "kind": target_kind,
+            "label": label or target_label,
+            "name": label or target_label,
+            "code": _text(doc.get("chain_id")),
+            "latest_price": doc.get("heat_score"),
+            "day_change_pct": doc.get("change_pct"),
+            "daily_change_pct": doc.get("change_pct"),
+            "range_returns": {
+                "momentum_5m": doc.get("momentum_5m"),
+                "momentum_15m": doc.get("momentum_15m"),
+                "momentum_30m": doc.get("momentum_30m"),
+            },
+            "range_return_source": "chain_heat_snapshots",
+            "lane": "board_lane",
+            "second_screen_role": "chain_heat_map",
+            "action_status": doc.get("phase"),
+            "trader_action": doc.get("trader_action"),
+            "invalidates_when": doc.get("invalidates_when"),
+            "explanation": " · ".join([
+                _text(doc.get("range_pattern")),
+                f"热度 {doc.get('heat_score')}",
+                f"来源 {doc.get('integrated_count')} 个行业/概念",
+            ]),
+            "source": "chain_heat_snapshots",
+            "latest_signal": doc.get("trading_signal"),
+            "target_kind": target_kind,
+            "target_label": target_label,
+            "target_symbol": target_label,
+            "target_freq": DEFAULT_TERMINAL_FREQ,
+            "display_label": label or target_label,
+            "heat_target_label": target_label,
+            "heat_resolution_status": "chain_primary_domain",
+            "carrier": carrier,
+            "representatives": {
+                "core": candidate_groups.get("leaders", []),
+                "elastic": candidate_groups.get("elastic", []),
+                "source_leader": [],
+            },
+            "candidate_groups": candidate_groups,
+            "focus_stocks_preview": _flatten_candidate_groups(candidate_groups, limit=6),
+            "mapping_chain": {
+                "query": label or target_label,
+                "chain_id": doc.get("chain_id"),
+                "chain_name": doc.get("chain_name"),
+                "node_id": doc.get("node_id"),
+                "node_name": doc.get("node_name"),
+                "layer": doc.get("layer"),
+                "stage": doc.get("stage"),
+                "mapping_status": "mapped",
+                "evidence_sources": doc.get("evidence_sources") or [],
+            },
+        }
+        rows.append(row)
+    return rows
+
+
+def _terminal_stock_pool_rows(range_columns: list[dict[str, Any]], limit: int = 24) -> list[dict[str, Any]]:
+    try:
+        db = _mongo_db()
+        doc = db["terminal_stock_pool"].find_one(
+            {"pool": "terminal_stock_pool", "market": "A"},
+            {"stocks": 1},
+            sort=[("updated_at", -1)],
+        ) or {}
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in doc.get("stocks") or []:
+        if not isinstance(item, dict):
+            continue
+        row = _enrich_stock_row(dict(item), range_columns)
+        row["lane"] = "signal_lane"
+        row["second_screen_role"] = "actionable_focus_stock"
+        row["focus_reasons"] = [
+            _text(reason.get("signal_type") or reason.get("reason_type"))
+            for reason in item.get("inclusion_reasons") or []
+            if isinstance(reason, dict)
+        ][:4]
+        row["source_tags"] = item.get("source_tags") or []
+        row["inclusion_reasons"] = item.get("inclusion_reasons") or []
+        row["signal_origin"] = item.get("signal_origin", "")
+        row["signal_family"] = item.get("signal_family", "")
+        row["chain_context"] = item.get("chain_context") if isinstance(item.get("chain_context"), dict) else {}
+        row["exit_condition"] = item.get("exit_condition") or item.get("invalidates_when") or row.get("invalidates_when")
+        row["invalidates_when"] = row["exit_condition"]
+        row["reason"] = item.get("reason") or " · ".join(row["focus_reasons"][:2])
+        row["latest_signal"] = item.get("latest_signal") or row.get("latest_signal")
+        row["explanation"] = "纳入: " + " / ".join(row["focus_reasons"][:3]) if row["focus_reasons"] else ""
+        rows.append(row)
+        if len(rows) >= limit:
+            break
+    return rows
+
+
 def _build_trader_task_queue(
     *,
     decision_rows: list[dict[str, Any]],
@@ -2281,16 +2434,8 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
             cluster = {}
         industry_top = industry_top or (cluster.get("industry") or {}).get("top") or []
         concept_top = concept_top or (cluster.get("concept") or {}).get("top") or []
-    sector_boards = _build_sector_board_rows(
-        industry_top=industry_top,
-        concept_top=concept_top,
-    )
-    focus_stocks = _build_focus_stock_rows(
-        buy_rows=scored,
-        sell_rows=sell_warnings,
-        decision_rows=decision_rows_raw,
-        range_columns=range_columns,
-    )
+    sector_boards = _chain_heat_sector_rows()
+    focus_stocks = _terminal_stock_pool_rows(range_columns)
     for rows, lane in (
         (macro_indices, "quote_lane"),
         (sector_boards, "board_lane"),

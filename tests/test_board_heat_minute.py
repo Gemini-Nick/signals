@@ -40,5 +40,6 @@ def test_board_heat_tick_docs_capture_minute_heat_fields():
         "up_count": 48,
         "down_count": 3,
         "leader_name": "测试股份",
+        "leader_symbol": "",
         "leader_change_pct": 9.8,
     }]

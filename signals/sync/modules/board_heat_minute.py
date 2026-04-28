@@ -63,6 +63,7 @@ def _tick_docs(df: pd.DataFrame, *, kind: str, now) -> list[dict[str, Any]]:
             "up_count": _int(row.get("上涨家数")),
             "down_count": _int(row.get("下跌家数")),
             "leader_name": str(row.get("领涨股票") or row.get("leader_name") or "").strip(),
+            "leader_symbol": str(row.get("领涨股票代码") or row.get("leader_symbol") or row.get("leader_code") or "").strip(),
             "leader_change_pct": _float(row.get("领涨股票-涨跌幅") or row.get("leader_change_pct")),
         })
     return docs
