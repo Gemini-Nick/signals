@@ -12,15 +12,26 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      CN_SERVER_IP: ${{ secrets.CN_SERVER_IP }}
+      CN_SERVER_USER: ${{ secrets.CN_SERVER_USER }}
+      CN_SSH_KEY: ${{ secrets.CN_SSH_KEY }}
     steps:
+      - name: Skip when China Cloud deploy secrets are not configured
+        if: ${{ env.CN_SERVER_IP == '' || env.CN_SERVER_USER == '' || env.CN_SSH_KEY == '' }}
+        run: |
+          echo "China Cloud deploy secrets are not configured; skipping deploy."
+
       - uses: actions/checkout@v4
+        if: ${{ env.CN_SERVER_IP != '' && env.CN_SERVER_USER != '' && env.CN_SSH_KEY != '' }}
 
       - name: Deploy via SSH
+        if: ${{ env.CN_SERVER_IP != '' && env.CN_SERVER_USER != '' && env.CN_SSH_KEY != '' }}
         uses: appleboy/ssh-action@v1
         with:
-          host: ${{ secrets.CN_SERVER_IP }}
-          username: ${{ secrets.CN_SERVER_USER }}
-          key: ${{ secrets.CN_SSH_KEY }}
+          host: ${{ env.CN_SERVER_IP }}
+          username: ${{ env.CN_SERVER_USER }}
+          key: ${{ env.CN_SSH_KEY }}
           script: |
             set -e
             cd /opt/signals
