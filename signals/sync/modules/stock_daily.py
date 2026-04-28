@@ -189,15 +189,80 @@ def _select_codes_with_priority(codes: list[str], priority: set[str], max_codes:
     return selected, skipped
 
 
-def _get_all_stock_codes() -> list:
-    """获取全量 A 股代码列表"""
+def _cached_stock_universe(db: Database | None) -> list[str]:
+    """Return the last known A-share universe when live stock-list sources fail."""
+    if db is None:
+        return []
+
+    codes: list[str] = []
+
+    def add(value: object) -> None:
+        code = _pure_a_code(value)
+        if code and code not in codes:
+            codes.append(code)
+
     try:
-        df = ak.stock_info_a_code_name()
+        cursor = db["sync_log"].find(
+            {"module": "stock_daily", "symbol": {"$exists": True}},
+            {"symbol": 1},
+        )
+        for doc in cursor:
+            add(doc.get("symbol"))
+    except Exception as exc:
+        logger.debug("读取 stock_daily sync_log universe 失败: %s", exc)
+
+    try:
+        pool = db["market_pools"].find_one(
+            {"pool": "active"},
+            {"symbols": 1, "items": 1},
+            sort=[("dt", -1), ("updated_at", -1)],
+        ) or {}
+        for symbol in pool.get("symbols") or []:
+            add(symbol)
+        for item in pool.get("items") or []:
+            if isinstance(item, dict):
+                add(item.get("symbol") or item.get("code") or item.get("raw_code"))
+            else:
+                add(item)
+    except Exception as exc:
+        logger.debug("读取 market_pools universe 失败: %s", exc)
+
+    try:
+        for doc in db["bars"].aggregate([
+            {"$match": {"meta.market": "A", "meta.freq": "日线"}},
+            {"$sort": {"dt": -1}},
+            {"$group": {"_id": "$meta.symbol", "latest_dt": {"$first": "$dt"}}},
+            {"$limit": 6000},
+        ]):
+            add(doc.get("_id"))
+    except Exception as exc:
+        logger.debug("读取 bars universe 失败: %s", exc)
+
+    return codes
+
+
+def _get_all_stock_codes(db: Database | None = None) -> list:
+    """获取全量 A 股代码列表；网络源失败时复用 Mongo 里的既有 universe。"""
+    try:
+        with em_proxy(None):
+            df = ak.stock_info_a_code_name()
         return df["code"].tolist()
     except Exception as e:
         logger.warning(f"获取股票列表失败: {e}，使用 stock_zh_a_spot_em 兜底")
-        df = ak.stock_zh_a_spot_em()
-        return df["代码"].tolist()
+        try:
+            with em_proxy(None):
+                df = ak.stock_zh_a_spot_em()
+            return df["代码"].tolist()
+        except Exception as spot_exc:
+            cached = _cached_stock_universe(db)
+            if cached:
+                logger.warning(
+                    "股票列表网络兜底失败: %s；使用 Mongo cached universe: %d 只",
+                    spot_exc,
+                    len(cached),
+                )
+                return cached
+            raise
 
 
 def _get_active_stock_codes(db: Database) -> list[str]:
@@ -291,7 +356,7 @@ def _get_stock_codes(db: Database) -> tuple[list[str], str]:
     full_sync = os.getenv("SIGNALS_SYNC_FULL_STOCK_DAILY", "false").lower() == "true"
     scope = os.getenv("STOCK_DAILY_SCOPE", "active").lower()
     if full_sync or scope == "all":
-        return _get_all_stock_codes(), "all"
+        return _get_all_stock_codes(db), "all"
 
     codes = _get_active_stock_codes(db)
     if codes:
@@ -299,7 +364,7 @@ def _get_stock_codes(db: Database) -> tuple[list[str], str]:
             return codes, "manual_only_codes"
         return codes, "active"
 
-    return _get_all_stock_codes(), "all_fallback"
+    return _get_all_stock_codes(db), "all_fallback"
 
 
 def _docs_from_daily_df(code: str, df: pd.DataFrame, column_map: dict[str, str], source: str) -> list:

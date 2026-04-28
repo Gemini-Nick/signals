@@ -6,6 +6,30 @@ import pandas as pd
 from signals.sync.modules import stock_daily
 
 
+class _Collection:
+    def __init__(self, docs=None):
+        self.docs = docs or []
+
+    def find(self, query=None, projection=None):
+        return list(self.docs)
+
+    def find_one(self, query, projection=None, sort=None):
+        for doc in self.docs:
+            if all(doc.get(key) == value for key, value in query.items()):
+                return doc
+        return None
+
+    def aggregate(self, pipeline):
+        return list(self.docs)
+
+
+class _DB(dict):
+    def __getitem__(self, name):
+        if name not in self:
+            self[name] = _Collection()
+        return dict.__getitem__(self, name)
+
+
 def test_stock_daily_uses_tencent_primary_without_akshare(monkeypatch):
     calls = []
 
@@ -47,3 +71,64 @@ def test_stock_daily_tencent_empty_returns_without_akshare(monkeypatch):
     )
 
     assert stock_daily._sync_one_stock("600423", "20260427", "20260427") == []
+
+
+def test_get_all_stock_codes_falls_back_to_cached_universe(monkeypatch):
+    db = _DB({
+        "sync_log": _Collection([
+            {"module": "stock_daily", "symbol": "600001"},
+            {"module": "stock_daily", "symbol": "SZ.300001"},
+        ]),
+        "market_pools": _Collection([
+            {
+                "pool": "active",
+                "symbols": ["SH.600001", "BJ.430001"],
+                "items": [{"symbol": "SZ.000001"}],
+            }
+        ]),
+        "bars": _Collection([
+            {"_id": "SH.600002"},
+        ]),
+    })
+
+    monkeypatch.setattr(
+        stock_daily.ak,
+        "stock_info_a_code_name",
+        lambda: (_ for _ in ()).throw(ConnectionError("sse eof")),
+    )
+    monkeypatch.setattr(
+        stock_daily.ak,
+        "stock_zh_a_spot_em",
+        lambda: (_ for _ in ()).throw(ConnectionError("push2 proxy")),
+    )
+
+    assert stock_daily._get_all_stock_codes(db) == [
+        "600001",
+        "300001",
+        "430001",
+        "000001",
+        "600002",
+    ]
+
+
+def test_get_stock_codes_all_scope_uses_cached_universe_without_raising(monkeypatch):
+    db = _DB({
+        "sync_log": _Collection([
+            {"module": "stock_daily", "symbol": "600001"},
+        ]),
+    })
+
+    monkeypatch.setenv("STOCK_DAILY_SCOPE", "all")
+    monkeypatch.setenv("SIGNALS_SYNC_FULL_STOCK_DAILY", "false")
+    monkeypatch.setattr(
+        stock_daily.ak,
+        "stock_info_a_code_name",
+        lambda: (_ for _ in ()).throw(ConnectionError("bse ssl eof")),
+    )
+    monkeypatch.setattr(
+        stock_daily.ak,
+        "stock_zh_a_spot_em",
+        lambda: (_ for _ in ()).throw(ConnectionError("remote disconnected")),
+    )
+
+    assert stock_daily._get_stock_codes(db) == (["600001"], "all")
