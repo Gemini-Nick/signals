@@ -465,6 +465,7 @@ class SignalsPack:
                 ]))
                 cursor.update(self._project_fields(board_cons_progress, ["next_cursor", "remaining", "total_groups"]))
             progress_pct = self._task_progress_pct(status, summary, cursor)
+            eta_seconds = self._task_eta_seconds(task, progress_pct)
             if progress_pct is not None:
                 progress_values.append(progress_pct)
             errors = summary.get("sample_errors")
@@ -481,6 +482,7 @@ class SignalsPack:
                 "cursor": _json_safe(cursor),
                 "result_summary": _json_safe(summary),
                 "progress_pct": progress_pct,
+                "eta_seconds": eta_seconds,
                 "error_msg": str(task.get("error_msg") or "")[:500],
                 "started_at": self._iso(task.get("started_at")),
                 "updated_at": self._iso(task.get("updated_at")),
@@ -493,6 +495,7 @@ class SignalsPack:
         progress_pct = round(sum(progress_values) / task_count, 2) if task_count and progress_values else (
             round(completed / task_count * 100, 2) if task_count else 0
         )
+        eta_seconds = self._postmarket_eta_seconds(rows, progress_pct, run.get("started_at"))
         return {
             "run": {
                 "run_id": run_id,
@@ -511,6 +514,7 @@ class SignalsPack:
                 "completed": completed,
                 "status_counts": status_counts,
                 "progress_pct": progress_pct,
+                "eta_seconds": eta_seconds,
                 "sample_errors": _json_safe(sample_errors[:10]),
             },
         }
@@ -648,6 +652,38 @@ class SignalsPack:
         if status == "ok":
             return 100.0
         return None
+
+    def _task_eta_seconds(self, task: Mapping[str, Any], progress_pct: Optional[float]) -> Optional[int]:
+        if progress_pct is None or progress_pct <= 0 or progress_pct >= 100:
+            return None
+        started_at = self._coerce_datetime(task.get("started_at"))
+        if not started_at:
+            return None
+        elapsed = max(0, (datetime.now() - started_at).total_seconds())
+        total_estimate = elapsed / (progress_pct / 100)
+        remaining = int(max(0, total_estimate - elapsed))
+        return remaining
+
+    def _postmarket_eta_seconds(
+        self,
+        rows: List[Mapping[str, Any]],
+        progress_pct: float,
+        started_at_raw: Any,
+    ) -> Optional[int]:
+        running_etas = [
+            int(row["eta_seconds"])
+            for row in rows
+            if isinstance(row.get("eta_seconds"), int)
+        ]
+        if running_etas:
+            return max(running_etas)
+        if progress_pct <= 0 or progress_pct >= 100:
+            return None
+        started_at = self._coerce_datetime(started_at_raw)
+        if not started_at:
+            return None
+        elapsed = max(0, (datetime.now() - started_at).total_seconds())
+        return int(max(0, elapsed / (progress_pct / 100) - elapsed))
 
     def _trade_date_bounds(self, trade_date: str) -> tuple[Optional[datetime], Optional[datetime]]:
         try:
