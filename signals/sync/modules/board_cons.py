@@ -22,7 +22,9 @@ import requests
 from pymongo.database import Database
 
 from ..proxy import em_proxy
+from ..provider_limits import provider_call
 from ..retry import sync_retry
+from ..task_context import get_task_env
 
 logger = logging.getLogger("signals.sync.board_cons")
 
@@ -62,6 +64,23 @@ def _progress_interval() -> int:
     return max(1, int(os.getenv("BOARD_CONS_PROGRESS_INTERVAL", "5")))
 
 
+def _shard_kind() -> str:
+    kind = str(get_task_env("BOARD_CONS_KIND", "") or "").strip().lower()
+    return kind if kind in {"board", "concept"} else ""
+
+
+def _shard_key() -> str:
+    kind = _shard_kind()
+    return str(get_task_env("BOARD_CONS_SHARD_KEY", "") or "").strip() or kind or "all"
+
+
+def _meta_id(shard_key: str | None = None) -> str:
+    key = shard_key or _shard_key()
+    if key and key != "all":
+        return f"board_cons:{key}:_meta"
+    return "board_cons:_meta"
+
+
 def _eastmoney_map_max_pages() -> int:
     return max(1, int(os.getenv("BOARD_CONS_EM_MAP_MAX_PAGES", "12")))
 
@@ -78,14 +97,17 @@ def _write_board_cons_progress(
     errors: list,
     unmapped: int,
     source_counts: dict[str, int],
+    shard_key: str | None = None,
 ) -> None:
     remaining = max(0, total_count - cursor)
     next_cursor = cursor if remaining else 0
     error_msg = f"{len(errors)} errors; remaining={remaining}" if errors or remaining else ""
+    key = shard_key or _shard_key()
     sync_col.update_one(
-        {"_id": "board_cons:_meta"},
+        {"_id": _meta_id(key)},
         {"$set": {
             "module": "board_cons",
+            "shard_key": key,
             "last_run": datetime.now(),
             "heartbeat_at": datetime.now(),
             "status": status,
@@ -98,6 +120,56 @@ def _write_board_cons_progress(
             "total_groups": total_count,
             "batch_size": _batch_size(),
             "sample_errors": errors[:10],
+            "unmapped": unmapped,
+            "source_counts": source_counts,
+        }},
+        upsert=True,
+    )
+    if key != "all":
+        _write_board_cons_aggregate(sync_col)
+
+
+def _write_board_cons_aggregate(sync_col) -> None:
+    try:
+        rows = list(sync_col.find({"module": "board_cons"}))
+    except Exception:
+        return
+    rows = [
+        row for row in rows
+        if row.get("shard_key") and row.get("_id") != "board_cons:_meta"
+    ]
+    if not rows:
+        return
+    total_groups = sum(int(row.get("total_groups") or 0) for row in rows)
+    processed = sum(int(row.get("processed") or 0) for row in rows)
+    processed_groups = sum(int(row.get("processed_groups") or 0) for row in rows)
+    remaining = sum(int(row.get("remaining") or 0) for row in rows)
+    total_stocks = sum(int(row.get("bar_count") or 0) for row in rows)
+    unmapped = sum(int(row.get("unmapped") or 0) for row in rows)
+    sample_errors = []
+    source_counts: dict[str, int] = {}
+    for row in rows:
+        sample_errors.extend((row.get("sample_errors") or [])[:5])
+        for source, count in dict(row.get("source_counts") or {}).items():
+            source_counts[str(source)] = source_counts.get(str(source), 0) + int(count or 0)
+    statuses = {str(row.get("status") or "") for row in rows}
+    status = "ok" if statuses == {"ok"} else "partial" if any(item in statuses for item in {"partial", "running"}) else "degraded"
+    sync_col.update_one(
+        {"_id": "board_cons:_meta"},
+        {"$set": {
+            "module": "board_cons",
+            "shard_key": "aggregate",
+            "last_run": datetime.now(),
+            "heartbeat_at": datetime.now(),
+            "status": status,
+            "bar_count": total_stocks,
+            "error_msg": f"{len(sample_errors)} errors; remaining={remaining}" if sample_errors or remaining else "",
+            "processed": processed,
+            "processed_groups": processed_groups,
+            "remaining": remaining,
+            "next_cursor": remaining,
+            "total_groups": total_groups,
+            "sample_errors": sample_errors[:10],
             "unmapped": unmapped,
             "source_counts": source_counts,
         }},
@@ -210,19 +282,27 @@ def _extract_constituents(df) -> tuple[list[str], dict[str, str]]:
 def _eastmoney_delay_clist(params: dict) -> list[dict]:
     session = requests.Session()
     session.trust_env = False
-    response = session.get(
-        "https://push2delay.eastmoney.com/api/qt/clist/get",
-        params=params,
-        timeout=float(os.getenv("BOARD_CONS_EM_DELAY_TIMEOUT", "8")),
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://quote.eastmoney.com/center/boardlist.html",
-        },
-    )
-    response.raise_for_status()
-    payload = response.json()
-    data = payload.get("data") or {}
-    return data.get("diff") or []
+    try:
+        response = provider_call(
+            "eastmoney",
+            "board_cons_delay_clist",
+            lambda: session.get(
+                "https://push2delay.eastmoney.com/api/qt/clist/get",
+                params=params,
+                timeout=float(os.getenv("BOARD_CONS_EM_DELAY_TIMEOUT", "8")),
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": "https://quote.eastmoney.com/center/boardlist.html",
+                },
+            ),
+            domain="board_cons",
+        )
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data") or {}
+        return data.get("diff") or []
+    finally:
+        session.close()
 
 
 @lru_cache(maxsize=4)
@@ -375,12 +455,19 @@ def sync_board_cons(db: Database, proxy_url: str = None) -> dict:
     遍历所有行业板块，拉取成分股列表存入 board_constituents。
     """
     sync_col = db["sync_log"]
-    meta = sync_col.find_one({"_id": "board_cons:_meta"}, {"next_cursor": 1}) or {}
+    shard_key = _shard_key()
+    shard_kind = _shard_kind()
+    meta = sync_col.find_one({"_id": _meta_id(shard_key)}, {"next_cursor": 1}) or {}
 
     boards = _get_board_list(db)
     concepts = _get_concept_list(db)
-    groups = [("board", name) for name in boards] + [("concept", name) for name in concepts]
-    logger.info("成分股同步: %d 行业, %d 概念", len(boards), len(concepts))
+    if shard_kind == "board":
+        groups = [("board", name) for name in boards]
+    elif shard_kind == "concept":
+        groups = [("concept", name) for name in concepts]
+    else:
+        groups = [("board", name) for name in boards] + [("concept", name) for name in concepts]
+    logger.info("成分股同步: %d 行业, %d 概念, shard=%s", len(boards), len(concepts), shard_key)
 
     start_cursor = 0 if os.getenv("BOARD_CONS_RESET_CURSOR", "false").lower() == "true" else int(meta.get("next_cursor") or 0)
     if start_cursor >= len(groups):
@@ -406,6 +493,7 @@ def sync_board_cons(db: Database, proxy_url: str = None) -> dict:
         errors=[],
         unmapped=0,
         source_counts={},
+        shard_key=shard_key,
     )
 
     while cursor < batch_limit and time.monotonic() < deadline:
@@ -440,6 +528,7 @@ def sync_board_cons(db: Database, proxy_url: str = None) -> dict:
                     errors=errors,
                     unmapped=unmapped,
                     source_counts=source_counts,
+                    shard_key=shard_key,
                 )
 
     remaining = max(0, len(groups) - cursor)
@@ -460,12 +549,15 @@ def sync_board_cons(db: Database, proxy_url: str = None) -> dict:
         errors=errors,
         unmapped=unmapped,
         source_counts=source_counts,
+        shard_key=shard_key,
     )
 
     logger.info("成分股完成: %s, %d 组, %d 只股票, %d 失败, remaining=%d",
                 status, total_groups, total_stocks, len(errors), remaining)
     return {
         "status": status,
+        "shard_key": shard_key,
+        "kind": shard_kind or "all",
         "groups": total_groups,
         "processed": cursor - start_cursor,
         "remaining": remaining,

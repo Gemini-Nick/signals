@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ from zoneinfo import ZoneInfo
 from signals.core.market_hours import TZ_BEIJING
 
 from .engine import LANE_MAINTENANCE_PLANS
+from .task_context import task_env
 
 logger = logging.getLogger("signals.sync.postmarket")
 
@@ -36,20 +38,56 @@ class PostmarketTaskSpec:
         return f"{self.module}:{self.shard_key}"
 
 
+def _const_env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 64) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+def _stock_daily_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
+    shard_count = _const_env_int("SIGNALS_POSTMARKET_STOCK_DAILY_SHARDS", 16, minimum=1, maximum=64)
+    return tuple(
+        PostmarketTaskSpec(
+            "stock_daily",
+            "market_data",
+            shard_key=f"shard_{idx:02d}",
+            env={
+                "SIGNALS_SYNC_FULL_STOCK_DAILY": "true",
+                "STOCK_DAILY_SCOPE": "all",
+                "STOCK_DAILY_SHARD_COUNT": str(shard_count),
+                "STOCK_DAILY_SHARD_INDEX": str(idx),
+                "STOCK_DAILY_SHARD_KEY": f"shard_{idx:02d}",
+            },
+        )
+        for idx in range(shard_count)
+    )
+
+
+def _board_cons_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
+    return (
+        PostmarketTaskSpec("board_cons", "market_data", shard_key="board", env={"BOARD_CONS_KIND": "board", "BOARD_CONS_SHARD_KEY": "board"}),
+        PostmarketTaskSpec("board_cons", "market_data", shard_key="concept", env={"BOARD_CONS_KIND": "concept", "BOARD_CONS_SHARD_KEY": "concept"}),
+    )
+
+
+_STOCK_DAILY_TASKS = _stock_daily_shard_tasks()
+_BOARD_CONS_TASKS = _board_cons_shard_tasks()
+_STOCK_DAILY_DEPS = tuple(task.task_key for task in _STOCK_DAILY_TASKS)
+_BOARD_CONS_DEPS = tuple(task.task_key for task in _BOARD_CONS_TASKS)
+
+
 POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     PostmarketTaskSpec("market_pools", "market_data"),
     PostmarketTaskSpec("quote_snapshots", "market_data"),
     PostmarketTaskSpec("index_daily", "market_data"),
-    PostmarketTaskSpec(
-        "stock_daily",
-        "market_data",
-        env={"SIGNALS_SYNC_FULL_STOCK_DAILY": "true", "STOCK_DAILY_SCOPE": "all"},
-    ),
+    *_STOCK_DAILY_TASKS,
     PostmarketTaskSpec("board_ranking", "market_data"),
-    PostmarketTaskSpec("board_cons", "market_data"),
-    PostmarketTaskSpec("weekly_rollup", "derived", depends_on=("stock_daily:all", "index_daily:all")),
-    PostmarketTaskSpec("chain_heat_snapshots", "derived", depends_on=("board_ranking:all", "board_cons:all")),
-    PostmarketTaskSpec("technical_signal_scan", "derived", depends_on=("stock_daily:all", "weekly_rollup:all")),
+    *_BOARD_CONS_TASKS,
+    PostmarketTaskSpec("weekly_rollup", "derived", depends_on=(*_STOCK_DAILY_DEPS, "index_daily:all")),
+    PostmarketTaskSpec("chain_heat_snapshots", "derived", depends_on=("board_ranking:all", *_BOARD_CONS_DEPS)),
+    PostmarketTaskSpec("technical_signal_scan", "derived", depends_on=(*_STOCK_DAILY_DEPS, "weekly_rollup:all")),
     PostmarketTaskSpec("knowledge_market_views", "derived"),
     PostmarketTaskSpec("signal_pool", "derived", depends_on=("technical_signal_scan:all",)),
     PostmarketTaskSpec(
@@ -172,7 +210,11 @@ class PostmarketRunner:
     def __init__(self, engine, *, max_workers: int | None = None):
         self.engine = engine
         self.db = engine.db
-        self.max_workers = max_workers or _env_int("SIGNALS_POSTMARKET_WORKERS", 4, minimum=1)
+        self.max_workers = max_workers or _env_int("SIGNALS_POSTMARKET_WORKERS", 8, minimum=1)
+        self.module_semaphores = {
+            "stock_daily": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_STOCK_DAILY_WORKERS", 4, minimum=1)),
+            "board_cons": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_BOARD_CONS_WORKERS", 2, minimum=1)),
+        }
         self.owner_pid = os.getpid()
         self.heartbeat_seconds = _env_int("SIGNALS_POSTMARKET_HEARTBEAT_SECONDS", 60, minimum=10)
         self.task_stale_seconds = _env_int("SIGNALS_POSTMARKET_TASK_STALE_SECONDS", 15 * 60, minimum=60)
@@ -230,14 +272,18 @@ class PostmarketRunner:
 
     def _init_tasks(self, run_id: str, trade_date: str) -> None:
         now = _naive_bj()
+        current_ids: set[str] = set()
         for order, spec in enumerate(POSTMARKET_TASKS):
+            task_id = self._task_id(run_id, spec)
+            current_ids.add(task_id)
             self.db["sync_tasks"].update_one(
-                {"_id": self._task_id(run_id, spec)},
+                {"_id": task_id},
                 {
                     "$set": {
                         "run_id": run_id,
                         "trade_date": trade_date,
                         "module": spec.module,
+                        "task_key": spec.task_key,
                         "phase": spec.phase,
                         "shard_key": spec.shard_key,
                         "depends_on": list(spec.depends_on),
@@ -255,6 +301,21 @@ class PostmarketRunner:
                     },
                 },
                 upsert=True,
+            )
+        for doc in self.db["sync_tasks"].find({"run_id": run_id}, {"_id": 1, "status": 1}):
+            task_id = str(doc.get("_id") or "")
+            if task_id in current_ids:
+                continue
+            if str(doc.get("status") or "") == "obsolete":
+                continue
+            self.db["sync_tasks"].update_one(
+                {"_id": task_id},
+                {"$set": {
+                    "status": "obsolete",
+                    "owner_pid": "",
+                    "error_msg": "superseded_by_sharded_postmarket_dag",
+                    "updated_at": now,
+                }},
             )
 
     def _heartbeat(self, run_id: str, phase: str = "") -> None:
@@ -344,19 +405,16 @@ class PostmarketRunner:
         class EnvGuard:
             def __init__(self, values: dict[str, str]):
                 self.values = values
-                self.previous: dict[str, str | None] = {}
+                self.guard = None
 
             def __enter__(self):
-                for key, value in self.values.items():
-                    self.previous[key] = os.environ.get(key)
-                    os.environ[key] = value
+                self.guard = task_env(self.values)
+                return self.guard.__enter__()
 
             def __exit__(self, exc_type, exc, tb):
-                for key, value in self.previous.items():
-                    if value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = value
+                if self.guard is not None:
+                    return self.guard.__exit__(exc_type, exc, tb)
+                return None
 
         return EnvGuard(env)
 
@@ -368,8 +426,13 @@ class PostmarketRunner:
             return result
         fn, _schedule = self.engine.module_map[spec.module]
         plan = LANE_MAINTENANCE_PLANS.get(spec.module)
+        semaphore = self.module_semaphores.get(spec.module)
         with self._with_env(spec.env):
-            result = self.engine.run_module(spec.module, fn, plan=plan)
+            if semaphore is None:
+                result = self.engine.run_module(spec.module, fn, plan=plan)
+            else:
+                with semaphore:
+                    result = self.engine.run_module(spec.module, fn, plan=plan)
         self._mark_task_finished(run_id, spec, result)
         return result
 

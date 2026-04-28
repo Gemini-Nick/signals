@@ -19,7 +19,9 @@ from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
 from ..proxy import em_proxy
+from ..provider_limits import provider_call
 from ..retry import sync_retry
+from ..task_context import get_task_env
 from .daily_sources import fetch_tencent_daily
 
 logger = logging.getLogger("signals.sync.stock_daily")
@@ -28,11 +30,46 @@ logger = logging.getLogger("signals.sync.stock_daily")
 # multiple MiniRacer initializations happen in parallel on macOS.
 _BATCH_WORKERS = max(1, int(os.getenv("STOCK_DAILY_WORKERS", "1")))
 # 每只股票间隔（秒），避免被东财限速
-_CALL_INTERVAL = 0.3
+_CALL_INTERVAL = float(os.getenv("STOCK_DAILY_CALL_INTERVAL", "0.3"))
 _PROVIDER_TIMEOUT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="stock-daily-provider")
 atexit.register(_PROVIDER_TIMEOUT_POOL.shutdown, wait=False, cancel_futures=True)
 _DEFAULT_PRIORITY_CODES = "688802,300575"
 _PROGRESS_META_ID = "stock_daily:progress:_meta"
+
+
+def _shard_count() -> int:
+    try:
+        return max(1, int(get_task_env("STOCK_DAILY_SHARD_COUNT", "1") or "1"))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _shard_index() -> int:
+    try:
+        return max(0, int(get_task_env("STOCK_DAILY_SHARD_INDEX", "0") or "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _shard_key() -> str:
+    return (get_task_env("STOCK_DAILY_SHARD_KEY", "") or "").strip() or "all"
+
+
+def _progress_meta_id(shard_key: str | None = None) -> str:
+    key = shard_key or _shard_key()
+    if key and key != "all":
+        return f"stock_daily:progress:{key}"
+    return _PROGRESS_META_ID
+
+
+def _apply_code_shard(codes: list[str]) -> tuple[list[str], dict[str, int | str]]:
+    count = _shard_count()
+    index = min(_shard_index(), count - 1)
+    key = _shard_key()
+    if count <= 1:
+        return codes, {"shard_key": key, "shard_index": index, "shard_count": count, "global_total": len(codes)}
+    shard_codes = [code for position, code in enumerate(codes) if position % count == index]
+    return shard_codes, {"shard_key": key, "shard_index": index, "shard_count": count, "global_total": len(codes)}
 
 
 def _provider_timeout() -> float:
@@ -56,15 +93,24 @@ def _write_progress(
     latest_symbol: str = "",
     latest_status: str = "",
     latest_written: int = 0,
+    shard_key: str | None = None,
+    shard_index: int = 0,
+    shard_count: int = 1,
+    global_total: int | None = None,
 ) -> None:
     now = naive_market_now("A")
     progress_pct = round(processed / total * 100, 2) if total else 0
+    key = shard_key or _shard_key()
     sync_col.update_one(
-        {"_id": _PROGRESS_META_ID},
+        {"_id": _progress_meta_id(key)},
         {"$set": {
             "module": "stock_daily",
             "status": status,
             "scope": scope,
+            "shard_key": key,
+            "shard_index": shard_index,
+            "shard_count": shard_count,
+            "global_total": global_total if global_total is not None else total,
             "total": total,
             "processed": processed,
             "remaining": max(0, total - processed),
@@ -75,6 +121,66 @@ def _write_progress(
             "latest_status": latest_status,
             "latest_written": latest_written,
             "progress_pct": progress_pct,
+            "heartbeat_at": now,
+            "updated_at": now,
+            "last_run": now,
+        }},
+        upsert=True,
+    )
+    if key != "all":
+        _write_aggregate_progress(sync_col, scope=scope)
+
+
+def _write_aggregate_progress(sync_col, *, scope: str) -> None:
+    try:
+        rows = list(sync_col.find(
+            {"module": "stock_daily"},
+            {
+                "status": 1,
+                "total": 1,
+                "processed": 1,
+                "inserted": 1,
+                "skipped": 1,
+                "errors": 1,
+                "latest_symbol": 1,
+                "latest_status": 1,
+                "latest_written": 1,
+                "heartbeat_at": 1,
+                "global_total": 1,
+            },
+        ))
+    except Exception:
+        return
+    rows = [row for row in rows if row.get("shard_key") and row.get("_id") != _PROGRESS_META_ID]
+    if not rows:
+        return
+    total = sum(int(row.get("total") or 0) for row in rows)
+    processed = sum(int(row.get("processed") or 0) for row in rows)
+    inserted = sum(int(row.get("inserted") or 0) for row in rows)
+    skipped = sum(int(row.get("skipped") or 0) for row in rows)
+    errors_count = sum(int(row.get("errors") or 0) for row in rows)
+    latest = max(rows, key=lambda row: row.get("heartbeat_at") or datetime.min)
+    statuses = {str(row.get("status") or "") for row in rows}
+    status = "ok" if statuses == {"ok"} else "partial" if "partial" in statuses else "running"
+    now = naive_market_now("A")
+    sync_col.update_one(
+        {"_id": _PROGRESS_META_ID},
+        {"$set": {
+            "module": "stock_daily",
+            "status": status,
+            "scope": scope,
+            "shard_key": "aggregate",
+            "shard_count": len(rows),
+            "total": total,
+            "processed": processed,
+            "remaining": max(0, total - processed),
+            "inserted": inserted,
+            "skipped": skipped,
+            "errors": errors_count,
+            "latest_symbol": latest.get("latest_symbol", ""),
+            "latest_status": latest.get("latest_status", ""),
+            "latest_written": latest.get("latest_written", 0),
+            "progress_pct": round(processed / total * 100, 2) if total else 0,
             "heartbeat_at": now,
             "updated_at": now,
             "last_run": now,
@@ -353,8 +459,8 @@ def _get_active_stock_codes(db: Database) -> list[str]:
 
 
 def _get_stock_codes(db: Database) -> tuple[list[str], str]:
-    full_sync = os.getenv("SIGNALS_SYNC_FULL_STOCK_DAILY", "false").lower() == "true"
-    scope = os.getenv("STOCK_DAILY_SCOPE", "active").lower()
+    full_sync = str(get_task_env("SIGNALS_SYNC_FULL_STOCK_DAILY", "false") or "false").lower() == "true"
+    scope = str(get_task_env("STOCK_DAILY_SCOPE", "active") or "active").lower()
     if full_sync or scope == "all":
         return _get_all_stock_codes(db), "all"
 
@@ -388,36 +494,49 @@ def _docs_from_daily_df(code: str, df: pd.DataFrame, column_map: dict[str, str],
 
 
 def _sync_one_stock(code: str, last_dt: str, end_date: str,
-                    proxy_url: str = None) -> list:
+                    proxy_url: str = None, db: Database | None = None) -> list:
     """同步单只股票日线，返回文档列表"""
     start = last_dt or "19900101"
     primary_source = os.getenv("STOCK_DAILY_PRIMARY_SOURCE", "tencent").lower()
     if primary_source == "tencent":
-        df = fetch_tencent_daily(
-            code,
-            start_date=start,
-            end_date=end_date,
-            timeout=float(os.getenv("STOCK_DAILY_TENCENT_TIMEOUT", "8")),
-        )
-        return _docs_from_daily_df(code, df, {
-            "dt": "日期",
-            "open": "开盘",
-            "high": "最高",
-            "low": "最低",
-            "close": "收盘",
-            "vol": "成交量",
-            "amount": "成交额",
-        }, "tencent")
+        try:
+            df = provider_call(
+                "tencent",
+                "stock_daily",
+                lambda: fetch_tencent_daily(
+                    code,
+                    start_date=start,
+                    end_date=end_date,
+                    timeout=float(os.getenv("STOCK_DAILY_TENCENT_TIMEOUT", "8")),
+                ),
+                db=db,
+            )
+            return _docs_from_daily_df(code, df, {
+                "dt": "日期",
+                "open": "开盘",
+                "high": "最高",
+                "low": "最低",
+                "close": "收盘",
+                "vol": "成交量",
+                "amount": "成交额",
+            }, "tencent")
+        except Exception as tencent_primary_exc:
+            logger.debug("tencent daily primary failed %s: %s", code, tencent_primary_exc)
 
     source = "eastmoney"
     try:
         with em_proxy(proxy_url):
-            df = _call_provider(
-                lambda: ak.stock_zh_a_hist(
-                    symbol=code, period="daily",
-                    start_date=start, end_date=end_date,
-                    adjust="qfq",
-                )
+            df = provider_call(
+                "eastmoney",
+                "stock_daily_hist",
+                lambda: _call_provider(
+                    lambda: ak.stock_zh_a_hist(
+                        symbol=code, period="daily",
+                        start_date=start, end_date=end_date,
+                        adjust="qfq",
+                    )
+                ),
+                db=db,
             )
         column_map = {
             "dt": "日期",
@@ -432,13 +551,18 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
         source = "sina"
         prefix = "sh" if code.startswith(("5", "6", "9")) else ("bj" if code.startswith(("4", "8")) else "sz")
         try:
-            df = _call_provider(
-                lambda: ak.stock_zh_a_daily(
-                    symbol=f"{prefix}{code}",
-                    start_date=start,
-                    end_date=end_date,
-                    adjust="qfq",
-                )
+            df = provider_call(
+                "sina",
+                "stock_daily",
+                lambda: _call_provider(
+                    lambda: ak.stock_zh_a_daily(
+                        symbol=f"{prefix}{code}",
+                        start_date=start,
+                        end_date=end_date,
+                        adjust="qfq",
+                    )
+                ),
+                db=db,
             )
             column_map = {
                 "dt": "date",
@@ -452,11 +576,16 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
         except Exception as sina_exc:
             source = "tencent"
             try:
-                df = fetch_tencent_daily(
-                    code,
-                    start_date=start,
-                    end_date=end_date,
-                    timeout=float(os.getenv("STOCK_DAILY_TENCENT_TIMEOUT", "8")),
+                df = provider_call(
+                    "tencent",
+                    "stock_daily",
+                    lambda: fetch_tencent_daily(
+                        code,
+                        start_date=start,
+                        end_date=end_date,
+                        timeout=float(os.getenv("STOCK_DAILY_TENCENT_TIMEOUT", "8")),
+                    ),
+                    db=db,
                 )
                 column_map = {
                     "dt": "日期",
@@ -492,8 +621,16 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
     end_date = now.strftime("%Y%m%d")
 
     # 默认只补活跃池；全市场补仓库需要显式设置 STOCK_DAILY_SCOPE=all。
-    codes, scope = _get_stock_codes(db)
-    logger.info(f"A股日线同步: {len(codes)} 只股票, scope={scope}")
+    all_codes, scope = _get_stock_codes(db)
+    codes, shard_meta = _apply_code_shard(all_codes)
+    shard_key = str(shard_meta["shard_key"])
+    shard_index = int(shard_meta["shard_index"])
+    shard_count = int(shard_meta["shard_count"])
+    global_total = int(shard_meta["global_total"])
+    logger.info(
+        "A股日线同步: %d/%d 只股票, scope=%s shard=%s",
+        len(codes), global_total, scope, shard_key,
+    )
 
     # 批量查询 sync_log
     sync_docs = {
@@ -519,6 +656,10 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         inserted=0,
         skipped=0,
         errors_count=0,
+        shard_key=shard_key,
+        shard_index=shard_index,
+        shard_count=shard_count,
+        global_total=global_total,
     )
 
     def _process(code):
@@ -537,7 +678,12 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
             inc_start = (now - timedelta(days=730)).strftime("%Y%m%d")
 
         try:
-            docs = _sync_one_stock(code, inc_start, end_date, proxy_url)
+            try:
+                docs = _sync_one_stock(code, inc_start, end_date, proxy_url, db=db)
+            except TypeError as exc:
+                if "unexpected keyword argument 'db'" not in str(exc):
+                    raise
+                docs = _sync_one_stock(code, inc_start, end_date, proxy_url)
             time.sleep(_CALL_INTERVAL)
             return code, docs, "ok"
         except Exception as e:
@@ -611,6 +757,10 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
                         latest_symbol=latest_symbol,
                         latest_status=latest_status,
                         latest_written=latest_written,
+                        shard_key=shard_key,
+                        shard_index=shard_index,
+                        shard_count=shard_count,
+                        global_total=global_total,
                     )
 
     logger.info(f"A股日线完成: +{total_inserted} bars, "
@@ -623,6 +773,10 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         "skipped": total_skipped,
         "errors": len(errors),
         "scope": scope,
+        "shard_key": shard_key,
+        "shard_index": shard_index,
+        "shard_count": shard_count,
+        "global_total": global_total,
         "codes": len(codes),
         "processed": processed_count,
         "total": len(codes),

@@ -4,6 +4,20 @@ from __future__ import annotations
 from signals.sync import postmarket as pm
 
 
+def test_default_postmarket_tasks_split_long_market_data_tasks():
+    stock_daily = [task for task in pm.POSTMARKET_TASKS if task.module == "stock_daily"]
+    board_cons = [task for task in pm.POSTMARKET_TASKS if task.module == "board_cons"]
+    weekly = next(task for task in pm.POSTMARKET_TASKS if task.module == "weekly_rollup")
+    chain = next(task for task in pm.POSTMARKET_TASKS if task.module == "chain_heat_snapshots")
+
+    assert len(stock_daily) == 16
+    assert {task.shard_key for task in stock_daily} == {f"shard_{idx:02d}" for idx in range(16)}
+    assert all(task.env["STOCK_DAILY_SCOPE"] == "all" for task in stock_daily)
+    assert {task.shard_key for task in board_cons} == {"board", "concept"}
+    assert set(task.task_key for task in stock_daily).issubset(set(weekly.depends_on))
+    assert set(task.task_key for task in board_cons).issubset(set(chain.depends_on))
+
+
 class _Cursor(list):
     def sort(self, keys, *args, **kwargs):
         if isinstance(keys, list):
@@ -143,6 +157,33 @@ def test_postmarket_runner_resumes_only_unfinished_tasks(monkeypatch):
     assert calls == ["alpha", "beta", "beta"]
     assert db["sync_tasks"].docs["postmarket:2026-04-28:alpha:all"]["status"] == "ok"
     assert db["sync_tasks"].docs["postmarket:2026-04-28:beta:all"]["attempts"] == 2
+
+
+def test_postmarket_runner_marks_superseded_tasks_obsolete(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00"),
+        pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_01"),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+
+    db = _Db()
+    db["sync_tasks"].docs["postmarket:2026-04-28:stock_daily:all"] = {
+        "_id": "postmarket:2026-04-28:stock_daily:all",
+        "run_id": "postmarket:2026-04-28",
+        "module": "stock_daily",
+        "shard_key": "all",
+        "status": "stale",
+    }
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+
+    runner._init_tasks("postmarket:2026-04-28", "2026-04-28")
+
+    legacy = db["sync_tasks"].docs["postmarket:2026-04-28:stock_daily:all"]
+    current = db["sync_tasks"].docs["postmarket:2026-04-28:stock_daily:shard_00"]
+    assert legacy["status"] == "obsolete"
+    assert legacy["error_msg"] == "superseded_by_sharded_postmarket_dag"
+    assert current["status"] == "pending"
+    assert current["task_key"] == "stock_daily:shard_00"
 
 
 def test_postmarket_completed_run_is_not_repeated(monkeypatch):

@@ -10,6 +10,7 @@ A股分钟线同步 — 活跃标的 5M/15M/30M 增量同步
 import logging
 import os
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import akshare as ak
@@ -19,6 +20,7 @@ from pymongo.database import Database
 from signals.core.market_time import naive_market_now
 from ..proxy import em_proxy
 from ..retry import sync_retry
+from ..task_context import get_task_env
 from .minute_sources import fetch_public_minute, stock_to_market_symbol
 
 logger = logging.getLogger("signals.sync.stock_minute")
@@ -162,10 +164,10 @@ def _selection_cap() -> int:
 
 
 def _postmarket_minute_scope() -> bool:
-    scope = os.getenv("STOCK_MINUTE_SCOPE", "").strip().lower()
+    scope = str(get_task_env("STOCK_MINUTE_SCOPE", "") or "").strip().lower()
     if scope in {"postmarket", "postmarket_candidates", "expanded_postmarket"}:
         return True
-    return os.getenv("SIGNALS_POSTMARKET_MINUTE_PREHEAT", "false").strip().lower() in {"1", "true", "yes", "on"}
+    return str(get_task_env("SIGNALS_POSTMARKET_MINUTE_PREHEAT", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _add_candidate(
@@ -179,6 +181,7 @@ def _add_candidate(
     *,
     priority: bool = True,
     pinned: bool = False,
+    symbol_sources: dict[str, set[str]] | None = None,
 ) -> str:
     code = _pure_a_code(value)
     if not code or code in index_codes:
@@ -191,6 +194,8 @@ def _add_candidate(
         pinned_symbols.add(code)
     if source:
         source_counts[source] = source_counts.get(source, 0) + 1
+        if symbol_sources is not None:
+            symbol_sources.setdefault(code, set()).add(source)
     return code
 
 
@@ -210,6 +215,7 @@ def _add_postmarket_expanded_candidates(
     priority_symbols: set[str],
     pinned_symbols: set[str],
     index_codes: set[str],
+    symbol_sources: dict[str, set[str]] | None = None,
 ) -> None:
     """Add wider next-day minute preheat candidates without scanning all A shares."""
     tech_limit = _int_env("STOCK_MINUTE_POSTMARKET_TECHNICAL_LIMIT", 500, min_value=1, max_value=2000)
@@ -222,7 +228,7 @@ def _add_postmarket_expanded_candidates(
             {"symbol": 1, "raw_code": 1, "signal_side": 1, "total_score": 1, "score": 1, "updated_at": 1, "as_of": 1},
         ).sort([("as_of", -1), ("updated_at", -1), ("total_score", -1), ("score", -1)]).limit(tech_limit)
         for doc in cursor:
-            _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, doc.get("raw_code") or doc.get("symbol"), "terminal_technical_signals")
+            _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, doc.get("raw_code") or doc.get("symbol"), "terminal_technical_signals", symbol_sources=symbol_sources)
     except Exception as exc:
         logger.debug("postmarket technical minute candidates skipped: %s", exc)
 
@@ -232,7 +238,7 @@ def _add_postmarket_expanded_candidates(
             {"symbol": 1, "raw_code": 1, "updated_at": 1, "as_of": 1},
         ).sort([("as_of", -1), ("updated_at", -1)]).limit(knowledge_limit)
         for doc in cursor:
-            _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, doc.get("raw_code") or doc.get("symbol"), "knowledge_market_views")
+            _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, doc.get("raw_code") or doc.get("symbol"), "knowledge_market_views", symbol_sources=symbol_sources)
     except Exception as exc:
         logger.debug("postmarket knowledge minute candidates skipped: %s", exc)
 
@@ -247,10 +253,10 @@ def _add_postmarket_expanded_candidates(
             for chain in cursor:
                 for rep in chain.get("representatives") or []:
                     if isinstance(rep, dict):
-                        _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, rep.get("symbol"), "chain_representatives")
+                        _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, rep.get("symbol"), "chain_representatives", symbol_sources=symbol_sources)
                 for domain in chain.get("integrated_domains") or []:
                     if isinstance(domain, dict):
-                        _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, domain.get("leader_symbol"), "chain_domain_leaders")
+                        _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, domain.get("leader_symbol"), "chain_domain_leaders", symbol_sources=symbol_sources)
     except Exception as exc:
         logger.debug("postmarket chain minute candidates skipped: %s", exc)
 
@@ -327,6 +333,206 @@ def _latest_stock_minute_runs(db: Database, symbols: list[str]) -> dict[str, obj
     return last_runs
 
 
+def _minute_trade_date() -> str:
+    return naive_market_now("A").date().isoformat()
+
+
+def _minute_universe_statuses(db: Database, symbols: list[str], trade_date: str) -> dict[str, dict]:
+    if not symbols:
+        return {}
+    try:
+        cursor = db["minute_preheat_universe"].find(
+            {"trade_date": trade_date, "symbol": {"$in": symbols}},
+            {"symbol": 1, "status": 1, "updated_at": 1, "cached_at": 1, "last_attempt_at": 1},
+        )
+    except Exception:
+        return {}
+    result: dict[str, dict] = {}
+    for doc in cursor:
+        code = _pure_a_code(doc.get("symbol"))
+        if code:
+            result[code] = dict(doc)
+    return result
+
+
+def _upsert_minute_preheat_universe(
+    db: Database,
+    *,
+    symbols: list[str],
+    symbol_sources: dict[str, set[str]],
+    priority_symbols: set[str],
+    pinned_symbols: set[str],
+    source_counts: dict[str, int],
+    max_symbols: int,
+) -> dict[str, int]:
+    trade_date = _minute_trade_date()
+    now = naive_market_now("A")
+    col = db["minute_preheat_universe"]
+    written = 0
+    try:
+        for idx, code in enumerate(symbols):
+            sources = sorted(symbol_sources.get(code) or [])
+            col.update_one(
+                {"_id": f"{trade_date}:{code}"},
+                {
+                    "$set": {
+                        "trade_date": trade_date,
+                        "market": "A",
+                        "symbol": code,
+                        "order": idx,
+                        "sources": sources,
+                        "source_counts": source_counts,
+                        "priority": code in priority_symbols,
+                        "pinned": code in pinned_symbols,
+                        "max_per_run": max_symbols,
+                        "updated_at": now,
+                    },
+                    "$setOnInsert": {
+                        "status": "pending",
+                        "freq_status": {},
+                        "skipped_reason": "",
+                        "created_at": now,
+                    },
+                },
+                upsert=True,
+            )
+            written += 1
+    except Exception:
+        return {"written": written, "total": len(symbols)}
+    return {"written": written, "total": len(symbols)}
+
+
+def _select_postmarket_minute_symbols(
+    ordered: list[str],
+    priority: set[str],
+    max_symbols: int,
+    *,
+    pinned: set[str],
+    last_runs: dict[str, object],
+    universe_states: dict[str, dict],
+) -> tuple[list[str], list[dict[str, str]]]:
+    if max_symbols <= 0 or len(ordered) <= max_symbols:
+        return ordered, []
+    original_idx = {code: idx for idx, code in enumerate(ordered)}
+
+    def stale_rank(code: str) -> float:
+        value = last_runs.get(code)
+        if value is None:
+            return float("-inf")
+        try:
+            parsed = pd.to_datetime(value, errors="coerce")
+            if pd.isna(parsed):
+                return float("-inf")
+            return float(parsed.timestamp())
+        except Exception:
+            return float("-inf")
+
+    def status_rank(code: str) -> int:
+        if code in pinned:
+            return 0
+        status = str((universe_states.get(code) or {}).get("status") or "pending")
+        if status in {"pending", "error", "stale"}:
+            return 1
+        if status == "running":
+            return 2
+        if status == "cached":
+            return 4
+        return 3
+
+    sorted_codes = sorted(
+        ordered,
+        key=lambda code: (
+            status_rank(code),
+            0 if code in priority else 1,
+            stale_rank(code),
+            original_idx.get(code, 0),
+        ),
+    )
+    selected = sorted_codes[:max_symbols]
+    selected_set = set(selected)
+    skipped = [
+        {
+            "symbol": code,
+            "reason": "postmarket_universe_pending",
+            "next_due_hint": "next postmarket minute preheat rotation",
+        }
+        for code in ordered
+        if code not in selected_set
+    ]
+    return selected, skipped
+
+
+def _mark_minute_universe_selected(db: Database, symbols: list[str]) -> None:
+    if not symbols:
+        return
+    trade_date = _minute_trade_date()
+    now = naive_market_now("A")
+    try:
+        for code in symbols:
+            db["minute_preheat_universe"].update_one(
+                {"_id": f"{trade_date}:{code}"},
+                {"$set": {"status": "running", "selected_current_run": True, "last_attempt_at": now, "updated_at": now}},
+                upsert=True,
+            )
+    except Exception:
+        return
+
+
+def _mark_minute_universe_results(db: Database, per_symbol: dict[str, dict]) -> dict[str, int]:
+    if not per_symbol:
+        return {"cached": 0, "error": 0}
+    trade_date = _minute_trade_date()
+    now = naive_market_now("A")
+    cached = 0
+    failed = 0
+    try:
+        for code, result in per_symbol.items():
+            freq_status = result.get("freq_status") or {}
+            errors = int(result.get("errors") or 0)
+            ok_calls = sum(1 for status in freq_status.values() if status in {"ok", "empty"})
+            status = "cached" if errors == 0 and ok_calls == len(_MINUTE_FREQS) else "error"
+            if status == "cached":
+                cached += 1
+            else:
+                failed += 1
+            db["minute_preheat_universe"].update_one(
+                {"_id": f"{trade_date}:{code}"},
+                {"$set": {
+                    "status": status,
+                    "freq_status": freq_status,
+                    "written": int(result.get("written") or 0),
+                    "errors": errors,
+                    "skipped_reason": "" if status == "cached" else "minute_fetch_failed",
+                    "cached_at": now if status == "cached" else None,
+                    "selected_current_run": False,
+                    "updated_at": now,
+                }},
+                upsert=True,
+            )
+    except Exception:
+        return {"cached": cached, "error": failed}
+    return {"cached": cached, "error": failed}
+
+
+def _minute_universe_summary(db: Database, trade_date: str | None = None) -> dict[str, int]:
+    trade_date = trade_date or _minute_trade_date()
+    try:
+        rows = list(db["minute_preheat_universe"].find({"trade_date": trade_date}, {"status": 1}))
+    except Exception:
+        return {}
+    counts = defaultdict(int)
+    for row in rows:
+        counts[str(row.get("status") or "pending")] += 1
+    total = sum(counts.values())
+    return {
+        "total": total,
+        "cached": counts["cached"],
+        "pending": counts["pending"],
+        "running": counts["running"],
+        "error": counts["error"],
+    }
+
+
 def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
     """获取需要同步分钟线的活跃标的列表。
 
@@ -336,6 +542,7 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
     """
     priority_symbols: set[str] = set()
     pinned_symbols: set[str] = set()
+    symbol_sources: dict[str, set[str]] = {}
     index_codes = _index_codes()
 
     only_codes = os.getenv("STOCK_MINUTE_ONLY_CODES", "")
@@ -376,12 +583,13 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
                 "terminal_stock_pool",
                 priority=bool(reason_types),
                 pinned="user_pinned" in reason_types,
+                symbol_sources=symbol_sources,
             )
             for reason_type in reason_types:
                 if reason_type:
                     source_counts[reason_type] = source_counts.get(reason_type, 0) + 1
         else:
-            _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, row, "terminal_stock_pool")
+            _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, row, "terminal_stock_pool", symbol_sources=symbol_sources)
 
     if not symbols and postmarket_scope:
         _add_postmarket_expanded_candidates(
@@ -391,6 +599,7 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
             priority_symbols,
             pinned_symbols,
             index_codes,
+            symbol_sources,
         )
         expanded_candidates_added = True
 
@@ -424,6 +633,7 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
                 "terminal_stock_pool_skipped",
                 priority=bool(reason_types),
                 pinned="user_pinned" in reason_types,
+                symbol_sources=symbol_sources,
             )
             for reason_type in reason_types:
                 source_counts[reason_type] = source_counts.get(reason_type, 0) + 1
@@ -441,16 +651,39 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
             priority_symbols,
             pinned_symbols,
             index_codes,
+            symbol_sources,
         )
     max_symbols = _selection_cap()
     last_runs = _latest_stock_minute_runs(db, symbols)
-    selected, skipped = _select_symbols_with_priority(
-        symbols,
-        priority_symbols,
-        max_symbols,
-        pinned=pinned_symbols,
-        last_runs=last_runs,
-    )
+    universe_meta: dict[str, int] = {}
+    if postmarket_scope:
+        universe_meta = _upsert_minute_preheat_universe(
+            db,
+            symbols=symbols,
+            symbol_sources=symbol_sources,
+            priority_symbols=priority_symbols,
+            pinned_symbols=pinned_symbols,
+            source_counts=source_counts,
+            max_symbols=max_symbols,
+        )
+        universe_states = _minute_universe_statuses(db, symbols, _minute_trade_date())
+        selected, skipped = _select_postmarket_minute_symbols(
+            symbols,
+            priority_symbols,
+            max_symbols,
+            pinned=pinned_symbols,
+            last_runs=last_runs,
+            universe_states=universe_states,
+        )
+    else:
+        selected, skipped = _select_symbols_with_priority(
+            symbols,
+            priority_symbols,
+            max_symbols,
+            pinned=pinned_symbols,
+            last_runs=last_runs,
+        )
+    universe_summary = _minute_universe_summary(db) if postmarket_scope else {}
     return selected, {
         "priority_symbols": [code for code in selected if code in priority_symbols],
         "pinned_symbols": [code for code in selected if code in pinned_symbols],
@@ -469,6 +702,10 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
             "candidate_pinned": len(pinned_symbols),
             "pool_skipped": len(skipped_pool),
         },
+        "universe_total": universe_summary.get("total") or universe_meta.get("total") or len(symbols) if postmarket_scope else len(symbols),
+        "universe_cached": universe_summary.get("cached", 0),
+        "universe_pending": universe_summary.get("pending", 0),
+        "universe_error": universe_summary.get("error", 0),
     }
 
 
@@ -556,6 +793,9 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
 
     symbols, selection_meta = _get_active_symbols_with_meta(db)
     logger.info(f"分钟线同步: {len(symbols)} 只活跃标的")
+    postmarket_scope = _postmarket_minute_scope()
+    if postmarket_scope:
+        _mark_minute_universe_selected(db, symbols)
 
     workers = _worker_count()
     tail_counts = {freq: _tail_count_for_freq(freq) for freq in _MINUTE_FREQS}
@@ -563,6 +803,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
     total_skipped_existing = 0
     empty = 0
     errors = []
+    per_symbol: dict[str, dict] = defaultdict(lambda: {"written": 0, "errors": 0, "freq_status": {}})
     tasks = [(code, freq) for code in symbols for freq in _MINUTE_FREQS]
 
     def sync_one(code: str, freq: str) -> dict:
@@ -618,11 +859,15 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
             code, freq = future_map[future]
             try:
                 result = future.result()
+                per_symbol[code]["freq_status"][freq] = str(result.get("status") or "ok")
+                per_symbol[code]["written"] += int(result.get("written") or 0)
                 if result.get("status") == "empty":
                     empty += 1
                 total_written += int(result.get("written") or 0)
                 total_skipped_existing += int(result.get("skipped_existing") or 0)
             except Exception as e:
+                per_symbol[code]["freq_status"][freq] = "error"
+                per_symbol[code]["errors"] += 1
                 errors.append((code, freq, str(e)))
                 sync_col.update_one(
                     {"_id": f"stock_minute:{code}:{freq}"},
@@ -640,6 +885,8 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
                     upsert=True,
                 )
 
+    universe_result = _mark_minute_universe_results(db, per_symbol) if postmarket_scope else {}
+    universe_summary = _minute_universe_summary(db) if postmarket_scope else {}
     skipped_symbols = selection_meta.get("skipped_symbols") or []
     sync_col.update_one(
         {"_id": "stock_minute:selection:_meta"},
@@ -659,6 +906,11 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
             "rotation_policy": selection_meta.get("rotation_policy", ""),
             "minute_scope": selection_meta.get("minute_scope", ""),
             "tier_counts": selection_meta.get("tier_counts") or {},
+            "universe_total": universe_summary.get("total") or selection_meta.get("universe_total"),
+            "universe_cached": universe_summary.get("cached", 0),
+            "universe_pending": universe_summary.get("pending", 0),
+            "universe_running": universe_summary.get("running", 0),
+            "universe_error": universe_summary.get("error", 0),
             "workers": workers,
             "tail_counts": tail_counts,
             "incremental": True,
@@ -688,6 +940,11 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
         "skipped_symbols": skipped_symbols[:20],
         "minute_scope": selection_meta.get("minute_scope", ""),
         "source_counts": selection_meta.get("source_counts") or {},
+        "universe_total": universe_summary.get("total") or selection_meta.get("universe_total"),
+        "universe_cached": universe_summary.get("cached", 0),
+        "universe_pending": universe_summary.get("pending", 0),
+        "universe_error": universe_summary.get("error", 0),
+        "universe_result": universe_result,
         "workers": workers,
         "tail_counts": tail_counts,
         "planned_calls": len(tasks),

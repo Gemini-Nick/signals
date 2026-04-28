@@ -19,6 +19,26 @@ def _bars():
     )
 
 
+def _intraday_bars():
+    index = pd.to_datetime([
+        "2026-03-15 10:00",
+        "2026-03-15 10:30",
+        "2026-03-15 11:00",
+        "2026-03-16 10:00",
+    ])
+    return pd.DataFrame(
+        {
+            "open": [10.0, 10.4, 10.8, 11.0],
+            "high": [10.5, 10.9, 11.2, 11.4],
+            "low": [9.8, 10.2, 10.6, 10.9],
+            "close": [10.3, 10.7, 11.0, 11.2],
+            "vol": [1000] * 4,
+            "amount": [10000] * 4,
+        },
+        index=index,
+    )
+
+
 def test_watchlist_range_columns_include_all_key_presets():
     from signals.web.api import workbench
 
@@ -79,6 +99,31 @@ def test_chart_merges_custom_signal_pool_rows(monkeypatch):
     assert merged["signals"]
     assert merged["signals"][-1]["type"] == "自定义三买: MACD 0轴上方确认"
     assert merged["signals"][-1]["source"] == "sqlite.backtest.signal_records"
+
+
+def test_intraday_chart_aligns_date_only_custom_signal_to_bar(monkeypatch):
+    from signals.web.api import workbench
+
+    df = _intraday_bars()
+    chart = workbench._chart_from_df(df, symbol="SZ.002759", freq="30min", source="test_bars")
+    last_same_day = chart["ohlcv"][2]
+    monkeypatch.setattr(workbench, "_load_signal_pool_rows", lambda limit=200, symbol=None: [
+        {
+            "symbol": "SZ.002759",
+            "signal_date": "2026-03-15",
+            "signal_type": "缺口买:突破",
+            "freq": "30分钟",
+            "confidence": 0.88,
+            "source": "sqlite.backtest.signal_records",
+        }
+    ])
+
+    merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002759", "30min")
+
+    assert merged["signals"][-1]["type"] == "缺口买:突破"
+    assert merged["signals"][-1]["dt"] == last_same_day["time"]
+    assert merged["signals"][-1]["chart_aligned"] is True
+    assert merged["signals"][-1]["price"] == last_same_day["low"]
 
 
 def test_focus_stocks_aggregate_buy_points_by_timeframe(monkeypatch):

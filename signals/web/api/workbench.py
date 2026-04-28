@@ -223,6 +223,11 @@ def _signal_ts(value: Any, *, market: Any = "", symbol: Any = "", source: Any = 
     return _dt_to_unix(value, market=market, symbol=symbol, source=source)
 
 
+def _timestamp_date(ts: int, *, market: Any = "", symbol: Any = "", source: Any = "") -> str:
+    start, _ = timestamp_range_to_dates(ts, ts, market=market, symbol=symbol, source=source)
+    return start or ""
+
+
 def _float(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         if value is None:
@@ -1142,14 +1147,24 @@ def _signal_pool_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) ->
             continue
         signal_dt = signal.get("signal_date") or signal.get("dt") or signal.get("updated_at")
         ts = _signal_ts(signal_dt, market=market, symbol=symbol, source=source)
-        if start_ts and ts < start_ts:
+        aligned_ts, aligned_price, aligned = _aligned_signal_bar(
+            signal,
+            signal_dt=signal_dt,
+            ts=ts,
+            ohlcv=ohlcv,
+            effective_freq=effective_freq,
+            market=market,
+            symbol=symbol,
+            source=source,
+        )
+        if start_ts and aligned_ts < start_ts:
             continue
-        if end_ts and ts > end_ts + 86400:
+        if end_ts and aligned_ts > end_ts + 86400:
             continue
         details = signal.get("details_json") if isinstance(signal.get("details_json"), dict) else {}
-        price = _float(signal.get("price") or signal.get("close") or details.get("close"))
+        price = _float(signal.get("price") or signal.get("close") or details.get("close"), aligned_price)
         output.append({
-            "dt": ts,
+            "dt": aligned_ts,
             "date_str": str(signal_dt)[:10] if signal_dt else "",
             "type": signal_type,
             "price": price,
@@ -1158,8 +1173,52 @@ def _signal_pool_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) ->
             "details": _signal_details(signal),
             "source": signal.get("source") or "signals.signal_pool",
             "pool_status": signal.get("pool_status"),
+            "chart_aligned": aligned,
         })
     return output
+
+
+def _aligned_signal_bar(
+    signal: dict[str, Any],
+    *,
+    signal_dt: Any,
+    ts: int,
+    ohlcv: list[dict[str, Any]],
+    effective_freq: str,
+    market: str,
+    symbol: str,
+    source: str,
+) -> tuple[int, Optional[float], bool]:
+    if effective_freq in {"daily", "weekly", "monthly"} or not ohlcv:
+        return ts, None, False
+    bar_by_time = {
+        int(row.get("time") or 0): row
+        for row in ohlcv
+        if isinstance(row, dict) and row.get("time")
+    }
+    if ts in bar_by_time:
+        row = bar_by_time[ts]
+        return ts, _float(row.get("close")), False
+
+    signal_date = str(signal_dt or "")[:10]
+    if not signal_date:
+        return ts, None, False
+    same_day = [
+        row for row in ohlcv
+        if isinstance(row, dict)
+        and row.get("time")
+        and _timestamp_date(int(row["time"]), market=market, symbol=symbol, source=source) == signal_date
+    ]
+    if not same_day:
+        return ts, None, False
+    row = same_day[-1]
+    if _is_sell_signal(signal):
+        price = _float(row.get("high") or row.get("close"))
+    elif _is_buy_signal(signal):
+        price = _float(row.get("low") or row.get("close"))
+    else:
+        price = _float(row.get("close"))
+    return int(row.get("time") or ts), price, True
 
 
 def _merge_signal_pool_into_chart(chart: dict[str, Any], symbol: str, freq: str) -> dict[str, Any]:
@@ -2114,7 +2173,9 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
     return rows
 
 
-def _terminal_stock_pool_rows(range_columns: list[dict[str, Any]], limit: int = 24) -> list[dict[str, Any]]:
+def _terminal_stock_pool_rows(range_columns: list[dict[str, Any]], limit: Optional[int] = None) -> list[dict[str, Any]]:
+    if limit is None:
+        limit = max(1, int(os.getenv("TERMINAL_WORKBENCH_FOCUS_STOCK_LIMIT", "72")))
     try:
         db = _mongo_db()
         doc = db["terminal_stock_pool"].find_one(
@@ -2138,6 +2199,14 @@ def _terminal_stock_pool_rows(range_columns: list[dict[str, Any]], limit: int = 
         ][:4]
         row["source_tags"] = item.get("source_tags") or []
         row["inclusion_reasons"] = item.get("inclusion_reasons") or []
+        row["technical_evidence"] = item.get("technical_evidence") if isinstance(item.get("technical_evidence"), dict) else {}
+        row["knowledge_confirmation"] = item.get("knowledge_confirmation") if isinstance(item.get("knowledge_confirmation"), dict) else {"status": "none"}
+        row["resonance_context"] = item.get("resonance_context") if isinstance(item.get("resonance_context"), dict) else {}
+        row["trace_summary"] = " / ".join(
+            f"{_text(reason.get('reason_type'))}:{_text(reason.get('source_collection'))}"
+            for reason in row["inclusion_reasons"][:3]
+            if isinstance(reason, dict)
+        )
         row["signal_origin"] = item.get("signal_origin", "")
         row["signal_family"] = item.get("signal_family", "")
         row["chain_context"] = item.get("chain_context") if isinstance(item.get("chain_context"), dict) else {}

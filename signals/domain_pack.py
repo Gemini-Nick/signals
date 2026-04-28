@@ -354,6 +354,7 @@ class SignalsPack:
             "postmarket_backfill": {"run": None, "tasks": [], "summary": {}},
             "mongo_stock_cache": {"freqs": [], "summary": {}},
             "terminal_outputs": [],
+            "provider_health": [],
             "blockers": [],
         }
 
@@ -375,7 +376,8 @@ class SignalsPack:
         postmarket = self._cache_postmarket_backfill(db)
         mongo_cache = self._cache_mongo_stock_cache(db, trade_date)
         terminal_outputs = self._cache_terminal_outputs(db)
-        blockers = self._cache_blockers(live, postmarket)
+        provider_health = self._cache_provider_health(db)
+        blockers = self._cache_blockers(live, postmarket, provider_health)
         return {
             "available": True,
             "mode": "mongo",
@@ -385,6 +387,7 @@ class SignalsPack:
             "postmarket_backfill": postmarket,
             "mongo_stock_cache": mongo_cache,
             "terminal_outputs": terminal_outputs,
+            "provider_health": provider_health,
             "blockers": blockers,
         }
 
@@ -437,6 +440,7 @@ class SignalsPack:
 
         run_id = str(run.get("run_id") or run.get("_id") or "")
         tasks = self._find_many(db, "sync_tasks", {"run_id": run_id}, sort=[("order", 1)])
+        tasks = self._current_postmarket_tasks(tasks)
         stock_daily_progress = self._find_one(db, "sync_log", {"_id": "stock_daily:progress:_meta"}) or {}
         board_cons_progress = self._find_one(db, "sync_log", {"_id": "board_cons:_meta"}) or {}
 
@@ -453,17 +457,27 @@ class SignalsPack:
                 completed += 1
             summary = dict(task.get("result_summary") or {})
             cursor = dict(task.get("cursor") or {})
+            shard_key = str(task.get("shard_key") or "all")
+            if module == "stock_daily":
+                shard_progress = self._find_one(db, "sync_log", {"_id": f"stock_daily:progress:{shard_key}"}) if shard_key not in {"all", "aggregate"} else stock_daily_progress
+                if shard_progress:
+                    summary.update(self._project_fields(shard_progress, [
+                        "scope", "shard_key", "shard_index", "shard_count", "global_total",
+                        "total", "processed", "remaining", "inserted", "skipped",
+                        "errors", "latest_symbol", "latest_status", "progress_pct",
+                    ]))
             if module == "stock_daily" and stock_daily_progress:
-                summary.update(self._project_fields(stock_daily_progress, [
-                    "scope", "total", "processed", "remaining", "inserted", "skipped",
-                    "errors", "latest_symbol", "latest_status", "progress_pct",
+                cursor.update(self._project_fields(stock_daily_progress, [
+                    "shard_count", "global_total",
                 ]))
-            if module == "board_cons" and board_cons_progress:
-                summary.update(self._project_fields(board_cons_progress, [
-                    "processed", "processed_groups", "remaining", "next_cursor",
-                    "total_groups", "sample_errors", "unmapped", "source_counts",
-                ]))
-                cursor.update(self._project_fields(board_cons_progress, ["next_cursor", "remaining", "total_groups"]))
+            if module == "board_cons":
+                shard_progress = self._find_one(db, "sync_log", {"_id": f"board_cons:{shard_key}:_meta"}) if shard_key not in {"all", "aggregate"} else board_cons_progress
+                if shard_progress:
+                    summary.update(self._project_fields(shard_progress, [
+                        "shard_key", "processed", "processed_groups", "remaining", "next_cursor",
+                        "total_groups", "sample_errors", "unmapped", "source_counts",
+                    ]))
+                    cursor.update(self._project_fields(shard_progress, ["next_cursor", "remaining", "total_groups"]))
             progress_pct = self._task_progress_pct(status, summary, cursor)
             eta_seconds = self._task_eta_seconds(task, progress_pct)
             if progress_pct is not None:
@@ -519,6 +533,22 @@ class SignalsPack:
             },
         }
 
+    def _current_postmarket_tasks(self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        rows = [task for task in tasks if str(task.get("status") or "") != "obsolete"]
+        try:
+            from signals.sync.postmarket import POSTMARKET_TASKS
+
+            current = {(task.module, task.shard_key) for task in POSTMARKET_TASKS}
+        except Exception:
+            return rows
+        if not current:
+            return rows
+        filtered = [
+            task for task in rows
+            if (str(task.get("module") or ""), str(task.get("shard_key") or "all")) in current
+        ]
+        return filtered or rows
+
     def _cache_mongo_stock_cache(self, db, trade_date: str) -> Dict[str, Any]:
         freqs = ["日线", "周线", "5分钟", "15分钟", "30分钟", "60分钟"]
         rows: List[Dict[str, Any]] = []
@@ -531,6 +561,7 @@ class SignalsPack:
         minute_result = dict(stock_minute_doc.get("result") or {})
         minute_symbols = len(stock_minute_doc.get("selected_symbols") or []) or int(minute_result.get("selected") or 0)
         tail_counts = dict(stock_minute_doc.get("tail_counts") or minute_result.get("tail_counts") or {})
+        minute_universe = self._cache_minute_universe(db, trade_date)
         daily_latest = None
         for freq in freqs:
             query = {"meta.freq": freq}
@@ -575,8 +606,25 @@ class SignalsPack:
                 "daily_symbols": daily.get("symbols", 0),
                 "daily_today_symbols": daily.get("today_symbols", 0),
                 "latest_daily_dt": daily.get("latest_dt") or self._iso((daily_latest or {}).get("dt") if daily_latest else None),
+                "minute_universe_total": minute_universe.get("total", 0),
+                "minute_universe_cached": minute_universe.get("cached", 0),
+                "minute_universe_pending": minute_universe.get("pending", 0),
+                "minute_universe_running": minute_universe.get("running", 0),
+                "minute_universe_error": minute_universe.get("error", 0),
             },
         }
+
+    def _cache_minute_universe(self, db, trade_date: str) -> Dict[str, int]:
+        try:
+            rows = list(db["minute_preheat_universe"].find({"trade_date": trade_date}, {"status": 1}))
+        except Exception:
+            return {}
+        counts: Dict[str, int] = {}
+        for row in rows:
+            status = str(row.get("status") or "pending")
+            counts[status] = counts.get(status, 0) + 1
+        counts["total"] = sum(counts.values())
+        return counts
 
     def _cache_terminal_outputs(self, db) -> List[Dict[str, Any]]:
         outputs = [
@@ -598,7 +646,28 @@ class SignalsPack:
             })
         return rows
 
-    def _cache_blockers(self, live: Dict[str, Any], postmarket: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _cache_provider_health(self, db) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        try:
+            docs = db["provider_health"].find({}, {"_id": 0}).sort("updated_at", -1).limit(12)
+        except Exception:
+            return rows
+        for doc in docs:
+            rows.append({
+                "provider": str(doc.get("provider") or ""),
+                "endpoint": str(doc.get("endpoint") or ""),
+                "domain": str(doc.get("domain") or ""),
+                "status": str(doc.get("status") or ""),
+                "avg_latency_ms": doc.get("avg_latency_ms"),
+                "last_error_type": str(doc.get("last_error_type") or "")[:240],
+                "last_success_at": self._iso(doc.get("last_success_at")),
+                "last_error_at": self._iso(doc.get("last_error_at")),
+                "cooldown_until": self._iso(doc.get("cooldown_until")),
+                "updated_at": self._iso(doc.get("updated_at")),
+            })
+        return rows
+
+    def _cache_blockers(self, live: Dict[str, Any], postmarket: Dict[str, Any], provider_health: List[Dict[str, Any]] | None = None) -> List[Dict[str, Any]]:
         blockers: List[Dict[str, Any]] = []
         for item in live.get("modules", []):
             status = str(item.get("status") or "")
@@ -618,6 +687,16 @@ class SignalsPack:
                     "status": status,
                     "error_msg": task.get("error_msg") or "",
                     "sample_errors": task.get("result_summary", {}).get("sample_errors") or [],
+                })
+        for item in provider_health or []:
+            status = str(item.get("status") or "")
+            if status in {"degraded", "cooldown", "error", "stale"}:
+                blockers.append({
+                    "scope": "provider_health",
+                    "module": item.get("provider"),
+                    "status": status,
+                    "error_msg": item.get("last_error_type") or "",
+                    "cooldown_until": item.get("cooldown_until") or "",
                 })
         return blockers[:12]
 

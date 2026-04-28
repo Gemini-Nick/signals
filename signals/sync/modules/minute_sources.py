@@ -8,6 +8,8 @@ from typing import Iterable
 import pandas as pd
 import requests
 
+from signals.sync.provider_limits import provider_call
+
 _SINA_URL = "https://quotes.sina.cn/cn/api/jsonp_v2.php/=/CN_MarketDataService.getKLineData"
 _TENCENT_URL = "https://ifzq.gtimg.cn/appstock/app/kline/mkline"
 _HEADERS = {
@@ -38,8 +40,14 @@ def stock_to_market_symbol(code: str) -> str:
 def _direct_get(url: str, *, params: dict, headers: dict | None = None, timeout: float = 10.0):
     session = requests.Session()
     session.trust_env = False
+    provider = "tencent" if "gtimg.cn" in url else "sina" if "sina.cn" in url else "unknown"
     try:
-        response = session.get(url, params=params, headers=headers or _HEADERS, timeout=timeout)
+        response = provider_call(
+            provider,
+            "stock_minute",
+            lambda: session.get(url, params=params, headers=headers or _HEADERS, timeout=timeout),
+            domain="minute",
+        )
         response.raise_for_status()
         return response
     finally:

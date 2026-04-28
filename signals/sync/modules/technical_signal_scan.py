@@ -23,6 +23,28 @@ MINUTE_FREQS = {
     "15分钟": ["15分钟", "15min", "15m", "F15"],
     "5分钟": ["5分钟", "5min", "5m", "F5"],
 }
+FREQ_ORDER = {
+    "周线": 0,
+    "weekly": 0,
+    "1w": 0,
+    "w": 0,
+    "日线": 1,
+    "daily": 1,
+    "1d": 1,
+    "d": 1,
+    "30分钟": 2,
+    "30min": 2,
+    "30m": 2,
+    "f30": 2,
+    "15分钟": 3,
+    "15min": 3,
+    "15m": 3,
+    "f15": 3,
+    "5分钟": 4,
+    "5min": 4,
+    "5m": 4,
+    "f5": 4,
+}
 
 
 def _pure_a_code(symbol: Any) -> str:
@@ -93,6 +115,80 @@ def _signal_side(signal_type: str, score: float) -> str:
     return "buy"
 
 
+def _freq_sort_key(freq: Any) -> tuple[int, str]:
+    text = str(freq or "").strip()
+    return FREQ_ORDER.get(text.lower(), FREQ_ORDER.get(text, 99)), text
+
+
+def _event_dt_value(event: Any) -> datetime | None:
+    value = getattr(event, "dt", None)
+    if not value:
+        return None
+    try:
+        parsed = pd.to_datetime(value).to_pydatetime()
+    except Exception:
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def _event_side(event: Any, weights: dict[str, Any]) -> str:
+    signal_type = str(getattr(event, "signal_type", "") or "")
+    score = float(weights.get(signal_type, 0) or 0) * float(getattr(event, "confidence", 0) or 0)
+    return _signal_side(signal_type, score)
+
+
+def _resonance_grade(aligned_freqs: list[str], conflict_freqs: list[str]) -> str:
+    if conflict_freqs:
+        return "conflict"
+    if len(aligned_freqs) >= 3:
+        return "strong_resonance"
+    if len(aligned_freqs) >= 2:
+        return "multi_period"
+    return "single_period"
+
+
+def _resonance_context(events: list[Any], *, side: str, primary_freq: str, direction: str, weights: dict[str, Any]) -> dict[str, Any]:
+    aligned_freqs = sorted(
+        {str(getattr(event, "freq", "") or "") for event in events if _event_side(event, weights) == side},
+        key=_freq_sort_key,
+    )
+    conflict_freqs = sorted(
+        {str(getattr(event, "freq", "") or "") for event in events if _event_side(event, weights) != side},
+        key=_freq_sort_key,
+    )
+    latest_values = [value for value in (_event_dt_value(event) for event in events) if value]
+    latest_dt = max(latest_values).isoformat() if latest_values else ""
+    grade = _resonance_grade(aligned_freqs, conflict_freqs)
+    tags: list[str] = []
+    if grade == "conflict":
+        tags.append("周期冲突")
+    if grade in {"multi_period", "strong_resonance"}:
+        tags.append("多周期共振")
+    if grade == "strong_resonance":
+        tags.append("强共振")
+    if "周线" in aligned_freqs and "日线" in aligned_freqs:
+        tags.append("日周同向")
+    if any(freq in {"5分钟", "5min", "5m", "F5"} for freq in aligned_freqs):
+        tags.append("5m确认")
+    if not tags:
+        tags.append("硬技术")
+    side_text = "买点" if side == "buy" else "风险"
+    if grade == "conflict":
+        summary = f"{side_text}信号存在周期冲突：同向 {','.join(aligned_freqs) or primary_freq}；冲突 {','.join(conflict_freqs)}"
+    else:
+        summary = f"{side_text}信号获得 {','.join(aligned_freqs) or primary_freq} 确认"
+    return {
+        "direction": direction or side,
+        "primary_freq": primary_freq,
+        "aligned_freqs": aligned_freqs,
+        "conflict_freqs": conflict_freqs,
+        "grade": grade,
+        "tags": tags[:5],
+        "summary": summary[:240],
+        "latest_dt": latest_dt,
+    }
+
+
 def _details_dict(details: str) -> dict[str, Any]:
     if not details:
         return {}
@@ -129,14 +225,21 @@ def _scan_symbol(db: Database, symbol: str) -> list[dict[str, Any]]:
 
     scored = score_signals(_prefixed_symbol(symbol), events)
     now = naive_market_now("A")
-    buy_freqs = sorted({event.freq for event in events if _signal_side(event.signal_type, SIGNAL_WEIGHTS.get(event.signal_type, 0)) == "buy"})
-    sell_freqs = sorted({event.freq for event in events if _signal_side(event.signal_type, SIGNAL_WEIGHTS.get(event.signal_type, 0)) == "sell"})
+    buy_freqs = sorted({event.freq for event in events if _event_side(event, SIGNAL_WEIGHTS) == "buy"}, key=_freq_sort_key)
+    sell_freqs = sorted({event.freq for event in events if _event_side(event, SIGNAL_WEIGHTS) == "sell"}, key=_freq_sort_key)
     docs: list[dict[str, Any]] = []
     for event in events:
         base_score = float(SIGNAL_WEIGHTS.get(event.signal_type, 0)) * float(event.confidence or 0)
         side = _signal_side(event.signal_type, base_score)
         dt_value = event.dt.replace(tzinfo=None) if getattr(event.dt, "tzinfo", None) else event.dt
         dedupe_key = f"{_prefixed_symbol(symbol)}|{event.freq}|{event.signal_type}|{dt_value.isoformat()}"
+        resonance_context = _resonance_context(
+            events,
+            side=side,
+            primary_freq=str(event.freq or ""),
+            direction=scored.direction,
+            weights=SIGNAL_WEIGHTS,
+        )
         docs.append({
             "dedupe_key": dedupe_key,
             "symbol": _prefixed_symbol(symbol),
@@ -155,6 +258,7 @@ def _scan_symbol(db: Database, symbol: str) -> list[dict[str, Any]]:
             "direction": scored.direction,
             "confidence": float(event.confidence or 0),
             "resonance_freqs": buy_freqs if side == "buy" else sell_freqs,
+            "resonance_context": resonance_context,
             "technical_evidence": {
                 "signal_type": event.signal_type,
                 "freq": event.freq,
@@ -162,6 +266,7 @@ def _scan_symbol(db: Database, symbol: str) -> list[dict[str, Any]]:
                 "score_details": scored.details[:1600],
                 "bi_counts": bi_counts,
                 "direction": scored.direction,
+                "resonance_context": resonance_context,
             },
             "invalidates_when": "跌破信号触发价或上级周期转弱" if side == "buy" else "重新站回风险触发周期并出现买点确认",
             "source": "sync.technical_signal_scan",

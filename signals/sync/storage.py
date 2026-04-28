@@ -83,6 +83,8 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["chain_heat_snapshots"], [("market", ASCENDING), ("trade_minute", ASCENDING), ("rank", ASCENDING)])
     _safe_create_index(db["chain_heat_snapshots"], [("chain_id", ASCENDING), ("node_id", ASCENDING), ("trade_minute", ASCENDING)])
     _safe_create_index(db["minute_readiness"], [("trade_date", ASCENDING), ("domain", ASCENDING), ("symbol", ASCENDING), ("freq", ASCENDING)])
+    _safe_create_index(db["minute_preheat_universe"], [("trade_date", ASCENDING), ("status", ASCENDING), ("order", ASCENDING)])
+    _safe_create_index(db["minute_preheat_universe"], [("trade_date", ASCENDING), ("symbol", ASCENDING)], unique=True, sparse=True)
 
     for name in ("board_em", "board_ths", "board_sina", "concept_em", "concept_ths", "concept_sina"):
         _safe_create_index(db[name], [("expires_at", ASCENDING)], expireAfterSeconds=0)

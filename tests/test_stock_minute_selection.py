@@ -109,6 +109,36 @@ def test_postmarket_minute_scope_uses_expanded_candidate_cap(monkeypatch):
     assert stock_minute._selection_cap() == 360
 
 
+def test_postmarket_minute_selection_consumes_pending_universe_before_cached():
+    selected, skipped = stock_minute._select_postmarket_minute_symbols(
+        ["300001", "300002", "300003", "300004"],
+        {"300001", "300003"},
+        max_symbols=2,
+        pinned=set(),
+        last_runs={},
+        universe_states={
+            "300001": {"status": "cached"},
+            "300002": {"status": "pending"},
+            "300003": {"status": "error"},
+            "300004": {"status": "cached"},
+        },
+    )
+
+    assert selected == ["300003", "300002"]
+    assert skipped == [
+        {
+            "symbol": "300001",
+            "reason": "postmarket_universe_pending",
+            "next_due_hint": "next postmarket minute preheat rotation",
+        },
+        {
+            "symbol": "300004",
+            "reason": "postmarket_universe_pending",
+            "next_due_hint": "next postmarket minute preheat rotation",
+        },
+    ]
+
+
 def test_postmarket_minute_selection_merges_terminal_skipped_and_signal_sources(monkeypatch):
     monkeypatch.setenv("STOCK_MINUTE_SCOPE", "postmarket_candidates")
     monkeypatch.setenv("STOCK_MINUTE_POSTMARKET_MAX_CODES", "10")

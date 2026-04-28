@@ -10,12 +10,30 @@ from typing import Any
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
+from signals.sync.task_context import get_task_env
 
 logger = logging.getLogger("signals.sync.terminal_pool")
 
 SELL_TOKENS = ("卖", "顶", "风险", "死叉", "减仓", "跌破", "预警")
 CHAN_TOKENS = ("一买", "二买", "三买", "一卖", "二卖", "三卖", "背驰", "中枢", "笔", "线段")
 BUY_FREQ_BONUS = {"30分钟": 120, "30min": 120, "30m": 120, "15分钟": 110, "15min": 110, "15m": 110, "5分钟": 80, "5min": 80, "5m": 80}
+FREQ_ORDER = {
+    "周线": 0,
+    "weekly": 0,
+    "1w": 0,
+    "日线": 1,
+    "daily": 1,
+    "1d": 1,
+    "30分钟": 2,
+    "30min": 2,
+    "30m": 2,
+    "15分钟": 3,
+    "15min": 3,
+    "15m": 3,
+    "5分钟": 4,
+    "5min": 4,
+    "5m": 4,
+}
 REASON_WEIGHTS = {
     "user_pinned": 10000,
     "technical_signal": 880,
@@ -45,6 +63,11 @@ def _float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _freq_sort_key(freq: Any) -> tuple[int, str]:
+    text = _text(freq)
+    return FREQ_ORDER.get(text, FREQ_ORDER.get(text.lower(), 99)), text
 
 
 def _pure_a_code(symbol: Any) -> str:
@@ -107,6 +130,78 @@ def _reason_type_for_signal(row: dict[str, Any]) -> str:
     return "custom_signal"
 
 
+def _is_generated_daily_signal(row: dict[str, Any]) -> bool:
+    source = _text(row.get("source") or row.get("data_source")).lower()
+    signal_type = _text(row.get("signal_type") or row.get("type") or row.get("reason"))
+    freq = _text(row.get("freq") or row.get("timeframe"))
+    return (
+        source.startswith("sync.signal_pool.generated")
+        or signal_type.startswith("日线候选")
+        or signal_type.startswith("日线预警")
+        or (freq == "日线" and source.startswith("sync.signal_pool"))
+    )
+
+
+def _is_hard_screen_signal(row: dict[str, Any]) -> bool:
+    source = _text(row.get("source") or row.get("data_source")).lower()
+    if source.startswith("sqlite.backtest.signal_records"):
+        return True
+    if "czsc" in source or "chan" in source:
+        return True
+    signal_type = _signal_text(row)
+    return any(token in signal_type for token in CHAN_TOKENS)
+
+
+def _resonance_grade(aligned_freqs: list[str], conflict_freqs: list[str]) -> str:
+    if conflict_freqs:
+        return "conflict"
+    if len(aligned_freqs) >= 3:
+        return "strong_resonance"
+    if len(aligned_freqs) >= 2:
+        return "multi_period"
+    return "single_period"
+
+
+def _screen_resonance_context(signal: dict[str, Any], sibling_signals: list[dict[str, Any]]) -> dict[str, Any]:
+    side = _signal_side(signal)
+    primary_freq = _text(signal.get("freq") or signal.get("timeframe"))
+    aligned_freqs = sorted(
+        {_text(item.get("freq") or item.get("timeframe")) for item in sibling_signals if _is_hard_screen_signal(item) and _signal_side(item) == side},
+        key=_freq_sort_key,
+    )
+    conflict_freqs = sorted(
+        {_text(item.get("freq") or item.get("timeframe")) for item in sibling_signals if _is_hard_screen_signal(item) and _signal_side(item) != side},
+        key=_freq_sort_key,
+    )
+    aligned_freqs = [item for item in aligned_freqs if item]
+    conflict_freqs = [item for item in conflict_freqs if item]
+    grade = _resonance_grade(aligned_freqs, conflict_freqs)
+    tags: list[str] = []
+    if grade == "conflict":
+        tags.append("周期冲突")
+    if grade in {"multi_period", "strong_resonance"}:
+        tags.append("多周期共振")
+    if grade == "strong_resonance":
+        tags.append("强共振")
+    if "周线" in aligned_freqs and "日线" in aligned_freqs:
+        tags.append("日周同向")
+    if any(freq in {"5分钟", "5min", "5m"} for freq in aligned_freqs):
+        tags.append("5m确认")
+    if not tags:
+        tags.append("硬技术")
+    side_text = "买点" if side == "buy" else "风险"
+    return {
+        "direction": side,
+        "primary_freq": primary_freq,
+        "aligned_freqs": aligned_freqs or ([primary_freq] if primary_freq else []),
+        "conflict_freqs": conflict_freqs,
+        "grade": grade,
+        "tags": tags[:5],
+        "summary": f"{side_text}筛选信号：{','.join(aligned_freqs or [primary_freq])}",
+        "latest_dt": _text(signal.get("signal_date") or signal.get("updated_at"))[:10],
+    }
+
+
 def _source_doc_id(row: dict[str, Any]) -> str:
     return _text(row.get("_id") or row.get("dedupe_key") or row.get("action_id") or row.get("decision_id"))
 
@@ -140,6 +235,7 @@ def _empty_row(code: str, name: str = "") -> dict[str, Any]:
         "next_action": "观察",
         "invalidates_when": "入池条件失效或产业链热度回落",
         "technical_evidence": {},
+        "resonance_context": {},
         "knowledge_confirmation": {"status": "none"},
         "chain_context": {},
         "inclusion_reasons": [],
@@ -180,6 +276,7 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
         "board_or_concept": _text(reason.get("board_or_concept")),
         "as_of": _text(reason.get("as_of")),
         "evidence": reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {},
+        "resonance_context": reason.get("resonance_context") if isinstance(reason.get("resonance_context"), dict) else {},
         "knowledge_status": _text(reason.get("knowledge_status")),
     }
     key = _reason_key(normalized)
@@ -200,10 +297,13 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
             "node_id": top.get("node_id"),
             "board_or_concept": top.get("board_or_concept"),
         }
-    source_tag = top["reason_type"]
+    source_tag = reason_type
     if source_tag and source_tag not in row["source_tags"]:
         row["source_tags"].append(source_tag)
     if reason_type == "technical_signal":
+        resonance_context = normalized["resonance_context"]
+        if not resonance_context and isinstance(normalized["evidence"], dict):
+            resonance_context = normalized["evidence"].get("resonance_context") or {}
         row["technical_evidence"] = {
             "source_collection": normalized["source_collection"],
             "source_doc_id": normalized["source_doc_id"],
@@ -214,7 +314,10 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
             "confidence": normalized["confidence"],
             "as_of": normalized["as_of"],
             "evidence": normalized["evidence"],
+            "resonance_context": resonance_context,
         }
+        if resonance_context:
+            row["resonance_context"] = resonance_context
     if reason_type.startswith("knowledge_"):
         row["knowledge_confirmation"] = {
             "status": normalized.get("knowledge_status") or reason_type.replace("knowledge_", ""),
@@ -287,11 +390,32 @@ def _add_user_pinned(rows: dict[str, dict[str, Any]], index_codes: set[str], now
         }, index_codes=index_codes)
 
 
-def _add_signal_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str]) -> None:
+def _add_signal_rows(
+    rows: dict[str, dict[str, Any]],
+    db: Database,
+    index_codes: set[str],
+    *,
+    include_generated_daily: bool = False,
+    generated_daily_only: bool = False,
+) -> None:
     cursor = db["signals"].find({}).sort([("signal_date", -1), ("updated_at", -1)]).limit(500)
-    for signal in cursor:
+    signals = list(cursor)
+    by_code: dict[str, list[dict[str, Any]]] = {}
+    for signal in signals:
+        code = _pure_a_code(signal.get("symbol"))
+        if code:
+            by_code.setdefault(code, []).append(signal)
+    for signal in signals:
+        generated_daily = _is_generated_daily_signal(signal)
+        if generated_daily_only and not generated_daily:
+            continue
+        if generated_daily and not include_generated_daily:
+            continue
         signal_type = _text(signal.get("signal_type") or signal.get("type") or signal.get("reason"))
-        reason_type = _reason_type_for_signal(signal)
+        hard_screen_signal = _is_hard_screen_signal(signal) and not generated_daily
+        reason_type = "technical_signal" if hard_screen_signal else _reason_type_for_signal(signal)
+        code = _pure_a_code(signal.get("symbol"))
+        resonance_context = _screen_resonance_context(signal, by_code.get(code, [])) if hard_screen_signal else {}
         _add_reason(rows, signal.get("symbol"), {
             "reason_type": reason_type,
             "source_collection": "signals",
@@ -303,10 +427,12 @@ def _add_signal_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes:
             "score": _float(signal.get("score") or signal.get("total_score")),
             "confidence": _float(signal.get("confidence")),
             "as_of": _text(signal.get("signal_date") or signal.get("updated_at"))[:10],
+            "resonance_context": resonance_context,
             "evidence": {
                 "source": _text(signal.get("source")),
                 "dedupe_key": _text(signal.get("dedupe_key")),
                 "details": signal.get("details_json") if isinstance(signal.get("details_json"), dict) else {},
+                "resonance_context": resonance_context,
             },
         }, index_codes=index_codes, name=_text(signal.get("name")))
 
@@ -329,11 +455,15 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
             "updated_at": 1,
             "dedupe_key": 1,
             "technical_evidence": 1,
+            "resonance_context": 1,
             "invalidates_when": 1,
         },
     ).sort([("as_of", -1), ("updated_at", -1), ("total_score", -1), ("confidence", -1)]).limit(limit)
     for signal in cursor:
         evidence = signal.get("technical_evidence") if isinstance(signal.get("technical_evidence"), dict) else {}
+        resonance_context = signal.get("resonance_context") if isinstance(signal.get("resonance_context"), dict) else {}
+        if not resonance_context and isinstance(evidence, dict):
+            resonance_context = evidence.get("resonance_context") or {}
         _add_reason(rows, signal.get("symbol") or signal.get("raw_code"), {
             "reason_type": "technical_signal",
             "source_collection": "terminal_technical_signals",
@@ -345,6 +475,7 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
             "score": _float(signal.get("total_score") or signal.get("score")),
             "confidence": _float(signal.get("confidence")),
             "as_of": _text(signal.get("as_of") or signal.get("updated_at"))[:10],
+            "resonance_context": resonance_context,
             "evidence": evidence,
         }, index_codes=index_codes)
 
@@ -620,16 +751,19 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
 
     now = naive_market_now("A")
     stock_limit = int(os.getenv("TERMINAL_REALTIME_STOCK_LIMIT", "72"))
-    strict_sources = os.getenv("TERMINAL_POOL_STRICT_SOURCES", "false").strip().lower() in {"1", "true", "yes", "on"}
+    strict_sources = str(get_task_env("TERMINAL_POOL_STRICT_SOURCES", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
+    include_legacy_daily = os.getenv("TERMINAL_POOL_INCLUDE_LEGACY_DAILY", "false").strip().lower() in {"1", "true", "yes", "on"}
     index_codes = _index_codes()
     rows: dict[str, dict[str, Any]] = {}
 
     _add_user_pinned(rows, index_codes, now)
     _add_technical_signal_rows(rows, db, index_codes)
+    _add_signal_rows(rows, db, index_codes, include_generated_daily=False)
     _add_chain_rows(rows, db, index_codes)
     _add_knowledge_rows(rows, db, index_codes)
     if not strict_sources:
-        _add_signal_rows(rows, db, index_codes)
+        if include_legacy_daily:
+            _add_signal_rows(rows, db, index_codes, include_generated_daily=True, generated_daily_only=True)
         _add_strategy_rows(rows, db, index_codes)
         _add_active_pool(rows, db, index_codes)
         _add_recent_opened(rows, db, index_codes)
