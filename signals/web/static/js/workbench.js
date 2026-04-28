@@ -1,7 +1,7 @@
 const WB_STATE = {
   shell: null,
   cluster: null,
-  target: { label: '', kind: 'auto', freq: 'daily' },
+  target: { label: '', kind: 'auto', freq: '30min' },
   symbolData: null,
   backtestData: null,
   activeTab: 'backtest',
@@ -12,7 +12,7 @@ const WB_STATE = {
   retryTimer: null,
 };
 
-const WB_FREQS = ['daily', '30min', '15min', 'weekly', 'monthly'];
+const WB_FREQS = ['30min', '15min', '5min', 'daily', 'weekly'];
 
 function wbCssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -118,7 +118,7 @@ function wbReadUrlTarget() {
   return {
     label: symbol,
     kind: kind || 'auto',
-    freq: freq || 'daily',
+    freq: freq || '30min',
   };
 }
 
@@ -817,12 +817,13 @@ function wbRenderTrades(trade) {
 
 function wbUpdateFreqButtons(target) {
   const available = target.available_freqs || [];
+  const effective = target.effective_freq || target.requested_freq || WB_STATE.target.freq || '30min';
   document.querySelectorAll('.wb-freq-btn').forEach(btn => {
     const freq = btn.dataset.freq;
     btn.disabled = available.length ? !available.includes(freq) : false;
-    btn.classList.toggle('active', freq === target.effective_freq);
+    btn.classList.toggle('active', freq === effective);
   });
-  WB_STATE.target.freq = target.effective_freq;
+  WB_STATE.target.freq = effective;
 }
 
 async function wbLoadShell() {
@@ -1013,11 +1014,11 @@ function wbBindEvents() {
       document.getElementById('wb-search-input').focus();
       return;
     }
-    if (event.key === '1') document.querySelector('.wb-freq-btn[data-freq="daily"]')?.click();
-    if (event.key === '2') document.querySelector('.wb-freq-btn[data-freq="30min"]')?.click();
-    if (event.key === '3') document.querySelector('.wb-freq-btn[data-freq="15min"]')?.click();
-    if (event.key === '4') document.querySelector('.wb-freq-btn[data-freq="weekly"]')?.click();
-    if (event.key === '5') document.querySelector('.wb-freq-btn[data-freq="monthly"]')?.click();
+    if (event.key === '1') document.querySelector('.wb-freq-btn[data-freq="30min"]')?.click();
+    if (event.key === '2') document.querySelector('.wb-freq-btn[data-freq="15min"]')?.click();
+    if (event.key === '3') document.querySelector('.wb-freq-btn[data-freq="5min"]')?.click();
+    if (event.key === '4') document.querySelector('.wb-freq-btn[data-freq="daily"]')?.click();
+    if (event.key === '5') document.querySelector('.wb-freq-btn[data-freq="weekly"]')?.click();
   });
 }
 
@@ -1031,11 +1032,11 @@ async function wbBootstrap() {
     wbRenderBootState(WB_STATE.shell.session);
   }
   const deepLink = wbReadUrlTarget();
-  const target = deepLink || WB_STATE.shell?.default_target || { label: '沪深300', kind: 'index', freq: 'daily' };
+  const target = deepLink || WB_STATE.shell?.default_target || { label: '沪深300', kind: 'index', freq: '30min' };
   WB_STATE.target = {
     label: target.label,
     kind: target.kind || 'index',
-    freq: target.freq || 'daily',
+    freq: target.freq || '30min',
   };
   document.getElementById('wb-search-input').value = WB_STATE.target.label;
   await wbLoadSymbol(WB_STATE.target.label, WB_STATE.target.kind);

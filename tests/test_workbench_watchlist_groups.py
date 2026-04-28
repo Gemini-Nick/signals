@@ -328,3 +328,40 @@ def test_trader_task_queue_is_action_oriented():
     assert tasks[0]["action_label"] == "可试仓"
     assert tasks[0]["chart_target"]["kind"] == "stock"
     assert tasks[0]["invalidates_when"]
+
+
+def test_static_index_minute_request_does_not_fallback_to_daily(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (pd.DataFrame(), "index_bars"))
+    monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "miss"}})
+
+    payload = asyncio.run(workbench._build_static_index_target("上证指数", "sh000001", "30min"))
+
+    assert payload["target"]["requested_freq"] == "30min"
+    assert payload["target"]["effective_freq"] == "30min"
+    assert payload["target"]["not_ready_reason"] == "index_minute_not_ready"
+    assert payload["chart"]["meta"]["fallback_reason"] == ""
+    assert payload["chart"]["meta"]["not_ready_reason"] == "index_minute_not_ready"
+
+
+def test_stock_minute_request_does_not_fallback_to_daily(monkeypatch):
+    from signals.web.api import workbench
+
+    class FakeEngine:
+        def get_status(self):
+            return {"ready": True, "active_markets": ["A"]}
+
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (pd.DataFrame(), "bars"))
+    monkeypatch.setattr(workbench, "_merge_signal_pool_into_chart", lambda chart, symbol, freq: chart)
+    monkeypatch.setattr(workbench, "analyze_stock", lambda symbol: {"symbol": symbol, "name": "测试股份"})
+    monkeypatch.setattr(workbench, "_ensure_engine", lambda: FakeEngine())
+    monkeypatch.setattr(workbench, "_review_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "miss"}})
+
+    payload = asyncio.run(workbench._build_stock_target("SH.600000", "600000", "30min"))
+
+    assert payload["target"]["requested_freq"] == "30min"
+    assert payload["target"]["effective_freq"] == "30min"
+    assert payload["target"]["not_ready_reason"] == "stock_minute_not_ready"
+    assert payload["chart"]["meta"]["fallback_reason"] == ""

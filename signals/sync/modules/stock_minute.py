@@ -5,11 +5,12 @@ A股分钟线同步 — 活跃标的 5M/15M/30M 增量同步
 数据源: Sina/Tencent 公共分钟线；东财分钟线可显式开启为最后兜底
 策略: 增量同步，仅白名单 + 最近入池标的（~200只上限）
 频率: 工作日 16:00
-注意: 公共分钟线返回滚动窗口数据，直接全量覆盖
+注意: 公共分钟线返回滚动窗口数据；盘中只取尾窗并写入新 bar
 """
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import akshare as ak
 import pandas as pd
@@ -27,6 +28,32 @@ _PUBLIC_TIMEOUT = float(os.getenv("STOCK_MINUTE_TIMEOUT", "5"))
 _MINUTE_FREQS = ["5分钟", "15分钟", "30分钟"]
 _ENABLE_EASTMONEY_FALLBACK = os.getenv("STOCK_MINUTE_EASTMONEY_FALLBACK", "false").lower() == "true"
 _DEFAULT_PRIORITY_CODES = "688802,300575"
+_DEFAULT_TAIL_COUNTS = {"5分钟": 240, "15分钟": 160, "30分钟": 120}
+
+
+def _int_env(name: str, default: int, *, min_value: int = 1, max_value: int | None = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def _worker_count() -> int:
+    return _int_env("STOCK_MINUTE_WORKERS", 3, min_value=1, max_value=6)
+
+
+def _tail_count_for_freq(freq: str) -> int:
+    suffix_map = {"5分钟": "5", "15分钟": "15", "30分钟": "30"}
+    default = _DEFAULT_TAIL_COUNTS.get(freq, 120)
+    generic = _int_env("STOCK_MINUTE_TAIL_COUNT", default, min_value=40, max_value=500)
+    suffix = suffix_map.get(freq)
+    if not suffix:
+        return generic
+    return _int_env(f"STOCK_MINUTE_TAIL_COUNT_{suffix}", generic, min_value=40, max_value=500)
 
 
 def _index_codes() -> set[str]:
@@ -135,8 +162,7 @@ def _select_symbols_with_priority(
         return ordered, []
     priority_ordered = [code for code in ordered if code in priority]
     normal_ordered = [code for code in ordered if code not in priority]
-    remaining = max(0, max_symbols - len(priority_ordered))
-    selected = [*priority_ordered, *normal_ordered[:remaining]]
+    selected = [*priority_ordered, *normal_ordered][:max_symbols]
     selected_set = set(selected)
     skipped = [
         {"symbol": code, "reason": "cap_exceeded", "next_due_hint": "next signal_lane cycle"}
@@ -182,6 +208,14 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
         default=os.getenv("STOCK_MINUTE_DEFAULT_PRIORITY_CODES", _DEFAULT_PRIORITY_CODES),
     ):
         add(symbol, "priority_codes", priority=True)
+
+    terminal_pool = db["terminal_realtime_pool"].find_one(
+        {"pool": "terminal_realtime", "market": "A"},
+        {"stocks": 1},
+        sort=[("updated_at", -1)],
+    ) or {}
+    for symbol in terminal_pool.get("stocks") or []:
+        add(symbol, "terminal_realtime_pool", priority=True)
 
     for symbol in getattr(config, "WHITELIST", []):
         add(symbol, "whitelist", priority=True)
@@ -231,14 +265,21 @@ def _get_active_symbols(db: Database) -> list:
     return _get_active_symbols_with_meta(db)[0]
 
 
-def _sync_one_minute(code: str, freq: str, proxy_url: str = None) -> list:
+def _sync_one_minute(code: str, freq: str, proxy_url: str = None, *, tail_count: int | None = None) -> list:
     """同步单只股票分钟线"""
     period_map = {"5分钟": "5", "15分钟": "15", "30分钟": "30"}
     period = period_map.get(freq, "30")
     source = "eastmoney"
+    tail_count = tail_count or _tail_count_for_freq(freq)
 
     try:
-        df, source = fetch_public_minute(stock_to_market_symbol(code), period, timeout=_PUBLIC_TIMEOUT)
+        df, source = fetch_public_minute(
+            stock_to_market_symbol(code),
+            period,
+            timeout=_PUBLIC_TIMEOUT,
+            datalen=tail_count,
+            count=tail_count,
+        )
     except Exception as public_error:
         if not _ENABLE_EASTMONEY_FALLBACK:
             logger.warning("公共分钟线失败，跳过东财兜底 %s %s: %s", code, freq, public_error)
@@ -266,13 +307,38 @@ def _sync_one_minute(code: str, freq: str, proxy_url: str = None) -> list:
     return docs
 
 
+def _insert_new_minute_docs(bars_col, code: str, freq: str, docs: list[dict]) -> dict:
+    if not docs:
+        return {"written": 0, "bar_count": 0, "last_dt": None}
+
+    latest_before = bars_col.find_one(
+        {"meta.symbol": code, "meta.freq": freq},
+        {"dt": 1},
+        sort=[("dt", -1)],
+    )
+    latest_dt = latest_before.get("dt") if latest_before else None
+    new_docs = [doc for doc in docs if latest_dt is None or doc["dt"] > latest_dt]
+    written = 0
+    if new_docs:
+        result = bars_col.insert_many(new_docs, ordered=False)
+        written = len(result.inserted_ids)
+    return {
+        "written": written,
+        "inserted": written,
+        "skipped_existing": len(docs) - len(new_docs),
+        "bar_count": len(docs),
+        "last_dt": docs[-1]["dt"],
+        "latest_before": latest_dt,
+    }
+
+
 @sync_retry
 def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
     """
     A 股分钟线增量同步。
 
     仅同步白名单 + 最近活跃标的的 5M、15M 和 30M 数据。
-    公共分钟线返回滚动窗口，直接全量写入（小数据量）。
+    公共分钟线返回滚动窗口；盘中只拉尾窗并插入新 bar，避免删整段重插。
     """
     bars_col = db["bars"]
     sync_col = db["sync_log"]
@@ -280,42 +346,88 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
     symbols, selection_meta = _get_active_symbols_with_meta(db)
     logger.info(f"分钟线同步: {len(symbols)} 只活跃标的")
 
-    total_inserted = 0
+    workers = _worker_count()
+    tail_counts = {freq: _tail_count_for_freq(freq) for freq in _MINUTE_FREQS}
+    total_written = 0
+    total_skipped_existing = 0
+    empty = 0
     errors = []
+    tasks = [(code, freq) for code in symbols for freq in _MINUTE_FREQS]
 
-    for code in symbols:
-        for freq in _MINUTE_FREQS:
+    def sync_one(code: str, freq: str) -> dict:
+        started = time.monotonic()
+        docs = _sync_one_minute(code, freq, proxy_url, tail_count=tail_counts[freq])
+        time.sleep(_CALL_INTERVAL)
+        if not docs:
+            sync_col.update_one(
+                {"_id": f"stock_minute:{code}:{freq}"},
+                {"$set": {
+                    "module": "stock_minute",
+                    "symbol": code,
+                    "freq": freq,
+                    "last_run": naive_market_now("A"),
+                    "status": "empty",
+                    "incremental": True,
+                    "write_mode": "insert_new",
+                    "tail_count": tail_counts[freq],
+                    "elapsed": round(time.monotonic() - started, 3),
+                }},
+                upsert=True,
+            )
+            return {"code": code, "freq": freq, "status": "empty", "written": 0, "skipped_existing": 0}
+
+        write_result = _insert_new_minute_docs(bars_col, code, freq, docs)
+        sync_col.update_one(
+            {"_id": f"stock_minute:{code}:{freq}"},
+            {"$set": {
+                "module": "stock_minute",
+                "symbol": code,
+                "freq": freq,
+                "last_dt": write_result["last_dt"],
+                "last_run": naive_market_now("A"),
+                "status": "ok",
+                "bar_count": write_result["bar_count"],
+                "written": write_result["written"],
+                "inserted": write_result["inserted"],
+                "skipped_existing": write_result["skipped_existing"],
+                "incremental": True,
+                "write_mode": "insert_new",
+                "tail_count": tail_counts[freq],
+                "latest_before": write_result.get("latest_before"),
+                "source": docs[-1].get("meta", {}).get("source"),
+                "elapsed": round(time.monotonic() - started, 3),
+            }},
+            upsert=True,
+        )
+        return {"code": code, "freq": freq, "status": "ok", **write_result}
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {executor.submit(sync_one, code, freq): (code, freq) for code, freq in tasks}
+        for future in as_completed(future_map):
+            code, freq = future_map[future]
             try:
-                docs = _sync_one_minute(code, freq, proxy_url)
-                time.sleep(_CALL_INTERVAL)
-
-                if not docs:
-                    continue
-
-                # 删除该标的该频率的旧数据，重新插入（滚动窗口，全量覆盖更安全）
-                bars_col.delete_many({
-                    "meta.symbol": code,
-                    "meta.freq": freq,
-                })
-                bars_col.insert_many(docs, ordered=False)
-                total_inserted += len(docs)
-
+                result = future.result()
+                if result.get("status") == "empty":
+                    empty += 1
+                total_written += int(result.get("written") or 0)
+                total_skipped_existing += int(result.get("skipped_existing") or 0)
+            except Exception as e:
+                errors.append((code, freq, str(e)))
                 sync_col.update_one(
                     {"_id": f"stock_minute:{code}:{freq}"},
                     {"$set": {
                         "module": "stock_minute",
                         "symbol": code,
-                        "last_dt": docs[-1]["dt"],
+                        "freq": freq,
                         "last_run": naive_market_now("A"),
-                        "status": "ok",
-                        "bar_count": len(docs),
-                        "source": docs[-1].get("meta", {}).get("source"),
+                        "status": "error",
+                        "error": str(e)[:300],
+                        "incremental": True,
+                        "write_mode": "insert_new",
+                        "tail_count": tail_counts.get(freq),
                     }},
                     upsert=True,
                 )
-
-            except Exception as e:
-                errors.append((code, freq, str(e)))
 
     skipped_symbols = selection_meta.get("skipped_symbols") or []
     sync_col.update_one(
@@ -331,16 +443,36 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
             "source_counts": selection_meta.get("source_counts") or {},
             "max_symbols": selection_meta.get("max_symbols"),
             "candidate_count": selection_meta.get("candidate_count"),
+            "workers": workers,
+            "tail_counts": tail_counts,
+            "incremental": True,
+            "write_mode": "insert_new",
+            "planned_calls": len(tasks),
+            "empty_calls": empty,
+            "failed_calls": len(errors),
+            "written": total_written,
+            "skipped_existing": total_skipped_existing,
         }},
         upsert=True,
     )
 
-    logger.info(f"分钟线完成: +{total_inserted} bars, {len(errors)} 失败, {len(skipped_symbols)} cap跳过")
+    logger.info(
+        "分钟线完成: %d calls, inserted=%d skipped_existing=%d empty=%d failed=%d, %d cap跳过",
+        len(tasks), total_written, total_skipped_existing, empty, len(errors), len(skipped_symbols),
+    )
     return {
-        "inserted": total_inserted,
+        "inserted": total_written,
+        "written": total_written,
+        "skipped_existing": total_skipped_existing,
         "errors": len(errors),
+        "empty": empty,
         "selected": len(symbols),
         "priority": len(selection_meta.get("priority_symbols") or []),
         "skipped": len(skipped_symbols),
         "skipped_symbols": skipped_symbols[:20],
+        "workers": workers,
+        "tail_counts": tail_counts,
+        "planned_calls": len(tasks),
+        "incremental": True,
+        "write_mode": "insert_new",
     }

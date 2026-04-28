@@ -143,15 +143,17 @@ def fetch_public_minute(
     *,
     providers: Iterable[str] = ("sina", "tencent"),
     timeout: float = 10.0,
+    datalen: int | None = None,
+    count: int | None = None,
 ) -> tuple[pd.DataFrame, str]:
     """Fetch public minute bars and return (dataframe, provider)."""
     errors: list[str] = []
     for provider in providers:
         try:
             if provider == "sina":
-                df = fetch_sina_minute(symbol, period, timeout=timeout)
+                df = fetch_sina_minute(symbol, period, timeout=timeout, datalen=datalen or 1970)
             elif provider == "tencent":
-                df = fetch_tencent_minute(symbol, period, timeout=timeout)
+                df = fetch_tencent_minute(symbol, period, timeout=timeout, count=count or 320)
             else:
                 raise ValueError(f"unknown minute provider: {provider}")
             if df is not None and not df.empty:

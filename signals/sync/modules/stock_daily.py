@@ -186,6 +186,14 @@ def _get_active_stock_codes(db: Database) -> list[str]:
     ):
         add(symbol, priority=True)
 
+    terminal_pool = db["terminal_realtime_pool"].find_one(
+        {"pool": "terminal_realtime", "market": "A"},
+        {"stocks": 1},
+        sort=[("updated_at", -1)],
+    ) or {}
+    for symbol in terminal_pool.get("stocks") or []:
+        add(symbol, priority=True)
+
     for symbol in getattr(config, "WHITELIST", []):
         add(symbol, priority=True)
 
@@ -236,6 +244,8 @@ def _get_stock_codes(db: Database) -> tuple[list[str], str]:
 
     codes = _get_active_stock_codes(db)
     if codes:
+        if os.getenv("STOCK_DAILY_ONLY_CODES", "").strip():
+            return codes, "manual_only_codes"
         return codes, "active"
 
     return _get_all_stock_codes(), "all_fallback"
@@ -464,4 +474,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         "errors": len(errors),
         "scope": scope,
         "codes": len(codes),
+        "expected_codes": len(codes),
+        "covered_codes": max(0, len(codes) - len(errors)),
+        "coverage_pct": round((max(0, len(codes) - len(errors)) / len(codes) * 100), 2) if codes else 0,
     }

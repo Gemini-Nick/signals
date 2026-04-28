@@ -533,12 +533,16 @@ def get_index_bars(request: DataRequest) -> DataResponse:
             is_stale=stale,
             latency_ms=_elapsed_ms(start),
         )
-    response = get_kline(request)
-    response.source = response.source if response.source == "bars" else f"index_bars->{response.source}"
-    response.latency_ms = _elapsed_ms(start)
-    if response.source == "bars":
-        _write_data_freshness("index", mode, "bars", response.as_of, "index_bars_empty_bars_compat")
-    return response
+    _write_data_freshness("index", mode, "index_bars", None, "index_bars_cache_empty", "empty")
+    return DataResponse(
+        pd.DataFrame(),
+        mode_used=mode,
+        source="index_bars",
+        freshness="empty",
+        is_stale=True,
+        latency_ms=_elapsed_ms(start),
+        errors=["index_bars_cache_empty", "runtime_provider_fetch_disabled"],
+    )
 
 
 def get_quote_snapshot(request: DataRequest) -> DataResponse:

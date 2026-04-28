@@ -17,6 +17,11 @@ def test_schedule_not_due_before_scheduled_weekday():
     assert SyncEngine._schedule_due("16:30 weekday", now) is False
 
 
+def test_schedule_window_is_only_due_inside_window():
+    assert SyncEngine._schedule_due("16:00-17:30 weekday", datetime(2026, 4, 24, 16, 1)) is True
+    assert SyncEngine._schedule_due("16:00-17:30 weekday", datetime(2026, 4, 24, 17, 31)) is False
+
+
 def test_sunday_schedule_only_on_sunday():
     sunday = datetime(2026, 4, 26, 10, 1)
     friday = datetime(2026, 4, 24, 10, 1)
@@ -129,7 +134,7 @@ def test_live_plan_uses_lane_specific_interval():
         "status": "ok",
         "last_run": now - timedelta(seconds=65),
     }
-    sync_log.docs["board_ranking:A:_meta"] = {
+    sync_log.docs["board_heat_minute:A:_meta"] = {
         "status": "ok",
         "last_run": now - timedelta(minutes=10),
     }
@@ -137,7 +142,7 @@ def test_live_plan_uses_lane_specific_interval():
     engine.db = _FakeDb({"sync_log": sync_log})
 
     assert engine._has_run_recent("quote_snapshots", "A", now, interval_seconds=60) is False
-    assert engine._has_run_recent("board_ranking", "A", now, interval_seconds=30 * 60) is True
+    assert engine._has_run_recent("board_heat_minute", "A", now, interval_seconds=30 * 60) is True
 
 
 def test_mark_market_unavailable_is_explicit():
@@ -182,6 +187,68 @@ def test_lane_filtered_daemon_only_runs_matching_live_plans():
     assert [item["module"] for item in results] == ["quote_snapshots"]
 
 
+def test_signal_lane_intraday_runs_readiness_probe():
+    engine = object.__new__(SyncEngine)
+    engine.enabled_lanes = {"signal_lane"}
+    engine.db = _FakeDb({"sync_log": _FakeCollection(), "minute_readiness": _FakeCollection(count=1)})
+    calls = []
+
+    def stock_fn(db, proxy_url=None):
+        calls.append("stock_minute")
+        return {"inserted": 1}
+
+    def index_fn(db, proxy_url=None):
+        calls.append("index_minute")
+        return {"inserted": 1}
+
+    def readiness_fn(db, proxy_url=None):
+        calls.append("minute_readiness_probe")
+        return {"inserted": 1}
+
+    engine.module_map = {
+        "stock_minute": (stock_fn, ""),
+        "index_minute": (index_fn, ""),
+        "minute_readiness_probe": (readiness_fn, ""),
+    }
+    engine.proxy_url = None
+
+    results = engine._run_intraday_bundle({Market.A}, datetime(2026, 4, 27, 10, 0))
+
+    assert calls == ["index_minute", "stock_minute", "minute_readiness_probe"]
+    assert [item["module"] for item in results] == calls
+
+
+def test_board_lane_intraday_runs_heat_not_board_cons():
+    engine = object.__new__(SyncEngine)
+    engine.enabled_lanes = {"board_lane"}
+    engine.db = _FakeDb({"sync_log": _FakeCollection(), "board_heat_ticks": _FakeCollection(count=1)})
+    calls = []
+
+    def board_heat(db, proxy_url=None):
+        calls.append("board_heat_minute")
+        return {"inserted": 1}
+
+    def concept_heat(db, proxy_url=None):
+        calls.append("concept_heat_minute")
+        return {"inserted": 1}
+
+    def board_cons(db, proxy_url=None):
+        calls.append("board_cons")
+        return {"inserted": 1}
+
+    engine.module_map = {
+        "board_heat_minute": (board_heat, ""),
+        "concept_heat_minute": (concept_heat, ""),
+        "board_cons": (board_cons, ""),
+    }
+    engine.proxy_url = None
+
+    results = engine._run_intraday_bundle({Market.A}, datetime(2026, 4, 27, 10, 0))
+
+    assert calls == ["board_heat_minute", "concept_heat_minute"]
+    assert [item["module"] for item in results] == calls
+
+
 def test_lane_unavailable_state_is_throttled_per_lane():
     sync_log = _FakeCollection()
     freshness = _FakeCollection()
@@ -213,13 +280,13 @@ def test_workbench_lane_runs_scheduled_daily_maintenance():
         calls.append("stock_daily")
         return {"inserted": 1}
 
-    def board_cons(db, proxy_url=None):
-        calls.append("board_cons")
-        return {"status": "partial", "inserted": 0}
+    def weekly_rollup(db, proxy_url=None):
+        calls.append("weekly_rollup")
+        return {"inserted": 1}
 
     engine.modules = [
-        ("stock_daily", stock_daily, "16:30 weekday"),
-        ("board_cons", board_cons, "16:30 weekday"),
+        ("stock_daily", stock_daily, "16:00-17:30 weekday"),
+        ("weekly_rollup", weekly_rollup, "17:30-18:00 weekday"),
     ]
     engine.module_map = {name: (fn, schedule) for name, fn, schedule in engine.modules}
 

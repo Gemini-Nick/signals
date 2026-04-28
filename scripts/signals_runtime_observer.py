@@ -7,9 +7,10 @@ import argparse
 import json
 import os
 import subprocess
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 DEFAULT_LABEL = "com.zhangqilong.ai.signals.runtime"
@@ -28,16 +29,22 @@ MODULES = [
     "quote_snapshots",
     "index_minute",
     "stock_minute",
+    "minute_readiness_probe",
     "market_pools",
     "strategy_snapshot",
+    "board_heat_minute",
+    "concept_heat_minute",
     "board_ranking",
     "stock_daily",
     "index_daily",
+    "weekly_rollup",
+    "terminal_realtime_pool",
     "cache_preheat",
     "signal_pool",
     "board_cons",
 ]
-FREQS = ["日线", "5分钟", "15分钟", "30分钟"]
+FREQS = ["5分钟", "15分钟", "30分钟", "日线", "周线"]
+TZ_BEIJING = ZoneInfo("Asia/Shanghai")
 
 
 def _json_default(value: Any) -> str:
@@ -116,6 +123,21 @@ def _db():
     return get_db()
 
 
+def _runtime_mode() -> dict[str, Any]:
+    now = datetime.now(TZ_BEIJING)
+    weekday = now.weekday() < 5
+    current = now.time()
+    intraday = weekday and time(9, 15) <= current <= time(15, 5)
+    postmarket = weekday and time(15, 5) < current <= time(23, 30)
+    mode = "intraday_low_latency" if intraday else "postmarket_backfill" if postmarket else "off_hours"
+    return {
+        "mode": mode,
+        "beijing_time": now.isoformat(timespec="seconds"),
+        "intraday": intraday,
+        "postmarket": postmarket,
+    }
+
+
 def _module_meta(db) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for module in MODULES:
@@ -146,6 +168,39 @@ def _provider_health(db) -> list[dict[str, Any]]:
         {},
         {"_id": 0, "provider": 1, "endpoint": 1, "domain": 1, "status": 1, "ok": 1, "updated_at": 1, "error": 1, "error_msg": 1},
     ).sort("updated_at", -1).limit(40))
+
+
+def _readiness(db) -> dict[str, Any]:
+    rows = list(db["minute_readiness"].find(
+        {},
+        {"_id": 0, "domain": 1, "symbol": 1, "freq": 1, "status": 1, "latest_dt": 1, "root_cause_class": 1},
+    ).sort("checked_at", -1).limit(120))
+    summary: dict[str, dict[str, int]] = {}
+    for row in rows:
+        domain = row.get("domain") or "unknown"
+        item = summary.setdefault(domain, {"ready": 0, "not_ready": 0})
+        if row.get("status") == "ready":
+            item["ready"] += 1
+        else:
+            item["not_ready"] += 1
+    return {"summary": summary, "rows": rows}
+
+
+def _board_heat_probe(db) -> dict[str, Any]:
+    rows = []
+    for kind in ("industry", "concept"):
+        latest = db["board_heat_ticks"].find_one(
+            {"kind": kind},
+            {"trade_minute": 1, "source": 1},
+            sort=[("trade_minute", -1)],
+        ) or {}
+        rows.append({
+            "kind": kind,
+            "count": db["board_heat_ticks"].count_documents({"kind": kind}),
+            "latest_dt": latest.get("trade_minute"),
+            "source": latest.get("source", ""),
+        })
+    return {"rows": rows}
 
 
 def _normalize_stock_symbol(symbol: str) -> list[str]:
@@ -221,6 +276,7 @@ def build_snapshot(args: argparse.Namespace) -> dict[str, Any]:
     pid_dir = Path(args.pid_dir)
     snapshot: dict[str, Any] = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "runtime_mode": _runtime_mode(),
         "launchd": _launchd_status(args.label),
         "processes": {
             "web": _pid_status("web", pid_dir / "signals-web.pid"),
@@ -248,6 +304,8 @@ def build_snapshot(args: argparse.Namespace) -> dict[str, Any]:
             "freshness": _freshness(db),
             "provider_health": _provider_health(db),
             "symbol_probe": _symbol_probe(db, args.symbols),
+            "readiness": _readiness(db),
+            "board_heat": _board_heat_probe(db),
         }
     except Exception as exc:
         snapshot["mongo"] = {"available": False, "error": f"{exc.__class__.__name__}: {exc}"}
@@ -256,6 +314,8 @@ def build_snapshot(args: argparse.Namespace) -> dict[str, Any]:
 
 def print_human(snapshot: dict[str, Any]) -> None:
     print(f"Signals observer @ {snapshot['generated_at']}")
+    runtime_mode = snapshot.get("runtime_mode") or {}
+    print(f"mode: {runtime_mode.get('mode')} BJ={runtime_mode.get('beijing_time')}")
     launchd = snapshot.get("launchd") or {}
     print(f"launchd {launchd.get('label')}: state={launchd.get('state', '')} pid={launchd.get('pid', '')} runs={launchd.get('runs', '')} last_exit={launchd.get('last_exit_code', '')}")
     web = (snapshot.get("processes") or {}).get("web") or {}
@@ -273,6 +333,12 @@ def print_human(snapshot: dict[str, Any]) -> None:
     for item in mongo.get("symbol_probe", []):
         freqs = ", ".join(f"{row['collection']}:{row['symbol']}:{row['freq']}@{_json_default(row.get('latest_dt'))}" for row in item.get("freqs", []))
         print(f"- {item['input']} active={item['active_pool_member']} strategy={item['strategy_candidate']} {freqs or 'MISS'}")
+    print("\nreadiness:")
+    for domain, item in (mongo.get("readiness") or {}).get("summary", {}).items():
+        print(f"- {domain}: ready={item.get('ready', 0)} not_ready={item.get('not_ready', 0)}")
+    print("\nboard heat:")
+    for item in (mongo.get("board_heat") or {}).get("rows", []):
+        print(f"- {item.get('kind')}: count={item.get('count')} latest={_json_default(item.get('latest_dt'))} source={item.get('source')}")
 
 
 def main() -> int:

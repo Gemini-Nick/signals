@@ -78,7 +78,7 @@ def test_realtime_concept_reads_snapshot_without_provider(monkeypatch):
     response = gateway.get_concept_rank(DataRequest(
         domain="concept",
         mode="realtime",
-        as_of="today",
+        as_of="2026-04-24",
     ))
 
     assert response.mode_used == "realtime"
@@ -168,6 +168,28 @@ def test_index_bars_prefers_index_collection(monkeypatch):
 
     assert response.source == "index_bars"
     assert response.freshness == "fresh"
+    assert calls == ["index_bars"]
+
+
+def test_index_bars_do_not_fallback_to_stock_bars(monkeypatch):
+    from signals.data import gateway
+
+    calls = []
+
+    def fake_load(collection, symbol, freq):
+        calls.append(collection)
+        return pd.DataFrame(), ""
+
+    monkeypatch.setattr(gateway, "_load_bars_from_collection", fake_load)
+    monkeypatch.setattr(gateway, "_write_data_freshness", lambda *a, **k: None)
+
+    response = gateway.get_index_bars(
+        DataRequest(domain="index", mode="historical", symbol="sh000001", freq="30m", as_of="2026-04-23")
+    )
+
+    assert response.source == "index_bars"
+    assert response.freshness == "empty"
+    assert "index_bars_cache_empty" in response.errors
     assert calls == ["index_bars"]
 
 

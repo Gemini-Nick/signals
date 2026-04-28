@@ -46,6 +46,11 @@ MODULE_TARGETS = {
     "stock_minute": ("bars",),
     "index_minute": ("index_bars",),
     "board_ranking": ("board_ranking", "concept_ranking"),
+    "board_heat_minute": ("board_heat_ticks",),
+    "concept_heat_minute": ("board_heat_ticks",),
+    "minute_readiness_probe": ("minute_readiness",),
+    "weekly_rollup": ("bars", "index_bars"),
+    "terminal_realtime_pool": ("terminal_realtime_pool",),
     "board_cons": ("board_constituents", "concept_constituents"),
 }
 
@@ -55,6 +60,9 @@ COLLECTION_DOMAINS = {
     "index_bars": "index",
     "board_ranking": "board",
     "concept_ranking": "concept",
+    "board_heat_ticks": "board_heat",
+    "minute_readiness": "readiness",
+    "terminal_realtime_pool": "terminal_pool",
     "board_constituents": "constituents",
     "concept_constituents": "constituents",
     "quote_snapshots": "quote",
@@ -68,6 +76,9 @@ REALTIME_MODULES = {
     "quote_snapshots",
     "stock_minute",
     "index_minute",
+    "board_heat_minute",
+    "concept_heat_minute",
+    "minute_readiness_probe",
     "board_ranking",
     "strategy_snapshot",
 }
@@ -93,7 +104,7 @@ INTRADAY_STALE_SECONDS = max(
 QUOTE_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_QUOTE_INTERVAL_SECONDS", 60)
 SIGNAL_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_SIGNAL_INTERVAL_SECONDS", 5 * 60)
 WORKBENCH_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_WORKBENCH_INTERVAL_SECONDS", 10 * 60)
-BOARD_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_BOARD_INTERVAL_SECONDS", 30 * 60)
+BOARD_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_BOARD_INTERVAL_SECONDS", 5 * 60)
 
 
 @dataclass(frozen=True)
@@ -115,9 +126,11 @@ LIVE_SYNC_PLANS = {
         LiveSyncPlan("quote_snapshots", "quote_lane", QUOTE_LANE_INTERVAL_SECONDS, _lane_stale(QUOTE_LANE_INTERVAL_SECONDS, 3), 45, 10),
         LiveSyncPlan("index_minute", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 120, 20),
         LiveSyncPlan("stock_minute", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 240, 30),
+        LiveSyncPlan("minute_readiness_probe", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 60, 35),
         LiveSyncPlan("market_pools", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 60, 40),
         LiveSyncPlan("strategy_snapshot", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 90, 50),
-        LiveSyncPlan("board_ranking", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 2), 240, 60),
+        LiveSyncPlan("board_heat_minute", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 180, 60),
+        LiveSyncPlan("concept_heat_minute", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 180, 65),
     ),
     # HK/US slots are explicit and independently throttled. Data-source modules
     # can be plugged in here without affecting the A-share live bundle.
@@ -136,13 +149,20 @@ LIVE_PLAN_BY_MODULE = {
 }
 
 LANE_MAINTENANCE_PLANS = {
-    "cache_preheat": LiveSyncPlan("cache_preheat", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 180, 10),
-    "signal_pool": LiveSyncPlan("signal_pool", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 20),
+    "stock_minute": LiveSyncPlan("stock_minute", "signal_lane", 24 * 60 * 60, 60 * 60, 240, 5),
+    "index_minute": LiveSyncPlan("index_minute", "signal_lane", 24 * 60 * 60, 60 * 60, 120, 6),
+    "board_heat_minute": LiveSyncPlan("board_heat_minute", "board_lane", 24 * 60 * 60, 60 * 60, 180, 7),
+    "concept_heat_minute": LiveSyncPlan("concept_heat_minute", "board_lane", 24 * 60 * 60, 60 * 60, 180, 8),
+    "minute_readiness_probe": LiveSyncPlan("minute_readiness_probe", "signal_lane", 24 * 60 * 60, 60 * 60, 60, 9),
     "stock_daily": LiveSyncPlan("stock_daily", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 900, 30),
     "index_daily": LiveSyncPlan("index_daily", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 40),
-    "strategy_snapshot": LiveSyncPlan("strategy_snapshot", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 120, 50),
+    "weekly_rollup": LiveSyncPlan("weekly_rollup", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 600, 45),
     "board_ranking": LiveSyncPlan("board_ranking", "board_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 60),
     "board_cons": LiveSyncPlan("board_cons", "board_lane", 24 * 60 * 60, 6 * 60 * 60, 900, 70),
+    "signal_pool": LiveSyncPlan("signal_pool", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 80),
+    "strategy_snapshot": LiveSyncPlan("strategy_snapshot", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 120, 90),
+    "terminal_realtime_pool": LiveSyncPlan("terminal_realtime_pool", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 120, 95),
+    "cache_preheat": LiveSyncPlan("cache_preheat", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 180, 100),
 }
 
 BOOTSTRAP_LANE_MODULES = {
@@ -151,8 +171,13 @@ BOOTSTRAP_LANE_MODULES = {
     "cache_preheat": {"workbench_lane"},
     "signal_pool": {"workbench_lane"},
     "index_daily": {"workbench_lane"},
+    "weekly_rollup": {"workbench_lane"},
+    "terminal_realtime_pool": {"workbench_lane"},
     "strategy_snapshot": {"workbench_lane"},
     "board_ranking": {"board_lane"},
+    "board_heat_minute": {"board_lane"},
+    "concept_heat_minute": {"board_lane"},
+    "minute_readiness_probe": {"signal_lane"},
     "board_cons": {"board_lane"},
 }
 
@@ -293,6 +318,8 @@ class SyncEngine:
         sync_log = self.db["sync_log"]
         start_time = self._now()
         meta_id = self._meta_id(name, market)
+        if name == "stock_daily" and os.getenv("STOCK_DAILY_ONLY_CODES", "").strip() and not market:
+            meta_id = self._meta_id("stock_daily:manual_only_codes", market)
         plan = plan or LIVE_PLAN_BY_MODULE.get(name)
         lane = plan.lane if plan else ""
 
@@ -671,14 +698,6 @@ class SyncEngine:
             if not self._module_allowed_for_lanes(name):
                 continue
             plan = LANE_MAINTENANCE_PLANS.get(name)
-            if name in REALTIME_MODULES and self._has_run_recent(
-                name,
-                Market.A.value,
-                now,
-                interval_seconds=plan.interval_seconds if plan else INTRADAY_INTERVAL_SECONDS,
-                stale_seconds=plan.stale_seconds if plan else INTRADAY_STALE_SECONDS,
-            ):
-                continue
             if self._has_run_today(name, today):
                 continue
 
@@ -692,9 +711,20 @@ class SyncEngine:
     def _parse_schedule_time(schedule: str) -> dt_time:
         for token in schedule.split():
             if ":" in token:
+                if "-" in token:
+                    token = token.split("-", 1)[0]
                 hour, minute = token.split(":", 1)
                 return dt_time(int(hour), int(minute))
         return dt_time(0, 0)
+
+    @staticmethod
+    def _parse_schedule_end_time(schedule: str) -> dt_time | None:
+        for token in schedule.split():
+            if ":" in token and "-" in token:
+                _, end_token = token.split("-", 1)
+                hour, minute = end_token.split(":", 1)
+                return dt_time(int(hour), int(minute))
+        return None
 
     @classmethod
     def _schedule_due(cls, schedule: str, now: datetime) -> bool:
@@ -703,7 +733,11 @@ class SyncEngine:
             return False
         if "Sunday" in schedule and weekday != 6:
             return False
-        return now.time() >= cls._parse_schedule_time(schedule)
+        start = cls._parse_schedule_time(schedule)
+        end = cls._parse_schedule_end_time(schedule)
+        if end is not None and now.time() > end:
+            return False
+        return now.time() >= start
 
     def bootstrap_preheat(self) -> list[dict]:
         """Run conservative startup preheat for empty critical collections."""

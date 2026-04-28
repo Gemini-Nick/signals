@@ -68,7 +68,7 @@ def ensure_storage_model(db: Database) -> None:
     """
     now = datetime.now()
 
-    for name in ("board_ranking", "concept_ranking", "bars", "index_bars"):
+    for name in ("board_ranking", "concept_ranking", "board_heat_ticks", "bars", "index_bars"):
         _drop_ttl_indexes(db[name])
 
     _safe_create_index(db["bars"], [("meta.symbol", ASCENDING), ("meta.freq", ASCENDING), ("dt", ASCENDING)])
@@ -76,6 +76,9 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["index_bars"], [("meta.symbol", ASCENDING), ("meta.freq", ASCENDING), ("dt", ASCENDING)])
     _safe_create_index(db["board_ranking"], [("source", ASCENDING), ("dt", ASCENDING)])
     _safe_create_index(db["concept_ranking"], [("source", ASCENDING), ("dt", ASCENDING)])
+    _safe_create_index(db["board_heat_ticks"], [("kind", ASCENDING), ("name", ASCENDING), ("trade_minute", ASCENDING)])
+    _safe_create_index(db["board_heat_ticks"], [("source", ASCENDING), ("trade_minute", ASCENDING)])
+    _safe_create_index(db["minute_readiness"], [("trade_date", ASCENDING), ("domain", ASCENDING), ("symbol", ASCENDING), ("freq", ASCENDING)])
 
     for name in ("board_em", "board_ths", "board_sina", "concept_em", "concept_ths", "concept_sina"):
         _safe_create_index(db[name], [("expires_at", ASCENDING)], expireAfterSeconds=0)
@@ -84,6 +87,7 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["quote_snapshots"], [("expires_at", ASCENDING)], expireAfterSeconds=0)
     _safe_create_index(db["market_pools"], [("pool", ASCENDING), ("dt", ASCENDING)])
     _safe_create_index(db["market_pools"], [("expires_at", ASCENDING)], expireAfterSeconds=0)
+    _safe_create_index(db["terminal_realtime_pool"], [("pool", ASCENDING), ("market", ASCENDING), ("updated_at", ASCENDING)])
     _safe_create_index(db["signals"], [("dedupe_key", ASCENDING)], unique=True, sparse=True)
     _safe_create_index(db["signals"], [("symbol", ASCENDING), ("signal_date", ASCENDING), ("freq", ASCENDING)])
     _safe_create_index(db["strategy_snapshots"], [("as_of", ASCENDING)], unique=True, sparse=True)

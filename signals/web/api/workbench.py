@@ -37,14 +37,13 @@ from ..services.serializers import (
     serialize_scored_symbol,
     serialize_signal_change,
 )
-from .chart import get_chart_data
 from .industry import get_industry_detail
 from .plan import _serialize_plan
 from .stock import analyze_stock
 
 router = APIRouter(prefix="/api/workbench", tags=["workbench"])
 
-UI_FREQS = ["5min", "15min", "30min", "daily", "weekly"]
+UI_FREQS = ["30min", "15min", "5min", "daily", "weekly"]
 MINUTE_FREQS = {"5min", "5m", "15min", "15m", "30min", "30m"}
 BUY_FREQS = ["daily", "30min", "15min", "5min"]
 SECOND_SCREEN_LANES = {
@@ -317,7 +316,7 @@ def _fallback_chart_when_empty(
     requested_freq: str,
     loader,
 ) -> dict[str, Any]:
-    """Keep the terminal usable while minute caches are cold or a provider is down."""
+    """Legacy helper kept for older callers; trading terminal paths do not use it."""
     if requested_freq not in MINUTE_FREQS or _chart_has_ohlcv(chart):
         return chart
     fallback_df, fallback_source = loader("daily")
@@ -333,6 +332,41 @@ def _fallback_chart_when_empty(
         "fallback_reason": "empty_minute_ohlcv",
     }
     return fallback if _chart_has_ohlcv(fallback) else chart
+
+
+def _not_ready_reason(kind: str, requested_freq: str, chart: dict[str, Any]) -> str:
+    if _chart_has_ohlcv(chart):
+        return ""
+    canonical = _canonical_freq(requested_freq)
+    if canonical in {"5min", "15min", "30min"}:
+        if kind == "index":
+            return "index_minute_not_ready"
+        if kind == "stock":
+            return "stock_minute_not_ready"
+        if kind in {"industry", "concept"}:
+            return "board_heat_not_ready"
+        return "minute_cache_stale"
+    if canonical == "daily":
+        return "daily_cache_missing"
+    if canonical == "weekly":
+        return "weekly_cache_missing"
+    return "cache_missing"
+
+
+def _mark_chart_readiness(chart: dict[str, Any], *, kind: str, requested_freq: str) -> dict[str, Any]:
+    meta = dict(chart.get("meta") or {})
+    meta["requested_freq"] = _canonical_freq(requested_freq)
+    meta["effective_freq"] = meta.get("freq") or _canonical_freq(requested_freq)
+    meta["fallback_reason"] = ""
+    reason = _not_ready_reason(kind, requested_freq, chart)
+    if reason:
+        meta["cache_status"] = "not_ready"
+        meta["not_ready_reason"] = reason
+    else:
+        meta["cache_status"] = "ready"
+        meta["not_ready_reason"] = ""
+    chart["meta"] = meta
+    return chart
 
 
 def _resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
@@ -367,20 +401,6 @@ def _stock_df(symbol: str, freq: str) -> tuple[pd.DataFrame, str]:
     df = response.data if response.data is not None else pd.DataFrame()
     if df is not None and not df.empty:
         return df, response.source
-    if canonical == "weekly":
-        daily = get_kline(DataRequest(
-            domain="kline",
-            mode="historical",
-            market="A",
-            symbol=symbol,
-            freq="daily",
-            purpose="review",
-            allow_stale=True,
-        ))
-        daily_df = daily.data if daily.data is not None else pd.DataFrame()
-        weekly = _resample_weekly(daily_df)
-        if not weekly.empty:
-            return weekly, "daily_resampled_weekly"
     return pd.DataFrame(), response.source
 
 
@@ -397,20 +417,6 @@ def _index_df(symbol: str, freq: str) -> tuple[pd.DataFrame, str]:
     df = response.data if response.data is not None else pd.DataFrame()
     if df is not None and not df.empty:
         return df, response.source
-    if _canonical_freq(freq) == "weekly":
-        daily = get_index_bars(DataRequest(
-            domain="index",
-            mode="historical",
-            market="A",
-            symbol=symbol,
-            freq="daily",
-            purpose="review",
-            allow_stale=True,
-        ))
-        daily_df = daily.data if daily.data is not None else pd.DataFrame()
-        weekly = _resample_weekly(daily_df)
-        if not weekly.empty:
-            return weekly, "index_daily_resampled_weekly"
     return pd.DataFrame(), response.source
 
 
@@ -449,7 +455,7 @@ def _cache_probe(symbol: str, *, kind: str, requested_freq: str) -> dict[str, An
         "15min": "15分钟",
         "30min": "30分钟",
     }
-    freqs = ["日线", "5分钟", "15分钟", "30分钟"]
+    freqs = ["日线", "周线", "5分钟", "15分钟", "30分钟"]
     requested_label = freq_labels.get(_canonical_freq(requested_freq), _gateway_freq(requested_freq))
     if requested_label not in freqs:
         freqs.insert(0, requested_label)
@@ -507,6 +513,62 @@ def _target_diagnostics(kind: str, symbol: str, requested_freq: str, *, probe_sy
             requested_freq=requested_freq,
         ),
     }
+
+
+def _board_heat_df(name: str, kind: str, freq: str) -> tuple[pd.DataFrame, str, dict[str, Any]]:
+    canonical = _canonical_freq(freq)
+    if canonical not in {"5min", "15min", "30min"}:
+        return pd.DataFrame(), "board_heat_ticks", {}
+    bucket = {"5min": "5min", "15min": "15min", "30min": "30min"}[canonical]
+    try:
+        db = _mongo_db()
+        docs = list(db["board_heat_ticks"].find(
+            {"kind": kind, "name": name},
+            {"_id": 0},
+        ).sort("trade_minute", 1))
+    except Exception:
+        return pd.DataFrame(), "board_heat_ticks", {}
+    if not docs:
+        return pd.DataFrame(), "board_heat_ticks", {}
+    df = pd.DataFrame(docs)
+    df["trade_minute"] = pd.to_datetime(df["trade_minute"], errors="coerce")
+    df = df.dropna(subset=["trade_minute"]).sort_values("trade_minute").set_index("trade_minute")
+    if df.empty or "change_pct" not in df.columns:
+        return pd.DataFrame(), "board_heat_ticks", {}
+    df["change_pct"] = pd.to_numeric(df["change_pct"], errors="coerce")
+    if "market_value" not in df.columns:
+        df["market_value"] = 0
+    df["market_value"] = pd.to_numeric(df["market_value"], errors="coerce").fillna(0)
+    grouped = df.resample(bucket).agg({
+        "change_pct": ["first", "max", "min", "last"],
+        "market_value": "last",
+    }).dropna(subset=[("change_pct", "last")])
+    if grouped.empty:
+        return pd.DataFrame(), "board_heat_ticks", {}
+    out = pd.DataFrame({
+        "open": grouped[("change_pct", "first")],
+        "high": grouped[("change_pct", "max")],
+        "low": grouped[("change_pct", "min")],
+        "close": grouped[("change_pct", "last")],
+        "vol": grouped[("market_value", "last")].fillna(0),
+        "amount": grouped[("market_value", "last")].fillna(0),
+    })
+    out.attrs["data_source"] = "board_heat_ticks"
+    out.attrs["as_of"] = str(out.index.max().date())
+    latest = docs[-1] if docs else {}
+    return out, "board_heat_ticks", latest
+
+
+def _board_heat_chart(name: str, kind: str, freq: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    df, source, latest = _board_heat_df(name, kind, freq)
+    chart = _chart_from_df(df, symbol=name, freq=freq, source=source)
+    chart["meta"] = {
+        **chart.get("meta", {}),
+        "kind": kind,
+        "value_axis": "change_pct",
+        "chart_source": "board_heat_ticks",
+    }
+    return _mark_chart_readiness(chart, kind=kind, requested_freq=freq), latest
 
 
 def _preset_start_date(info: dict[str, Any], today: date) -> Optional[date]:
@@ -2211,7 +2273,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         "default_target": {
             "kind": "index",
             "label": macro_indices[0]["name"] if macro_indices else "沪深300",
-            "freq": "daily",
+            "freq": "30min",
         },
         "legacy_url": "/legacy",
         "notices": notices,
@@ -2691,8 +2753,6 @@ def _available_daily_carrier(
             symbol, raw_code = _stock_symbol_from_code_or_name(item.get("code"), item.get("name"))
         if not symbol:
             continue
-        if item.get("source") in {"semantic_preferred_carrier", "semantic_industry_chain", "industry_leader_map"}:
-            _ensure_daily_bars(symbol, raw_code)
         df, source = _stock_df(symbol, "daily")
         if df is None or df.empty:
             continue
@@ -3009,17 +3069,9 @@ async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
         return await _build_static_index_target(static_index[0], static_index[1], requested_freq)
 
     report = serialize_index_report(report_obj)
-    if requested_freq in {"daily", "30min", "15min"}:
-        chart = _unwrap_response(get_chart_data(name, freq=requested_freq))
-    else:
-        df, source = _index_df(str(report.get("symbol") or name), requested_freq)
-        chart = _chart_from_df(df, symbol=str(report.get("symbol") or name), freq=requested_freq, source=source)
-    chart = _fallback_chart_when_empty(
-        chart,
-        symbol=str(report.get("symbol") or name),
-        requested_freq=requested_freq,
-        loader=lambda fallback_freq: _index_df(str(report.get("symbol") or name), fallback_freq),
-    )
+    df, source = _index_df(str(report.get("symbol") or name), requested_freq)
+    chart = _chart_from_df(df, symbol=str(report.get("symbol") or name), freq=requested_freq, source=source)
+    chart = _mark_chart_readiness(chart, kind="index", requested_freq=requested_freq)
     plan = _plan_for_index(engine, name)
     analysis_target = _top_candidate_symbol(engine)
 
@@ -3030,8 +3082,10 @@ async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
             "symbol": report.get("symbol", ""),
             **_target_time_fields(market="A", symbol=report.get("symbol", ""), source=chart.get("meta", {}).get("source", "")),
             "requested_freq": requested_freq,
-            "effective_freq": chart.get("meta", {}).get("freq", requested_freq),
+            "effective_freq": requested_freq,
             "available_freqs": UI_FREQS,
+            "fallback_reason": "",
+            "not_ready_reason": chart.get("meta", {}).get("not_ready_reason", ""),
             **_target_diagnostics("index", str(report.get("symbol") or name), requested_freq),
         },
         "chart": chart,
@@ -3049,12 +3103,7 @@ async def _build_static_index_target(name: str, symbol: str, freq: str) -> Dict[
     requested_freq = _canonical_freq(freq)
     df, source = _index_df(symbol, requested_freq)
     chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)
-    chart = _fallback_chart_when_empty(
-        chart,
-        symbol=symbol,
-        requested_freq=requested_freq,
-        loader=lambda fallback_freq: _index_df(symbol, fallback_freq),
-    )
+    chart = _mark_chart_readiness(chart, kind="index", requested_freq=requested_freq)
     summary = _summary_from_static_index(name, symbol, chart)
     summary["latest_signal"] = summary.get("latest_signal") or _ma_signal_from_df(df)
     return {
@@ -3064,8 +3113,10 @@ async def _build_static_index_target(name: str, symbol: str, freq: str) -> Dict[
             "symbol": symbol,
             **_target_time_fields(market="A", symbol=symbol, source=chart.get("meta", {}).get("source", "")),
             "requested_freq": requested_freq,
-            "effective_freq": chart.get("meta", {}).get("freq", requested_freq),
+            "effective_freq": requested_freq,
             "available_freqs": UI_FREQS,
+            "fallback_reason": "",
+            "not_ready_reason": chart.get("meta", {}).get("not_ready_reason", ""),
             **_target_diagnostics("index", symbol, requested_freq),
         },
         "chart": chart,
@@ -3121,6 +3172,53 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
     ordered_candidates = _flatten_candidate_groups(candidate_groups, limit=20)
     carrier = _preview_carrier(carrier_candidates)
 
+    if requested_freq in {"5min", "15min", "30min"}:
+        chart, latest_heat = _board_heat_chart(name, "industry", requested_freq)
+        return {
+            "target": {
+                "kind": "industry",
+                "label": name,
+                "symbol": name,
+                **_target_time_fields(market="A", symbol=name, source="board_heat_ticks"),
+                "requested_freq": requested_freq,
+                "effective_freq": requested_freq,
+                "available_freqs": UI_FREQS,
+                "mapping_status": "direct_board_heat",
+                "unmapped_reason": "",
+                "fallback_reason": "",
+                "not_ready_reason": chart.get("meta", {}).get("not_ready_reason", ""),
+                "cache_probe": {
+                    "status": "hit" if _chart_has_ohlcv(chart) else "miss",
+                    "kind": "industry",
+                    "requested_freq": requested_freq,
+                    "collection": "board_heat_ticks",
+                    "latest_dt": _serialize_dt(latest_heat.get("trade_minute")),
+                    "source": latest_heat.get("source", ""),
+                },
+            },
+            "chart": chart,
+            "summary": {
+                "title": name,
+                "subtitle": "行业分钟热度",
+                "latest_price": chart.get("ohlcv", [{}])[-1].get("close", 0) if chart.get("ohlcv") else 0,
+                "conclusion": "行业分钟热度来自缓存。" if _chart_has_ohlcv(chart) else "行业分钟热度缓存未就绪。",
+                "gain_pct": latest_heat.get("change_pct"),
+                "composite_score": getattr(ranking, "composite_score", 0) if ranking else 0,
+                "leader": latest_heat.get("leader_name", ""),
+                "up_count": latest_heat.get("up_count"),
+                "down_count": latest_heat.get("down_count"),
+                "mapping_status": "direct_board_heat",
+                "not_ready_reason": chart.get("meta", {}).get("not_ready_reason", ""),
+            },
+            "signals": [],
+            "plan": None,
+            "review": _review_context(engine, "industry", name),
+            "trade": _trade_context(analysis_target or None),
+            "analysis_target": analysis_target,
+            "candidate_groups": candidate_groups,
+            "candidate_stocks": ordered_candidates,
+        }
+
     async def fallback_to_carrier(reason: str) -> Dict[str, Any]:
         fallback = carrier
         if not fallback and candidate_stocks:
@@ -3136,8 +3234,6 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
                 }
         if not fallback:
             raise HTTPException(status_code=404, detail=f"无法获取 {name} K线数据，且未找到可承接代表股")
-        _ensure_daily_bars(fallback["symbol"], fallback.get("raw_code", ""))
-        _ensure_minute_bars(fallback["symbol"], fallback.get("raw_code", ""), requested_freq)
         payload = await _build_stock_target(fallback["symbol"], fallback.get("raw_code", ""), requested_freq)
         stock_title = payload.get("summary", {}).get("title") or fallback.get("name") or fallback["symbol"]
         mapping_chain = _mapping_chain_from_carrier(name, fallback, kind="industry")
@@ -3223,6 +3319,61 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
     candidate_groups = _candidate_groups(carrier_candidates, heat_value=heat_value)
     ordered_candidates = _ordered_candidate_stocks(carrier_candidates, heat_value=heat_value)
     non_chain = non_chain_reason(name)
+    if requested_freq in {"5min", "15min", "30min"}:
+        chart, latest_heat = _board_heat_chart(name, "concept", requested_freq)
+        return {
+            "target": {
+                "kind": "concept",
+                "label": name,
+                "symbol": getattr(concept, "code", "") or name,
+                **_target_time_fields(market="A", symbol=getattr(concept, "code", "") or name, source="board_heat_ticks"),
+                "requested_freq": requested_freq,
+                "effective_freq": requested_freq,
+                "available_freqs": UI_FREQS,
+                "mapping_status": "direct_board_heat" if _chart_has_ohlcv(chart) else ("non_chain" if non_chain else "heat_not_ready"),
+                "unmapped_reason": non_chain or "",
+                "fallback_reason": "",
+                "not_ready_reason": chart.get("meta", {}).get("not_ready_reason", ""),
+                "cache_probe": {
+                    "status": "hit" if _chart_has_ohlcv(chart) else "miss",
+                    "kind": "concept",
+                    "requested_freq": requested_freq,
+                    "collection": "board_heat_ticks",
+                    "latest_dt": _serialize_dt(latest_heat.get("trade_minute")),
+                    "source": latest_heat.get("source", ""),
+                },
+            },
+            "chart": chart,
+            "summary": {
+                "title": name,
+                "subtitle": "概念分钟热度",
+                "latest_price": chart.get("ohlcv", [{}])[-1].get("close", 0) if chart.get("ohlcv") else 0,
+                "conclusion": "概念分钟热度来自缓存。" if _chart_has_ohlcv(chart) else "概念分钟热度缓存未就绪。",
+                "gain_pct": latest_heat.get("change_pct") or heat_value,
+                "leader": latest_heat.get("leader_name", ""),
+                "up_count": latest_heat.get("up_count"),
+                "down_count": latest_heat.get("down_count"),
+                "representatives": representatives,
+                "candidate_groups": candidate_groups,
+                "mapping_chain": {
+                    "query": name,
+                    "concepts": [name],
+                    "industries": related[:5],
+                    "mapping_status": "direct_board_heat" if _chart_has_ohlcv(chart) else "heat_not_ready",
+                    "unmapped_reason": non_chain or chart.get("meta", {}).get("not_ready_reason", ""),
+                    "candidate_count": len(carrier_candidates),
+                },
+                "mapping_status": "direct_board_heat" if _chart_has_ohlcv(chart) else "heat_not_ready",
+                "not_ready_reason": chart.get("meta", {}).get("not_ready_reason", ""),
+            },
+            "signals": [],
+            "plan": None,
+            "review": _review_context(engine, "concept", name),
+            "trade": _trade_context(None),
+            "analysis_target": "",
+            "candidate_groups": candidate_groups,
+            "candidate_stocks": ordered_candidates,
+        }
     constituent_candidates = [
         item for item in carrier_candidates
         if item.get("source") in {"concept_constituents", "industry_constituents"}
@@ -3253,7 +3404,6 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
         or _available_daily_carrier(constituent_candidates, preserve_order=True)
     )
     if carrier:
-        _ensure_minute_bars(carrier["symbol"], carrier["raw_code"], requested_freq)
         payload = await _build_stock_target(carrier["symbol"], carrier["raw_code"], requested_freq)
         if not _chart_has_ohlcv(payload.get("chart", {})):
             df, source = _stock_df(carrier["symbol"], requested_freq)
@@ -3414,12 +3564,7 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
     else:
         df, source = _stock_df(symbol, requested_freq)
         chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)
-    chart = _fallback_chart_when_empty(
-        chart,
-        symbol=symbol,
-        requested_freq=requested_freq,
-        loader=lambda fallback_freq: _stock_df(symbol, fallback_freq),
-    )
+    chart = _mark_chart_readiness(chart, kind="stock", requested_freq=requested_freq)
     chart = _merge_signal_pool_into_chart(chart, symbol, chart.get("meta", {}).get("freq", requested_freq))
     try:
         stock = _unwrap_response(analyze_stock(symbol))
@@ -3442,8 +3587,10 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
             "symbol": symbol,
             **_target_time_fields(symbol=symbol, source=chart.get("meta", {}).get("source", "")),
             "requested_freq": requested_freq,
-            "effective_freq": chart.get("meta", {}).get("freq", requested_freq),
+            "effective_freq": requested_freq,
             "available_freqs": UI_FREQS,
+            "fallback_reason": "",
+            "not_ready_reason": chart.get("meta", {}).get("not_ready_reason", ""),
             **_target_diagnostics("stock", symbol, requested_freq),
         },
         "chart": chart,
@@ -3577,7 +3724,7 @@ async def get_workbench_cluster(
 async def get_workbench_symbol(
     symbol: str,
     kind: str = Query("auto", description="auto / index / industry / concept / stock"),
-    freq: str = Query("daily", description="5min / 15min / 30min / daily / weekly"),
+    freq: str = Query("30min", description="5min / 15min / 30min / daily / weekly"),
 ):
     engine = _ensure_engine()
     if not engine.is_ready() and kind in {"auto", "index"}:
