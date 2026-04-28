@@ -1,0 +1,478 @@
+# -*- coding: utf-8 -*-
+"""Postmarket DAG runner with Mongo-backed resume/checkpoint state."""
+from __future__ import annotations
+
+import logging
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import datetime, time as dt_time, timedelta
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from signals.core.market_hours import TZ_BEIJING
+
+from .engine import LANE_MAINTENANCE_PLANS
+
+logger = logging.getLogger("signals.sync.postmarket")
+
+RUN_OK_STATUSES = {"ok"}
+TASK_OK_STATUSES = {"ok"}
+RUN_TERMINAL_STATUSES = {"ok"}
+RETRYABLE_TASK_STATUSES = {"pending", "running", "stale", "partial", "degraded", "error"}
+
+
+@dataclass(frozen=True)
+class PostmarketTaskSpec:
+    module: str
+    phase: str
+    shard_key: str = "all"
+    depends_on: tuple[str, ...] = ()
+    env: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def task_key(self) -> str:
+        return f"{self.module}:{self.shard_key}"
+
+
+POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
+    PostmarketTaskSpec("market_pools", "market_data"),
+    PostmarketTaskSpec("quote_snapshots", "market_data"),
+    PostmarketTaskSpec("index_daily", "market_data"),
+    PostmarketTaskSpec(
+        "stock_daily",
+        "market_data",
+        env={"SIGNALS_SYNC_FULL_STOCK_DAILY": "true", "STOCK_DAILY_SCOPE": "all"},
+    ),
+    PostmarketTaskSpec("board_ranking", "market_data"),
+    PostmarketTaskSpec("board_cons", "market_data"),
+    PostmarketTaskSpec("weekly_rollup", "derived", depends_on=("stock_daily:all", "index_daily:all")),
+    PostmarketTaskSpec("chain_heat_snapshots", "derived", depends_on=("board_ranking:all", "board_cons:all")),
+    PostmarketTaskSpec("technical_signal_scan", "derived", depends_on=("stock_daily:all", "weekly_rollup:all")),
+    PostmarketTaskSpec("knowledge_market_views", "derived"),
+    PostmarketTaskSpec("signal_pool", "derived", depends_on=("technical_signal_scan:all",)),
+    PostmarketTaskSpec(
+        "terminal_realtime_pool",
+        "terminal",
+        depends_on=("technical_signal_scan:all", "knowledge_market_views:all", "chain_heat_snapshots:all"),
+        env={"TERMINAL_POOL_STRICT_SOURCES": "true"},
+    ),
+    PostmarketTaskSpec("strategy_snapshot", "terminal", depends_on=("terminal_realtime_pool:all",)),
+    PostmarketTaskSpec("cache_preheat", "terminal", depends_on=("terminal_realtime_pool:all",)),
+    PostmarketTaskSpec(
+        "stock_minute",
+        "minute_preheat",
+        depends_on=("terminal_realtime_pool:all",),
+        env={"STOCK_MINUTE_SCOPE": "postmarket_candidates"},
+    ),
+    PostmarketTaskSpec("index_minute", "minute_preheat", depends_on=("terminal_realtime_pool:all",)),
+    PostmarketTaskSpec("minute_readiness_probe", "minute_preheat", depends_on=("stock_minute:all", "index_minute:all")),
+)
+
+POSTMARKET_PHASES: tuple[str, ...] = tuple(dict.fromkeys(task.phase for task in POSTMARKET_TASKS))
+
+
+def default_run_id(trade_date: str) -> str:
+    return f"postmarket:{trade_date}"
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return max(minimum, default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _now_bj() -> datetime:
+    return datetime.now(TZ_BEIJING)
+
+
+def _naive_bj() -> datetime:
+    return _now_bj().replace(tzinfo=None)
+
+
+def _coerce_dt(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=None) if parsed.tzinfo is None else parsed.astimezone(TZ_BEIJING).replace(tzinfo=None)
+    return None
+
+
+def _parse_hm(value: str, default: dt_time) -> dt_time:
+    try:
+        hour, minute = value.strip().split(":", 1)
+        return dt_time(int(hour), int(minute))
+    except Exception:
+        return default
+
+
+def _summarize_result(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {"value": str(result)[:500]}
+    allow = {
+        "module",
+        "status",
+        "elapsed",
+        "market",
+        "lane",
+        "inserted",
+        "updated",
+        "stocks",
+        "symbols",
+        "candidates",
+        "skipped",
+        "errors",
+        "processed",
+        "total",
+        "expected_codes",
+        "covered_codes",
+        "coverage_pct",
+        "progress_pct",
+        "remaining",
+        "next_cursor",
+        "total_groups",
+        "processed_groups",
+        "sample_errors",
+        "source_counts",
+        "unmapped",
+        "reason_counts",
+        "result",
+    }
+    summary: dict[str, Any] = {}
+    for key, value in result.items():
+        if key not in allow:
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            summary[key] = value
+        elif isinstance(value, dict):
+            summary[key] = {str(k): v for k, v in list(value.items())[:20] if isinstance(v, (str, int, float, bool, type(None)))}
+        elif isinstance(value, list):
+            summary[key] = value[:20]
+        else:
+            summary[key] = str(value)[:300]
+    return summary
+
+
+class PostmarketRunner:
+    """Run the postmarket DAG and store task/run state in Mongo."""
+
+    def __init__(self, engine, *, max_workers: int | None = None):
+        self.engine = engine
+        self.db = engine.db
+        self.max_workers = max_workers or _env_int("SIGNALS_POSTMARKET_WORKERS", 4, minimum=1)
+        self.owner_pid = os.getpid()
+        self.heartbeat_seconds = _env_int("SIGNALS_POSTMARKET_HEARTBEAT_SECONDS", 60, minimum=10)
+        self.task_stale_seconds = _env_int("SIGNALS_POSTMARKET_TASK_STALE_SECONDS", 15 * 60, minimum=60)
+
+    @staticmethod
+    def _pid_alive(pid: Any) -> bool:
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid_int <= 0:
+            return False
+        try:
+            os.kill(pid_int, 0)
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _task_id(run_id: str, spec: PostmarketTaskSpec) -> str:
+        return f"{run_id}:{spec.task_key}"
+
+    def _get_task(self, run_id: str, spec: PostmarketTaskSpec) -> dict[str, Any]:
+        return self.db["sync_tasks"].find_one({"_id": self._task_id(run_id, spec)}) or {}
+
+    def _task_status(self, run_id: str, task_key: str) -> str:
+        doc = self.db["sync_tasks"].find_one({"_id": f"{run_id}:{task_key}"}, {"status": 1}) or {}
+        return str(doc.get("status") or "pending")
+
+    def _dependencies_ok(self, run_id: str, spec: PostmarketTaskSpec) -> bool:
+        return all(self._task_status(run_id, dep) in TASK_OK_STATUSES for dep in spec.depends_on)
+
+    def _init_run(self, run_id: str, trade_date: str) -> None:
+        now = _naive_bj()
+        self.db["sync_runs"].update_one(
+            {"_id": run_id},
+            {
+                "$set": {
+                    "run_id": run_id,
+                    "trade_date": trade_date,
+                    "status": "running",
+                    "owner_pid": self.owner_pid,
+                    "heartbeat_at": now,
+                    "updated_at": now,
+                    "task_count": len(POSTMARKET_TASKS),
+                },
+                "$setOnInsert": {
+                    "started_at": now,
+                    "phase": "",
+                    "finished_at": None,
+                },
+            },
+            upsert=True,
+        )
+
+    def _init_tasks(self, run_id: str, trade_date: str) -> None:
+        now = _naive_bj()
+        for order, spec in enumerate(POSTMARKET_TASKS):
+            self.db["sync_tasks"].update_one(
+                {"_id": self._task_id(run_id, spec)},
+                {
+                    "$set": {
+                        "run_id": run_id,
+                        "trade_date": trade_date,
+                        "module": spec.module,
+                        "phase": spec.phase,
+                        "shard_key": spec.shard_key,
+                        "depends_on": list(spec.depends_on),
+                        "order": order,
+                        "updated_at": now,
+                    },
+                    "$setOnInsert": {
+                        "status": "pending",
+                        "attempts": 0,
+                        "cursor": {},
+                        "result_summary": {},
+                        "error_msg": "",
+                        "started_at": None,
+                        "finished_at": None,
+                    },
+                },
+                upsert=True,
+            )
+
+    def _heartbeat(self, run_id: str, phase: str = "") -> None:
+        now = _naive_bj()
+        update = {
+            "owner_pid": self.owner_pid,
+            "heartbeat_at": now,
+            "updated_at": now,
+        }
+        if phase:
+            update["phase"] = phase
+        self.db["sync_runs"].update_one({"_id": run_id}, {"$set": update}, upsert=True)
+
+    def _release_stale_running_tasks(self, run_id: str) -> int:
+        now = _naive_bj()
+        released = 0
+        for doc in self.db["sync_tasks"].find({"run_id": run_id, "status": "running"}):
+            heartbeat = _coerce_dt(doc.get("heartbeat_at") or doc.get("started_at"))
+            owner_dead = bool(doc.get("owner_pid")) and not self._pid_alive(doc.get("owner_pid"))
+            too_old = bool(heartbeat and (now - heartbeat).total_seconds() > self.task_stale_seconds)
+            if not (owner_dead or too_old):
+                continue
+            reason = "running_owner_dead" if owner_dead else "stale_running_task"
+            self.db["sync_tasks"].update_one(
+                {"_id": doc["_id"]},
+                {"$set": {
+                    "status": "stale",
+                    "owner_pid": "",
+                    "error_msg": reason,
+                    "updated_at": now,
+                }},
+            )
+            released += 1
+        return released
+
+    def _mark_task_started(self, run_id: str, spec: PostmarketTaskSpec) -> None:
+        now = _naive_bj()
+        self.db["sync_tasks"].update_one(
+            {"_id": self._task_id(run_id, spec)},
+            {
+                "$set": {
+                    "status": "running",
+                    "owner_pid": self.owner_pid,
+                    "started_at": now,
+                    "heartbeat_at": now,
+                    "updated_at": now,
+                    "error_msg": "",
+                },
+                "$inc": {"attempts": 1},
+            },
+        )
+
+    def _mark_task_finished(self, run_id: str, spec: PostmarketTaskSpec, result: dict[str, Any]) -> None:
+        now = _naive_bj()
+        status = str(result.get("status") or "ok")
+        result_summary = _summarize_result(result)
+        cursor = {}
+        nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+        for source in (result, nested):
+            if source.get("next_cursor") is not None:
+                cursor["next_cursor"] = source.get("next_cursor")
+            if source.get("remaining") is not None:
+                cursor["remaining"] = source.get("remaining")
+            if source.get("processed") is not None:
+                cursor["processed"] = source.get("processed")
+            if source.get("total") is not None:
+                cursor["total"] = source.get("total")
+            if source.get("total_groups") is not None:
+                cursor["total_groups"] = source.get("total_groups")
+            if source.get("progress_pct") is not None:
+                cursor["progress_pct"] = source.get("progress_pct")
+        self.db["sync_tasks"].update_one(
+            {"_id": self._task_id(run_id, spec)},
+            {"$set": {
+                "status": status,
+                "owner_pid": "",
+                "heartbeat_at": now,
+                "finished_at": now,
+                "updated_at": now,
+                "cursor": cursor,
+                "result_summary": result_summary,
+                "error_msg": str(result.get("error") or result.get("error_msg") or "")[:1000],
+            }},
+        )
+
+    def _with_env(self, env: dict[str, str]):
+        class EnvGuard:
+            def __init__(self, values: dict[str, str]):
+                self.values = values
+                self.previous: dict[str, str | None] = {}
+
+            def __enter__(self):
+                for key, value in self.values.items():
+                    self.previous[key] = os.environ.get(key)
+                    os.environ[key] = value
+
+            def __exit__(self, exc_type, exc, tb):
+                for key, value in self.previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+        return EnvGuard(env)
+
+    def _run_task(self, run_id: str, spec: PostmarketTaskSpec) -> dict[str, Any]:
+        self._mark_task_started(run_id, spec)
+        if spec.module not in self.engine.module_map:
+            result = {"module": spec.module, "status": "error", "error": "module_missing"}
+            self._mark_task_finished(run_id, spec, result)
+            return result
+        fn, _schedule = self.engine.module_map[spec.module]
+        plan = LANE_MAINTENANCE_PLANS.get(spec.module)
+        with self._with_env(spec.env):
+            result = self.engine.run_module(spec.module, fn, plan=plan)
+        self._mark_task_finished(run_id, spec, result)
+        return result
+
+    def _phase_specs(self, phase: str) -> list[PostmarketTaskSpec]:
+        return [task for task in POSTMARKET_TASKS if task.phase == phase]
+
+    def run_once(self, *, resume_run_id: str | None = None, trade_date: str | None = None, force: bool = False) -> dict[str, Any]:
+        trade_date = trade_date or _now_bj().date().isoformat()
+        run_id = resume_run_id or default_run_id(trade_date)
+        run_doc = self.db["sync_runs"].find_one({"_id": run_id}) or {}
+        if run_doc.get("trade_date"):
+            trade_date = str(run_doc["trade_date"])
+        if run_doc.get("status") in RUN_TERMINAL_STATUSES and not force:
+            return {"run_id": run_id, "trade_date": trade_date, "status": run_doc.get("status"), "skipped": True}
+
+        self._init_run(run_id, trade_date)
+        self._init_tasks(run_id, trade_date)
+        released = self._release_stale_running_tasks(run_id)
+        if released:
+            logger.warning("postmarket released stale tasks: run=%s released=%d", run_id, released)
+
+        results: list[dict[str, Any]] = []
+        blocked: list[str] = []
+        for phase in POSTMARKET_PHASES:
+            self._heartbeat(run_id, phase)
+            runnable: list[PostmarketTaskSpec] = []
+            for spec in self._phase_specs(phase):
+                current = self._get_task(run_id, spec)
+                status = str(current.get("status") or "pending")
+                if status in TASK_OK_STATUSES and not force:
+                    continue
+                if not self._dependencies_ok(run_id, spec):
+                    blocked.append(spec.task_key)
+                    continue
+                if status not in RETRYABLE_TASK_STATUSES and not force:
+                    continue
+                runnable.append(spec)
+
+            if not runnable:
+                continue
+
+            logger.info("postmarket phase=%s tasks=%s workers=%d", phase, [item.task_key for item in runnable], self.max_workers)
+            workers = min(self.max_workers, max(1, len(runnable)))
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"postmarket-{phase}") as executor:
+                future_map = {executor.submit(self._run_task, run_id, spec): spec for spec in runnable}
+                for future in as_completed(future_map):
+                    spec = future_map[future]
+                    self._heartbeat(run_id, phase)
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        result = {"module": spec.module, "status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
+                        self._mark_task_finished(run_id, spec, result)
+                        results.append(result)
+
+        task_docs = list(self.db["sync_tasks"].find({"run_id": run_id}, {"module": 1, "status": 1, "phase": 1, "updated_at": 1}))
+        incomplete = [doc for doc in task_docs if doc.get("status") not in TASK_OK_STATUSES]
+        status = "ok" if not incomplete and not blocked else "partial"
+        now = _naive_bj()
+        self.db["sync_runs"].update_one(
+            {"_id": run_id},
+            {"$set": {
+                "status": status,
+                "owner_pid": "",
+                "heartbeat_at": now,
+                "updated_at": now,
+                "finished_at": now,
+                "blocked_tasks": blocked,
+                "ok_tasks": len(task_docs) - len(incomplete),
+                "incomplete_tasks": len(incomplete),
+            }},
+        )
+        return {
+            "run_id": run_id,
+            "trade_date": trade_date,
+            "status": status,
+            "results": results,
+            "blocked_tasks": blocked,
+            "ok_tasks": len(task_docs) - len(incomplete),
+            "incomplete_tasks": len(incomplete),
+        }
+
+    @staticmethod
+    def should_run_now(now: datetime | None = None) -> bool:
+        now = now or _now_bj()
+        if now.weekday() >= 5:
+            return False
+        start = _parse_hm(os.getenv("SIGNALS_POSTMARKET_START_TIME", "15:35"), dt_time(15, 35))
+        end = _parse_hm(os.getenv("SIGNALS_POSTMARKET_END_TIME", "23:50"), dt_time(23, 50))
+        current = now.time()
+        return start <= current <= end
+
+    def run_daemon(self, *, check_seconds: int | None = None) -> None:
+        check_seconds = check_seconds or _env_int("SIGNALS_POSTMARKET_CHECK_SECONDS", 300, minimum=30)
+        logger.info("postmarket daemon started workers=%d check_seconds=%d", self.max_workers, check_seconds)
+        while True:
+            now = _now_bj()
+            trade_date = now.date().isoformat()
+            run_id = default_run_id(trade_date)
+            if self.should_run_now(now):
+                run_doc = self.db["sync_runs"].find_one({"_id": run_id}, {"status": 1}) or {}
+                status = run_doc.get("status")
+                if status not in RUN_TERMINAL_STATUSES or _env_bool("SIGNALS_POSTMARKET_FORCE", False):
+                    logger.info("postmarket trigger run=%s previous_status=%s", run_id, status or "missing")
+                    self.run_once(trade_date=trade_date, force=_env_bool("SIGNALS_POSTMARKET_FORCE", False))
+            time.sleep(check_seconds)

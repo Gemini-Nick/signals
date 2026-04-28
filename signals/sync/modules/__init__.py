@@ -17,6 +17,8 @@ from .strategy_snapshot import sync_strategy_snapshot
 from .minute_readiness import sync_minute_readiness_probe
 from .weekly_rollup import sync_weekly_rollup
 from .terminal_pool import sync_terminal_realtime_pool
+from .technical_signal_scan import sync_technical_signal_scan
+from .knowledge_market_views import sync_knowledge_market_views
 
 ALL_MODULES = [
     ("market_pools",  sync_market_pools,  "09:05 weekday"),
@@ -32,6 +34,8 @@ ALL_MODULES = [
     ("weekly_rollup", sync_weekly_rollup, "17:30-18:00 weekday"),
     ("board_ranking", sync_board_ranking, "18:00-21:00 weekday"),
     ("board_cons",    sync_board_cons,    "18:00-21:00 weekday"),
+    ("technical_signal_scan", sync_technical_signal_scan, "20:30-22:30 weekday"),
+    ("knowledge_market_views", sync_knowledge_market_views, "20:30-22:30 weekday"),
     ("signal_pool",   sync_signal_pool,   "21:00 weekday"),
     ("strategy_snapshot", sync_strategy_snapshot, "21:10 weekday"),
     ("terminal_realtime_pool", sync_terminal_realtime_pool, "21:15 weekday"),

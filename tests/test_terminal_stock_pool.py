@@ -46,3 +46,33 @@ def test_terminal_stock_pool_signal_origin_classification_is_explicit():
         "signal_type": "日线预警: 跌破二十日均线",
         "pool_status": "warning",
     }) == "generated_risk_signal"
+
+
+def test_terminal_stock_pool_knowledge_conflict_downgrades_technical_candidate():
+    rows = {}
+    _add_reason(rows, "300575", {
+        "reason_type": "technical_signal",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "tech-1",
+        "signal_type": "三买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 120,
+        "confidence": 0.8,
+        "evidence": {"detail": "hard signal"},
+    }, index_codes=set(), name="中旗新材")
+    _add_reason(rows, "300575", {
+        "reason_type": "knowledge_conflict",
+        "source_collection": "knowledge_market_views",
+        "source_doc_id": "view-1",
+        "signal_type": "知识库看空",
+        "signal_side": "buy",
+        "sentiment": "看空",
+        "knowledge_status": "conflict",
+    }, index_codes=set(), name="中旗新材")
+
+    selected, _ = _selected_rows(rows, 1)
+
+    assert selected[0]["action_status"] == "knowledge_conflict"
+    assert selected[0]["technical_evidence"]["signal_type"] == "三买"
+    assert selected[0]["knowledge_confirmation"]["status"] == "conflict"

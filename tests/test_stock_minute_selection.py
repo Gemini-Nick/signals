@@ -5,6 +5,32 @@ import config
 from signals.sync.modules import stock_minute
 
 
+class _Cursor(list):
+    def sort(self, *args, **kwargs):
+        return self
+
+    def limit(self, n):
+        return _Cursor(self[:n])
+
+
+class _Collection:
+    def __init__(self, doc=None, docs=None):
+        self.doc = doc or {}
+        self.docs = docs or []
+
+    def find_one(self, *args, **kwargs):
+        return self.doc
+
+    def find(self, *args, **kwargs):
+        return _Cursor(self.docs)
+
+
+class _Db(dict):
+    def __missing__(self, key):
+        self[key] = _Collection()
+        return self[key]
+
+
 def test_priority_selection_respects_signal_lane_cap():
     selected, skipped = stock_minute._select_symbols_with_priority(
         ["688802", "300575", "600000"],
@@ -72,3 +98,57 @@ def test_stock_minute_cap_splits_intraday_and_close(monkeypatch):
 
     monkeypatch.delenv("SIGNALS_CURRENT_SYNC_MARKET", raising=False)
     assert stock_minute._selection_cap() == 96
+
+
+def test_postmarket_minute_scope_uses_expanded_candidate_cap(monkeypatch):
+    monkeypatch.setenv("STOCK_MINUTE_SCOPE", "postmarket_candidates")
+    monkeypatch.setenv("STOCK_MINUTE_POSTMARKET_MAX_CODES", "360")
+    monkeypatch.setenv("SIGNALS_CURRENT_SYNC_LANE", "signal_lane")
+    monkeypatch.setenv("STOCK_MINUTE_CLOSE_MAX_CODES", "72")
+
+    assert stock_minute._selection_cap() == 360
+
+
+def test_postmarket_minute_selection_merges_terminal_skipped_and_signal_sources(monkeypatch):
+    monkeypatch.setenv("STOCK_MINUTE_SCOPE", "postmarket_candidates")
+    monkeypatch.setenv("STOCK_MINUTE_POSTMARKET_MAX_CODES", "10")
+
+    db = _Db({
+        "terminal_stock_pool": _Collection(doc={
+            "candidate_count": 6,
+            "stocks": [
+                {
+                    "raw_code": "300001",
+                    "inclusion_reasons": [{"reason_type": "technical_signal"}],
+                }
+            ],
+            "skipped_stocks": [
+                {
+                    "raw_code": "300002",
+                    "signal_origin": "technical_signal",
+                    "inclusion_reasons": [{"reason_type": "technical_signal"}],
+                }
+            ],
+        }),
+        "terminal_technical_signals": _Collection(docs=[{"raw_code": "300003"}]),
+        "knowledge_market_views": _Collection(docs=[{"raw_code": "300004"}]),
+        "chain_heat_snapshots": _Collection(
+            doc={"trade_minute": "2026-04-28 15:00"},
+            docs=[{
+                "representatives": [{"symbol": "300005"}],
+                "integrated_domains": [{"leader_symbol": "300006"}],
+            }],
+        ),
+        "sync_log": _Collection(),
+    })
+
+    selected, meta = stock_minute._get_active_symbols_with_meta(db)
+
+    assert selected == ["300001", "300002", "300003", "300004", "300005", "300006"]
+    assert meta["minute_scope"] == "postmarket_candidates"
+    assert meta["rotation_policy"] == "postmarket_expanded_candidate_preheat"
+    assert meta["source_counts"]["terminal_stock_pool_skipped"] == 1
+    assert meta["source_counts"]["terminal_technical_signals"] == 1
+    assert meta["source_counts"]["knowledge_market_views"] == 1
+    assert meta["source_counts"]["chain_representatives"] == 1
+    assert meta["source_counts"]["chain_domain_leaders"] == 1

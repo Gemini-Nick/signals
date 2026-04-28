@@ -70,6 +70,20 @@ def _launchd_absent(label: str) -> dict[str, Any]:
     }
 
 
+def _pid_status(name: str, pid_file: Path) -> dict[str, Any]:
+    try:
+        pid = pid_file.read_text(encoding="utf-8").strip()
+    except Exception:
+        return {"name": name, "ok": False, "state": "missing", "pid_file": str(pid_file)}
+    if not pid:
+        return {"name": name, "ok": False, "state": "missing", "pid_file": str(pid_file)}
+    result = subprocess.run(["ps", "-p", pid, "-o", "command="], text=True, capture_output=True, timeout=5)
+    command = result.stdout.strip()
+    if result.returncode != 0 or not command:
+        return {"name": name, "ok": False, "state": "stale", "pid": pid, "pid_file": str(pid_file)}
+    return {"name": name, "ok": True, "state": "running", "pid": pid, "command": command, "pid_file": str(pid_file)}
+
+
 def _mongo_check() -> dict[str, Any]:
     try:
         from signals.data.mongo_fallback import get_db
@@ -83,7 +97,7 @@ def _mongo_check() -> dict[str, Any]:
             "database": db.name,
             "counts": {
                 name: db[name].estimated_document_count()
-                for name in ["bars", "quote_snapshots", "market_pools", "signals"]
+                for name in ["bars", "quote_snapshots", "market_pools", "signals", "sync_runs", "sync_tasks"]
             },
         }
     except Exception as exc:
@@ -143,6 +157,7 @@ def main() -> int:
     checks: dict[str, Any] = {
         "mongo": _mongo_check(),
         "launchd_runtime": _launchd("com.zhangqilong.ai.signals.runtime"),
+        "postmarket_child": _pid_status("postmarket", Path.home() / ".longclaw/runtime-v2/pids/signals-postmarket.pid"),
         "retired_launchd_signals_web_absent": _launchd_absent("com.zhangqilong.ai.signals.web"),
         "retired_launchd_signals_sync_absent": _launchd_absent("com.zhangqilong.ai.signals.sync"),
         "retired_launchd_signals_web2_absent": _launchd_absent("com.zhangqilong.ai.signals.web2"),

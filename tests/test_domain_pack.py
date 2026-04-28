@@ -39,6 +39,15 @@ def test_signals_pack_dashboard_matches_electron_contract(tmp_path, monkeypatch)
         "freshness": "fresh",
         "warning": "",
     })
+    monkeypatch.setattr(pack, "_cache_status", lambda: {
+        "available": False,
+        "mode": "test",
+        "live_low_latency": {"modules": [], "summary": {}},
+        "postmarket_backfill": {"run": None, "tasks": [], "summary": {}},
+        "mongo_stock_cache": {"freqs": [], "summary": {}},
+        "terminal_outputs": [],
+        "blockers": [],
+    })
 
     dashboard = asyncio.run(pack.dashboard())
 
@@ -55,6 +64,7 @@ def test_signals_pack_dashboard_matches_electron_contract(tmp_path, monkeypatch)
     assert isinstance(dashboard["backtest_jobs"], list)
     assert isinstance(dashboard["deep_links"], list)
     assert dashboard["operator_actions"][0]["metadata"] == {}
+    assert dashboard["cache_status"]["mode"] == "test"
 
 
 def test_pack_dashboard_endpoint_smoke():
@@ -72,3 +82,4 @@ def test_pack_dashboard_endpoint_smoke():
     assert "decision_queue" in payload
     assert "strategy_kpis" in payload
     assert "source_confidence" in payload
+    assert "cache_status" in payload

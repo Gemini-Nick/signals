@@ -18,9 +18,13 @@ CHAN_TOKENS = ("一买", "二买", "三买", "一卖", "二卖", "三卖", "背�
 BUY_FREQ_BONUS = {"30分钟": 120, "30min": 120, "30m": 120, "15分钟": 110, "15min": 110, "15m": 110, "5分钟": 80, "5min": 80, "5m": 80}
 REASON_WEIGHTS = {
     "user_pinned": 10000,
+    "technical_signal": 880,
     "generated_risk_signal": 950,
     "custom_signal": 620,
     "chan_signal": 620,
+    "knowledge_confirmed": 260,
+    "knowledge_conflict": 240,
+    "knowledge_watch": 160,
     "chain_core_rep": 700,
     "chain_elastic_rep": 620,
     "source_leader": 600,
@@ -133,7 +137,10 @@ def _empty_row(code: str, name: str = "") -> dict[str, Any]:
         "latest_signal": "",
         "action_status": "watch",
         "trader_action": "观察",
+        "next_action": "观察",
         "invalidates_when": "入池条件失效或产业链热度回落",
+        "technical_evidence": {},
+        "knowledge_confirmation": {"status": "none"},
         "chain_context": {},
         "inclusion_reasons": [],
         "source_tags": [],
@@ -173,6 +180,7 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
         "board_or_concept": _text(reason.get("board_or_concept")),
         "as_of": _text(reason.get("as_of")),
         "evidence": reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {},
+        "knowledge_status": _text(reason.get("knowledge_status")),
     }
     key = _reason_key(normalized)
     existing_keys = {_reason_key(item) for item in row["inclusion_reasons"]}
@@ -195,18 +203,70 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
     source_tag = top["reason_type"]
     if source_tag and source_tag not in row["source_tags"]:
         row["source_tags"].append(source_tag)
+    if reason_type == "technical_signal":
+        row["technical_evidence"] = {
+            "source_collection": normalized["source_collection"],
+            "source_doc_id": normalized["source_doc_id"],
+            "signal_type": normalized["signal_type"],
+            "signal_side": normalized["signal_side"],
+            "freq": normalized["freq"],
+            "score": normalized["score"],
+            "confidence": normalized["confidence"],
+            "as_of": normalized["as_of"],
+            "evidence": normalized["evidence"],
+        }
+    if reason_type.startswith("knowledge_"):
+        row["knowledge_confirmation"] = {
+            "status": normalized.get("knowledge_status") or reason_type.replace("knowledge_", ""),
+            "sentiment": _text(reason.get("sentiment")),
+            "source_collection": normalized["source_collection"],
+            "source_doc_id": normalized["source_doc_id"],
+            "as_of": normalized["as_of"],
+            "evidence": normalized["evidence"],
+        }
     if top.get("signal_side") == "sell":
         row["action_status"] = "risk_review"
         row["trader_action"] = "风险复核"
+        row["next_action"] = row["trader_action"]
         row["invalidates_when"] = "卖出/风险信号解除或重新站回关键周期"
-    elif top["reason_type"] in {"custom_signal", "chan_signal"}:
+    elif top["reason_type"] in {"custom_signal", "chan_signal", "technical_signal"}:
         row["action_status"] = "buy_candidate"
         row["trader_action"] = "等待5m确认" if top.get("freq") not in {"5m", "5min", "5分钟"} else "可试仓"
+        row["next_action"] = row["trader_action"]
         row["invalidates_when"] = "5m 无法确认或上级周期转弱"
+    elif top["reason_type"] == "knowledge_conflict":
+        row["action_status"] = "knowledge_conflict"
+        row["trader_action"] = "知识库冲突复核"
+        row["next_action"] = row["trader_action"]
+        row["invalidates_when"] = "技术信号或知识观点解除冲突"
+    elif top["reason_type"] in {"knowledge_confirmed", "knowledge_watch"}:
+        row["action_status"] = "knowledge_watch"
+        row["trader_action"] = "知识库观察"
+        row["next_action"] = row["trader_action"]
+        row["invalidates_when"] = "知识观点过期或缺少硬技术确认"
     elif top["reason_type"].startswith("chain_") or top["reason_type"] in {"source_leader", "constituent_hot"}:
         row["action_status"] = "chain_watch"
         row["trader_action"] = "观察产业链共振"
+        row["next_action"] = row["trader_action"]
         row["invalidates_when"] = "产业链节点热度转弱或领涨股回落"
+
+    technical = next((item for item in row["inclusion_reasons"] if item.get("reason_type") == "technical_signal"), None)
+    if technical:
+        if technical.get("signal_side") == "sell":
+            row["action_status"] = "risk_review"
+            row["trader_action"] = "风险复核"
+            row["next_action"] = row["trader_action"]
+            row["invalidates_when"] = "卖出/风险信号解除或重新站回关键周期"
+        elif row.get("action_status") in {"watch", "knowledge_watch", "chain_watch"}:
+            row["action_status"] = "buy_candidate"
+            row["trader_action"] = "等待5m确认" if technical.get("freq") not in {"5m", "5min", "5分钟"} else "可试仓"
+            row["next_action"] = row["trader_action"]
+            row["invalidates_when"] = "5m 无法确认或上级周期转弱"
+    if (row.get("knowledge_confirmation") or {}).get("status") == "conflict" and row.get("action_status") == "buy_candidate":
+        row["action_status"] = "knowledge_conflict"
+        row["trader_action"] = "知识库冲突复核"
+        row["next_action"] = row["trader_action"]
+        row["invalidates_when"] = "知识观点或技术信号解除冲突"
 
 
 def _add_user_pinned(rows: dict[str, dict[str, Any]], index_codes: set[str], now) -> None:
@@ -249,6 +309,96 @@ def _add_signal_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes:
                 "details": signal.get("details_json") if isinstance(signal.get("details_json"), dict) else {},
             },
         }, index_codes=index_codes, name=_text(signal.get("name")))
+
+
+def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str]) -> None:
+    limit = max(1, int(os.getenv("TERMINAL_POOL_TECHNICAL_SIGNAL_LIMIT", "1000")))
+    cursor = db["terminal_technical_signals"].find(
+        {"market": "A"},
+        {
+            "symbol": 1,
+            "raw_code": 1,
+            "freq": 1,
+            "signal_type": 1,
+            "signal_side": 1,
+            "signal_family": 1,
+            "score": 1,
+            "total_score": 1,
+            "confidence": 1,
+            "as_of": 1,
+            "updated_at": 1,
+            "dedupe_key": 1,
+            "technical_evidence": 1,
+            "invalidates_when": 1,
+        },
+    ).sort([("as_of", -1), ("updated_at", -1), ("total_score", -1), ("confidence", -1)]).limit(limit)
+    for signal in cursor:
+        evidence = signal.get("technical_evidence") if isinstance(signal.get("technical_evidence"), dict) else {}
+        _add_reason(rows, signal.get("symbol") or signal.get("raw_code"), {
+            "reason_type": "technical_signal",
+            "source_collection": "terminal_technical_signals",
+            "source_doc_id": _source_doc_id(signal),
+            "signal_type": _text(signal.get("signal_type")),
+            "signal_side": _text(signal.get("signal_side")) or _signal_side(signal),
+            "signal_family": _text(signal.get("signal_family")) or "hard_technical",
+            "freq": _text(signal.get("freq")),
+            "score": _float(signal.get("total_score") or signal.get("score")),
+            "confidence": _float(signal.get("confidence")),
+            "as_of": _text(signal.get("as_of") or signal.get("updated_at"))[:10],
+            "evidence": evidence,
+        }, index_codes=index_codes)
+
+
+def _knowledge_status_for(sentiment: str, tech_side: str) -> tuple[str, str]:
+    if not tech_side:
+        return "knowledge_watch", "watch"
+    if tech_side == "buy" and sentiment == "看多":
+        return "knowledge_confirmed", "confirmed"
+    if tech_side == "sell" and sentiment == "看空":
+        return "knowledge_confirmed", "confirmed"
+    if tech_side == "buy" and sentiment == "看空":
+        return "knowledge_conflict", "conflict"
+    if tech_side == "sell" and sentiment == "看多":
+        return "knowledge_conflict", "conflict"
+    return "knowledge_watch", "neutral"
+
+
+def _add_knowledge_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str]) -> None:
+    cursor = db["knowledge_market_views"].find(
+        {"market": "A", "target_type": "stock"},
+        {"symbol": 1, "raw_code": 1, "sentiment": 1, "latest_sentiment": 1, "confidence": 1, "as_of": 1,
+         "sources": 1, "catalysts": 1, "view_id": 1, "updated_at": 1},
+    ).sort([("as_of", -1), ("updated_at", -1)]).limit(500)
+    for view in cursor:
+        code = _pure_a_code(view.get("symbol") or view.get("raw_code"))
+        if not code:
+            continue
+        existing = rows.get(code)
+        tech_side = ""
+        if existing:
+            tech_reason = next((item for item in existing.get("inclusion_reasons", []) if item.get("reason_type") == "technical_signal"), None)
+            if tech_reason:
+                tech_side = _text(tech_reason.get("signal_side"))
+        sentiment = _text(view.get("latest_sentiment") or view.get("sentiment"))
+        reason_type, status = _knowledge_status_for(sentiment, tech_side)
+        sources = view.get("sources") if isinstance(view.get("sources"), list) else []
+        _add_reason(rows, code, {
+            "reason_type": reason_type,
+            "source_collection": "knowledge_market_views",
+            "source_doc_id": _text(view.get("view_id")),
+            "signal_type": f"知识库{sentiment or '覆盖'}",
+            "signal_side": tech_side or "neutral",
+            "score": 0,
+            "confidence": _float(view.get("confidence")),
+            "as_of": _text(view.get("as_of") or view.get("updated_at"))[:10],
+            "sentiment": sentiment,
+            "knowledge_status": status,
+            "evidence": {
+                "sources": sources[:4],
+                "catalysts": view.get("catalysts") if isinstance(view.get("catalysts"), list) else [],
+                "policy": "confirm_conflict_degrade_only",
+            },
+        }, index_codes=index_codes)
 
 
 def _latest_strategy_snapshot(db: Database) -> dict[str, Any]:
@@ -455,6 +605,11 @@ def _selected_rows(rows: dict[str, dict[str, Any]], limit: int) -> tuple[list[di
             if _text(item.get("signal_type") or item.get("reason_type"))
         )
         row["exit_condition"] = row.get("invalidates_when")
+        row["next_action"] = row.get("next_action") or row.get("trader_action") or "观察"
+        if not isinstance(row.get("technical_evidence"), dict) or not row.get("technical_evidence"):
+            row["technical_evidence"] = {"status": "missing", "note": "watch_only_not_buy_candidate"}
+        if not isinstance(row.get("knowledge_confirmation"), dict) or not row.get("knowledge_confirmation"):
+            row["knowledge_confirmation"] = {"status": "none"}
     ordered.sort(key=lambda item: (_float(item.get("sort_score")), _float(item.get("score"))), reverse=True)
     return ordered[:limit], ordered[limit:]
 
@@ -465,15 +620,19 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
 
     now = naive_market_now("A")
     stock_limit = int(os.getenv("TERMINAL_REALTIME_STOCK_LIMIT", "72"))
+    strict_sources = os.getenv("TERMINAL_POOL_STRICT_SOURCES", "false").strip().lower() in {"1", "true", "yes", "on"}
     index_codes = _index_codes()
     rows: dict[str, dict[str, Any]] = {}
 
     _add_user_pinned(rows, index_codes, now)
-    _add_signal_rows(rows, db, index_codes)
-    _add_strategy_rows(rows, db, index_codes)
+    _add_technical_signal_rows(rows, db, index_codes)
     _add_chain_rows(rows, db, index_codes)
-    _add_active_pool(rows, db, index_codes)
-    _add_recent_opened(rows, db, index_codes)
+    _add_knowledge_rows(rows, db, index_codes)
+    if not strict_sources:
+        _add_signal_rows(rows, db, index_codes)
+        _add_strategy_rows(rows, db, index_codes)
+        _add_active_pool(rows, db, index_codes)
+        _add_recent_opened(rows, db, index_codes)
 
     selected, skipped = _selected_rows(rows, stock_limit)
     reason_counts = Counter(
@@ -494,6 +653,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "candidate_count": len(rows),
         "reason_counts": dict(reason_counts),
         "source": "whitebox_pool_builder",
+        "source_policy": "postmarket_strict_technical_knowledge_chain" if strict_sources else "runtime_watch_and_signal_blend",
     }
     db["terminal_stock_pool"].update_one(
         {"pool": "terminal_stock_pool", "market": "A"},

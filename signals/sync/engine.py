@@ -49,6 +49,8 @@ MODULE_TARGETS = {
     "board_heat_minute": ("board_heat_ticks",),
     "concept_heat_minute": ("board_heat_ticks",),
     "chain_heat_snapshots": ("chain_heat_snapshots",),
+    "technical_signal_scan": ("terminal_technical_signals",),
+    "knowledge_market_views": ("knowledge_market_views",),
     "minute_readiness_probe": ("minute_readiness",),
     "weekly_rollup": ("bars", "index_bars"),
     "terminal_realtime_pool": ("terminal_realtime_pool", "terminal_stock_pool"),
@@ -63,6 +65,8 @@ COLLECTION_DOMAINS = {
     "concept_ranking": "concept",
     "board_heat_ticks": "board_heat",
     "chain_heat_snapshots": "chain_heat",
+    "terminal_technical_signals": "technical_signal",
+    "knowledge_market_views": "knowledge",
     "minute_readiness": "readiness",
     "terminal_realtime_pool": "terminal_pool",
     "terminal_stock_pool": "terminal_pool",
@@ -85,6 +89,11 @@ REALTIME_MODULES = {
     "minute_readiness_probe",
     "board_ranking",
     "strategy_snapshot",
+}
+
+EMPTY_OK_MODULES = {
+    "technical_signal_scan",
+    "knowledge_market_views",
 }
 
 SYNC_TZ = ZoneInfo(os.getenv("SIGNALS_SYNC_TIMEZONE", "Asia/Shanghai"))
@@ -166,6 +175,8 @@ LANE_MAINTENANCE_PLANS = {
     "board_ranking": LiveSyncPlan("board_ranking", "board_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 60),
     "board_cons": LiveSyncPlan("board_cons", "board_lane", 24 * 60 * 60, 6 * 60 * 60, 900, 70),
     "signal_pool": LiveSyncPlan("signal_pool", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 80),
+    "technical_signal_scan": LiveSyncPlan("technical_signal_scan", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 1800, 82),
+    "knowledge_market_views": LiveSyncPlan("knowledge_market_views", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 84),
     "strategy_snapshot": LiveSyncPlan("strategy_snapshot", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 120, 90),
     "terminal_realtime_pool": LiveSyncPlan("terminal_realtime_pool", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 120, 95),
     "cache_preheat": LiveSyncPlan("cache_preheat", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 180, 100),
@@ -176,6 +187,8 @@ BOOTSTRAP_LANE_MODULES = {
     "market_pools": {"workbench_lane"},
     "cache_preheat": {"workbench_lane"},
     "signal_pool": {"workbench_lane"},
+    "technical_signal_scan": {"workbench_lane"},
+    "knowledge_market_views": {"workbench_lane"},
     "index_daily": {"workbench_lane"},
     "weekly_rollup": {"workbench_lane"},
     "terminal_realtime_pool": {"workbench_lane"},
@@ -562,6 +575,8 @@ class SyncEngine:
         if not counts:
             return "ok", None
         inserted = self._result_inserted(result)
+        if module_name in EMPTY_OK_MODULES:
+            return "ok", None
         if inserted == 0 and all(count <= 0 for count in counts.values()):
             return "degraded", "target_empty_after_zero_insert"
         if isinstance(result, dict) and result.get("errors"):
@@ -701,6 +716,8 @@ class SyncEngine:
 
     def _run_scheduled_modules(self, now: datetime, today: str) -> list[dict]:
         results: list[dict] = []
+        if self.enabled_lanes is not None:
+            return results
         for name, fn, schedule in self.modules:
             if not self._module_allowed_for_lanes(name):
                 continue
@@ -790,7 +807,8 @@ class SyncEngine:
             today = now.strftime("%Y-%m-%d")
             active_markets = get_active_markets(self._now_utc())
 
-            self._run_scheduled_modules(now, today)
+            if self.enabled_lanes is None:
+                self._run_scheduled_modules(now, today)
 
             if active_markets:
                 active_label = ",".join(market.value for market in sorted(active_markets, key=lambda item: item.value))
@@ -815,6 +833,12 @@ def main():
                         help="一次性执行所有模块")
     parser.add_argument("--daemon", action="store_true",
                         help="常驻调度模式")
+    parser.add_argument("--postmarket-daemon", action="store_true",
+                        help="盘后常驻 DAG worker，按北京时间触发并支持断点续跑")
+    parser.add_argument("--postmarket-once", action="store_true",
+                        help="立即执行一次盘后 DAG")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="恢复指定 postmarket run_id，例如 postmarket:2026-04-28")
     parser.add_argument("--module", type=str, default=None,
                         help="只执行指定模块（配合 --once）")
     parser.add_argument("--lane", action="append", default=[],
@@ -865,6 +889,15 @@ def main():
             for r in results:
                 status = "✓" if r["status"] == "ok" else "✗"
                 print(f"  {status} {r['module']}: {r.get('elapsed', 0):.1f}s")
+    elif args.postmarket_once:
+        from .postmarket import PostmarketRunner
+
+        result = PostmarketRunner(engine, max_workers=args.workers).run_once(resume_run_id=args.resume)
+        print(f"\n{result}")
+    elif args.postmarket_daemon:
+        from .postmarket import PostmarketRunner
+
+        PostmarketRunner(engine, max_workers=args.workers).run_daemon()
     elif args.daemon:
         engine.run_daemon()
     else:

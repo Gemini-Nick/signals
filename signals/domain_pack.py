@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -17,6 +17,8 @@ def utc_now() -> datetime:
 
 
 def _json_safe(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, dict):
@@ -235,6 +237,7 @@ class SignalsPack:
         backtest_jobs = self._backtest_jobs(recent_runs)
         status = self._dashboard_status(connector_health)
         overview = self._overview(backtest_summary, strategy_snapshot)
+        cache_status = self._cache_status()
         return {
             "pack_id": "signals",
             "title": "Signals",
@@ -257,6 +260,7 @@ class SignalsPack:
             "decision_queue": strategy_snapshot.get("decision_queue", []),
             "strategy_kpis": strategy_snapshot.get("strategy_kpis", {}),
             "source_confidence": strategy_snapshot.get("source_confidence", {}),
+            "cache_status": cache_status,
         }
 
     def _operator_actions(self) -> List[Dict[str, Any]]:
@@ -339,6 +343,400 @@ class SignalsPack:
             if item.get("status") in {"critical", "warning"}
         ]
         return "Degraded connectors: " + ", ".join([item for item in bad if item])
+
+    def _cache_status_empty(self, mode: str, error: str = "") -> Dict[str, Any]:
+        return {
+            "available": False,
+            "mode": mode,
+            "updated_at": utc_now().isoformat(),
+            "error": error,
+            "live_low_latency": {"modules": [], "summary": {}},
+            "postmarket_backfill": {"run": None, "tasks": [], "summary": {}},
+            "mongo_stock_cache": {"freqs": [], "summary": {}},
+            "terminal_outputs": [],
+            "blockers": [],
+        }
+
+    def _cache_status(self) -> Dict[str, Any]:
+        if not config.MONGO_URL:
+            return self._cache_status_empty("mongo_not_configured")
+        try:
+            from signals.data.mongo_fallback import get_db
+
+            db = get_db()
+            if db is None:
+                return self._cache_status_empty("mongo_unavailable")
+            db.command("ping")
+        except Exception as exc:
+            return self._cache_status_empty("mongo_error", f"{exc.__class__.__name__}: {exc}")
+
+        trade_date = self._cache_trade_date(db)
+        live = self._cache_live_low_latency(db)
+        postmarket = self._cache_postmarket_backfill(db)
+        mongo_cache = self._cache_mongo_stock_cache(db, trade_date)
+        terminal_outputs = self._cache_terminal_outputs(db)
+        blockers = self._cache_blockers(live, postmarket)
+        return {
+            "available": True,
+            "mode": "mongo",
+            "updated_at": utc_now().isoformat(),
+            "trade_date": trade_date,
+            "live_low_latency": live,
+            "postmarket_backfill": postmarket,
+            "mongo_stock_cache": mongo_cache,
+            "terminal_outputs": terminal_outputs,
+            "blockers": blockers,
+        }
+
+    def _cache_trade_date(self, db) -> str:
+        run = self._find_one(db, "sync_runs", {}, {"trade_date": 1, "started_at": 1}, sort=[("started_at", -1)])
+        if run and run.get("trade_date"):
+            return str(run.get("trade_date"))
+        return datetime.now().date().isoformat()
+
+    def _cache_live_low_latency(self, db) -> Dict[str, Any]:
+        specs = [
+            ("quote_snapshots", "quote_lane", "quotes"),
+            ("stock_minute", "signal_lane", "stock minute"),
+            ("index_minute", "signal_lane", "index minute"),
+            ("minute_readiness_probe", "signal_lane", "minute readiness"),
+            ("market_pools", "workbench_lane", "market pools"),
+            ("board_heat_minute", "board_lane", "board heat"),
+            ("concept_heat_minute", "board_lane", "concept heat"),
+            ("chain_heat_snapshots", "board_lane", "chain heat"),
+        ]
+        modules: List[Dict[str, Any]] = []
+        for module, lane, label in specs:
+            doc = self._latest_sync_doc(db, module)
+            if module == "stock_minute":
+                selection = self._find_one(db, "sync_log", {"_id": "stock_minute:selection:_meta"}) or {}
+                doc = {**doc, **{key: value for key, value in selection.items() if key not in {"_id", "module"}}} if doc else selection
+            modules.append(self._cache_sync_doc_summary(module, label, lane, doc))
+
+        ok_count = sum(1 for item in modules if item.get("status") in {"ok", "partial", "running"})
+        freshness = [item.get("freshness_seconds") for item in modules if item.get("freshness_seconds") is not None]
+        minute = next((item for item in modules if item.get("module") == "minute_readiness_probe"), {})
+        stock_minute = next((item for item in modules if item.get("module") == "stock_minute"), {})
+        return {
+            "modules": modules,
+            "summary": {
+                "ok_modules": ok_count,
+                "total_modules": len(modules),
+                "freshness_seconds_max": max(freshness) if freshness else None,
+                "minute_checked": self._int_from_result(minute, "checked"),
+                "minute_not_ready": self._int_from_result(minute, "not_ready"),
+                "selected_symbols": len(stock_minute.get("selected_symbols") or []),
+                "skipped_symbols": int(stock_minute.get("skipped_count") or self._int_from_result(stock_minute, "skipped") or 0),
+            },
+        }
+
+    def _cache_postmarket_backfill(self, db) -> Dict[str, Any]:
+        run = self._find_one(db, "sync_runs", {}, sort=[("started_at", -1), ("updated_at", -1)])
+        if not run:
+            return {"run": None, "tasks": [], "summary": {"status": "not_started", "progress_pct": 0}}
+
+        run_id = str(run.get("run_id") or run.get("_id") or "")
+        tasks = self._find_many(db, "sync_tasks", {"run_id": run_id}, sort=[("order", 1)])
+        stock_daily_progress = self._find_one(db, "sync_log", {"_id": "stock_daily:progress:_meta"}) or {}
+        board_cons_progress = self._find_one(db, "sync_log", {"_id": "board_cons:_meta"}) or {}
+
+        rows: List[Dict[str, Any]] = []
+        status_counts: Dict[str, int] = {}
+        completed = 0
+        progress_values: List[float] = []
+        sample_errors: List[Any] = []
+        for task in tasks:
+            module = str(task.get("module") or "")
+            status = str(task.get("status") or "pending")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            if status == "ok":
+                completed += 1
+            summary = dict(task.get("result_summary") or {})
+            cursor = dict(task.get("cursor") or {})
+            if module == "stock_daily" and stock_daily_progress:
+                summary.update(self._project_fields(stock_daily_progress, [
+                    "scope", "total", "processed", "remaining", "inserted", "skipped",
+                    "errors", "latest_symbol", "latest_status", "progress_pct",
+                ]))
+            if module == "board_cons" and board_cons_progress:
+                summary.update(self._project_fields(board_cons_progress, [
+                    "processed", "processed_groups", "remaining", "next_cursor",
+                    "total_groups", "sample_errors", "unmapped", "source_counts",
+                ]))
+                cursor.update(self._project_fields(board_cons_progress, ["next_cursor", "remaining", "total_groups"]))
+            progress_pct = self._task_progress_pct(status, summary, cursor)
+            if progress_pct is not None:
+                progress_values.append(progress_pct)
+            errors = summary.get("sample_errors")
+            if isinstance(errors, list):
+                sample_errors.extend(errors[:3])
+            row = {
+                "task_id": str(task.get("_id") or ""),
+                "module": module,
+                "phase": task.get("phase") or "",
+                "shard_key": task.get("shard_key") or "all",
+                "status": status,
+                "attempts": int(task.get("attempts") or 0),
+                "depends_on": task.get("depends_on") or [],
+                "cursor": _json_safe(cursor),
+                "result_summary": _json_safe(summary),
+                "progress_pct": progress_pct,
+                "error_msg": str(task.get("error_msg") or "")[:500],
+                "started_at": self._iso(task.get("started_at")),
+                "updated_at": self._iso(task.get("updated_at")),
+                "heartbeat_at": self._iso(task.get("heartbeat_at")),
+                "finished_at": self._iso(task.get("finished_at")),
+            }
+            rows.append(row)
+
+        task_count = len(rows)
+        progress_pct = round(sum(progress_values) / task_count, 2) if task_count and progress_values else (
+            round(completed / task_count * 100, 2) if task_count else 0
+        )
+        return {
+            "run": {
+                "run_id": run_id,
+                "trade_date": str(run.get("trade_date") or ""),
+                "status": str(run.get("status") or ""),
+                "phase": str(run.get("phase") or ""),
+                "owner_pid": run.get("owner_pid") or "",
+                "started_at": self._iso(run.get("started_at")),
+                "updated_at": self._iso(run.get("updated_at")),
+                "heartbeat_at": self._iso(run.get("heartbeat_at")),
+                "finished_at": self._iso(run.get("finished_at")),
+            },
+            "tasks": rows,
+            "summary": {
+                "task_count": task_count,
+                "completed": completed,
+                "status_counts": status_counts,
+                "progress_pct": progress_pct,
+                "sample_errors": _json_safe(sample_errors[:10]),
+            },
+        }
+
+    def _cache_mongo_stock_cache(self, db, trade_date: str) -> Dict[str, Any]:
+        freqs = ["日线", "周线", "5分钟", "15分钟", "30分钟", "60分钟"]
+        rows: List[Dict[str, Any]] = []
+        trade_start, trade_end = self._trade_date_bounds(trade_date)
+        stock_daily_progress = self._find_one(db, "sync_log", {"_id": "stock_daily:progress:_meta"}) or {}
+        for freq in freqs:
+            query = {"meta.freq": freq}
+            latest = self._find_one(db, "bars", query, {"dt": 1, "meta.symbol": 1}, sort=[("dt", -1)])
+            today_query = dict(query)
+            if trade_start and trade_end:
+                today_query["dt"] = {"$gte": trade_start, "$lt": trade_end}
+            today_symbols = self._distinct_count(db, "bars", "meta.symbol", today_query) if trade_start else 0
+            symbols = self._distinct_count(db, "bars", "meta.symbol", query)
+            if freq == "日线":
+                progress_total = int(stock_daily_progress.get("total") or stock_daily_progress.get("expected_codes") or 0)
+                symbols = max(symbols, progress_total, today_symbols)
+            elif symbols == 0:
+                symbols = today_symbols
+            rows.append({
+                "freq": freq,
+                "symbols": symbols,
+                "today_symbols": today_symbols,
+                "total_bars": self._count(db, "bars", query),
+                "latest_dt": self._iso(latest.get("dt") if latest else None),
+                "latest_symbol": (latest or {}).get("meta", {}).get("symbol", ""),
+            })
+
+        daily = next((item for item in rows if item.get("freq") == "日线"), {})
+        return {
+            "freqs": rows,
+            "summary": {
+                "daily_symbols": daily.get("symbols", 0),
+                "daily_today_symbols": daily.get("today_symbols", 0),
+                "latest_daily_dt": daily.get("latest_dt", ""),
+            },
+        }
+
+    def _cache_terminal_outputs(self, db) -> List[Dict[str, Any]]:
+        outputs = [
+            ("terminal_technical_signals", "generated_at"),
+            ("knowledge_market_views", "generated_at"),
+            ("terminal_stock_pool", "generated_at"),
+            ("strategy_snapshots", "generated_at"),
+            ("chain_heat_snapshots", "updated_at"),
+        ]
+        rows: List[Dict[str, Any]] = []
+        for collection, sort_field in outputs:
+            latest = self._find_one(db, collection, {}, sort=[(sort_field, -1), ("updated_at", -1)])
+            rows.append({
+                "collection": collection,
+                "generated": bool(latest),
+                "count": self._count(db, collection, {}),
+                "latest_at": self._iso((latest or {}).get(sort_field) or (latest or {}).get("updated_at")),
+                "status": (latest or {}).get("status") or ("ok" if latest else "missing"),
+            })
+        return rows
+
+    def _cache_blockers(self, live: Dict[str, Any], postmarket: Dict[str, Any]) -> List[Dict[str, Any]]:
+        blockers: List[Dict[str, Any]] = []
+        for item in live.get("modules", []):
+            status = str(item.get("status") or "")
+            if status in {"error", "degraded", "missing"}:
+                blockers.append({
+                    "scope": "live_low_latency",
+                    "module": item.get("module"),
+                    "status": status,
+                    "error_msg": item.get("error_msg") or item.get("degraded_reason") or "",
+                })
+        for task in postmarket.get("tasks", []):
+            status = str(task.get("status") or "")
+            if status in {"error", "degraded", "stale"}:
+                blockers.append({
+                    "scope": "postmarket_backfill",
+                    "module": task.get("module"),
+                    "status": status,
+                    "error_msg": task.get("error_msg") or "",
+                    "sample_errors": task.get("result_summary", {}).get("sample_errors") or [],
+                })
+        return blockers[:12]
+
+    def _latest_sync_doc(self, db, module: str) -> Dict[str, Any]:
+        doc = self._find_one(db, "sync_log", {"module": module}, sort=[("last_run", -1), ("updated_at", -1)])
+        if doc:
+            return doc
+        return self._find_one(db, "sync_log", {"_id": f"{module}:_meta"}) or {}
+
+    def _cache_sync_doc_summary(self, module: str, label: str, lane: str, doc: Mapping[str, Any]) -> Dict[str, Any]:
+        if not doc:
+            return {"module": module, "label": label, "lane": lane, "status": "missing", "freshness": "missing"}
+        last_dt = doc.get("last_dt") or doc.get("latest_dt")
+        last_run = doc.get("last_run") or doc.get("updated_at")
+        freshness_seconds = self._freshness_seconds(last_run)
+        result = dict(doc.get("result") or {})
+        row = {
+            "module": module,
+            "label": label,
+            "lane": doc.get("lane") or lane,
+            "status": str(doc.get("status") or ""),
+            "freshness": self._freshness_label(freshness_seconds),
+            "freshness_seconds": freshness_seconds,
+            "latest_dt": self._iso(last_dt),
+            "last_run": self._iso(last_run),
+            "next_due_at": self._iso(doc.get("next_due_at")),
+            "elapsed_seconds": doc.get("elapsed_seconds") or doc.get("runtime_seconds"),
+            "error_msg": str(doc.get("error_msg") or doc.get("error") or "")[:500],
+            "degraded_reason": str(doc.get("degraded_reason") or "")[:500],
+            "result": _json_safe(result),
+        }
+        for key in (
+            "selected_symbols", "priority_symbols", "pinned_symbols", "skipped_symbols",
+            "skipped_count", "candidate_count", "source_counts", "planned_calls",
+            "empty_calls", "failed_calls", "written", "skipped_existing",
+        ):
+            if key in doc:
+                row[key] = _json_safe(doc.get(key))
+        return row
+
+    def _task_progress_pct(self, status: str, summary: Mapping[str, Any], cursor: Mapping[str, Any]) -> Optional[float]:
+        for source in (summary, cursor):
+            value = source.get("progress_pct")
+            if isinstance(value, (int, float)):
+                return round(float(value), 2)
+            next_cursor = source.get("next_cursor")
+            total_groups = source.get("total_groups")
+            if isinstance(next_cursor, (int, float)) and isinstance(total_groups, (int, float)) and total_groups:
+                return round(float(next_cursor) / float(total_groups) * 100, 2)
+            processed = source.get("processed")
+            total = source.get("total") or source.get("expected_codes") or source.get("total_groups")
+            if isinstance(processed, (int, float)) and isinstance(total, (int, float)) and total:
+                return round(float(processed) / float(total) * 100, 2)
+        if status == "ok":
+            return 100.0
+        return None
+
+    def _trade_date_bounds(self, trade_date: str) -> tuple[Optional[datetime], Optional[datetime]]:
+        try:
+            start = datetime.fromisoformat(str(trade_date)[:10])
+        except Exception:
+            return None, None
+        return start, start + timedelta(days=1)
+
+    def _freshness_seconds(self, value: Any) -> Optional[int]:
+        dt = self._coerce_datetime(value)
+        if not dt:
+            return None
+        return max(0, int((datetime.now() - dt).total_seconds()))
+
+    def _freshness_label(self, seconds: Optional[int]) -> str:
+        if seconds is None:
+            return "missing"
+        if seconds <= 5 * 60:
+            return "fresh"
+        if seconds <= 60 * 60:
+            return "warm"
+        return "stale"
+
+    def _coerce_datetime(self, value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None) if value.tzinfo else value
+        if isinstance(value, str) and value:
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None) if parsed.tzinfo else parsed
+        return None
+
+    def _iso(self, value: Any) -> str:
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if value is None:
+            return ""
+        return str(value)
+
+    def _find_one(self, db, collection: str, query: Mapping[str, Any], projection: Optional[Mapping[str, int]] = None, sort=None):
+        try:
+            return db[collection].find_one(dict(query), projection, sort=sort)
+        except Exception:
+            return None
+
+    def _find_many(self, db, collection: str, query: Mapping[str, Any], projection: Optional[Mapping[str, int]] = None, sort=None) -> List[Dict[str, Any]]:
+        try:
+            cursor = db[collection].find(dict(query), projection)
+            if sort:
+                cursor = cursor.sort(sort)
+            return list(cursor)
+        except Exception:
+            return []
+
+    def _count(self, db, collection: str, query: Mapping[str, Any]) -> int:
+        try:
+            return int(db[collection].count_documents(dict(query), maxTimeMS=1500))
+        except TypeError:
+            try:
+                return int(db[collection].count_documents(dict(query)))
+            except Exception:
+                return 0
+        except Exception:
+            return 0
+
+    def _distinct_count(self, db, collection: str, field: str, query: Mapping[str, Any]) -> int:
+        try:
+            return len(db[collection].distinct(field, dict(query), maxTimeMS=1500))
+        except TypeError:
+            try:
+                return len(db[collection].distinct(field, dict(query)))
+            except Exception:
+                return 0
+        except Exception:
+            return 0
+
+    def _project_fields(self, doc: Mapping[str, Any], keys: List[str]) -> Dict[str, Any]:
+        return {key: _json_safe(doc.get(key)) for key in keys if key in doc}
+
+    def _int_from_result(self, row: Mapping[str, Any], key: str) -> int:
+        result = row.get("result")
+        if isinstance(result, Mapping):
+            value = result.get(key)
+            if isinstance(value, (int, float)):
+                return int(value)
+        value = row.get(key)
+        return int(value) if isinstance(value, (int, float)) else 0
 
     def _overview(
         self,

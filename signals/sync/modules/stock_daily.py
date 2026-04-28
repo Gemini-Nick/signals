@@ -32,10 +32,55 @@ _CALL_INTERVAL = 0.3
 _PROVIDER_TIMEOUT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="stock-daily-provider")
 atexit.register(_PROVIDER_TIMEOUT_POOL.shutdown, wait=False, cancel_futures=True)
 _DEFAULT_PRIORITY_CODES = "688802,300575"
+_PROGRESS_META_ID = "stock_daily:progress:_meta"
 
 
 def _provider_timeout() -> float:
     return float(os.getenv("STOCK_DAILY_PROVIDER_TIMEOUT", "12"))
+
+
+def _progress_interval() -> int:
+    return max(1, int(os.getenv("STOCK_DAILY_PROGRESS_INTERVAL", "25")))
+
+
+def _write_progress(
+    sync_col,
+    *,
+    status: str,
+    scope: str,
+    total: int,
+    processed: int,
+    inserted: int,
+    skipped: int,
+    errors_count: int,
+    latest_symbol: str = "",
+    latest_status: str = "",
+    latest_written: int = 0,
+) -> None:
+    now = naive_market_now("A")
+    progress_pct = round(processed / total * 100, 2) if total else 0
+    sync_col.update_one(
+        {"_id": _PROGRESS_META_ID},
+        {"$set": {
+            "module": "stock_daily",
+            "status": status,
+            "scope": scope,
+            "total": total,
+            "processed": processed,
+            "remaining": max(0, total - processed),
+            "inserted": inserted,
+            "skipped": skipped,
+            "errors": errors_count,
+            "latest_symbol": latest_symbol,
+            "latest_status": latest_status,
+            "latest_written": latest_written,
+            "progress_pct": progress_pct,
+            "heartbeat_at": now,
+            "updated_at": now,
+            "last_run": now,
+        }},
+        upsert=True,
+    )
 
 
 def _call_provider(fn):
@@ -397,7 +442,19 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
 
     total_inserted = 0
     total_skipped = 0
+    processed_count = 0
     errors = []
+    progress_interval = _progress_interval()
+    _write_progress(
+        sync_col,
+        status="running",
+        scope=scope,
+        total=len(codes),
+        processed=0,
+        inserted=0,
+        skipped=0,
+        errors_count=0,
+    )
 
     def _process(code):
         last_dt_raw = sync_docs.get(code)
@@ -426,8 +483,13 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         futures = {executor.submit(_process, c): c for c in codes}
         for future in as_completed(futures):
             code = futures[future]
+            latest_symbol = code
+            latest_status = "error"
+            latest_written = 0
             try:
                 code, docs, status = future.result()
+                latest_symbol = code
+                latest_status = status
                 if status == "skip":
                     total_skipped += 1
                 elif status == "ok" and docs:
@@ -448,6 +510,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
                     if new_docs:
                         result = bars_col.insert_many(new_docs, ordered=False)
                         written = len(result.inserted_ids)
+                    latest_written = written
                     total_inserted += written
                     # 更新 sync_log
                     last = docs[-1]["dt"]
@@ -468,6 +531,22 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
                     errors.append((code, str(status)[:240]))
             except Exception as e:
                 errors.append((code, str(e)[:240]))
+            finally:
+                processed_count += 1
+                if processed_count % progress_interval == 0 or processed_count == len(codes):
+                    _write_progress(
+                        sync_col,
+                        status="running" if processed_count < len(codes) else ("partial" if errors else "ok"),
+                        scope=scope,
+                        total=len(codes),
+                        processed=processed_count,
+                        inserted=total_inserted,
+                        skipped=total_skipped,
+                        errors_count=len(errors),
+                        latest_symbol=latest_symbol,
+                        latest_status=latest_status,
+                        latest_written=latest_written,
+                    )
 
     logger.info(f"A股日线完成: +{total_inserted} bars, "
                 f"{total_skipped} 已最新, {len(errors)} 失败")
@@ -480,7 +559,10 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         "errors": len(errors),
         "scope": scope,
         "codes": len(codes),
+        "processed": processed_count,
+        "total": len(codes),
         "expected_codes": len(codes),
         "covered_codes": max(0, len(codes) - len(errors)),
         "coverage_pct": round((max(0, len(codes) - len(errors)) / len(codes) * 100), 2) if codes else 0,
+        "progress_pct": round((processed_count / len(codes) * 100), 2) if codes else 0,
     }

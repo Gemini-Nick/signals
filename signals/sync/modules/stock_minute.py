@@ -147,6 +147,8 @@ def _env_symbol_values(*names: str, default: str = "") -> list[str]:
 
 
 def _selection_cap() -> int:
+    if _postmarket_minute_scope():
+        return _int_env("STOCK_MINUTE_POSTMARKET_MAX_CODES", 360, min_value=1, max_value=1000)
     lane = os.getenv("SIGNALS_CURRENT_SYNC_LANE", "")
     market = os.getenv("SIGNALS_CURRENT_SYNC_MARKET", "")
     if lane == "signal_lane":
@@ -157,6 +159,100 @@ def _selection_cap() -> int:
     if market == "A":
         return int(os.getenv("STOCK_MINUTE_SIGNAL_MAX_CODES", "72"))
     return int(os.getenv("STOCK_MINUTE_MAX_CODES", "200"))
+
+
+def _postmarket_minute_scope() -> bool:
+    scope = os.getenv("STOCK_MINUTE_SCOPE", "").strip().lower()
+    if scope in {"postmarket", "postmarket_candidates", "expanded_postmarket"}:
+        return True
+    return os.getenv("SIGNALS_POSTMARKET_MINUTE_PREHEAT", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _add_candidate(
+    symbols: list[str],
+    source_counts: dict[str, int],
+    priority_symbols: set[str],
+    pinned_symbols: set[str],
+    index_codes: set[str],
+    value: object,
+    source: str,
+    *,
+    priority: bool = True,
+    pinned: bool = False,
+) -> str:
+    code = _pure_a_code(value)
+    if not code or code in index_codes:
+        return ""
+    if code not in symbols:
+        symbols.append(code)
+    if priority:
+        priority_symbols.add(code)
+    if pinned:
+        pinned_symbols.add(code)
+    if source:
+        source_counts[source] = source_counts.get(source, 0) + 1
+    return code
+
+
+def _reason_types_from_row(row: dict) -> set[str]:
+    reasons = row.get("inclusion_reasons") if isinstance(row.get("inclusion_reasons"), list) else []
+    reason_types = {str(reason.get("reason_type") or "") for reason in reasons if isinstance(reason, dict)}
+    signal_origin = str(row.get("signal_origin") or "")
+    if signal_origin:
+        reason_types.add(signal_origin)
+    return {reason_type for reason_type in reason_types if reason_type}
+
+
+def _add_postmarket_expanded_candidates(
+    db: Database,
+    symbols: list[str],
+    source_counts: dict[str, int],
+    priority_symbols: set[str],
+    pinned_symbols: set[str],
+    index_codes: set[str],
+) -> None:
+    """Add wider next-day minute preheat candidates without scanning all A shares."""
+    tech_limit = _int_env("STOCK_MINUTE_POSTMARKET_TECHNICAL_LIMIT", 500, min_value=1, max_value=2000)
+    knowledge_limit = _int_env("STOCK_MINUTE_POSTMARKET_KNOWLEDGE_LIMIT", 300, min_value=1, max_value=1000)
+    chain_limit = _int_env("STOCK_MINUTE_POSTMARKET_CHAIN_LIMIT", 120, min_value=1, max_value=500)
+
+    try:
+        cursor = db["terminal_technical_signals"].find(
+            {"market": "A"},
+            {"symbol": 1, "raw_code": 1, "signal_side": 1, "total_score": 1, "score": 1, "updated_at": 1, "as_of": 1},
+        ).sort([("as_of", -1), ("updated_at", -1), ("total_score", -1), ("score", -1)]).limit(tech_limit)
+        for doc in cursor:
+            _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, doc.get("raw_code") or doc.get("symbol"), "terminal_technical_signals")
+    except Exception as exc:
+        logger.debug("postmarket technical minute candidates skipped: %s", exc)
+
+    try:
+        cursor = db["knowledge_market_views"].find(
+            {"market": "A", "target_type": "stock"},
+            {"symbol": 1, "raw_code": 1, "updated_at": 1, "as_of": 1},
+        ).sort([("as_of", -1), ("updated_at", -1)]).limit(knowledge_limit)
+        for doc in cursor:
+            _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, doc.get("raw_code") or doc.get("symbol"), "knowledge_market_views")
+    except Exception as exc:
+        logger.debug("postmarket knowledge minute candidates skipped: %s", exc)
+
+    try:
+        latest = db["chain_heat_snapshots"].find_one({"market": "A"}, {"trade_minute": 1}, sort=[("trade_minute", -1)]) or {}
+        trade_minute = latest.get("trade_minute")
+        if trade_minute is not None:
+            cursor = db["chain_heat_snapshots"].find(
+                {"market": "A", "trade_minute": trade_minute},
+                {"representatives": 1, "integrated_domains": 1},
+            ).sort("rank", 1).limit(chain_limit)
+            for chain in cursor:
+                for rep in chain.get("representatives") or []:
+                    if isinstance(rep, dict):
+                        _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, rep.get("symbol"), "chain_representatives")
+                for domain in chain.get("integrated_domains") or []:
+                    if isinstance(domain, dict):
+                        _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, domain.get("leader_symbol"), "chain_domain_leaders")
+    except Exception as exc:
+        logger.debug("postmarket chain minute candidates skipped: %s", exc)
 
 
 def _select_symbols_with_priority(
@@ -265,24 +361,38 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
     ) or {}
     symbols = []
     source_counts: dict[str, int] = {}
+    postmarket_scope = _postmarket_minute_scope()
+    expanded_candidates_added = False
     for row in terminal_pool.get("stocks") or []:
         if isinstance(row, dict):
-            code = _pure_a_code(row.get("raw_code") or row.get("symbol") or row.get("code"))
-            reasons = row.get("inclusion_reasons") if isinstance(row.get("inclusion_reasons"), list) else []
-            reason_types = {str(reason.get("reason_type") or "") for reason in reasons if isinstance(reason, dict)}
-            if "user_pinned" in reason_types:
-                pinned_symbols.add(code)
-            if reason_types:
-                priority_symbols.add(code)
+            reason_types = _reason_types_from_row(row)
+            code = _add_candidate(
+                symbols,
+                source_counts,
+                priority_symbols,
+                pinned_symbols,
+                index_codes,
+                row.get("raw_code") or row.get("symbol") or row.get("code"),
+                "terminal_stock_pool",
+                priority=bool(reason_types),
+                pinned="user_pinned" in reason_types,
+            )
             for reason_type in reason_types:
                 if reason_type:
                     source_counts[reason_type] = source_counts.get(reason_type, 0) + 1
         else:
-            code = _pure_a_code(row)
-            priority_symbols.add(code)
-            source_counts["terminal_stock_pool"] = source_counts.get("terminal_stock_pool", 0) + 1
-        if code and code not in index_codes and code not in symbols:
-            symbols.append(code)
+            _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, row, "terminal_stock_pool")
+
+    if not symbols and postmarket_scope:
+        _add_postmarket_expanded_candidates(
+            db,
+            symbols,
+            source_counts,
+            priority_symbols,
+            pinned_symbols,
+            index_codes,
+        )
+        expanded_candidates_added = True
 
     if not symbols:
         return [], {
@@ -302,12 +412,36 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
         if not isinstance(row, dict):
             continue
         code = _pure_a_code(row.get("raw_code") or row.get("symbol") or row.get("code"))
-        if code:
+        if code and postmarket_scope:
+            reason_types = _reason_types_from_row(row)
+            _add_candidate(
+                symbols,
+                source_counts,
+                priority_symbols,
+                pinned_symbols,
+                index_codes,
+                code,
+                "terminal_stock_pool_skipped",
+                priority=bool(reason_types),
+                pinned="user_pinned" in reason_types,
+            )
+            for reason_type in reason_types:
+                source_counts[reason_type] = source_counts.get(reason_type, 0) + 1
+        elif code:
             skipped_pool.append({
                 "symbol": code,
                 "reason": "terminal_stock_pool_cap",
                 "next_due_hint": row.get("signal_origin") or "whitebox pool rank rotation",
             })
+    if postmarket_scope and not expanded_candidates_added:
+        _add_postmarket_expanded_candidates(
+            db,
+            symbols,
+            source_counts,
+            priority_symbols,
+            pinned_symbols,
+            index_codes,
+        )
     max_symbols = _selection_cap()
     last_runs = _latest_stock_minute_runs(db, symbols)
     selected, skipped = _select_symbols_with_priority(
@@ -325,7 +459,8 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
         "max_symbols": max_symbols,
         "candidate_count": int(terminal_pool.get("candidate_count") or len(symbols)),
         "rotation_enabled": True,
-        "rotation_policy": "terminal_stock_pool_rank_then_stale_first",
+        "rotation_policy": "postmarket_expanded_candidate_preheat" if postmarket_scope else "terminal_stock_pool_rank_then_stale_first",
+        "minute_scope": "postmarket_candidates" if postmarket_scope else "terminal_stock_pool",
         "tier_counts": {
             "selected_pinned": sum(1 for code in selected if code in pinned_symbols),
             "selected_priority": sum(1 for code in selected if code in priority_symbols and code not in pinned_symbols),
@@ -522,6 +657,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
             "candidate_count": selection_meta.get("candidate_count"),
             "rotation_enabled": selection_meta.get("rotation_enabled", False),
             "rotation_policy": selection_meta.get("rotation_policy", ""),
+            "minute_scope": selection_meta.get("minute_scope", ""),
             "tier_counts": selection_meta.get("tier_counts") or {},
             "workers": workers,
             "tail_counts": tail_counts,
@@ -550,6 +686,8 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
         "priority": len(selection_meta.get("priority_symbols") or []),
         "skipped": len(skipped_symbols),
         "skipped_symbols": skipped_symbols[:20],
+        "minute_scope": selection_meta.get("minute_scope", ""),
+        "source_counts": selection_meta.get("source_counts") or {},
         "workers": workers,
         "tail_counts": tail_counts,
         "planned_calls": len(tasks),

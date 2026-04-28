@@ -270,9 +270,9 @@ def test_lane_unavailable_state_is_throttled_per_lane():
     assert engine._has_run_recent("live_bundle:quote_lane", "HK", now + timedelta(seconds=60)) is True
 
 
-def test_workbench_lane_runs_scheduled_daily_maintenance():
+def test_unfiltered_daemon_runs_scheduled_daily_maintenance():
     engine = object.__new__(SyncEngine)
-    engine.enabled_lanes = {"workbench_lane"}
+    engine.enabled_lanes = None
     engine.db = _FakeDb({
         "sync_log": _FakeCollection(),
         "data_freshness": _FakeCollection(),
@@ -302,9 +302,29 @@ def test_workbench_lane_runs_scheduled_daily_maintenance():
     assert engine.db["sync_log"].docs["stock_daily:_meta"]["lane"] == "workbench_lane"
 
 
+def test_live_lane_daemon_does_not_run_scheduled_maintenance_directly():
+    engine = object.__new__(SyncEngine)
+    engine.enabled_lanes = {"workbench_lane"}
+    engine.db = _FakeDb({"sync_log": _FakeCollection(), "data_freshness": _FakeCollection()})
+    engine.proxy_url = None
+    calls = []
+
+    def stock_daily(db, proxy_url=None):
+        calls.append("stock_daily")
+        return {"inserted": 1}
+
+    engine.modules = [("stock_daily", stock_daily, "16:00-17:30 weekday")]
+    engine.module_map = {"stock_daily": (stock_daily, "16:00-17:30 weekday")}
+
+    results = engine._run_scheduled_modules(datetime(2026, 4, 27, 16, 45), "2026-04-27")
+
+    assert calls == []
+    assert results == []
+
+
 def test_board_lane_runs_board_cons_as_partial_status():
     engine = object.__new__(SyncEngine)
-    engine.enabled_lanes = {"board_lane"}
+    engine.enabled_lanes = None
     engine.db = _FakeDb({
         "sync_log": _FakeCollection(),
         "data_freshness": _FakeCollection(),

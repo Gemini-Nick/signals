@@ -1,0 +1,230 @@
+# -*- coding: utf-8 -*-
+"""Scan cached bars and publish explainable hard-technical signals."""
+from __future__ import annotations
+
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from typing import Any
+
+import pandas as pd
+from pymongo import UpdateOne
+from pymongo.database import Database
+
+from signals.core.market_time import naive_market_now
+
+logger = logging.getLogger("signals.sync.technical_signal_scan")
+
+DAILY_FREQS = ["日线", "daily", "D", "1d"]
+WEEKLY_FREQS = ["周线", "weekly", "W", "1w"]
+MINUTE_FREQS = {
+    "30分钟": ["30分钟", "30min", "30m", "F30"],
+    "15分钟": ["15分钟", "15min", "15m", "F15"],
+    "5分钟": ["5分钟", "5min", "5m", "F5"],
+}
+
+
+def _pure_a_code(symbol: Any) -> str:
+    raw = str(symbol or "").strip().upper()
+    if not raw:
+        return ""
+    pure = raw.split(".", 1)[-1] if "." in raw else raw
+    pure = pure.replace("SH", "").replace("SZ", "").replace("BJ", "")
+    return pure if pure.isdigit() and len(pure) == 6 else ""
+
+
+def _prefixed_symbol(symbol: Any) -> str:
+    code = _pure_a_code(symbol)
+    if not code:
+        return str(symbol or "").strip()
+    if code.startswith(("6", "9")):
+        return f"SH.{code}"
+    if code.startswith(("4", "8")):
+        return f"BJ.{code}"
+    return f"SZ.{code}"
+
+
+def _symbols_with_daily(db: Database) -> list[str]:
+    symbols = db["bars"].distinct("meta.symbol", {"meta.freq": {"$in": DAILY_FREQS}})
+    clean = sorted({_pure_a_code(symbol) for symbol in symbols if _pure_a_code(symbol)})
+    max_symbols = int(os.getenv("TECHNICAL_SIGNAL_SCAN_MAX_SYMBOLS", "0"))
+    if max_symbols > 0:
+        return clean[:max_symbols]
+    return clean
+
+
+def _doc_to_rawbar(doc: dict[str, Any], symbol: str, freq, idx: int) -> Any:
+    from czsc import RawBar
+
+    return RawBar(
+        symbol=symbol,
+        dt=doc["dt"] if isinstance(doc.get("dt"), datetime) else pd.to_datetime(doc.get("dt")).to_pydatetime(),
+        id=idx,
+        freq=freq,
+        open=float(doc.get("open") or 0),
+        high=float(doc.get("high") or 0),
+        low=float(doc.get("low") or 0),
+        close=float(doc.get("close") or 0),
+        vol=int(float(doc.get("vol") or 0)),
+        amount=int(float(doc.get("amount") or 0)),
+    )
+
+
+def _load_bars(db: Database, symbol: str, freq_values: list[str], freq, *, limit: int) -> list[Any]:
+    docs = list(db["bars"].find(
+        {"meta.symbol": symbol, "meta.freq": {"$in": freq_values}},
+        {"_id": 0, "dt": 1, "open": 1, "high": 1, "low": 1, "close": 1, "vol": 1, "amount": 1},
+    ).sort("dt", -1).limit(limit))
+    docs.reverse()
+    out = []
+    output_symbol = _prefixed_symbol(symbol)
+    for idx, doc in enumerate(docs):
+        try:
+            out.append(_doc_to_rawbar(doc, output_symbol, freq, idx))
+        except Exception:
+            continue
+    return out
+
+
+def _signal_side(signal_type: str, score: float) -> str:
+    if "卖" in signal_type or "顶" in signal_type or "风险" in signal_type or score < 0:
+        return "sell"
+    return "buy"
+
+
+def _details_dict(details: str) -> dict[str, Any]:
+    if not details:
+        return {}
+    return {"summary": details[:800]}
+
+
+def _scan_symbol(db: Database, symbol: str) -> list[dict[str, Any]]:
+    from czsc import Freq
+    from signals.core.analyzer import SymbolAnalyzer
+    from signals.core.detectors import detect_all_signals
+    from signals.core.scorer import SIGNAL_WEIGHTS, score_signals
+
+    bars_by_freq: list[tuple[str, Any, list[Any], int]] = [
+        ("日线", Freq.D, _load_bars(db, symbol, DAILY_FREQS, Freq.D, limit=360), 200),
+        ("周线", Freq.W, _load_bars(db, symbol, WEEKLY_FREQS, Freq.W, limit=180), 100),
+        ("30分钟", Freq.F30, _load_bars(db, symbol, MINUTE_FREQS["30分钟"], Freq.F30, limit=260), 80),
+        ("15分钟", Freq.F15, _load_bars(db, symbol, MINUTE_FREQS["15分钟"], Freq.F15, limit=260), 80),
+        ("5分钟", Freq.F5, _load_bars(db, symbol, MINUTE_FREQS["5分钟"], Freq.F5, limit=260), 80),
+    ]
+    events = []
+    bi_counts: dict[str, int] = {}
+    for label, freq, bars, max_bi in bars_by_freq:
+        if len(bars) < 20:
+            continue
+        try:
+            analyzer = SymbolAnalyzer(_prefixed_symbol(symbol), freq, bars, max_bi_num=max_bi)
+            detected = detect_all_signals(analyzer.czsc, _prefixed_symbol(symbol))
+            events.extend(detected)
+            bi_counts[label] = len(analyzer.finished_bis)
+        except Exception as exc:
+            logger.debug("technical scan failed %s/%s: %s", symbol, label, exc)
+    if not events:
+        return []
+
+    scored = score_signals(_prefixed_symbol(symbol), events)
+    now = naive_market_now("A")
+    buy_freqs = sorted({event.freq for event in events if _signal_side(event.signal_type, SIGNAL_WEIGHTS.get(event.signal_type, 0)) == "buy"})
+    sell_freqs = sorted({event.freq for event in events if _signal_side(event.signal_type, SIGNAL_WEIGHTS.get(event.signal_type, 0)) == "sell"})
+    docs: list[dict[str, Any]] = []
+    for event in events:
+        base_score = float(SIGNAL_WEIGHTS.get(event.signal_type, 0)) * float(event.confidence or 0)
+        side = _signal_side(event.signal_type, base_score)
+        dt_value = event.dt.replace(tzinfo=None) if getattr(event.dt, "tzinfo", None) else event.dt
+        dedupe_key = f"{_prefixed_symbol(symbol)}|{event.freq}|{event.signal_type}|{dt_value.isoformat()}"
+        docs.append({
+            "dedupe_key": dedupe_key,
+            "symbol": _prefixed_symbol(symbol),
+            "raw_code": _pure_a_code(symbol),
+            "market": "A",
+            "freq": event.freq,
+            "dt": dt_value,
+            "as_of": now.date().isoformat(),
+            "updated_at": now,
+            "signal_type": event.signal_type,
+            "signal_side": side,
+            "signal_family": "hard_technical",
+            "price": float(event.price or 0),
+            "score": round(base_score, 3),
+            "total_score": float(scored.total_score or 0),
+            "direction": scored.direction,
+            "confidence": float(event.confidence or 0),
+            "resonance_freqs": buy_freqs if side == "buy" else sell_freqs,
+            "technical_evidence": {
+                "signal_type": event.signal_type,
+                "freq": event.freq,
+                "details": event.details,
+                "score_details": scored.details[:1600],
+                "bi_counts": bi_counts,
+                "direction": scored.direction,
+            },
+            "invalidates_when": "跌破信号触发价或上级周期转弱" if side == "buy" else "重新站回风险触发周期并出现买点确认",
+            "source": "sync.technical_signal_scan",
+        })
+    return docs
+
+
+def sync_technical_signal_scan(db: Database, proxy_url: str = None) -> dict:
+    """Scan all cached A-share daily/weekly bars and publish hard-technical signals."""
+    now = naive_market_now("A")
+    try:
+        symbols = _symbols_with_daily(db)
+    except Exception as exc:
+        return {"status": "error", "error_msg": f"symbol_universe_failed: {exc}"}
+    workers = max(1, int(os.getenv("TECHNICAL_SIGNAL_SCAN_WORKERS", "4")))
+    operations: list[UpdateOne] = []
+    scanned = 0
+    failed = 0
+    signal_count = 0
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="technical-scan") as executor:
+        futures = {executor.submit(_scan_symbol, db, symbol): symbol for symbol in symbols}
+        for future in as_completed(futures):
+            scanned += 1
+            symbol = futures[future]
+            try:
+                docs = future.result()
+            except Exception as exc:
+                failed += 1
+                logger.debug("technical scan symbol failed %s: %s", symbol, exc)
+                continue
+            signal_count += len(docs)
+            for doc in docs:
+                operations.append(UpdateOne({"dedupe_key": doc["dedupe_key"]}, {"$set": doc}, upsert=True))
+            if len(operations) >= 500:
+                db["terminal_technical_signals"].bulk_write(operations, ordered=False)
+                operations.clear()
+    if operations:
+        db["terminal_technical_signals"].bulk_write(operations, ordered=False)
+
+    db["data_freshness"].update_one(
+        {"domain": "technical_signal", "market": "A", "mode": "postmarket", "collection": "terminal_technical_signals"},
+        {"$set": {
+            "domain": "technical_signal",
+            "market": "A",
+            "mode": "postmarket",
+            "lane": "postmarket",
+            "collection": "terminal_technical_signals",
+            "freshness": "fresh",
+            "latest_dt": now.date().isoformat(),
+            "as_of": now.date().isoformat(),
+            "updated_at": now,
+            "stale_reason": "" if signal_count or not symbols else "no_technical_signal_detected",
+            "count": signal_count,
+            "scanned_symbols": scanned,
+            "failed_symbols": failed,
+        }},
+        upsert=True,
+    )
+    logger.info("technical signal scan: symbols=%d signals=%d failed=%d", scanned, signal_count, failed)
+    return {
+        "status": "ok",
+        "inserted": signal_count,
+        "symbols": scanned,
+        "signals": signal_count,
+        "failed": failed,
+    }

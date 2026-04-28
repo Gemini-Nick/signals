@@ -35,6 +35,8 @@ MODULES = [
     "board_heat_minute",
     "concept_heat_minute",
     "chain_heat_snapshots",
+    "technical_signal_scan",
+    "knowledge_market_views",
     "board_ranking",
     "stock_daily",
     "index_daily",
@@ -215,6 +217,27 @@ def _board_heat_probe(db) -> dict[str, Any]:
     return {"rows": rows}
 
 
+def _postmarket_state(db) -> dict[str, Any]:
+    run = db["sync_runs"].find_one(
+        {"run_id": {"$regex": "^postmarket:"}},
+        {"_id": 0},
+        sort=[("updated_at", -1), ("started_at", -1)],
+    ) or {}
+    if not run:
+        return {"run": None, "tasks": [], "summary": {}}
+    run_id = run.get("run_id")
+    tasks = list(db["sync_tasks"].find(
+        {"run_id": run_id},
+        {"_id": 0, "module": 1, "phase": 1, "shard_key": 1, "status": 1, "attempts": 1,
+         "heartbeat_at": 1, "updated_at": 1, "finished_at": 1, "error_msg": 1, "cursor": 1},
+    ).sort([("phase", 1), ("order", 1)]))
+    summary: dict[str, int] = {}
+    for task in tasks:
+        status = task.get("status") or "unknown"
+        summary[status] = summary.get(status, 0) + 1
+    return {"run": run, "tasks": tasks, "summary": summary}
+
+
 def _normalize_stock_symbol(symbol: str) -> list[str]:
     raw = str(symbol or "").strip()
     if not raw:
@@ -304,6 +327,7 @@ def build_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         "launchd": _launchd_status(args.label),
         "processes": {
             "web": _pid_status("web", pid_dir / "signals-web.pid"),
+            "postmarket": _pid_status("postmarket", pid_dir / "signals-postmarket.pid"),
             "lanes": {
                 lane: _pid_status(lane, pid_dir / f"signals-lane-{lane}.pid")
                 for lane in LANES
@@ -313,6 +337,7 @@ def build_snapshot(args: argparse.Namespace) -> dict[str, Any]:
         "logs": {
             "runtime": _tail(log_dir / "signals.runtime.log", args.tail_lines),
             "web": _tail(log_dir / "signals.web.launchd.log", args.tail_lines),
+            "postmarket": _tail(log_dir / "signals.postmarket.launchd.log", args.tail_lines),
             **{
                 lane: _tail(log_dir / f"signals.{LANE_SHORT[lane]}.launchd.log", args.tail_lines)
                 for lane in LANES
@@ -330,6 +355,7 @@ def build_snapshot(args: argparse.Namespace) -> dict[str, Any]:
             "symbol_probe": _symbol_probe(db, args.symbols),
             "readiness": _readiness(db),
             "board_heat": _board_heat_probe(db),
+            "postmarket": _postmarket_state(db),
         }
     except Exception as exc:
         snapshot["mongo"] = {"available": False, "error": f"{exc.__class__.__name__}: {exc}"}
@@ -344,6 +370,8 @@ def print_human(snapshot: dict[str, Any]) -> None:
     print(f"launchd {launchd.get('label')}: state={launchd.get('state', '')} pid={launchd.get('pid', '')} runs={launchd.get('runs', '')} last_exit={launchd.get('last_exit_code', '')}")
     web = (snapshot.get("processes") or {}).get("web") or {}
     print(f"web: {web.get('state')} pid={web.get('pid')} rss={web.get('rss_kb')}KB cpu={web.get('cpu_pct')}")
+    postmarket = (snapshot.get("processes") or {}).get("postmarket") or {}
+    print(f"postmarket: {postmarket.get('state')} pid={postmarket.get('pid')} rss={postmarket.get('rss_kb')}KB cpu={postmarket.get('cpu_pct')}")
     for lane, item in ((snapshot.get("processes") or {}).get("lanes") or {}).items():
         print(f"{lane}: {item.get('state')} pid={item.get('pid')} rss={item.get('rss_kb')}KB cpu={item.get('cpu_pct')}")
     mongo = snapshot.get("mongo") or {}
@@ -353,6 +381,13 @@ def print_human(snapshot: dict[str, Any]) -> None:
     print("\nmodule meta:")
     for item in mongo.get("module_meta", [])[:20]:
         print(f"- {item.get('module')} lane={item.get('lane', '')} market={item.get('market', '')} status={item.get('status')} last={_json_default(item.get('last_run'))} next={_json_default(item.get('next_due_at'))} reason={item.get('degraded_reason') or item.get('error_msg') or ''}")
+    post_state = mongo.get("postmarket") or {}
+    run = post_state.get("run") or {}
+    if run:
+        print("\npostmarket:")
+        print(f"- run={run.get('run_id')} trade_date={run.get('trade_date')} status={run.get('status')} phase={run.get('phase')} heartbeat={_json_default(run.get('heartbeat_at'))} tasks={post_state.get('summary')}")
+        for task in (post_state.get("tasks") or [])[:16]:
+            print(f"  - {task.get('phase')}/{task.get('module')} status={task.get('status')} attempts={task.get('attempts')} error={task.get('error_msg') or ''}")
     print("\nsymbol probe:")
     for item in mongo.get("symbol_probe", []):
         freqs = ", ".join(f"{row['collection']}:{row['symbol']}:{row['freq']}@{_json_default(row.get('latest_dt'))}" for row in item.get("freqs", []))
