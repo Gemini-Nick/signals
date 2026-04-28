@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "longclaw-signals"
+name = "chan-ai-signals"
 version = "0.1.0"
-description = "Three-layer market analysis engine for Longclaw Agent OS"
+description = "Chan-theory signal and evidence engine for the chan.AI trading framework"
 readme = "README.md"
 requires-python = ">=3.11"
 dynamic = ["dependencies"]
@@ -16,6 +16,7 @@ dev = [
 ]
 
 [project.scripts]
+chan-ai-signals = "run:main"
 longclaw-signals = "run:main"
 
 [tool.setuptools]

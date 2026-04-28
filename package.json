@@ -1,4 +1,8 @@
 {
+  "name": "chan-ai-signals-tools",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Document and utility tooling for chan.AI Signals",
   "dependencies": {
     "docx": "^9.6.0"
   }
