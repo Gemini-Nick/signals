@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from difflib import SequenceMatcher
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -44,6 +45,7 @@ from .stock import analyze_stock
 router = APIRouter(prefix="/api/workbench", tags=["workbench"])
 
 UI_FREQS = ["30min", "15min", "5min", "daily", "weekly"]
+DEFAULT_TERMINAL_FREQ = "30min"
 MINUTE_FREQS = {"5min", "5m", "15min", "15m", "30min", "30m"}
 BUY_FREQS = ["daily", "30min", "15min", "5min"]
 SECOND_SCREEN_LANES = {
@@ -301,6 +303,68 @@ def _chart_has_ohlcv(chart: dict[str, Any]) -> bool:
     return bool(chart.get("ohlcv"))
 
 
+def _board_heat_alias_candidates(kind: str, label: str) -> list[str]:
+    raw = _text(label)
+    candidates = [raw]
+    if raw.endswith("概念"):
+        candidates.append(raw[:-2])
+    if "和其他" in raw:
+        candidates.append(raw.split("和其他", 1)[0])
+    for separator in (" · ", "·", "-", "/", "／"):
+        if separator in raw:
+            candidates.extend(part.strip() for part in raw.split(separator))
+    output: list[str] = []
+    for item in candidates:
+        normalized = _text(item)
+        if normalized and normalized not in output:
+            output.append(normalized)
+    return output
+
+
+def _choose_board_heat_name(kind: str, label: str, names: list[str]) -> tuple[str, str]:
+    candidates = _board_heat_alias_candidates(kind, label)
+    name_set = {name for name in names if name}
+    for candidate in candidates:
+        if candidate in name_set:
+            return candidate, "exact" if candidate == label else "alias"
+
+    best_name = ""
+    best_score = 0.0
+    for name in name_set:
+        for candidate in candidates:
+            if name in candidate or candidate in name:
+                score = 2.0 + min(len(name), len(candidate)) / max(len(name), len(candidate), 1)
+            else:
+                score = SequenceMatcher(None, candidate, name).ratio()
+            if score > best_score:
+                best_name = name
+                best_score = score
+    if best_name and best_score >= 0.62:
+        return best_name, "fuzzy"
+    return _text(label), "unresolved"
+
+
+def resolve_board_heat_name(kind: str, label: str) -> dict[str, str]:
+    query = _text(label)
+    if not query:
+        return {"query": "", "heat_name": "", "status": "missing_query"}
+    try:
+        db = _mongo_db()
+        latest = db["board_heat_ticks"].find_one({"kind": kind}, sort=[("trade_minute", -1)])
+        scope = {"kind": kind}
+        if latest and latest.get("trade_minute") is not None:
+            scope["trade_minute"] = latest.get("trade_minute")
+        names = [
+            _text(doc.get("name"))
+            for doc in db["board_heat_ticks"].find(scope, {"_id": 0, "name": 1})
+        ]
+    except Exception:
+        return {"query": query, "heat_name": query, "status": "mongo_unavailable"}
+
+    heat_name, status = _choose_board_heat_name(kind, query, names)
+    return {"query": query, "heat_name": heat_name or query, "status": status}
+
+
 def _target_time_fields(*, market: str = "", symbol: str = "", source: str = "") -> dict[str, str]:
     resolved_market = infer_market(market, symbol=symbol, source=source)
     return {
@@ -515,26 +579,28 @@ def _target_diagnostics(kind: str, symbol: str, requested_freq: str, *, probe_sy
     }
 
 
-def _board_heat_df(name: str, kind: str, freq: str) -> tuple[pd.DataFrame, str, dict[str, Any]]:
+def _board_heat_df(name: str, kind: str, freq: str) -> tuple[pd.DataFrame, str, dict[str, Any], dict[str, str]]:
     canonical = _canonical_freq(freq)
+    resolution = resolve_board_heat_name(kind, name)
+    heat_name = resolution.get("heat_name") or name
     if canonical not in {"5min", "15min", "30min"}:
-        return pd.DataFrame(), "board_heat_ticks", {}
+        return pd.DataFrame(), "board_heat_ticks", {}, resolution
     bucket = {"5min": "5min", "15min": "15min", "30min": "30min"}[canonical]
     try:
         db = _mongo_db()
         docs = list(db["board_heat_ticks"].find(
-            {"kind": kind, "name": name},
+            {"kind": kind, "name": heat_name},
             {"_id": 0},
         ).sort("trade_minute", 1))
     except Exception:
-        return pd.DataFrame(), "board_heat_ticks", {}
+        return pd.DataFrame(), "board_heat_ticks", {}, resolution
     if not docs:
-        return pd.DataFrame(), "board_heat_ticks", {}
+        return pd.DataFrame(), "board_heat_ticks", {}, resolution
     df = pd.DataFrame(docs)
     df["trade_minute"] = pd.to_datetime(df["trade_minute"], errors="coerce")
     df = df.dropna(subset=["trade_minute"]).sort_values("trade_minute").set_index("trade_minute")
     if df.empty or "change_pct" not in df.columns:
-        return pd.DataFrame(), "board_heat_ticks", {}
+        return pd.DataFrame(), "board_heat_ticks", {}, resolution
     df["change_pct"] = pd.to_numeric(df["change_pct"], errors="coerce")
     if "market_value" not in df.columns:
         df["market_value"] = 0
@@ -544,7 +610,7 @@ def _board_heat_df(name: str, kind: str, freq: str) -> tuple[pd.DataFrame, str, 
         "market_value": "last",
     }).dropna(subset=[("change_pct", "last")])
     if grouped.empty:
-        return pd.DataFrame(), "board_heat_ticks", {}
+        return pd.DataFrame(), "board_heat_ticks", {}, resolution
     out = pd.DataFrame({
         "open": grouped[("change_pct", "first")],
         "high": grouped[("change_pct", "max")],
@@ -556,17 +622,27 @@ def _board_heat_df(name: str, kind: str, freq: str) -> tuple[pd.DataFrame, str, 
     out.attrs["data_source"] = "board_heat_ticks"
     out.attrs["as_of"] = str(out.index.max().date())
     latest = docs[-1] if docs else {}
-    return out, "board_heat_ticks", latest
+    latest = {**latest, "heat_target_label": heat_name, "heat_resolution_status": resolution.get("status", "")}
+    return out, "board_heat_ticks", latest, resolution
 
 
 def _board_heat_chart(name: str, kind: str, freq: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    df, source, latest = _board_heat_df(name, kind, freq)
-    chart = _chart_from_df(df, symbol=name, freq=freq, source=source)
+    df, source, latest, resolution = _board_heat_df(name, kind, freq)
+    heat_name = resolution.get("heat_name") or name
+    latest = {
+        "heat_target_label": heat_name,
+        "heat_resolution_status": resolution.get("status", ""),
+        **latest,
+    }
+    chart = _chart_from_df(df, symbol=heat_name, freq=freq, source=source)
     chart["meta"] = {
         **chart.get("meta", {}),
         "kind": kind,
         "value_axis": "change_pct",
         "chart_source": "board_heat_ticks",
+        "query_label": name,
+        "heat_target_label": heat_name,
+        "heat_resolution_status": resolution.get("status", ""),
     }
     return _mark_chart_readiness(chart, kind=kind, requested_freq=freq), latest
 
@@ -945,6 +1021,7 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "target_kind": "stock",
         "target_label": normalized,
         "target_symbol": normalized,
+        "target_freq": DEFAULT_TERMINAL_FREQ,
     })
     return enriched
 
@@ -965,10 +1042,11 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "latest_signal": _signal_or_fallback(row, df),
         "range_returns": _compute_range_returns(df, range_columns),
         "range_return_source": source,
-        "available_freqs": ["daily", "weekly", "30min", "15min"],
+        "available_freqs": UI_FREQS,
         "target_kind": "index",
         "target_label": row.get("name") or row.get("label") or symbol,
         "target_symbol": symbol,
+        "target_freq": DEFAULT_TERMINAL_FREQ,
     })
     return enriched
 
@@ -989,6 +1067,7 @@ def _enrich_cluster_row(row: dict[str, Any], kind: str) -> dict[str, Any]:
         "target_kind": kind,
         "target_label": label,
         "target_symbol": str(enriched.get("code") or enriched.get("board_code") or label),
+        "target_freq": DEFAULT_TERMINAL_FREQ,
     })
     return enriched
 
@@ -1381,7 +1460,7 @@ def _build_macro_index_rows(
             "target_kind": target_kind,
             "target_label": target_label,
             "target_symbol": target_symbol,
-            "target_freq": "daily",
+            "target_freq": DEFAULT_TERMINAL_FREQ,
         })
         rows.append(enriched)
     return rows
@@ -1691,6 +1770,8 @@ def _mapping_chain_from_carrier(name: str, carrier: Optional[dict[str, Any]], *,
 def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
     enriched = _enrich_cluster_row(row, kind)
     label = str(enriched.get("label") or enriched.get("name") or "").strip()
+    heat_resolution = resolve_board_heat_name(kind, label)
+    heat_target_label = heat_resolution.get("heat_name") or label
     non_chain = non_chain_reason(label) if kind == "concept" else ""
     leader = _text(
         enriched.get("leader")
@@ -1795,9 +1876,12 @@ def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
         "chart_target_status": "non_chain" if non_chain else ("carrier_stock" if carrier_payload else "unmapped"),
         "latest_signal": latest_signal,
         "target_kind": kind,
-        "target_label": label,
-        "target_symbol": label,
-        "target_freq": "daily",
+        "target_label": heat_target_label,
+        "target_symbol": heat_target_label,
+        "target_freq": DEFAULT_TERMINAL_FREQ,
+        "display_label": label,
+        "heat_target_label": heat_target_label,
+        "heat_resolution_status": heat_resolution.get("status", ""),
         "fallback_target": {
             "kind": "stock",
             "label": carrier_payload.get("symbol"),
@@ -1964,7 +2048,7 @@ def _build_trader_task_queue(
             "chart_target": {
                 "kind": row.get("target_kind") or row.get("domain") or "industry",
                 "label": row.get("target_label") or row.get("label"),
-                "freq": "daily",
+                "freq": row.get("target_freq") or DEFAULT_TERMINAL_FREQ,
                 "fallback_target": row.get("fallback_target") or {},
             },
             "invalidates_when": row.get("invalidates_when"),
@@ -1980,7 +2064,7 @@ def _build_trader_task_queue(
             "action_label": action,
             "title": _text(row.get("title")) or f"{action} · {_text(row.get('symbol') or row.get('decision_id'))}",
             "trigger_reason": _text(row.get("summary") or row.get("reason") or row.get("recommended_action")),
-            "chart_target": row.get("chart_target") or {"kind": "stock", "label": row.get("symbol"), "freq": "daily"},
+            "chart_target": row.get("chart_target") or {"kind": "stock", "label": row.get("symbol"), "freq": DEFAULT_TERMINAL_FREQ},
             "invalidates_when": row.get("invalidates_when") or "复核条件解除或关键位被破坏",
         })
 
@@ -3174,26 +3258,34 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
 
     if requested_freq in {"5min", "15min", "30min"}:
         chart, latest_heat = _board_heat_chart(name, "industry", requested_freq)
+        heat_target_label = _text(latest_heat.get("heat_target_label")) or name
+        heat_resolution_status = _text(latest_heat.get("heat_resolution_status")) or ("exact" if heat_target_label == name else "unresolved")
+        heat_ready = _chart_has_ohlcv(chart)
         return {
             "target": {
                 "kind": "industry",
                 "label": name,
-                "symbol": name,
-                **_target_time_fields(market="A", symbol=name, source="board_heat_ticks"),
+                "symbol": heat_target_label,
+                "heat_target_label": heat_target_label,
+                "heat_resolution_status": heat_resolution_status,
+                **_target_time_fields(market="A", symbol=heat_target_label, source="board_heat_ticks"),
                 "requested_freq": requested_freq,
                 "effective_freq": requested_freq,
                 "available_freqs": UI_FREQS,
-                "mapping_status": "direct_board_heat",
+                "mapping_status": "direct_board_heat" if heat_ready else "heat_not_ready",
                 "unmapped_reason": "",
                 "fallback_reason": "",
                 "not_ready_reason": chart.get("meta", {}).get("not_ready_reason", ""),
                 "cache_probe": {
-                    "status": "hit" if _chart_has_ohlcv(chart) else "miss",
+                    "status": "hit" if heat_ready else "miss",
                     "kind": "industry",
                     "requested_freq": requested_freq,
                     "collection": "board_heat_ticks",
                     "latest_dt": _serialize_dt(latest_heat.get("trade_minute")),
                     "source": latest_heat.get("source", ""),
+                    "query_label": name,
+                    "heat_target_label": heat_target_label,
+                    "heat_resolution_status": heat_resolution_status,
                 },
             },
             "chart": chart,
@@ -3201,13 +3293,15 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
                 "title": name,
                 "subtitle": "行业分钟热度",
                 "latest_price": chart.get("ohlcv", [{}])[-1].get("close", 0) if chart.get("ohlcv") else 0,
-                "conclusion": "行业分钟热度来自缓存。" if _chart_has_ohlcv(chart) else "行业分钟热度缓存未就绪。",
+                "conclusion": "行业分钟热度来自缓存。" if heat_ready else "行业分钟热度缓存未就绪。",
                 "gain_pct": latest_heat.get("change_pct"),
                 "composite_score": getattr(ranking, "composite_score", 0) if ranking else 0,
                 "leader": latest_heat.get("leader_name", ""),
                 "up_count": latest_heat.get("up_count"),
                 "down_count": latest_heat.get("down_count"),
-                "mapping_status": "direct_board_heat",
+                "mapping_status": "direct_board_heat" if heat_ready else "heat_not_ready",
+                "heat_target_label": heat_target_label,
+                "heat_resolution_status": heat_resolution_status,
                 "not_ready_reason": chart.get("meta", {}).get("not_ready_reason", ""),
             },
             "signals": [],
@@ -3321,26 +3415,34 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
     non_chain = non_chain_reason(name)
     if requested_freq in {"5min", "15min", "30min"}:
         chart, latest_heat = _board_heat_chart(name, "concept", requested_freq)
+        heat_target_label = _text(latest_heat.get("heat_target_label")) or name
+        heat_resolution_status = _text(latest_heat.get("heat_resolution_status")) or ("exact" if heat_target_label == name else "unresolved")
+        heat_ready = _chart_has_ohlcv(chart)
         return {
             "target": {
                 "kind": "concept",
                 "label": name,
-                "symbol": getattr(concept, "code", "") or name,
-                **_target_time_fields(market="A", symbol=getattr(concept, "code", "") or name, source="board_heat_ticks"),
+                "symbol": heat_target_label,
+                "heat_target_label": heat_target_label,
+                "heat_resolution_status": heat_resolution_status,
+                **_target_time_fields(market="A", symbol=heat_target_label, source="board_heat_ticks"),
                 "requested_freq": requested_freq,
                 "effective_freq": requested_freq,
                 "available_freqs": UI_FREQS,
-                "mapping_status": "direct_board_heat" if _chart_has_ohlcv(chart) else ("non_chain" if non_chain else "heat_not_ready"),
+                "mapping_status": "direct_board_heat" if heat_ready else ("non_chain" if non_chain else "heat_not_ready"),
                 "unmapped_reason": non_chain or "",
                 "fallback_reason": "",
                 "not_ready_reason": chart.get("meta", {}).get("not_ready_reason", ""),
                 "cache_probe": {
-                    "status": "hit" if _chart_has_ohlcv(chart) else "miss",
+                    "status": "hit" if heat_ready else "miss",
                     "kind": "concept",
                     "requested_freq": requested_freq,
                     "collection": "board_heat_ticks",
                     "latest_dt": _serialize_dt(latest_heat.get("trade_minute")),
                     "source": latest_heat.get("source", ""),
+                    "query_label": name,
+                    "heat_target_label": heat_target_label,
+                    "heat_resolution_status": heat_resolution_status,
                 },
             },
             "chart": chart,
@@ -3348,7 +3450,7 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
                 "title": name,
                 "subtitle": "概念分钟热度",
                 "latest_price": chart.get("ohlcv", [{}])[-1].get("close", 0) if chart.get("ohlcv") else 0,
-                "conclusion": "概念分钟热度来自缓存。" if _chart_has_ohlcv(chart) else "概念分钟热度缓存未就绪。",
+                "conclusion": "概念分钟热度来自缓存。" if heat_ready else "概念分钟热度缓存未就绪。",
                 "gain_pct": latest_heat.get("change_pct") or heat_value,
                 "leader": latest_heat.get("leader_name", ""),
                 "up_count": latest_heat.get("up_count"),
@@ -3359,11 +3461,15 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
                     "query": name,
                     "concepts": [name],
                     "industries": related[:5],
-                    "mapping_status": "direct_board_heat" if _chart_has_ohlcv(chart) else "heat_not_ready",
+                    "mapping_status": "direct_board_heat" if heat_ready else "heat_not_ready",
                     "unmapped_reason": non_chain or chart.get("meta", {}).get("not_ready_reason", ""),
                     "candidate_count": len(carrier_candidates),
+                    "heat_target_label": heat_target_label,
+                    "heat_resolution_status": heat_resolution_status,
                 },
-                "mapping_status": "direct_board_heat" if _chart_has_ohlcv(chart) else "heat_not_ready",
+                "mapping_status": "direct_board_heat" if heat_ready else "heat_not_ready",
+                "heat_target_label": heat_target_label,
+                "heat_resolution_status": heat_resolution_status,
                 "not_ready_reason": chart.get("meta", {}).get("not_ready_reason", ""),
             },
             "signals": [],

@@ -22,8 +22,10 @@ def _pure_a_code(symbol: Any) -> str:
     return pure if pure.isdigit() and len(pure) == 6 else ""
 
 
-def _add_stock(stocks: list[str], value: Any) -> None:
+def _add_stock(stocks: list[str], value: Any, *, index_codes: set[str] | None = None) -> None:
     code = _pure_a_code(value)
+    if index_codes and code in index_codes:
+        return
     if code and code not in stocks:
         stocks.append(code)
 
@@ -93,14 +95,19 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     import config
 
     now = naive_market_now("A")
-    stock_limit = int(os.getenv("TERMINAL_REALTIME_STOCK_LIMIT", os.getenv("STOCK_MINUTE_SIGNAL_MAX_CODES", "24")))
+    stock_limit = int(os.getenv("TERMINAL_REALTIME_STOCK_LIMIT", "72"))
+    index_codes = {
+        _pure_a_code(symbol)
+        for symbol in getattr(config, "INDEX_AK_CODES", {}).values()
+    }
+    index_codes.discard("")
     stocks: list[str] = []
     for value in os.getenv("TERMINAL_REALTIME_PRIORITY_CODES", "688802,300575").replace(";", ",").split(","):
-        _add_stock(stocks, value)
+        _add_stock(stocks, value, index_codes=index_codes)
     for value in getattr(config, "WHITELIST", []):
-        _add_stock(stocks, value)
+        _add_stock(stocks, value, index_codes=index_codes)
     for value in _strategy_symbols(db) + _active_pool_symbols(db) + _recent_symbols(db):
-        _add_stock(stocks, value)
+        _add_stock(stocks, value, index_codes=index_codes)
     stocks = stocks[:stock_limit]
 
     doc = {

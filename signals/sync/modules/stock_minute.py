@@ -148,8 +148,14 @@ def _env_symbol_values(*names: str, default: str = "") -> list[str]:
 
 def _selection_cap() -> int:
     lane = os.getenv("SIGNALS_CURRENT_SYNC_LANE", "")
+    market = os.getenv("SIGNALS_CURRENT_SYNC_MARKET", "")
     if lane == "signal_lane":
-        return int(os.getenv("STOCK_MINUTE_SIGNAL_MAX_CODES", "24"))
+        if market == "A":
+            return int(os.getenv("STOCK_MINUTE_SIGNAL_MAX_CODES", "72"))
+        close_default = os.getenv("TERMINAL_REALTIME_STOCK_LIMIT", "72")
+        return int(os.getenv("STOCK_MINUTE_CLOSE_MAX_CODES", close_default))
+    if market == "A":
+        return int(os.getenv("STOCK_MINUTE_SIGNAL_MAX_CODES", "72"))
     return int(os.getenv("STOCK_MINUTE_MAX_CODES", "200"))
 
 
@@ -157,19 +163,72 @@ def _select_symbols_with_priority(
     ordered: list[str],
     priority: set[str],
     max_symbols: int,
+    *,
+    pinned: set[str] | None = None,
+    last_runs: dict[str, object] | None = None,
 ) -> tuple[list[str], list[dict[str, str]]]:
     if max_symbols <= 0 or len(ordered) <= max_symbols:
         return ordered, []
-    priority_ordered = [code for code in ordered if code in priority]
-    normal_ordered = [code for code in ordered if code not in priority]
-    selected = [*priority_ordered, *normal_ordered][:max_symbols]
+    pinned = pinned or set()
+    last_runs = last_runs or {}
+    original_idx = {code: idx for idx, code in enumerate(ordered)}
+
+    def stale_rank(code: str) -> float:
+        value = last_runs.get(code)
+        if value is None:
+            return float("-inf")
+        if hasattr(value, "timestamp"):
+            return float(value.timestamp())
+        try:
+            parsed = pd.to_datetime(value, errors="coerce")
+            if pd.isna(parsed):
+                return float("-inf")
+            return float(parsed.timestamp())
+        except Exception:
+            return float("-inf")
+
+    pinned_ordered = [code for code in ordered if code in pinned]
+    pinned_selected = pinned_ordered[:max_symbols]
+    remaining = max_symbols - len(pinned_selected)
+    rest = [code for code in ordered if code not in set(pinned_selected)]
+    rest_sorted = sorted(
+        rest,
+        key=lambda code: (
+            0 if code in priority else 1,
+            stale_rank(code),
+            original_idx.get(code, 0),
+        ),
+    )
+    selected = [*pinned_selected, *rest_sorted[:remaining]]
     selected_set = set(selected)
     skipped = [
-        {"symbol": code, "reason": "cap_exceeded", "next_due_hint": "next signal_lane cycle"}
+        {
+            "symbol": code,
+            "reason": "rotation_pending_priority" if code in priority else "rotation_pending",
+            "next_due_hint": "stale-first signal_lane rotation",
+        }
         for code in ordered
         if code not in selected_set
     ]
     return selected, skipped
+
+
+def _latest_stock_minute_runs(db: Database, symbols: list[str]) -> dict[str, object]:
+    if not symbols:
+        return {}
+    last_runs: dict[str, object] = {}
+    try:
+        docs = db["sync_log"].find(
+            {"module": "stock_minute", "status": "ok", "symbol": {"$in": symbols}},
+            {"symbol": 1, "last_run": 1},
+        ).sort("last_run", -1)
+    except Exception:
+        return {}
+    for doc in docs:
+        symbol = _pure_a_code(doc.get("symbol"))
+        if symbol and symbol not in last_runs:
+            last_runs[symbol] = doc.get("last_run")
+    return last_runs
 
 
 def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
@@ -178,14 +237,18 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
 
     symbols: list[str] = []
     priority_symbols: set[str] = set()
+    pinned_symbols: set[str] = set()
     source_counts: dict[str, int] = {}
     index_codes = _index_codes()
 
-    def add(value: object, source: str, *, priority: bool = False) -> None:
+    def add(value: object, source: str, *, priority: bool = False, pinned: bool = False) -> None:
         code = _pure_a_code(value)
         if code in index_codes:
             return
         if priority and code:
+            priority_symbols.add(code)
+        if pinned and code:
+            pinned_symbols.add(code)
             priority_symbols.add(code)
         if code and code not in symbols:
             symbols.append(code)
@@ -194,12 +257,14 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
     only_codes = os.getenv("STOCK_MINUTE_ONLY_CODES", "")
     if only_codes.strip():
         for symbol in only_codes.replace(";", ",").split(","):
-            add(symbol, "only_codes", priority=True)
+            add(symbol, "only_codes", priority=True, pinned=True)
         return symbols, {
             "priority_symbols": symbols,
+            "pinned_symbols": symbols,
             "skipped_symbols": [],
             "source_counts": {"only_codes": len(symbols)},
             "max_symbols": len(symbols),
+            "rotation_enabled": False,
         }
 
     for symbol in _env_symbol_values(
@@ -207,7 +272,7 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
         "SIGNALS_PRIORITY_STOCK_CODES",
         default=os.getenv("STOCK_MINUTE_DEFAULT_PRIORITY_CODES", _DEFAULT_PRIORITY_CODES),
     ):
-        add(symbol, "priority_codes", priority=True)
+        add(symbol, "priority_codes", priority=True, pinned=True)
 
     terminal_pool = db["terminal_realtime_pool"].find_one(
         {"pool": "terminal_realtime", "market": "A"},
@@ -218,13 +283,13 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
         add(symbol, "terminal_realtime_pool", priority=True)
 
     for symbol in getattr(config, "WHITELIST", []):
-        add(symbol, "whitelist", priority=True)
+        add(symbol, "whitelist", priority=True, pinned=True)
 
     for symbol in _iter_strategy_snapshot_symbols():
         add(symbol, "strategy_snapshot", priority=True)
 
     for symbol in _iter_configured_extra_symbols():
-        add(symbol, "configured_extra", priority=True)
+        add(symbol, "configured_extra")
 
     pool = db["market_pools"].find_one(
         {"pool": "active"},
@@ -248,16 +313,33 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
     ).sort("last_run", -1).limit(200)
 
     for doc in recent:
-        add(doc.get("symbol"), f"recent_{doc.get('module') or 'sync'}", priority=doc.get("module") == "stock_minute")
+        add(doc.get("symbol"), f"recent_{doc.get('module') or 'sync'}")
 
     max_symbols = _selection_cap()
-    selected, skipped = _select_symbols_with_priority(symbols, priority_symbols, max_symbols)
+    last_runs = _latest_stock_minute_runs(db, symbols)
+    selected, skipped = _select_symbols_with_priority(
+        symbols,
+        priority_symbols,
+        max_symbols,
+        pinned=pinned_symbols,
+        last_runs=last_runs,
+    )
     return selected, {
         "priority_symbols": [code for code in selected if code in priority_symbols],
+        "pinned_symbols": [code for code in selected if code in pinned_symbols],
         "skipped_symbols": skipped,
         "source_counts": source_counts,
         "max_symbols": max_symbols,
         "candidate_count": len(symbols),
+        "rotation_enabled": True,
+        "rotation_policy": "pinned_then_priority_stale_first",
+        "tier_counts": {
+            "selected_pinned": sum(1 for code in selected if code in pinned_symbols),
+            "selected_priority": sum(1 for code in selected if code in priority_symbols and code not in pinned_symbols),
+            "selected_normal": sum(1 for code in selected if code not in priority_symbols),
+            "candidate_priority": len(priority_symbols),
+            "candidate_pinned": len(pinned_symbols),
+        },
     }
 
 
@@ -438,11 +520,15 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
             "last_run": naive_market_now("A"),
             "selected_symbols": symbols,
             "priority_symbols": selection_meta.get("priority_symbols") or [],
+            "pinned_symbols": selection_meta.get("pinned_symbols") or [],
             "skipped_symbols": skipped_symbols[:80],
             "skipped_count": len(skipped_symbols),
             "source_counts": selection_meta.get("source_counts") or {},
             "max_symbols": selection_meta.get("max_symbols"),
             "candidate_count": selection_meta.get("candidate_count"),
+            "rotation_enabled": selection_meta.get("rotation_enabled", False),
+            "rotation_policy": selection_meta.get("rotation_policy", ""),
+            "tier_counts": selection_meta.get("tier_counts") or {},
             "workers": workers,
             "tail_counts": tail_counts,
             "incremental": True,

@@ -214,7 +214,12 @@ def _get_active_stock_codes(db: Database) -> list[str]:
     for doc in db["signals"].find({}, {"symbol": 1}).sort("signal_date", -1).limit(200):
         add(doc.get("symbol"))
 
-    max_codes = int(os.getenv("STOCK_DAILY_MAX_CODES", str(getattr(config, "MAX_POOL_SIZE", 50) or 50)))
+    default_max_codes = max(
+        int(getattr(config, "MAX_POOL_SIZE", 50) or 50),
+        int(os.getenv("TERMINAL_REALTIME_STOCK_LIMIT", "72")),
+        int(os.getenv("STOCK_MINUTE_SIGNAL_MAX_CODES", "72")) * 4,
+    )
+    max_codes = int(os.getenv("STOCK_DAILY_MAX_CODES", str(default_max_codes)))
     if max_codes > 0:
         codes, skipped = _select_codes_with_priority(codes, priority_codes, max_codes)
         if skipped:

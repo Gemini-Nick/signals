@@ -41,6 +41,8 @@ def test_macro_indices_have_day_and_range_returns(monkeypatch):
     assert rows
     assert rows[0]["kind"] == "index"
     assert rows[0]["target_kind"] == "index"
+    assert rows[0]["target_freq"] == "30min"
+    assert "5min" in rows[0]["available_freqs"]
     assert rows[0]["day_change_pct"] is not None
     assert rows[0]["daily_change_pct"] is not None
     assert rows[0]["latest_signal"]
@@ -175,6 +177,7 @@ def test_concept_sector_preview_returns_explicit_chain_carrier(monkeypatch):
     from signals.web.api import workbench
 
     df = _bars()
+    monkeypatch.setattr(workbench, "resolve_board_heat_name", lambda kind, label: {"query": label, "heat_name": label, "status": "exact"})
     monkeypatch.setattr(workbench, "_concept_theme_candidates", lambda name: [])
     monkeypatch.setattr(workbench, "_concept_rank_rows", lambda name, themes: [])
     monkeypatch.setattr(workbench, "_industry_constituent_symbols", lambda name: [])
@@ -183,6 +186,7 @@ def test_concept_sector_preview_returns_explicit_chain_carrier(monkeypatch):
     row = workbench._sector_board_preview({"label": "电解液", "change_pct": 2.2}, "concept")
 
     assert row["target_kind"] == "concept"
+    assert row["target_freq"] == "30min"
     assert row["fallback_target"]["symbol"] == "SZ.002709"
     assert row["mapping_chain"]["node_id"] == "electrolyte"
     assert row["latest_price"] is None
@@ -200,6 +204,7 @@ def test_sector_boards_expose_chain_aggregation_candidate_groups(monkeypatch):
     from signals.web.api import workbench
 
     df = _bars()
+    monkeypatch.setattr(workbench, "resolve_board_heat_name", lambda kind, label: {"query": label, "heat_name": label, "status": "exact"})
     monkeypatch.setattr(workbench, "_concept_theme_candidates", lambda name: [])
     monkeypatch.setattr(workbench, "_concept_rank_rows", lambda name, themes: [])
     monkeypatch.setattr(workbench, "_industry_constituent_symbols", lambda name: [])
@@ -231,6 +236,7 @@ def test_sector_boards_expose_chain_aggregation_candidate_groups(monkeypatch):
 def test_non_chain_sector_preview_is_not_forced_to_carrier(monkeypatch):
     from signals.web.api import workbench
 
+    monkeypatch.setattr(workbench, "resolve_board_heat_name", lambda kind, label: {"query": label, "heat_name": label, "status": "exact"})
     monkeypatch.setattr(workbench, "_concept_theme_candidates", lambda name: [])
     monkeypatch.setattr(workbench, "_concept_rank_rows", lambda name, themes: [])
     monkeypatch.setattr(workbench, "_concept_constituent_symbols", lambda name, themes: [])
@@ -239,9 +245,19 @@ def test_non_chain_sector_preview_is_not_forced_to_carrier(monkeypatch):
 
     assert row["non_chain_reason"]
     assert row["chart_target_status"] == "non_chain"
+    assert row["target_freq"] == "30min"
     assert row["carrier"] == {}
     assert row["fallback_target"] == {}
     assert row["action_status"] == "非产业链观察"
+
+
+def test_board_heat_name_aliases_match_cached_tick_names():
+    from signals.web.api import workbench
+
+    names = ["建筑装饰", "建筑材料", "CRO", "创新药"]
+
+    assert workbench._choose_board_heat_name("industry", "建筑装饰和其他建筑业", names) == ("建筑装饰", "alias")
+    assert workbench._choose_board_heat_name("concept", "CRO概念", names) == ("CRO", "alias")
 
 
 def test_concept_target_returns_scored_candidate_groups(monkeypatch):
@@ -318,6 +334,7 @@ def test_trader_task_queue_is_action_oriented():
             {
                 "label": "电解液",
                 "domain": "concept",
+                "target_freq": "30min",
                 "explanation": "电解液 异动 · 承接 天赐材料",
                 "fallback_target": {"kind": "stock", "symbol": "SZ.002709"},
             }
@@ -327,6 +344,7 @@ def test_trader_task_queue_is_action_oriented():
     assert tasks
     assert tasks[0]["action_label"] == "可试仓"
     assert tasks[0]["chart_target"]["kind"] == "stock"
+    assert tasks[1]["chart_target"]["freq"] == "30min"
     assert tasks[0]["invalidates_when"]
 
 

@@ -40,9 +40,23 @@ def _latest_bar(db: Database, collection: str, symbol: str, freq: str) -> tuple[
 
 
 def _stock_symbols(db: Database) -> list[str]:
-    meta = db["sync_log"].find_one({"_id": "stock_minute:selection:_meta"}, {"selected_symbols": 1, "priority_symbols": 1}) or {}
+    meta = db["sync_log"].find_one(
+        {"_id": "stock_minute:selection:_meta"},
+        {"selected_symbols": 1, "priority_symbols": 1, "pinned_symbols": 1},
+    ) or {}
     symbols = list(meta.get("selected_symbols") or [])
+    for symbol in meta.get("pinned_symbols") or []:
+        if symbol not in symbols:
+            symbols.append(symbol)
     for symbol in meta.get("priority_symbols") or []:
+        if symbol not in symbols:
+            symbols.append(symbol)
+    terminal_pool = db["terminal_realtime_pool"].find_one(
+        {"pool": "terminal_realtime", "market": "A"},
+        {"stocks": 1},
+        sort=[("updated_at", -1)],
+    ) or {}
+    for symbol in terminal_pool.get("stocks") or []:
         if symbol not in symbols:
             symbols.append(symbol)
     if symbols:
@@ -128,6 +142,8 @@ def sync_minute_readiness_probe(db: Database, proxy_url: str = None) -> dict:
     if not rows:
         return {"status": "degraded", "checked": 0, "not_ready": 0, "reason": "readiness_universe_empty"}
 
+    trade_date = now.date().isoformat()
+    db["minute_readiness"].delete_many({"trade_date": trade_date})
     ops = [
         UpdateOne(
             {
