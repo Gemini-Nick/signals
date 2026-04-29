@@ -75,6 +75,9 @@ def test_static_index_alias_resolves_shanghai_composite():
 
     assert workbench._resolve_static_index("上证综指") == ("上证指数", "sh000001")
     assert workbench._resolve_static_index("SH.000001") == ("上证指数", "sh000001")
+    assert workbench._resolve_static_index("科创综指") == ("科创综指", "sh000680")
+    assert workbench._resolve_static_index("sz399986") == ("中证银行", "sz399986")
+    assert workbench._resolve_static_index("标普500") == ("标普500", "US.SPY")
 
 
 def test_chart_merges_custom_signal_pool_rows(monkeypatch):
@@ -406,6 +409,20 @@ def test_static_index_minute_request_does_not_fallback_to_daily(monkeypatch):
     assert payload["target"]["not_ready_reason"] == "index_minute_not_ready"
     assert payload["chart"]["meta"]["fallback_reason"] == ""
     assert payload["chart"]["meta"]["not_ready_reason"] == "index_minute_not_ready"
+
+
+def test_us_index_minute_request_is_explicitly_unsupported(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (pd.DataFrame(), "index_bars"))
+    monkeypatch.setattr(workbench, "_ensure_engine", lambda: (_ for _ in ()).throw(RuntimeError("engine unavailable")))
+    monkeypatch.setattr(workbench, "_recent_custom_signal_candidates", lambda limit=10: [])
+
+    payload = asyncio.run(workbench._build_static_index_target("标普500", "US.SPY", "30min"))
+
+    assert payload["target"]["not_ready_reason"] == "index_minute_unsupported"
+    assert payload["target"]["cache_probe"]["status"] == "unsupported"
+    assert payload["chart"]["meta"]["not_ready_reason"] == "index_minute_unsupported"
 
 
 def test_stock_minute_request_does_not_fallback_to_daily(monkeypatch):

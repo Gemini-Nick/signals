@@ -23,6 +23,11 @@ from signals.core.market_time import (
     to_unix_seconds,
 )
 from signals.core.concept_carriers import non_chain_reason
+from signals.core.macro_universe import (
+    macro_index_themes,
+    macro_watchlist,
+    supports_a_index_minute_cache,
+)
 from signals.core.stock_names import get_resolver
 from signals.data.gateway import get_index_bars, get_kline
 from signals.data.models import DataRequest
@@ -95,41 +100,8 @@ GATEWAY_FREQS = {
     "weekly": "weekly",
     "monthly": "monthly",
 }
-MINGDAO_INDEX_THEMES = {
-    "上证指数": ["全市场", "权重", "政策温度"],
-    "上证50": ["权重", "大金融", "消费"],
-    "沪深300": ["核心资产", "权重", "大金融"],
-    "深证成指": ["成长", "先进制造", "消费电子"],
-    "创业板指": ["CPO", "电新", "成长链"],
-    "科创50": ["芯片", "半导体", "硬科技"],
-    "科创综指": ["硬科技", "半导体", "创新成长"],
-    "超大盘": ["央国企", "红利", "权重"],
-    "中证500": ["中盘成长", "制造业", "弹性成长"],
-    "中证1000": ["小盘成长", "主题弹性", "交易活跃"],
-    "中证银行": ["大金融", "红利", "顺周期"],
-    "国证2000": ["小微盘", "题材弹性", "市场广度"],
-    "恒生科技ETF": ["港股科技", "互联网", "风险偏好"],
-    "30年国债ETF": ["利率", "避险", "股债跷跷板"],
-    "中国石油": ["资源", "央企", "红利"],
-}
-
-MINGDAO_MACRO_WATCHLIST = [
-    {"name": "上证指数", "symbol": "sh000001", "kind": "index"},
-    {"name": "深证成指", "symbol": "sz399001", "kind": "index"},
-    {"name": "沪深300", "symbol": "sh000300", "kind": "index"},
-    {"name": "创业板指", "symbol": "sz399006", "kind": "index"},
-    {"name": "科创50", "symbol": "sh000688", "kind": "index"},
-    {"name": "科创综指", "symbol": "sh000680", "kind": "index"},
-    {"name": "上证50", "symbol": "sh000016", "kind": "index"},
-    {"name": "超大盘", "symbol": "sh000043", "kind": "index"},
-    {"name": "中证500", "symbol": "sh000905", "kind": "index"},
-    {"name": "中证1000", "symbol": "sh000852", "kind": "index"},
-    {"name": "中证银行", "symbol": "sz399986", "kind": "index"},
-    {"name": "国证2000", "symbol": "sz399303", "kind": "index"},
-    {"name": "恒生科技ETF", "symbol": "SH.513130", "kind": "stock"},
-    {"name": "30年国债ETF", "symbol": "SH.511090", "kind": "stock"},
-    {"name": "中国石油", "symbol": "SH.601857", "kind": "stock"},
-]
+MINGDAO_INDEX_THEMES = macro_index_themes()
+MINGDAO_MACRO_WATCHLIST = macro_watchlist()
 
 INDEX_NAME_ALIASES = {
     "上证综指": ("上证指数", "sh000001"),
@@ -149,13 +121,21 @@ INDEX_NAME_ALIASES = {
     "SZ.399006": ("创业板指", "sz399006"),
 }
 
+for _item in MINGDAO_MACRO_WATCHLIST:
+    if str(_item.get("kind") or "").strip() != "index":
+        continue
+    _name = str(_item.get("name") or "").strip()
+    _symbol = str(_item.get("symbol") or "").strip()
+    if not _name or not _symbol:
+        continue
+    INDEX_NAME_ALIASES.setdefault(_name, (_name, _symbol))
+    INDEX_NAME_ALIASES.setdefault(_symbol.lower(), (_name, _symbol))
+    INDEX_NAME_ALIASES.setdefault(_symbol.upper(), (_name, _symbol))
+
 _SHELL_CACHE_TTL_SECONDS = 120.0
 _SHELL_CACHE_LOCK = threading.Lock()
 _SHELL_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None, "refreshed_at": 0.0}
 
-for _name, _symbol in config.INDEX_AK_CODES.items():
-    if not any(item["name"] == _name for item in MINGDAO_MACRO_WATCHLIST):
-        MINGDAO_MACRO_WATCHLIST.append({"name": _name, "symbol": _symbol, "kind": "index"})
 BUY_SIGNAL_TOKENS = ("buy", "long", "entry", "候选", "买", "突破", "启动", "三买", "一买", "二买")
 SELL_SIGNAL_TOKENS = ("sell", "short", "exit", "预警", "卖", "跌破", "止损", "风险")
 
@@ -415,6 +395,8 @@ def _not_ready_reason(kind: str, requested_freq: str, chart: dict[str, Any]) -> 
     canonical = _canonical_freq(requested_freq)
     if canonical in {"5min", "15min", "30min"}:
         if kind == "index":
+            if not supports_a_index_minute_cache(chart.get("symbol")):
+                return "index_minute_unsupported"
             return "index_minute_not_ready"
         if kind == "stock":
             return "stock_minute_not_ready"
@@ -535,6 +517,16 @@ def _cache_probe(symbol: str, *, kind: str, requested_freq: str) -> dict[str, An
     if requested_label not in freqs:
         freqs.insert(0, requested_label)
     candidates = _probe_symbol_candidates(symbol, kind=kind)
+    if kind == "index" and _canonical_freq(requested_freq) in {"5min", "15min", "30min"} and not supports_a_index_minute_cache(symbol):
+        return {
+            "status": "unsupported",
+            "kind": kind,
+            "requested_freq": _canonical_freq(requested_freq),
+            "requested_freq_label": requested_label,
+            "symbol_candidates": candidates,
+            "reason": "index_minute_cache_not_connected_for_market",
+            "rows": [],
+        }
     collections = ["index_bars", "bars"] if kind == "index" else ["bars"]
     rows: list[dict[str, Any]] = []
     try:
@@ -955,6 +947,8 @@ def _resolve_static_index(raw: str) -> Optional[tuple[str, str]]:
         if _text(item.get("kind")) == "index":
             entries.append((_text(item.get("name")), _text(item.get("symbol"))))
     entries.extend((name, symbol) for name, symbol in config.INDEX_AK_CODES.items())
+    entries.extend((name, symbol) for name, symbol in getattr(config, "INDEX_FUTU_CODES", {}).items())
+    entries.extend((name, symbol) for name, symbol in getattr(config, "INDEX_US_CODES", {}).items())
     seen: set[tuple[str, str]] = set()
     for name, symbol in entries:
         if not name or not symbol:
