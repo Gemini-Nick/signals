@@ -282,6 +282,7 @@ def _write_aggregate_progress(sync_col, *, scope: str) -> None:
     skipped = sum(int(row.get("skipped") or 0) for row in rows)
     errors_count = sum(int(row.get("errors") or 0) for row in rows)
     deferred_count = sum(int(row.get("deferred") or 0) for row in rows)
+    now = naive_market_now("A")
     latest = max(rows, key=lambda row: row.get("heartbeat_at") or datetime.min)
     started_values = [row.get("started_at") for row in rows if isinstance(row.get("started_at"), datetime)]
     started_at = min(started_values) if started_values else now
@@ -290,7 +291,6 @@ def _write_aggregate_progress(sync_col, *, scope: str) -> None:
     processed_per_min = round(processed / (elapsed_seconds / 60), 2) if elapsed_seconds > 0 else 0.0
     statuses = {str(row.get("status") or "") for row in rows}
     status = "ok" if statuses == {"ok"} else "partial" if "partial" in statuses else "running"
-    now = naive_market_now("A")
     sync_col.update_one(
         {"_id": _PROGRESS_META_ID},
         {"$set": {
