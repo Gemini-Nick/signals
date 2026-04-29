@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from signals.sync.modules.technical_signal_scan import _resonance_context
+from signals.sync.modules.technical_signal_scan import _coverage_by_freq, _resonance_context
 
 
 @dataclass
@@ -67,3 +67,50 @@ def test_resonance_context_marks_period_conflict():
     assert context["aligned_freqs"] == ["30分钟"]
     assert context["conflict_freqs"] == ["日线"]
     assert "周期冲突" in context["tags"]
+
+
+class _Bars:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def distinct(self, field, query=None):
+        freqs = set(((query or {}).get("meta.freq") or {}).get("$in") or [])
+        values = []
+        for doc in self.docs:
+            if freqs and doc.get("meta", {}).get("freq") not in freqs:
+                continue
+            value = doc.get("meta", {}).get("symbol")
+            if value not in values:
+                values.append(value)
+        return values
+
+    def find_one(self, query=None, projection=None, sort=None):
+        freqs = set(((query or {}).get("meta.freq") or {}).get("$in") or [])
+        rows = [doc for doc in self.docs if not freqs or doc.get("meta", {}).get("freq") in freqs]
+        rows.sort(key=lambda item: item.get("dt"), reverse=True)
+        return rows[0] if rows else None
+
+
+class _Db(dict):
+    def __getitem__(self, key):
+        return super().__getitem__(key)
+
+
+def test_coverage_by_freq_marks_30m_incomplete_and_15m_on_demand():
+    db = _Db({
+        "bars": _Bars([
+            {"meta": {"symbol": "000001", "freq": "日线"}, "dt": datetime(2026, 4, 28)},
+            {"meta": {"symbol": "000002", "freq": "日线"}, "dt": datetime(2026, 4, 28)},
+            {"meta": {"symbol": "000001", "freq": "周线"}, "dt": datetime(2026, 4, 28)},
+            {"meta": {"symbol": "000002", "freq": "周线"}, "dt": datetime(2026, 4, 28)},
+            {"meta": {"symbol": "000001", "freq": "30分钟"}, "dt": datetime(2026, 4, 28, 15, 0)},
+        ]),
+    })
+
+    coverage = _coverage_by_freq(db, ["000001", "000002"])
+
+    assert coverage["日线"]["status"] == "complete"
+    assert coverage["周线"]["status"] == "complete"
+    assert coverage["30分钟"]["status"] == "coverage_incomplete"
+    assert coverage["30分钟"]["missing_count"] == 1
+    assert coverage["15分钟"]["status"] == "on_demand_missing"

@@ -606,14 +606,19 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
 
     terminal_pool = db["terminal_stock_pool"].find_one(
         {"pool": "terminal_stock_pool", "market": "A"},
-        {"stocks": 1, "skipped_stocks": 1, "candidate_count": 1, "reason_counts": 1, "stock_limit": 1},
+        {"stocks": 1, "focus_stocks": 1, "risk_stocks": 1, "watch_stocks": 1, "skipped_stocks": 1, "candidate_count": 1, "reason_counts": 1, "stock_limit": 1},
         sort=[("updated_at", -1)],
     ) or {}
     symbols = []
     source_counts: dict[str, int] = {}
     postmarket_scope = _postmarket_minute_scope()
     expanded_candidates_added = False
-    for row in terminal_pool.get("stocks") or []:
+    pool_rows: list[dict | str] = []
+    for key in ("focus_stocks", "stocks", "risk_stocks", "watch_stocks"):
+        for row in terminal_pool.get(key) or []:
+            if row not in pool_rows:
+                pool_rows.append(row)
+    for row in pool_rows:
         if isinstance(row, dict):
             reason_types = _reason_types_from_row(row)
             code = _add_candidate(

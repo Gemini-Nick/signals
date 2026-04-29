@@ -2,6 +2,7 @@
 """同步模块注册"""
 
 from .stock_daily import sync_stock_daily
+from .stock_30m_fullmarket import sync_stock_30m_fullmarket
 from .index_daily import sync_index_daily
 from .stock_minute import sync_stock_minute
 from .index_minute import sync_index_minute
@@ -30,6 +31,7 @@ ALL_MODULES = [
     ("chain_heat_snapshots", sync_chain_heat_snapshots, "15:06 weekday"),
     ("minute_readiness_probe", sync_minute_readiness_probe, "15:10 weekday"),
     ("stock_daily",   sync_stock_daily,   "16:00-17:30 weekday"),
+    ("stock_30m_fullmarket", sync_stock_30m_fullmarket, "17:00-20:30 weekday"),
     ("index_daily",   sync_index_daily,   "16:00-17:30 weekday"),
     ("weekly_rollup", sync_weekly_rollup, "17:30-18:00 weekday"),
     ("board_ranking", sync_board_ranking, "18:00-21:00 weekday"),

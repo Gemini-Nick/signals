@@ -72,10 +72,31 @@ def _board_cons_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
     )
 
 
+def _stock_30m_fullmarket_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
+    shard_count = _const_env_int("SIGNALS_POSTMARKET_STOCK_30M_SHARDS", 16, minimum=1, maximum=64)
+    return tuple(
+        PostmarketTaskSpec(
+            "stock_30m_fullmarket",
+            "minute_fullmarket",
+            shard_key=f"shard_{idx:02d}",
+            depends_on=(*_STOCK_DAILY_DEPS,),
+            env={
+                "STOCK_30M_FULLMARKET_SHARD_COUNT": str(shard_count),
+                "STOCK_30M_FULLMARKET_SHARD_INDEX": str(idx),
+                "STOCK_30M_FULLMARKET_SHARD_KEY": f"shard_{idx:02d}",
+                "STOCK_30M_FULLMARKET_MAX_CODES_PER_RUN": "500",
+            },
+        )
+        for idx in range(shard_count)
+    )
+
+
 _STOCK_DAILY_TASKS = _stock_daily_shard_tasks()
 _BOARD_CONS_TASKS = _board_cons_shard_tasks()
 _STOCK_DAILY_DEPS = tuple(task.task_key for task in _STOCK_DAILY_TASKS)
 _BOARD_CONS_DEPS = tuple(task.task_key for task in _BOARD_CONS_TASKS)
+_STOCK_30M_TASKS = _stock_30m_fullmarket_shard_tasks()
+_STOCK_30M_DEPS = tuple(task.task_key for task in _STOCK_30M_TASKS)
 
 
 POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
@@ -85,9 +106,10 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     *_STOCK_DAILY_TASKS,
     PostmarketTaskSpec("board_ranking", "market_data"),
     *_BOARD_CONS_TASKS,
+    *_STOCK_30M_TASKS,
     PostmarketTaskSpec("weekly_rollup", "derived", depends_on=(*_STOCK_DAILY_DEPS, "index_daily:all")),
-    PostmarketTaskSpec("chain_heat_snapshots", "derived", depends_on=("board_ranking:all", *_BOARD_CONS_DEPS)),
-    PostmarketTaskSpec("technical_signal_scan", "derived", depends_on=(*_STOCK_DAILY_DEPS, "weekly_rollup:all")),
+    PostmarketTaskSpec("chain_heat_snapshots", "derived", depends_on=("board_ranking:all",)),
+    PostmarketTaskSpec("technical_signal_scan", "derived", depends_on=(*_STOCK_DAILY_DEPS, *_STOCK_30M_DEPS, "weekly_rollup:all")),
     PostmarketTaskSpec("knowledge_market_views", "derived"),
     PostmarketTaskSpec("signal_pool", "derived", depends_on=("technical_signal_scan:all",)),
     PostmarketTaskSpec(
@@ -127,6 +149,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: float = 100.0) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, minimum), maximum)
 
 
 def _now_bj() -> datetime:
@@ -207,6 +237,52 @@ def _summarize_result(result: Any) -> dict[str, Any]:
     return summary
 
 
+def _result_sources(task_doc: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    summary = task_doc.get("result_summary") if isinstance(task_doc.get("result_summary"), dict) else {}
+    nested = summary.get("result") if isinstance(summary.get("result"), dict) else {}
+    return summary, nested
+
+
+def _result_number(task_doc: dict[str, Any], key: str, default: float = 0.0) -> float:
+    summary, nested = _result_sources(task_doc)
+    value = nested.get(key, summary.get(key, default))
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _stock_daily_dependency_ok(task_doc: dict[str, Any]) -> bool:
+    status = str(task_doc.get("status") or "pending")
+    summary, nested = _result_sources(task_doc)
+    result_status = str(nested.get("status") or summary.get("status") or "").lower()
+    processed = _result_number(task_doc, "processed")
+    total = _result_number(task_doc, "total")
+    progress_pct = _result_number(task_doc, "progress_pct")
+    errors = _result_number(task_doc, "errors")
+    deferred = _result_number(task_doc, "deferred")
+    coverage_pct = _result_number(task_doc, "coverage_pct")
+    min_coverage = _env_float("SIGNALS_POSTMARKET_STOCK_DAILY_PARTIAL_MIN_COVERAGE", 40.0)
+    processed_all = bool(total > 0 and processed >= total)
+    progress_done = bool(progress_pct >= 99.9)
+    if status == "degraded" and (result_status != "ok" or deferred > 0):
+        return False
+    return errors == 0 and (processed_all or progress_done) and coverage_pct >= min_coverage
+
+
+def _dependency_status_ok(task_doc: dict[str, Any]) -> bool:
+    status = str(task_doc.get("status") or "pending")
+    if status in TASK_OK_STATUSES:
+        return True
+    if status not in {"partial", "degraded"}:
+        return False
+    if str(task_doc.get("module") or "") == "stock_daily":
+        return _stock_daily_dependency_ok(task_doc)
+    return False
+
+
 class PostmarketRunner:
     """Run the postmarket DAG and store task/run state in Mongo."""
 
@@ -216,6 +292,7 @@ class PostmarketRunner:
         self.max_workers = max_workers or _env_int("SIGNALS_POSTMARKET_WORKERS", 8, minimum=1)
         self.module_semaphores = {
             "stock_daily": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_STOCK_DAILY_WORKERS", 2, minimum=1)),
+            "stock_30m_fullmarket": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_STOCK_30M_WORKERS", 2, minimum=1)),
             "board_cons": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_BOARD_CONS_WORKERS", 2, minimum=1)),
         }
         self.owner_pid = os.getpid()
@@ -248,7 +325,11 @@ class PostmarketRunner:
         return str(doc.get("status") or "pending")
 
     def _dependencies_ok(self, run_id: str, spec: PostmarketTaskSpec) -> bool:
-        return all(self._task_status(run_id, dep) in TASK_OK_STATUSES for dep in spec.depends_on)
+        for dep in spec.depends_on:
+            doc = self.db["sync_tasks"].find_one({"_id": f"{run_id}:{dep}"}) or {}
+            if not _dependency_status_ok(doc):
+                return False
+        return True
 
     def _init_run(self, run_id: str, trade_date: str) -> None:
         now = _naive_bj()
@@ -458,38 +539,48 @@ class PostmarketRunner:
             logger.warning("postmarket released stale tasks: run=%s released=%d", run_id, released)
 
         results: list[dict[str, Any]] = []
-        blocked: list[str] = []
+        blocked: set[str] = set()
         for phase in POSTMARKET_PHASES:
-            self._heartbeat(run_id, phase)
-            runnable: list[PostmarketTaskSpec] = []
-            for spec in self._phase_specs(phase):
-                current = self._get_task(run_id, spec)
-                status = str(current.get("status") or "pending")
-                if status in TASK_OK_STATUSES and not force:
-                    continue
-                if not self._dependencies_ok(run_id, spec):
-                    blocked.append(spec.task_key)
-                    continue
-                if status not in RETRYABLE_TASK_STATUSES and not force:
-                    continue
-                runnable.append(spec)
+            phase_specs = self._phase_specs(phase)
+            attempted: set[str] = set()
+            while True:
+                self._heartbeat(run_id, phase)
+                runnable: list[PostmarketTaskSpec] = []
+                waiting: set[str] = set()
+                for spec in phase_specs:
+                    current = self._get_task(run_id, spec)
+                    status = str(current.get("status") or "pending")
+                    task_id = self._task_id(run_id, spec)
+                    if status in TASK_OK_STATUSES and not force:
+                        continue
+                    if task_id in attempted:
+                        continue
+                    if not self._dependencies_ok(run_id, spec):
+                        waiting.add(spec.task_key)
+                        continue
+                    if status not in RETRYABLE_TASK_STATUSES and not force:
+                        continue
+                    runnable.append(spec)
 
-            if not runnable:
-                continue
+                if not runnable:
+                    blocked.update(waiting)
+                    break
 
-            logger.info("postmarket phase=%s tasks=%s workers=%d", phase, [item.task_key for item in runnable], self.max_workers)
-            workers = min(self.max_workers, max(1, len(runnable)))
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"postmarket-{phase}") as executor:
-                future_map = {executor.submit(self._run_task, run_id, spec): spec for spec in runnable}
-                for future in as_completed(future_map):
-                    spec = future_map[future]
-                    self._heartbeat(run_id, phase)
-                    try:
-                        results.append(future.result())
-                    except Exception as exc:
-                        result = {"module": spec.module, "status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
-                        self._mark_task_finished(run_id, spec, result)
-                        results.append(result)
+                logger.info("postmarket phase=%s tasks=%s workers=%d", phase, [item.task_key for item in runnable], self.max_workers)
+                workers = min(self.max_workers, max(1, len(runnable)))
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"postmarket-{phase}") as executor:
+                    future_map = {executor.submit(self._run_task, run_id, spec): spec for spec in runnable}
+                    for future in as_completed(future_map):
+                        spec = future_map[future]
+                        attempted.add(self._task_id(run_id, spec))
+                        blocked.discard(spec.task_key)
+                        self._heartbeat(run_id, phase)
+                        try:
+                            results.append(future.result())
+                        except Exception as exc:
+                            result = {"module": spec.module, "status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
+                            self._mark_task_finished(run_id, spec, result)
+                            results.append(result)
 
         task_docs = list(self.db["sync_tasks"].find({"run_id": run_id}, {"module": 1, "status": 1, "phase": 1, "updated_at": 1}))
         incomplete = [doc for doc in task_docs if doc.get("status") not in TASK_OK_STATUSES]
@@ -503,7 +594,7 @@ class PostmarketRunner:
                 "heartbeat_at": now,
                 "updated_at": now,
                 "finished_at": now,
-                "blocked_tasks": blocked,
+                "blocked_tasks": sorted(blocked),
                 "ok_tasks": len(task_docs) - len(incomplete),
                 "incomplete_tasks": len(incomplete),
             }},
@@ -513,7 +604,7 @@ class PostmarketRunner:
             "trade_date": trade_date,
             "status": status,
             "results": results,
-            "blocked_tasks": blocked,
+            "blocked_tasks": sorted(blocked),
             "ok_tasks": len(task_docs) - len(incomplete),
             "incomplete_tasks": len(incomplete),
         }

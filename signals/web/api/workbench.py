@@ -237,6 +237,89 @@ def _text(value: Any) -> str:
     return str(value).strip()
 
 
+def _iso_dt(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        return pd.to_datetime(value).isoformat()
+    except Exception:
+        return _text(value)
+
+
+def _date_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        return str(pd.to_datetime(value).date())
+    except Exception:
+        return _text(value)[:10]
+
+
+def _normalize_chart_df(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        out = pd.DataFrame()
+        if df is not None:
+            out.attrs.update(getattr(df, "attrs", {}) or {})
+        return out
+    working = df.copy().sort_index()
+    working.attrs.update(getattr(df, "attrs", {}) or {})
+    if _canonical_freq(freq) == "weekly" and not working.empty:
+        latest_idx = pd.to_datetime(working.index.max())
+        today = _market_today("A")
+        if latest_idx.date() > today:
+            new_index = []
+            for item in working.index:
+                parsed = pd.to_datetime(item)
+                new_index.append(pd.Timestamp(today) if parsed.date() > today else parsed)
+            working.index = pd.DatetimeIndex(new_index)
+            working.attrs["period_end"] = latest_idx.date().isoformat()
+            working.attrs["data_as_of"] = today.isoformat()
+            working.attrs["is_partial_period"] = True
+            working.attrs["time_semantics"] = "period_data_as_of"
+    return working
+
+
+def _chart_cache_meta(df: pd.DataFrame, *, source: str, freq: str) -> dict[str, Any]:
+    attrs = getattr(df, "attrs", {}) or {}
+    latest_bar_time = _iso_dt(df.index.max()) if df is not None and not df.empty else ""
+    data_as_of = _text(attrs.get("data_as_of")) or _text(attrs.get("as_of")) or _date_text(latest_bar_time)
+    freshness = _text(attrs.get("gateway_freshness") or attrs.get("freshness"))
+    is_stale = bool(attrs.get("gateway_is_stale") or attrs.get("is_stale") or freshness == "stale")
+    if df is None or df.empty:
+        cache_status = "empty"
+    elif is_stale:
+        cache_status = "stale"
+    else:
+        cache_status = "ready"
+    return {
+        "collection": _text(attrs.get("collection")) or source,
+        "as_of": data_as_of,
+        "data_as_of": data_as_of,
+        "latest_bar_time": latest_bar_time,
+        "period_end": _text(attrs.get("period_end")),
+        "is_partial_period": bool(attrs.get("is_partial_period")),
+        "cache_status": cache_status,
+        "freshness": freshness or ("stale" if is_stale else ("fresh" if cache_status == "ready" else "empty")),
+        "is_stale": is_stale,
+        "stale_reason": _text(attrs.get("stale_reason")),
+        "time_semantics": _text(attrs.get("time_semantics")) or ("period_data_as_of" if _canonical_freq(freq) == "weekly" and attrs.get("is_partial_period") else "bar_close_market_time"),
+        "errors": list(attrs.get("gateway_errors") or []),
+    }
+
+
+def _attach_gateway_meta(df: pd.DataFrame, response: Any, *, collection: str) -> pd.DataFrame:
+    out = df if df is not None else pd.DataFrame()
+    out.attrs["collection"] = collection or _text(getattr(response, "source", ""))
+    out.attrs["gateway_as_of"] = getattr(response, "as_of", None)
+    out.attrs["as_of"] = getattr(response, "as_of", None) or out.attrs.get("as_of")
+    out.attrs["gateway_freshness"] = getattr(response, "freshness", "")
+    out.attrs["gateway_is_stale"] = bool(getattr(response, "is_stale", False))
+    out.attrs["gateway_errors"] = list(getattr(response, "errors", []) or [])
+    if getattr(response, "is_stale", False):
+        out.attrs["stale_reason"] = "older_than_request"
+    return out
+
+
 def _serialize_ohlcv_df(
     df: pd.DataFrame,
     *,
@@ -272,19 +355,21 @@ def _serialize_ohlcv_df(
 def _chart_from_df(df: pd.DataFrame, *, symbol: str, freq: str, source: str = "gateway") -> dict[str, Any]:
     market = infer_market(symbol=symbol, source=source)
     limit = 900 if _canonical_freq(freq) in {"5min", "15min", "30min"} else 720
+    working = _normalize_chart_df(df, freq)
+    cache_meta = _chart_cache_meta(working, source=source, freq=freq)
     return {
         "symbol": symbol,
         "freq": _freq_label(freq),
         "meta": {
             "freq": _canonical_freq(freq),
             "source": source,
+            **cache_meta,
             "market": market,
             "market_timezone": market_timezone_name(market, symbol=symbol, source=source),
-            "time_semantics": "bar_close_market_time",
             "time_unit": "s",
-            "bars": int(len(df)) if df is not None else 0,
+            "bars": int(len(working)) if working is not None else 0,
         },
-        "ohlcv": _serialize_ohlcv_df(df, limit=limit, market=market, symbol=symbol, source=source),
+        "ohlcv": _serialize_ohlcv_df(working, limit=limit, market=market, symbol=symbol, source=source),
         "signals": [],
         "ma_lines": [],
     }
@@ -420,7 +505,7 @@ def _mark_chart_readiness(chart: dict[str, Any], *, kind: str, requested_freq: s
         meta["cache_status"] = "not_ready"
         meta["not_ready_reason"] = reason
     else:
-        meta["cache_status"] = "ready"
+        meta["cache_status"] = meta.get("cache_status") if meta.get("cache_status") in {"stale", "ready"} else "ready"
         meta["not_ready_reason"] = ""
     chart["meta"] = meta
     return chart
@@ -429,18 +514,40 @@ def _mark_chart_readiness(chart: dict[str, Any], *, kind: str, requested_freq: s
 def _resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-    weekly = df.sort_index().resample("W-FRI").agg({
+    daily = df.sort_index().copy()
+    daily["_source_dt"] = daily.index
+    weekly = daily.resample("W-FRI").agg({
         "open": "first",
         "high": "max",
         "low": "min",
         "close": "last",
         "vol": "sum",
         "amount": "sum",
+        "_source_dt": "last",
     })
     weekly = weekly.dropna(subset=["open", "high", "low", "close"], how="any")
+    if not weekly.empty:
+        new_index = []
+        latest_period_end = ""
+        latest_data_as_of = ""
+        latest_partial = False
+        for dt_idx, row in weekly.iterrows():
+            period_end = pd.to_datetime(dt_idx)
+            data_as_of = pd.to_datetime(row.get("_source_dt") or dt_idx)
+            partial = data_as_of.date() < period_end.date()
+            new_index.append(pd.Timestamp(data_as_of.date()) if partial else period_end)
+            latest_period_end = period_end.date().isoformat()
+            latest_data_as_of = data_as_of.date().isoformat()
+            latest_partial = partial
+        weekly.index = pd.DatetimeIndex(new_index)
+        weekly = weekly.drop(columns=["_source_dt"], errors="ignore")
+        weekly.attrs["period_end"] = latest_period_end
+        weekly.attrs["data_as_of"] = latest_data_as_of
+        weekly.attrs["is_partial_period"] = latest_partial
+        weekly.attrs["time_semantics"] = "period_data_as_of" if latest_partial else "period_end"
     weekly.attrs["data_source"] = "daily_resampled_weekly"
     if not weekly.empty:
-        weekly.attrs["as_of"] = str(weekly.index.max().date())
+        weekly.attrs["as_of"] = str(weekly.attrs.get("data_as_of") or weekly.index.max().date())
     return weekly
 
 
@@ -456,9 +563,10 @@ def _stock_df(symbol: str, freq: str) -> tuple[pd.DataFrame, str]:
         allow_stale=True,
     ))
     df = response.data if response.data is not None else pd.DataFrame()
+    df = _attach_gateway_meta(df, response, collection=response.source)
     if df is not None and not df.empty:
         return df, response.source
-    return pd.DataFrame(), response.source
+    return df, response.source
 
 
 def _index_df(symbol: str, freq: str) -> tuple[pd.DataFrame, str]:
@@ -472,9 +580,10 @@ def _index_df(symbol: str, freq: str) -> tuple[pd.DataFrame, str]:
         allow_stale=True,
     ))
     df = response.data if response.data is not None else pd.DataFrame()
+    df = _attach_gateway_meta(df, response, collection=response.source)
     if df is not None and not df.empty:
         return df, response.source
-    return pd.DataFrame(), response.source
+    return df, response.source
 
 
 def _probe_symbol_candidates(symbol: str, *, kind: str = "stock") -> list[str]:
@@ -540,16 +649,34 @@ def _cache_probe(symbol: str, *, kind: str, requested_freq: str) -> dict[str, An
                         continue
                     latest = db[collection].find_one(
                         query,
-                        {"dt": 1, "meta.source": 1, "close": 1},
+                        {"dt": 1, "meta": 1, "close": 1},
                         sort=[("dt", -1)],
                     ) or {}
+                    meta = latest.get("meta") or {}
+                    latest_dt = _serialize_dt(latest.get("dt"))
+                    data_as_of = _text(meta.get("data_as_of")) or latest_dt[:10]
+                    period_end = _text(meta.get("period_end"))
+                    is_partial_period = bool(meta.get("is_partial_period"))
+                    if freq == "周线" and latest.get("dt") is not None:
+                        try:
+                            dt_value = pd.to_datetime(latest.get("dt")).date()
+                            if dt_value > _market_today("A"):
+                                period_end = period_end or dt_value.isoformat()
+                                data_as_of = _market_today("A").isoformat()
+                                is_partial_period = True
+                                latest_dt = data_as_of
+                        except Exception:
+                            pass
                     rows.append({
                         "collection": collection,
                         "symbol": candidate,
                         "freq": freq,
                         "count": int(count),
-                        "latest_dt": _serialize_dt(latest.get("dt")),
-                        "source": (latest.get("meta") or {}).get("source", ""),
+                        "latest_dt": latest_dt,
+                        "data_as_of": data_as_of,
+                        "period_end": period_end,
+                        "is_partial_period": is_partial_period,
+                        "source": meta.get("source", ""),
                         "close": latest.get("close"),
                     })
         return {
@@ -623,7 +750,10 @@ def _board_heat_df(name: str, kind: str, freq: str) -> tuple[pd.DataFrame, str, 
         "amount": grouped[("market_value", "last")].fillna(0),
     })
     out.attrs["data_source"] = "board_heat_ticks"
+    out.attrs["collection"] = "board_heat_ticks"
     out.attrs["as_of"] = str(out.index.max().date())
+    out.attrs["data_as_of"] = str(out.index.max().date())
+    out.attrs["time_semantics"] = "bar_close_market_time"
     latest = docs[-1] if docs else {}
     latest = {**latest, "heat_target_label": heat_name, "heat_resolution_status": resolution.get("status", "")}
     return out, "board_heat_ticks", latest, resolution
@@ -641,8 +771,27 @@ def _board_heat_chart(name: str, kind: str, freq: str) -> tuple[dict[str, Any], 
     chart["meta"] = {
         **chart.get("meta", {}),
         "kind": kind,
+        "chart_type": "heat_ohlc",
+        "display_name": "热度K线/涨跌幅OHLC",
+        "is_price_kline": False,
         "value_axis": "change_pct",
         "chart_source": "board_heat_ticks",
+        "collection": "board_heat_ticks",
+        "ohlc_formula": {
+            "open": "change_pct:first",
+            "high": "change_pct:max",
+            "low": "change_pct:min",
+            "close": "change_pct:last",
+            "volume": "market_value:last",
+            "amount": "market_value:last",
+        },
+        "lineage": [
+            "Eastmoney push2delay",
+            "board_heat_ticks.change_pct",
+            "resample_to_ohlc",
+            "chart",
+        ],
+        "candidate_stocks_role": "representatives_only_not_price_source",
         "query_label": name,
         "heat_target_label": heat_name,
         "heat_resolution_status": resolution.get("status", ""),
@@ -2311,25 +2460,43 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
     return rows
 
 
-def _terminal_stock_pool_rows(range_columns: list[dict[str, Any]], limit: Optional[int] = None) -> list[dict[str, Any]]:
+def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: str = "focus_stocks", limit: Optional[int] = None) -> list[dict[str, Any]]:
     if limit is None:
-        limit = max(1, int(os.getenv("TERMINAL_WORKBENCH_FOCUS_STOCK_LIMIT", "72")))
+        env_name = {
+            "focus_stocks": "TERMINAL_WORKBENCH_FOCUS_STOCK_LIMIT",
+            "risk_stocks": "TERMINAL_WORKBENCH_RISK_STOCK_LIMIT",
+            "watch_stocks": "TERMINAL_WORKBENCH_WATCH_STOCK_LIMIT",
+        }.get(group, "TERMINAL_WORKBENCH_FOCUS_STOCK_LIMIT")
+        default = "72" if group != "watch_stocks" else "120"
+        limit = max(1, int(os.getenv(env_name, default)))
     try:
         db = _mongo_db()
         doc = db["terminal_stock_pool"].find_one(
             {"pool": "terminal_stock_pool", "market": "A"},
-            {"stocks": 1},
+            {"stocks": 1, "focus_stocks": 1, "risk_stocks": 1, "watch_stocks": 1},
             sort=[("updated_at", -1)],
         ) or {}
     except Exception:
         return []
     rows: list[dict[str, Any]] = []
-    for item in doc.get("stocks") or []:
+    source_rows = doc.get(group)
+    if source_rows is None and group == "focus_stocks":
+        source_rows = doc.get("stocks")
+    for item in source_rows or []:
         if not isinstance(item, dict):
+            continue
+        reasons = [reason for reason in item.get("inclusion_reasons") or [] if isinstance(reason, dict)]
+        has_technical = any(
+            reason.get("reason_type") in {"technical_trigger", "technical_signal"}
+            or reason.get("source_collection") == "terminal_technical_signals"
+            for reason in reasons
+        )
+        fallback_only = bool(reasons) and all(reason.get("reason_type") == "fallback_watch" for reason in reasons)
+        if group == "focus_stocks" and (fallback_only or (item.get("signal_origin") == "fallback_watch" and not has_technical)):
             continue
         row = _enrich_stock_row(dict(item), range_columns)
         row["lane"] = "signal_lane"
-        row["second_screen_role"] = "actionable_focus_stock"
+        row["second_screen_role"] = "actionable_focus_stock" if group == "focus_stocks" else group
         row["focus_reasons"] = [
             _text(reason.get("signal_type") or reason.get("reason_type"))
             for reason in item.get("inclusion_reasons") or []
@@ -2357,6 +2524,137 @@ def _terminal_stock_pool_rows(range_columns: list[dict[str, Any]], limit: Option
         if len(rows) >= limit:
             break
     return rows
+
+
+def _terminal_stock_pool_rows(range_columns: list[dict[str, Any]], limit: Optional[int] = None) -> list[dict[str, Any]]:
+    return _terminal_stock_pool_group_rows(range_columns, "focus_stocks", limit)
+
+
+def _focus_stock_pool_meta(focus_count: int) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "label": "真实买点",
+        "source_collection": "terminal_stock_pool",
+        "count": focus_count,
+        "empty_reason": "",
+        "terminal_technical_signal_count": 0,
+    }
+    try:
+        db = _mongo_db()
+        doc = db["terminal_stock_pool"].find_one(
+            {"pool": "terminal_stock_pool", "market": "A"},
+            {
+                "updated_at": 1,
+                "candidate_count": 1,
+                "stock_limit": 1,
+                "risk_limit": 1,
+                "watch_limit": 1,
+                "reason_counts": 1,
+                "fallback_count": 1,
+                "source_policy": 1,
+                "selection_policy": 1,
+                "ranking_version": 1,
+                "stocks": 1,
+                "focus_stocks": 1,
+                "risk_stocks": 1,
+                "watch_stocks": 1,
+                "pool_counts": 1,
+                "candidate_counts_by_source": 1,
+                "candidate_counts_by_side": 1,
+                "candidate_counts_by_freq": 1,
+                "coverage_by_freq": 1,
+                "coverage_status": 1,
+                "is_full_market_complete": 1,
+            },
+            sort=[("updated_at", -1)],
+        ) or {}
+        tech_count = db["terminal_technical_signals"].count_documents({"market": "A"})
+        freshness = db["data_freshness"].find_one(
+            {"domain": "terminal_pool", "market": "A", "collection": "terminal_stock_pool"},
+            sort=[("updated_at", -1)],
+        ) or {}
+        run = db["sync_runs"].find_one({"_id": {"$regex": "^postmarket:"}}, sort=[("updated_at", -1)]) or {}
+        stocks_len = len(doc.get("focus_stocks") or doc.get("stocks") or [])
+        empty_reason = ""
+        if focus_count == 0:
+            if tech_count == 0:
+                empty_reason = "terminal_technical_signals=0"
+            elif run.get("status") == "partial":
+                empty_reason = "postmarket partial"
+            else:
+                empty_reason = _text(freshness.get("stale_reason")) or "terminal_stock_pool_empty"
+        meta.update({
+            "count": focus_count,
+            "terminal_stock_pool_count": stocks_len,
+            "candidate_count": int(doc.get("candidate_count") or 0),
+            "stock_limit": int(doc.get("stock_limit") or 0),
+            "risk_limit": int(doc.get("risk_limit") or 0),
+            "watch_limit": int(doc.get("watch_limit") or 0),
+            "fallback_count": int(doc.get("fallback_count") or 0),
+            "reason_counts": doc.get("reason_counts") or {},
+            "pool_counts": doc.get("pool_counts") or {},
+            "candidate_counts_by_source": doc.get("candidate_counts_by_source") or {},
+            "candidate_counts_by_side": doc.get("candidate_counts_by_side") or {},
+            "candidate_counts_by_freq": doc.get("candidate_counts_by_freq") or {},
+            "coverage_by_freq": doc.get("coverage_by_freq") or {},
+            "coverage_status": _text(doc.get("coverage_status")),
+            "is_full_market_complete": bool(doc.get("is_full_market_complete")),
+            "selection_policy": _text(doc.get("selection_policy")),
+            "ranking_version": _text(doc.get("ranking_version")),
+            "source_policy": _text(doc.get("source_policy")),
+            "updated_at": _serialize_dt(doc.get("updated_at")),
+            "freshness": _text(freshness.get("freshness")),
+            "stale_reason": _text(freshness.get("stale_reason")),
+            "terminal_technical_signal_count": int(tech_count),
+            "postmarket_status": _text(run.get("status")),
+            "postmarket_run_id": _text(run.get("_id")),
+            "empty_reason": empty_reason,
+        })
+    except Exception as exc:
+        meta.update({"empty_reason": "metadata_unavailable", "error": exc.__class__.__name__})
+    return meta
+
+
+def _kline_cache_coverage() -> dict[str, Any]:
+    freqs = ["日线", "周线", "5分钟", "15分钟", "30分钟"]
+    coverage: dict[str, Any] = {"collections": []}
+    try:
+        db = _mongo_db()
+        for collection in ("bars", "index_bars"):
+            rows: list[dict[str, Any]] = []
+            for freq in freqs:
+                pipeline = [
+                    {"$match": {"meta.freq": freq}},
+                    {"$group": {
+                        "_id": "$meta.symbol",
+                        "count": {"$sum": 1},
+                        "latest_dt": {"$max": "$dt"},
+                    }},
+                    {"$group": {
+                        "_id": None,
+                        "symbol_count": {"$sum": 1},
+                        "bar_count": {"$sum": "$count"},
+                        "latest_dt": {"$max": "$latest_dt"},
+                    }},
+                ]
+                result = list(db[collection].aggregate(pipeline))
+                row = result[0] if result else {}
+                rows.append({
+                    "freq": freq,
+                    "symbol_count": int(row.get("symbol_count") or 0),
+                    "bar_count": int(row.get("bar_count") or 0),
+                    "latest_dt": _serialize_dt(row.get("latest_dt")),
+                })
+            coverage["collections"].append({"collection": collection, "rows": rows})
+        latest_heat = db["board_heat_ticks"].find_one({}, {"trade_minute": 1}, sort=[("trade_minute", -1)]) or {}
+        coverage["board_heat_ticks"] = {
+            "latest_trade_minute": _serialize_dt(latest_heat.get("trade_minute")),
+            "symbol_count": len(db["board_heat_ticks"].distinct("name")),
+        }
+        coverage["status"] = "ok"
+    except Exception as exc:
+        coverage["status"] = "unavailable"
+        coverage["error"] = exc.__class__.__name__
+    return coverage
 
 
 def _build_trader_task_queue(
@@ -2677,10 +2975,15 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         concept_top = concept_top or (cluster.get("concept") or {}).get("top") or []
     sector_boards = _chain_heat_sector_rows()
     focus_stocks = _terminal_stock_pool_rows(range_columns)
+    risk_stocks = _terminal_stock_pool_group_rows(range_columns, "risk_stocks")
+    watch_stocks = _terminal_stock_pool_group_rows(range_columns, "watch_stocks")
+    focus_stocks_meta = _focus_stock_pool_meta(len(focus_stocks))
     for rows, lane in (
         (macro_indices, "quote_lane"),
         (sector_boards, "board_lane"),
         (focus_stocks, "signal_lane"),
+        (risk_stocks, "signal_lane"),
+        (watch_stocks, "signal_lane"),
     ):
         for row in rows:
             row["lane_status"] = sync_lanes.get(lane, {})
@@ -2688,7 +2991,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
 
     decision_queue = _build_trader_task_queue(
         decision_rows=decision_rows_raw,
-        focus_stocks=focus_stocks,
+        focus_stocks=focus_stocks + risk_stocks,
         sector_boards=sector_boards,
     )
 
@@ -2730,10 +3033,48 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         "watchlist_groups": {
             "macro_indices": macro_indices,
             "sector_boards": sector_boards,
+            "buy_candidates": scored,
             "focus_stocks": focus_stocks,
+            "risk_stocks": risk_stocks,
+            "watch_stocks": watch_stocks,
+        },
+        "watchlist_groups_meta": {
+            "macro_indices": {
+                "label": "宏观指数",
+                "source_collection": "index_bars",
+                "count": len(macro_indices),
+            },
+            "sector_boards": {
+                "label": "异动板块",
+                "source_collection": "chain_heat_snapshots",
+                "count": len(sector_boards),
+                "representative_stock_role": "preview_only_not_focus_pool",
+            },
+            "buy_candidates": {
+                "label": "策略候选/未硬技术确认",
+                "source_collection": "strategy_snapshots",
+                "count": len(scored),
+                "role": "strategy_candidates_not_hard_technical_focus",
+            },
+            "focus_stocks": focus_stocks_meta,
+            "risk_stocks": {
+                "label": "风险/止盈止损",
+                "source_collection": "terminal_stock_pool.risk_stocks",
+                "count": len(risk_stocks),
+                "role": "exit_and_risk_queue_not_focus_pool",
+                **{key: value for key, value in focus_stocks_meta.items() if key in {"pool_counts", "candidate_counts_by_source", "candidate_counts_by_side", "candidate_counts_by_freq", "coverage_by_freq", "coverage_status", "selection_policy", "ranking_version"}},
+            },
+            "watch_stocks": {
+                "label": "观察/预热",
+                "source_collection": "terminal_stock_pool.watch_stocks",
+                "count": len(watch_stocks),
+                "role": "watch_and_minute_preheat_not_focus_pool",
+                **{key: value for key, value in focus_stocks_meta.items() if key in {"pool_counts", "candidate_counts_by_source", "candidate_counts_by_side", "candidate_counts_by_freq", "coverage_by_freq", "coverage_status", "selection_policy", "ranking_version"}},
+            },
         },
         "watchlist": watchlist,
         "watchlist_range_columns": range_columns,
+        "kline_cache_coverage": _kline_cache_coverage(),
         "sync_lanes": sync_lanes,
         "daily_brief": strategy_snapshot.get("daily_brief", {}),
         "decision_queue": decision_queue,
@@ -3703,9 +4044,9 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
             "chart": chart,
             "summary": {
                 "title": name,
-                "subtitle": "行业分钟热度",
+                "subtitle": "行业热度K线/涨跌幅OHLC",
                 "latest_price": chart.get("ohlcv", [{}])[-1].get("close", 0) if chart.get("ohlcv") else 0,
-                "conclusion": "行业分钟热度来自缓存。" if heat_ready else "行业分钟热度缓存未就绪。",
+                "conclusion": "行业图形来自东财板块快照 change_pct 重采样，不是成分股价格K线。" if heat_ready else "行业分钟热度缓存未就绪。",
                 "gain_pct": latest_heat.get("change_pct"),
                 "composite_score": getattr(ranking, "composite_score", 0) if ranking else 0,
                 "leader": latest_heat.get("leader_name", ""),
@@ -3875,9 +4216,9 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
             "chart": chart,
             "summary": {
                 "title": name,
-                "subtitle": "概念分钟热度",
+                "subtitle": "概念热度K线/涨跌幅OHLC",
                 "latest_price": chart.get("ohlcv", [{}])[-1].get("close", 0) if chart.get("ohlcv") else 0,
-                "conclusion": "概念分钟热度来自缓存。" if heat_ready else "概念分钟热度缓存未就绪。",
+                "conclusion": "概念图形来自东财概念快照 change_pct 重采样，不是成分股价格K线。" if heat_ready else "概念分钟热度缓存未就绪。",
                 "gain_pct": latest_heat.get("change_pct") or heat_value,
                 "leader": latest_heat.get("leader_name", ""),
                 "up_count": latest_heat.get("up_count"),

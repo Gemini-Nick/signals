@@ -6,16 +6,22 @@ from signals.sync import postmarket as pm
 
 def test_default_postmarket_tasks_split_long_market_data_tasks():
     stock_daily = [task for task in pm.POSTMARKET_TASKS if task.module == "stock_daily"]
+    stock_30m = [task for task in pm.POSTMARKET_TASKS if task.module == "stock_30m_fullmarket"]
     board_cons = [task for task in pm.POSTMARKET_TASKS if task.module == "board_cons"]
     weekly = next(task for task in pm.POSTMARKET_TASKS if task.module == "weekly_rollup")
+    technical_scan = next(task for task in pm.POSTMARKET_TASKS if task.module == "technical_signal_scan")
     chain = next(task for task in pm.POSTMARKET_TASKS if task.module == "chain_heat_snapshots")
 
     assert len(stock_daily) == 16
+    assert len(stock_30m) == 16
     assert {task.shard_key for task in stock_daily} == {f"shard_{idx:02d}" for idx in range(16)}
+    assert {task.shard_key for task in stock_30m} == {f"shard_{idx:02d}" for idx in range(16)}
     assert all(task.env["STOCK_DAILY_SCOPE"] == "all" for task in stock_daily)
+    assert all(task.task_key in technical_scan.depends_on for task in stock_30m)
     assert {task.shard_key for task in board_cons} == {"board", "concept"}
     assert set(task.task_key for task in stock_daily).issubset(set(weekly.depends_on))
-    assert set(task.task_key for task in board_cons).issubset(set(chain.depends_on))
+    assert not (set(task.task_key for task in board_cons) & set(chain.depends_on))
+    assert chain.depends_on == ("board_ranking:all",)
 
 
 class _Cursor(list):
@@ -207,3 +213,70 @@ def test_postmarket_completed_run_is_not_repeated(monkeypatch):
     assert first["status"] == "ok"
     assert second["skipped"] is True
     assert calls == ["alpha"]
+
+
+def test_postmarket_same_phase_dependency_runs_after_parent_finishes(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("alpha", "derived"),
+        pm.PostmarketTaskSpec("beta", "derived", depends_on=("alpha:all",)),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("derived",))
+
+    calls = []
+
+    def alpha(db, proxy_url=None):
+        calls.append("alpha")
+        return {"status": "ok"}
+
+    def beta(db, proxy_url=None):
+        calls.append("beta")
+        return {"status": "ok"}
+
+    db = _Db()
+    engine = _Engine(db, {"alpha": (alpha, ""), "beta": (beta, "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(trade_date="2026-04-28")
+
+    assert result["status"] == "ok"
+    assert calls == ["alpha", "beta"]
+    assert db["sync_tasks"].docs["postmarket:2026-04-28:beta:all"]["status"] == "ok"
+
+
+def test_postmarket_stock_daily_cooling_partial_unlocks_downstream(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00"),
+        pm.PostmarketTaskSpec("weekly_rollup", "derived", depends_on=("stock_daily:shard_00",)),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data", "derived"))
+
+    calls = []
+
+    def stock_daily(db, proxy_url=None):
+        calls.append("stock_daily")
+        return {
+            "status": "partial",
+            "processed": 10,
+            "total": 10,
+            "progress_pct": 100.0,
+            "coverage_pct": 45.0,
+            "errors": 0,
+            "deferred": 5,
+            "cooling_down": 5,
+        }
+
+    def weekly_rollup(db, proxy_url=None):
+        calls.append("weekly_rollup")
+        return {"status": "ok"}
+
+    db = _Db()
+    engine = _Engine(db, {"stock_daily": (stock_daily, ""), "weekly_rollup": (weekly_rollup, "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(trade_date="2026-04-28")
+
+    assert result["status"] == "partial"
+    assert calls == ["stock_daily", "weekly_rollup"]
+    assert db["sync_tasks"].docs["postmarket:2026-04-28:weekly_rollup:all"]["status"] == "ok"

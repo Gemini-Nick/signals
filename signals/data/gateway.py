@@ -106,6 +106,11 @@ def _bars_df_from_docs(docs: list[dict], source: str) -> pd.DataFrame:
     df = pd.DataFrame(docs)
     if "dt" not in df.columns:
         return pd.DataFrame()
+    latest_doc = max(
+        docs,
+        key=lambda item: pd.to_datetime(item.get("dt"), errors="coerce") if item.get("dt") is not None else pd.Timestamp.min,
+    )
+    latest_meta = latest_doc.get("meta") if isinstance(latest_doc.get("meta"), dict) else {}
     df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
     df = df.dropna(subset=["dt"]).sort_values("dt").set_index("dt")
     for col in ["open", "high", "low", "close", "vol", "amount"]:
@@ -116,6 +121,11 @@ def _bars_df_from_docs(docs: list[dict], source: str) -> pd.DataFrame:
     df.attrs["data_source"] = source
     if not df.empty:
         df.attrs["as_of"] = str(df.index.max().date())
+        df.attrs["latest_bar_time"] = df.index.max().isoformat()
+    if latest_meta:
+        for key in ("period_end", "data_as_of", "time_semantics", "is_partial_period"):
+            if key in latest_meta:
+                df.attrs[key] = latest_meta.get(key)
     return df
 
 

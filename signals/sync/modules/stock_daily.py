@@ -7,14 +7,17 @@ A股日线同步 — ~5000 只股票增量同步
 频率: 工作日 16:30
 """
 import logging
+import math
 import os
 import atexit
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed
 from datetime import datetime, timedelta
 
 import akshare as ak
 import pandas as pd
+import requests
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
@@ -40,6 +43,19 @@ _STOCK_DAILY_PROVIDER_ENDPOINTS = (
     ("eastmoney", "stock_daily_hist"),
     ("sina", "stock_daily"),
 )
+_EM_SPOT_CLIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
+_EM_SPOT_CLIST_FIELDS = "f2,f5,f6,f12,f15,f16,f17,f18"
+_EM_SPOT_CLIST_FS = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048"
+_EM_SPOT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+    "Connection": "close",
+}
+_SPOT_BATCH_LOCK = threading.Lock()
+_SPOT_BATCH_CACHE: dict[str, pd.DataFrame] = {}
 
 
 def _shard_count() -> int:
@@ -87,6 +103,42 @@ def _progress_interval() -> int:
 
 def _write_batch_symbols() -> int:
     return max(1, int(os.getenv("STOCK_DAILY_WRITE_BATCH_SYMBOLS", "20")))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _batch_today_min_hour() -> int:
+    try:
+        return max(0, min(23, int(os.getenv("STOCK_DAILY_BATCH_TODAY_MIN_HOUR", "15"))))
+    except (TypeError, ValueError):
+        return 15
+
+
+def _batch_prev_close_tolerance() -> float:
+    try:
+        return max(0.0, float(os.getenv("STOCK_DAILY_BATCH_PREV_CLOSE_TOLERANCE", "0.02")))
+    except (TypeError, ValueError):
+        return 0.02
+
+
+def _spot_batch_page_size() -> int:
+    try:
+        # Eastmoney accepts larger pz values but still returns at most 100 rows.
+        return max(50, min(100, int(os.getenv("STOCK_DAILY_SPOT_BATCH_PAGE_SIZE", "100"))))
+    except (TypeError, ValueError):
+        return 100
+
+
+def _spot_batch_timeout() -> float:
+    try:
+        return max(3.0, float(os.getenv("STOCK_DAILY_SPOT_BATCH_TIMEOUT", "10")))
+    except (TypeError, ValueError):
+        return 10.0
 
 
 def _coerce_last_dt(value) -> datetime | None:
@@ -629,6 +681,220 @@ def _docs_from_daily_df(code: str, df: pd.DataFrame, column_map: dict[str, str],
     return docs
 
 
+def _safe_number(value, default: float | None = None) -> float | None:
+    parsed = pd.to_numeric(value, errors="coerce")
+    if pd.isna(parsed):
+        return default
+    return float(parsed)
+
+
+def _em_spot_clist_params(page: int, page_size: int) -> dict[str, str]:
+    return {
+        "pn": str(page),
+        "pz": str(page_size),
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f12",
+        "fs": _EM_SPOT_CLIST_FS,
+        "fields": _EM_SPOT_CLIST_FIELDS,
+    }
+
+
+def _fetch_eastmoney_spot_batch_df(db: Database | None, end_date: str) -> pd.DataFrame:
+    """Fetch one full-market Eastmoney spot snapshot and cache it per process/date."""
+    cache_key = f"{end_date}:{_EM_SPOT_CLIST_FIELDS}"
+    with _SPOT_BATCH_LOCK:
+        cached = _SPOT_BATCH_CACHE.get(cache_key)
+        if cached is not None:
+            return cached.copy()
+
+        page_size = _spot_batch_page_size()
+        timeout = _spot_batch_timeout()
+        def _fetch_pages() -> list[dict]:
+            rows: list[dict] = []
+            with requests.Session() as session:
+                session.trust_env = False
+
+                def _request(page: int) -> dict:
+                    response = session.get(
+                        _EM_SPOT_CLIST_URL,
+                        params=_em_spot_clist_params(page, page_size),
+                        headers=_EM_SPOT_HEADERS,
+                        timeout=timeout,
+                    )
+                    response.raise_for_status()
+                    return response.json()
+
+                first_payload = _request(1)
+                first_data = first_payload.get("data") or {}
+                total = int(first_data.get("total") or 0)
+                rows.extend(first_data.get("diff") or [])
+                page_count = max(1, math.ceil(total / page_size))
+                for page in range(2, page_count + 1):
+                    payload = _request(page)
+                    data = payload.get("data") or {}
+                    rows.extend(data.get("diff") or [])
+            return rows
+
+        rows = provider_call(
+            "eastmoney",
+            "stock_daily_spot_batch",
+            _fetch_pages,
+            db=db,
+        )
+
+        docs = []
+        for row in rows:
+            docs.append({
+                "代码": row.get("f12"),
+                "最新价": row.get("f2"),
+                "成交量": row.get("f5"),
+                "成交额": row.get("f6"),
+                "最高": row.get("f15"),
+                "最低": row.get("f16"),
+                "今开": row.get("f17"),
+                "昨收": row.get("f18"),
+            })
+        df = pd.DataFrame(docs)
+        if not df.empty:
+            df["_pure_code"] = df["代码"].map(_pure_a_code)
+        _SPOT_BATCH_CACHE[cache_key] = df
+        return df.copy()
+
+
+def _previous_daily_close_by_symbol(db: Database, codes: list[str], end_date: str) -> dict[str, float]:
+    if not codes:
+        return {}
+    try:
+        cutoff = pd.to_datetime(end_date).to_pydatetime()
+        rows = db["bars"].aggregate([
+            {
+                "$match": {
+                    "meta.freq": "日线",
+                    "meta.symbol": {"$in": codes},
+                    "dt": {"$lt": cutoff},
+                }
+            },
+            {"$sort": {"meta.symbol": 1, "dt": -1}},
+            {"$group": {"_id": "$meta.symbol", "close": {"$first": "$close"}}},
+        ])
+        result: dict[str, float] = {}
+        for row in rows:
+            code = _pure_a_code(row.get("_id"))
+            close = _safe_number(row.get("close"))
+            if code and close and close > 0:
+                result[code] = close
+        return result
+    except Exception as exc:
+        logger.debug("读取昨日日线 close 失败，今日批量快照跳过复权校验: %s", exc)
+        return {}
+
+
+def _snapshot_daily_doc(
+    code: str,
+    row: pd.Series,
+    end_date: str,
+    *,
+    previous_close: float | None = None,
+) -> dict | None:
+    """Build today's unadjusted daily bar from the all-market spot snapshot.
+
+    Eastmoney's daily qfq series keeps the latest trading day at raw price scale
+    in normal cases. Historical gaps and failed snapshot rows still fall back to
+    per-symbol kline fetch below.
+    """
+    open_price = _safe_number(row.get("今开"))
+    high = _safe_number(row.get("最高"))
+    low = _safe_number(row.get("最低"))
+    close = _safe_number(row.get("最新价"))
+    vol = _safe_number(row.get("成交量"), 0.0)
+    amount = _safe_number(row.get("成交额"), 0.0)
+    if not all(value is not None and value > 0 for value in (open_price, high, low, close)):
+        return None
+    snapshot_prev_close = _safe_number(row.get("昨收"))
+    if previous_close and previous_close > 0 and snapshot_prev_close and snapshot_prev_close > 0:
+        prev_gap = abs(snapshot_prev_close - previous_close) / previous_close
+        if prev_gap > _batch_prev_close_tolerance():
+            return None
+    return {
+        "dt": pd.to_datetime(end_date),
+        "meta": {
+            "symbol": code,
+            "freq": "日线",
+            "market": "A",
+            "source": "eastmoney_spot_clist_batch",
+            "batch_semantics": "today_spot_ohlcv",
+            "prev_close": snapshot_prev_close,
+        },
+        "open": float(open_price),
+        "high": float(high),
+        "low": float(low),
+        "close": float(close),
+        "vol": int(float(vol or 0)),
+        "amount": int(float(amount or 0)),
+        "source": "eastmoney_spot_clist_batch",
+    }
+
+
+def _batch_today_candidates(codes: list[str], sync_docs: dict[str, object], end_date: str) -> list[str]:
+    candidates: list[str] = []
+    for code in codes:
+        last_dt = _coerce_last_dt(sync_docs.get(code))
+        if not last_dt:
+            continue
+        inc_start = (last_dt + timedelta(days=1)).strftime("%Y%m%d")
+        if inc_start == end_date:
+            candidates.append(code)
+    return candidates
+
+
+def _sync_today_from_spot_batch(
+    db: Database,
+    codes: list[str],
+    sync_docs: dict[str, object],
+    end_date: str,
+) -> tuple[dict[str, list], str]:
+    if not _env_bool("STOCK_DAILY_BATCH_TODAY_ENABLED", True):
+        return {}, "disabled"
+    if naive_market_now("A").hour < _batch_today_min_hour():
+        return {}, "before_batch_today_window"
+    candidates = _batch_today_candidates(codes, sync_docs, end_date)
+    if not candidates:
+        return {}, "no_today_candidates"
+    try:
+        df = _fetch_eastmoney_spot_batch_df(db, end_date)
+    except Exception as exc:
+        logger.warning("全市场今日日线批量快照失败，回退单股历史 K 线: %s", str(exc)[:200])
+        return {}, f"batch_fetch_failed:{exc.__class__.__name__}"
+    if df is None or df.empty or "_pure_code" not in df.columns:
+        return {}, "batch_snapshot_empty"
+
+    prev_close_by_code = _previous_daily_close_by_symbol(db, candidates, end_date)
+    snapshot_rows = {
+        str(row.get("_pure_code")): row
+        for _, row in df.iterrows()
+        if row.get("_pure_code")
+    }
+    docs_by_code: dict[str, list] = {}
+    for code in candidates:
+        row = snapshot_rows.get(code)
+        if row is None:
+            continue
+        doc = _snapshot_daily_doc(
+            code,
+            row,
+            end_date,
+            previous_close=prev_close_by_code.get(code),
+        )
+        if doc:
+            docs_by_code[code] = [doc]
+    fallback_count = max(0, len(candidates) - len(docs_by_code))
+    return docs_by_code, f"batch_today_candidates={len(candidates)},batch_docs={len(docs_by_code)},fallback={fallback_count}"
+
+
 def _provider_failure(failures: list[tuple[str, BaseException]]) -> BaseException:
     message = "; ".join(f"{name}={str(exc)[:160]}" for name, exc in failures)
     if failures and all(isinstance(exc, ProviderCoolingDown) for _, exc in failures):
@@ -822,6 +1088,41 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         global_total=global_total,
     )
 
+    batch_docs_by_code, batch_reason = _sync_today_from_spot_batch(db, codes, sync_docs, end_date)
+    batch_codes = set(batch_docs_by_code)
+    batch_inserted = 0
+    if batch_docs_by_code:
+        written_by_code = _write_daily_docs_batch(bars_col, sync_col, batch_docs_by_code)
+        batch_inserted = sum(int(value or 0) for value in written_by_code.values())
+        total_inserted += batch_inserted
+        processed_count += len(batch_codes)
+        _write_progress(
+            sync_col,
+            status="running" if processed_count < len(codes) else "ok",
+            scope=scope,
+            total=len(codes),
+            processed=processed_count,
+            inserted=total_inserted,
+            skipped=total_skipped,
+            errors_count=0,
+            deferred_count=0,
+            latest_symbol=next(iter(batch_codes), ""),
+            latest_status=f"batch_today:{batch_inserted}/{len(batch_codes)}",
+            latest_written=batch_inserted,
+            started_at=run_started_at,
+            shard_key=shard_key,
+            shard_index=shard_index,
+            shard_count=shard_count,
+            global_total=global_total,
+        )
+        logger.info(
+            "A股日线今日批量快照: %d codes, +%d bars, shard=%s reason=%s",
+            len(batch_codes),
+            batch_inserted,
+            shard_key,
+            batch_reason,
+        )
+
     def _process(code):
         last_dt_raw = sync_docs.get(code)
         last_dt = _coerce_last_dt(last_dt_raw)
@@ -864,8 +1165,9 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         return sum(int(value or 0) for value in written_by_code.values())
 
     # 并行拉取
+    remaining_codes = [code for code in codes if code not in batch_codes]
     with ThreadPoolExecutor(max_workers=_BATCH_WORKERS) as executor:
-        futures = {executor.submit(_process, c): c for c in codes}
+        futures = {executor.submit(_process, c): c for c in remaining_codes}
         for future in as_completed(futures):
             code = futures[future]
             latest_symbol = code
@@ -966,4 +1268,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         "progress_pct": round((processed_count / len(codes) * 100), 2) if codes else 0,
         "sample_errors": errors[:5],
         "sample_deferred": deferred[:5],
+        "batch_today": len(batch_codes),
+        "batch_today_inserted": batch_inserted,
+        "batch_today_reason": batch_reason,
     }

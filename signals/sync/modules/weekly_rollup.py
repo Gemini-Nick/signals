@@ -47,6 +47,7 @@ def _weekly_docs(symbol: str, docs: list[dict[str, Any]], *, collection: str) ->
     required = ["open", "high", "low", "close"]
     if any(column not in df.columns for column in required):
         return []
+    df["_source_dt"] = df.index
     weekly = df.resample("W-FRI").agg({
         "open": "first",
         "high": "max",
@@ -54,6 +55,7 @@ def _weekly_docs(symbol: str, docs: list[dict[str, Any]], *, collection: str) ->
         "close": "last",
         "vol": "sum" if "vol" in df.columns else "first",
         "amount": "sum" if "amount" in df.columns else "first",
+        "_source_dt": "last",
     })
     weekly = weekly.dropna(subset=required, how="any")
     source = "daily_rollup"
@@ -61,13 +63,21 @@ def _weekly_docs(symbol: str, docs: list[dict[str, Any]], *, collection: str) ->
         source = "index_daily_rollup"
     out: list[dict[str, Any]] = []
     for dt_idx, row in weekly.iterrows():
+        period_end = pd.to_datetime(dt_idx)
+        data_as_of = pd.to_datetime(row.get("_source_dt") or dt_idx)
+        is_partial_period = data_as_of.date() < period_end.date()
+        display_dt = data_as_of if is_partial_period else period_end
         out.append({
-            "dt": pd.to_datetime(dt_idx),
+            "dt": display_dt,
             "meta": {
                 "symbol": symbol,
                 "freq": WEEKLY_FREQ,
                 "source": source,
                 "market": "A",
+                "period_end": period_end.date().isoformat(),
+                "data_as_of": data_as_of.date().isoformat(),
+                "time_semantics": "period_data_as_of" if is_partial_period else "period_end",
+                "is_partial_period": is_partial_period,
                 **({"asset_type": "index"} if collection == "index_bars" else {}),
             },
             "open": float(row["open"]),

@@ -129,6 +129,64 @@ def test_intraday_chart_aligns_date_only_custom_signal_to_bar(monkeypatch):
     assert merged["signals"][-1]["price"] == last_same_day["low"]
 
 
+def test_weekly_chart_uses_data_as_of_for_unfinished_current_week(monkeypatch):
+    from signals.web.api import workbench
+
+    df = pd.DataFrame(
+        {
+            "open": [10.0],
+            "high": [12.0],
+            "low": [9.0],
+            "close": [11.0],
+            "vol": [1000],
+            "amount": [10000],
+        },
+        index=pd.to_datetime(["2026-05-01"]),
+    )
+    monkeypatch.setattr(workbench, "_market_today", lambda market="A": date(2026, 4, 29))
+
+    chart = workbench._chart_from_df(df, symbol="sh000001", freq="weekly", source="index_bars")
+
+    assert chart["meta"]["period_end"] == "2026-05-01"
+    assert chart["meta"]["data_as_of"] == "2026-04-29"
+    assert chart["meta"]["time_semantics"] == "period_data_as_of"
+    assert workbench._timestamp_date(chart["ohlcv"][-1]["time"], market="A", symbol="sh000001") == "2026-04-29"
+
+
+def test_board_heat_chart_declares_heat_ohlc_formula(monkeypatch):
+    from signals.web.api import workbench
+
+    df = pd.DataFrame(
+        {
+            "open": [1.0],
+            "high": [3.0],
+            "low": [0.5],
+            "close": [2.0],
+            "vol": [1000],
+            "amount": [1000],
+        },
+        index=pd.to_datetime(["2026-04-29 10:30"]),
+    )
+
+    monkeypatch.setattr(
+        workbench,
+        "_board_heat_df",
+        lambda name, kind, freq: (
+            df,
+            "board_heat_ticks",
+            {"trade_minute": "2026-04-29 10:30", "source": "eastmoney_push2delay"},
+            {"heat_name": name, "status": "exact"},
+        ),
+    )
+
+    chart, _ = workbench._board_heat_chart("锂", "industry", "30min")
+
+    assert chart["meta"]["chart_type"] == "heat_ohlc"
+    assert chart["meta"]["is_price_kline"] is False
+    assert chart["meta"]["ohlc_formula"]["open"] == "change_pct:first"
+    assert chart["meta"]["candidate_stocks_role"] == "representatives_only_not_price_source"
+
+
 def test_focus_stocks_aggregate_buy_points_by_timeframe(monkeypatch):
     from signals.web.api import workbench
 
@@ -219,6 +277,64 @@ def test_focus_stocks_attach_sell_warning_to_existing_buy_row(monkeypatch):
     assert [item["badge"] for item in rows[0]["buy_timeframes"]] == ["5m"]
     assert rows[0]["latest_signal"] == "卖D/5m"
     assert rows[0]["trader_action"] == "风险复核"
+
+
+def test_terminal_stock_pool_group_rows_keep_focus_risk_watch_separate(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Collection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "focus_stocks": [
+                    {
+                        "symbol": "SZ.300575",
+                        "name": "中旗新材",
+                        "pool_type": "focus",
+                        "action_status": "entry_ready",
+                        "entry_gate_status": "entry_confirmed",
+                        "inclusion_reasons": [{"reason_type": "technical_trigger", "signal_type": "三买"}],
+                    }
+                ],
+                "risk_stocks": [
+                    {
+                        "symbol": "SH.688484",
+                        "name": "风险股",
+                        "pool_type": "risk",
+                        "action_status": "risk_review",
+                        "entry_gate_status": "blocked_by_risk",
+                        "inclusion_reasons": [{"reason_type": "technical_trigger", "signal_side": "sell", "signal_type": "一卖"}],
+                    }
+                ],
+                "watch_stocks": [
+                    {
+                        "symbol": "SZ.002812",
+                        "name": "观察股",
+                        "pool_type": "watch",
+                        "action_status": "entry_waiting_30m_confirm",
+                        "entry_gate_status": "entry_waiting_30m_confirm",
+                        "inclusion_reasons": [{"reason_type": "fallback_watch", "signal_type": "策略候选"}],
+                    }
+                ],
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"terminal_stock_pool": _Collection()}))
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (_bars(), "test_bars"))
+    columns = workbench._watchlist_range_columns(date(2026, 4, 26))
+
+    focus = workbench._terminal_stock_pool_group_rows(columns, "focus_stocks")
+    risk = workbench._terminal_stock_pool_group_rows(columns, "risk_stocks")
+    watch = workbench._terminal_stock_pool_group_rows(columns, "watch_stocks")
+
+    assert [row["pool_type"] for row in focus] == ["focus"]
+    assert [row["pool_type"] for row in risk] == ["risk"]
+    assert [row["pool_type"] for row in watch] == ["watch"]
+    assert focus[0]["entry_gate_status"] == "entry_confirmed"
+    assert risk[0]["action_status"] == "risk_review"
+    assert watch[0]["action_status"] == "entry_waiting_30m_confirm"
 
 
 def test_concept_sector_preview_returns_explicit_chain_carrier(monkeypatch):

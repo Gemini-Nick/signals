@@ -23,6 +23,10 @@ ENTRY_FACTOR_TOKENS = ("gap", "trend_breakout", "vol_contraction", "candle_run",
 TECHNICAL_TOKENS = CHAN_TOKENS + PATTERN_TOKENS + MACD_TOKENS + GAP_TOKENS + ENTRY_FACTOR_TOKENS
 RIGHT_SIDE_FREQS = {"5分钟", "5min", "5m", "15分钟", "15min", "15m"}
 BUY_FREQ_BONUS = {"30分钟": 120, "30min": 120, "30m": 120, "15分钟": 110, "15min": 110, "15m": 110, "5分钟": 80, "5min": 80, "5m": 80}
+ENTRY_30M_FREQS = {"30分钟", "30min", "30m", "F30", "f30"}
+ENTRY_PARTNER_FREQS = {"日线", "daily", "1d", "D", "d", "周线", "weekly", "1w", "W", "w", "15分钟", "15min", "15m", "F15", "f15"}
+RISK_ACTION_STATUSES = {"risk_review", "chain_risk_review", "knowledge_blocked", "knowledge_conflict"}
+POOL_RANKING_VERSION = "entry_risk_watch_v1"
 FREQ_ORDER = {
     "周线": 0,
     "weekly": 0,
@@ -57,6 +61,7 @@ REASON_WEIGHTS = {
     "constituent_hot": 0,
     "active_pool_watch": 260,
     "recent_opened": 180,
+    "fallback_watch": 160,
 }
 
 
@@ -76,6 +81,14 @@ def _float(value: Any, default: float = 0.0) -> float:
 def _freq_sort_key(freq: Any) -> tuple[int, str]:
     text = _text(freq)
     return FREQ_ORDER.get(text, FREQ_ORDER.get(text.lower(), 99)), text
+
+
+def _is_30m_freq(freq: Any) -> bool:
+    return _text(freq) in ENTRY_30M_FREQS
+
+
+def _is_entry_partner_freq(freq: Any) -> bool:
+    return _text(freq) in ENTRY_PARTNER_FREQS
 
 
 def _pure_a_code(symbol: Any) -> str:
@@ -461,6 +474,13 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
         row["trader_action"] = "知识库观察"
         row["next_action"] = row["trader_action"]
         row["invalidates_when"] = "知识观点过期或缺少硬技术确认"
+    elif top["reason_type"] == "fallback_watch":
+        row["action_status"] = "fallback_watch"
+        row["trader_action"] = "观察/预热"
+        row["next_action"] = row["trader_action"]
+        row["queue_lane"] = "fallback_watch"
+        row["actionability"] = "observe_only"
+        row["invalidates_when"] = "硬技术信号未确认或降级候选过期"
     elif top["reason_type"].startswith("chain_") or top["reason_type"] in {"source_leader", "constituent_hot"}:
         row["action_status"] = "chain_watch"
         row["trader_action"] = "观察产业链共振"
@@ -722,18 +742,24 @@ def _add_strategy_rows(rows: dict[str, dict[str, Any]], db: Database, index_code
                 continue
             source = _text(metadata.get("source") or item.get("source"))
             probe = {**item, "source": source, "signal_type": signal_type, "pool_status": "warning" if key == "warnings" else item.get("status")}
+            signal_side = _signal_side(probe)
+            reason_type = "generated_risk_signal" if signal_side == "sell" or key == "warnings" else "fallback_watch"
             _add_reason(rows, item.get("symbol") or item.get("code"), {
-                "reason_type": _reason_type_for_signal(probe),
+                "reason_type": reason_type,
                 "source_collection": "strategy_snapshots",
                 "source_doc_id": source_doc_id,
                 "signal_type": signal_type,
-                "signal_side": _signal_side(probe),
-                "signal_family": _signal_family(probe),
+                "signal_side": signal_side,
+                "signal_family": "fallback_candidate" if reason_type == "fallback_watch" else _signal_family(probe),
                 "freq": _text(metadata.get("freq") or item.get("freq")),
                 "score": _float(item.get("score") or metadata.get("score")),
                 "confidence": _float(item.get("confidence") or metadata.get("confidence")),
                 "board_or_concept": _text(metadata.get("theme")),
                 "as_of": as_of,
+                "source_role": "fallback" if reason_type == "fallback_watch" else "technical_trigger",
+                "decision_effect": "fallback_watch" if reason_type == "fallback_watch" else "exit_priority",
+                "actionability": "observe_only" if reason_type == "fallback_watch" else "risk_exit_first",
+                "queue_lane": "fallback_watch" if reason_type == "fallback_watch" else "risk_exit_first",
                 "evidence": metadata.get("evidence") if isinstance(metadata.get("evidence"), dict) else {"source": source},
             }, index_codes=index_codes, name=_text(item.get("name")))
 
@@ -790,7 +816,7 @@ def _add_chain_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: 
                 "signal_side": "neutral",
                 "source_role": "context",
                 "decision_effect": chain_effect,
-                "can_create_candidate": False,
+                "can_create_candidate": True,
                 "score": _float(chain.get("heat_score")),
                 "confidence": _float(rep.get("priority")),
                 "chain_id": _text(chain.get("chain_id")),
@@ -826,7 +852,7 @@ def _add_chain_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: 
                     "signal_side": "neutral",
                     "source_role": "context",
                     "decision_effect": _chain_decision_effect(_text(chain.get("phase"))),
-                    "can_create_candidate": False,
+                    "can_create_candidate": True,
                     "score": _float(domain.get("leader_change_pct")),
                     "confidence": _float(domain.get("mapping_confidence")),
                     "chain_id": _text(chain.get("chain_id")),
@@ -886,6 +912,73 @@ def _add_active_pool(rows: dict[str, dict[str, Any]], db: Database, index_codes:
         }, index_codes=index_codes)
 
 
+def _add_fallback_watch_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str], *, limit: int, now) -> int:
+    if limit <= 0:
+        return 0
+    before = len(rows)
+    snapshot = _latest_strategy_snapshot(db)
+    source_doc_id = _text(snapshot.get("_source_doc_id")) or "latest"
+    as_of = _text(snapshot.get("_as_of")) or now.date().isoformat()
+    for item in snapshot.get("candidates") or []:
+        if len(rows) - before >= limit:
+            break
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        signal_type = _text(item.get("reason") or metadata.get("trigger") or item.get("latest_signal") or "买点候选")
+        _add_reason(rows, item.get("symbol") or item.get("code"), {
+            "reason_type": "fallback_watch",
+            "source_collection": "strategy_snapshots",
+            "source_doc_id": source_doc_id,
+            "signal_type": signal_type,
+            "signal_side": "buy",
+            "signal_family": "fallback_candidate",
+            "freq": _text(metadata.get("freq") or item.get("freq")),
+            "score": _float(item.get("score") or metadata.get("score")),
+            "confidence": _float(item.get("confidence") or metadata.get("confidence")),
+            "board_or_concept": _text(metadata.get("theme")),
+            "as_of": as_of,
+            "source_role": "fallback",
+            "decision_effect": "fallback_watch",
+            "actionability": "observe_only",
+            "queue_lane": "fallback_watch",
+            "evidence": metadata.get("evidence") if isinstance(metadata.get("evidence"), dict) else {"policy": "strict_pool_fallback"},
+        }, index_codes=index_codes, name=_text(item.get("name")))
+
+    if len(rows) - before >= limit:
+        return len(rows) - before
+
+    doc = db["market_pools"].find_one(
+        {"pool": "active"},
+        {"symbols": 1, "items": 1, "dt": 1, "updated_at": 1},
+        sort=[("dt", -1), ("updated_at", -1)],
+    ) or {}
+    active_as_of = _text(doc.get("dt") or doc.get("updated_at"))[:10] or now.date().isoformat()
+    active_items = [item for item in doc.get("items") or [] if isinstance(item, dict)]
+    if not active_items:
+        active_items = [{"symbol": symbol} for symbol in doc.get("symbols") or []]
+    for item in active_items:
+        if len(rows) - before >= limit:
+            break
+        _add_reason(rows, item.get("symbol") or item.get("code"), {
+            "reason_type": "fallback_watch",
+            "source_collection": "market_pools",
+            "source_doc_id": "active",
+            "signal_type": "活跃池降级观察",
+            "signal_side": "buy",
+            "signal_family": "fallback_active_pool",
+            "score": _float(item.get("score") or item.get("total_score")),
+            "confidence": _float(item.get("confidence")),
+            "as_of": active_as_of,
+            "source_role": "fallback",
+            "decision_effect": "fallback_watch",
+            "actionability": "observe_only",
+            "queue_lane": "fallback_watch",
+            "evidence": {"sources": item.get("sources") or [], "policy": "strict_pool_fallback"},
+        }, index_codes=index_codes, name=_text(item.get("name") or item.get("stock_name")))
+    return len(rows) - before
+
+
 def _add_recent_opened(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str]) -> None:
     cursor = db["sync_log"].find(
         {"module": {"$in": ["stock_minute", "stock_daily"]}, "status": "ok", "symbol": {"$exists": True}},
@@ -917,15 +1010,232 @@ def _top_heat_names(db: Database, kind: str, limit: int) -> list[str]:
     return names
 
 
-def _selected_rows(rows: dict[str, dict[str, Any]], limit: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _reason_freqs(reason: dict[str, Any]) -> set[str]:
+    freqs = {_text(reason.get("freq"))}
+    context = reason.get("resonance_context") if isinstance(reason.get("resonance_context"), dict) else {}
+    for key in ("aligned_freqs", "conflict_freqs"):
+        for freq in context.get(key) or []:
+            if _text(freq):
+                freqs.add(_text(freq))
+    evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+    nested = evidence.get("resonance_context") if isinstance(evidence.get("resonance_context"), dict) else {}
+    for key in ("aligned_freqs", "conflict_freqs"):
+        for freq in nested.get(key) or []:
+            if _text(freq):
+                freqs.add(_text(freq))
+    return {freq for freq in freqs if freq}
+
+
+def _buy_technical_reasons(row: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        reason
+        for reason in row.get("inclusion_reasons") or []
+        if isinstance(reason, dict) and _is_technical_reason(reason) and _text(reason.get("signal_side")) == "buy"
+    ]
+
+
+def _risk_reasons(row: dict[str, Any]) -> list[dict[str, Any]]:
+    reasons: list[dict[str, Any]] = []
+    for reason in row.get("inclusion_reasons") or []:
+        if not isinstance(reason, dict):
+            continue
+        signal_side = _text(reason.get("signal_side"))
+        reason_type = _text(reason.get("reason_type"))
+        decision_effect = _text(reason.get("decision_effect"))
+        knowledge_effect = _text(reason.get("knowledge_effect"))
+        if signal_side == "sell" or decision_effect in {"exit_priority", "block"} or knowledge_effect in {"block", "exit_priority"}:
+            reasons.append(reason)
+            continue
+        if reason_type in {"generated_risk_signal", "knowledge_conflict"}:
+            reasons.append(reason)
+    return reasons
+
+
+def _source_collections(row: dict[str, Any]) -> list[str]:
+    values = []
+    for reason in row.get("inclusion_reasons") or []:
+        if not isinstance(reason, dict):
+            continue
+        source = _text(reason.get("source_collection"))
+        if source and source not in values:
+            values.append(source)
+    return values
+
+
+def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, Any] | None, dict[str, Any] | None]:
+    buy_reasons = _buy_technical_reasons(row)
+    risk_reasons = _risk_reasons(row)
+    top_buy = max(buy_reasons, key=lambda item: (_float(item.get("score")), _float(item.get("confidence"))), default=None)
+    top_risk = max(risk_reasons, key=lambda item: (_float(item.get("weight")), abs(_float(item.get("score")))), default=None)
+    if top_risk:
+        return False, "blocked_by_risk", ["risk_signal_present"], top_buy, top_risk
+    if not top_buy:
+        return False, "watch_only_not_hard_buy", ["missing_buy_technical"], None, None
+    freqs: set[str] = set()
+    conflict_freqs: set[str] = set()
+    for reason in buy_reasons:
+        freqs.update(_reason_freqs(reason))
+        context = reason.get("resonance_context") if isinstance(reason.get("resonance_context"), dict) else {}
+        conflict_freqs.update(_text(freq) for freq in context.get("conflict_freqs") or [] if _text(freq))
+    if conflict_freqs:
+        return False, "blocked_by_period_conflict", sorted(conflict_freqs, key=_freq_sort_key), top_buy, top_risk
+    has_30m = any(_is_30m_freq(freq) for freq in freqs)
+    has_partner = any(_is_entry_partner_freq(freq) for freq in freqs)
+    if not has_30m:
+        return False, "entry_waiting_30m_confirm", ["30m_missing"], top_buy, top_risk
+    if not has_partner:
+        return False, "entry_waiting_resonance_confirm", ["partner_period_missing"], top_buy, top_risk
+    return True, "entry_confirmed", [], top_buy, top_risk
+
+
+def _freq_severity(freqs: set[str]) -> float:
+    if any(freq in {"周线", "weekly", "1w", "W", "w"} for freq in freqs):
+        return 30.0
+    if any(freq in {"日线", "daily", "1d", "D", "d"} for freq in freqs):
+        return 24.0
+    if any(_is_30m_freq(freq) for freq in freqs):
+        return 18.0
+    if any(freq in {"15分钟", "15min", "15m", "F15", "f15"} for freq in freqs):
+        return 14.0
+    return 8.0
+
+
+def _context_adjust(row: dict[str, Any]) -> float:
+    adjust = 0.0
+    knowledge = row.get("knowledge_confirmation") if isinstance(row.get("knowledge_confirmation"), dict) else {}
+    if knowledge.get("status") == "confirmed":
+        adjust += 8.0
+    if knowledge.get("status") == "conflict" or knowledge.get("effect") == "block":
+        adjust -= 40.0
+    chain = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
+    if chain.get("effect") == "confirm":
+        adjust += 6.0
+    if chain.get("effect") in {"block", "exit_priority"}:
+        adjust -= 25.0
+    return adjust
+
+
+def _entry_components(row: dict[str, Any], top_buy: dict[str, Any]) -> dict[str, float]:
+    freqs = _reason_freqs(top_buy)
+    context = top_buy.get("resonance_context") if isinstance(top_buy.get("resonance_context"), dict) else {}
+    grade = _text(context.get("grade"))
+    resonance = 30.0 if grade == "strong_resonance" else 22.0 if grade == "multi_period" else 12.0
+    components = {
+        "technical_score": max(0.0, _float(top_buy.get("score"))) * 0.35,
+        "resonance": resonance,
+        "right_side_30m": 24.0 if any(_is_30m_freq(freq) for freq in freqs) else 0.0,
+        "confidence": min(1.0, _float(top_buy.get("confidence"))) * 18.0,
+        "freshness": 10.0,
+        "context_adjust": _context_adjust(row),
+    }
+    return {key: round(value, 3) for key, value in components.items()}
+
+
+def _risk_components(row: dict[str, Any], top_risk: dict[str, Any]) -> dict[str, float]:
+    freqs = _reason_freqs(top_risk)
+    components = {
+        "sell_strength": abs(_float(top_risk.get("score"))) * 0.50,
+        "timeframe_severity": _freq_severity(freqs),
+        "freshness": 16.0,
+        "chain_or_knowledge_risk": 18.0 if _text(top_risk.get("reason_type")) in {"knowledge_conflict", "chain_context", "chain_core_rep", "chain_elastic_rep"} else 0.0,
+    }
+    return {key: round(value, 3) for key, value in components.items()}
+
+
+def _watch_components(row: dict[str, Any], gate_status: str) -> dict[str, float]:
+    source_priority = 0.0
+    if _buy_technical_reasons(row):
+        source_priority = 40.0
+    elif "fallback_watch" in row.get("source_tags", []):
+        source_priority = 22.0
+    elif "active_pool_watch" in row.get("source_tags", []):
+        source_priority = 18.0
+    elif any(tag.startswith("chain_") for tag in row.get("source_tags", [])):
+        source_priority = 16.0
+    proximity = 30.0 if gate_status == "entry_waiting_30m_confirm" else 22.0 if gate_status == "entry_waiting_resonance_confirm" else 10.0
+    components = {
+        "source_priority": source_priority,
+        "entry_proximity": proximity,
+        "heat_or_theme": _float(row.get("score")) * 0.05,
+        "freshness": 8.0,
+    }
+    return {key: round(value, 3) for key, value in components.items()}
+
+
+def _finalize_pool_row(
+    row: dict[str, Any],
+    *,
+    pool_type: str,
+    rank_score: float,
+    score_components: dict[str, float],
+    entry_gate_status: str,
+    blocked_by: list[str],
+    top_buy: dict[str, Any] | None,
+    top_risk: dict[str, Any] | None,
+) -> dict[str, Any]:
+    row["pool_type"] = pool_type
+    row["rank_score"] = round(rank_score, 3)
+    row["sort_score"] = row["rank_score"]
+    row["score_components"] = score_components
+    row["entry_gate_status"] = entry_gate_status
+    row["blocked_by"] = blocked_by
+    row["top_buy_reason"] = top_buy or {}
+    row["top_risk_reason"] = top_risk or {}
+    row["source_collections"] = _source_collections(row)
+    row["coverage_status"] = "required_freqs_present" if entry_gate_status == "entry_confirmed" else entry_gate_status
+    if pool_type == "focus":
+        row["action_status"] = "entry_ready"
+        row["trader_action"] = "可试仓"
+        row["next_action"] = "可试仓"
+        row["queue_lane"] = "entry_ready"
+        row["actionability"] = "entry_ready"
+        row["decision_effect"] = "confirm"
+        row["signal_origin"] = _text((top_buy or {}).get("reason_type")) or row.get("signal_origin")
+        row["latest_signal"] = _text((top_buy or {}).get("signal_type")) or row.get("latest_signal")
+        row["invalidates_when"] = "30m买点失效、上级周期转弱或风险信号出现"
+    elif pool_type == "risk":
+        row["action_status"] = "risk_review"
+        row["trader_action"] = "止盈/止损复核"
+        row["next_action"] = row["trader_action"]
+        row["queue_lane"] = "risk_exit_first"
+        row["actionability"] = "risk_exit_first"
+        row["decision_effect"] = "exit_priority"
+        row["signal_origin"] = _text((top_risk or {}).get("reason_type")) or row.get("signal_origin")
+        row["latest_signal"] = _text((top_risk or {}).get("signal_type")) or row.get("latest_signal")
+        row["invalidates_when"] = "风险信号解除或重新站回关键周期"
+    else:
+        if entry_gate_status == "entry_waiting_30m_confirm":
+            row["action_status"] = "entry_waiting_30m_confirm"
+            row["trader_action"] = "等待30m确认"
+            row["queue_lane"] = "watch_preheat"
+        elif entry_gate_status == "entry_waiting_resonance_confirm":
+            row["action_status"] = "entry_waiting_resonance_confirm"
+            row["trader_action"] = "等待共振确认"
+            row["queue_lane"] = "watch_preheat"
+        elif entry_gate_status.startswith("blocked_by"):
+            row["action_status"] = "watch_blocked"
+            row["trader_action"] = "观察/排除风险"
+            row["queue_lane"] = "watch_preheat"
+        else:
+            row["action_status"] = row.get("action_status") if row.get("action_status") != "risk_review" else "watch"
+            row["trader_action"] = row.get("trader_action") or "观察/预热"
+            row["queue_lane"] = row.get("queue_lane") if row.get("queue_lane") != "risk_exit_first" else "watch_preheat"
+        row["next_action"] = row["trader_action"]
+        row["actionability"] = "observe_only"
+        row["decision_effect"] = "context_only"
+        row["invalidates_when"] = row.get("invalidates_when") or "硬技术买点未确认或观察条件过期"
+    row["reason"] = " · ".join(
+        _text(reason.get("signal_type") or reason.get("reason_type"))
+        for reason in (top_buy, top_risk)
+        if isinstance(reason, dict) and _text(reason.get("signal_type") or reason.get("reason_type"))
+    ) or row.get("reason")
+    return row
+
+
+def _prepare_pool_rows(rows: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     ordered = list(rows.values())
     for row in ordered:
         row["inclusion_reasons"] = sorted(row.get("inclusion_reasons") or [], key=lambda item: _float(item.get("weight")), reverse=True)[:12]
-        row["reason"] = " · ".join(
-            _text(item.get("signal_type") or item.get("reason_type"))
-            for item in row["inclusion_reasons"][:2]
-            if _text(item.get("signal_type") or item.get("reason_type"))
-        )
         row["exit_condition"] = row.get("invalidates_when")
         row["next_action"] = row.get("next_action") or row.get("trader_action") or "观察"
         row["queue_lane"] = row.get("queue_lane") or "context_only"
@@ -939,6 +1249,104 @@ def _selected_rows(rows: dict[str, dict[str, Any]], limit: int) -> tuple[list[di
             row["technical_evidence"] = {"status": "missing", "note": "watch_only_not_buy_candidate"}
         if not isinstance(row.get("knowledge_confirmation"), dict) or not row.get("knowledge_confirmation"):
             row["knowledge_confirmation"] = {"status": "none"}
+    return ordered
+
+
+def _split_pool_rows(
+    rows: dict[str, dict[str, Any]],
+    *,
+    focus_limit: int,
+    risk_limit: int,
+    watch_limit: int,
+) -> dict[str, Any]:
+    focus: list[dict[str, Any]] = []
+    risk: list[dict[str, Any]] = []
+    watch: list[dict[str, Any]] = []
+    prepared = _prepare_pool_rows(rows)
+    for row in prepared:
+        entry_ok, gate_status, blocked_by, top_buy, top_risk = _entry_gate(row)
+        if top_risk and not entry_ok:
+            components = _risk_components(row, top_risk)
+            risk.append(_finalize_pool_row(
+                row,
+                pool_type="risk",
+                rank_score=sum(components.values()),
+                score_components=components,
+                entry_gate_status=gate_status,
+                blocked_by=blocked_by,
+                top_buy=top_buy,
+                top_risk=top_risk,
+            ))
+        elif entry_ok and top_buy:
+            components = _entry_components(row, top_buy)
+            focus.append(_finalize_pool_row(
+                row,
+                pool_type="focus",
+                rank_score=sum(components.values()),
+                score_components=components,
+                entry_gate_status=gate_status,
+                blocked_by=blocked_by,
+                top_buy=top_buy,
+                top_risk=top_risk,
+            ))
+        else:
+            components = _watch_components(row, gate_status)
+            watch.append(_finalize_pool_row(
+                row,
+                pool_type="watch",
+                rank_score=sum(components.values()),
+                score_components=components,
+                entry_gate_status=gate_status,
+                blocked_by=blocked_by,
+                top_buy=top_buy,
+                top_risk=top_risk,
+            ))
+    for bucket in (focus, risk, watch):
+        bucket.sort(key=lambda item: (_float(item.get("rank_score")), _float(item.get("score"))), reverse=True)
+    return {
+        "focus": focus[:focus_limit],
+        "risk": risk[:risk_limit],
+        "watch": watch[:watch_limit],
+        "skipped": {
+            "focus": focus[focus_limit:],
+            "risk": risk[risk_limit:],
+            "watch": watch[watch_limit:],
+        },
+        "pool_counts": {
+            "focus": len(focus),
+            "risk": len(risk),
+            "watch": len(watch),
+            "total": len(prepared),
+        },
+    }
+
+
+def _candidate_meta(rows: dict[str, dict[str, Any]]) -> dict[str, dict[str, int]]:
+    by_source: Counter[str] = Counter()
+    by_side: Counter[str] = Counter()
+    by_freq: Counter[str] = Counter()
+    for row in rows.values():
+        for reason in row.get("inclusion_reasons") or []:
+            if not isinstance(reason, dict):
+                continue
+            by_source[_text(reason.get("source_collection")) or "unknown"] += 1
+            by_side[_text(reason.get("signal_side")) or "unknown"] += 1
+            by_freq[_text(reason.get("freq")) or "unknown"] += 1
+    return {
+        "candidate_counts_by_source": dict(by_source),
+        "candidate_counts_by_side": dict(by_side),
+        "candidate_counts_by_freq": dict(by_freq),
+    }
+
+
+def _selected_rows(rows: dict[str, dict[str, Any]], limit: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ordered = _prepare_pool_rows(rows)
+    for row in ordered:
+        row["reason"] = " · ".join(
+            _text(item.get("signal_type") or item.get("reason_type"))
+            for item in row["inclusion_reasons"][:2]
+            if _text(item.get("signal_type") or item.get("reason_type"))
+        )
     ordered.sort(key=lambda item: (_float(item.get("sort_score")), _float(item.get("score"))), reverse=True)
     return ordered[:limit], ordered[limit:]
 
@@ -949,8 +1357,11 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
 
     now = naive_market_now("A")
     stock_limit = int(os.getenv("TERMINAL_REALTIME_STOCK_LIMIT", "72"))
+    risk_limit = int(os.getenv("TERMINAL_RISK_STOCK_LIMIT", "72"))
+    watch_limit = int(os.getenv("TERMINAL_WATCH_STOCK_LIMIT", "120"))
     strict_sources = str(get_task_env("TERMINAL_POOL_STRICT_SOURCES", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
     include_legacy_daily = os.getenv("TERMINAL_POOL_INCLUDE_LEGACY_DAILY", "false").strip().lower() in {"1", "true", "yes", "on"}
+    fallback_min = max(0, int(os.getenv("TERMINAL_POOL_FALLBACK_MIN_STOCKS", "12")))
     index_codes = _index_codes()
     rows: dict[str, dict[str, Any]] = {}
 
@@ -959,33 +1370,80 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     _add_signal_rows(rows, db, index_codes, include_generated_daily=False)
     _add_chain_rows(rows, db, index_codes)
     _add_knowledge_rows(rows, db, index_codes)
+    strict_candidate_count = len(rows)
+    fallback_count = 0
+    fallback_enabled = False
     if not strict_sources:
         if include_legacy_daily:
             _add_signal_rows(rows, db, index_codes, include_generated_daily=True, generated_daily_only=True)
         _add_strategy_rows(rows, db, index_codes)
         _add_active_pool(rows, db, index_codes)
         _add_recent_opened(rows, db, index_codes)
+    elif strict_candidate_count < fallback_min:
+        fallback_enabled = True
+        fallback_count = _add_fallback_watch_rows(
+            rows,
+            db,
+            index_codes,
+            limit=fallback_min - strict_candidate_count,
+            now=now,
+        )
 
-    selected, skipped = _selected_rows(rows, stock_limit)
-    reason_counts = Counter(
+    split = _split_pool_rows(rows, focus_limit=stock_limit, risk_limit=risk_limit, watch_limit=watch_limit)
+    focus_stocks = split["focus"]
+    risk_stocks = split["risk"]
+    watch_stocks = split["watch"]
+    skipped_by_pool = split["skipped"]
+    skipped = (skipped_by_pool.get("focus") or []) + (skipped_by_pool.get("risk") or []) + (skipped_by_pool.get("watch") or [])
+    candidate_meta = _candidate_meta(rows)
+    focus_reason_counts = Counter(
         reason.get("reason_type")
-        for row in selected
+        for row in focus_stocks
         for reason in row.get("inclusion_reasons", [])
         if reason.get("reason_type")
     )
+    pool_counts = dict(split["pool_counts"])
+    pool_counts.update({
+        "focus_selected": len(focus_stocks),
+        "risk_selected": len(risk_stocks),
+        "watch_selected": len(watch_stocks),
+    })
+    technical_freshness = db["data_freshness"].find_one(
+        {"domain": "technical_signal", "market": "A", "collection": "terminal_technical_signals", "coverage_by_freq": {"$exists": True}},
+        {"coverage_by_freq": 1, "required_freqs": 1, "optional_freqs": 1, "is_full_market_complete": 1, "coverage_status": 1},
+        sort=[("updated_at", -1)],
+    ) or {}
     pool_doc = {
         "pool": "terminal_stock_pool",
         "market": "A",
         "dt": now.replace(hour=0, minute=0, second=0, microsecond=0),
         "updated_at": now,
         "stock_limit": stock_limit,
-        "stocks": selected,
+        "risk_limit": risk_limit,
+        "watch_limit": watch_limit,
+        "stocks": focus_stocks,
+        "focus_stocks": focus_stocks,
+        "risk_stocks": risk_stocks,
+        "watch_stocks": watch_stocks,
         "skipped_stocks": skipped[:100],
+        "skipped_by_pool": {key: value[:50] for key, value in skipped_by_pool.items()},
         "skipped_count": len(skipped),
         "candidate_count": len(rows),
-        "reason_counts": dict(reason_counts),
+        "strict_candidate_count": strict_candidate_count,
+        "fallback_count": fallback_count,
+        "fallback_enabled": fallback_enabled,
+        "pool_counts": pool_counts,
+        "reason_counts": dict(focus_reason_counts),
+        **candidate_meta,
+        "coverage_by_freq": technical_freshness.get("coverage_by_freq") or {},
+        "required_freqs": technical_freshness.get("required_freqs") or ["日线", "周线", "30分钟"],
+        "optional_freqs": technical_freshness.get("optional_freqs") or ["15分钟", "5分钟"],
+        "is_full_market_complete": bool(technical_freshness.get("is_full_market_complete")),
+        "coverage_status": _text(technical_freshness.get("coverage_status")) or "unknown",
+        "ranking_version": POOL_RANKING_VERSION,
         "source": "whitebox_pool_builder",
-        "source_policy": "postmarket_strict_technical_knowledge_chain" if strict_sources else "runtime_watch_and_signal_blend",
+        "source_policy": "postmarket_strict_with_fallback_watch" if strict_sources and fallback_enabled else ("postmarket_strict_technical_knowledge_chain" if strict_sources else "runtime_watch_and_signal_blend"),
+        "selection_policy": "buy_entry_focus__risk_exit_separate__watch_preheat",
     }
     db["terminal_stock_pool"].update_one(
         {"pool": "terminal_stock_pool", "market": "A"},
@@ -998,7 +1456,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "market": "A",
         "dt": pool_doc["dt"],
         "updated_at": now,
-        "stocks": [row["raw_code"] for row in selected],
+        "stocks": [row["raw_code"] for row in (focus_stocks + risk_stocks + watch_stocks)[: max(stock_limit, 72)]],
         "indices": list(getattr(config, "INDEX_AK_CODES", {}).values()),
         "industries": _top_heat_names(db, "industry", 20),
         "concepts": _top_heat_names(db, "concept", 20),
@@ -1019,26 +1477,52 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
             "mode": "realtime",
             "lane": "workbench_lane",
             "collection": "terminal_stock_pool",
-            "freshness": "fresh" if selected else "empty",
+            "freshness": "fresh" if focus_stocks else "empty",
             "latest_dt": now.date().isoformat(),
             "as_of": now.date().isoformat(),
             "updated_at": now,
-            "stale_reason": "" if selected else "terminal_stock_pool_empty",
-            "count": len(selected),
+            "stale_reason": "" if focus_stocks else "terminal_focus_stock_pool_empty",
+            "count": len(focus_stocks),
             "candidate_count": len(rows),
+            "strict_candidate_count": strict_candidate_count,
+            "fallback_count": fallback_count,
             "skipped_count": len(skipped),
-            "reason_counts": dict(reason_counts),
+            "pool_counts": pool_counts,
+            "reason_counts": dict(focus_reason_counts),
+            **candidate_meta,
+            "coverage_by_freq": pool_doc["coverage_by_freq"],
+            "coverage_status": pool_doc["coverage_status"],
+            "is_full_market_complete": pool_doc["is_full_market_complete"],
+            "selection_policy": pool_doc["selection_policy"],
+            "ranking_version": POOL_RANKING_VERSION,
         }},
         upsert=True,
     )
-    logger.info("terminal stock pool: selected=%d candidates=%d skipped=%d", len(selected), len(rows), len(skipped))
+    logger.info(
+        "terminal stock pool: focus=%d risk=%d watch=%d candidates=%d skipped=%d",
+        len(focus_stocks),
+        len(risk_stocks),
+        len(watch_stocks),
+        len(rows),
+        len(skipped),
+    )
     return {
-        "inserted": len(selected),
-        "stocks": len(selected),
+        "inserted": len(focus_stocks),
+        "stocks": len(focus_stocks),
+        "focus_stocks": len(focus_stocks),
+        "risk_stocks": len(risk_stocks),
+        "watch_stocks": len(watch_stocks),
         "candidates": len(rows),
+        "strict_candidates": strict_candidate_count,
+        "fallback_candidates": fallback_count,
         "skipped": len(skipped),
         "indices": len(legacy_doc["indices"]),
         "industries": len(legacy_doc["industries"]),
         "concepts": len(legacy_doc["concepts"]),
-        "reason_counts": dict(reason_counts),
+        "pool_counts": pool_counts,
+        "reason_counts": dict(focus_reason_counts),
+        **candidate_meta,
+        "coverage_status": pool_doc["coverage_status"],
+        "is_full_market_complete": pool_doc["is_full_market_complete"],
+        "ranking_version": POOL_RANKING_VERSION,
     }

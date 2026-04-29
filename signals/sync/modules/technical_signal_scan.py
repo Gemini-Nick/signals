@@ -23,6 +23,8 @@ MINUTE_FREQS = {
     "15分钟": ["15分钟", "15min", "15m", "F15"],
     "5分钟": ["5分钟", "5min", "5m", "F5"],
 }
+REQUIRED_FULL_FREQS = ("日线", "周线", "30分钟")
+OPTIONAL_ON_DEMAND_FREQS = ("15分钟", "5分钟")
 FREQ_ORDER = {
     "周线": 0,
     "weekly": 0,
@@ -74,6 +76,51 @@ def _symbols_with_daily(db: Database) -> list[str]:
     if max_symbols > 0:
         return clean[:max_symbols]
     return clean
+
+
+def _freq_aliases(label: str) -> list[str]:
+    if label == "日线":
+        return DAILY_FREQS
+    if label == "周线":
+        return WEEKLY_FREQS
+    return MINUTE_FREQS.get(label, [label])
+
+
+def _coverage_by_freq(db: Database, symbols: list[str]) -> dict[str, dict[str, Any]]:
+    symbol_set = {_pure_a_code(symbol) for symbol in symbols if _pure_a_code(symbol)}
+    total = len(symbol_set)
+    coverage: dict[str, dict[str, Any]] = {}
+    for label in (*REQUIRED_FULL_FREQS, *OPTIONAL_ON_DEMAND_FREQS):
+        aliases = _freq_aliases(label)
+        try:
+            raw_symbols = db["bars"].distinct("meta.symbol", {"meta.freq": {"$in": aliases}})
+            covered = {
+                _pure_a_code(symbol)
+                for symbol in raw_symbols
+                if _pure_a_code(symbol) in symbol_set
+            }
+            latest = db["bars"].find_one(
+                {"meta.freq": {"$in": aliases}},
+                {"dt": 1},
+                sort=[("dt", -1)],
+            ) or {}
+        except Exception:
+            covered = set()
+            latest = {}
+        missing_count = max(0, total - len(covered))
+        required = label in REQUIRED_FULL_FREQS
+        coverage[label] = {
+            "freq": label,
+            "required": required,
+            "mode": "full_market_required" if required else "on_demand",
+            "symbol_count": len(covered),
+            "total_symbols": total,
+            "missing_count": missing_count,
+            "coverage_pct": round((len(covered) / total * 100), 2) if total else 0.0,
+            "latest_dt": latest.get("dt"),
+            "status": "complete" if missing_count == 0 else ("coverage_incomplete" if required else "on_demand_missing"),
+        }
+    return coverage
 
 
 def _doc_to_rawbar(doc: dict[str, Any], symbol: str, freq, idx: int) -> Any:
@@ -275,12 +322,26 @@ def _scan_symbol(db: Database, symbol: str) -> list[dict[str, Any]]:
 
 
 def sync_technical_signal_scan(db: Database, proxy_url: str = None) -> dict:
-    """Scan all cached A-share daily/weekly bars and publish hard-technical signals."""
+    """Scan cached A-share hard-technical bars and publish explainable signals."""
     now = naive_market_now("A")
     try:
         symbols = _symbols_with_daily(db)
     except Exception as exc:
         return {"status": "error", "error_msg": f"symbol_universe_failed: {exc}"}
+    coverage_by_freq = _coverage_by_freq(db, symbols)
+    skipped_by_freq = {
+        freq: {
+            "missing_symbols": int(meta.get("missing_count") or 0),
+            "status": str(meta.get("status") or ""),
+            "mode": str(meta.get("mode") or ""),
+        }
+        for freq, meta in coverage_by_freq.items()
+        if int(meta.get("missing_count") or 0) > 0
+    }
+    is_full_market_complete = all(
+        coverage_by_freq.get(freq, {}).get("status") == "complete"
+        for freq in REQUIRED_FULL_FREQS
+    )
     workers = max(1, int(os.getenv("TECHNICAL_SIGNAL_SCAN_WORKERS", "4")))
     operations: list[UpdateOne] = []
     scanned = 0
@@ -322,6 +383,12 @@ def sync_technical_signal_scan(db: Database, proxy_url: str = None) -> dict:
             "count": signal_count,
             "scanned_symbols": scanned,
             "failed_symbols": failed,
+            "required_freqs": list(REQUIRED_FULL_FREQS),
+            "optional_freqs": list(OPTIONAL_ON_DEMAND_FREQS),
+            "coverage_by_freq": coverage_by_freq,
+            "skipped_by_freq": skipped_by_freq,
+            "is_full_market_complete": is_full_market_complete,
+            "coverage_status": "full_market_complete" if is_full_market_complete else "coverage_incomplete",
         }},
         upsert=True,
     )
@@ -332,4 +399,10 @@ def sync_technical_signal_scan(db: Database, proxy_url: str = None) -> dict:
         "symbols": scanned,
         "signals": signal_count,
         "failed": failed,
+        "required_freqs": list(REQUIRED_FULL_FREQS),
+        "optional_freqs": list(OPTIONAL_ON_DEMAND_FREQS),
+        "coverage_by_freq": coverage_by_freq,
+        "skipped_by_freq": skipped_by_freq,
+        "is_full_market_complete": is_full_market_complete,
+        "coverage_status": "full_market_complete" if is_full_market_complete else "coverage_incomplete",
     }

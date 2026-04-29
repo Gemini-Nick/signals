@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from signals.sync.modules.terminal_pool import _add_reason, _add_signal_rows, _add_user_pinned, _reason_type_for_signal, _selected_rows
+from signals.sync.modules.terminal_pool import _add_fallback_watch_rows, _add_reason, _add_signal_rows, _add_user_pinned, _reason_type_for_signal, _selected_rows, _split_pool_rows
 
 
 class _Cursor(list):
@@ -18,6 +18,9 @@ class _Collection:
 
     def find(self, query=None, projection=None):
         return _Cursor(dict(item) for item in self.docs)
+
+    def find_one(self, query=None, projection=None, sort=None):
+        return dict(self.docs[0]) if self.docs else None
 
 
 class _Db(dict):
@@ -273,3 +276,147 @@ def test_terminal_stock_pool_historical_records_do_not_create_candidates():
     assert history_reason["score"] == 0
     assert history_reason["backtest_quality"]["score"] == 0
     assert history_reason["decision_effect"] == "history_pending"
+
+
+def test_terminal_stock_pool_fallback_watch_is_observation_only():
+    from datetime import datetime
+
+    db = _Db({
+        "strategy_snapshots": _Collection([
+            {
+                "_id": "strategy:2026-04-29",
+                "as_of": "2026-04-29",
+                "snapshot": {
+                    "candidates": [
+                        {
+                            "symbol": "SZ.002812",
+                            "name": "恩捷股份",
+                            "score": 96.7,
+                            "reason": "背驰买",
+                            "metadata": {
+                                "freq": "15分钟",
+                                "source": "sqlite.backtest.signal_records",
+                            },
+                        },
+                    ],
+                },
+            },
+        ]),
+        "market_pools": _Collection([]),
+    })
+    rows = {}
+
+    added = _add_fallback_watch_rows(rows, db, index_codes=set(), limit=3, now=datetime(2026, 4, 29))
+    selected, _ = _selected_rows(rows, 3)
+
+    assert added == 1
+    assert selected[0]["raw_code"] == "002812"
+    assert selected[0]["signal_origin"] == "fallback_watch"
+    assert selected[0]["action_status"] == "fallback_watch"
+    assert selected[0]["queue_lane"] == "fallback_watch"
+    assert selected[0]["actionability"] == "observe_only"
+
+
+def test_terminal_stock_pool_splits_buy_entries_from_risk_controls():
+    rows = {}
+    _add_reason(rows, "300575", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "buy-ready",
+        "signal_type": "三买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 120,
+        "confidence": 0.8,
+        "resonance_context": {
+            "direction": "buy",
+            "aligned_freqs": ["日线", "30分钟"],
+            "conflict_freqs": [],
+            "grade": "multi_period",
+        },
+    }, index_codes=set(), name="中旗新材")
+    _add_reason(rows, "688484", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "risk-high",
+        "signal_type": "一卖",
+        "signal_side": "sell",
+        "freq": "日线",
+        "score": 200,
+        "confidence": 0.9,
+        "resonance_context": {
+            "direction": "sell",
+            "aligned_freqs": ["日线", "30分钟"],
+            "conflict_freqs": [],
+            "grade": "multi_period",
+        },
+    }, index_codes=set(), name="风险股")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert [row["raw_code"] for row in split["focus"]] == ["300575"]
+    assert [row["raw_code"] for row in split["risk"]] == ["688484"]
+    assert split["focus"][0]["pool_type"] == "focus"
+    assert split["focus"][0]["entry_gate_status"] == "entry_confirmed"
+    assert split["risk"][0]["pool_type"] == "risk"
+
+
+def test_terminal_stock_pool_single_period_buy_waits_in_watch_pool():
+    rows = {}
+    _add_reason(rows, "300575", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "single-30m",
+        "signal_type": "三买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 120,
+        "confidence": 0.8,
+        "resonance_context": {
+            "direction": "buy",
+            "aligned_freqs": ["30分钟"],
+            "conflict_freqs": [],
+            "grade": "single_period",
+        },
+    }, index_codes=set(), name="中旗新材")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["focus"] == []
+    assert split["risk"] == []
+    assert split["watch"][0]["raw_code"] == "300575"
+    assert split["watch"][0]["entry_gate_status"] == "entry_waiting_resonance_confirm"
+
+
+def test_terminal_stock_pool_strategy_fallback_only_goes_to_watch_pool():
+    from datetime import datetime
+
+    db = _Db({
+        "strategy_snapshots": _Collection([
+            {
+                "_id": "strategy:2026-04-29",
+                "as_of": "2026-04-29",
+                "snapshot": {
+                    "candidates": [
+                        {
+                            "symbol": "SZ.002812",
+                            "name": "恩捷股份",
+                            "score": 96.7,
+                            "reason": "背驰买",
+                            "metadata": {"freq": "15分钟", "source": "sqlite.backtest.signal_records"},
+                        },
+                    ],
+                },
+            },
+        ]),
+        "market_pools": _Collection([]),
+    })
+    rows = {}
+
+    _add_fallback_watch_rows(rows, db, index_codes=set(), limit=3, now=datetime(2026, 4, 29))
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["focus"] == []
+    assert split["risk"] == []
+    assert split["watch"][0]["raw_code"] == "002812"
+    assert split["watch"][0]["pool_type"] == "watch"
