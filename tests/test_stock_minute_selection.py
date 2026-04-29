@@ -65,6 +65,8 @@ def test_selection_rotates_stale_priority_after_pinned():
 def test_shanghai_composite_is_treated_as_index_not_stock():
     assert config.INDEX_AK_CODES["上证指数"] == "sh000001"
     assert "000001" in stock_minute._index_codes()
+    assert "000680" in stock_minute._index_codes()
+    assert "513130" not in stock_minute._index_codes()
 
 
 def test_stock_minute_worker_count_is_constrained(monkeypatch):
@@ -116,7 +118,28 @@ def test_stock_minute_opening_phase_caps_symbols_and_freqs(monkeypatch):
     assert stock_minute._active_minute_freqs() == ["5分钟"]
 
     monkeypatch.setenv("STOCK_MINUTE_OPENING_ALL_FREQS", "true")
-    assert stock_minute._active_minute_freqs() == ["5分钟", "15分钟", "30分钟"]
+    assert stock_minute._active_minute_freqs() == ["5分钟"]
+
+
+def test_stock_minute_signal_lane_defaults_to_5m_low_latency(monkeypatch):
+    monkeypatch.setattr(stock_minute, "naive_market_now", lambda _market: datetime(2026, 4, 29, 10, 5))
+    monkeypatch.setenv("SIGNALS_CURRENT_SYNC_LANE", "signal_lane")
+    monkeypatch.setenv("SIGNALS_CURRENT_SYNC_MARKET", "A")
+    monkeypatch.setenv("STOCK_MINUTE_FREQS", "5min,15min,30min")
+    monkeypatch.delenv("STOCK_MINUTE_SIGNAL_FREQS", raising=False)
+    monkeypatch.delenv("STOCK_MINUTE_SIGNAL_TAIL_COUNT_5", raising=False)
+    monkeypatch.delenv("STOCK_MINUTE_SIGNAL_ALL_FREQS", raising=False)
+
+    assert stock_minute._active_minute_freqs() == ["5分钟"]
+    assert stock_minute._tail_count_for_freq("5分钟") == 80
+
+    monkeypatch.setenv("STOCK_MINUTE_SIGNAL_FREQS", "5min,15min")
+    monkeypatch.setenv("STOCK_MINUTE_SIGNAL_TAIL_COUNT_5", "120")
+    assert stock_minute._active_minute_freqs() == ["5分钟"]
+    assert stock_minute._tail_count_for_freq("5分钟") == 120
+
+    monkeypatch.setenv("STOCK_MINUTE_SIGNAL_ALL_FREQS", "true")
+    assert stock_minute._active_minute_freqs() == ["5分钟", "15分钟"]
 
 
 def test_postmarket_minute_scope_uses_expanded_candidate_cap(monkeypatch):

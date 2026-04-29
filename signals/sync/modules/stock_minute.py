@@ -17,6 +17,7 @@ import akshare as ak
 import pandas as pd
 from pymongo.database import Database
 
+from signals.core.macro_universe import macro_a_index_pure_codes
 from signals.core.market_time import naive_market_now
 from ..proxy import em_proxy
 from ..retry import sync_retry
@@ -31,6 +32,17 @@ _MINUTE_FREQS = ["5分钟", "15分钟", "30分钟"]
 _ENABLE_EASTMONEY_FALLBACK = os.getenv("STOCK_MINUTE_EASTMONEY_FALLBACK", "false").lower() == "true"
 _DEFAULT_PRIORITY_CODES = "688802,300575"
 _DEFAULT_TAIL_COUNTS = {"5分钟": 240, "15分钟": 160, "30分钟": 120}
+
+
+def _parse_freqs(raw: str) -> list[str]:
+    values: list[str] = []
+    aliases = {"5m": "5分钟", "15m": "15分钟", "30m": "30分钟", "5min": "5分钟", "15min": "15分钟", "30min": "30分钟"}
+    for item in raw.replace(";", ",").split(","):
+        key = item.strip().lower()
+        freq = aliases.get(key, item.strip())
+        if freq in _MINUTE_FREQS and freq not in values:
+            values.append(freq)
+    return values
 
 
 def _int_env(name: str, default: int, *, min_value: int = 1, max_value: int | None = None) -> int:
@@ -54,15 +66,19 @@ def _opening_phase() -> bool:
 
 
 def _active_minute_freqs() -> list[str]:
+    lane = os.getenv("SIGNALS_CURRENT_SYNC_LANE", "")
+    market = os.getenv("SIGNALS_CURRENT_SYNC_MARKET", "")
+    if lane == "signal_lane" and market == "A" and not _postmarket_minute_scope():
+        all_freqs = os.getenv("STOCK_MINUTE_SIGNAL_ALL_FREQS", "false").strip().lower() in {"1", "true", "yes", "on"}
+        if not all_freqs:
+            return ["5分钟"]
+        values = _parse_freqs(os.getenv("STOCK_MINUTE_SIGNAL_FREQS", ""))
+        if values:
+            return values
+
     configured = os.getenv("STOCK_MINUTE_FREQS", "").strip()
     if configured:
-        values = []
-        aliases = {"5m": "5分钟", "15m": "15分钟", "30m": "30分钟", "5min": "5分钟", "15min": "15分钟", "30min": "30分钟"}
-        for item in configured.replace(";", ",").split(","):
-            key = item.strip().lower()
-            freq = aliases.get(key, item.strip())
-            if freq in _MINUTE_FREQS and freq not in values:
-                values.append(freq)
+        values = _parse_freqs(configured)
         if values:
             return values
     if _opening_phase() and os.getenv("STOCK_MINUTE_OPENING_ALL_FREQS", "false").lower() not in {"1", "true", "yes", "on"}:
@@ -72,21 +88,22 @@ def _active_minute_freqs() -> list[str]:
 
 def _tail_count_for_freq(freq: str) -> int:
     suffix_map = {"5分钟": "5", "15分钟": "15", "30分钟": "30"}
-    default = _DEFAULT_TAIL_COUNTS.get(freq, 120)
-    generic = _int_env("STOCK_MINUTE_TAIL_COUNT", default, min_value=40, max_value=500)
+    lane = os.getenv("SIGNALS_CURRENT_SYNC_LANE", "")
+    market = os.getenv("SIGNALS_CURRENT_SYNC_MARKET", "")
+    signal_lane = lane == "signal_lane" and market == "A" and not _postmarket_minute_scope()
+    signal_defaults = {"5分钟": 80, "15分钟": 80, "30分钟": 80}
+    default = signal_defaults.get(freq, 80) if signal_lane else _DEFAULT_TAIL_COUNTS.get(freq, 120)
     suffix = suffix_map.get(freq)
+    if signal_lane and suffix:
+        return _int_env(f"STOCK_MINUTE_SIGNAL_TAIL_COUNT_{suffix}", default, min_value=40, max_value=500)
+    generic = _int_env("STOCK_MINUTE_TAIL_COUNT", default, min_value=40, max_value=500)
     if not suffix:
         return generic
     return _int_env(f"STOCK_MINUTE_TAIL_COUNT_{suffix}", generic, min_value=40, max_value=500)
 
 
 def _index_codes() -> set[str]:
-    import config
-
-    return {
-        str(symbol).lower().replace("sh", "").replace("sz", "")
-        for symbol in getattr(config, "INDEX_AK_CODES", {}).values()
-    }
+    return macro_a_index_pure_codes()
 
 
 def _pure_a_code(symbol: object) -> str:
@@ -754,6 +771,7 @@ def _sync_one_minute(code: str, freq: str, proxy_url: str = None, *, tail_count:
             datalen=tail_count,
             count=tail_count,
             db=db,
+            endpoint="stock_minute",
         )
     except Exception as public_error:
         if not _ENABLE_EASTMONEY_FALLBACK:
@@ -843,6 +861,17 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
             "planned_calls": len(tasks),
             "minute_freqs": minute_freqs,
             "opening_phase": _opening_phase(),
+            "result": {
+                "selected": len(symbols),
+                "planned_calls": len(tasks),
+                "workers": workers,
+                "tail_counts": tail_counts,
+                "minute_freqs": minute_freqs,
+                "incremental": True,
+                "write_mode": "insert_new",
+            },
+            "degraded_reason": "",
+            "error_msg": "",
             "workers": workers,
             "tail_counts": tail_counts,
             "incremental": True,
@@ -939,7 +968,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
         {"_id": "stock_minute:selection:_meta"},
         {"$set": {
             "module": "stock_minute",
-            "status": "ok" if not skipped_symbols else "partial",
+            "status": "ok" if not errors else "partial",
             "last_run": naive_market_now("A"),
             "selected_symbols": symbols,
             "priority_symbols": selection_meta.get("priority_symbols") or [],
@@ -969,10 +998,12 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
             "failed_calls": len(errors),
             "written": total_written,
             "skipped_existing": total_skipped_existing,
+            "error_msg": "" if not errors else f"{len(errors)} minute fetch errors",
+            "degraded_reason": "" if not errors else f"{len(errors)} minute fetch errors",
         }},
         upsert=True,
     )
-    final_status = "partial" if errors or skipped_symbols else "ok"
+    final_status = "partial" if errors else "ok"
     sync_col.update_one(
         {"_id": "stock_minute:_meta"},
         {"$set": {
@@ -995,6 +1026,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
                 "incremental": True,
                 "write_mode": "insert_new",
             },
+            "error_msg": "" if not errors else f"{len(errors)} minute fetch errors",
             "degraded_reason": "" if not errors else f"{len(errors)} minute fetch errors",
             "lane": os.getenv("SIGNALS_CURRENT_SYNC_LANE", ""),
             "market": os.getenv("SIGNALS_CURRENT_SYNC_MARKET", ""),

@@ -136,7 +136,7 @@ def _lane_stale(interval_seconds: int, multiplier: int = 3) -> int:
 
 LIVE_SYNC_PLANS = {
     Market.A: (
-        LiveSyncPlan("quote_snapshots", "quote_lane", QUOTE_LANE_INTERVAL_SECONDS, _lane_stale(QUOTE_LANE_INTERVAL_SECONDS, 3), 45, 10),
+        LiveSyncPlan("quote_snapshots", "quote_lane", QUOTE_LANE_INTERVAL_SECONDS, _lane_stale(QUOTE_LANE_INTERVAL_SECONDS, 3), 75, 10),
         LiveSyncPlan("index_minute", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 120, 20),
         LiveSyncPlan("stock_minute", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 240, 30),
         LiveSyncPlan("minute_readiness_probe", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 60, 35),
@@ -210,7 +210,7 @@ class SyncEngine:
     - stock_daily:   ~5000 A股日线（增量）
     - index_daily:   11 只指数日线（全量）
     - stock_minute:  活跃标的 30M/15M（增量）
-    - index_minute:  11 只指数 30M/15M
+    - index_minute:  宏观观察指数 5M/15M/30M
     - board_ranking: 行业排行快照
     - board_cons:    行业成分股（周日全量）
     """
