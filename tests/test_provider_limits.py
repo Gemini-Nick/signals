@@ -60,7 +60,7 @@ def test_shared_cooldown_older_than_update_is_ignored(monkeypatch):
     provider_limits._STATES.clear()
     monkeypatch.setenv("SIGNALS_PROVIDER_JITTER_SECONDS", "0,0")
     db = _Db()
-    now = datetime.now()
+    now = provider_limits._now()
     db["provider_health"].docs[("sina", "stock_daily", "market_data")] = {
         "provider": "sina",
         "endpoint": "stock_daily",
@@ -72,6 +72,28 @@ def test_shared_cooldown_older_than_update_is_ignored(monkeypatch):
     }
 
     assert provider_limits.provider_call("sina", "stock_daily", lambda: "ok", db=db) == "ok"
+    doc = db["provider_health"].find_one({"provider": "sina", "endpoint": "stock_daily", "domain": "market_data"})
+    assert doc["status"] == "ok"
+
+
+def test_expired_provider_cooldown_is_marked_expired(monkeypatch):
+    provider_limits._STATES.clear()
+    db = _Db()
+    now = provider_limits._now()
+    db["provider_health"].docs[("sina", "stock_daily", "market_data")] = {
+        "provider": "sina",
+        "endpoint": "stock_daily",
+        "domain": "market_data",
+        "status": "cooldown",
+        "last_error_type": "429",
+        "cooldown_until": now - timedelta(seconds=1),
+        "updated_at": now - timedelta(seconds=30),
+    }
+
+    assert provider_limits.provider_cooldown_remaining(db, "sina", "stock_daily") == 0
+    doc = db["provider_health"].find_one({"provider": "sina", "endpoint": "stock_daily", "domain": "market_data"})
+    assert doc["status"] == "cooldown_expired"
+    assert doc["cooldown_until"] is None
 
 
 def test_provider_limits_are_endpoint_scoped(monkeypatch):
@@ -108,7 +130,7 @@ def test_dotted_endpoint_uses_safe_env_name(monkeypatch):
 def test_providers_all_cooling_down_uses_provider_health(monkeypatch):
     provider_limits._STATES.clear()
     db = _Db()
-    now = datetime.now()
+    now = provider_limits._now()
     for provider, endpoint in (("tencent", "stock_daily"), ("eastmoney", "stock_daily_hist"), ("sina", "stock_daily")):
         db["provider_health"].docs[(provider, endpoint, "market_data")] = {
             "provider": provider,

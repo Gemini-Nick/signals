@@ -41,3 +41,32 @@ def test_fetch_public_minute_passes_tail_limits_to_tencent_after_empty_sina(monk
     assert source == "tencent"
     assert not df.empty
     assert calls == [("sina", 88), ("tencent", 77)]
+
+
+def test_fetch_public_minute_keeps_stock_and_index_cooldown_endpoints_separate(monkeypatch):
+    calls = []
+
+    def fake_cooldown(db, provider, endpoint, *, domain):
+        calls.append(("cooldown", provider, endpoint, domain))
+        return 0
+
+    def fake_sina(symbol, period, *, timeout, datalen, db=None, endpoint="stock_minute"):
+        calls.append(("sina", endpoint, db is not None))
+        return pd.DataFrame([{"时间": "2026-04-27 15:00", "收盘": 10}])
+
+    monkeypatch.setattr(minute_sources, "provider_cooldown_remaining", fake_cooldown)
+    monkeypatch.setattr(minute_sources, "fetch_sina_minute", fake_sina)
+
+    df, source = minute_sources.fetch_public_minute(
+        "sh000680",
+        "30",
+        db=object(),
+        endpoint="index_minute",
+    )
+
+    assert source == "sina"
+    assert not df.empty
+    assert calls == [
+        ("cooldown", "sina", "index_minute", "minute"),
+        ("sina", "index_minute", True),
+    ]

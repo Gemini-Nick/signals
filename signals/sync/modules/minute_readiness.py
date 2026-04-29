@@ -8,6 +8,7 @@ from typing import Any
 from pymongo import UpdateOne
 from pymongo.database import Database
 
+from signals.core.macro_universe import macro_a_index_symbols
 from signals.core.market_time import naive_market_now
 
 logger = logging.getLogger("signals.sync.minute_readiness")
@@ -64,9 +65,7 @@ def _stock_symbols(db: Database) -> list[str]:
 
 
 def _index_symbols() -> list[str]:
-    import config
-
-    return list(getattr(config, "INDEX_AK_CODES", {}).values())
+    return macro_a_index_symbols()
 
 
 def _heat_names(db: Database, kind: str) -> list[str]:

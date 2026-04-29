@@ -8,7 +8,7 @@ from typing import Iterable
 import pandas as pd
 import requests
 
-from signals.sync.provider_limits import provider_call
+from signals.sync.provider_limits import provider_call, provider_cooldown_remaining
 
 _SINA_URL = "https://quotes.sina.cn/cn/api/jsonp_v2.php/=/CN_MarketDataService.getKLineData"
 _TENCENT_URL = "https://ifzq.gtimg.cn/appstock/app/kline/mkline"
@@ -37,14 +37,22 @@ def stock_to_market_symbol(code: str) -> str:
     return pure
 
 
-def _direct_get(url: str, *, params: dict, headers: dict | None = None, timeout: float = 10.0, db=None):
+def _direct_get(
+    url: str,
+    *,
+    params: dict,
+    headers: dict | None = None,
+    timeout: float = 10.0,
+    db=None,
+    endpoint: str = "stock_minute",
+):
     session = requests.Session()
     session.trust_env = False
     provider = "tencent" if "gtimg.cn" in url else "sina" if "sina.cn" in url else "unknown"
     try:
         response = provider_call(
             provider,
-            "stock_minute",
+            endpoint,
             lambda: session.get(url, params=params, headers=headers or _HEADERS, timeout=timeout),
             domain="minute",
             db=db,
@@ -77,7 +85,15 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def fetch_sina_minute(symbol: str, period: str, *, timeout: float = 10.0, datalen: int = 1970, db=None) -> pd.DataFrame:
+def fetch_sina_minute(
+    symbol: str,
+    period: str,
+    *,
+    timeout: float = 10.0,
+    datalen: int = 1970,
+    db=None,
+    endpoint: str = "stock_minute",
+) -> pd.DataFrame:
     """Fetch 5/15/30 minute bars from Sina for stocks or indexes."""
     response = _direct_get(
         _SINA_URL,
@@ -85,6 +101,7 @@ def fetch_sina_minute(symbol: str, period: str, *, timeout: float = 10.0, datale
         headers={**_HEADERS, "Accept": "*/*"},
         timeout=timeout,
         db=db,
+        endpoint=endpoint,
     )
     text = response.text
     try:
@@ -111,7 +128,15 @@ def fetch_sina_minute(symbol: str, period: str, *, timeout: float = 10.0, datale
     return _normalize_columns(df.rename(columns=rename))
 
 
-def fetch_tencent_minute(symbol: str, period: str, *, timeout: float = 10.0, count: int = 320, db=None) -> pd.DataFrame:
+def fetch_tencent_minute(
+    symbol: str,
+    period: str,
+    *,
+    timeout: float = 10.0,
+    count: int = 320,
+    db=None,
+    endpoint: str = "stock_minute",
+) -> pd.DataFrame:
     """Fetch 5/15/30 minute bars from Tencent for stocks or indexes."""
     key = f"m{period}"
     response = _direct_get(
@@ -120,6 +145,7 @@ def fetch_tencent_minute(symbol: str, period: str, *, timeout: float = 10.0, cou
         headers={**_HEADERS, "Referer": "https://gu.qq.com/"},
         timeout=timeout,
         db=db,
+        endpoint=endpoint,
     )
     data = response.json()
     rows = data.get("data", {}).get(symbol, {}).get(key, [])
@@ -157,23 +183,41 @@ def fetch_public_minute(
     datalen: int | None = None,
     count: int | None = None,
     db=None,
+    endpoint: str = "stock_minute",
 ) -> tuple[pd.DataFrame, str]:
     """Fetch public minute bars and return (dataframe, provider)."""
     errors: list[str] = []
     for provider in providers:
         try:
+            if db is not None and provider_cooldown_remaining(db, provider, endpoint, domain="minute") > 0:
+                errors.append(f"{provider}: provider_cooling_down")
+                continue
             if provider == "sina":
                 try:
-                    df = fetch_sina_minute(symbol, period, timeout=timeout, datalen=datalen or 1970, db=db)
+                    df = fetch_sina_minute(
+                        symbol,
+                        period,
+                        timeout=timeout,
+                        datalen=datalen or 1970,
+                        db=db,
+                        endpoint=endpoint,
+                    )
                 except TypeError as exc:
-                    if "unexpected keyword argument 'db'" not in str(exc):
+                    if "unexpected keyword argument" not in str(exc):
                         raise
                     df = fetch_sina_minute(symbol, period, timeout=timeout, datalen=datalen or 1970)
             elif provider == "tencent":
                 try:
-                    df = fetch_tencent_minute(symbol, period, timeout=timeout, count=count or 320, db=db)
+                    df = fetch_tencent_minute(
+                        symbol,
+                        period,
+                        timeout=timeout,
+                        count=count or 320,
+                        db=db,
+                        endpoint=endpoint,
+                    )
                 except TypeError as exc:
-                    if "unexpected keyword argument 'db'" not in str(exc):
+                    if "unexpected keyword argument" not in str(exc):
                         raise
                     df = fetch_tencent_minute(symbol, period, timeout=timeout, count=count or 320)
             else:

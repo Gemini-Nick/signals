@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Iterable, TypeVar
 
+from signals.core.market_time import naive_market_now
+
 T = TypeVar("T")
 
 RISK_ERROR_TOKENS = (
@@ -46,6 +48,13 @@ _LOCK = threading.Lock()
 _STATES: dict[str, ProviderState] = {}
 
 
+def _now() -> datetime:
+    try:
+        return naive_market_now("A")
+    except Exception:
+        return datetime.now()
+
+
 def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 32) -> int:
     try:
         value = int(os.getenv(name, str(default)))
@@ -64,7 +73,7 @@ def _capacity(provider: str, endpoint: str = "") -> int:
     endpoint_defaults = {
         ("TENCENT", "STOCK_DAILY"): 2,
         ("TENCENT", "STOCK_MINUTE"): 2,
-        ("SINA", "STOCK_MINUTE"): 1,
+        ("SINA", "STOCK_MINUTE"): 3,
         ("SINA", "STOCK_DAILY"): 1,
         ("EASTMONEY", "QUOTE_SNAPSHOT"): 2,
         ("EASTMONEY", "PUSH2DELAY_STOCK_GET"): 2,
@@ -98,11 +107,11 @@ def _min_interval_seconds(provider: str, endpoint: str = "") -> float:
     endpoint_key = _safe_env_name(endpoint)
     endpoint_defaults = {
         ("TENCENT", "STOCK_DAILY"): 0.5,
-        ("TENCENT", "STOCK_MINUTE"): 0.5,
-        ("SINA", "STOCK_MINUTE"): 1.0,
+        ("TENCENT", "STOCK_MINUTE"): 0.15,
+        ("SINA", "STOCK_MINUTE"): 0.15,
         ("SINA", "STOCK_DAILY"): 3.0,
-        ("EASTMONEY", "QUOTE_SNAPSHOT"): 0.3,
-        ("EASTMONEY", "PUSH2DELAY_STOCK_GET"): 0.3,
+        ("EASTMONEY", "QUOTE_SNAPSHOT"): 0.15,
+        ("EASTMONEY", "PUSH2DELAY_STOCK_GET"): 0.15,
         ("EASTMONEY", "PUSH2DELAY_CLIST_INDUSTRY"): 3.0,
         ("EASTMONEY", "PUSH2DELAY_CLIST_CONCEPT"): 3.0,
         ("EM", "PUSH2DELAY_CLIST_INDUSTRY"): 3.0,
@@ -195,6 +204,24 @@ def _coerce_dt(value) -> datetime | None:
     return None
 
 
+def _expire_provider_cooldown(db, *, provider: str, endpoint: str, domain: str) -> None:
+    if db is None:
+        return
+    try:
+        now = _now()
+        db["provider_health"].update_one(
+            {"provider": provider, "endpoint": endpoint, "domain": domain, "status": "cooldown"},
+            {"$set": {
+                "status": "cooldown_expired",
+                "cooldown_until": None,
+                "updated_at": now,
+                "cooldown_expired_at": now,
+            }},
+        )
+    except Exception:
+        return
+
+
 def _read_provider_cooldown(db, *, provider: str, endpoint: str, domain: str) -> tuple[float, str] | None:
     if db is None:
         return None
@@ -212,9 +239,11 @@ def _read_provider_cooldown(db, *, provider: str, endpoint: str, domain: str) ->
         return None
     updated_at = _coerce_dt(doc.get("updated_at"))
     if updated_at is not None and cooldown_until <= updated_at:
+        _expire_provider_cooldown(db, provider=provider, endpoint=endpoint, domain=domain)
         return None
-    remaining = (cooldown_until - datetime.now()).total_seconds()
+    remaining = (cooldown_until - _now()).total_seconds()
     if remaining <= 0:
+        _expire_provider_cooldown(db, provider=provider, endpoint=endpoint, domain=domain)
         return None
     return remaining, str(doc.get("last_error_type") or "")
 
@@ -235,7 +264,7 @@ def _write_provider_health(
     if db is None:
         return
     try:
-        now = datetime.now()
+        now = _now()
         update = {
             "provider": provider,
             "endpoint": endpoint,
@@ -296,14 +325,18 @@ def provider_cooldown_remaining(
             ) or {}
         except Exception:
             doc = {}
-        if str(doc.get("status") or "").lower() == "cooldown":
+        status = str(doc.get("status") or "").lower()
+        if status == "cooldown":
             cooldown_until = _coerce_dt(doc.get("cooldown_until"))
             updated_at = _coerce_dt(doc.get("updated_at"))
             if cooldown_until is not None and (
-                cooldown_until <= datetime.now()
+                cooldown_until <= _now()
                 or (updated_at is not None and cooldown_until <= updated_at)
             ):
                 state.cooldown_until = 0.0
+                _expire_provider_cooldown(db, provider=state.provider, endpoint=endpoint, domain=domain)
+        elif status:
+            state.cooldown_until = 0.0
     local_remaining = state.cooldown_until - time.monotonic()
     return max(0.0, remaining, local_remaining)
 
@@ -356,6 +389,7 @@ def provider_call(
     if state.cooldown_until > now:
         remaining = int(state.cooldown_until - now)
         error = f"provider_cooling_down:{provider}:{remaining}s"
+        cooldown_dt = _now() + timedelta(seconds=remaining)
         _write_provider_health(
             db,
             provider=state.provider,
@@ -363,6 +397,7 @@ def provider_call(
             domain=domain,
             status="cooldown",
             error=error,
+            cooldown_until=cooldown_dt,
             preserve_last_error=True,
             inc={"cooldown_hit_count": 1},
         )
@@ -393,7 +428,7 @@ def provider_call(
                 seconds = _cooldown_seconds()
                 state.cooldown_until = time.monotonic() + seconds
                 state.last_error = str(exc)[:240]
-                cooldown_dt = datetime.now() + timedelta(seconds=seconds)
+                cooldown_dt = _now() + timedelta(seconds=seconds)
             _write_provider_health(
                 db,
                 provider=state.provider,

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-指数分钟线同步 — 11 只指数 5M/15M/30M
+指数分钟线同步 — 宏观观察指数 5M/15M/30M
 
 数据源: Sina/Tencent 公共分钟线；东财指数分钟线可显式开启为最后兜底
 策略: 全量覆盖（数据量小，近 5 天窗口）
@@ -15,6 +15,7 @@ import akshare as ak
 import pandas as pd
 from pymongo.database import Database
 
+from signals.core.macro_universe import macro_a_index_codes
 from signals.core.market_time import naive_market_now
 from ..proxy import em_proxy
 from ..retry import sync_retry
@@ -99,7 +100,15 @@ def _fetch_index_docs(
 ) -> tuple[list[dict], str]:
     pure_code = symbol.replace("sh", "").replace("sz", "")
     try:
-        df, source = fetch_public_minute(symbol, period, timeout=_PUBLIC_TIMEOUT, datalen=tail_count, count=tail_count, db=db)
+        df, source = fetch_public_minute(
+            symbol,
+            period,
+            timeout=_PUBLIC_TIMEOUT,
+            datalen=tail_count,
+            count=tail_count,
+            db=db,
+            endpoint="index_minute",
+        )
     except Exception as public_error:
         if not _ENABLE_EASTMONEY_FALLBACK:
             logger.warning("公共指数分钟线失败，跳过东财兜底 %s %s: %s", symbol, freq, public_error)
@@ -228,10 +237,31 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
 @sync_retry(max_attempts=5, min_wait=3)
 def sync_index_minute(db: Database, proxy_url: str = None) -> dict:
     """指数分钟线全量同步"""
-    import config
-
     logger.info("指数分钟线同步: A股指数 5M/15M/30M")
-    result = _sync_a_index_minute(db, config.INDEX_AK_CODES, proxy_url)
+    ak_codes = macro_a_index_codes()
+    result = _sync_a_index_minute(db, ak_codes, proxy_url)
+    status = "ok" if result["errors"] == 0 and result["empty"] == 0 else "partial"
+    now = naive_market_now("A")
+    db["sync_log"].update_one(
+        {"_id": "index_minute:A:_meta"},
+        {"$set": {
+            "module": "index_minute",
+            "market": "A",
+            "last_run": now,
+            "updated_at": now,
+            "status": status,
+            "planned_calls": result.get("planned_calls", 0),
+            "failed_calls": result.get("errors", 0),
+            "empty_calls": result.get("empty", 0),
+            "written": result.get("inserted", 0),
+            "skipped_existing": result.get("skipped_existing", 0),
+            "tail_counts": result.get("tail_counts", {}),
+            "result": result,
+            "error_msg": "" if status == "ok" else "index_minute_partial",
+            "degraded_reason": "" if status == "ok" else "empty_or_failed_index_minute_calls",
+        }},
+        upsert=True,
+    )
 
     logger.info(
         "指数分钟线完成: inserted=%d skipped_existing=%d failed=%d",
