@@ -2373,6 +2373,14 @@ def _build_trader_task_queue(
         "entry_waiting_confirm": "等待确认",
     }
 
+    def has_hard_technical(row: dict[str, Any]) -> bool:
+        tech = row.get("technical_evidence") if isinstance(row.get("technical_evidence"), dict) else {}
+        return bool(tech and tech.get("status") != "missing")
+
+    def is_buy_review(action: str, row: dict[str, Any]) -> bool:
+        text = " ".join([action, _text(row.get("title")), _text(row.get("reason")), _text(row.get("summary"))])
+        return any(token in text for token in ("买", "入场", "可试仓", "entry_ready", "entry_waiting_confirm"))
+
     def normalize_lane(row: dict[str, Any], action: str) -> str:
         lane = _text(row.get("queue_lane") or row.get("lane"))
         if lane in allowed_lanes:
@@ -2388,9 +2396,7 @@ def _build_trader_task_queue(
         ])
         if any(token in text for token in ("减仓", "止盈", "风险", "卖", "跌破", "阻断")):
             return "risk_exit_first"
-        tech = row.get("technical_evidence") if isinstance(row.get("technical_evidence"), dict) else {}
-        has_hard_technical = bool(tech and tech.get("status") != "missing")
-        if not has_hard_technical:
+        if not has_hard_technical(row):
             return ""
         if action == "可试仓" or "entry_ready" in text:
             return "entry_ready"
@@ -2440,6 +2446,8 @@ def _build_trader_task_queue(
         if not isinstance(row, dict):
             continue
         action = _text(row.get("action_label") or row.get("recommended_action") or row.get("action")) or "观察"
+        if is_buy_review(action, row) and not has_hard_technical(row):
+            continue
         lane = normalize_lane(row, action)
         if lane not in allowed_lanes:
             continue

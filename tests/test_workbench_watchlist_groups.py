@@ -436,6 +436,7 @@ def test_trader_task_queue_excludes_legacy_buy_review_without_hard_technical():
                 "title": "买入复核 · 测试股",
                 "symbol": "SZ.000001",
                 "action_label": "复合买点",
+                "queue_lane": "risk_exit_first",
                 "summary": "打开图表确认买点、关键均线方向和止损位。",
                 "reason": "背驰买",
             },
