@@ -2,8 +2,48 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 
 from fastapi.testclient import TestClient
+
+
+class _Cursor(list):
+    def sort(self, *args, **kwargs):
+        return self
+
+    def limit(self, n):
+        return _Cursor(self[:n])
+
+
+class _Collection:
+    def __init__(self, docs=None):
+        self.docs = docs or []
+
+    def _match(self, doc, query):
+        for key, value in (query or {}).items():
+            actual = doc.get(key)
+            if isinstance(value, dict) and "$ne" in value:
+                if actual == value["$ne"]:
+                    return False
+                continue
+            if actual != value:
+                return False
+        return True
+
+    def find_one(self, query=None, projection=None, sort=None):
+        for doc in self.docs:
+            if self._match(doc, query):
+                return dict(doc)
+        return None
+
+    def find(self, query=None, projection=None):
+        return _Cursor([dict(doc) for doc in self.docs if self._match(doc, query)])
+
+
+class _Db(dict):
+    def __missing__(self, key):
+        self[key] = _Collection()
+        return self[key]
 
 
 def test_signals_pack_dashboard_matches_electron_contract(tmp_path, monkeypatch):
@@ -83,3 +123,77 @@ def test_pack_dashboard_endpoint_smoke():
     assert "strategy_kpis" in payload
     assert "source_confidence" in payload
     assert "cache_status" in payload
+
+
+def test_cache_freshness_uses_beijing_market_time(monkeypatch):
+    from signals import domain_pack
+    from signals.domain_pack import SignalsPack
+
+    monkeypatch.setattr(domain_pack, "naive_market_now", lambda _market: datetime(2026, 4, 29, 10, 5))
+
+    pack = SignalsPack()
+
+    assert pack._freshness_seconds(datetime(2026, 4, 29, 9, 55)) == 600
+
+
+def test_live_low_latency_strict_status_and_stock_selection_merge(monkeypatch):
+    from signals import domain_pack
+    from signals.domain_pack import SignalsPack
+
+    now = datetime(2026, 4, 29, 10, 0)
+    monkeypatch.setattr(domain_pack, "naive_market_now", lambda _market: now)
+    db = _Db({
+        "sync_log": _Collection([
+            {"_id": "quote_snapshots:A:_meta", "module": "quote_snapshots", "status": "ok", "last_run": now},
+            {
+                "_id": "stock_minute:A:_meta",
+                "module": "stock_minute",
+                "status": "degraded",
+                "last_run": now,
+                "error_msg": "orphaned_running_module",
+            },
+            {
+                "_id": "stock_minute:selection:_meta",
+                "module": "stock_minute",
+                "status": "partial",
+                "selected_symbols": ["688802", "300575"],
+                "error_msg": "",
+            },
+            {"_id": "index_minute:A:_meta", "module": "index_minute", "status": "ok", "last_run": now},
+            {
+                "_id": "minute_readiness_probe:A:_meta",
+                "module": "minute_readiness_probe",
+                "status": "ok",
+                "last_run": now,
+                "result": {"checked": 36, "not_ready": 2},
+            },
+            {"_id": "market_pools:A:_meta", "module": "market_pools", "status": "running", "last_run": now},
+            {"_id": "board_heat_minute:A:_meta", "module": "board_heat_minute", "status": "ok", "last_run": now},
+            {"_id": "concept_heat_minute:A:_meta", "module": "concept_heat_minute", "status": "partial", "last_run": now},
+            {"_id": "chain_heat_snapshots:A:_meta", "module": "chain_heat_snapshots", "status": "ok", "last_run": now},
+        ]),
+        "minute_readiness": _Collection([
+            {
+                "trade_date": "2026-04-29",
+                "domain": "index",
+                "symbol": "sh000680",
+                "freq": "5分钟",
+                "status": "not_ready",
+                "root_cause_class": "index_minute_not_ready",
+            }
+        ]),
+    })
+    pack = SignalsPack()
+
+    live = pack._cache_live_low_latency(db)
+
+    assert live["summary"]["ok_modules"] == 4
+    assert live["summary"]["strict_status"] == "degraded"
+    assert live["summary"]["minute_not_ready"] == 2
+    assert live["summary"]["minute_not_ready_samples"][0]["symbol"] == "sh000680"
+    stock = next(item for item in live["modules"] if item["module"] == "stock_minute")
+    assert stock["status"] == "degraded"
+    assert stock["error_msg"] == "orphaned_running_module"
+    assert stock["selected_symbols"] == ["688802", "300575"]
+    blockers = pack._cache_blockers(live, {"tasks": []}, [])
+    assert {item["module"] for item in blockers} >= {"stock_minute", "minute_readiness_probe", "market_pools", "concept_heat_minute"}

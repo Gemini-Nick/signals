@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 import config
+from signals.core.market_time import market_timezone, naive_market_now
 
 
 def utc_now() -> datetime:
@@ -395,7 +396,7 @@ class SignalsPack:
         run = self._find_one(db, "sync_runs", {}, {"trade_date": 1, "started_at": 1}, sort=[("started_at", -1)])
         if run and run.get("trade_date"):
             return str(run.get("trade_date"))
-        return datetime.now().date().isoformat()
+        return naive_market_now("A").date().isoformat()
 
     def _cache_live_low_latency(self, db) -> Dict[str, Any]:
         specs = [
@@ -413,25 +414,62 @@ class SignalsPack:
             doc = self._latest_sync_doc(db, module)
             if module == "stock_minute":
                 selection = self._find_one(db, "sync_log", {"_id": "stock_minute:selection:_meta"}) or {}
-                doc = {**doc, **{key: value for key, value in selection.items() if key not in {"_id", "module"}}} if doc else selection
+                doc = self._merge_stock_minute_selection(doc, selection)
             modules.append(self._cache_sync_doc_summary(module, label, lane, doc))
 
-        ok_count = sum(1 for item in modules if item.get("status") in {"ok", "partial", "running"})
+        ok_count = sum(1 for item in modules if item.get("status") == "ok")
         freshness = [item.get("freshness_seconds") for item in modules if item.get("freshness_seconds") is not None]
         minute = next((item for item in modules if item.get("module") == "minute_readiness_probe"), {})
         stock_minute = next((item for item in modules if item.get("module") == "stock_minute"), {})
+        minute_not_ready = self._int_from_result(minute, "not_ready")
+        problem_modules = [
+            item.get("module")
+            for item in modules
+            if item.get("status") != "ok"
+        ]
         return {
             "modules": modules,
             "summary": {
                 "ok_modules": ok_count,
                 "total_modules": len(modules),
+                "strict_status": "ok" if ok_count == len(modules) and minute_not_ready == 0 else "degraded",
+                "problem_modules": problem_modules,
                 "freshness_seconds_max": max(freshness) if freshness else None,
                 "minute_checked": self._int_from_result(minute, "checked"),
-                "minute_not_ready": self._int_from_result(minute, "not_ready"),
+                "minute_not_ready": minute_not_ready,
+                "minute_not_ready_samples": self._cache_minute_not_ready_samples(db),
                 "selected_symbols": len(stock_minute.get("selected_symbols") or []),
                 "skipped_symbols": int(stock_minute.get("skipped_count") or self._int_from_result(stock_minute, "skipped") or 0),
             },
         }
+
+    def _merge_stock_minute_selection(self, doc: Mapping[str, Any], selection: Mapping[str, Any]) -> Mapping[str, Any]:
+        if not doc:
+            return selection
+        merged = dict(doc)
+        for key in (
+            "selected_symbols",
+            "priority_symbols",
+            "pinned_symbols",
+            "skipped_symbols",
+            "skipped_count",
+            "candidate_count",
+            "source_counts",
+            "max_symbols",
+            "rotation_enabled",
+            "rotation_policy",
+            "minute_scope",
+            "tier_counts",
+            "universe_total",
+            "universe_cached",
+            "universe_pending",
+            "universe_error",
+        ):
+            if key in selection:
+                merged[key] = selection.get(key)
+        if "tail_counts" not in merged and "tail_counts" in selection:
+            merged["tail_counts"] = selection.get("tail_counts")
+        return merged
 
     def _cache_postmarket_backfill(self, db) -> Dict[str, Any]:
         run = self._find_one(db, "sync_runs", {}, sort=[("started_at", -1), ("updated_at", -1)])
@@ -636,6 +674,23 @@ class SignalsPack:
         counts["total"] = sum(counts.values())
         return counts
 
+    def _cache_minute_not_ready_samples(self, db, limit: int = 8) -> List[Dict[str, Any]]:
+        try:
+            latest = db["minute_readiness"].find_one({}, {"trade_date": 1}, sort=[("checked_at", -1)])
+            trade_date = latest.get("trade_date") if latest else None
+            query = {"status": {"$ne": "ready"}}
+            if trade_date:
+                query["trade_date"] = trade_date
+            rows = list(
+                db["minute_readiness"].find(
+                    query,
+                    {"_id": 0, "domain": 1, "symbol": 1, "freq": 1, "root_cause_class": 1, "latest_dt": 1, "source": 1},
+                ).sort([("domain", 1), ("symbol", 1), ("freq", 1)]).limit(limit)
+            )
+        except Exception:
+            return []
+        return [_json_safe(row) for row in rows]
+
     def _cache_terminal_outputs(self, db) -> List[Dict[str, Any]]:
         outputs = [
             ("terminal_technical_signals", "generated_at"),
@@ -687,12 +742,22 @@ class SignalsPack:
         blockers: List[Dict[str, Any]] = []
         for item in live.get("modules", []):
             status = str(item.get("status") or "")
-            if status in {"error", "degraded", "missing"}:
+            failed_calls = self._int_from_result(item, "failed_calls") or self._int_from_result(item, "errors")
+            minute_not_ready = self._int_from_result(item, "not_ready")
+            error_msg = str(item.get("error_msg") or item.get("degraded_reason") or "")
+            if (
+                status in {"error", "degraded", "missing", "partial", "running", "stale"}
+                or failed_calls > 0
+                or minute_not_ready > 0
+                or "orphaned_running_module" in error_msg
+            ):
                 blockers.append({
                     "scope": "live_low_latency",
                     "module": item.get("module"),
                     "status": status,
-                    "error_msg": item.get("error_msg") or item.get("degraded_reason") or "",
+                    "failed_calls": failed_calls,
+                    "not_ready": minute_not_ready,
+                    "error_msg": error_msg,
                 })
         postmarket_by_module: Dict[str, Dict[str, Any]] = {}
         for task in postmarket.get("tasks", []):
@@ -726,6 +791,8 @@ class SignalsPack:
         blockers.extend(postmarket_by_module.values())
         for item in provider_health or []:
             status = str(item.get("status") or "")
+            if status in {"degraded", "error", "stale"} and not item.get("updated_at"):
+                continue
             if status in {"degraded", "cooldown", "error", "stale"}:
                 blockers.append({
                     "scope": "provider_health",
@@ -753,10 +820,21 @@ class SignalsPack:
         return status
 
     def _latest_sync_doc(self, db, module: str) -> Dict[str, Any]:
+        candidates: List[Dict[str, Any]] = []
+        for doc_id in (f"{module}:A:_meta", f"{module}:_meta"):
+            doc = self._find_one(db, "sync_log", {"_id": doc_id})
+            if doc:
+                candidates.append(doc)
         doc = self._find_one(db, "sync_log", {"module": module}, sort=[("last_run", -1), ("updated_at", -1)])
         if doc:
-            return doc
-        return self._find_one(db, "sync_log", {"_id": f"{module}:_meta"}) or {}
+            candidates.append(doc)
+        if not candidates:
+            return {}
+
+        def sort_key(item: Mapping[str, Any]) -> datetime:
+            return self._coerce_datetime(item.get("last_run") or item.get("updated_at")) or datetime.min
+
+        return max(candidates, key=sort_key)
 
     def _cache_sync_doc_summary(self, module: str, label: str, lane: str, doc: Mapping[str, Any]) -> Dict[str, Any]:
         if not doc:
@@ -770,6 +848,7 @@ class SignalsPack:
             "label": label,
             "lane": doc.get("lane") or lane,
             "status": str(doc.get("status") or ""),
+            "raw_status": str(doc.get("status") or ""),
             "freshness": self._freshness_label(freshness_seconds),
             "freshness_seconds": freshness_seconds,
             "latest_dt": self._iso(last_dt),
@@ -787,7 +866,31 @@ class SignalsPack:
         ):
             if key in doc:
                 row[key] = _json_safe(doc.get(key))
+        row["status"] = self._cache_effective_module_status(row)
+        if row["status"] != row.get("raw_status") and not row.get("degraded_reason"):
+            row["degraded_reason"] = "strict_low_latency_status"
         return row
+
+    def _cache_effective_module_status(self, row: Mapping[str, Any]) -> str:
+        status = str(row.get("raw_status") or row.get("status") or "missing").lower()
+        if not status:
+            return "missing"
+        if status != "ok":
+            return status
+        error_msg = str(row.get("error_msg") or "").lower()
+        if "orphaned_running_module" in error_msg:
+            return "degraded"
+        if self._int_from_result(row, "failed_calls") > 0 or self._int_from_result(row, "errors") > 0:
+            return "partial"
+        if self._int_from_result(row, "not_ready") > 0:
+            return "partial"
+        planned = self._int_from_result(row, "planned_calls")
+        empty = self._int_from_result(row, "empty_calls") or self._int_from_result(row, "empty")
+        if planned > 0 and empty >= planned:
+            return "partial"
+        if row.get("freshness") == "stale":
+            return "stale"
+        return "ok"
 
     def _task_progress_pct(self, status: str, summary: Mapping[str, Any], cursor: Mapping[str, Any]) -> Optional[float]:
         for source in (summary, cursor):
@@ -812,7 +915,7 @@ class SignalsPack:
         started_at = self._coerce_datetime(task.get("started_at"))
         if not started_at:
             return None
-        elapsed = max(0, (datetime.now() - started_at).total_seconds())
+        elapsed = max(0, (naive_market_now("A") - started_at).total_seconds())
         total_estimate = elapsed / (progress_pct / 100)
         remaining = int(max(0, total_estimate - elapsed))
         return remaining
@@ -835,7 +938,7 @@ class SignalsPack:
         started_at = self._coerce_datetime(started_at_raw)
         if not started_at:
             return None
-        elapsed = max(0, (datetime.now() - started_at).total_seconds())
+        elapsed = max(0, (naive_market_now("A") - started_at).total_seconds())
         return int(max(0, elapsed / (progress_pct / 100) - elapsed))
 
     def _trade_date_bounds(self, trade_date: str) -> tuple[Optional[datetime], Optional[datetime]]:
@@ -849,7 +952,7 @@ class SignalsPack:
         dt = self._coerce_datetime(value)
         if not dt:
             return None
-        return max(0, int((datetime.now() - dt).total_seconds()))
+        return max(0, int((naive_market_now("A") - dt).total_seconds()))
 
     def _freshness_label(self, seconds: Optional[int]) -> str:
         if seconds is None:
@@ -862,13 +965,13 @@ class SignalsPack:
 
     def _coerce_datetime(self, value: Any) -> Optional[datetime]:
         if isinstance(value, datetime):
-            return value.replace(tzinfo=None) if value.tzinfo else value
+            return value.astimezone(market_timezone("A")).replace(tzinfo=None) if value.tzinfo else value
         if isinstance(value, str) and value:
             try:
                 parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
             except ValueError:
                 return None
-            return parsed.astimezone(timezone.utc).replace(tzinfo=None) if parsed.tzinfo else parsed
+            return parsed.astimezone(market_timezone("A")).replace(tzinfo=None) if parsed.tzinfo else parsed
         return None
 
     def _iso(self, value: Any) -> str:
@@ -924,8 +1027,14 @@ class SignalsPack:
             value = result.get(key)
             if isinstance(value, (int, float)):
                 return int(value)
+            if isinstance(value, str) and value.strip().isdigit():
+                return int(value)
         value = row.get(key)
-        return int(value) if isinstance(value, (int, float)) else 0
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value)
+        return 0
 
     def _overview(
         self,
