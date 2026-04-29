@@ -48,3 +48,34 @@ def test_chain_heat_aggregate_builds_realtime_node_fields():
     assert node["taxonomy_source"] == "industry_chains.yaml"
     assert node["momentum_5m"] == 0.4
     assert node["representatives"][0]["symbol"] == "SH.688981"
+
+
+def test_chain_heat_marks_consensus_climax_as_risk_context():
+    latest = datetime(2026, 4, 28, 10, 30)
+    rows = [{
+        "kind": "industry",
+        "name": "半导体",
+        "source": "eastmoney_push2delay",
+        "rank": 1,
+        "change_pct": 3.6,
+        "up_count": 90,
+        "down_count": 8,
+        "leader_name": "测试龙头",
+        "leader_change_pct": 9.8,
+        "trade_minute": latest,
+        "heat_score": 88,
+        "momentum_5m": 0.05,
+        "momentum_15m": 1.1,
+        "momentum_30m": 1.8,
+        "chain_id": "semiconductor",
+        "chain_name": "半导体产业链",
+        "node_id": "wafer_foundry",
+        "node_name": "晶圆制造",
+        "mapping_confidence": 92,
+        "representatives": [],
+    }]
+
+    snapshots = _aggregate(rows, latest)
+
+    assert snapshots[0]["phase"] == "consensus_climax"
+    assert snapshots[0]["trading_signal"] == "chain_consensus_climax"

@@ -373,9 +373,11 @@ def test_trader_task_queue_is_action_oriented():
                 "symbol": "SZ.002709",
                 "name": "天赐材料",
                 "trader_action": "可试仓",
+                "queue_lane": "entry_ready",
                 "latest_signal": "5m",
                 "reason": "5m买点确认",
                 "invalidates_when": "跌破短线防守位",
+                "technical_evidence": {"signal_type": "三买"},
             }
         ],
         sector_boards=[
@@ -392,8 +394,37 @@ def test_trader_task_queue_is_action_oriented():
     assert tasks
     assert tasks[0]["action_label"] == "可试仓"
     assert tasks[0]["chart_target"]["kind"] == "stock"
-    assert tasks[1]["chart_target"]["freq"] == "30min"
+    assert len(tasks) == 1
+    assert tasks[0]["queue_lane"] == "entry_ready"
     assert tasks[0]["invalidates_when"]
+
+
+def test_trader_task_queue_excludes_observation_context():
+    from signals.web.api import workbench
+
+    tasks = workbench._build_trader_task_queue(
+        decision_rows=[],
+        focus_stocks=[
+            {
+                "symbol": "SZ.002709",
+                "name": "天赐材料",
+                "trader_action": "观察",
+                "latest_signal": "产业链热度",
+                "queue_lane": "context_only",
+                "reason": "产业链升温",
+            }
+        ],
+        sector_boards=[
+            {
+                "label": "电解液",
+                "domain": "concept",
+                "target_freq": "30min",
+                "explanation": "电解液 异动",
+            }
+        ],
+    )
+
+    assert tasks == []
 
 
 def test_static_index_minute_request_does_not_fallback_to_daily(monkeypatch):

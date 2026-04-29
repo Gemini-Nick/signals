@@ -2366,9 +2366,32 @@ def _build_trader_task_queue(
     sector_boards: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     tasks: list[dict[str, Any]] = []
+    allowed_lanes = {"risk_exit_first", "entry_ready", "entry_waiting_confirm"}
+    lane_titles = {
+        "risk_exit_first": "风险优先",
+        "entry_ready": "入场准备",
+        "entry_waiting_confirm": "等待确认",
+    }
+
+    def normalize_lane(row: dict[str, Any], action: str) -> str:
+        lane = _text(row.get("queue_lane") or row.get("lane"))
+        if lane in allowed_lanes:
+            return lane
+        status = _text(row.get("action_status") or row.get("recommended_action"))
+        text = " ".join([action, status, _text(row.get("latest_signal")), _text(row.get("reason"))])
+        if any(token in text for token in ("减仓", "止盈", "风险", "卖", "跌破", "阻断")):
+            return "risk_exit_first"
+        if action == "可试仓" or "entry_ready" in text:
+            return "entry_ready"
+        if "等待" in action or "确认" in action or "entry_waiting_confirm" in text:
+            return "entry_waiting_confirm"
+        return ""
 
     def add(task: dict[str, Any]) -> None:
         if not task.get("title"):
+            return
+        lane = _text(task.get("queue_lane"))
+        if lane not in allowed_lanes:
             return
         task.setdefault("decision_id", f"task-{len(tasks) + 1}")
         task.setdefault("source", "second_screen")
@@ -2378,51 +2401,43 @@ def _build_trader_task_queue(
 
     for row in focus_stocks:
         action = _text(row.get("trader_action")) or "观察"
-        if action == "观察" and not row.get("latest_signal"):
+        lane = normalize_lane(row, action)
+        if lane not in allowed_lanes:
+            continue
+        tech = row.get("technical_evidence") if isinstance(row.get("technical_evidence"), dict) else {}
+        if lane in {"entry_ready", "entry_waiting_confirm"} and tech.get("status") == "missing":
             continue
         add({
             "decision_id": f"focus:{row.get('symbol') or row.get('label')}",
-            "title": f"{action} · {row.get('name') or row.get('symbol')}",
+            "title": f"{lane_titles[lane]} · {row.get('name') or row.get('symbol')}",
             "symbol": row.get("symbol"),
             "name": row.get("name"),
             "action": action,
             "action_label": action,
-            "priority": "high" if action in {"减仓/止盈", "可试仓"} else "medium",
+            "queue_lane": lane,
+            "priority": "high" if lane in {"risk_exit_first", "entry_ready"} else "medium",
             "summary": row.get("reason") or row.get("latest_signal") or "",
             "trigger_reason": row.get("latest_signal") or row.get("reason") or "",
             "chart_target": {"kind": "stock", "label": row.get("symbol"), "freq": "5min"},
             "invalidates_when": row.get("invalidates_when"),
-        })
-
-    for row in sector_boards[:6]:
-        add({
-            "decision_id": f"sector:{row.get('domain')}:{row.get('label')}",
-            "title": f"观察 · {row.get('label')}",
-            "symbol": row.get("carrier", {}).get("symbol") if isinstance(row.get("carrier"), dict) else "",
-            "name": row.get("label"),
-            "action": "观察",
-            "action_label": "观察",
-            "priority": "medium",
-            "summary": row.get("explanation") or row.get("latest_signal") or "",
-            "trigger_reason": row.get("explanation") or "",
-            "chart_target": {
-                "kind": row.get("target_kind") or row.get("domain") or "industry",
-                "label": row.get("target_label") or row.get("label"),
-                "freq": row.get("target_freq") or DEFAULT_TERMINAL_FREQ,
-                "fallback_target": row.get("fallback_target") or {},
-            },
-            "invalidates_when": row.get("invalidates_when"),
+            "technical_evidence": tech,
+            "knowledge_confirmation": row.get("knowledge_confirmation") if isinstance(row.get("knowledge_confirmation"), dict) else {},
+            "chain_context": row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {},
         })
 
     for row in decision_rows:
         if not isinstance(row, dict):
             continue
         action = _text(row.get("action_label") or row.get("recommended_action") or row.get("action")) or "观察"
+        lane = normalize_lane(row, action)
+        if lane not in allowed_lanes:
+            continue
         add({
             **row,
             "action": action,
             "action_label": action,
-            "title": _text(row.get("title")) or f"{action} · {_text(row.get('symbol') or row.get('decision_id'))}",
+            "queue_lane": lane,
+            "title": _text(row.get("title")) or f"{lane_titles[lane]} · {_text(row.get('symbol') or row.get('decision_id'))}",
             "trigger_reason": _text(row.get("summary") or row.get("reason") or row.get("recommended_action")),
             "chart_target": row.get("chart_target") or {"kind": "stock", "label": row.get("symbol"), "freq": DEFAULT_TERMINAL_FREQ},
             "invalidates_when": row.get("invalidates_when") or "复核条件解除或关键位被破坏",

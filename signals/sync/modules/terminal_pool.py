@@ -15,7 +15,13 @@ from signals.sync.task_context import get_task_env
 logger = logging.getLogger("signals.sync.terminal_pool")
 
 SELL_TOKENS = ("卖", "顶", "风险", "死叉", "减仓", "跌破", "预警")
-CHAN_TOKENS = ("一买", "二买", "三买", "一卖", "二卖", "三卖", "背驰", "中枢", "笔", "线段")
+CHAN_TOKENS = ("一买", "二买", "三买", "一卖", "二卖", "三卖", "背驰", "中枢", "笔", "线段", "趋势")
+PATTERN_TOKENS = ("头肩", "双底", "双头", "三角形")
+MACD_TOKENS = ("MACD", "零上绿柱扩大", "零下绿柱缩小")
+GAP_TOKENS = ("缺口", "突破缺口", "持续缺口", "衰竭缺口", "普通缺口")
+ENTRY_FACTOR_TOKENS = ("gap", "trend_breakout", "vol_contraction", "candle_run", "candle_accel")
+TECHNICAL_TOKENS = CHAN_TOKENS + PATTERN_TOKENS + MACD_TOKENS + GAP_TOKENS + ENTRY_FACTOR_TOKENS
+RIGHT_SIDE_FREQS = {"5分钟", "5min", "5m", "15分钟", "15min", "15m"}
 BUY_FREQ_BONUS = {"30分钟": 120, "30min": 120, "30m": 120, "15分钟": 110, "15min": 110, "15m": 110, "5分钟": 80, "5min": 80, "5m": 80}
 FREQ_ORDER = {
     "周线": 0,
@@ -35,18 +41,20 @@ FREQ_ORDER = {
     "5m": 4,
 }
 REASON_WEIGHTS = {
-    "user_pinned": 10000,
-    "technical_signal": 880,
+    "user_pinned": 180,
+    "technical_trigger": 880,
     "generated_risk_signal": 950,
-    "custom_signal": 620,
-    "chan_signal": 620,
-    "knowledge_confirmed": 260,
-    "knowledge_conflict": 240,
-    "knowledge_watch": 160,
-    "chain_core_rep": 700,
-    "chain_elastic_rep": 620,
-    "source_leader": 600,
-    "constituent_hot": 520,
+    "historical_signal_record": 0,
+    "custom_signal": 0,
+    "chan_signal": 0,
+    "knowledge_confirmed": 0,
+    "knowledge_conflict": 0,
+    "knowledge_watch": 0,
+    "chain_context": 0,
+    "chain_core_rep": 0,
+    "chain_elastic_rep": 0,
+    "source_leader": 0,
+    "constituent_hot": 0,
     "active_pool_watch": 260,
     "recent_opened": 180,
 }
@@ -89,6 +97,12 @@ def _prefixed_symbol(code: str) -> str:
     return f"SZ.{code}"
 
 
+def _add_stock(stocks: list[str], value: Any, *, index_codes: set[str]) -> None:
+    code = _pure_a_code(value)
+    if code and code not in index_codes and code not in stocks:
+        stocks.append(code)
+
+
 def _index_codes() -> set[str]:
     import config
 
@@ -101,6 +115,15 @@ def _index_codes() -> set[str]:
 
 def _signal_text(row: dict[str, Any]) -> str:
     return " ".join(_text(row.get(key)) for key in ("signal_type", "type", "reason", "summary", "details"))
+
+
+def _source(row: dict[str, Any]) -> str:
+    return _text(row.get("source") or row.get("data_source")).lower()
+
+
+def _is_historical_signal_source(row: dict[str, Any]) -> bool:
+    source = _source(row)
+    return source.startswith("sqlite.backtest.signal_records") or source.startswith("historical_signal_record")
 
 
 def _signal_side(row: dict[str, Any]) -> str:
@@ -119,19 +142,19 @@ def _signal_family(row: dict[str, Any]) -> str:
 
 
 def _reason_type_for_signal(row: dict[str, Any]) -> str:
-    source = _text(row.get("source") or row.get("data_source")).lower()
+    source = _source(row)
     side = _signal_side(row)
+    if _is_historical_signal_source(row):
+        return "historical_signal_record"
     if "czsc" in source or "chan" in source:
-        return "chan_signal"
-    if source.startswith("sqlite.backtest"):
-        return "custom_signal"
+        return "technical_trigger"
     if source.startswith("sync.signal_pool.generated") or side == "sell":
         return "generated_risk_signal"
     return "custom_signal"
 
 
 def _is_generated_daily_signal(row: dict[str, Any]) -> bool:
-    source = _text(row.get("source") or row.get("data_source")).lower()
+    source = _source(row)
     signal_type = _text(row.get("signal_type") or row.get("type") or row.get("reason"))
     freq = _text(row.get("freq") or row.get("timeframe"))
     return (
@@ -143,13 +166,13 @@ def _is_generated_daily_signal(row: dict[str, Any]) -> bool:
 
 
 def _is_hard_screen_signal(row: dict[str, Any]) -> bool:
-    source = _text(row.get("source") or row.get("data_source")).lower()
-    if source.startswith("sqlite.backtest.signal_records"):
-        return True
+    source = _source(row)
+    if _is_historical_signal_source(row) or source.startswith("sync.signal_pool.generated"):
+        return False
     if "czsc" in source or "chan" in source:
         return True
     signal_type = _signal_text(row)
-    return any(token in signal_type for token in CHAN_TOKENS)
+    return any(token in signal_type for token in TECHNICAL_TOKENS)
 
 
 def _resonance_grade(aligned_freqs: list[str], conflict_freqs: list[str]) -> str:
@@ -202,6 +225,41 @@ def _screen_resonance_context(signal: dict[str, Any], sibling_signals: list[dict
     }
 
 
+def _right_side_confirmed(aligned_freqs: list[str]) -> bool:
+    return any(freq in RIGHT_SIDE_FREQS for freq in aligned_freqs)
+
+
+def _technical_actionability(side: str, resonance_context: dict[str, Any], freq: str = "") -> tuple[str, str]:
+    if side == "sell":
+        return "risk_exit_first", "risk_exit_first"
+    grade = _text(resonance_context.get("grade"))
+    aligned_freqs = [str(item) for item in resonance_context.get("aligned_freqs") or [] if item]
+    if not aligned_freqs and freq:
+        aligned_freqs = [freq]
+    conflict_freqs = [str(item) for item in resonance_context.get("conflict_freqs") or [] if item]
+    if grade == "conflict" or conflict_freqs:
+        return "review_required", "context_only"
+    if len(aligned_freqs) < 2:
+        return "observe_only", "context_only"
+    if not _right_side_confirmed(aligned_freqs):
+        return "entry_waiting_confirm", "entry_waiting_confirm"
+    return "entry_ready", "entry_ready"
+
+
+def _chain_decision_effect(phase: str) -> str:
+    if phase == "accelerating":
+        return "confirm"
+    if phase in {"consensus_climax", "risk_off"}:
+        return "exit_priority"
+    if phase in {"diverging", "cooling"}:
+        return "block"
+    return "context_only"
+
+
+def _is_technical_reason(reason: dict[str, Any]) -> bool:
+    return _text(reason.get("reason_type")) in {"technical_trigger", "technical_signal"}
+
+
 def _source_doc_id(row: dict[str, Any]) -> str:
     return _text(row.get("_id") or row.get("dedupe_key") or row.get("action_id") or row.get("decision_id"))
 
@@ -233,6 +291,10 @@ def _empty_row(code: str, name: str = "") -> dict[str, Any]:
         "action_status": "watch",
         "trader_action": "观察",
         "next_action": "观察",
+        "actionability": "context_only",
+        "queue_lane": "context_only",
+        "decision_effect": "context_only",
+        "source_role": "context",
         "invalidates_when": "入池条件失效或产业链热度回落",
         "technical_evidence": {},
         "resonance_context": {},
@@ -251,6 +313,8 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
     code = _pure_a_code(value)
     if not code or code in index_codes:
         return
+    if code not in rows and reason.get("can_create_candidate") is False:
+        return
     row = rows.setdefault(code, _empty_row(code, name))
     if name and not row.get("name"):
         row["name"] = name
@@ -259,10 +323,21 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
     freq = _text(reason.get("freq"))
     signal_side = _text(reason.get("signal_side"))
     side_bonus = 180 if signal_side == "sell" else 0
-    weight = base_weight + BUY_FREQ_BONUS.get(freq, 0) + side_bonus + _float(reason.get("score")) * 0.05 + _float(reason.get("heat_score")) * 0.05
+    decision_effect = _text(reason.get("decision_effect"))
+    if not decision_effect:
+        decision_effect = "exit_priority" if reason_type == "technical_trigger" and signal_side == "sell" else ("confirm" if reason_type == "technical_trigger" else "context_only")
+    source_role = _text(reason.get("source_role")) or ("technical_trigger" if reason_type == "technical_trigger" else "context")
+    actionability = _text(reason.get("actionability"))
+    queue_lane = _text(reason.get("queue_lane"))
+    context_only = decision_effect in {"context_only", "history_pending"} or source_role == "context"
+    weight = 0.0 if context_only else base_weight + BUY_FREQ_BONUS.get(freq, 0) + side_bonus + _float(reason.get("score")) * 0.05 + _float(reason.get("heat_score")) * 0.05
     normalized = {
         "reason_type": reason_type,
         "weight": round(weight, 3),
+        "source_role": source_role,
+        "decision_effect": decision_effect,
+        "actionability": actionability,
+        "queue_lane": queue_lane,
         "source_collection": _text(reason.get("source_collection")),
         "source_doc_id": _text(reason.get("source_doc_id")),
         "signal_type": _text(reason.get("signal_type")),
@@ -278,6 +353,8 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
         "evidence": reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {},
         "resonance_context": reason.get("resonance_context") if isinstance(reason.get("resonance_context"), dict) else {},
         "knowledge_status": _text(reason.get("knowledge_status")),
+        "knowledge_effect": _text(reason.get("knowledge_effect")),
+        "backtest_quality": reason.get("backtest_quality") if isinstance(reason.get("backtest_quality"), dict) else {},
     }
     key = _reason_key(normalized)
     existing_keys = {_reason_key(item) for item in row["inclusion_reasons"]}
@@ -300,10 +377,14 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
     source_tag = reason_type
     if source_tag and source_tag not in row["source_tags"]:
         row["source_tags"].append(source_tag)
-    if reason_type == "technical_signal":
+    if _is_technical_reason(normalized):
         resonance_context = normalized["resonance_context"]
         if not resonance_context and isinstance(normalized["evidence"], dict):
             resonance_context = normalized["evidence"].get("resonance_context") or {}
+        actionability, queue_lane = _technical_actionability(normalized["signal_side"], resonance_context, normalized["freq"])
+        normalized["actionability"] = normalized.get("actionability") or actionability
+        normalized["queue_lane"] = normalized.get("queue_lane") or queue_lane
+        normalized["decision_effect"] = "exit_priority" if queue_lane == "risk_exit_first" else ("confirm" if queue_lane in {"entry_ready", "entry_waiting_confirm"} else "context_only")
         row["technical_evidence"] = {
             "source_collection": normalized["source_collection"],
             "source_doc_id": normalized["source_doc_id"],
@@ -315,28 +396,61 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
             "as_of": normalized["as_of"],
             "evidence": normalized["evidence"],
             "resonance_context": resonance_context,
+            "actionability": normalized["actionability"],
+            "queue_lane": normalized["queue_lane"],
         }
         if resonance_context:
             row["resonance_context"] = resonance_context
+        row["actionability"] = normalized["actionability"]
+        row["queue_lane"] = normalized["queue_lane"]
+        row["source_role"] = "technical_trigger"
+        row["decision_effect"] = normalized["decision_effect"]
     if reason_type.startswith("knowledge_"):
         row["knowledge_confirmation"] = {
             "status": normalized.get("knowledge_status") or reason_type.replace("knowledge_", ""),
+            "effect": normalized.get("knowledge_effect") or normalized.get("decision_effect") or "context_only",
             "sentiment": _text(reason.get("sentiment")),
             "source_collection": normalized["source_collection"],
             "source_doc_id": normalized["source_doc_id"],
             "as_of": normalized["as_of"],
             "evidence": normalized["evidence"],
         }
-    if top.get("signal_side") == "sell":
+    if reason_type in {"chain_context", "chain_core_rep", "chain_elastic_rep", "source_leader", "constituent_hot"}:
+        phase = _text(normalized["evidence"].get("phase") if isinstance(normalized.get("evidence"), dict) else "")
+        row["chain_context"] = {
+            "chain_id": normalized.get("chain_id"),
+            "node_id": normalized.get("node_id"),
+            "board_or_concept": normalized.get("board_or_concept"),
+            "phase": phase,
+            "effect": normalized.get("decision_effect") or _chain_decision_effect(phase),
+            "as_of": normalized.get("as_of"),
+            "evidence": normalized.get("evidence"),
+        }
+    if top.get("signal_side") == "sell" and top.get("decision_effect") != "context_only":
         row["action_status"] = "risk_review"
-        row["trader_action"] = "风险复核"
+        row["trader_action"] = "减仓/止盈" if top.get("queue_lane") == "risk_exit_first" else "风险复核"
         row["next_action"] = row["trader_action"]
+        row["queue_lane"] = top.get("queue_lane") or "risk_exit_first"
+        row["actionability"] = top.get("actionability") or "risk_exit_first"
         row["invalidates_when"] = "卖出/风险信号解除或重新站回关键周期"
-    elif top["reason_type"] in {"custom_signal", "chan_signal", "technical_signal"}:
-        row["action_status"] = "buy_candidate"
-        row["trader_action"] = "等待5m确认" if top.get("freq") not in {"5m", "5min", "5分钟"} else "可试仓"
+    elif top["reason_type"] in {"technical_trigger", "technical_signal"}:
+        actionability = top.get("actionability") or row.get("actionability") or "observe_only"
+        if actionability == "entry_ready":
+            row["action_status"] = "entry_ready"
+            row["trader_action"] = "可试仓"
+        elif actionability == "entry_waiting_confirm":
+            row["action_status"] = "entry_waiting_confirm"
+            row["trader_action"] = "等待5m/15m确认"
+        elif actionability == "review_required":
+            row["action_status"] = "period_conflict_review"
+            row["trader_action"] = "周期冲突复核"
+        else:
+            row["action_status"] = "technical_watch"
+            row["trader_action"] = "观察"
         row["next_action"] = row["trader_action"]
-        row["invalidates_when"] = "5m 无法确认或上级周期转弱"
+        row["queue_lane"] = top.get("queue_lane") or row.get("queue_lane")
+        row["actionability"] = actionability
+        row["invalidates_when"] = "5m/15m 无法确认或上级周期转弱"
     elif top["reason_type"] == "knowledge_conflict":
         row["action_status"] = "knowledge_conflict"
         row["trader_action"] = "知识库冲突复核"
@@ -353,38 +467,70 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
         row["next_action"] = row["trader_action"]
         row["invalidates_when"] = "产业链节点热度转弱或领涨股回落"
 
-    technical = next((item for item in row["inclusion_reasons"] if item.get("reason_type") == "technical_signal"), None)
+    technical = next((item for item in row["inclusion_reasons"] if _is_technical_reason(item)), None)
     if technical:
         if technical.get("signal_side") == "sell":
             row["action_status"] = "risk_review"
-            row["trader_action"] = "风险复核"
+            row["trader_action"] = "减仓/止盈" if technical.get("queue_lane") == "risk_exit_first" else "风险复核"
             row["next_action"] = row["trader_action"]
+            row["queue_lane"] = technical.get("queue_lane") or "risk_exit_first"
+            row["actionability"] = technical.get("actionability") or "risk_exit_first"
             row["invalidates_when"] = "卖出/风险信号解除或重新站回关键周期"
-        elif row.get("action_status") in {"watch", "knowledge_watch", "chain_watch"}:
-            row["action_status"] = "buy_candidate"
-            row["trader_action"] = "等待5m确认" if technical.get("freq") not in {"5m", "5min", "5分钟"} else "可试仓"
+        elif row.get("action_status") in {"watch", "knowledge_watch", "chain_watch", "technical_watch"}:
+            actionability = technical.get("actionability") or row.get("actionability") or "observe_only"
+            if actionability == "entry_ready":
+                row["action_status"] = "entry_ready"
+                row["trader_action"] = "可试仓"
+            elif actionability == "entry_waiting_confirm":
+                row["action_status"] = "entry_waiting_confirm"
+                row["trader_action"] = "等待5m/15m确认"
+            elif actionability == "review_required":
+                row["action_status"] = "period_conflict_review"
+                row["trader_action"] = "周期冲突复核"
+            else:
+                row["action_status"] = "technical_watch"
+                row["trader_action"] = "观察"
             row["next_action"] = row["trader_action"]
-            row["invalidates_when"] = "5m 无法确认或上级周期转弱"
+            row["queue_lane"] = technical.get("queue_lane") or row.get("queue_lane")
+            row["actionability"] = actionability
+            row["invalidates_when"] = "5m/15m 无法确认或上级周期转弱"
     if (row.get("knowledge_confirmation") or {}).get("status") == "conflict" and row.get("action_status") == "buy_candidate":
         row["action_status"] = "knowledge_conflict"
         row["trader_action"] = "知识库冲突复核"
         row["next_action"] = row["trader_action"]
         row["invalidates_when"] = "知识观点或技术信号解除冲突"
+    knowledge_effect = _text((row.get("knowledge_confirmation") or {}).get("effect"))
+    chain_effect = _text((row.get("chain_context") or {}).get("effect"))
+    if row.get("queue_lane") in {"entry_ready", "entry_waiting_confirm"} and knowledge_effect in {"block", "downgrade", "exit_priority"}:
+        row["action_status"] = "knowledge_blocked" if knowledge_effect == "block" else "knowledge_downgraded"
+        row["trader_action"] = "知识库阻断" if knowledge_effect == "block" else "知识库降级复核"
+        row["next_action"] = row["trader_action"]
+        row["queue_lane"] = "context_only" if knowledge_effect == "block" else "entry_waiting_confirm"
+        row["actionability"] = "review_required" if knowledge_effect == "block" else "entry_waiting_confirm"
+        row["invalidates_when"] = "知识库风险解除且右侧确认重新出现"
+    if row.get("queue_lane") in {"entry_ready", "entry_waiting_confirm"} and chain_effect in {"block", "exit_priority"}:
+        row["action_status"] = "chain_risk_review"
+        row["trader_action"] = "产业链风险复核"
+        row["next_action"] = row["trader_action"]
+        row["queue_lane"] = "risk_exit_first" if chain_effect == "exit_priority" else "context_only"
+        row["actionability"] = "risk_exit_first" if chain_effect == "exit_priority" else "review_required"
+        row["invalidates_when"] = "产业链退潮/高潮风险解除且5m/15m重新确认"
 
 
 def _add_user_pinned(rows: dict[str, dict[str, Any]], index_codes: set[str], now) -> None:
-    import config
-
-    values = os.getenv("TERMINAL_REALTIME_PRIORITY_CODES", "688802,300575").replace(";", ",").split(",")
-    values.extend(getattr(config, "WHITELIST", []))
+    raw_values = os.getenv("TERMINAL_REALTIME_PRIORITY_CODES", "")
+    values = raw_values.replace(";", ",").split(",") if raw_values.strip() else []
     for value in values:
         code = _pure_a_code(value)
         _add_reason(rows, code, {
             "reason_type": "user_pinned",
             "source_collection": "config",
-            "source_doc_id": "TERMINAL_REALTIME_PRIORITY_CODES/WHITELIST",
-            "signal_type": "用户重点观察",
-            "signal_side": "buy",
+            "source_doc_id": "TERMINAL_REALTIME_PRIORITY_CODES",
+            "signal_type": "手动关注",
+            "signal_side": "neutral",
+            "source_role": "context",
+            "decision_effect": "context_only",
+            "queue_lane": "context_only",
             "as_of": now.date().isoformat(),
             "evidence": {"raw_value": _text(value)},
         }, index_codes=index_codes)
@@ -414,6 +560,8 @@ def _add_signal_rows(
         signal_type = _text(signal.get("signal_type") or signal.get("type") or signal.get("reason"))
         hard_screen_signal = _is_hard_screen_signal(signal) and not generated_daily
         reason_type = "technical_signal" if hard_screen_signal else _reason_type_for_signal(signal)
+        if hard_screen_signal:
+            reason_type = "technical_trigger"
         code = _pure_a_code(signal.get("symbol"))
         resonance_context = _screen_resonance_context(signal, by_code.get(code, [])) if hard_screen_signal else {}
         _add_reason(rows, signal.get("symbol"), {
@@ -424,9 +572,17 @@ def _add_signal_rows(
             "signal_side": _signal_side(signal),
             "signal_family": _signal_family(signal),
             "freq": _text(signal.get("freq") or signal.get("timeframe")),
-            "score": _float(signal.get("score") or signal.get("total_score")),
+            "score": 0 if reason_type == "historical_signal_record" else _float(signal.get("score") or signal.get("total_score")),
             "confidence": _float(signal.get("confidence")),
             "as_of": _text(signal.get("signal_date") or signal.get("updated_at"))[:10],
+            "source_role": "technical_trigger" if hard_screen_signal else "context",
+            "decision_effect": "history_pending" if reason_type == "historical_signal_record" else ("confirm" if hard_screen_signal else "context_only"),
+            "can_create_candidate": reason_type not in {"historical_signal_record", "custom_signal"},
+            "backtest_quality": {
+                "status": "not_evaluated",
+                "score": 0,
+                "source": "sqlite.backtest.signal_records",
+            } if reason_type == "historical_signal_record" else {},
             "resonance_context": resonance_context,
             "evidence": {
                 "source": _text(signal.get("source")),
@@ -465,7 +621,7 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
         if not resonance_context and isinstance(evidence, dict):
             resonance_context = evidence.get("resonance_context") or {}
         _add_reason(rows, signal.get("symbol") or signal.get("raw_code"), {
-            "reason_type": "technical_signal",
+            "reason_type": "technical_trigger",
             "source_collection": "terminal_technical_signals",
             "source_doc_id": _source_doc_id(signal),
             "signal_type": _text(signal.get("signal_type")),
@@ -475,6 +631,7 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
             "score": _float(signal.get("total_score") or signal.get("score")),
             "confidence": _float(signal.get("confidence")),
             "as_of": _text(signal.get("as_of") or signal.get("updated_at"))[:10],
+            "source_role": "technical_trigger",
             "resonance_context": resonance_context,
             "evidence": evidence,
         }, index_codes=index_codes)
@@ -508,10 +665,13 @@ def _add_knowledge_rows(rows: dict[str, dict[str, Any]], db: Database, index_cod
         tech_side = ""
         if existing:
             tech_reason = next((item for item in existing.get("inclusion_reasons", []) if item.get("reason_type") == "technical_signal"), None)
+            if not tech_reason:
+                tech_reason = next((item for item in existing.get("inclusion_reasons", []) if _is_technical_reason(item)), None)
             if tech_reason:
                 tech_side = _text(tech_reason.get("signal_side"))
         sentiment = _text(view.get("latest_sentiment") or view.get("sentiment"))
         reason_type, status = _knowledge_status_for(sentiment, tech_side)
+        knowledge_effect = _text(view.get("knowledge_effect")) or ("block" if status == "conflict" else ("confirm" if status == "confirmed" else "context_only"))
         sources = view.get("sources") if isinstance(view.get("sources"), list) else []
         _add_reason(rows, code, {
             "reason_type": reason_type,
@@ -519,6 +679,10 @@ def _add_knowledge_rows(rows: dict[str, dict[str, Any]], db: Database, index_cod
             "source_doc_id": _text(view.get("view_id")),
             "signal_type": f"知识库{sentiment or '覆盖'}",
             "signal_side": tech_side or "neutral",
+            "source_role": "context",
+            "decision_effect": knowledge_effect,
+            "knowledge_effect": knowledge_effect,
+            "can_create_candidate": False,
             "score": 0,
             "confidence": _float(view.get("confidence")),
             "as_of": _text(view.get("as_of") or view.get("updated_at"))[:10],
@@ -616,19 +780,38 @@ def _add_chain_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: 
             if not isinstance(rep, dict):
                 continue
             rep_type = "chain_core_rep" if _text(rep.get("representative_type")) == "core" else "chain_elastic_rep"
+            phase = _text(chain.get("phase"))
+            chain_effect = _chain_decision_effect(phase)
             _add_reason(rows, rep.get("symbol"), {
                 "reason_type": rep_type,
                 "source_collection": "chain_heat_snapshots",
                 "source_doc_id": chain_key,
                 "signal_type": _text(chain.get("trading_signal")),
-                "signal_side": "buy" if chain.get("phase") not in {"risk_off", "cooling"} else "sell",
+                "signal_side": "neutral",
+                "source_role": "context",
+                "decision_effect": chain_effect,
+                "can_create_candidate": False,
                 "score": _float(chain.get("heat_score")),
                 "confidence": _float(rep.get("priority")),
                 "chain_id": _text(chain.get("chain_id")),
                 "node_id": _text(chain.get("node_id")),
                 "board_or_concept": board_or_concept,
                 "as_of": _text(chain.get("trade_minute")),
-                "evidence": {"phase": chain.get("phase"), "range_pattern": chain.get("range_pattern")},
+                "evidence": {
+                    "phase": phase,
+                    "range_pattern": chain.get("range_pattern"),
+                    "change_pct": chain.get("change_pct"),
+                    "up_count": chain.get("up_count"),
+                    "down_count": chain.get("down_count"),
+                    "rank": chain.get("rank"),
+                    "leader_change_pct": chain.get("leader_change_pct"),
+                    "heat_score": chain.get("heat_score"),
+                    "momentum_5m": chain.get("momentum_5m"),
+                    "momentum_15m": chain.get("momentum_15m"),
+                    "momentum_30m": chain.get("momentum_30m"),
+                    "mapping_confidence": chain.get("mapping_confidence"),
+                    "integrated_count": chain.get("integrated_count"),
+                },
             }, index_codes=index_codes, name=_text(rep.get("name")))
         for domain in integrated[:6]:
             if added_constituents >= 36:
@@ -640,13 +823,17 @@ def _add_chain_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: 
                     "source_collection": "chain_heat_snapshots",
                     "source_doc_id": chain_key,
                     "signal_type": _text(chain.get("trading_signal")),
-                    "signal_side": "buy",
+                    "signal_side": "neutral",
+                    "source_role": "context",
+                    "decision_effect": _chain_decision_effect(_text(chain.get("phase"))),
+                    "can_create_candidate": False,
                     "score": _float(domain.get("leader_change_pct")),
                     "confidence": _float(domain.get("mapping_confidence")),
                     "chain_id": _text(chain.get("chain_id")),
                     "node_id": _text(chain.get("node_id")),
                     "board_or_concept": _text(domain.get("name")),
                     "as_of": _text(chain.get("trade_minute")),
+                    "evidence": {"phase": chain.get("phase"), "range_pattern": chain.get("range_pattern")},
                 }, index_codes=index_codes, name=_text(domain.get("leader_name")))
             symbols, stock_names = _constituents_for_domain(db, domain)
             for symbol in symbols[:2]:
@@ -658,13 +845,17 @@ def _add_chain_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: 
                     "source_collection": "board_constituents" if domain.get("kind") == "industry" else "concept_constituents",
                     "source_doc_id": _text(domain.get("name")),
                     "signal_type": _text(chain.get("trading_signal")),
-                    "signal_side": "buy",
+                    "signal_side": "neutral",
+                    "source_role": "context",
+                    "decision_effect": _chain_decision_effect(_text(chain.get("phase"))),
+                    "can_create_candidate": False,
                     "heat_score": _float(chain.get("heat_score")),
                     "confidence": _float(domain.get("mapping_confidence")),
                     "chain_id": _text(chain.get("chain_id")),
                     "node_id": _text(chain.get("node_id")),
                     "board_or_concept": _text(domain.get("name")),
                     "as_of": _text(chain.get("trade_minute")),
+                    "evidence": {"phase": chain.get("phase"), "range_pattern": chain.get("range_pattern")},
                 }, index_codes=index_codes, name=stock_names.get(code, ""))
                 added_constituents += 1
 
@@ -737,6 +928,13 @@ def _selected_rows(rows: dict[str, dict[str, Any]], limit: int) -> tuple[list[di
         )
         row["exit_condition"] = row.get("invalidates_when")
         row["next_action"] = row.get("next_action") or row.get("trader_action") or "观察"
+        row["queue_lane"] = row.get("queue_lane") or "context_only"
+        row["actionability"] = row.get("actionability") or "context_only"
+        row["decision_effects"] = [
+            _text(item.get("decision_effect"))
+            for item in row["inclusion_reasons"]
+            if _text(item.get("decision_effect"))
+        ][:6]
         if not isinstance(row.get("technical_evidence"), dict) or not row.get("technical_evidence"):
             row["technical_evidence"] = {"status": "missing", "note": "watch_only_not_buy_candidate"}
         if not isinstance(row.get("knowledge_confirmation"), dict) or not row.get("knowledge_confirmation"):
