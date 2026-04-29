@@ -37,7 +37,7 @@ def stock_to_market_symbol(code: str) -> str:
     return pure
 
 
-def _direct_get(url: str, *, params: dict, headers: dict | None = None, timeout: float = 10.0):
+def _direct_get(url: str, *, params: dict, headers: dict | None = None, timeout: float = 10.0, db=None):
     session = requests.Session()
     session.trust_env = False
     provider = "tencent" if "gtimg.cn" in url else "sina" if "sina.cn" in url else "unknown"
@@ -47,6 +47,7 @@ def _direct_get(url: str, *, params: dict, headers: dict | None = None, timeout:
             "stock_minute",
             lambda: session.get(url, params=params, headers=headers or _HEADERS, timeout=timeout),
             domain="minute",
+            db=db,
         )
         response.raise_for_status()
         return response
@@ -76,13 +77,14 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def fetch_sina_minute(symbol: str, period: str, *, timeout: float = 10.0, datalen: int = 1970) -> pd.DataFrame:
+def fetch_sina_minute(symbol: str, period: str, *, timeout: float = 10.0, datalen: int = 1970, db=None) -> pd.DataFrame:
     """Fetch 5/15/30 minute bars from Sina for stocks or indexes."""
     response = _direct_get(
         _SINA_URL,
         params={"symbol": symbol, "scale": period, "ma": "no", "datalen": str(datalen)},
         headers={**_HEADERS, "Accept": "*/*"},
         timeout=timeout,
+        db=db,
     )
     text = response.text
     try:
@@ -109,7 +111,7 @@ def fetch_sina_minute(symbol: str, period: str, *, timeout: float = 10.0, datale
     return _normalize_columns(df.rename(columns=rename))
 
 
-def fetch_tencent_minute(symbol: str, period: str, *, timeout: float = 10.0, count: int = 320) -> pd.DataFrame:
+def fetch_tencent_minute(symbol: str, period: str, *, timeout: float = 10.0, count: int = 320, db=None) -> pd.DataFrame:
     """Fetch 5/15/30 minute bars from Tencent for stocks or indexes."""
     key = f"m{period}"
     response = _direct_get(
@@ -117,6 +119,7 @@ def fetch_tencent_minute(symbol: str, period: str, *, timeout: float = 10.0, cou
         params={"param": f"{symbol},{key},,{count}"},
         headers={**_HEADERS, "Referer": "https://gu.qq.com/"},
         timeout=timeout,
+        db=db,
     )
     data = response.json()
     rows = data.get("data", {}).get(symbol, {}).get(key, [])
@@ -153,15 +156,26 @@ def fetch_public_minute(
     timeout: float = 10.0,
     datalen: int | None = None,
     count: int | None = None,
+    db=None,
 ) -> tuple[pd.DataFrame, str]:
     """Fetch public minute bars and return (dataframe, provider)."""
     errors: list[str] = []
     for provider in providers:
         try:
             if provider == "sina":
-                df = fetch_sina_minute(symbol, period, timeout=timeout, datalen=datalen or 1970)
+                try:
+                    df = fetch_sina_minute(symbol, period, timeout=timeout, datalen=datalen or 1970, db=db)
+                except TypeError as exc:
+                    if "unexpected keyword argument 'db'" not in str(exc):
+                        raise
+                    df = fetch_sina_minute(symbol, period, timeout=timeout, datalen=datalen or 1970)
             elif provider == "tencent":
-                df = fetch_tencent_minute(symbol, period, timeout=timeout, count=count or 320)
+                try:
+                    df = fetch_tencent_minute(symbol, period, timeout=timeout, count=count or 320, db=db)
+                except TypeError as exc:
+                    if "unexpected keyword argument 'db'" not in str(exc):
+                        raise
+                    df = fetch_tencent_minute(symbol, period, timeout=timeout, count=count or 320)
             else:
                 raise ValueError(f"unknown minute provider: {provider}")
             if df is not None and not df.empty:

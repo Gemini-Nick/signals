@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from datetime import datetime
+
 import config
 from signals.sync.modules import stock_minute
 
@@ -90,6 +92,7 @@ def test_stock_minute_tail_count_defaults_and_overrides(monkeypatch):
 
 
 def test_stock_minute_cap_splits_intraday_and_close(monkeypatch):
+    monkeypatch.setattr(stock_minute, "naive_market_now", lambda _market: datetime(2026, 4, 29, 10, 0))
     monkeypatch.setenv("SIGNALS_CURRENT_SYNC_LANE", "signal_lane")
     monkeypatch.setenv("SIGNALS_CURRENT_SYNC_MARKET", "A")
     monkeypatch.setenv("STOCK_MINUTE_SIGNAL_MAX_CODES", "24")
@@ -98,6 +101,22 @@ def test_stock_minute_cap_splits_intraday_and_close(monkeypatch):
 
     monkeypatch.delenv("SIGNALS_CURRENT_SYNC_MARKET", raising=False)
     assert stock_minute._selection_cap() == 96
+
+
+def test_stock_minute_opening_phase_caps_symbols_and_freqs(monkeypatch):
+    monkeypatch.setattr(stock_minute, "naive_market_now", lambda _market: datetime(2026, 4, 29, 9, 35))
+    monkeypatch.setenv("SIGNALS_CURRENT_SYNC_LANE", "signal_lane")
+    monkeypatch.setenv("SIGNALS_CURRENT_SYNC_MARKET", "A")
+    monkeypatch.setenv("STOCK_MINUTE_SIGNAL_MAX_CODES", "72")
+    monkeypatch.setenv("STOCK_MINUTE_OPENING_MAX_CODES", "24")
+    monkeypatch.delenv("STOCK_MINUTE_FREQS", raising=False)
+    monkeypatch.delenv("STOCK_MINUTE_OPENING_ALL_FREQS", raising=False)
+
+    assert stock_minute._selection_cap() == 24
+    assert stock_minute._active_minute_freqs() == ["5分钟"]
+
+    monkeypatch.setenv("STOCK_MINUTE_OPENING_ALL_FREQS", "true")
+    assert stock_minute._active_minute_freqs() == ["5分钟", "15分钟", "30分钟"]
 
 
 def test_postmarket_minute_scope_uses_expanded_candidate_cap(monkeypatch):

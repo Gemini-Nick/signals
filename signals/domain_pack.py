@@ -464,7 +464,9 @@ class SignalsPack:
                     summary.update(self._project_fields(shard_progress, [
                         "scope", "shard_key", "shard_index", "shard_count", "global_total",
                         "total", "processed", "remaining", "inserted", "skipped",
-                        "errors", "latest_symbol", "latest_status", "progress_pct",
+                        "errors", "deferred", "latest_symbol", "latest_status", "progress_pct",
+                        "inserted_per_min", "processed_per_min", "landing_rate",
+                        "missing_symbols", "deferred_symbols", "elapsed_seconds",
                     ]))
             if module == "stock_daily" and stock_daily_progress:
                 cursor.update(self._project_fields(stock_daily_progress, [
@@ -530,6 +532,10 @@ class SignalsPack:
                 "progress_pct": progress_pct,
                 "eta_seconds": eta_seconds,
                 "sample_errors": _json_safe(sample_errors[:10]),
+                "stock_daily_landing_rate": stock_daily_progress.get("landing_rate", 0),
+                "stock_daily_inserted_per_min": stock_daily_progress.get("inserted_per_min", 0),
+                "stock_daily_missing_symbols": stock_daily_progress.get("missing_symbols", 0),
+                "stock_daily_deferred_symbols": stock_daily_progress.get("deferred_symbols", stock_daily_progress.get("deferred", 0)),
             },
         }
 
@@ -611,6 +617,10 @@ class SignalsPack:
                 "minute_universe_pending": minute_universe.get("pending", 0),
                 "minute_universe_running": minute_universe.get("running", 0),
                 "minute_universe_error": minute_universe.get("error", 0),
+                "daily_landing_rate": stock_daily_progress.get("landing_rate", 0),
+                "daily_inserted_per_min": stock_daily_progress.get("inserted_per_min", 0),
+                "daily_missing_symbols": stock_daily_progress.get("missing_symbols", 0),
+                "daily_deferred_symbols": stock_daily_progress.get("deferred_symbols", stock_daily_progress.get("deferred", 0)),
             },
         }
 
@@ -657,9 +667,15 @@ class SignalsPack:
                 "provider": str(doc.get("provider") or ""),
                 "endpoint": str(doc.get("endpoint") or ""),
                 "domain": str(doc.get("domain") or ""),
-                "status": str(doc.get("status") or ""),
+                "status": self._provider_health_status(doc),
                 "avg_latency_ms": doc.get("avg_latency_ms"),
                 "last_error_type": str(doc.get("last_error_type") or "")[:240],
+                "cooldown_hit_type": str(doc.get("cooldown_hit_type") or "")[:240],
+                "attempt_count": int(doc.get("attempt_count") or 0),
+                "success_count": int(doc.get("success_count") or 0),
+                "risk_error_count": int(doc.get("risk_error_count") or 0),
+                "cooldown_hit_count": int(doc.get("cooldown_hit_count") or 0),
+                "degraded_count": int(doc.get("degraded_count") or 0),
                 "last_success_at": self._iso(doc.get("last_success_at")),
                 "last_error_at": self._iso(doc.get("last_error_at")),
                 "cooldown_until": self._iso(doc.get("cooldown_until")),
@@ -678,16 +694,36 @@ class SignalsPack:
                     "status": status,
                     "error_msg": item.get("error_msg") or item.get("degraded_reason") or "",
                 })
+        postmarket_by_module: Dict[str, Dict[str, Any]] = {}
         for task in postmarket.get("tasks", []):
             status = str(task.get("status") or "")
             if status in {"error", "degraded", "stale"}:
-                blockers.append({
+                module = str(task.get("module") or "postmarket")
+                summary = task.get("result_summary", {}) if isinstance(task.get("result_summary"), dict) else {}
+                result = summary.get("result") if isinstance(summary.get("result"), dict) else {}
+                row = postmarket_by_module.setdefault(module, {
                     "scope": "postmarket_backfill",
-                    "module": task.get("module"),
+                    "module": module,
                     "status": status,
-                    "error_msg": task.get("error_msg") or "",
-                    "sample_errors": task.get("result_summary", {}).get("sample_errors") or [],
+                    "task_count": 0,
+                    "error_count": 0,
+                    "deferred_count": 0,
+                    "error_msg": "",
+                    "sample_errors": [],
                 })
+                row["task_count"] = int(row.get("task_count") or 0) + 1
+                row["error_count"] = int(row.get("error_count") or 0) + int(summary.get("errors") or result.get("errors") or 0)
+                row["deferred_count"] = int(row.get("deferred_count") or 0) + int(summary.get("deferred") or result.get("deferred") or 0)
+                if status == "error":
+                    row["status"] = "error"
+                elif row.get("status") != "error" and status == "degraded":
+                    row["status"] = "degraded"
+                if not row.get("error_msg"):
+                    row["error_msg"] = task.get("error_msg") or ""
+                errors = summary.get("sample_errors") or result.get("sample_errors") or []
+                if isinstance(errors, list):
+                    row["sample_errors"] = [*row.get("sample_errors", []), *errors[:3]][:6]
+        blockers.extend(postmarket_by_module.values())
         for item in provider_health or []:
             status = str(item.get("status") or "")
             if status in {"degraded", "cooldown", "error", "stale"}:
@@ -695,10 +731,26 @@ class SignalsPack:
                     "scope": "provider_health",
                     "module": item.get("provider"),
                     "status": status,
-                    "error_msg": item.get("last_error_type") or "",
+                    "error_msg": item.get("last_error_type") or item.get("cooldown_hit_type") or "",
                     "cooldown_until": item.get("cooldown_until") or "",
                 })
         return blockers[:12]
+
+    def _provider_health_status(self, doc: Mapping[str, Any]) -> str:
+        status = str(doc.get("status") or "")
+        if status != "cooldown":
+            return status
+        cooldown_until = doc.get("cooldown_until")
+        updated_at = doc.get("updated_at")
+        if (
+            isinstance(cooldown_until, datetime)
+            and (
+                cooldown_until <= datetime.now()
+                or (isinstance(updated_at, datetime) and cooldown_until <= updated_at)
+            )
+        ):
+            return "cooldown_expired"
+        return status
 
     def _latest_sync_doc(self, db, module: str) -> Dict[str, Any]:
         doc = self._find_one(db, "sync_log", {"module": module}, sort=[("last_run", -1), ("updated_at", -1)])

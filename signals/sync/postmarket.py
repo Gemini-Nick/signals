@@ -22,7 +22,7 @@ logger = logging.getLogger("signals.sync.postmarket")
 RUN_OK_STATUSES = {"ok"}
 TASK_OK_STATUSES = {"ok"}
 RUN_TERMINAL_STATUSES = {"ok"}
-RETRYABLE_TASK_STATUSES = {"pending", "running", "stale", "partial", "degraded", "error"}
+RETRYABLE_TASK_STATUSES = {"pending", "running", "stale", "partial", "degraded", "error", "deferred"}
 
 
 @dataclass(frozen=True)
@@ -173,6 +173,8 @@ def _summarize_result(result: Any) -> dict[str, Any]:
         "candidates",
         "skipped",
         "errors",
+        "deferred",
+        "cooling_down",
         "processed",
         "total",
         "expected_codes",
@@ -184,6 +186,7 @@ def _summarize_result(result: Any) -> dict[str, Any]:
         "total_groups",
         "processed_groups",
         "sample_errors",
+        "sample_deferred",
         "source_counts",
         "unmapped",
         "reason_counts",
@@ -212,7 +215,7 @@ class PostmarketRunner:
         self.db = engine.db
         self.max_workers = max_workers or _env_int("SIGNALS_POSTMARKET_WORKERS", 8, minimum=1)
         self.module_semaphores = {
-            "stock_daily": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_STOCK_DAILY_WORKERS", 4, minimum=1)),
+            "stock_daily": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_STOCK_DAILY_WORKERS", 2, minimum=1)),
             "board_cons": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_BOARD_CONS_WORKERS", 2, minimum=1)),
         }
         self.owner_pid = os.getpid()

@@ -73,13 +73,19 @@ SECOND_SCREEN_LANES = {
 FREQ_ALIASES = {
     "5m": "5min",
     "5min": "5min",
+    "5分钟": "5min",
     "15m": "15min",
     "15min": "15min",
+    "15分钟": "15min",
     "30m": "30min",
     "30min": "30min",
+    "30分钟": "30min",
     "daily": "daily",
+    "日线": "daily",
     "weekly": "weekly",
+    "周线": "weekly",
     "monthly": "monthly",
+    "月线": "monthly",
 }
 GATEWAY_FREQS = {
     "5min": "5m",
@@ -1116,6 +1122,144 @@ def _load_signal_pool_rows(limit: int = 200, symbol: Optional[str] = None) -> li
         return [dict(item) for item in rows[:limit] if isinstance(item, dict)]
     except Exception:
         return []
+
+
+def _signal_source_text(signal: dict[str, Any]) -> str:
+    parts = [
+        signal.get("source"),
+        signal.get("pool_status"),
+        signal.get("signal_type"),
+        signal.get("type"),
+        signal.get("reason"),
+        signal.get("details"),
+    ]
+    details = signal.get("details_json")
+    if isinstance(details, dict):
+        parts.append(json.dumps(details, ensure_ascii=False, default=str)[:300])
+    return " ".join(str(item or "") for item in parts).lower()
+
+
+def _is_custom_signal_record(signal: dict[str, Any]) -> bool:
+    text = _signal_source_text(signal)
+    return any(token in text for token in ("signal_records", "backtest", "custom", "自定义", "回测"))
+
+
+def _custom_signal_rows(symbol: str, *, limit: int = 500) -> list[dict[str, Any]]:
+    if not symbol:
+        return []
+    rows = _load_signal_pool_rows(limit=limit, symbol=symbol)
+    return [row for row in rows if _is_custom_signal_record(row)]
+
+
+def _custom_signal_diagnostics(
+    symbol: str,
+    requested_freq: str,
+    visible_signals: list[dict[str, Any]],
+) -> dict[str, Any]:
+    current_freq = _freq_bucket(requested_freq)
+    rows = _custom_signal_rows(symbol)
+    freqs = sorted({_freq_bucket(row.get("freq") or row.get("timeframe")) for row in rows if _freq_bucket(row.get("freq") or row.get("timeframe"))})
+    current_rows = [
+        row for row in rows
+        if _freq_bucket(row.get("freq") or row.get("timeframe")) in {current_freq, ""}
+    ]
+    visible_custom = [signal for signal in visible_signals if isinstance(signal, dict) and _is_custom_signal_record(signal)]
+    hidden_reasons: list[str] = []
+    if not rows:
+        hidden_reasons.append("no_custom_signal_records")
+    elif not current_rows:
+        hidden_reasons.append("custom_signals_on_other_freq")
+    elif not visible_custom:
+        hidden_reasons.append("custom_signals_not_in_loaded_chart_range")
+    return {
+        "custom_signal_count": len(rows),
+        "direct_custom_signal_count": len(rows),
+        "visible_custom_signal_count": len(visible_custom),
+        "hidden_custom_signal_count": max(0, len(rows) - len(visible_custom)),
+        "available_custom_signal_freqs": freqs,
+        "hidden_reasons": hidden_reasons,
+    }
+
+
+def _candidate_stock_symbol(row: dict[str, Any]) -> tuple[str, str]:
+    for key in ("symbol", "code", "raw_code", "target_symbol", "label"):
+        value = _text(row.get(key))
+        if not value:
+            continue
+        symbol, raw_code = _normalize_stock_symbol(value)
+        if symbol:
+            return symbol, raw_code or symbol.split(".")[-1]
+    name = _text(row.get("name") or row.get("stock_name"))
+    if name:
+        symbol, raw_code = _normalize_stock_symbol(name)
+        if symbol:
+            return symbol, raw_code or symbol.split(".")[-1]
+    return "", ""
+
+
+def _related_custom_signals_from_candidates(
+    candidates: list[dict[str, Any]],
+    requested_freq: str,
+    *,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    current_freq = _freq_bucket(requested_freq)
+    related: list[dict[str, Any]] = []
+    seen_symbols: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        symbol, _ = _candidate_stock_symbol(candidate)
+        if not symbol or symbol in seen_symbols:
+            continue
+        seen_symbols.add(symbol)
+        rows = _custom_signal_rows(symbol, limit=200)
+        if not rows:
+            continue
+        preferred = [
+            row for row in rows
+            if _freq_bucket(row.get("freq") or row.get("timeframe")) in {current_freq, ""}
+        ] or rows
+        for row in preferred[:2]:
+            signal_type = _text(row.get("signal_type") or row.get("type") or row.get("reason"))
+            related.append({
+                "symbol": symbol,
+                "name": _text(candidate.get("name") or candidate.get("stock_name")) or _stock_name(symbol),
+                "relation": _text(candidate.get("relation") or candidate.get("role") or candidate.get("representative_type")),
+                "type": signal_type,
+                "signal_type": signal_type,
+                "freq": _freq_bucket(row.get("freq") or row.get("timeframe")),
+                "date_str": _signal_date(row),
+                "signal_date": row.get("signal_date") or row.get("dt") or row.get("updated_at"),
+                "source": row.get("source") or "signals.signal_pool",
+                "details": _signal_details(row),
+                "confidence": _float(row.get("confidence")),
+            })
+            if len(related) >= limit:
+                return related
+    return related
+
+
+def _recent_custom_signal_candidates(*, limit: int = 10) -> list[dict[str, Any]]:
+    rows = [row for row in _load_signal_pool_rows(limit=500) if _is_custom_signal_record(row)]
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        symbol, raw_code = _candidate_stock_symbol(row)
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        output.append({
+            "symbol": symbol,
+            "raw_code": raw_code,
+            "name": _stock_name(symbol, row),
+            "relation": "近期自定义信号",
+            "source": "signal_records",
+            "representative_type": "custom_signal_candidate",
+        })
+        if len(output) >= limit:
+            break
+    return output
 
 
 def _signal_details(signal: dict[str, Any]) -> str:
@@ -3372,6 +3516,8 @@ async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
     chart = _mark_chart_readiness(chart, kind="index", requested_freq=requested_freq)
     plan = _plan_for_index(engine, name)
     analysis_target = _top_candidate_symbol(engine)
+    candidate_stocks = [serialize_scored_symbol(item) for item in engine.get_scored_symbols()[:10]]
+    related_custom_signals = _related_custom_signals_from_candidates(candidate_stocks, requested_freq)
 
     return {
         "target": {
@@ -3393,7 +3539,14 @@ async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
         "review": _review_context(engine, "index", name),
         "trade": _trade_context(None),
         "analysis_target": analysis_target,
-        "candidate_stocks": [serialize_scored_symbol(item) for item in engine.get_scored_symbols()[:10]],
+        "candidate_stocks": candidate_stocks,
+        "custom_signal_count": 0,
+        "direct_custom_signal_count": 0,
+        "visible_custom_signal_count": 0,
+        "hidden_custom_signal_count": 0,
+        "available_custom_signal_freqs": [],
+        "hidden_reasons": ["index_has_no_direct_custom_signal"],
+        "related_custom_signals": related_custom_signals,
     }
 
 
@@ -3404,6 +3557,15 @@ async def _build_static_index_target(name: str, symbol: str, freq: str) -> Dict[
     chart = _mark_chart_readiness(chart, kind="index", requested_freq=requested_freq)
     summary = _summary_from_static_index(name, symbol, chart)
     summary["latest_signal"] = summary.get("latest_signal") or _ma_signal_from_df(df)
+    try:
+        engine = _ensure_engine()
+        candidate_stocks = [serialize_scored_symbol(item) for item in engine.get_scored_symbols()[:10]]
+    except Exception:
+        engine = None
+        candidate_stocks = []
+    if not candidate_stocks:
+        candidate_stocks = _recent_custom_signal_candidates(limit=10)
+    related_custom_signals = _related_custom_signals_from_candidates(candidate_stocks, requested_freq)
     return {
         "target": {
             "kind": "index",
@@ -3421,10 +3583,17 @@ async def _build_static_index_target(name: str, symbol: str, freq: str) -> Dict[
         "summary": summary,
         "signals": chart.get("signals", []),
         "plan": None,
-        "review": {},
+        "review": _review_context(engine, "index", name) if engine is not None else {},
         "trade": _trade_context(None),
         "analysis_target": "",
-        "candidate_stocks": [],
+        "candidate_stocks": candidate_stocks,
+        "custom_signal_count": 0,
+        "direct_custom_signal_count": 0,
+        "visible_custom_signal_count": 0,
+        "hidden_custom_signal_count": 0,
+        "available_custom_signal_freqs": [],
+        "hidden_reasons": ["index_has_no_direct_custom_signal"],
+        "related_custom_signals": related_custom_signals,
     }
 
 
@@ -3475,6 +3644,7 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
         heat_target_label = _text(latest_heat.get("heat_target_label")) or name
         heat_resolution_status = _text(latest_heat.get("heat_resolution_status")) or ("exact" if heat_target_label == name else "unresolved")
         heat_ready = _chart_has_ohlcv(chart)
+        related_custom_signals = _related_custom_signals_from_candidates(ordered_candidates, requested_freq)
         return {
             "target": {
                 "kind": "industry",
@@ -3525,6 +3695,13 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
             "analysis_target": analysis_target,
             "candidate_groups": candidate_groups,
             "candidate_stocks": ordered_candidates,
+            "custom_signal_count": 0,
+            "direct_custom_signal_count": 0,
+            "visible_custom_signal_count": 0,
+            "hidden_custom_signal_count": 0,
+            "available_custom_signal_freqs": [],
+            "hidden_reasons": ["board_heat_chart_has_no_direct_custom_signal"],
+            "related_custom_signals": related_custom_signals,
         }
 
     async def fallback_to_carrier(reason: str) -> Dict[str, Any]:
@@ -3601,6 +3778,13 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
         "analysis_target": analysis_target,
         "candidate_groups": candidate_groups,
         "candidate_stocks": ordered_candidates,
+        "custom_signal_count": 0,
+        "direct_custom_signal_count": 0,
+        "visible_custom_signal_count": 0,
+        "hidden_custom_signal_count": 0,
+        "available_custom_signal_freqs": [],
+        "hidden_reasons": ["industry_chart_has_no_direct_custom_signal"],
+        "related_custom_signals": _related_custom_signals_from_candidates(ordered_candidates, requested_freq),
     }
 
 
@@ -3632,6 +3816,7 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
         heat_target_label = _text(latest_heat.get("heat_target_label")) or name
         heat_resolution_status = _text(latest_heat.get("heat_resolution_status")) or ("exact" if heat_target_label == name else "unresolved")
         heat_ready = _chart_has_ohlcv(chart)
+        related_custom_signals = _related_custom_signals_from_candidates(ordered_candidates, requested_freq)
         return {
             "target": {
                 "kind": "concept",
@@ -3693,6 +3878,13 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
             "analysis_target": "",
             "candidate_groups": candidate_groups,
             "candidate_stocks": ordered_candidates,
+            "custom_signal_count": 0,
+            "direct_custom_signal_count": 0,
+            "visible_custom_signal_count": 0,
+            "hidden_custom_signal_count": 0,
+            "available_custom_signal_freqs": [],
+            "hidden_reasons": ["board_heat_chart_has_no_direct_custom_signal"],
+            "related_custom_signals": related_custom_signals,
         }
     constituent_candidates = [
         item for item in carrier_candidates
@@ -3869,6 +4061,13 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
         "analysis_target": "",
         "candidate_groups": candidate_groups,
         "candidate_stocks": ordered_candidates,
+        "custom_signal_count": 0,
+        "direct_custom_signal_count": 0,
+        "visible_custom_signal_count": 0,
+        "hidden_custom_signal_count": 0,
+        "available_custom_signal_freqs": [],
+        "hidden_reasons": ["concept_has_no_direct_custom_signal"],
+        "related_custom_signals": _related_custom_signals_from_candidates(ordered_candidates, requested_freq),
     }
 
 
@@ -3886,6 +4085,7 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
         chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)
     chart = _mark_chart_readiness(chart, kind="stock", requested_freq=requested_freq)
     chart = _merge_signal_pool_into_chart(chart, symbol, chart.get("meta", {}).get("freq", requested_freq))
+    custom_signal_diagnostics = _custom_signal_diagnostics(symbol, requested_freq, chart.get("signals", []))
     try:
         stock = _unwrap_response(analyze_stock(symbol))
     except Exception as exc:
@@ -3925,6 +4125,8 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
         "analysis_target": symbol,
         "candidate_stocks": [],
         "stock_analysis": stock,
+        **custom_signal_diagnostics,
+        "related_custom_signals": [],
     }
 
 

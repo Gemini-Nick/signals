@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
+from signals.sync import provider_limits
 from signals.sync.modules import stock_daily
 
 
@@ -28,6 +30,13 @@ class _DB(dict):
         if name not in self:
             self[name] = _Collection()
         return dict.__getitem__(self, name)
+
+
+@pytest.fixture(autouse=True)
+def _clear_provider_state():
+    provider_limits._STATES.clear()
+    yield
+    provider_limits._STATES.clear()
 
 
 def test_stock_daily_uses_tencent_primary_without_akshare(monkeypatch):

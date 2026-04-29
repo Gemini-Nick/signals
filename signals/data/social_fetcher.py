@@ -324,6 +324,47 @@ def search_concepts(keyword: str) -> List[Dict]:
             for _, row in matches.iterrows()]
 
 
+def _cached_concept_theme(concept_name: str) -> Optional[ConceptTheme]:
+    """Use Mongo concept_constituents cache before hitting realtime Eastmoney."""
+    try:
+        from signals.data.gateway import get_concept_constituents
+        from signals.data.models import DataRequest
+
+        response = get_concept_constituents(DataRequest(
+            domain="constituents",
+            mode="historical",
+            market="A",
+            concept_name=concept_name,
+            purpose="social_theme",
+            allow_stale=True,
+        ))
+    except Exception:
+        return None
+    docs = response.data or []
+    if not docs:
+        return None
+    doc = dict(docs[0])
+    symbols = doc.get("symbols") or []
+    stock_names = doc.get("stock_names") or {}
+    if not isinstance(symbols, list) or not symbols:
+        return None
+    stocks = [
+        {
+            "code": str(symbol).split(".")[-1],
+            "name": str(stock_names.get(symbol) or stock_names.get(str(symbol).split(".")[-1]) or ""),
+            "price": 0.0,
+            "change_pct": 0.0,
+        }
+        for symbol in symbols
+    ]
+    return ConceptTheme(
+        name=concept_name,
+        code=str(doc.get("code") or ""),
+        stocks=stocks,
+        stock_count=len(stocks),
+    )
+
+
 def fetch_concept_stocks(concept_name: str) -> ConceptTheme:
     """
     获取概念板块成分股。
@@ -338,6 +379,9 @@ def fetch_concept_stocks(concept_name: str) -> ConceptTheme:
             stocks=cached["stocks"],
             stock_count=len(cached["stocks"]),
         )
+    mongo_cached = _cached_concept_theme(concept_name)
+    if mongo_cached and mongo_cached.stocks:
+        return mongo_cached
 
     import akshare as ak
 
@@ -402,6 +446,9 @@ def fetch_concept_stocks(concept_name: str) -> ConceptTheme:
                 stocks=cached["stocks"],
                 stock_count=len(cached["stocks"]),
             )
+        mongo_cached = _cached_concept_theme(concept_name)
+        if mongo_cached and mongo_cached.stocks:
+            return mongo_cached
         _log.warning(f"概念成分股 [{concept_name}] 获取失败且无可用缓存: {e}")
         return ConceptTheme(name=concept_name)
 

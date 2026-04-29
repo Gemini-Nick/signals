@@ -19,7 +19,7 @@ from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
 from ..proxy import em_proxy
-from ..provider_limits import provider_call
+from ..provider_limits import ProviderCoolingDown, provider_call, providers_all_cooling_down
 from ..retry import sync_retry
 from ..task_context import get_task_env
 from .daily_sources import fetch_tencent_daily
@@ -35,6 +35,11 @@ _PROVIDER_TIMEOUT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="s
 atexit.register(_PROVIDER_TIMEOUT_POOL.shutdown, wait=False, cancel_futures=True)
 _DEFAULT_PRIORITY_CODES = "688802,300575"
 _PROGRESS_META_ID = "stock_daily:progress:_meta"
+_STOCK_DAILY_PROVIDER_ENDPOINTS = (
+    ("tencent", "stock_daily"),
+    ("eastmoney", "stock_daily_hist"),
+    ("sina", "stock_daily"),
+)
 
 
 def _shard_count() -> int:
@@ -80,6 +85,106 @@ def _progress_interval() -> int:
     return max(1, int(os.getenv("STOCK_DAILY_PROGRESS_INTERVAL", "25")))
 
 
+def _write_batch_symbols() -> int:
+    return max(1, int(os.getenv("STOCK_DAILY_WRITE_BATCH_SYMBOLS", "20")))
+
+
+def _coerce_last_dt(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if value:
+        try:
+            return datetime.strptime(str(value)[:10], "%Y-%m-%d")
+        except ValueError:
+            try:
+                return pd.to_datetime(value).to_pydatetime()
+            except Exception:
+                return None
+    return None
+
+
+def _latest_daily_dates_by_symbol(db: Database, codes: list[str]) -> dict[str, datetime]:
+    if not codes:
+        return {}
+    try:
+        rows = db["bars"].aggregate([
+            {"$match": {"meta.freq": "日线", "meta.symbol": {"$in": codes}}},
+            {"$group": {"_id": "$meta.symbol", "latest_dt": {"$max": "$dt"}}},
+        ])
+        return {
+            str(row.get("_id")): row.get("latest_dt")
+            for row in rows
+            if row.get("_id") and isinstance(row.get("latest_dt"), datetime)
+        }
+    except Exception as exc:
+        logger.debug("读取 bars 日线最新日期失败: %s", exc)
+        return {}
+
+
+def _stock_daily_providers_all_cooling(db: Database | None) -> bool:
+    try:
+        return providers_all_cooling_down(db, _STOCK_DAILY_PROVIDER_ENDPOINTS)
+    except Exception:
+        return False
+
+
+def _write_daily_docs_batch(bars_col, sync_col, docs_by_code: dict[str, list]) -> dict[str, int]:
+    """Write several symbols in one Mongo round trip and update per-symbol cursors."""
+    docs_by_code = {code: docs for code, docs in docs_by_code.items() if docs}
+    if not docs_by_code:
+        return {}
+    all_docs = [doc for docs in docs_by_code.values() for doc in docs]
+    symbols = list(docs_by_code.keys())
+    dts = [doc["dt"] for doc in all_docs]
+    existing_keys: set[tuple[str, datetime]] = set()
+    try:
+        for item in bars_col.find(
+            {
+                "meta.symbol": {"$in": symbols},
+                "meta.freq": "日线",
+                "dt": {"$in": dts},
+            },
+            {"dt": 1, "meta.symbol": 1},
+        ):
+            symbol = str((item.get("meta") or {}).get("symbol") or "")
+            dt = item.get("dt")
+            if symbol and isinstance(dt, datetime):
+                existing_keys.add((symbol, dt))
+    except Exception as exc:
+        logger.debug("批量查询已有日线失败，继续尝试写入: %s", exc)
+
+    new_docs = [
+        doc for doc in all_docs
+        if (str((doc.get("meta") or {}).get("symbol") or ""), doc.get("dt")) not in existing_keys
+    ]
+    written_by_code = {code: 0 for code in docs_by_code}
+    if new_docs:
+        result = bars_col.insert_many(new_docs, ordered=False)
+        inserted_count = len(getattr(result, "inserted_ids", []) or [])
+        for doc in new_docs[:inserted_count]:
+            symbol = str((doc.get("meta") or {}).get("symbol") or "")
+            if symbol in written_by_code:
+                written_by_code[symbol] += 1
+
+    now = naive_market_now("A")
+    for code, docs in docs_by_code.items():
+        last = docs[-1]["dt"]
+        sync_col.update_one(
+            {"_id": f"stock_daily:{code}"},
+            {"$set": {
+                "module": "stock_daily",
+                "symbol": code,
+                "last_dt": last,
+                "last_run": now,
+                "status": "ok",
+                "bar_count": len(docs),
+                "written": written_by_code.get(code, 0),
+            }},
+            upsert=True,
+        )
+    return written_by_code
+
+
 def _write_progress(
     sync_col,
     *,
@@ -90,15 +195,21 @@ def _write_progress(
     inserted: int,
     skipped: int,
     errors_count: int,
+    deferred_count: int = 0,
     latest_symbol: str = "",
     latest_status: str = "",
     latest_written: int = 0,
+    started_at: datetime | None = None,
     shard_key: str | None = None,
     shard_index: int = 0,
     shard_count: int = 1,
     global_total: int | None = None,
 ) -> None:
     now = naive_market_now("A")
+    start = started_at or now
+    elapsed_seconds = max(0.0, (now - start).total_seconds())
+    inserted_per_min = round(inserted / (elapsed_seconds / 60), 2) if elapsed_seconds > 0 else 0.0
+    processed_per_min = round(processed / (elapsed_seconds / 60), 2) if elapsed_seconds > 0 else 0.0
     progress_pct = round(processed / total * 100, 2) if total else 0
     key = shard_key or _shard_key()
     sync_col.update_one(
@@ -117,9 +228,17 @@ def _write_progress(
             "inserted": inserted,
             "skipped": skipped,
             "errors": errors_count,
+            "deferred": deferred_count,
             "latest_symbol": latest_symbol,
             "latest_status": latest_status,
             "latest_written": latest_written,
+            "started_at": start,
+            "elapsed_seconds": round(elapsed_seconds, 2),
+            "inserted_per_min": inserted_per_min,
+            "processed_per_min": processed_per_min,
+            "landing_rate": inserted_per_min,
+            "missing_symbols": max(0, total - skipped - processed),
+            "deferred_symbols": deferred_count,
             "progress_pct": progress_pct,
             "heartbeat_at": now,
             "updated_at": now,
@@ -137,15 +256,18 @@ def _write_aggregate_progress(sync_col, *, scope: str) -> None:
             {"module": "stock_daily"},
             {
                 "status": 1,
+                "shard_key": 1,
                 "total": 1,
                 "processed": 1,
                 "inserted": 1,
                 "skipped": 1,
                 "errors": 1,
+                "deferred": 1,
                 "latest_symbol": 1,
                 "latest_status": 1,
                 "latest_written": 1,
                 "heartbeat_at": 1,
+                "started_at": 1,
                 "global_total": 1,
             },
         ))
@@ -159,7 +281,13 @@ def _write_aggregate_progress(sync_col, *, scope: str) -> None:
     inserted = sum(int(row.get("inserted") or 0) for row in rows)
     skipped = sum(int(row.get("skipped") or 0) for row in rows)
     errors_count = sum(int(row.get("errors") or 0) for row in rows)
+    deferred_count = sum(int(row.get("deferred") or 0) for row in rows)
     latest = max(rows, key=lambda row: row.get("heartbeat_at") or datetime.min)
+    started_values = [row.get("started_at") for row in rows if isinstance(row.get("started_at"), datetime)]
+    started_at = min(started_values) if started_values else now
+    elapsed_seconds = max(0.0, (now - started_at).total_seconds())
+    inserted_per_min = round(inserted / (elapsed_seconds / 60), 2) if elapsed_seconds > 0 else 0.0
+    processed_per_min = round(processed / (elapsed_seconds / 60), 2) if elapsed_seconds > 0 else 0.0
     statuses = {str(row.get("status") or "") for row in rows}
     status = "ok" if statuses == {"ok"} else "partial" if "partial" in statuses else "running"
     now = naive_market_now("A")
@@ -177,9 +305,17 @@ def _write_aggregate_progress(sync_col, *, scope: str) -> None:
             "inserted": inserted,
             "skipped": skipped,
             "errors": errors_count,
+            "deferred": deferred_count,
             "latest_symbol": latest.get("latest_symbol", ""),
             "latest_status": latest.get("latest_status", ""),
             "latest_written": latest.get("latest_written", 0),
+            "started_at": started_at,
+            "elapsed_seconds": round(elapsed_seconds, 2),
+            "inserted_per_min": inserted_per_min,
+            "processed_per_min": processed_per_min,
+            "landing_rate": inserted_per_min,
+            "missing_symbols": max(0, total - skipped - processed),
+            "deferred_symbols": deferred_count,
             "progress_pct": round(processed / total * 100, 2) if total else 0,
             "heartbeat_at": now,
             "updated_at": now,
@@ -493,12 +629,22 @@ def _docs_from_daily_df(code: str, df: pd.DataFrame, column_map: dict[str, str],
     return docs
 
 
+def _provider_failure(failures: list[tuple[str, BaseException]]) -> BaseException:
+    message = "; ".join(f"{name}={str(exc)[:160]}" for name, exc in failures)
+    if failures and all(isinstance(exc, ProviderCoolingDown) for _, exc in failures):
+        return ProviderCoolingDown(message)
+    return RuntimeError(message)
+
+
 def _sync_one_stock(code: str, last_dt: str, end_date: str,
                     proxy_url: str = None, db: Database | None = None) -> list:
     """同步单只股票日线，返回文档列表"""
     start = last_dt or "19900101"
     primary_source = os.getenv("STOCK_DAILY_PRIMARY_SOURCE", "tencent").lower()
+    failures: list[tuple[str, BaseException]] = []
+    attempted: set[str] = set()
     if primary_source == "tencent":
+        attempted.add("tencent")
         try:
             df = provider_call(
                 "tencent",
@@ -521,9 +667,11 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
                 "amount": "成交额",
             }, "tencent")
         except Exception as tencent_primary_exc:
+            failures.append(("tencent", tencent_primary_exc))
             logger.debug("tencent daily primary failed %s: %s", code, tencent_primary_exc)
 
     source = "eastmoney"
+    attempted.add("eastmoney")
     try:
         with em_proxy(proxy_url):
             df = provider_call(
@@ -548,8 +696,10 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
             "amount": "成交额",
         }
     except Exception as em_exc:
+        failures.append(("eastmoney", em_exc))
         source = "sina"
         prefix = "sh" if code.startswith(("5", "6", "9")) else ("bj" if code.startswith(("4", "8")) else "sz")
+        attempted.add("sina")
         try:
             df = provider_call(
                 "sina",
@@ -574,33 +724,35 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
                 "amount": "amount",
             }
         except Exception as sina_exc:
-            source = "tencent"
-            try:
-                df = provider_call(
-                    "tencent",
-                    "stock_daily",
-                    lambda: fetch_tencent_daily(
-                        code,
-                        start_date=start,
-                        end_date=end_date,
-                        timeout=float(os.getenv("STOCK_DAILY_TENCENT_TIMEOUT", "8")),
-                    ),
-                    db=db,
-                )
-                column_map = {
-                    "dt": "日期",
-                    "open": "开盘",
-                    "high": "最高",
-                    "low": "最低",
-                    "close": "收盘",
-                    "vol": "成交量",
-                    "amount": "成交额",
-                }
-            except Exception as tencent_exc:
-                raise RuntimeError(
-                    f"eastmoney={str(em_exc)[:160]}; sina={str(sina_exc)[:160]}; "
-                    f"tencent={str(tencent_exc)[:160]}"
-                ) from tencent_exc
+            failures.append(("sina", sina_exc))
+            if "tencent" not in attempted:
+                source = "tencent"
+                attempted.add("tencent")
+                try:
+                    df = provider_call(
+                        "tencent",
+                        "stock_daily",
+                        lambda: fetch_tencent_daily(
+                            code,
+                            start_date=start,
+                            end_date=end_date,
+                            timeout=float(os.getenv("STOCK_DAILY_TENCENT_TIMEOUT", "8")),
+                        ),
+                        db=db,
+                    )
+                    column_map = {
+                        "dt": "日期",
+                        "open": "开盘",
+                        "high": "最高",
+                        "low": "最低",
+                        "close": "收盘",
+                        "vol": "成交量",
+                        "amount": "成交额",
+                    }
+                    return _docs_from_daily_df(code, df, column_map, source)
+                except Exception as tencent_exc:
+                    failures.append(("tencent", tencent_exc))
+            raise _provider_failure(failures)
     return _docs_from_daily_df(code, df, column_map, source)
 
 
@@ -632,7 +784,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         len(codes), global_total, scope, shard_key,
     )
 
-    # 批量查询 sync_log
+    # 批量查询 sync_log，并用 bars 最新日期补齐，避免 sync_log 旧值导致重复打外部源。
     sync_docs = {
         doc["symbol"]: doc.get("last_dt")
         for doc in sync_col.find(
@@ -641,12 +793,19 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         )
         if doc.get("symbol")
     }
+    bars_latest = _latest_daily_dates_by_symbol(db, codes)
+    for code, latest_dt in bars_latest.items():
+        current = _coerce_last_dt(sync_docs.get(code))
+        if current is None or latest_dt > current:
+            sync_docs[code] = latest_dt
 
     total_inserted = 0
     total_skipped = 0
     processed_count = 0
     errors = []
+    deferred = []
     progress_interval = _progress_interval()
+    run_started_at = now
     _write_progress(
         sync_col,
         status="running",
@@ -656,6 +815,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         inserted=0,
         skipped=0,
         errors_count=0,
+        started_at=run_started_at,
         shard_key=shard_key,
         shard_index=shard_index,
         shard_count=shard_count,
@@ -664,18 +824,18 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
 
     def _process(code):
         last_dt_raw = sync_docs.get(code)
-        if last_dt_raw:
+        last_dt = _coerce_last_dt(last_dt_raw)
+        if last_dt:
             # 增量：从 last_dt 下一天开始
-            if isinstance(last_dt_raw, datetime):
-                inc_start = (last_dt_raw + timedelta(days=1)).strftime("%Y%m%d")
-            else:
-                inc_start = (datetime.strptime(str(last_dt_raw)[:10], "%Y-%m-%d")
-                             + timedelta(days=1)).strftime("%Y%m%d")
+            inc_start = (last_dt + timedelta(days=1)).strftime("%Y%m%d")
             if inc_start > end_date:
                 return code, [], "skip"
         else:
             # 全量：近 2 年
             inc_start = (now - timedelta(days=730)).strftime("%Y%m%d")
+
+        if _stock_daily_providers_all_cooling(db):
+            return code, [], "deferred/cooling_down:all_stock_daily_providers"
 
         try:
             try:
@@ -687,7 +847,21 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
             time.sleep(_CALL_INTERVAL)
             return code, docs, "ok"
         except Exception as e:
+            if isinstance(e, ProviderCoolingDown):
+                return code, [], f"deferred/cooling_down:{e}"
             return code, [], str(e)
+
+    pending_docs: dict[str, list] = {}
+    write_batch_symbols = _write_batch_symbols()
+
+    def _flush_pending() -> int:
+        nonlocal pending_docs
+        if not pending_docs:
+            return 0
+        batch = pending_docs
+        pending_docs = {}
+        written_by_code = _write_daily_docs_batch(bars_col, sync_col, batch)
+        return sum(int(value or 0) for value in written_by_code.values())
 
     # 并行拉取
     with ThreadPoolExecutor(max_workers=_BATCH_WORKERS) as executor:
@@ -704,74 +878,80 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
                 if status == "skip":
                     total_skipped += 1
                 elif status == "ok" and docs:
-                    # 写入 MongoDB
-                    existing_dts = {
-                        item.get("dt")
-                        for item in bars_col.find(
-                            {
-                                "meta.symbol": code,
-                                "meta.freq": "日线",
-                                "dt": {"$in": [doc["dt"] for doc in docs]},
-                            },
-                            {"dt": 1},
-                        )
-                    }
-                    new_docs = [doc for doc in docs if doc["dt"] not in existing_dts]
-                    written = 0
-                    if new_docs:
-                        result = bars_col.insert_many(new_docs, ordered=False)
-                        written = len(result.inserted_ids)
-                    latest_written = written
-                    total_inserted += written
-                    # 更新 sync_log
-                    last = docs[-1]["dt"]
-                    sync_col.update_one(
-                        {"_id": f"stock_daily:{code}"},
-                        {"$set": {
-                            "module": "stock_daily",
-                            "symbol": code,
-                            "last_dt": last,
-                            "last_run": naive_market_now("A"),
-                            "status": "ok",
-                            "bar_count": len(docs),
-                            "written": written,
-                        }},
-                        upsert=True,
-                    )
+                    pending_docs[code] = docs
+                    if len(pending_docs) >= write_batch_symbols:
+                        latest_written = _flush_pending()
+                        total_inserted += latest_written
                 elif status != "ok":
-                    errors.append((code, str(status)[:240]))
+                    if str(status).startswith("deferred/"):
+                        deferred.append((code, str(status)[:240]))
+                    else:
+                        errors.append((code, str(status)[:240]))
             except Exception as e:
-                errors.append((code, str(e)[:240]))
+                if isinstance(e, ProviderCoolingDown):
+                    deferred.append((code, str(e)[:240]))
+                    latest_status = f"deferred/cooling_down:{str(e)[:200]}"
+                else:
+                    errors.append((code, str(e)[:240]))
             finally:
                 processed_count += 1
                 if processed_count % progress_interval == 0 or processed_count == len(codes):
+                    final_partial = bool(errors or deferred)
                     _write_progress(
                         sync_col,
-                        status="running" if processed_count < len(codes) else ("partial" if errors else "ok"),
+                        status="running" if processed_count < len(codes) else ("partial" if final_partial else "ok"),
                         scope=scope,
                         total=len(codes),
                         processed=processed_count,
                         inserted=total_inserted,
                         skipped=total_skipped,
                         errors_count=len(errors),
+                        deferred_count=len(deferred),
                         latest_symbol=latest_symbol,
                         latest_status=latest_status,
                         latest_written=latest_written,
+                        started_at=run_started_at,
                         shard_key=shard_key,
                         shard_index=shard_index,
                         shard_count=shard_count,
                         global_total=global_total,
                     )
 
+    total_inserted += _flush_pending()
+    _write_progress(
+        sync_col,
+        status="partial" if errors or deferred else "ok",
+        scope=scope,
+        total=len(codes),
+        processed=processed_count,
+        inserted=total_inserted,
+        skipped=total_skipped,
+        errors_count=len(errors),
+        deferred_count=len(deferred),
+        latest_symbol=(codes[-1] if codes else ""),
+        latest_status="final_flush",
+        latest_written=0,
+        started_at=run_started_at,
+        shard_key=shard_key,
+        shard_index=shard_index,
+        shard_count=shard_count,
+        global_total=global_total,
+    )
+
     logger.info(f"A股日线完成: +{total_inserted} bars, "
-                f"{total_skipped} 已最新, {len(errors)} 失败")
+                f"{total_skipped} 已最新, {len(errors)} 失败, {len(deferred)} deferred")
     if errors[:5]:
         logger.warning(f"前 5 个错误: {errors[:5]}")
+    if deferred[:5]:
+        logger.info(f"前 5 个 deferred/cooling_down: {deferred[:5]}")
 
     return {
+        "status": "partial" if errors or deferred else "ok",
         "inserted": total_inserted,
         "skipped": total_skipped,
         "errors": len(errors),
+        "deferred": len(deferred),
+        "cooling_down": len(deferred),
         "scope": scope,
         "shard_key": shard_key,
         "shard_index": shard_index,
@@ -781,7 +961,9 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         "processed": processed_count,
         "total": len(codes),
         "expected_codes": len(codes),
-        "covered_codes": max(0, len(codes) - len(errors)),
-        "coverage_pct": round((max(0, len(codes) - len(errors)) / len(codes) * 100), 2) if codes else 0,
+        "covered_codes": max(0, len(codes) - len(errors) - len(deferred)),
+        "coverage_pct": round((max(0, len(codes) - len(errors) - len(deferred)) / len(codes) * 100), 2) if codes else 0,
         "progress_pct": round((processed_count / len(codes) * 100), 2) if codes else 0,
+        "sample_errors": errors[:5],
+        "sample_deferred": deferred[:5],
     }

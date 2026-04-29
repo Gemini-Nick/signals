@@ -8,9 +8,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
+from pymongo import UpdateOne
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
+from signals.sync.provider_limits import ProviderCoolingDown, provider_call
 
 logger = logging.getLogger("signals.sync.quote_snapshots")
 _EM_ENDPOINT = "https://push2delay.eastmoney.com/api/qt/stock/get"
@@ -225,24 +227,38 @@ def _quote_doc_from_em(symbol: str, payload: dict, now: datetime, trading_day: s
     }
 
 
-def _fetch_em_quote(symbol: str, timeout: float = 5.0) -> tuple[dict | None, float, str]:
+def _fetch_em_quote(db: Database, symbol: str, timeout: float = 5.0) -> tuple[dict | None, float, str]:
     start = time.monotonic()
     try:
         import requests
 
-        session = requests.Session()
-        session.trust_env = False
-        response = session.get(
-            _EM_ENDPOINT,
-            params={"secid": _secid_for_symbol(symbol), "fields": _EM_FIELDS},
-            timeout=timeout,
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+        def request_quote():
+            session = requests.Session()
+            session.trust_env = False
+            try:
+                return session.get(
+                    _EM_ENDPOINT,
+                    params={"secid": _secid_for_symbol(symbol), "fields": _EM_FIELDS},
+                    timeout=timeout,
+                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+                )
+            finally:
+                session.close()
+
+        response = provider_call(
+            "eastmoney",
+            "push2delay.stock.get",
+            request_quote,
+            db=db,
+            domain="quote",
         )
         response.raise_for_status()
         payload = response.json()
         if payload.get("rc") not in (0, None):
-            return None, (time.monotonic() - start) * 1000, f"rc={payload.get('rc')}"
+            raise ValueError(f"rc={payload.get('rc')}")
         return payload, (time.monotonic() - start) * 1000, ""
+    except ProviderCoolingDown as exc:
+        return None, (time.monotonic() - start) * 1000, f"provider_cooling_down:{exc}"
     except Exception as exc:
         return None, (time.monotonic() - start) * 1000, str(exc)
 
@@ -310,18 +326,19 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
     errors = []
     latest_dt = None
     timeout = float(os.getenv("QUOTE_PROVIDER_TIMEOUT", "5"))
-    max_workers = int(os.getenv("QUOTE_MAX_WORKERS", "8"))
+    max_workers = int(os.getenv("QUOTE_MAX_WORKERS", "2"))
 
     quote_results = {}
     latencies = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_fetch_em_quote, symbol, timeout): symbol for symbol in symbols}
+        futures = {executor.submit(_fetch_em_quote, db, symbol, timeout): symbol for symbol in symbols}
         for future in as_completed(futures):
             symbol = futures[future]
             payload, latency_ms, error = future.result()
             latencies.append(latency_ms)
             quote_results[symbol] = (payload, error)
 
+    ops = []
     for symbol in symbols:
         payload, error = quote_results.get(symbol, (None, "not_requested"))
         doc = _quote_doc_from_em(symbol, payload or {}, now, trading_day)
@@ -337,13 +354,17 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
             stale_count += 1
             latest_dt = max(latest_dt or dt_str, dt_str)
 
-        result = db["quote_snapshots"].update_one({"_id": doc["_id"]}, {"$set": doc}, upsert=True)
-        inserted += 1 if result.upserted_id else 0
-        modified += result.modified_count
+        ops.append(UpdateOne({"_id": doc["_id"]}, {"$set": doc}, upsert=True))
         processed += 1
 
+    if ops:
+        result = db["quote_snapshots"].bulk_write(ops, ordered=False)
+        inserted = int(result.upserted_count)
+        modified = int(result.modified_count)
+
     avg_latency = sum(latencies) / len(latencies) if latencies else 0
-    _write_provider_health(db, live_count > 0, avg_latency, errors[0][1] if errors else "")
+    if not quote_results:
+        _write_provider_health(db, False, avg_latency, "quote_snapshot_empty")
     _write_data_freshness(db, processed, latest_dt, live_count, stale_count)
     logger.info("quote snapshots: %d inserted, %d modified, %d live, %d stale", inserted, modified, live_count, stale_count)
     return {

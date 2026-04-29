@@ -88,10 +88,18 @@ def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict]) ->
     }
 
 
-def _fetch_index_docs(name: str, symbol: str, freq: str, period: str, proxy_url: str | None, tail_count: int) -> tuple[list[dict], str]:
+def _fetch_index_docs(
+    db: Database,
+    name: str,
+    symbol: str,
+    freq: str,
+    period: str,
+    proxy_url: str | None,
+    tail_count: int,
+) -> tuple[list[dict], str]:
     pure_code = symbol.replace("sh", "").replace("sz", "")
     try:
-        df, source = fetch_public_minute(symbol, period, timeout=_PUBLIC_TIMEOUT, datalen=tail_count, count=tail_count)
+        df, source = fetch_public_minute(symbol, period, timeout=_PUBLIC_TIMEOUT, datalen=tail_count, count=tail_count, db=db)
     except Exception as public_error:
         if not _ENABLE_EASTMONEY_FALLBACK:
             logger.warning("公共指数分钟线失败，跳过东财兜底 %s %s: %s", symbol, freq, public_error)
@@ -143,7 +151,7 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
 
     def sync_one(name: str, symbol: str, freq: str, period: str) -> dict:
         started = time.monotonic()
-        docs, source = _fetch_index_docs(name, symbol, freq, period, proxy_url, tail_counts[freq])
+        docs, source = _fetch_index_docs(db, name, symbol, freq, period, proxy_url, tail_counts[freq])
         time.sleep(_CALL_INTERVAL)
         if not docs:
             sync_col.update_one(

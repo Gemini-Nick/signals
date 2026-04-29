@@ -15,6 +15,7 @@ from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
 
+from ..provider_limits import provider_call
 from ..retry import sync_retry
 from .board_ranking import _fetch_em_board_names_resilient, _health
 
@@ -75,7 +76,13 @@ def _sync_heat_kind(db: Database, *, kind: str, proxy_url: str | None = None) ->
     domain = "concept" if kind == "concept" else "board"
     endpoint = f"push2delay_clist_{source_kind}"
     try:
-        df = _fetch_em_board_names_resilient(source_kind)
+        df = provider_call(
+            "eastmoney",
+            endpoint,
+            lambda: _fetch_em_board_names_resilient(source_kind),
+            db=db,
+            domain=domain,
+        )
         docs = _tick_docs(df, kind=kind, now=now)
         if not docs:
             _health(db, "em", endpoint, domain, False, "empty")
