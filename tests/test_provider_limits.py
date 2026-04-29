@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from signals.sync import provider_limits
+from signals.sync.task_context import task_env
 
 
 class _Collection:
@@ -125,6 +126,13 @@ def test_dotted_endpoint_uses_safe_env_name(monkeypatch):
     state = provider_limits._state("eastmoney", "push2delay.stock.get", "quote")
 
     assert state.capacity == 3
+
+
+def test_provider_jitter_reads_task_env(monkeypatch):
+    monkeypatch.delenv("SIGNALS_PROVIDER_JITTER_SECONDS", raising=False)
+
+    with task_env({"SIGNALS_PROVIDER_JITTER_SECONDS": "0,0.15"}):
+        assert provider_limits._jitter_seconds() == (0.0, 0.15)
 
 
 def test_providers_all_cooling_down_uses_provider_health(monkeypatch):

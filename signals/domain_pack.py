@@ -546,15 +546,21 @@ class SignalsPack:
             rows.append(row)
 
         task_count = len(rows)
-        progress_pct = round(sum(progress_values) / task_count, 2) if task_count and progress_values else (
-            round(completed / task_count * 100, 2) if task_count else 0
-        )
-        eta_seconds = self._postmarket_eta_seconds(rows, progress_pct, run.get("started_at"))
+        run_status = str(run.get("status") or "")
+        all_tasks_ok = bool(task_count and completed == task_count and set(status_counts) <= {"ok"})
+        if run_status == "ok" or all_tasks_ok:
+            progress_pct = 100.0
+            eta_seconds = 0
+        else:
+            progress_pct = round(sum(progress_values) / task_count, 2) if task_count and progress_values else (
+                round(completed / task_count * 100, 2) if task_count else 0
+            )
+            eta_seconds = self._postmarket_eta_seconds(rows, progress_pct, run.get("started_at"))
         return {
             "run": {
                 "run_id": run_id,
                 "trade_date": str(run.get("trade_date") or ""),
-                "status": str(run.get("status") or ""),
+                "status": run_status,
                 "phase": str(run.get("phase") or ""),
                 "owner_pid": run.get("owner_pid") or "",
                 "started_at": self._iso(run.get("started_at")),

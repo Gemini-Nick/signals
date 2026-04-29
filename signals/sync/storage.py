@@ -42,6 +42,19 @@ def _drop_ttl_indexes(collection) -> None:
         logger.warning("drop ttl indexes failed for %s: %s", collection.name, exc)
 
 
+def _drop_index_if_present(collection, name: str) -> None:
+    try:
+        if name in collection.index_information():
+            collection.drop_index(name)
+            logger.info("dropped legacy index %s on %s", name, collection.name)
+    except OperationFailure as exc:
+        if getattr(exc, "code", None) == 27:
+            return
+        logger.warning("drop legacy index failed for %s.%s: %s", collection.name, name, exc)
+    except PyMongoError as exc:
+        logger.warning("drop legacy index failed for %s.%s: %s", collection.name, name, exc)
+
+
 def _cleanup_legacy_freshness_docs(db: Database) -> None:
     """Remove module-name freshness rows that duplicate the canonical domains."""
     legacy_pairs = [
@@ -85,6 +98,9 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["minute_readiness"], [("trade_date", ASCENDING), ("domain", ASCENDING), ("symbol", ASCENDING), ("freq", ASCENDING)])
     _safe_create_index(db["minute_preheat_universe"], [("trade_date", ASCENDING), ("status", ASCENDING), ("order", ASCENDING)])
     _safe_create_index(db["minute_preheat_universe"], [("trade_date", ASCENDING), ("symbol", ASCENDING)], unique=True, sparse=True)
+    _safe_create_index(db["fullmarket_spot_snapshots"], [("date_key", ASCENDING), ("code", ASCENDING)], unique=True)
+    _safe_create_index(db["fullmarket_spot_snapshots"], [("date_key", ASCENDING), ("symbol", ASCENDING)])
+    _safe_create_index(db["fullmarket_spot_snapshots"], [("expires_at", ASCENDING)], expireAfterSeconds=0)
 
     for name in ("board_em", "board_ths", "board_sina", "concept_em", "concept_ths", "concept_sina"):
         _safe_create_index(db[name], [("expires_at", ASCENDING)], expireAfterSeconds=0)
@@ -110,7 +126,9 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["sync_tasks"], [("run_id", ASCENDING), ("phase", ASCENDING), ("status", ASCENDING), ("updated_at", ASCENDING)])
     _safe_create_index(db["sync_tasks"], [("module", ASCENDING), ("shard_key", ASCENDING), ("status", ASCENDING)])
     _safe_create_index(db["provider_health"], [("provider", ASCENDING), ("endpoint", ASCENDING), ("domain", ASCENDING)])
+    _drop_index_if_present(db["data_freshness"], "domain_1_market_1_mode_1_collection_1")
     _safe_create_index(db["data_freshness"], [("domain", ASCENDING), ("market", ASCENDING), ("mode", ASCENDING), ("lane", ASCENDING), ("collection", ASCENDING)])
+    _safe_create_index(db["data_freshness"], [("domain", ASCENDING), ("market", ASCENDING), ("mode", ASCENDING), ("collection", ASCENDING), ("freq", ASCENDING), ("shard_key", ASCENDING)])
     _cleanup_legacy_freshness_docs(db)
 
     db["data_freshness"].update_one(

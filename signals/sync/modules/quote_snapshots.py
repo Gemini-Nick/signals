@@ -227,6 +227,135 @@ def _quote_doc_from_em(symbol: str, payload: dict, now: datetime, trading_day: s
     }
 
 
+def _code_for_symbol(symbol: str) -> str:
+    raw = str(symbol or "").strip().upper()
+    if "." in raw:
+        return raw.split(".", 1)[-1]
+    if len(raw) >= 8 and raw[:2] in {"SH", "SZ", "BJ"}:
+        return raw[2:]
+    return raw.replace("SH", "").replace("SZ", "").replace("BJ", "")
+
+
+def _quote_doc_from_fullmarket_spot(symbol: str, row: dict, now: datetime, trading_day: str) -> dict | None:
+    price = row.get("price", row.get("latest"))
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0:
+        return None
+    code = str(row.get("code") or _code_for_symbol(symbol))
+    return {
+        "_id": f"{symbol}:latest",
+        "symbol": symbol,
+        "code": code,
+        "name": row.get("name") or "",
+        "dt": trading_day,
+        "snapshot_at": now,
+        "source": "fullmarket_spot_snapshot",
+        "freshness": "fresh",
+        "is_stale": False,
+        "stale_reason": "",
+        "open": row.get("open"),
+        "high": row.get("high"),
+        "low": row.get("low"),
+        "close": price,
+        "price": price,
+        "prev_close": row.get("prev_close"),
+        "change": row.get("change"),
+        "change_pct": row.get("change_pct"),
+        "turnover_pct": row.get("turnover_pct"),
+        "amplitude_pct": row.get("amplitude_pct"),
+        "vol": int(float(row.get("vol") or 0) * 100),
+        "amount": float(row.get("amount") or 0),
+        "market_cap": float(row.get("market_cap") or 0),
+        "float_market_cap": float(row.get("float_market_cap") or 0),
+        "expires_at": now + timedelta(days=3),
+    }
+
+
+def _read_fullmarket_spot_quotes(db: Database, symbols: list[str], trading_day: str, now: datetime) -> dict[str, dict]:
+    if not symbols:
+        return {}
+    date_key = str(trading_day or "").replace("-", "")[:8]
+    by_symbol: dict[str, str] = {}
+    codes: set[str] = set()
+    normalized_symbols: set[str] = set()
+    for symbol in symbols:
+        code = _code_for_symbol(symbol)
+        if code:
+            by_symbol[code] = symbol
+            codes.add(code)
+        for candidate in _symbol_candidates(symbol):
+            if "." in candidate:
+                normalized_symbols.add(candidate.upper())
+
+    def read_rows(date_key_value: str) -> list[dict]:
+        return list(db["fullmarket_spot_snapshots"].find(
+            {
+                "date_key": date_key_value,
+                "$or": [
+                    {"code": {"$in": list(codes)}},
+                    {"symbol": {"$in": list(normalized_symbols)}},
+                ],
+            },
+            {
+                "_id": 0,
+                "code": 1,
+                "symbol": 1,
+                "trade_date": 1,
+                "name": 1,
+                "latest": 1,
+                "price": 1,
+                "change": 1,
+                "change_pct": 1,
+                "turnover_pct": 1,
+                "amplitude_pct": 1,
+                "vol": 1,
+                "amount": 1,
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "prev_close": 1,
+                "market_cap": 1,
+                "float_market_cap": 1,
+            },
+        ))
+
+    try:
+        rows = read_rows(date_key)
+        if not rows:
+            latest = db["fullmarket_spot_snapshots"].find_one(
+                {},
+                {"date_key": 1},
+                sort=[("snapshot_at", -1)],
+            )
+            latest_date_key = str((latest or {}).get("date_key") or "")
+            if latest_date_key and latest_date_key != date_key:
+                rows = read_rows(latest_date_key)
+    except Exception as exc:
+        logger.debug("读取 fullmarket_spot_snapshots 失败，改用逐股 quote: %s", exc)
+        return {}
+
+    docs: dict[str, dict] = {}
+    symbol_set = set(symbols)
+    for row in rows:
+        code = str(row.get("code") or "")
+        candidates = []
+        if code and code in by_symbol:
+            candidates.append(by_symbol[code])
+        normalized = str(row.get("symbol") or "").upper()
+        if normalized in symbol_set:
+            candidates.append(normalized)
+        for symbol in candidates:
+            if symbol in docs:
+                continue
+            doc = _quote_doc_from_fullmarket_spot(symbol, row, now, str(row.get("trade_date") or trading_day))
+            if doc:
+                docs[symbol] = doc
+    return docs
+
+
 def _fetch_em_quote(db: Database, symbol: str, timeout: float = 5.0) -> tuple[dict | None, float, str]:
     start = time.monotonic()
     try:
@@ -328,18 +457,29 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
     timeout = float(os.getenv("QUOTE_PROVIDER_TIMEOUT", "5"))
     max_workers = int(os.getenv("QUOTE_MAX_WORKERS", "2"))
 
+    spot_docs = _read_fullmarket_spot_quotes(db, symbols, trading_day, now)
+    request_symbols = [symbol for symbol in symbols if symbol not in spot_docs]
     quote_results = {}
     latencies = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_fetch_em_quote, db, symbol, timeout): symbol for symbol in symbols}
-        for future in as_completed(futures):
-            symbol = futures[future]
-            payload, latency_ms, error = future.result()
-            latencies.append(latency_ms)
-            quote_results[symbol] = (payload, error)
+    if request_symbols:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_fetch_em_quote, db, symbol, timeout): symbol for symbol in request_symbols}
+            for future in as_completed(futures):
+                symbol = futures[future]
+                payload, latency_ms, error = future.result()
+                latencies.append(latency_ms)
+                quote_results[symbol] = (payload, error)
 
     ops = []
     for symbol in symbols:
+        doc = spot_docs.get(symbol)
+        if doc:
+            live_count += 1
+            latest_dt = max(latest_dt or trading_day, trading_day)
+            ops.append(UpdateOne({"_id": doc["_id"]}, {"$set": doc}, upsert=True))
+            processed += 1
+            continue
+
         payload, error = quote_results.get(symbol, (None, "not_requested"))
         doc = _quote_doc_from_em(symbol, payload or {}, now, trading_day)
         if doc:
@@ -373,6 +513,8 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
         "count": processed,
         "live": live_count,
         "stale": stale_count,
+        "spot_snapshot": len(spot_docs),
+        "requested": len(request_symbols),
         "errors": len(errors),
         "target_collection": "quote_snapshots",
     }

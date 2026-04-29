@@ -703,6 +703,52 @@ def _em_spot_clist_params(page: int, page_size: int) -> dict[str, str]:
     }
 
 
+def _read_persisted_spot_batch_df(db: Database | None, end_date: str) -> pd.DataFrame:
+    if db is None:
+        return pd.DataFrame()
+    try:
+        min_rows = int(os.getenv("STOCK_DAILY_SPOT_SNAPSHOT_MIN_ROWS", "3000"))
+    except (TypeError, ValueError):
+        min_rows = 3000
+    try:
+        rows = list(db["fullmarket_spot_snapshots"].find(
+            {"date_key": end_date},
+            {
+                "_id": 0,
+                "code": 1,
+                "price": 1,
+                "vol": 1,
+                "amount": 1,
+                "high": 1,
+                "low": 1,
+                "open": 1,
+                "prev_close": 1,
+            },
+        ))
+    except Exception as exc:
+        logger.debug("读取 fullmarket_spot_snapshots 失败，改用实时 clist: %s", exc)
+        return pd.DataFrame()
+    if len(rows) < min_rows:
+        return pd.DataFrame()
+    docs = []
+    for row in rows:
+        code = _pure_a_code(row.get("code"))
+        if not code:
+            continue
+        docs.append({
+            "代码": code,
+            "最新价": row.get("price"),
+            "成交量": row.get("vol"),
+            "成交额": row.get("amount"),
+            "最高": row.get("high"),
+            "最低": row.get("low"),
+            "今开": row.get("open"),
+            "昨收": row.get("prev_close"),
+            "_pure_code": code,
+        })
+    return pd.DataFrame(docs)
+
+
 def _fetch_eastmoney_spot_batch_df(db: Database | None, end_date: str) -> pd.DataFrame:
     """Fetch one full-market Eastmoney spot snapshot and cache it per process/date."""
     cache_key = f"{end_date}:{_EM_SPOT_CLIST_FIELDS}"
@@ -710,6 +756,11 @@ def _fetch_eastmoney_spot_batch_df(db: Database | None, end_date: str) -> pd.Dat
         cached = _SPOT_BATCH_CACHE.get(cache_key)
         if cached is not None:
             return cached.copy()
+
+        persisted = _read_persisted_spot_batch_df(db, end_date)
+        if not persisted.empty:
+            _SPOT_BATCH_CACHE[cache_key] = persisted
+            return persisted.copy()
 
         page_size = _spot_batch_page_size()
         timeout = _spot_batch_timeout()

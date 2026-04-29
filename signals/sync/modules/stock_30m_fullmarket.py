@@ -120,7 +120,10 @@ def sync_stock_30m_fullmarket(db: Database, proxy_url: str = None) -> dict:
     max_codes = _env_int("STOCK_30M_FULLMARKET_MAX_CODES_PER_RUN", 320, minimum=1, maximum=1000)
     tail_count = _env_int("STOCK_30M_FULLMARKET_TAIL_COUNT", max(min_bars, 320), minimum=min_bars, maximum=1200)
     require_today = _env_bool("STOCK_30M_FULLMARKET_REQUIRE_TODAY", True)
-    call_interval = float(os.getenv("STOCK_30M_FULLMARKET_CALL_INTERVAL", os.getenv("STOCK_MINUTE_CALL_INTERVAL", "0.5")))
+    call_interval = float(get_task_env(
+        "STOCK_30M_FULLMARKET_CALL_INTERVAL",
+        os.getenv("STOCK_30M_FULLMARKET_CALL_INTERVAL", os.getenv("STOCK_MINUTE_CALL_INTERVAL", "0.5")),
+    ) or "0.5")
 
     universe = _symbols_with_daily(db)
     shard_symbols = _shard_symbols(universe, shard_index, shard_count)

@@ -178,7 +178,9 @@ def get_last_trading_day(market: str = "A") -> str:
     - 周末/节假日 → 上一个工作日（周五）
     """
     from datetime import timedelta
-    now = datetime.now()
+    from signals.core.market_time import naive_market_now
+
+    now = naive_market_now(market)
     d = now
 
     # 如果是工作日且 A 股已开盘（9:30后），用今天
@@ -186,7 +188,7 @@ def get_last_trading_day(market: str = "A") -> str:
         return d.strftime("%Y-%m-%d")
 
     # 否则回退到上一个工作日
-    if d.weekday() < 5 and d.hour < 9:
+    if d.weekday() < 5 and (d.hour < 9 or (d.hour == 9 and d.minute < 30)):
         d -= timedelta(days=1)
     while d.weekday() >= 5:
         d -= timedelta(days=1)

@@ -5,6 +5,7 @@ from datetime import datetime
 
 import config
 from signals.sync.modules import stock_minute
+from signals.sync.task_context import task_env
 
 
 class _Cursor(list):
@@ -151,6 +152,22 @@ def test_postmarket_minute_scope_uses_expanded_candidate_cap(monkeypatch):
     assert stock_minute._selection_cap() == 360
 
 
+def test_postmarket_minute_freqs_read_task_env(monkeypatch):
+    monkeypatch.delenv("STOCK_MINUTE_FREQS", raising=False)
+    monkeypatch.delenv("SIGNALS_CURRENT_SYNC_LANE", raising=False)
+    monkeypatch.delenv("SIGNALS_CURRENT_SYNC_MARKET", raising=False)
+
+    with task_env({"STOCK_MINUTE_SCOPE": "postmarket_candidates", "STOCK_MINUTE_FREQS": "5min,15min"}):
+        assert stock_minute._active_minute_freqs() == ["5分钟", "15分钟"]
+
+
+def test_postmarket_minute_cap_reads_task_env(monkeypatch):
+    monkeypatch.delenv("STOCK_MINUTE_POSTMARKET_MAX_CODES", raising=False)
+
+    with task_env({"STOCK_MINUTE_SCOPE": "postmarket_candidates", "STOCK_MINUTE_POSTMARKET_MAX_CODES": "120"}):
+        assert stock_minute._selection_cap() == 120
+
+
 def test_postmarket_minute_selection_consumes_pending_universe_before_cached():
     selected, skipped = stock_minute._select_postmarket_minute_symbols(
         ["300001", "300002", "300003", "300004"],
@@ -224,3 +241,24 @@ def test_postmarket_minute_selection_merges_terminal_skipped_and_signal_sources(
     assert meta["source_counts"]["knowledge_market_views"] == 1
     assert meta["source_counts"]["chain_representatives"] == 1
     assert meta["source_counts"]["chain_domain_leaders"] == 1
+
+
+def test_split_current_minute_tasks_skips_already_closed_bars():
+    tasks = [("300001", "5分钟"), ("300001", "15分钟"), ("300002", "5分钟")]
+    expected = {
+        "5分钟": datetime(2026, 4, 29, 15, 0),
+        "15分钟": datetime(2026, 4, 29, 15, 0),
+    }
+    latest = {
+        ("300001", "5分钟"): datetime(2026, 4, 29, 15, 0),
+        ("300001", "15分钟"): datetime(2026, 4, 29, 14, 45),
+        ("300002", "5分钟"): datetime(2026, 4, 29, 15, 5),
+    }
+
+    pending, current = stock_minute._split_current_minute_tasks(tasks, latest, expected)
+
+    assert pending == [("300001", "15分钟")]
+    assert current == [
+        ("300001", "5分钟", datetime(2026, 4, 29, 15, 0)),
+        ("300002", "5分钟", datetime(2026, 4, 29, 15, 5)),
+    ]

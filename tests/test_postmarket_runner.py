@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 from signals.sync import postmarket as pm
 
 
 def test_default_postmarket_tasks_split_long_market_data_tasks():
+    spot = next(task for task in pm.POSTMARKET_TASKS if task.module == "fullmarket_spot_snapshot")
     stock_daily = [task for task in pm.POSTMARKET_TASKS if task.module == "stock_daily"]
     stock_30m = [task for task in pm.POSTMARKET_TASKS if task.module == "stock_30m_fullmarket"]
     board_cons = [task for task in pm.POSTMARKET_TASKS if task.module == "board_cons"]
@@ -12,16 +16,21 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     technical_scan = next(task for task in pm.POSTMARKET_TASKS if task.module == "technical_signal_scan")
     chain = next(task for task in pm.POSTMARKET_TASKS if task.module == "chain_heat_snapshots")
 
+    assert spot.phase == "market_data"
     assert len(stock_daily) == 16
     assert len(stock_30m) == 16
     assert {task.shard_key for task in stock_daily} == {f"shard_{idx:02d}" for idx in range(16)}
     assert {task.shard_key for task in stock_30m} == {f"shard_{idx:02d}" for idx in range(16)}
     assert all(task.env["STOCK_DAILY_SCOPE"] == "all" for task in stock_daily)
+    assert all(task.depends_on == ("fullmarket_spot_snapshot:all",) for task in stock_daily)
     assert all(task.task_key in technical_scan.depends_on for task in stock_30m)
     assert {task.shard_key for task in board_cons} == {"board", "concept"}
+    assert all(task.depends_on == ("board_ranking:all",) for task in board_cons)
     assert set(task.task_key for task in stock_daily).issubset(set(weekly.depends_on))
     assert not (set(task.task_key for task in board_cons) & set(chain.depends_on))
     assert chain.depends_on == ("board_ranking:all",)
+    stock_minute = next(task for task in pm.POSTMARKET_TASKS if task.module == "stock_minute")
+    assert stock_minute.env["STOCK_MINUTE_FREQS"] == "5min,15min"
 
 
 class _Cursor(list):
@@ -277,6 +286,122 @@ def test_postmarket_stock_daily_cooling_partial_unlocks_downstream(monkeypatch):
 
     result = runner.run_once(trade_date="2026-04-28")
 
-    assert result["status"] == "partial"
+    assert result["status"] == "ok"
     assert calls == ["stock_daily", "weekly_rollup"]
     assert db["sync_tasks"].docs["postmarket:2026-04-28:weekly_rollup:all"]["status"] == "ok"
+
+
+def test_postmarket_effectively_done_stock_daily_degraded_is_not_repeated(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00"),
+        pm.PostmarketTaskSpec("weekly_rollup", "derived", depends_on=("stock_daily:shard_00",)),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data", "derived"))
+
+    calls = []
+
+    def stock_daily(db, proxy_url=None):
+        calls.append("stock_daily")
+        return {"status": "ok", "processed": 10, "total": 10, "progress_pct": 100.0, "coverage_pct": 100.0, "errors": 0, "deferred": 0}
+
+    def weekly_rollup(db, proxy_url=None):
+        calls.append("weekly_rollup")
+        return {"status": "ok"}
+
+    db = _Db()
+    task_id = "postmarket:2026-04-28:stock_daily:shard_00"
+    db["sync_tasks"].docs[task_id] = {
+        "_id": task_id,
+        "run_id": "postmarket:2026-04-28",
+        "module": "stock_daily",
+        "task_key": "stock_daily:shard_00",
+        "phase": "market_data",
+        "shard_key": "shard_00",
+        "status": "degraded",
+        "attempts": 1,
+        "result_summary": {
+            "status": "degraded",
+            "result": {
+                "status": "ok",
+                "processed": 10,
+                "total": 10,
+                "progress_pct": 100.0,
+                "coverage_pct": 100.0,
+                "errors": 0,
+                "deferred": 0,
+            },
+        },
+    }
+    engine = _Engine(db, {"stock_daily": (stock_daily, ""), "weekly_rollup": (weekly_rollup, "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(resume_run_id="postmarket:2026-04-28")
+
+    assert result["status"] == "ok"
+    assert calls == ["weekly_rollup"]
+    assert db["sync_tasks"].docs[task_id]["attempts"] == 1
+
+
+def test_postmarket_semaphore_waiting_task_is_not_marked_running(monkeypatch):
+    tasks = (pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00"),)
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data",))
+    monkeypatch.setenv("SIGNALS_POSTMARKET_STOCK_DAILY_WORKERS", "1")
+
+    def stock_daily(db, proxy_url=None):
+        return {"status": "ok"}
+
+    db = _Db()
+    engine = _Engine(db, {"stock_daily": (stock_daily, "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+    runner._init_run("postmarket:2026-04-28", "2026-04-28")
+    runner._init_tasks("postmarket:2026-04-28", "2026-04-28")
+    sem = runner.module_semaphores["stock_daily"]
+    sem.acquire()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(runner._run_task, "postmarket:2026-04-28", tasks[0])
+            task = db["sync_tasks"].docs["postmarket:2026-04-28:stock_daily:shard_00"]
+            assert task["status"] == "pending"
+            sem.release()
+            assert future.result()["status"] == "ok"
+    finally:
+        try:
+            sem.release()
+        except ValueError:
+            pass
+
+
+def test_postmarket_heartbeats_running_tasks_during_long_phase(monkeypatch):
+    tasks = (pm.PostmarketTaskSpec("alpha", "market_data"),)
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data",))
+
+    def alpha(db, proxy_url=None):
+        task_id = "postmarket:2026-04-28:alpha:all"
+        deadline = time.time() + 1
+        while db["sync_tasks"].docs.get(task_id, {}).get("status") != "running" and time.time() < deadline:
+            time.sleep(0.001)
+        time.sleep(0.15)
+        return {"status": "ok"}
+
+    db = _Db()
+    engine = _Engine(db, {"alpha": (alpha, "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+    runner.heartbeat_seconds = 0.01
+    heartbeats = []
+    original = runner._heartbeat_running_tasks
+
+    def spy(run_id, phase=""):
+        count = original(run_id, phase)
+        heartbeats.append((run_id, phase, count))
+        return count
+
+    runner._heartbeat_running_tasks = spy
+
+    result = runner.run_once(trade_date="2026-04-28")
+
+    assert result["status"] == "ok"
+    assert any(count == 1 for _run_id, _phase, count in heartbeats)
+    assert db["sync_tasks"].docs["postmarket:2026-04-28:alpha:all"]["status"] == "ok"

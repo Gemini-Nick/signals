@@ -39,6 +39,7 @@ MODULE_TARGETS = {
     "cache_preheat": ("bars",),
     "signal_pool": ("signals",),
     "market_pools": ("market_pools",),
+    "fullmarket_spot_snapshot": ("fullmarket_spot_snapshots",),
     "quote_snapshots": ("quote_snapshots",),
     "strategy_snapshot": ("strategy_snapshots",),
     "stock_daily": ("bars",),
@@ -75,6 +76,7 @@ COLLECTION_DOMAINS = {
     "concept_constituents": "constituents",
     "quote_snapshots": "quote",
     "market_pools": "market_pool",
+    "fullmarket_spot_snapshots": "spot",
     "signals": "signal",
     "strategy_snapshots": "strategy",
 }
@@ -164,7 +166,7 @@ LIVE_PLAN_BY_MODULE = {
 }
 
 LANE_MAINTENANCE_PLANS = {
-    "stock_minute": LiveSyncPlan("stock_minute", "signal_lane", 24 * 60 * 60, 60 * 60, 240, 5),
+    "stock_minute": LiveSyncPlan("stock_minute", "signal_lane", 24 * 60 * 60, 60 * 60, 360, 5),
     "index_minute": LiveSyncPlan("index_minute", "signal_lane", 24 * 60 * 60, 60 * 60, 120, 6),
     "board_heat_minute": LiveSyncPlan("board_heat_minute", "board_lane", 24 * 60 * 60, 60 * 60, 180, 7),
     "concept_heat_minute": LiveSyncPlan("concept_heat_minute", "board_lane", 24 * 60 * 60, 60 * 60, 180, 8),

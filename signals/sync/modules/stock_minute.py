@@ -12,6 +12,7 @@ import os
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 import akshare as ak
 import pandas as pd
@@ -47,13 +48,24 @@ def _parse_freqs(raw: str) -> list[str]:
 
 def _int_env(name: str, default: int, *, min_value: int = 1, max_value: int | None = None) -> int:
     try:
-        value = int(os.getenv(name, str(default)))
+        value = int(get_task_env(name, os.getenv(name, str(default))) or default)
     except (TypeError, ValueError):
         value = default
     value = max(min_value, value)
     if max_value is not None:
         value = min(max_value, value)
     return value
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = get_task_env(name, os.getenv(name, ""))
+    if raw in (None, ""):
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_value(name: str, default: str = "") -> str:
+    return str(get_task_env(name, os.getenv(name, default)) or default)
 
 
 def _worker_count() -> int:
@@ -66,30 +78,30 @@ def _opening_phase() -> bool:
 
 
 def _active_minute_freqs() -> list[str]:
-    lane = os.getenv("SIGNALS_CURRENT_SYNC_LANE", "")
-    market = os.getenv("SIGNALS_CURRENT_SYNC_MARKET", "")
+    lane = _env_value("SIGNALS_CURRENT_SYNC_LANE")
+    market = _env_value("SIGNALS_CURRENT_SYNC_MARKET")
     if lane == "signal_lane" and market == "A" and not _postmarket_minute_scope():
-        all_freqs = os.getenv("STOCK_MINUTE_SIGNAL_ALL_FREQS", "false").strip().lower() in {"1", "true", "yes", "on"}
+        all_freqs = _env_value("STOCK_MINUTE_SIGNAL_ALL_FREQS", "false").strip().lower() in {"1", "true", "yes", "on"}
         if not all_freqs:
             return ["5分钟"]
-        values = _parse_freqs(os.getenv("STOCK_MINUTE_SIGNAL_FREQS", ""))
+        values = _parse_freqs(_env_value("STOCK_MINUTE_SIGNAL_FREQS"))
         if values:
             return values
 
-    configured = os.getenv("STOCK_MINUTE_FREQS", "").strip()
+    configured = _env_value("STOCK_MINUTE_FREQS").strip()
     if configured:
         values = _parse_freqs(configured)
         if values:
             return values
-    if _opening_phase() and os.getenv("STOCK_MINUTE_OPENING_ALL_FREQS", "false").lower() not in {"1", "true", "yes", "on"}:
+    if _opening_phase() and _env_value("STOCK_MINUTE_OPENING_ALL_FREQS", "false").lower() not in {"1", "true", "yes", "on"}:
         return ["5分钟"]
     return list(_MINUTE_FREQS)
 
 
 def _tail_count_for_freq(freq: str) -> int:
     suffix_map = {"5分钟": "5", "15分钟": "15", "30分钟": "30"}
-    lane = os.getenv("SIGNALS_CURRENT_SYNC_LANE", "")
-    market = os.getenv("SIGNALS_CURRENT_SYNC_MARKET", "")
+    lane = _env_value("SIGNALS_CURRENT_SYNC_LANE")
+    market = _env_value("SIGNALS_CURRENT_SYNC_MARKET")
     signal_lane = lane == "signal_lane" and market == "A" and not _postmarket_minute_scope()
     signal_defaults = {"5分钟": 80, "15分钟": 80, "30分钟": 80}
     default = signal_defaults.get(freq, 80) if signal_lane else _DEFAULT_TAIL_COUNTS.get(freq, 120)
@@ -190,8 +202,8 @@ def _env_symbol_values(*names: str, default: str = "") -> list[str]:
 def _selection_cap() -> int:
     if _postmarket_minute_scope():
         return _int_env("STOCK_MINUTE_POSTMARKET_MAX_CODES", 360, min_value=1, max_value=1000)
-    lane = os.getenv("SIGNALS_CURRENT_SYNC_LANE", "")
-    market = os.getenv("SIGNALS_CURRENT_SYNC_MARKET", "")
+    lane = _env_value("SIGNALS_CURRENT_SYNC_LANE")
+    market = _env_value("SIGNALS_CURRENT_SYNC_MARKET")
     if lane == "signal_lane":
         if market == "A":
             configured = int(os.getenv("STOCK_MINUTE_SIGNAL_MAX_CODES", "72"))
@@ -576,6 +588,56 @@ def _minute_universe_summary(db: Database, trade_date: str | None = None) -> dic
     }
 
 
+def _postmarket_expected_latest_dt_by_freq(freqs: list[str]) -> dict[str, datetime]:
+    """Expected A-share minute bar close after market close."""
+    now = naive_market_now("A")
+    close_dt = datetime(now.year, now.month, now.day, 15, 0)
+    return {freq: close_dt for freq in freqs}
+
+
+def _latest_minute_dates_by_symbol_freq(
+    db: Database,
+    symbols: list[str],
+    freqs: list[str],
+) -> dict[tuple[str, str], datetime]:
+    if not symbols or not freqs:
+        return {}
+    try:
+        rows = db["bars"].aggregate([
+            {"$match": {"meta.symbol": {"$in": symbols}, "meta.freq": {"$in": freqs}}},
+            {"$group": {"_id": {"symbol": "$meta.symbol", "freq": "$meta.freq"}, "latest_dt": {"$max": "$dt"}}},
+        ])
+    except Exception as exc:
+        logger.debug("读取分钟线最新日期失败，继续按需请求: %s", exc)
+        return {}
+    result: dict[tuple[str, str], datetime] = {}
+    for row in rows:
+        key = row.get("_id") or {}
+        symbol = _pure_a_code(key.get("symbol"))
+        freq = str(key.get("freq") or "")
+        latest_dt = row.get("latest_dt")
+        if symbol and freq and isinstance(latest_dt, datetime):
+            result[(symbol, freq)] = latest_dt
+    return result
+
+
+def _split_current_minute_tasks(
+    tasks: list[tuple[str, str]],
+    latest_by_key: dict[tuple[str, str], datetime],
+    expected_by_freq: dict[str, datetime],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str, datetime]]]:
+    pending: list[tuple[str, str]] = []
+    current: list[tuple[str, str, datetime]] = []
+    for code, freq in tasks:
+        expected_dt = expected_by_freq.get(freq)
+        latest_dt = latest_by_key.get((code, freq))
+        if expected_dt is not None and latest_dt is not None and latest_dt >= expected_dt:
+            current.append((code, freq, latest_dt))
+        else:
+            pending.append((code, freq))
+    return pending, current
+
+
 def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
     """获取需要同步分钟线的活跃标的列表。
 
@@ -852,10 +914,24 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
     tail_counts = {freq: _tail_count_for_freq(freq) for freq in minute_freqs}
     total_written = 0
     total_skipped_existing = 0
+    total_skipped_current_calls = 0
     empty = 0
     errors = []
     per_symbol: dict[str, dict] = defaultdict(lambda: {"written": 0, "errors": 0, "freq_status": {}})
-    tasks = [(code, freq) for code in symbols for freq in minute_freqs]
+    planned_tasks = [(code, freq) for code in symbols for freq in minute_freqs]
+    tasks = planned_tasks
+    skipped_current_tasks: list[tuple[str, str, datetime]] = []
+    if postmarket_scope and _bool_env("STOCK_MINUTE_SKIP_CURRENT_CACHE", True):
+        latest_by_key = _latest_minute_dates_by_symbol_freq(db, symbols, minute_freqs)
+        tasks, skipped_current_tasks = _split_current_minute_tasks(
+            planned_tasks,
+            latest_by_key,
+            _postmarket_expected_latest_dt_by_freq(minute_freqs),
+        )
+        total_skipped_current_calls = len(skipped_current_tasks)
+        for code, freq, _latest_dt in skipped_current_tasks:
+            per_symbol[code]["freq_status"][freq] = "ok"
+
     sync_col.update_one(
         {"_id": "stock_minute:_meta"},
         {"$set": {
@@ -863,12 +939,16 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
             "status": "running",
             "last_run": naive_market_now("A"),
             "selected": len(symbols),
-            "planned_calls": len(tasks),
+            "planned_calls": len(planned_tasks),
+            "requested_calls": len(tasks),
+            "skipped_current_calls": total_skipped_current_calls,
             "minute_freqs": minute_freqs,
             "opening_phase": _opening_phase(),
             "result": {
                 "selected": len(symbols),
-                "planned_calls": len(tasks),
+                "planned_calls": len(planned_tasks),
+                "requested_calls": len(tasks),
+                "skipped_current_calls": total_skipped_current_calls,
                 "workers": workers,
                 "tail_counts": tail_counts,
                 "minute_freqs": minute_freqs,
@@ -998,7 +1078,9 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
             "opening_phase": _opening_phase(),
             "incremental": True,
             "write_mode": "insert_new",
-            "planned_calls": len(tasks),
+            "planned_calls": len(planned_tasks),
+            "requested_calls": len(tasks),
+            "skipped_current_calls": total_skipped_current_calls,
             "empty_calls": empty,
             "failed_calls": len(errors),
             "written": total_written,
@@ -1019,6 +1101,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
                 "inserted": total_written,
                 "written": total_written,
                 "skipped_existing": total_skipped_existing,
+                "skipped_current_calls": total_skipped_current_calls,
                 "errors": len(errors),
                 "empty": empty,
                 "selected": len(symbols),
@@ -1027,7 +1110,8 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
                 "workers": workers,
                 "tail_counts": tail_counts,
                 "minute_freqs": minute_freqs,
-                "planned_calls": len(tasks),
+                "planned_calls": len(planned_tasks),
+                "requested_calls": len(tasks),
                 "incremental": True,
                 "write_mode": "insert_new",
             },
@@ -1036,9 +1120,11 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
             "lane": os.getenv("SIGNALS_CURRENT_SYNC_LANE", ""),
             "market": os.getenv("SIGNALS_CURRENT_SYNC_MARKET", ""),
             "selected": len(symbols),
-            "planned_calls": len(tasks),
+            "planned_calls": len(planned_tasks),
+            "requested_calls": len(tasks),
             "written": total_written,
             "skipped_existing": total_skipped_existing,
+            "skipped_current_calls": total_skipped_current_calls,
             "failed_calls": len(errors),
             "empty_calls": empty,
             "minute_freqs": minute_freqs,
@@ -1048,13 +1134,14 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
     )
 
     logger.info(
-        "分钟线完成: %d calls, inserted=%d skipped_existing=%d empty=%d failed=%d, %d cap跳过",
-        len(tasks), total_written, total_skipped_existing, empty, len(errors), len(skipped_symbols),
+        "分钟线完成: %d/%d calls, inserted=%d skipped_existing=%d skipped_current=%d empty=%d failed=%d, %d cap跳过",
+        len(tasks), len(planned_tasks), total_written, total_skipped_existing, total_skipped_current_calls, empty, len(errors), len(skipped_symbols),
     )
     return {
         "inserted": total_written,
         "written": total_written,
         "skipped_existing": total_skipped_existing,
+        "skipped_current_calls": total_skipped_current_calls,
         "errors": len(errors),
         "empty": empty,
         "selected": len(symbols),
@@ -1072,7 +1159,8 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
         "tail_counts": tail_counts,
         "minute_freqs": minute_freqs,
         "opening_phase": _opening_phase(),
-        "planned_calls": len(tasks),
+        "planned_calls": len(planned_tasks),
+        "requested_calls": len(tasks),
         "incremental": True,
         "write_mode": "insert_new",
     }

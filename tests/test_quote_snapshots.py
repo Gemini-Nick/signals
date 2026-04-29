@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from signals.sync.modules.quote_snapshots import _quote_doc_from_em, _secid_for_symbol
+from signals.sync.modules.quote_snapshots import _quote_doc_from_em, _read_fullmarket_spot_quotes, _secid_for_symbol
 
 
 def test_eastmoney_secid_for_prefixed_symbols():
@@ -42,3 +42,84 @@ def test_quote_doc_from_eastmoney_payload_scales_fields():
     assert doc["prev_close"] == 19.43
     assert doc["change_pct"] == 1.24
     assert doc["vol"] == 30498700
+
+
+class _Collection:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def find(self, query=None, projection=None):
+        query = query or {}
+        date_key = query.get("date_key")
+        wanted_codes = set()
+        wanted_symbols = set()
+        for item in query.get("$or", []):
+            if "code" in item:
+                wanted_codes.update(item["code"].get("$in", []))
+            if "symbol" in item:
+                wanted_symbols.update(item["symbol"].get("$in", []))
+        return [
+            row for row in self.rows
+            if row.get("date_key") == date_key
+            and (row.get("code") in wanted_codes or row.get("symbol") in wanted_symbols)
+        ]
+
+    def find_one(self, query=None, projection=None, sort=None):
+        if not self.rows:
+            return None
+        if sort:
+            return self.rows[-1]
+        return self.rows[0]
+
+
+class _Db(dict):
+    def __getitem__(self, key):
+        return dict.__getitem__(self, key)
+
+
+def test_quote_snapshots_reads_fullmarket_spot_snapshot():
+    db = _Db({
+        "fullmarket_spot_snapshots": _Collection([
+            {
+                "date_key": "20260429",
+                "trade_date": "2026-04-29",
+                "code": "601958",
+                "symbol": "SH.601958",
+                "name": "金钼股份",
+                "price": 19.67,
+                "prev_close": 19.43,
+                "change_pct": 1.24,
+                "vol": 304987,
+                "amount": 591786626.0,
+                "open": 19.33,
+                "high": 19.86,
+                "low": 18.98,
+            }
+        ])
+    })
+
+    docs = _read_fullmarket_spot_quotes(db, ["SH.601958"], "2026-04-29", datetime(2026, 4, 29, 16, 0))
+
+    doc = docs["SH.601958"]
+    assert doc["source"] == "fullmarket_spot_snapshot"
+    assert doc["freshness"] == "fresh"
+    assert doc["price"] == 19.67
+    assert doc["vol"] == 30498700
+
+
+def test_quote_snapshots_falls_back_to_latest_fullmarket_spot_snapshot():
+    db = _Db({
+        "fullmarket_spot_snapshots": _Collection([
+            {
+                "date_key": "20260429",
+                "trade_date": "2026-04-29",
+                "code": "601958",
+                "symbol": "SH.601958",
+                "price": 19.67,
+            }
+        ])
+    })
+
+    docs = _read_fullmarket_spot_quotes(db, ["SH.601958"], "2026-04-28", datetime(2026, 4, 29, 16, 0))
+
+    assert docs["SH.601958"]["dt"] == "2026-04-29"

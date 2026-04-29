@@ -6,7 +6,7 @@ import logging
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, time as dt_time, timedelta
 from typing import Any
@@ -53,6 +53,7 @@ def _stock_daily_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
             "stock_daily",
             "market_data",
             shard_key=f"shard_{idx:02d}",
+            depends_on=("fullmarket_spot_snapshot:all",),
             env={
                 "SIGNALS_SYNC_FULL_STOCK_DAILY": "true",
                 "STOCK_DAILY_SCOPE": "all",
@@ -67,8 +68,20 @@ def _stock_daily_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
 
 def _board_cons_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
     return (
-        PostmarketTaskSpec("board_cons", "market_data", shard_key="board", env={"BOARD_CONS_KIND": "board", "BOARD_CONS_SHARD_KEY": "board"}),
-        PostmarketTaskSpec("board_cons", "market_data", shard_key="concept", env={"BOARD_CONS_KIND": "concept", "BOARD_CONS_SHARD_KEY": "concept"}),
+        PostmarketTaskSpec(
+            "board_cons",
+            "market_data",
+            shard_key="board",
+            depends_on=("board_ranking:all",),
+            env={"BOARD_CONS_KIND": "board", "BOARD_CONS_SHARD_KEY": "board", "BOARD_CONS_BATCH_SIZE": "500"},
+        ),
+        PostmarketTaskSpec(
+            "board_cons",
+            "market_data",
+            shard_key="concept",
+            depends_on=("board_ranking:all",),
+            env={"BOARD_CONS_KIND": "concept", "BOARD_CONS_SHARD_KEY": "concept", "BOARD_CONS_BATCH_SIZE": "500"},
+        ),
     )
 
 
@@ -85,6 +98,8 @@ def _stock_30m_fullmarket_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
                 "STOCK_30M_FULLMARKET_SHARD_INDEX": str(idx),
                 "STOCK_30M_FULLMARKET_SHARD_KEY": f"shard_{idx:02d}",
                 "STOCK_30M_FULLMARKET_MAX_CODES_PER_RUN": "500",
+                "STOCK_30M_FULLMARKET_CALL_INTERVAL": "0.1",
+                "SIGNALS_PROVIDER_JITTER_SECONDS": "0,0.15",
             },
         )
         for idx in range(shard_count)
@@ -100,6 +115,7 @@ _STOCK_30M_DEPS = tuple(task.task_key for task in _STOCK_30M_TASKS)
 
 
 POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
+    PostmarketTaskSpec("fullmarket_spot_snapshot", "market_data"),
     PostmarketTaskSpec("market_pools", "market_data"),
     PostmarketTaskSpec("quote_snapshots", "market_data"),
     PostmarketTaskSpec("index_daily", "market_data"),
@@ -124,7 +140,11 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
         "stock_minute",
         "minute_preheat",
         depends_on=("terminal_realtime_pool:all",),
-        env={"STOCK_MINUTE_SCOPE": "postmarket_candidates"},
+        env={
+            "STOCK_MINUTE_SCOPE": "postmarket_candidates",
+            "STOCK_MINUTE_FREQS": "5min,15min",
+            "STOCK_MINUTE_POSTMARKET_MAX_CODES": "120",
+        },
     ),
     PostmarketTaskSpec("index_minute", "minute_preheat", depends_on=("terminal_realtime_pool:all",)),
     PostmarketTaskSpec("minute_readiness_probe", "minute_preheat", depends_on=("stock_minute:all", "index_minute:all")),
@@ -198,8 +218,11 @@ def _summarize_result(result: Any) -> dict[str, Any]:
         "lane",
         "inserted",
         "updated",
+        "count",
         "stocks",
         "symbols",
+        "spot_snapshot",
+        "requested",
         "candidates",
         "skipped",
         "errors",
@@ -219,6 +242,10 @@ def _summarize_result(result: Any) -> dict[str, Any]:
         "sample_deferred",
         "source_counts",
         "unmapped",
+        "skipped_fresh",
+        "skip_reason_counts",
+        "original_groups",
+        "incremental",
         "reason_counts",
         "result",
     }
@@ -283,6 +310,11 @@ def _dependency_status_ok(task_doc: dict[str, Any]) -> bool:
     return False
 
 
+def _task_effectively_done(task_doc: dict[str, Any]) -> bool:
+    """True when a previous task attempt is good enough to resume past."""
+    return _dependency_status_ok(task_doc)
+
+
 class PostmarketRunner:
     """Run the postmarket DAG and store task/run state in Mongo."""
 
@@ -292,7 +324,7 @@ class PostmarketRunner:
         self.max_workers = max_workers or _env_int("SIGNALS_POSTMARKET_WORKERS", 8, minimum=1)
         self.module_semaphores = {
             "stock_daily": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_STOCK_DAILY_WORKERS", 2, minimum=1)),
-            "stock_30m_fullmarket": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_STOCK_30M_WORKERS", 2, minimum=1)),
+            "stock_30m_fullmarket": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_STOCK_30M_WORKERS", 4, minimum=1)),
             "board_cons": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_BOARD_CONS_WORKERS", 2, minimum=1)),
         }
         self.owner_pid = os.getpid()
@@ -413,6 +445,23 @@ class PostmarketRunner:
             update["phase"] = phase
         self.db["sync_runs"].update_one({"_id": run_id}, {"$set": update}, upsert=True)
 
+    def _heartbeat_running_tasks(self, run_id: str, phase: str = "") -> int:
+        now = _naive_bj()
+        query = {"run_id": run_id, "status": "running", "owner_pid": self.owner_pid}
+        if phase:
+            query["phase"] = phase
+        task_ids = [
+            doc.get("_id")
+            for doc in self.db["sync_tasks"].find(query, {"_id": 1})
+            if doc.get("_id")
+        ]
+        for task_id in task_ids:
+            self.db["sync_tasks"].update_one(
+                {"_id": task_id},
+                {"$set": {"heartbeat_at": now, "updated_at": now}},
+            )
+        return len(task_ids)
+
     def _release_stale_running_tasks(self, run_id: str) -> int:
         now = _naive_bj()
         released = 0
@@ -503,8 +552,8 @@ class PostmarketRunner:
         return EnvGuard(env)
 
     def _run_task(self, run_id: str, spec: PostmarketTaskSpec) -> dict[str, Any]:
-        self._mark_task_started(run_id, spec)
         if spec.module not in self.engine.module_map:
+            self._mark_task_started(run_id, spec)
             result = {"module": spec.module, "status": "error", "error": "module_missing"}
             self._mark_task_finished(run_id, spec, result)
             return result
@@ -513,9 +562,11 @@ class PostmarketRunner:
         semaphore = self.module_semaphores.get(spec.module)
         with self._with_env(spec.env):
             if semaphore is None:
+                self._mark_task_started(run_id, spec)
                 result = self.engine.run_module(spec.module, fn, plan=plan)
             else:
                 with semaphore:
+                    self._mark_task_started(run_id, spec)
                     result = self.engine.run_module(spec.module, fn, plan=plan)
         self._mark_task_finished(run_id, spec, result)
         return result
@@ -551,7 +602,7 @@ class PostmarketRunner:
                     current = self._get_task(run_id, spec)
                     status = str(current.get("status") or "pending")
                     task_id = self._task_id(run_id, spec)
-                    if status in TASK_OK_STATUSES and not force:
+                    if _task_effectively_done(current) and not force:
                         continue
                     if task_id in attempted:
                         continue
@@ -570,20 +621,33 @@ class PostmarketRunner:
                 workers = min(self.max_workers, max(1, len(runnable)))
                 with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"postmarket-{phase}") as executor:
                     future_map = {executor.submit(self._run_task, run_id, spec): spec for spec in runnable}
-                    for future in as_completed(future_map):
-                        spec = future_map[future]
-                        attempted.add(self._task_id(run_id, spec))
-                        blocked.discard(spec.task_key)
+                    pending = set(future_map)
+                    while pending:
+                        done, pending = wait(
+                            pending,
+                            timeout=self.heartbeat_seconds,
+                            return_when=FIRST_COMPLETED,
+                        )
                         self._heartbeat(run_id, phase)
-                        try:
-                            results.append(future.result())
-                        except Exception as exc:
-                            result = {"module": spec.module, "status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
-                            self._mark_task_finished(run_id, spec, result)
-                            results.append(result)
+                        self._heartbeat_running_tasks(run_id, phase)
+                        if not done:
+                            continue
+                        for future in done:
+                            spec = future_map[future]
+                            attempted.add(self._task_id(run_id, spec))
+                            blocked.discard(spec.task_key)
+                            try:
+                                results.append(future.result())
+                            except Exception as exc:
+                                result = {"module": spec.module, "status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
+                                self._mark_task_finished(run_id, spec, result)
+                                results.append(result)
 
-        task_docs = list(self.db["sync_tasks"].find({"run_id": run_id}, {"module": 1, "status": 1, "phase": 1, "updated_at": 1}))
-        incomplete = [doc for doc in task_docs if doc.get("status") not in TASK_OK_STATUSES]
+        task_docs = list(self.db["sync_tasks"].find(
+            {"run_id": run_id},
+            {"module": 1, "status": 1, "phase": 1, "updated_at": 1, "result_summary": 1},
+        ))
+        incomplete = [doc for doc in task_docs if not _task_effectively_done(doc)]
         status = "ok" if not incomplete and not blocked else "partial"
         now = _naive_bj()
         self.db["sync_runs"].update_one(

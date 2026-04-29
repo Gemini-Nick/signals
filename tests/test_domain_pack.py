@@ -197,3 +197,39 @@ def test_live_low_latency_strict_status_and_stock_selection_merge(monkeypatch):
     assert stock["selected_symbols"] == ["688802", "300575"]
     blockers = pack._cache_blockers(live, {"tasks": []}, [])
     assert {item["module"] for item in blockers} >= {"stock_minute", "minute_readiness_probe", "market_pools", "concept_heat_minute"}
+
+
+def test_completed_postmarket_progress_is_done_even_with_stale_task_progress():
+    from signals.domain_pack import SignalsPack
+
+    db = _Db({
+        "sync_runs": _Collection([
+            {
+                "_id": "postmarket:2026-04-29",
+                "run_id": "postmarket:2026-04-29",
+                "trade_date": "2026-04-29",
+                "status": "ok",
+                "started_at": datetime(2026, 4, 29, 15, 35),
+                "finished_at": datetime(2026, 4, 29, 19, 14),
+            }
+        ]),
+        "sync_tasks": _Collection([
+            {
+                "_id": "postmarket:2026-04-29:stock_daily:shard_00",
+                "run_id": "postmarket:2026-04-29",
+                "module": "stock_daily",
+                "phase": "market_data",
+                "shard_key": "shard_00",
+                "status": "ok",
+                "order": 1,
+                "cursor": {"progress_pct": 20.0},
+            }
+        ]),
+    })
+    pack = SignalsPack()
+
+    postmarket = pack._cache_postmarket_backfill(db)
+
+    assert postmarket["summary"]["completed"] == 1
+    assert postmarket["summary"]["progress_pct"] == 100.0
+    assert postmarket["summary"]["eta_seconds"] == 0

@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from datetime import datetime
+
 from signals.sync.modules import board_cons
+from signals.sync.task_context import task_env
 
 
 class _Collection:
@@ -67,3 +70,63 @@ def test_board_cons_marks_unmapped_without_retrying_fallback(monkeypatch):
     assert result["source_counts"]["source_unmapped"] == 1
     assert db["board_constituents"].docs["未映射行业"]["status"] == "source_unmapped"
     assert db["sync_log"].docs["board_cons:_meta"]["sample_errors"] == []
+
+
+def test_board_cons_incremental_skips_fresh_constituents(monkeypatch):
+    db = _DB()
+    db["board_constituents"].docs["新鲜行业"] = {
+        "_id": "新鲜行业",
+        "status": "ok",
+        "symbols": ["600001"],
+        "stock_count": 1,
+        "updated_at": datetime(2026, 4, 29, 16, 0),
+    }
+    monkeypatch.setattr(board_cons, "_get_board_list", lambda _db: ["新鲜行业"])
+    monkeypatch.setattr(board_cons, "_get_concept_list", lambda _db: [])
+    monkeypatch.setattr(board_cons, "_now", lambda: datetime(2026, 4, 29, 17, 0))
+    monkeypatch.setattr(board_cons, "_batch_size", lambda: 1)
+
+    def fail_sync(*_args, **_kwargs):
+        raise AssertionError("fresh constituents should not be fetched")
+
+    monkeypatch.setattr(board_cons, "_sync_one_group", fail_sync)
+
+    result = board_cons.sync_board_cons(db)
+
+    assert result["status"] == "ok"
+    assert result["processed"] == 0
+    assert result["total_groups"] == 0
+    assert result["original_groups"] == 1
+    assert result["skipped_fresh"] == 1
+    assert result["skip_reason_counts"]["fresh_ok"] == 1
+    assert db["sync_log"].docs["board_cons:_meta"]["skipped_fresh"] == 1
+
+
+def test_board_cons_incremental_refreshes_stale_constituents(monkeypatch):
+    db = _DB()
+    db["board_constituents"].docs["过期行业"] = {
+        "_id": "过期行业",
+        "status": "ok",
+        "symbols": ["600001"],
+        "stock_count": 1,
+        "updated_at": datetime(2026, 4, 20, 16, 0),
+    }
+    monkeypatch.setattr(board_cons, "_get_board_list", lambda _db: ["过期行业"])
+    monkeypatch.setattr(board_cons, "_get_concept_list", lambda _db: [])
+    monkeypatch.setattr(board_cons, "_now", lambda: datetime(2026, 4, 29, 17, 0))
+    monkeypatch.setattr(board_cons, "_batch_size", lambda: 1)
+    monkeypatch.setattr(board_cons, "_max_runtime_seconds", lambda: 30)
+    monkeypatch.setattr(board_cons, "_CALL_INTERVAL", 0)
+    monkeypatch.setattr(board_cons, "_sync_one_group", lambda *_args, **_kwargs: (2, "em_delay"))
+
+    result = board_cons.sync_board_cons(db)
+
+    assert result["status"] == "ok"
+    assert result["processed"] == 1
+    assert result["total_groups"] == 1
+    assert result["skipped_fresh"] == 0
+
+
+def test_board_cons_batch_size_reads_task_env():
+    with task_env({"BOARD_CONS_BATCH_SIZE": "500"}):
+        assert board_cons._batch_size() == 500

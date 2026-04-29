@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Callable, Iterable, TypeVar
 
 from signals.core.market_time import naive_market_now
+from signals.sync.task_context import get_task_env
 
 T = TypeVar("T")
 
@@ -160,7 +161,7 @@ def _state(provider: str, endpoint: str, domain: str) -> ProviderState:
 
 
 def _jitter_seconds() -> tuple[float, float]:
-    raw = os.getenv("SIGNALS_PROVIDER_JITTER_SECONDS")
+    raw = get_task_env("SIGNALS_PROVIDER_JITTER_SECONDS")
     if raw is None and os.getenv("PYTEST_CURRENT_TEST"):
         return 0.0, 0.0
     raw = raw or "0.3,1.2"

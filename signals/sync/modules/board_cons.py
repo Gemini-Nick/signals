@@ -13,7 +13,7 @@ import os
 import atexit
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 
 import akshare as ak
@@ -53,15 +53,15 @@ def _call_provider(fn):
 
 
 def _batch_size() -> int:
-    return max(1, int(os.getenv("BOARD_CONS_BATCH_SIZE", "80")))
+    return max(1, int(get_task_env("BOARD_CONS_BATCH_SIZE", "80") or "80"))
 
 
 def _max_runtime_seconds() -> float:
-    return max(30.0, float(os.getenv("BOARD_CONS_MAX_RUNTIME_SECONDS", "720")))
+    return max(30.0, float(get_task_env("BOARD_CONS_MAX_RUNTIME_SECONDS", "720") or "720"))
 
 
 def _progress_interval() -> int:
-    return max(1, int(os.getenv("BOARD_CONS_PROGRESS_INTERVAL", "5")))
+    return max(1, int(get_task_env("BOARD_CONS_PROGRESS_INTERVAL", "5") or "5"))
 
 
 def _shard_kind() -> str:
@@ -82,7 +82,88 @@ def _meta_id(shard_key: str | None = None) -> str:
 
 
 def _eastmoney_map_max_pages() -> int:
-    return max(1, int(os.getenv("BOARD_CONS_EM_MAP_MAX_PAGES", "12")))
+    return max(1, int(get_task_env("BOARD_CONS_EM_MAP_MAX_PAGES", "12") or "12"))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = get_task_env(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_days(name: str, default: int) -> int:
+    try:
+        return max(0, int(get_task_env(name, str(default)) or str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _now() -> datetime:
+    return datetime.now()
+
+
+def _coerce_datetime(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    if not value:
+        return None
+    try:
+        parsed = pd.to_datetime(value).to_pydatetime()
+    except Exception:
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def _has_constituents(doc: dict) -> bool:
+    symbols = doc.get("symbols")
+    if isinstance(symbols, list) and symbols:
+        return True
+    try:
+        return int(doc.get("stock_count") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _collection_for_kind(kind: str) -> str:
+    return "concept_constituents" if kind == "concept" else "board_constituents"
+
+
+def _fresh_skip_reason(db: Database, *, kind: str, name: str, now: datetime) -> str:
+    doc = db[_collection_for_kind(kind)].find_one(
+        {"_id": name},
+        {"updated_at": 1, "status": 1, "symbols": 1, "stock_count": 1},
+    )
+    if not doc:
+        return ""
+    updated_at = _coerce_datetime(doc.get("updated_at"))
+    if not updated_at:
+        return ""
+    status = str(doc.get("status") or "").strip()
+    if status == "ok" and _has_constituents(doc):
+        if updated_at >= now - timedelta(days=_env_days("BOARD_CONS_OK_REFRESH_DAYS", 7)):
+            return "fresh_ok"
+    if status == "source_unmapped":
+        if updated_at >= now - timedelta(days=_env_days("BOARD_CONS_UNMAPPED_RETRY_DAYS", 7)):
+            return "fresh_source_unmapped"
+    return ""
+
+
+def _filter_due_groups(db: Database, groups: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], int, dict[str, int]]:
+    if not _env_bool("BOARD_CONS_INCREMENTAL", True) or _env_bool("BOARD_CONS_FORCE_REFRESH", False):
+        return groups, 0, {}
+    now = _now()
+    due: list[tuple[str, str]] = []
+    skipped = 0
+    skip_counts: dict[str, int] = {}
+    for kind, name in groups:
+        reason = _fresh_skip_reason(db, kind=kind, name=name, now=now)
+        if reason:
+            skipped += 1
+            skip_counts[reason] = skip_counts.get(reason, 0) + 1
+        else:
+            due.append((kind, name))
+    return due, skipped, skip_counts
 
 
 def _write_board_cons_progress(
@@ -98,9 +179,13 @@ def _write_board_cons_progress(
     unmapped: int,
     source_counts: dict[str, int],
     shard_key: str | None = None,
+    skipped_fresh: int = 0,
+    skip_reason_counts: dict[str, int] | None = None,
+    original_groups: int | None = None,
 ) -> None:
     remaining = max(0, total_count - cursor)
-    next_cursor = cursor if remaining else 0
+    incremental = _env_bool("BOARD_CONS_INCREMENTAL", True) and not _env_bool("BOARD_CONS_FORCE_REFRESH", False)
+    next_cursor = 0 if incremental else cursor if remaining else 0
     error_msg = f"{len(errors)} errors; remaining={remaining}" if errors or remaining else ""
     key = shard_key or _shard_key()
     sync_col.update_one(
@@ -122,6 +207,9 @@ def _write_board_cons_progress(
             "sample_errors": errors[:10],
             "unmapped": unmapped,
             "source_counts": source_counts,
+            "skipped_fresh": skipped_fresh,
+            "skip_reason_counts": skip_reason_counts or {},
+            "original_groups": original_groups if original_groups is not None else total_count,
         }},
         upsert=True,
     )
@@ -146,12 +234,17 @@ def _write_board_cons_aggregate(sync_col) -> None:
     remaining = sum(int(row.get("remaining") or 0) for row in rows)
     total_stocks = sum(int(row.get("bar_count") or 0) for row in rows)
     unmapped = sum(int(row.get("unmapped") or 0) for row in rows)
+    skipped_fresh = sum(int(row.get("skipped_fresh") or 0) for row in rows)
+    original_groups = sum(int(row.get("original_groups") or row.get("total_groups") or 0) for row in rows)
     sample_errors = []
     source_counts: dict[str, int] = {}
+    skip_reason_counts: dict[str, int] = {}
     for row in rows:
         sample_errors.extend((row.get("sample_errors") or [])[:5])
         for source, count in dict(row.get("source_counts") or {}).items():
             source_counts[str(source)] = source_counts.get(str(source), 0) + int(count or 0)
+        for reason, count in dict(row.get("skip_reason_counts") or {}).items():
+            skip_reason_counts[str(reason)] = skip_reason_counts.get(str(reason), 0) + int(count or 0)
     statuses = {str(row.get("status") or "") for row in rows}
     status = "ok" if statuses == {"ok"} else "partial" if any(item in statuses for item in {"partial", "running"}) else "degraded"
     sync_col.update_one(
@@ -172,6 +265,9 @@ def _write_board_cons_aggregate(sync_col) -> None:
             "sample_errors": sample_errors[:10],
             "unmapped": unmapped,
             "source_counts": source_counts,
+            "skipped_fresh": skipped_fresh,
+            "skip_reason_counts": skip_reason_counts,
+            "original_groups": original_groups,
         }},
         upsert=True,
     )
@@ -469,7 +565,12 @@ def sync_board_cons(db: Database, proxy_url: str = None) -> dict:
         groups = [("board", name) for name in boards] + [("concept", name) for name in concepts]
     logger.info("成分股同步: %d 行业, %d 概念, shard=%s", len(boards), len(concepts), shard_key)
 
-    start_cursor = 0 if os.getenv("BOARD_CONS_RESET_CURSOR", "false").lower() == "true" else int(meta.get("next_cursor") or 0)
+    original_groups = len(groups)
+    groups, skipped_fresh, skip_reason_counts = _filter_due_groups(db, groups)
+    incremental = _env_bool("BOARD_CONS_INCREMENTAL", True) and not _env_bool("BOARD_CONS_FORCE_REFRESH", False)
+
+    reset_cursor = str(get_task_env("BOARD_CONS_RESET_CURSOR", "false") or "false").lower() == "true"
+    start_cursor = 0 if incremental or reset_cursor else int(meta.get("next_cursor") or 0)
     if start_cursor >= len(groups):
         start_cursor = 0
     batch_limit = min(len(groups), start_cursor + _batch_size())
@@ -494,6 +595,9 @@ def sync_board_cons(db: Database, proxy_url: str = None) -> dict:
         unmapped=0,
         source_counts={},
         shard_key=shard_key,
+        skipped_fresh=skipped_fresh,
+        skip_reason_counts=skip_reason_counts,
+        original_groups=original_groups,
     )
 
     while cursor < batch_limit and time.monotonic() < deadline:
@@ -529,10 +633,13 @@ def sync_board_cons(db: Database, proxy_url: str = None) -> dict:
                     unmapped=unmapped,
                     source_counts=source_counts,
                     shard_key=shard_key,
+                    skipped_fresh=skipped_fresh,
+                    skip_reason_counts=skip_reason_counts,
+                    original_groups=original_groups,
                 )
 
     remaining = max(0, len(groups) - cursor)
-    next_cursor = cursor if remaining else 0
+    next_cursor = 0 if incremental else cursor if remaining else 0
     status = "ok"
     if remaining or errors:
         status = "partial" if total_groups > 0 or cursor > start_cursor else "degraded"
@@ -550,10 +657,13 @@ def sync_board_cons(db: Database, proxy_url: str = None) -> dict:
         unmapped=unmapped,
         source_counts=source_counts,
         shard_key=shard_key,
+        skipped_fresh=skipped_fresh,
+        skip_reason_counts=skip_reason_counts,
+        original_groups=original_groups,
     )
 
-    logger.info("成分股完成: %s, %d 组, %d 只股票, %d 失败, remaining=%d",
-                status, total_groups, total_stocks, len(errors), remaining)
+    logger.info("成分股完成: %s, %d 组, %d 只股票, %d 失败, remaining=%d, skipped_fresh=%d",
+                status, total_groups, total_stocks, len(errors), remaining, skipped_fresh)
     return {
         "status": status,
         "shard_key": shard_key,
@@ -569,4 +679,8 @@ def sync_board_cons(db: Database, proxy_url: str = None) -> dict:
         "sample_errors": errors[:10],
         "unmapped": unmapped,
         "source_counts": source_counts,
+        "skipped_fresh": skipped_fresh,
+        "skip_reason_counts": skip_reason_counts,
+        "original_groups": original_groups,
+        "incremental": incremental,
     }
