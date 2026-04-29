@@ -2378,9 +2378,20 @@ def _build_trader_task_queue(
         if lane in allowed_lanes:
             return lane
         status = _text(row.get("action_status") or row.get("recommended_action"))
-        text = " ".join([action, status, _text(row.get("latest_signal")), _text(row.get("reason"))])
+        text = " ".join([
+            action,
+            status,
+            _text(row.get("latest_signal")),
+            _text(row.get("reason")),
+            _text(row.get("summary")),
+            _text(row.get("trigger_reason")),
+        ])
         if any(token in text for token in ("减仓", "止盈", "风险", "卖", "跌破", "阻断")):
             return "risk_exit_first"
+        tech = row.get("technical_evidence") if isinstance(row.get("technical_evidence"), dict) else {}
+        has_hard_technical = bool(tech and tech.get("status") != "missing")
+        if not has_hard_technical:
+            return ""
         if action == "可试仓" or "entry_ready" in text:
             return "entry_ready"
         if "等待" in action or "确认" in action or "entry_waiting_confirm" in text:

@@ -427,6 +427,35 @@ def test_trader_task_queue_excludes_observation_context():
     assert tasks == []
 
 
+def test_trader_task_queue_excludes_legacy_buy_review_without_hard_technical():
+    from signals.web.api import workbench
+
+    tasks = workbench._build_trader_task_queue(
+        decision_rows=[
+            {
+                "title": "买入复核 · 测试股",
+                "symbol": "SZ.000001",
+                "action_label": "复合买点",
+                "summary": "打开图表确认买点、关键均线方向和止损位。",
+                "reason": "背驰买",
+            },
+            {
+                "title": "卖出复核 · 风险股",
+                "symbol": "SZ.000002",
+                "action_label": "复核卖点",
+                "summary": "检查是否跌破5日/20日或周线信心线。",
+                "reason": "背驰卖",
+            },
+        ],
+        focus_stocks=[],
+        sector_boards=[],
+    )
+
+    assert len(tasks) == 1
+    assert tasks[0]["queue_lane"] == "risk_exit_first"
+    assert tasks[0]["symbol"] == "SZ.000002"
+
+
 def test_static_index_minute_request_does_not_fallback_to_daily(monkeypatch):
     from signals.web.api import workbench
 
