@@ -136,6 +136,20 @@ def test_cache_freshness_uses_beijing_market_time(monkeypatch):
     assert pack._freshness_seconds(datetime(2026, 4, 29, 9, 55)) == 600
 
 
+def test_cache_trade_date_prefers_current_market_day(monkeypatch):
+    from signals.data import mongo_fallback
+    from signals.domain_pack import SignalsPack
+
+    monkeypatch.setattr(mongo_fallback, "get_last_trading_day", lambda _market="A": "2026-04-30")
+    db = _Db({
+        "sync_runs": _Collection([
+            {"trade_date": "2026-04-29", "started_at": datetime(2026, 4, 29, 19, 0)}
+        ])
+    })
+
+    assert SignalsPack()._cache_trade_date(db) == "2026-04-30"
+
+
 def test_live_low_latency_strict_status_and_stock_selection_merge(monkeypatch):
     from signals import domain_pack
     from signals.domain_pack import SignalsPack
@@ -197,6 +211,36 @@ def test_live_low_latency_strict_status_and_stock_selection_merge(monkeypatch):
     assert stock["selected_symbols"] == ["688802", "300575"]
     blockers = pack._cache_blockers(live, {"tasks": []}, [])
     assert {item["module"] for item in blockers} >= {"stock_minute", "minute_readiness_probe", "market_pools", "concept_heat_minute"}
+
+
+def test_provider_health_blocker_ignores_degraded_source_with_healthy_peer():
+    from signals.domain_pack import SignalsPack
+
+    pack = SignalsPack()
+    blockers = pack._cache_blockers(
+        {"modules": []},
+        {"tasks": []},
+        [
+            {
+                "provider": "sina",
+                "endpoint": "stock_minute",
+                "domain": "minute",
+                "status": "degraded",
+                "last_error_type": "ReadTimeout",
+                "updated_at": "2026-04-30T10:47:52",
+            },
+            {
+                "provider": "tencent",
+                "endpoint": "stock_minute",
+                "domain": "minute",
+                "status": "running",
+                "last_success_at": "2026-04-30T10:47:51",
+                "updated_at": "2026-04-30T10:47:53",
+            },
+        ],
+    )
+
+    assert blockers == []
 
 
 def test_completed_postmarket_progress_is_done_even_with_stale_task_progress():

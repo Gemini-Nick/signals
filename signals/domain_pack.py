@@ -393,6 +393,12 @@ class SignalsPack:
         }
 
     def _cache_trade_date(self, db) -> str:
+        try:
+            from signals.data.mongo_fallback import get_last_trading_day
+
+            return get_last_trading_day("A")
+        except Exception:
+            pass
         run = self._find_one(db, "sync_runs", {}, {"trade_date": 1, "started_at": 1}, sort=[("started_at", -1)])
         if run and run.get("trade_date"):
             return str(run.get("trade_date"))
@@ -799,15 +805,34 @@ class SignalsPack:
             status = str(item.get("status") or "")
             if status in {"degraded", "error", "stale"} and not item.get("updated_at"):
                 continue
+            if status in {"degraded", "cooldown", "error", "stale"} and self._provider_has_healthy_peer(item, provider_health or []):
+                continue
             if status in {"degraded", "cooldown", "error", "stale"}:
                 blockers.append({
                     "scope": "provider_health",
                     "module": item.get("provider"),
+                    "endpoint": item.get("endpoint"),
                     "status": status,
                     "error_msg": item.get("last_error_type") or item.get("cooldown_hit_type") or "",
                     "cooldown_until": item.get("cooldown_until") or "",
                 })
         return blockers[:12]
+
+    @staticmethod
+    def _provider_has_healthy_peer(item: Mapping[str, Any], provider_health: List[Dict[str, Any]]) -> bool:
+        domain = str(item.get("domain") or "")
+        endpoint = str(item.get("endpoint") or "")
+        provider = str(item.get("provider") or "")
+        if not domain or not endpoint:
+            return False
+        for peer in provider_health:
+            if str(peer.get("provider") or "") == provider:
+                continue
+            if str(peer.get("domain") or "") != domain or str(peer.get("endpoint") or "") != endpoint:
+                continue
+            if str(peer.get("status") or "") in {"ok", "running"} and peer.get("last_success_at"):
+                return True
+        return False
 
     def _provider_health_status(self, doc: Mapping[str, Any]) -> str:
         status = str(doc.get("status") or "")
@@ -818,7 +843,7 @@ class SignalsPack:
         if (
             isinstance(cooldown_until, datetime)
             and (
-                cooldown_until <= datetime.now()
+                cooldown_until <= naive_market_now("A")
                 or (isinstance(updated_at, datetime) and cooldown_until <= updated_at)
             )
         ):
@@ -1149,7 +1174,7 @@ class SignalsPack:
         return ""
 
     def _record_strategy_snapshot_run(self, snapshot: Mapping[str, Any]) -> None:
-        as_of = str(snapshot.get("as_of") or datetime.now().date().isoformat())[:10]
+        as_of = str(snapshot.get("as_of") or naive_market_now("A").date().isoformat())[:10]
         run_id = f"strategy-snapshot-{as_of}"
         path = self.state_root / "runs" / run_id / "run.json"
         try:

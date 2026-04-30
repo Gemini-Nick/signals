@@ -40,6 +40,7 @@ MODULE_TARGETS = {
     "signal_pool": ("signals",),
     "market_pools": ("market_pools",),
     "fullmarket_spot_snapshot": ("fullmarket_spot_snapshots",),
+    "eastmoney_ulist_quote": ("quote_snapshots",),
     "quote_snapshots": ("quote_snapshots",),
     "strategy_snapshot": ("strategy_snapshots",),
     "stock_daily": ("bars",),
@@ -51,6 +52,7 @@ MODULE_TARGETS = {
     "board_heat_minute": ("board_heat_ticks",),
     "concept_heat_minute": ("board_heat_ticks",),
     "chain_heat_snapshots": ("chain_heat_snapshots",),
+    "concept_relationship_graph": ("concept_relationship_graph",),
     "technical_signal_scan": ("terminal_technical_signals",),
     "knowledge_market_views": ("knowledge_market_views",),
     "minute_readiness_probe": ("minute_readiness",),
@@ -67,6 +69,7 @@ COLLECTION_DOMAINS = {
     "concept_ranking": "concept",
     "board_heat_ticks": "board_heat",
     "chain_heat_snapshots": "chain_heat",
+    "concept_relationship_graph": "concept_graph",
     "terminal_technical_signals": "technical_signal",
     "knowledge_market_views": "knowledge",
     "minute_readiness": "readiness",
@@ -81,8 +84,16 @@ COLLECTION_DOMAINS = {
     "strategy_snapshots": "strategy",
 }
 
+WRITER_FRESHNESS_FIELDS = {
+    "quote_snapshots": ("live_count", "stale_count"),
+    "eastmoney_ulist_quote": ("live_count", "stale_count"),
+    "fullmarket_spot_snapshot": ("elapsed_seconds", "latest_dt", "count"),
+}
+
 REALTIME_MODULES = {
     "market_pools",
+    "fullmarket_spot_snapshot",
+    "eastmoney_ulist_quote",
     "quote_snapshots",
     "stock_minute",
     "index_minute",
@@ -97,6 +108,7 @@ REALTIME_MODULES = {
 EMPTY_OK_MODULES = {
     "technical_signal_scan",
     "knowledge_market_views",
+    "concept_relationship_graph",
 }
 
 SYNC_TZ = ZoneInfo(os.getenv("SIGNALS_SYNC_TIMEZONE", "Asia/Shanghai"))
@@ -118,9 +130,11 @@ INTRADAY_STALE_SECONDS = max(
     int(os.getenv("SIGNALS_INTRADAY_STALE_SECONDS", str(2 * 60 * 60))),
 )
 QUOTE_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_QUOTE_INTERVAL_SECONDS", 60)
+EASTMONEY_ULIST_QUOTE_INTERVAL_SECONDS = _env_seconds("SIGNALS_EASTMONEY_ULIST_QUOTE_INTERVAL_SECONDS", 10, minimum=5)
+FULLMARKET_SPOT_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_FULLMARKET_SPOT_INTERVAL_SECONDS", 90, minimum=30)
 SIGNAL_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_SIGNAL_INTERVAL_SECONDS", 5 * 60)
 WORKBENCH_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_WORKBENCH_INTERVAL_SECONDS", 10 * 60)
-BOARD_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_BOARD_INTERVAL_SECONDS", 5 * 60)
+BOARD_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_BOARD_INTERVAL_SECONDS", 60)
 
 
 @dataclass(frozen=True)
@@ -139,12 +153,15 @@ def _lane_stale(interval_seconds: int, multiplier: int = 3) -> int:
 
 LIVE_SYNC_PLANS = {
     Market.A: (
-        LiveSyncPlan("quote_snapshots", "quote_lane", QUOTE_LANE_INTERVAL_SECONDS, _lane_stale(QUOTE_LANE_INTERVAL_SECONDS, 3), 75, 10),
+        LiveSyncPlan("eastmoney_ulist_quote", "quote_lane", EASTMONEY_ULIST_QUOTE_INTERVAL_SECONDS, _lane_stale(EASTMONEY_ULIST_QUOTE_INTERVAL_SECONDS, 6), 20, 5),
+        LiveSyncPlan("fullmarket_spot_snapshot", "quote_lane", FULLMARKET_SPOT_INTERVAL_SECONDS, _lane_stale(FULLMARKET_SPOT_INTERVAL_SECONDS, 3), 30, 8),
+        LiveSyncPlan("quote_snapshots", "quote_lane", QUOTE_LANE_INTERVAL_SECONDS, _lane_stale(QUOTE_LANE_INTERVAL_SECONDS, 3), 20, 10),
         LiveSyncPlan("index_minute", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 120, 20),
         LiveSyncPlan("stock_minute", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 240, 30),
         LiveSyncPlan("minute_readiness_probe", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 60, 35),
         LiveSyncPlan("market_pools", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 60, 40),
         LiveSyncPlan("strategy_snapshot", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 90, 50),
+        LiveSyncPlan("terminal_realtime_pool", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 120, 55),
         LiveSyncPlan("board_heat_minute", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 180, 60),
         LiveSyncPlan("concept_heat_minute", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 180, 65),
         LiveSyncPlan("chain_heat_snapshots", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 90, 70),
@@ -181,18 +198,22 @@ LANE_MAINTENANCE_PLANS = {
     "signal_pool": LiveSyncPlan("signal_pool", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 80),
     "technical_signal_scan": LiveSyncPlan("technical_signal_scan", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 1800, 82),
     "knowledge_market_views": LiveSyncPlan("knowledge_market_views", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 84),
+    "concept_relationship_graph": LiveSyncPlan("concept_relationship_graph", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 86),
     "strategy_snapshot": LiveSyncPlan("strategy_snapshot", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 120, 90),
     "terminal_realtime_pool": LiveSyncPlan("terminal_realtime_pool", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 120, 95),
     "cache_preheat": LiveSyncPlan("cache_preheat", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 180, 100),
 }
 
 BOOTSTRAP_LANE_MODULES = {
+    "eastmoney_ulist_quote": {"quote_lane"},
+    "fullmarket_spot_snapshot": {"quote_lane"},
     "quote_snapshots": {"quote_lane"},
     "market_pools": {"workbench_lane"},
     "cache_preheat": {"workbench_lane"},
     "signal_pool": {"workbench_lane"},
     "technical_signal_scan": {"workbench_lane"},
     "knowledge_market_views": {"workbench_lane"},
+    "concept_relationship_graph": {"workbench_lane"},
     "stock_30m_fullmarket": {"workbench_lane"},
     "index_daily": {"workbench_lane"},
     "weekly_rollup": {"workbench_lane"},
@@ -611,6 +632,18 @@ class SyncEngine:
         market_value = market or "A"
         for collection, count in self._target_counts(module_name).items():
             domain = COLLECTION_DOMAINS.get(collection, module_name)
+            freshness_query = {"domain": domain, "market": market_value, "mode": mode, "collection": collection}
+            writer_fields = WRITER_FRESHNESS_FIELDS.get(module_name)
+            if writer_fields and status == "ok":
+                try:
+                    existing = self.db["data_freshness"].find_one(
+                        freshness_query,
+                        {field: 1 for field in writer_fields},
+                    )
+                except Exception:
+                    existing = None
+                if existing and any(field in existing for field in writer_fields):
+                    continue
             latest_dt = None
             try:
                 latest = self.db[collection].find_one(
@@ -635,7 +668,7 @@ class SyncEngine:
                 freshness = "fresh"
             stale_reason = error_msg or latest.get("stale_reason") or ""
             self.db["data_freshness"].update_one(
-                {"domain": domain, "market": market_value, "mode": mode, "collection": collection},
+                freshness_query,
                 {"$set": {
                     "domain": domain,
                     "market": market_value,
@@ -850,6 +883,8 @@ def main():
                         help="只运行指定第二屏 lane，可重复或逗号分隔：quote_lane/signal_lane/workbench_lane/board_lane")
     parser.add_argument("--workers", type=int, default=4,
                         help="并行工人数（默认 4）")
+    parser.add_argument("--check-interval", type=int, default=int(os.getenv("SIGNALS_SYNC_CHECK_INTERVAL_SECONDS", "60")),
+                        help="daemon 检查间隔秒数")
     parser.add_argument("--log-level", type=str, default="INFO",
                         help="日志级别")
     args = parser.parse_args()
@@ -904,7 +939,7 @@ def main():
 
         PostmarketRunner(engine, max_workers=args.workers).run_daemon()
     elif args.daemon:
-        engine.run_daemon()
+        engine.run_daemon(check_interval=max(5, args.check_interval))
     else:
         parser.print_help()
 

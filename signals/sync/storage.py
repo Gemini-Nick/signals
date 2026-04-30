@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 
 from pymongo import ASCENDING, DESCENDING
 from pymongo.database import Database
 from pymongo.errors import OperationFailure, PyMongoError
+
+from signals.core.market_time import naive_market_now
 
 logger = logging.getLogger("signals.sync.storage")
 
@@ -79,7 +80,7 @@ def ensure_storage_model(db: Database) -> None:
 
     This function is intentionally idempotent and safe to run at daemon start.
     """
-    now = datetime.now()
+    now = naive_market_now("A")
 
     for name in ("board_ranking", "concept_ranking", "board_heat_ticks", "chain_heat_snapshots", "bars", "index_bars"):
         _drop_ttl_indexes(db[name])
@@ -126,6 +127,8 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["sync_tasks"], [("run_id", ASCENDING), ("phase", ASCENDING), ("status", ASCENDING), ("updated_at", ASCENDING)])
     _safe_create_index(db["sync_tasks"], [("module", ASCENDING), ("shard_key", ASCENDING), ("status", ASCENDING)])
     _safe_create_index(db["provider_health"], [("provider", ASCENDING), ("endpoint", ASCENDING), ("domain", ASCENDING)])
+    _safe_create_index(db["provider_observations"], [("provider", ASCENDING), ("endpoint", ASCENDING), ("observed_at", DESCENDING)])
+    _safe_create_index(db["provider_observations"], [("risk_signal", ASCENDING), ("observed_at", DESCENDING)])
     _drop_index_if_present(db["data_freshness"], "domain_1_market_1_mode_1_collection_1")
     _safe_create_index(db["data_freshness"], [("domain", ASCENDING), ("market", ASCENDING), ("mode", ASCENDING), ("lane", ASCENDING), ("collection", ASCENDING)])
     _safe_create_index(db["data_freshness"], [("domain", ASCENDING), ("market", ASCENDING), ("mode", ASCENDING), ("collection", ASCENDING), ("freq", ASCENDING), ("shard_key", ASCENDING)])

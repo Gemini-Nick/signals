@@ -85,7 +85,12 @@ def normalize_as_of(as_of: Optional[str], market: str = "A") -> str:
             return get_last_trading_day(market)
         except Exception:
             pass
-        return date.today().isoformat()
+        try:
+            from signals.core.market_time import market_date_str
+
+            return market_date_str(market)
+        except Exception:
+            return date.today().isoformat()
     value = str(as_of)
     if len(value) == 8 and value.isdigit():
         return f"{value[:4]}-{value[4:6]}-{value[6:]}"
@@ -113,7 +118,12 @@ def resolve_mode(request: DataRequest) -> ResolvedMode:
         return "realtime"
 
     as_of = normalize_as_of(request.as_of, request.market)
-    today = date.today().isoformat()
+    try:
+        from signals.core.market_time import market_date_str
+
+        today = market_date_str(request.market)
+    except Exception:
+        today = date.today().isoformat()
     if as_of < today:
         return "historical"
 
@@ -122,5 +132,10 @@ def resolve_mode(request: DataRequest) -> ResolvedMode:
 
         return "realtime" if is_any_market_live() else "historical"
     except Exception:
-        now = datetime.now()
+        try:
+            from signals.core.market_time import naive_market_now
+
+            now = naive_market_now(request.market)
+        except Exception:
+            now = datetime.now()
         return "realtime" if now.weekday() < 5 and 9 <= now.hour < 16 else "historical"

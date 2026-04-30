@@ -218,7 +218,9 @@ def smart_fetch_with_meta(
     save_col = save_collection or mongo_collection
     live = _is_market_live(market)
     trading_day = get_last_trading_day(market)
-    update_time = datetime.now().strftime("%m-%d %H:%M")
+    from signals.core.market_time import naive_market_now
+
+    update_time = naive_market_now(market).strftime("%m-%d %H:%M")
 
     meta = {"source": "未知", "data_date": trading_day, "update_time": update_time}
 

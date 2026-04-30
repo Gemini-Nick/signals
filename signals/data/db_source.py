@@ -19,6 +19,8 @@ from typing import Dict, List, Optional
 import pandas as pd
 from czsc import Freq, RawBar
 
+from signals.core.market_time import naive_market_now
+
 logger = logging.getLogger("signals.data.db_source")
 
 _mongo_source = None
@@ -120,7 +122,7 @@ class MongoSource:
         if start_date:
             sdt = start_date.replace("-", "")
         else:
-            sdt = (datetime.now() - timedelta(days=lookback_days)
+            sdt = (naive_market_now("A") - timedelta(days=lookback_days)
                    ).strftime("%Y%m%d")
         return self._query_bars(symbol, "日线", Freq.D, symbol, sdt)
 
@@ -130,7 +132,7 @@ class MongoSource:
         code = futu_code.split(".")[-1] if "." in futu_code else futu_code
         freq_str = _FREQ_MAP.get(freq.value, freq.value)
         # 分钟线只取最近 10 天
-        sdt = (datetime.now() - timedelta(days=10)).strftime("%Y%m%d")
+        sdt = (naive_market_now("A") - timedelta(days=10)).strftime("%Y%m%d")
         return self._query_bars(code, freq_str, freq, futu_code, sdt)
 
     def get_index_minute(self, symbol: str, freq: Freq,
@@ -176,7 +178,7 @@ class MongoSource:
         :param source: 数据源过滤 ("ths"/"em")，默认返回所有
         """
         if date is None:
-            date = datetime.now().replace(
+            date = naive_market_now("A").replace(
                 hour=0, minute=0, second=0, microsecond=0)
 
         query = {"dt": date}
@@ -217,7 +219,7 @@ class MongoSource:
                             source: str = None) -> Optional[pd.DataFrame]:
         """概念排行查询"""
         if date is None:
-            date = datetime.now().replace(
+            date = naive_market_now("A").replace(
                 hour=0, minute=0, second=0, microsecond=0)
 
         query = {"dt": date}

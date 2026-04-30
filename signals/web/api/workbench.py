@@ -53,6 +53,7 @@ UI_FREQS = ["30min", "15min", "5min", "daily", "weekly"]
 DEFAULT_TERMINAL_FREQ = "30min"
 MINUTE_FREQS = {"5min", "5m", "15min", "15m", "30min", "30m"}
 BUY_FREQS = ["daily", "30min", "15min", "5min"]
+CHART_FREQ_ORDER = {"weekly": 0, "daily": 1, "30min": 2, "15min": 3, "5min": 4}
 SECOND_SCREEN_LANES = {
     "quote_lane": {
         "label": "实时观察",
@@ -775,6 +776,10 @@ def _board_heat_chart(name: str, kind: str, freq: str) -> tuple[dict[str, Any], 
         "display_name": "热度K线/涨跌幅OHLC",
         "is_price_kline": False,
         "value_axis": "change_pct",
+        "axis_label": "涨跌幅/热度",
+        "price_label": "heat_close",
+        "chart_mode": "board_heat",
+        "non_price_notice": "非价格K线；OHLC 来自板块 change_pct 重采样。",
         "chart_source": "board_heat_ticks",
         "collection": "board_heat_ticks",
         "ohlc_formula": {
@@ -1143,6 +1148,111 @@ def _stock_name(symbol: str, row: Optional[dict[str, Any]] = None) -> str:
         return ""
 
 
+def _quote_symbol_candidates(symbol: str) -> list[str]:
+    raw = str(symbol or "").strip().upper()
+    if not raw:
+        return []
+    pure = raw.split(".", 1)[-1] if "." in raw else raw
+    candidates = [raw, pure]
+    if "." in raw and raw.split(".", 1)[0] in {"SH", "SZ", "BJ"}:
+        candidates.append(f"{raw.split('.', 1)[0].lower()}{pure}")
+    if len(raw) >= 8 and raw[:2] in {"SH", "SZ", "BJ"}:
+        candidates.append(f"{raw[:2]}.{raw[2:]}")
+    if pure.isdigit() and len(pure) == 6:
+        if pure.startswith(("5", "6", "9")):
+            candidates.extend([f"SH.{pure}", f"sh{pure}"])
+        elif pure.startswith(("4", "8")):
+            candidates.extend([f"BJ.{pure}", f"bj{pure}"])
+        else:
+            candidates.extend([f"SZ.{pure}", f"sz{pure}"])
+    return list(dict.fromkeys(candidates))
+
+
+def _quote_dt_text(doc: dict[str, Any]) -> str:
+    value = doc.get("dt") or doc.get("trade_date") or doc.get("snapshot_at")
+    if hasattr(value, "date"):
+        return value.date().isoformat()
+    return str(value or "")[:10]
+
+
+def _quote_age_seconds(doc: dict[str, Any]) -> Optional[float]:
+    value = doc.get("snapshot_at")
+    if value is None:
+        return None
+    try:
+        ts = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if ts.tzinfo is not None:
+            ts = ts.astimezone().replace(tzinfo=None)
+        return max(0.0, (_market_now("A") - ts).total_seconds())
+    except Exception:
+        return None
+
+
+def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
+    candidates = _quote_symbol_candidates(symbol)
+    if not candidates:
+        return {"quote_status": "missing", "quote_status_label": "无行情"}
+    try:
+        doc = _mongo_db()["quote_snapshots"].find_one(
+            {"symbol": {"$in": candidates}},
+            {"_id": 0},
+            sort=[("snapshot_at", -1), ("dt", -1)],
+        ) or {}
+    except Exception:
+        doc = {}
+    if not doc:
+        return {"quote_status": "missing", "quote_status_label": "无行情"}
+
+    expected_day = _market_today("A").isoformat()
+    quote_day = _quote_dt_text(doc)
+    age_seconds = _quote_age_seconds(doc)
+    stale_reason = _text(doc.get("stale_reason"))
+    is_stale = bool(doc.get("is_stale")) or doc.get("freshness") == "stale" or quote_day != expected_day
+    if is_stale:
+        status = "stale"
+        label = "行情陈旧"
+        if quote_day and quote_day != expected_day:
+            stale_reason = stale_reason or f"quote_day={quote_day}, expected={expected_day}"
+    elif age_seconds is not None and age_seconds > 30:
+        status = "delayed"
+        label = "行情延迟"
+    else:
+        status = "realtime"
+        label = "实时"
+
+    overlay = {
+        "quote_status": status,
+        "quote_status_label": label,
+        "quote_source": doc.get("source") or "",
+        "quote_as_of": quote_day,
+        "quote_snapshot_at": doc.get("snapshot_at"),
+        "quote_age_seconds": age_seconds,
+        "quote_stale_reason": stale_reason,
+    }
+    if status in {"realtime", "delayed"}:
+        overlay.update({
+            "latest_price": doc.get("price") or doc.get("close"),
+            "day_change_pct": doc.get("change_pct"),
+            "daily_change_pct": doc.get("change_pct"),
+            "today_change_pct": doc.get("change_pct"),
+            "realtime_price": doc.get("price") or doc.get("close"),
+        })
+    else:
+        overlay.update({
+            "day_change_pct": None,
+            "daily_change_pct": None,
+            "today_change_pct": None,
+        })
+    return overlay
+
+
+def _apply_quote_overlay(row: dict[str, Any], symbol: str) -> dict[str, Any]:
+    overlay = _quote_overlay_for_symbol(symbol)
+    updated = dict(row)
+    updated.update(overlay)
+    return updated
+
+
 def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) -> dict[str, Any]:
     symbol = str(row.get("symbol") or row.get("code") or row.get("label") or "").strip()
     normalized, raw_code = _normalize_stock_symbol(symbol)
@@ -1177,7 +1287,7 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "target_symbol": normalized,
         "target_freq": DEFAULT_TERMINAL_FREQ,
     })
-    return enriched
+    return _apply_quote_overlay(enriched, normalized)
 
 
 def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1202,7 +1312,7 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "target_symbol": symbol,
         "target_freq": DEFAULT_TERMINAL_FREQ,
     })
-    return enriched
+    return _apply_quote_overlay(enriched, symbol)
 
 
 def _enrich_cluster_row(row: dict[str, Any], kind: str) -> dict[str, Any]:
@@ -1267,6 +1377,21 @@ def _load_signal_pool_rows(limit: int = 200, symbol: Optional[str] = None) -> li
         return []
 
 
+def _load_terminal_technical_signal_rows(symbol: str, *, limit: int = 300) -> list[dict[str, Any]]:
+    if not symbol:
+        return []
+    try:
+        db = _mongo_db()
+        candidates = _probe_symbol_candidates(symbol, kind="stock")
+        docs = list(db["terminal_technical_signals"].find(
+            {"symbol": {"$in": candidates}},
+            {"_id": 0},
+        ).sort([("dt", -1), ("updated_at", -1)]).limit(limit))
+        return [dict(item) for item in docs if isinstance(item, dict)]
+    except Exception:
+        return []
+
+
 def _signal_source_text(signal: dict[str, Any]) -> str:
     parts = [
         signal.get("source"),
@@ -1287,6 +1412,50 @@ def _is_custom_signal_record(signal: dict[str, Any]) -> bool:
     return any(token in text for token in ("signal_records", "backtest", "custom", "自定义", "回测"))
 
 
+def _is_higher_timeframe(signal_freq: str, effective_freq: str) -> bool:
+    signal_order = CHART_FREQ_ORDER.get(_freq_bucket(signal_freq), 99)
+    effective_order = CHART_FREQ_ORDER.get(_freq_bucket(effective_freq), 99)
+    return signal_order < effective_order
+
+
+def _chart_signal_display_scope(signal_freq: str, effective_freq: str) -> str:
+    if not _text(signal_freq):
+        return "current_timeframe"
+    signal_bucket = _freq_bucket(signal_freq)
+    effective_bucket = _freq_bucket(effective_freq)
+    if not signal_bucket or signal_bucket == effective_bucket:
+        return "current_timeframe"
+    if effective_bucket in {"5min", "15min", "30min"} and _is_higher_timeframe(signal_bucket, effective_bucket):
+        return "higher_timeframe_context"
+    return "other_timeframe"
+
+
+def _should_include_chart_signal(signal_freq: str, effective_freq: str) -> bool:
+    return _chart_signal_display_scope(signal_freq, effective_freq) in {"current_timeframe", "higher_timeframe_context"}
+
+
+def _signal_counts_by_scope(signals: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for signal in signals:
+        if not isinstance(signal, dict):
+            continue
+        scope = _text(signal.get("display_scope")) or "current_timeframe"
+        counts[scope] = counts.get(scope, 0) + 1
+    return counts
+
+
+def _signal_counts_by_freq(signals: list[dict[str, Any]], *, custom_only: bool = False) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for signal in signals:
+        if not isinstance(signal, dict):
+            continue
+        if custom_only and not _is_custom_signal_record(signal):
+            continue
+        freq = _freq_bucket(signal.get("freq") or signal.get("timeframe")) or "unknown"
+        counts[freq] = counts.get(freq, 0) + 1
+    return counts
+
+
 def _custom_signal_rows(symbol: str, *, limit: int = 500) -> list[dict[str, Any]]:
     if not symbol:
         return []
@@ -1302,15 +1471,15 @@ def _custom_signal_diagnostics(
     current_freq = _freq_bucket(requested_freq)
     rows = _custom_signal_rows(symbol)
     freqs = sorted({_freq_bucket(row.get("freq") or row.get("timeframe")) for row in rows if _freq_bucket(row.get("freq") or row.get("timeframe"))})
-    current_rows = [
+    current_or_context_rows = [
         row for row in rows
-        if _freq_bucket(row.get("freq") or row.get("timeframe")) in {current_freq, ""}
+        if _should_include_chart_signal(_text(row.get("freq") or row.get("timeframe")), current_freq)
     ]
     visible_custom = [signal for signal in visible_signals if isinstance(signal, dict) and _is_custom_signal_record(signal)]
     hidden_reasons: list[str] = []
     if not rows:
         hidden_reasons.append("no_custom_signal_records")
-    elif not current_rows:
+    elif not current_or_context_rows:
         hidden_reasons.append("custom_signals_on_other_freq")
     elif not visible_custom:
         hidden_reasons.append("custom_signals_not_in_loaded_chart_range")
@@ -1320,6 +1489,9 @@ def _custom_signal_diagnostics(
         "visible_custom_signal_count": len(visible_custom),
         "hidden_custom_signal_count": max(0, len(rows) - len(visible_custom)),
         "available_custom_signal_freqs": freqs,
+        "custom_signal_counts_by_freq": _signal_counts_by_freq(rows),
+        "visible_custom_signal_counts_by_freq": _signal_counts_by_freq(visible_custom),
+        "signal_counts_by_scope": _signal_counts_by_scope(visible_signals),
         "hidden_reasons": hidden_reasons,
     }
 
@@ -1415,6 +1587,61 @@ def _signal_details(signal: dict[str, Any]) -> str:
     return _text(signal.get("details") or signal.get("summary") or signal.get("reason"))
 
 
+def _technical_signal_details(signal: dict[str, Any]) -> str:
+    evidence = signal.get("technical_evidence") if isinstance(signal.get("technical_evidence"), dict) else {}
+    return _text(evidence.get("details") or evidence.get("score_details") or signal.get("details") or signal.get("summary"))[:240]
+
+
+def _terminal_technical_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) -> list[dict[str, Any]]:
+    chart_meta = chart.get("meta") if isinstance(chart.get("meta"), dict) else {}
+    effective_freq = _freq_bucket(chart_meta.get("freq") or freq)
+    market = _text(chart_meta.get("market")) or infer_market(symbol=symbol, source=_text(chart_meta.get("source")))
+    source = _text(chart_meta.get("source")) or "signals"
+    ohlcv = chart.get("ohlcv") if isinstance(chart.get("ohlcv"), list) else []
+    start_ts = int(ohlcv[0]["time"]) if ohlcv and isinstance(ohlcv[0], dict) and ohlcv[0].get("time") else None
+    end_ts = int(ohlcv[-1]["time"]) if ohlcv and isinstance(ohlcv[-1], dict) and ohlcv[-1].get("time") else None
+    output: list[dict[str, Any]] = []
+    for signal in _load_terminal_technical_signal_rows(symbol):
+        signal_freq = _freq_bucket(signal.get("freq") or signal.get("timeframe"))
+        display_scope = _chart_signal_display_scope(_text(signal.get("freq") or signal.get("timeframe")), effective_freq)
+        if display_scope == "other_timeframe":
+            continue
+        signal_type = _text(signal.get("signal_type") or signal.get("type") or signal.get("reason"))
+        if not signal_type:
+            continue
+        signal_dt = signal.get("dt") or signal.get("signal_date") or signal.get("updated_at")
+        ts = _signal_ts(signal_dt, market=market, symbol=symbol, source=source)
+        aligned_ts, aligned_price, aligned = _aligned_signal_bar(
+            signal,
+            signal_dt=signal_dt,
+            ts=ts,
+            ohlcv=ohlcv,
+            effective_freq=effective_freq,
+            market=market,
+            symbol=symbol,
+            source=source,
+        )
+        if start_ts and aligned_ts < start_ts:
+            continue
+        if end_ts and aligned_ts > end_ts + 86400:
+            continue
+        output.append({
+            "dt": aligned_ts,
+            "date_str": _date_text(signal_dt),
+            "type": signal_type,
+            "price": _float(signal.get("price"), aligned_price),
+            "confidence": _float(signal.get("confidence")),
+            "freq": signal_freq or _canonical_freq(freq),
+            "details": _technical_signal_details(signal),
+            "source": "terminal_technical_signals",
+            "pool_status": signal.get("pool_status"),
+            "chart_aligned": aligned,
+            "display_scope": display_scope,
+            "signal_side": signal.get("signal_side"),
+        })
+    return output
+
+
 def _signal_pool_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) -> list[dict[str, Any]]:
     chart_meta = chart.get("meta") if isinstance(chart.get("meta"), dict) else {}
     effective_freq = _freq_bucket(chart_meta.get("freq") or freq)
@@ -1426,8 +1653,10 @@ def _signal_pool_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) ->
     rows = _load_signal_pool_rows(limit=200, symbol=symbol)
     output: list[dict[str, Any]] = []
     for signal in rows:
-        signal_freq = _freq_bucket(signal.get("freq") or signal.get("timeframe"))
-        if effective_freq not in {"daily", "weekly"} and signal_freq not in {effective_freq, ""}:
+        raw_signal_freq = _text(signal.get("freq") or signal.get("timeframe"))
+        signal_freq = _freq_bucket(raw_signal_freq)
+        display_scope = _chart_signal_display_scope(raw_signal_freq, effective_freq)
+        if display_scope == "other_timeframe":
             continue
         signal_type = _text(signal.get("signal_type") or signal.get("type") or signal.get("reason"))
         if not signal_type:
@@ -1461,6 +1690,7 @@ def _signal_pool_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) ->
             "source": signal.get("source") or "signals.signal_pool",
             "pool_status": signal.get("pool_status"),
             "chart_aligned": aligned,
+            "display_scope": display_scope,
         })
     return output
 
@@ -1476,7 +1706,7 @@ def _aligned_signal_bar(
     symbol: str,
     source: str,
 ) -> tuple[int, Optional[float], bool]:
-    if effective_freq in {"daily", "weekly", "monthly"} or not ohlcv:
+    if effective_freq in {"daily", "monthly"} or not ohlcv:
         return ts, None, False
     bar_by_time = {
         int(row.get("time") or 0): row
@@ -1489,6 +1719,33 @@ def _aligned_signal_bar(
 
     signal_date = str(signal_dt or "")[:10]
     if not signal_date:
+        return ts, None, False
+    if effective_freq == "weekly":
+        try:
+            parsed_signal_date = pd.to_datetime(signal_date).date()
+        except Exception:
+            return ts, None, False
+        dated_rows: list[tuple[date, dict[str, Any]]] = []
+        for row in ohlcv:
+            if not isinstance(row, dict) or not row.get("time"):
+                continue
+            row_date_text = _timestamp_date(int(row["time"]), market=market, symbol=symbol, source=source)
+            if not row_date_text:
+                continue
+            try:
+                dated_rows.append((pd.to_datetime(row_date_text).date(), row))
+            except Exception:
+                continue
+        dated_rows.sort(key=lambda item: item[0])
+        for row_date, row in dated_rows:
+            if parsed_signal_date <= row_date:
+                if _is_sell_signal(signal):
+                    price = _float(row.get("high") or row.get("close"))
+                elif _is_buy_signal(signal):
+                    price = _float(row.get("low") or row.get("close"))
+                else:
+                    price = _float(row.get("close"))
+                return int(row.get("time") or ts), price, True
         return ts, None, False
     same_day = [
         row for row in ohlcv
@@ -1509,13 +1766,14 @@ def _aligned_signal_bar(
 
 
 def _merge_signal_pool_into_chart(chart: dict[str, Any], symbol: str, freq: str) -> dict[str, Any]:
+    technical_signals = _terminal_technical_chart_signals(symbol, freq, chart)
     pool_signals = _signal_pool_chart_signals(symbol, freq, chart)
-    if not pool_signals:
+    if not technical_signals and not pool_signals:
         return chart
     existing = chart.get("signals") if isinstance(chart.get("signals"), list) else []
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in [*existing, *pool_signals]:
+    for item in [*existing, *technical_signals, *pool_signals]:
         if not isinstance(item, dict):
             continue
         ts = _signal_ts(item.get("dt") or item.get("time") or item.get("timestamp") or item.get("date_str") or item.get("signal_date"))
@@ -1530,6 +1788,7 @@ def _merge_signal_pool_into_chart(chart: dict[str, Any], symbol: str, freq: str)
         normalized["dt"] = ts
         normalized["type"] = signal_type
         normalized.setdefault("date_str", str(item.get("date_str") or item.get("signal_date") or "")[:10])
+        normalized.setdefault("display_scope", "current_timeframe")
         merged.append(normalized)
     merged.sort(key=lambda item: int(item.get("dt") or 0))
     updated = dict(chart)
@@ -2345,6 +2604,142 @@ def _build_sector_board_rows(
     return _aggregate_sector_board_rows(rows)[:16]
 
 
+def _latest_freshness_doc(collection: str, *, domain: str = "", market: str = "A") -> dict[str, Any]:
+    try:
+        db = _mongo_db()
+        query: dict[str, Any] = {"collection": collection, "market": market}
+        if domain:
+            query["domain"] = domain
+        doc = db["data_freshness"].find_one(query, {"_id": 0}, sort=[("updated_at", -1)])
+        return dict(doc or {})
+    except Exception:
+        return {}
+
+
+def _data_truth_payload(
+    *,
+    collection: str,
+    domain: str = "",
+    source: str = "",
+    chart_meta: Optional[dict[str, Any]] = None,
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    meta = chart_meta if isinstance(chart_meta, dict) else {}
+    freshness = _latest_freshness_doc(collection, domain=domain)
+    requested = _text(meta.get("requested_freq") or (extra or {}).get("requested_freq"))
+    effective = _text(meta.get("effective_freq") or meta.get("freq") or (extra or {}).get("effective_freq"))
+    return {
+        "collection": collection,
+        "source": source or _text(meta.get("source")) or _text(freshness.get("source")),
+        "freshness": _text(freshness.get("freshness")) or _text(meta.get("cache_status")),
+        "as_of": _text(meta.get("as_of") or meta.get("data_as_of") or freshness.get("as_of")),
+        "latest_bar_time": _text(meta.get("latest_bar_time") or freshness.get("latest_dt")),
+        "requested_freq": requested,
+        "effective_freq": effective,
+        "freq_fallback": bool(requested and effective and requested != effective),
+        "mapping_status": _text((extra or {}).get("mapping_status") or meta.get("heat_resolution_status")),
+        "stale_reason": _text(freshness.get("stale_reason") or meta.get("not_ready_reason")),
+        **(extra or {}),
+    }
+
+
+def _chain_graph_doc(chain_id: Any, node_id: Any = None) -> dict[str, Any]:
+    chain_key = _text(chain_id)
+    if not chain_key:
+        return {}
+    try:
+        db = _mongo_db()
+        query: dict[str, Any] = {"market": "A", "chain_id": chain_key}
+        node_key = _text(node_id)
+        if node_key:
+            query["node_id"] = node_key
+        doc = db["concept_relationship_graph"].find_one(query, {"_id": 0}, sort=[("updated_at", -1)])
+        return dict(doc or {})
+    except Exception:
+        return {}
+
+
+def _viewpoint_context_from_graph(graph: dict[str, Any]) -> dict[str, Any]:
+    rows = graph.get("viewpoint_context") if isinstance(graph.get("viewpoint_context"), list) else []
+    output: dict[str, Any] = {
+        "status": "context_only",
+        "items": rows[:8],
+        "pangge": None,
+        "daozhang": None,
+        "conflicts": [],
+    }
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        author = _text(item.get("author"))
+        if author == "pangge" and output["pangge"] is None:
+            output["pangge"] = item
+        elif author == "daozhang" and output["daozhang"] is None:
+            output["daozhang"] = item
+        if _text(item.get("stance")) in {"block", "downgrade", "conflict"}:
+            output["conflicts"].append(item)
+    if output["pangge"] and output["daozhang"]:
+        output["status"] = "dual_context"
+    elif output["items"]:
+        output["status"] = "single_context"
+    return output
+
+
+def _technical_linkage_from_groups(groups: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    rows = _flatten_candidate_groups(groups, limit=16)
+    buy = 0
+    sell = 0
+    neutral = 0
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        signal = _text(row.get("latest_signal"))
+        side = "neutral"
+        if any(token in signal for token in ("买", "突破", "多头", "站上", "强")):
+            side = "buy"
+            buy += 1
+        elif any(token in signal for token in ("卖", "跌破", "走弱", "退潮", "风险")):
+            side = "sell"
+            sell += 1
+        else:
+            neutral += 1
+        items.append({
+            "symbol": row.get("symbol") or row.get("code"),
+            "name": row.get("name"),
+            "role": row.get("chain_role") or row.get("leader_tier") or row.get("representative_type"),
+            "latest_signal": signal,
+            "signal_side": side,
+            "day_change_pct": row.get("day_change_pct"),
+            "attention_score": row.get("attention_score"),
+            "risk_flags": row.get("risk_flags") or [],
+        })
+    grade = "conflict" if buy and sell else "confirmed" if buy else "risk" if sell else "watch"
+    return {
+        "grade": grade,
+        "buy_count": buy,
+        "sell_count": sell,
+        "neutral_count": neutral,
+        "items": items[:12],
+        "summary": f"同向买点 {buy} / 风险 {sell} / 观察 {neutral}",
+    }
+
+
+def _chain_risk_flags(row: dict[str, Any], data_truth: dict[str, Any]) -> list[str]:
+    flags: list[str] = []
+    phase = _text(row.get("phase"))
+    if phase in {"diverging", "risk_off", "cooling"}:
+        flags.append(phase)
+    confidence = _float(row.get("mapping_confidence"))
+    if confidence is not None and confidence < 65:
+        flags.append("mapping_confidence_low")
+    if _text(data_truth.get("freshness")) in {"stale", "empty", "missing", "degraded"}:
+        flags.append("data_stale")
+    if data_truth.get("freq_fallback"):
+        flags.append("freq_fallback")
+    if _float(row.get("up_count"), 0) > 0 and _float(row.get("down_count"), 0) > 0 and _float(row.get("up_count"), 0) < _float(row.get("down_count"), 0):
+        flags.append("breadth_weak")
+    return flags
+
+
 def _candidate_groups_from_representatives(row: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     groups: dict[str, list[dict[str, Any]]] = {
         "leaders": [],
@@ -2371,11 +2766,15 @@ def _candidate_groups_from_representatives(row: dict[str, Any]) -> dict[str, lis
             "layer": row.get("layer"),
             "stage": row.get("stage"),
         }
+        payload = _scored_candidate_payload(item, heat_score=heat_score) or item
         if rep.get("representative_type") == "core":
-            groups["leaders"].append(item)
-            groups["weighted"].append(item)
+            groups["leaders"].append(payload)
+            groups["weighted"].append(payload)
         else:
-            groups["elastic"].append(item)
+            groups["elastic"].append(payload)
+    for key, rows in groups.items():
+        rows.sort(key=lambda item: _float(item.get("attention_score"), 0) or 0, reverse=True)
+        groups[key] = rows[:8 if key != "leaders" else 3]
     return groups
 
 
@@ -2399,6 +2798,21 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         target_label = _text(primary.get("name")) or _text(doc.get("node_name") or doc.get("chain_name"))
         label = " · ".join([item for item in [_text(doc.get("chain_name")), _text(doc.get("node_name"))] if item])
         candidate_groups = _candidate_groups_from_representatives(doc)
+        graph = _chain_graph_doc(doc.get("chain_id"), doc.get("node_id"))
+        viewpoint_context = _viewpoint_context_from_graph(graph)
+        data_truth = _data_truth_payload(
+            collection="chain_heat_snapshots",
+            domain="chain_heat",
+            source="chain_heat_snapshots",
+            extra={
+                "mapping_status": _text(doc.get("mapping_status")) or "mapped",
+                "chart_mode_default": "chain_heat",
+                "chain_key": _text(doc.get("chain_id")),
+                "node_key": _text(doc.get("node_id")),
+            },
+        )
+        technical_linkage = _technical_linkage_from_groups(candidate_groups)
+        risk_flags = _chain_risk_flags(doc, data_truth)
         carrier = (candidate_groups.get("leaders") or candidate_groups.get("elastic") or [{}])[0]
         row = {
             **doc,
@@ -2434,6 +2848,9 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             "target_symbol": target_label,
             "target_freq": DEFAULT_TERMINAL_FREQ,
             "display_label": label or target_label,
+            "chain_key": _text(doc.get("chain_id")),
+            "node_key": _text(doc.get("node_id")),
+            "chart_mode_default": "chain_heat",
             "heat_target_label": target_label,
             "heat_resolution_status": "chain_primary_domain",
             "carrier": carrier,
@@ -2444,6 +2861,18 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             },
             "candidate_groups": candidate_groups,
             "focus_stocks_preview": _flatten_candidate_groups(candidate_groups, limit=6),
+            "technical_linkage": technical_linkage,
+            "viewpoint_context": viewpoint_context,
+            "data_truth": data_truth,
+            "risk_flags": risk_flags,
+            "concept_relationship_graph": {
+                "graph_id": graph.get("graph_id"),
+                "updated_at": graph.get("updated_at"),
+                "construction_mode": graph.get("construction_mode"),
+                "validation_status": graph.get("validation_status"),
+                "confidence": graph.get("confidence"),
+                "relations": (graph.get("relations") or [])[:10] if isinstance(graph.get("relations"), list) else [],
+            },
             "mapping_chain": {
                 "query": label or target_label,
                 "chain_id": doc.get("chain_id"),
@@ -3790,7 +4219,7 @@ def _summary_from_index(report: Dict[str, Any], chart: Dict[str, Any]) -> Dict[s
     engine = get_engine()
     market_context = engine.get_market_context()
     style_switch = getattr(market_context, "style_switch", None) if market_context else None
-    return {
+    summary = {
         "title": report.get("name", ""),
         "subtitle": report.get("symbol", ""),
         "latest_price": report.get("latest_price", 0),
@@ -3802,11 +4231,15 @@ def _summary_from_index(report: Dict[str, Any], chart: Dict[str, Any]) -> Dict[s
         "key_levels": chart_report.get("key_levels") or ma_context.get("key_levels") or [],
         "style_switch": style_switch.suggestion if style_switch else "",
     }
+    summary.update(_quote_overlay_for_symbol(str(report.get("symbol") or "")))
+    if summary.get("today_change_pct") is not None:
+        summary["gain_pct"] = summary.get("today_change_pct")
+    return summary
 
 
 def _summary_from_static_index(name: str, symbol: str, chart: Dict[str, Any]) -> Dict[str, Any]:
     last_close = chart.get("ohlcv", [{}])[-1].get("close", 0) if chart.get("ohlcv") else 0
-    return {
+    summary = {
         "title": name,
         "subtitle": symbol,
         "latest_price": last_close,
@@ -3817,6 +4250,10 @@ def _summary_from_static_index(name: str, symbol: str, chart: Dict[str, Any]) ->
         "latest_signal": "",
         "key_levels": [],
     }
+    summary.update(_quote_overlay_for_symbol(symbol))
+    if summary.get("today_change_pct") is not None:
+        summary["gain_pct"] = summary.get("today_change_pct")
+    return summary
 
 
 def _summary_from_industry(name: str, detail: Dict[str, Any], ranking) -> Dict[str, Any]:
@@ -3853,7 +4290,7 @@ def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any
     conclusion = scored.get("direction", "")
     if risk.get("description"):
         conclusion = f"{conclusion} · {risk['description']}".strip(" ·")
-    return {
+    summary = {
         "title": stock.get("name") or symbol,
         "subtitle": symbol,
         "latest_price": last_close,
@@ -3868,6 +4305,10 @@ def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any
         "risk_reward": risk.get("risk_reward"),
         "position_pct": risk.get("position_pct"),
     }
+    summary.update(_quote_overlay_for_symbol(symbol))
+    if summary.get("today_change_pct") is not None:
+        summary["gain_pct"] = summary.get("today_change_pct")
+    return summary
 
 
 async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
@@ -4013,6 +4454,17 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
         heat_target_label = _text(latest_heat.get("heat_target_label")) or name
         heat_resolution_status = _text(latest_heat.get("heat_resolution_status")) or ("exact" if heat_target_label == name else "unresolved")
         heat_ready = _chart_has_ohlcv(chart)
+        data_truth = _data_truth_payload(
+            collection="board_heat_ticks",
+            domain="board_heat",
+            source="board_heat_ticks",
+            chart_meta=chart.get("meta") if isinstance(chart.get("meta"), dict) else {},
+            extra={
+                "mapping_status": "direct_board_heat" if heat_ready else "heat_not_ready",
+                "heat_target_label": heat_target_label,
+                "heat_resolution_status": heat_resolution_status,
+            },
+        )
         related_custom_signals = _related_custom_signals_from_candidates(ordered_candidates, requested_freq)
         return {
             "target": {
@@ -4064,6 +4516,8 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
             "analysis_target": analysis_target,
             "candidate_groups": candidate_groups,
             "candidate_stocks": ordered_candidates,
+            "data_truth": data_truth,
+            "viewpoint_context": {"status": "context_only", "items": []},
             "custom_signal_count": 0,
             "direct_custom_signal_count": 0,
             "visible_custom_signal_count": 0,
@@ -4185,6 +4639,17 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
         heat_target_label = _text(latest_heat.get("heat_target_label")) or name
         heat_resolution_status = _text(latest_heat.get("heat_resolution_status")) or ("exact" if heat_target_label == name else "unresolved")
         heat_ready = _chart_has_ohlcv(chart)
+        data_truth = _data_truth_payload(
+            collection="board_heat_ticks",
+            domain="board_heat",
+            source="board_heat_ticks",
+            chart_meta=chart.get("meta") if isinstance(chart.get("meta"), dict) else {},
+            extra={
+                "mapping_status": "direct_board_heat" if heat_ready else ("non_chain" if non_chain else "heat_not_ready"),
+                "heat_target_label": heat_target_label,
+                "heat_resolution_status": heat_resolution_status,
+            },
+        )
         related_custom_signals = _related_custom_signals_from_candidates(ordered_candidates, requested_freq)
         return {
             "target": {
@@ -4247,6 +4712,8 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
             "analysis_target": "",
             "candidate_groups": candidate_groups,
             "candidate_stocks": ordered_candidates,
+            "data_truth": data_truth,
+            "viewpoint_context": {"status": "context_only", "items": []},
             "custom_signal_count": 0,
             "direct_custom_signal_count": 0,
             "visible_custom_signal_count": 0,
@@ -4446,9 +4913,21 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
         chart = _unwrap_response(
             await _call_backtest_run(raw_code, requested_freq, lookback=360)
         )
-        if isinstance(chart, dict) and chart.get("error"):
+        if not isinstance(chart, dict) or chart.get("error") or not chart.get("ohlcv"):
             df, source = _stock_df(symbol, requested_freq)
             chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)
+    elif requested_freq == "30min":
+        df, source = _stock_df(symbol, requested_freq)
+        chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)
+        if chart.get("ohlcv"):
+            try:
+                candidate_chart = _unwrap_response(
+                    await _call_backtest_run(raw_code, requested_freq, lookback=360)
+                )
+                if isinstance(candidate_chart, dict) and candidate_chart.get("ohlcv") and not candidate_chart.get("error"):
+                    chart = candidate_chart
+            except Exception:
+                pass
     else:
         df, source = _stock_df(symbol, requested_freq)
         chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)

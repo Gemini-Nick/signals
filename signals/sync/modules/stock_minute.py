@@ -19,7 +19,7 @@ import pandas as pd
 from pymongo.database import Database
 
 from signals.core.macro_universe import macro_a_index_pure_codes
-from signals.core.market_time import naive_market_now
+from signals.core.market_time import naive_market_now, to_market_naive
 from ..proxy import em_proxy
 from ..retry import sync_retry
 from ..task_context import get_task_env
@@ -854,8 +854,11 @@ def _sync_one_minute(code: str, freq: str, proxy_url: str = None, *, tail_count:
 
     docs = []
     for _, row in df.iterrows():
+        dt = to_market_naive(row["时间"], market="A", symbol=code, source=source)
+        if dt is None:
+            continue
         docs.append({
-            "dt": pd.to_datetime(row["时间"]),
+            "dt": dt,
             "meta": {"symbol": code, "freq": freq, "source": source, "market": "A"},
             "open": float(row["开盘"]),
             "high": float(row["最高"]),

@@ -25,6 +25,7 @@ from ..proxy import em_proxy
 from ..provider_limits import provider_call
 from ..retry import sync_retry
 from ..task_context import get_task_env
+from signals.core.market_time import naive_market_now
 
 logger = logging.getLogger("signals.sync.board_cons")
 
@@ -100,7 +101,7 @@ def _env_days(name: str, default: int) -> int:
 
 
 def _now() -> datetime:
-    return datetime.now()
+    return naive_market_now("A")
 
 
 def _coerce_datetime(value) -> datetime | None:
@@ -193,8 +194,8 @@ def _write_board_cons_progress(
         {"$set": {
             "module": "board_cons",
             "shard_key": key,
-            "last_run": datetime.now(),
-            "heartbeat_at": datetime.now(),
+            "last_run": _now(),
+            "heartbeat_at": _now(),
             "status": status,
             "bar_count": total_stocks,
             "error_msg": error_msg,
@@ -252,8 +253,8 @@ def _write_board_cons_aggregate(sync_col) -> None:
         {"$set": {
             "module": "board_cons",
             "shard_key": "aggregate",
-            "last_run": datetime.now(),
-            "heartbeat_at": datetime.now(),
+            "last_run": _now(),
+            "heartbeat_at": _now(),
             "status": status,
             "bar_count": total_stocks,
             "error_msg": f"{len(sample_errors)} errors; remaining={remaining}" if sample_errors or remaining else "",
@@ -515,7 +516,7 @@ def _sync_one_group(db: Database, *, kind: str, name: str, proxy_url: str = None
             {"$set": {
                 name_field: name,
                 "source": "source_unmapped",
-                "updated_at": datetime.now(),
+                "updated_at": _now(),
                 "status": "source_unmapped",
                 "error_msg": str(exc),
             }},
@@ -535,7 +536,7 @@ def _sync_one_group(db: Database, *, kind: str, name: str, proxy_url: str = None
             "stock_names": stock_names,
             "source": source,
             "stock_count": len(symbols),
-            "updated_at": datetime.now(),
+            "updated_at": _now(),
             "status": "ok",
         }},
         upsert=True,

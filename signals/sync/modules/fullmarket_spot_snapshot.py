@@ -13,6 +13,7 @@ from pymongo import UpdateOne
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
+from signals.sync.eastmoney_observer import observe_eastmoney
 from signals.sync.provider_limits import provider_call
 
 logger = logging.getLogger("signals.sync.fullmarket_spot_snapshot")
@@ -144,21 +145,24 @@ def _doc_from_row(row: dict, *, date_key: str, trade_date: str, snapshot_at) -> 
     }
 
 
-def _write_data_freshness(db: Database, *, count: int, date_key: str, elapsed: float) -> None:
+def _write_data_freshness(db: Database, *, count: int, date_key: str, elapsed: float, error: str = "") -> None:
     now = naive_market_now("A")
+    lane = os.getenv("SIGNALS_CURRENT_SYNC_LANE", "")
+    mode = "realtime" if os.getenv("SIGNALS_CURRENT_SYNC_MARKET") or lane else "postmarket"
     status = "fresh" if count > 0 else "empty"
     db["data_freshness"].update_one(
-        {"domain": "spot", "market": "A", "mode": "postmarket", "collection": "fullmarket_spot_snapshots"},
+        {"domain": "spot", "market": "A", "mode": mode, "collection": "fullmarket_spot_snapshots"},
         {"$set": {
             "domain": "spot",
             "market": "A",
-            "mode": "postmarket",
+            "mode": mode,
+            "lane": lane,
             "collection": "fullmarket_spot_snapshots",
             "freshness": status,
             "latest_dt": date_key,
             "as_of": date_key,
             "updated_at": now,
-            "stale_reason": "" if count > 0 else "fullmarket_spot_empty",
+            "stale_reason": "" if count > 0 else (error or "fullmarket_spot_empty"),
             "count": count,
             "elapsed_seconds": round(elapsed, 3),
         }},
@@ -172,7 +176,33 @@ def sync_fullmarket_spot_snapshot(db: Database, proxy_url: str = None) -> dict:
     now = naive_market_now("A")
     trade_date = now.date().isoformat()
     date_key = now.strftime("%Y%m%d")
-    rows = fetch_eastmoney_spot_rows(db)
+    try:
+        rows = fetch_eastmoney_spot_rows(db)
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        error = f"{exc.__class__.__name__}: {exc}"
+        _write_data_freshness(db, count=0, date_key=date_key, elapsed=elapsed, error=error)
+        observe_eastmoney(
+            db,
+            endpoint="fullmarket_spot_snapshot",
+            domain="market_data",
+            request_count=0,
+            returned_count=0,
+            elapsed_ms=elapsed * 1000,
+            error=error,
+        )
+        logger.warning("fullmarket spot snapshot failed: %s", error)
+        return {
+            "module": "fullmarket_spot_snapshot",
+            "status": "degraded",
+            "count": 0,
+            "inserted": 0,
+            "modified": 0,
+            "target_collection": "fullmarket_spot_snapshots",
+            "date_key": date_key,
+            "elapsed": elapsed,
+            "reason": error,
+        }
     docs = [
         doc
         for row in rows
@@ -190,6 +220,20 @@ def sync_fullmarket_spot_snapshot(db: Database, proxy_url: str = None) -> dict:
 
     elapsed = time.monotonic() - started
     _write_data_freshness(db, count=len(docs), date_key=date_key, elapsed=elapsed)
+    page_size = _page_size()
+    request_count = max(1, math.ceil(len(rows) / page_size)) if rows else 0
+    observe_eastmoney(
+        db,
+        endpoint="fullmarket_spot_snapshot",
+        domain="market_data",
+        request_count=request_count,
+        returned_count=len(rows),
+        elapsed_ms=elapsed * 1000,
+        http_status=200 if rows else None,
+        rc=0 if rows else None,
+        batch_size=page_size,
+        extra={"date_key": date_key},
+    )
     logger.info("fullmarket spot snapshot: %d rows, inserted=%d modified=%d", len(docs), inserted, modified)
     return {
         "module": "fullmarket_spot_snapshot",
@@ -201,4 +245,3 @@ def sync_fullmarket_spot_snapshot(db: Database, proxy_url: str = None) -> dict:
         "date_key": date_key,
         "elapsed": elapsed,
     }
-

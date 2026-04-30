@@ -10,6 +10,7 @@ from typing import Any
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
+from signals.core.scorer import FREQ_MULTIPLIER
 from signals.sync.task_context import get_task_env
 
 logger = logging.getLogger("signals.sync.terminal_pool")
@@ -21,12 +22,14 @@ MACD_TOKENS = ("MACD", "零上绿柱扩大", "零下绿柱缩小")
 GAP_TOKENS = ("缺口", "突破缺口", "持续缺口", "衰竭缺口", "普通缺口")
 ENTRY_FACTOR_TOKENS = ("gap", "trend_breakout", "vol_contraction", "candle_run", "candle_accel")
 TECHNICAL_TOKENS = CHAN_TOKENS + PATTERN_TOKENS + MACD_TOKENS + GAP_TOKENS + ENTRY_FACTOR_TOKENS
-RIGHT_SIDE_FREQS = {"5分钟", "5min", "5m", "15分钟", "15min", "15m"}
+RIGHT_SIDE_FREQS = {"5分钟", "5min", "5m", "F5", "f5", "15分钟", "15min", "15m", "F15", "f15"}
 BUY_FREQ_BONUS = {"30分钟": 120, "30min": 120, "30m": 120, "15分钟": 110, "15min": 110, "15m": 110, "5分钟": 80, "5min": 80, "5m": 80}
 ENTRY_30M_FREQS = {"30分钟", "30min", "30m", "F30", "f30"}
-ENTRY_PARTNER_FREQS = {"日线", "daily", "1d", "D", "d", "周线", "weekly", "1w", "W", "w", "15分钟", "15min", "15m", "F15", "f15"}
+ENTRY_UPPER_FREQS = {"日线", "daily", "1d", "D", "d", "周线", "weekly", "1w", "W", "w"}
+ENTRY_PARTNER_FREQS = ENTRY_UPPER_FREQS | RIGHT_SIDE_FREQS
+ENTRY_QUEUE_LANES = {"entry_ready", "entry_waiting_confirm", "entry_waiting_upper_context", "entry_waiting_right_side_confirm"}
 RISK_ACTION_STATUSES = {"risk_review", "chain_risk_review", "knowledge_blocked", "knowledge_conflict"}
-POOL_RANKING_VERSION = "entry_risk_watch_v1"
+POOL_RANKING_VERSION = "entry_priority_v2"
 FREQ_ORDER = {
     "周线": 0,
     "weekly": 0,
@@ -85,6 +88,14 @@ def _freq_sort_key(freq: Any) -> tuple[int, str]:
 
 def _is_30m_freq(freq: Any) -> bool:
     return _text(freq) in ENTRY_30M_FREQS
+
+
+def _is_upper_freq(freq: Any) -> bool:
+    return _text(freq) in ENTRY_UPPER_FREQS
+
+
+def _is_right_side_freq(freq: Any) -> bool:
+    return _text(freq) in RIGHT_SIDE_FREQS
 
 
 def _is_entry_partner_freq(freq: Any) -> bool:
@@ -239,7 +250,19 @@ def _screen_resonance_context(signal: dict[str, Any], sibling_signals: list[dict
 
 
 def _right_side_confirmed(aligned_freqs: list[str]) -> bool:
-    return any(freq in RIGHT_SIDE_FREQS for freq in aligned_freqs)
+    return any(_is_right_side_freq(freq) for freq in aligned_freqs)
+
+
+def _upper_context_confirmed(aligned_freqs: list[str]) -> bool:
+    return any(_is_upper_freq(freq) for freq in aligned_freqs)
+
+
+def _entry_waiting_label(queue_lane: str) -> str:
+    if queue_lane == "entry_waiting_upper_context":
+        return "等待日/周确认"
+    if queue_lane == "entry_waiting_right_side_confirm":
+        return "等待5m/15m确认"
+    return "等待共振确认"
 
 
 def _technical_actionability(side: str, resonance_context: dict[str, Any], freq: str = "") -> tuple[str, str]:
@@ -254,8 +277,10 @@ def _technical_actionability(side: str, resonance_context: dict[str, Any], freq:
         return "review_required", "context_only"
     if len(aligned_freqs) < 2:
         return "observe_only", "context_only"
+    if not _upper_context_confirmed(aligned_freqs):
+        return "entry_waiting_confirm", "entry_waiting_upper_context"
     if not _right_side_confirmed(aligned_freqs):
-        return "entry_waiting_confirm", "entry_waiting_confirm"
+        return "entry_waiting_confirm", "entry_waiting_right_side_confirm"
     return "entry_ready", "entry_ready"
 
 
@@ -397,7 +422,7 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
         actionability, queue_lane = _technical_actionability(normalized["signal_side"], resonance_context, normalized["freq"])
         normalized["actionability"] = normalized.get("actionability") or actionability
         normalized["queue_lane"] = normalized.get("queue_lane") or queue_lane
-        normalized["decision_effect"] = "exit_priority" if queue_lane == "risk_exit_first" else ("confirm" if queue_lane in {"entry_ready", "entry_waiting_confirm"} else "context_only")
+        normalized["decision_effect"] = "exit_priority" if queue_lane == "risk_exit_first" else ("confirm" if queue_lane in ENTRY_QUEUE_LANES else "context_only")
         row["technical_evidence"] = {
             "source_collection": normalized["source_collection"],
             "source_doc_id": normalized["source_doc_id"],
@@ -452,8 +477,8 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
             row["action_status"] = "entry_ready"
             row["trader_action"] = "可试仓"
         elif actionability == "entry_waiting_confirm":
-            row["action_status"] = "entry_waiting_confirm"
-            row["trader_action"] = "等待5m/15m确认"
+            row["action_status"] = top.get("queue_lane") or "entry_waiting_confirm"
+            row["trader_action"] = _entry_waiting_label(row["action_status"])
         elif actionability == "review_required":
             row["action_status"] = "period_conflict_review"
             row["trader_action"] = "周期冲突复核"
@@ -502,8 +527,8 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
                 row["action_status"] = "entry_ready"
                 row["trader_action"] = "可试仓"
             elif actionability == "entry_waiting_confirm":
-                row["action_status"] = "entry_waiting_confirm"
-                row["trader_action"] = "等待5m/15m确认"
+                row["action_status"] = technical.get("queue_lane") or "entry_waiting_confirm"
+                row["trader_action"] = _entry_waiting_label(row["action_status"])
             elif actionability == "review_required":
                 row["action_status"] = "period_conflict_review"
                 row["trader_action"] = "周期冲突复核"
@@ -521,14 +546,14 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
         row["invalidates_when"] = "知识观点或技术信号解除冲突"
     knowledge_effect = _text((row.get("knowledge_confirmation") or {}).get("effect"))
     chain_effect = _text((row.get("chain_context") or {}).get("effect"))
-    if row.get("queue_lane") in {"entry_ready", "entry_waiting_confirm"} and knowledge_effect in {"block", "downgrade", "exit_priority"}:
+    if row.get("queue_lane") in ENTRY_QUEUE_LANES and knowledge_effect in {"block", "downgrade", "exit_priority"}:
         row["action_status"] = "knowledge_blocked" if knowledge_effect == "block" else "knowledge_downgraded"
         row["trader_action"] = "知识库阻断" if knowledge_effect == "block" else "知识库降级复核"
         row["next_action"] = row["trader_action"]
         row["queue_lane"] = "context_only" if knowledge_effect == "block" else "entry_waiting_confirm"
         row["actionability"] = "review_required" if knowledge_effect == "block" else "entry_waiting_confirm"
         row["invalidates_when"] = "知识库风险解除且右侧确认重新出现"
-    if row.get("queue_lane") in {"entry_ready", "entry_waiting_confirm"} and chain_effect in {"block", "exit_priority"}:
+    if row.get("queue_lane") in ENTRY_QUEUE_LANES and chain_effect in {"block", "exit_priority"}:
         row["action_status"] = "chain_risk_review"
         row["trader_action"] = "产业链风险复核"
         row["next_action"] = row["trader_action"]
@@ -1062,10 +1087,51 @@ def _source_collections(row: dict[str, Any]) -> list[str]:
     return values
 
 
+def _scorer_freq_multiplier(freq: Any) -> float:
+    text = _text(freq)
+    aliases = {
+        "weekly": "周线",
+        "1w": "周线",
+        "w": "周线",
+        "daily": "日线",
+        "1d": "日线",
+        "d": "日线",
+        "30min": "30分钟",
+        "30m": "30分钟",
+        "f30": "30分钟",
+        "15min": "15分钟",
+        "15m": "15分钟",
+        "f15": "15分钟",
+        "5min": "5分钟",
+        "5m": "5分钟",
+        "f5": "5分钟",
+    }
+    key = aliases.get(text.lower(), text)
+    return float(FREQ_MULTIPLIER.get(key, 1.0))
+
+
+def _buy_reason_priority(reason: dict[str, Any]) -> tuple[float, float, float, float]:
+    freqs = _reason_freqs(reason)
+    readiness = 0.0
+    if any(_is_30m_freq(freq) for freq in freqs):
+        readiness += 1000.0
+    if any(_is_upper_freq(freq) for freq in freqs):
+        readiness += 600.0
+    if any(_is_right_side_freq(freq) for freq in freqs):
+        readiness += 500.0
+    upper_quality = sum(_scorer_freq_multiplier(freq) for freq in freqs if _is_upper_freq(freq))
+    return (
+        readiness,
+        upper_quality,
+        _float(reason.get("score")),
+        _float(reason.get("confidence")),
+    )
+
+
 def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, Any] | None, dict[str, Any] | None]:
     buy_reasons = _buy_technical_reasons(row)
     risk_reasons = _risk_reasons(row)
-    top_buy = max(buy_reasons, key=lambda item: (_float(item.get("score")), _float(item.get("confidence"))), default=None)
+    top_buy = max(buy_reasons, key=_buy_reason_priority, default=None)
     top_risk = max(risk_reasons, key=lambda item: (_float(item.get("weight")), abs(_float(item.get("score")))), default=None)
     if top_risk:
         return False, "blocked_by_risk", ["risk_signal_present"], top_buy, top_risk
@@ -1080,11 +1146,17 @@ def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, An
     if conflict_freqs:
         return False, "blocked_by_period_conflict", sorted(conflict_freqs, key=_freq_sort_key), top_buy, top_risk
     has_30m = any(_is_30m_freq(freq) for freq in freqs)
+    has_upper = any(_is_upper_freq(freq) for freq in freqs)
+    has_right_side = any(_is_right_side_freq(freq) for freq in freqs)
     has_partner = any(_is_entry_partner_freq(freq) for freq in freqs)
     if not has_30m:
         return False, "entry_waiting_30m_confirm", ["30m_missing"], top_buy, top_risk
+    if not has_upper:
+        return False, "entry_waiting_upper_context", ["daily_or_weekly_missing"], top_buy, top_risk
     if not has_partner:
         return False, "entry_waiting_resonance_confirm", ["partner_period_missing"], top_buy, top_risk
+    if not has_right_side:
+        return False, "entry_waiting_right_side_confirm", ["5m_or_15m_missing"], top_buy, top_risk
     return True, "entry_confirmed", [], top_buy, top_risk
 
 
@@ -1115,20 +1187,65 @@ def _context_adjust(row: dict[str, Any]) -> float:
     return adjust
 
 
+def _row_buy_freqs(row: dict[str, Any], top_buy: dict[str, Any]) -> set[str]:
+    freqs = set(_reason_freqs(top_buy))
+    for reason in _buy_technical_reasons(row):
+        freqs.update(_reason_freqs(reason))
+    return {freq for freq in freqs if freq}
+
+
 def _entry_components(row: dict[str, Any], top_buy: dict[str, Any]) -> dict[str, float]:
-    freqs = _reason_freqs(top_buy)
+    freqs = _row_buy_freqs(row, top_buy)
     context = top_buy.get("resonance_context") if isinstance(top_buy.get("resonance_context"), dict) else {}
     grade = _text(context.get("grade"))
-    resonance = 30.0 if grade == "strong_resonance" else 22.0 if grade == "multi_period" else 12.0
+    resonance = 34.0 if grade == "strong_resonance" else 24.0 if grade == "multi_period" else 12.0
+    upper_score = min(30.0, sum(_scorer_freq_multiplier(freq) * 8.0 for freq in freqs if _is_upper_freq(freq)))
+    right_side = 24.0 if any(_is_right_side_freq(freq) for freq in freqs) else 0.0
+    trigger_30m = 22.0 if any(_is_30m_freq(freq) for freq in freqs) else 0.0
     components = {
-        "technical_score": max(0.0, _float(top_buy.get("score"))) * 0.35,
+        "entry_readiness": 36.0,
+        "upper_timeframe_quality": upper_score,
+        "trigger_30m": trigger_30m,
+        "right_side_confirmation": right_side,
+        "technical_score": max(0.0, _float(top_buy.get("score"))) * 0.30,
         "resonance": resonance,
-        "right_side_30m": 24.0 if any(_is_30m_freq(freq) for freq in freqs) else 0.0,
         "confidence": min(1.0, _float(top_buy.get("confidence"))) * 18.0,
         "freshness": 10.0,
         "context_adjust": _context_adjust(row),
     }
     return {key: round(value, 3) for key, value in components.items()}
+
+
+def _rank_reason(score_components: dict[str, float]) -> str:
+    labels = {
+        "entry_readiness": "执行确认",
+        "upper_timeframe_quality": "周/日线",
+        "trigger_30m": "30m触发",
+        "right_side_confirmation": "5m/15m确认",
+        "technical_score": "技术分",
+        "resonance": "共振",
+        "confidence": "置信度",
+        "freshness": "新鲜度",
+        "context_adjust": "观点修正",
+        "sell_strength": "风险强度",
+        "timeframe_severity": "级别严重度",
+        "chain_or_knowledge_risk": "知识/产业链风险",
+        "source_priority": "来源优先级",
+        "entry_proximity": "接近买点",
+        "heat_or_theme": "热度/主题",
+    }
+    ordered = sorted(score_components.items(), key=lambda item: abs(_float(item[1])), reverse=True)
+    selected = ordered[:5]
+    if "upper_timeframe_quality" in score_components and not any(key == "upper_timeframe_quality" for key, _ in selected):
+        selected.append(("upper_timeframe_quality", score_components["upper_timeframe_quality"]))
+    parts = []
+    for key, value in selected:
+        numeric = _float(value)
+        if numeric == 0:
+            continue
+        label = labels.get(key, key)
+        parts.append(f"{label}{numeric:+.1f}")
+    return " · ".join(parts)
 
 
 def _risk_components(row: dict[str, Any], top_risk: dict[str, Any]) -> dict[str, float]:
@@ -1152,7 +1269,7 @@ def _watch_components(row: dict[str, Any], gate_status: str) -> dict[str, float]
         source_priority = 18.0
     elif any(tag.startswith("chain_") for tag in row.get("source_tags", [])):
         source_priority = 16.0
-    proximity = 30.0 if gate_status == "entry_waiting_30m_confirm" else 22.0 if gate_status == "entry_waiting_resonance_confirm" else 10.0
+    proximity = 30.0 if gate_status in {"entry_waiting_30m_confirm", "entry_waiting_right_side_confirm"} else 22.0 if gate_status in {"entry_waiting_resonance_confirm", "entry_waiting_upper_context"} else 10.0
     components = {
         "source_priority": source_priority,
         "entry_proximity": proximity,
@@ -1177,6 +1294,7 @@ def _finalize_pool_row(
     row["rank_score"] = round(rank_score, 3)
     row["sort_score"] = row["rank_score"]
     row["score_components"] = score_components
+    row["rank_reason"] = _rank_reason(score_components)
     row["entry_gate_status"] = entry_gate_status
     row["blocked_by"] = blocked_by
     row["top_buy_reason"] = top_buy or {}
@@ -1208,6 +1326,14 @@ def _finalize_pool_row(
             row["action_status"] = "entry_waiting_30m_confirm"
             row["trader_action"] = "等待30m确认"
             row["queue_lane"] = "watch_preheat"
+        elif entry_gate_status == "entry_waiting_upper_context":
+            row["action_status"] = "entry_waiting_upper_context"
+            row["trader_action"] = "等待日/周确认"
+            row["queue_lane"] = "watch_preheat"
+        elif entry_gate_status == "entry_waiting_right_side_confirm":
+            row["action_status"] = "entry_waiting_right_side_confirm"
+            row["trader_action"] = "等待5m/15m确认"
+            row["queue_lane"] = "watch_preheat"
         elif entry_gate_status == "entry_waiting_resonance_confirm":
             row["action_status"] = "entry_waiting_resonance_confirm"
             row["trader_action"] = "等待共振确认"
@@ -1230,6 +1356,11 @@ def _finalize_pool_row(
         if isinstance(reason, dict) and _text(reason.get("signal_type") or reason.get("reason_type"))
     ) or row.get("reason")
     return row
+
+
+def _assign_pool_ranks(rows: list[dict[str, Any]]) -> None:
+    for index, row in enumerate(rows, start=1):
+        row["rank"] = index
 
 
 def _prepare_pool_rows(rows: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1303,6 +1434,7 @@ def _split_pool_rows(
             ))
     for bucket in (focus, risk, watch):
         bucket.sort(key=lambda item: (_float(item.get("rank_score")), _float(item.get("score"))), reverse=True)
+        _assign_pool_ranks(bucket)
     return {
         "focus": focus[:focus_limit],
         "risk": risk[:risk_limit],

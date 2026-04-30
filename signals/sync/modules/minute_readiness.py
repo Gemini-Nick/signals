@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 from pymongo import UpdateOne
@@ -14,6 +15,21 @@ from signals.core.market_time import naive_market_now
 logger = logging.getLogger("signals.sync.minute_readiness")
 
 MINUTE_FREQS = ["5分钟", "15分钟", "30分钟"]
+
+_FREQ_ALIASES = {
+    "5": "5分钟",
+    "5m": "5分钟",
+    "5min": "5分钟",
+    "5分钟": "5分钟",
+    "15": "15分钟",
+    "15m": "15分钟",
+    "15min": "15分钟",
+    "15分钟": "15分钟",
+    "30": "30分钟",
+    "30m": "30分钟",
+    "30min": "30分钟",
+    "30分钟": "30分钟",
+}
 
 
 def _symbol_candidates(symbol: str) -> list[str]:
@@ -40,11 +56,56 @@ def _latest_bar(db: Database, collection: str, symbol: str, freq: str) -> tuple[
     return int(count), latest.get("dt"), (latest.get("meta") or {}).get("source", "")
 
 
-def _stock_symbols(db: Database) -> list[str]:
-    meta = db["sync_log"].find_one(
+def _normalize_minute_freqs(values: Any) -> list[str]:
+    if isinstance(values, str):
+        raw_values = [part.strip() for part in values.split(",")]
+    else:
+        raw_values = list(values or [])
+    freqs: list[str] = []
+    for value in raw_values:
+        key = str(value or "").strip()
+        if not key:
+            continue
+        freq = _FREQ_ALIASES.get(key.lower(), key)
+        if freq in MINUTE_FREQS and freq not in freqs:
+            freqs.append(freq)
+    return freqs or list(MINUTE_FREQS)
+
+
+def _stock_selection_meta(db: Database) -> dict[str, Any]:
+    return db["sync_log"].find_one(
         {"_id": "stock_minute:selection:_meta"},
-        {"selected_symbols": 1, "priority_symbols": 1, "pinned_symbols": 1},
+        {
+            "selected_symbols": 1,
+            "priority_symbols": 1,
+            "pinned_symbols": 1,
+            "minute_freqs": 1,
+            "result.minute_freqs": 1,
+            "last_run": 1,
+        },
     ) or {}
+
+
+def _same_market_day(value: Any, now: datetime) -> bool:
+    if isinstance(value, datetime):
+        return value.date() == now.date()
+    if isinstance(value, str):
+        return value[:10] == now.date().isoformat()
+    return False
+
+
+def _stock_freqs(meta: dict[str, Any], now: datetime) -> list[str]:
+    values = meta.get("minute_freqs") or (meta.get("result") or {}).get("minute_freqs")
+    if not values:
+        return list(MINUTE_FREQS)
+    last_run = meta.get("last_run")
+    if last_run and not _same_market_day(last_run, now):
+        return list(MINUTE_FREQS)
+    return _normalize_minute_freqs(values)
+
+
+def _stock_symbols(db: Database, meta: dict[str, Any] | None = None) -> list[str]:
+    meta = meta if meta is not None else _stock_selection_meta(db)
     symbols = list(meta.get("selected_symbols") or [])
     for symbol in meta.get("pinned_symbols") or []:
         if symbol not in symbols:
@@ -84,10 +145,19 @@ def _heat_names(db: Database, kind: str) -> list[str]:
     return names[:40]
 
 
-def _probe_symbol_domain(db: Database, *, domain: str, collection: str, symbols: list[str], now) -> list[dict[str, Any]]:
+def _probe_symbol_domain(
+    db: Database,
+    *,
+    domain: str,
+    collection: str,
+    symbols: list[str],
+    now,
+    freqs: list[str] | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    active_freqs = freqs or MINUTE_FREQS
     for symbol in symbols:
-        for freq in MINUTE_FREQS:
+        for freq in active_freqs:
             count, latest_dt, source = _latest_bar(db, collection, symbol, freq)
             rows.append({
                 "domain": domain,
@@ -132,7 +202,16 @@ def _probe_heat_domain(db: Database, *, kind: str, names: list[str], now) -> lis
 def sync_minute_readiness_probe(db: Database, proxy_url: str = None) -> dict:
     now = naive_market_now("A")
     rows = []
-    rows.extend(_probe_symbol_domain(db, domain="stock", collection="bars", symbols=_stock_symbols(db), now=now))
+    stock_meta = _stock_selection_meta(db)
+    stock_freqs = _stock_freqs(stock_meta, now)
+    rows.extend(_probe_symbol_domain(
+        db,
+        domain="stock",
+        collection="bars",
+        symbols=_stock_symbols(db, stock_meta),
+        now=now,
+        freqs=stock_freqs,
+    ))
     rows.extend(_probe_symbol_domain(db, domain="index", collection="index_bars", symbols=_index_symbols(), now=now))
     rows.extend(_probe_heat_domain(db, kind="industry", names=_heat_names(db, "industry"), now=now))
     rows.extend(_probe_heat_domain(db, kind="concept", names=_heat_names(db, "concept"), now=now))

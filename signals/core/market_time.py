@@ -74,8 +74,31 @@ def market_today(value: Any = "A", *, symbol: Any = "", source: Any = ""):
     return market_now(value, symbol=symbol, source=source).date()
 
 
+def market_date_str(value: Any = "A", *, symbol: Any = "", source: Any = "") -> str:
+    return market_today(value, symbol=symbol, source=source).isoformat()
+
+
+def market_date_key(value: Any = "A", *, symbol: Any = "", source: Any = "") -> str:
+    return market_now(value, symbol=symbol, source=source).strftime("%Y%m%d")
+
+
 def naive_market_now(value: Any = "A", *, symbol: Any = "", source: Any = "") -> datetime:
     return market_now(value, symbol=symbol, source=source).replace(tzinfo=None)
+
+
+def to_market_naive(value: Any, *, market: Any = "", symbol: Any = "", source: Any = "") -> datetime | None:
+    if value is None:
+        return None
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        return None
+    if pd.isna(ts):
+        return None
+    tz = market_timezone(market, symbol=symbol, source=source)
+    if ts.tzinfo is None:
+        return ts.to_pydatetime().replace(tzinfo=None)
+    return ts.tz_convert(tz).to_pydatetime().replace(tzinfo=None)
 
 
 def to_unix_seconds(value: Any, *, market: Any = "", symbol: Any = "", source: Any = "") -> int:

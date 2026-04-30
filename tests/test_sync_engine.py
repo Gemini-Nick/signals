@@ -41,6 +41,10 @@ class _FakeCollection:
     def find_one(self, query=None, *args, **kwargs):
         if self.docs and isinstance(query, dict) and "_id" in query:
             return self.docs.get(query["_id"])
+        if self.docs and isinstance(query, dict):
+            for doc in self.docs.values():
+                if all(doc.get(key) == value for key, value in query.items()):
+                    return doc
         return self.doc
 
     def find(self, *args, **kwargs):
@@ -167,6 +171,14 @@ def test_lane_filtered_daemon_only_runs_matching_live_plans():
     engine.db = _FakeDb({"sync_log": _FakeCollection()})
     calls = []
 
+    def ulist_fn(db, proxy_url=None):
+        calls.append("eastmoney_ulist_quote")
+        return {"inserted": 1}
+
+    def fullmarket_fn(db, proxy_url=None):
+        calls.append("fullmarket_spot_snapshot")
+        return {"inserted": 1}
+
     def quote_fn(db, proxy_url=None):
         calls.append("quote_snapshots")
         return {"inserted": 1}
@@ -176,6 +188,8 @@ def test_lane_filtered_daemon_only_runs_matching_live_plans():
         return {"inserted": 1}
 
     engine.module_map = {
+        "eastmoney_ulist_quote": (ulist_fn, ""),
+        "fullmarket_spot_snapshot": (fullmarket_fn, ""),
         "quote_snapshots": (quote_fn, ""),
         "index_minute": (index_fn, ""),
     }
@@ -183,8 +197,8 @@ def test_lane_filtered_daemon_only_runs_matching_live_plans():
 
     results = engine._run_intraday_bundle({Market.A}, datetime(2026, 4, 27, 10, 0))
 
-    assert calls == ["quote_snapshots"]
-    assert [item["module"] for item in results] == ["quote_snapshots"]
+    assert calls == ["eastmoney_ulist_quote", "fullmarket_spot_snapshot", "quote_snapshots"]
+    assert [item["module"] for item in results] == calls
 
 
 def test_signal_lane_intraday_runs_readiness_probe():
@@ -216,6 +230,57 @@ def test_signal_lane_intraday_runs_readiness_probe():
 
     assert calls == ["index_minute", "stock_minute", "minute_readiness_probe"]
     assert [item["module"] for item in results] == calls
+
+
+def test_quote_snapshots_preserves_writer_freshness_summary():
+    engine = object.__new__(SyncEngine)
+    quote_snapshots = _FakeCollection(count=98, doc={"dt": datetime(2026, 4, 29), "freshness": "stale"})
+    freshness = _FakeCollection()
+    freshness.docs["quote"] = {
+        "domain": "quote",
+        "market": "A",
+        "mode": "realtime",
+        "collection": "quote_snapshots",
+        "freshness": "partial",
+        "live_count": 97,
+        "stale_count": 1,
+    }
+    engine.db = _FakeDb({
+        "quote_snapshots": quote_snapshots,
+        "data_freshness": freshness,
+    })
+
+    engine._write_module_freshness("quote_snapshots", "ok", None, market="A", lane="quote_lane")
+
+    assert freshness.docs["quote"]["freshness"] == "partial"
+    assert freshness.docs["quote"]["live_count"] == 97
+    assert "count" not in freshness.docs["quote"]
+
+
+def test_fullmarket_spot_preserves_writer_freshness_summary():
+    engine = object.__new__(SyncEngine)
+    spot_snapshots = _FakeCollection(count=11695, doc={"dt": datetime(2026, 4, 29), "freshness": "fresh"})
+    freshness = _FakeCollection()
+    freshness.docs["spot"] = {
+        "domain": "spot",
+        "market": "A",
+        "mode": "realtime",
+        "collection": "fullmarket_spot_snapshots",
+        "freshness": "fresh",
+        "latest_dt": "2026-04-30",
+        "count": 5849,
+        "elapsed_seconds": 4.449,
+    }
+    engine.db = _FakeDb({
+        "fullmarket_spot_snapshots": spot_snapshots,
+        "data_freshness": freshness,
+    })
+
+    engine._write_module_freshness("fullmarket_spot_snapshot", "ok", None, market="A", lane="quote_lane")
+
+    assert freshness.docs["spot"]["count"] == 5849
+    assert freshness.docs["spot"]["elapsed_seconds"] == 4.449
+    assert freshness.docs["spot"]["latest_dt"] == "2026-04-30"
 
 
 def test_board_lane_intraday_runs_heat_not_board_cons():
@@ -251,6 +316,37 @@ def test_board_lane_intraday_runs_heat_not_board_cons():
     results = engine._run_intraday_bundle({Market.A}, datetime(2026, 4, 27, 10, 0))
 
     assert calls == ["board_heat_minute", "concept_heat_minute", "chain_heat_snapshots"]
+    assert [item["module"] for item in results] == calls
+
+
+def test_workbench_lane_intraday_rebuilds_terminal_stock_pool():
+    engine = object.__new__(SyncEngine)
+    engine.enabled_lanes = {"workbench_lane"}
+    engine.db = _FakeDb({"sync_log": _FakeCollection(), "strategy_snapshots": _FakeCollection(count=1)})
+    calls = []
+
+    def market_pools(db, proxy_url=None):
+        calls.append("market_pools")
+        return {"inserted": 1}
+
+    def strategy_snapshot(db, proxy_url=None):
+        calls.append("strategy_snapshot")
+        return {"inserted": 1}
+
+    def terminal_realtime_pool(db, proxy_url=None):
+        calls.append("terminal_realtime_pool")
+        return {"inserted": 1}
+
+    engine.module_map = {
+        "market_pools": (market_pools, ""),
+        "strategy_snapshot": (strategy_snapshot, ""),
+        "terminal_realtime_pool": (terminal_realtime_pool, ""),
+    }
+    engine.proxy_url = None
+
+    results = engine._run_intraday_bundle({Market.A}, datetime(2026, 4, 27, 10, 0))
+
+    assert calls == ["market_pools", "strategy_snapshot", "terminal_realtime_pool"]
     assert [item["module"] for item in results] == calls
 
 

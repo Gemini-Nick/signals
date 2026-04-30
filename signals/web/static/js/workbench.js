@@ -355,8 +355,11 @@ function wbRenderTargetMeta(data) {
     ['最新信号', summary.latest_signal || '—'],
     ['结论', summary.conclusion ? '已生成' : '—'],
   ];
+  if (summary.quote_status_label) statItems.push(['行情', summary.quote_status_label]);
   if (summary.score != null) statItems.push(['评分', wbFormatNumber(summary.score, 1)]);
-  if (summary.gain_pct != null) statItems.push(['涨幅', wbFormatPct(summary.gain_pct, 2)]);
+  if (summary.gain_pct != null && ['realtime', 'delayed'].includes(summary.quote_status)) {
+    statItems.push(['今日涨幅', wbFormatPct(summary.gain_pct, 2)]);
+  }
 
   document.getElementById('wb-target-stats').innerHTML = statItems.map(([label, value]) => `
     <div class="wb-stat-chip">

@@ -12,10 +12,11 @@
     source, dt
 """
 import logging
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
+
+from signals.core.market_time import market_date_str
 
 logger = logging.getLogger("signals.data.board_normalizer")
 
@@ -46,7 +47,7 @@ def _ensure_unified(df: pd.DataFrame, source: str) -> pd.DataFrame:
     df = df.copy()
     df["source"] = source
     if "dt" not in df.columns:
-        df["dt"] = datetime.now().strftime("%Y-%m-%d")
+        df["dt"] = market_date_str("A")
     for col in UNIFIED_COLS:
         if col not in df.columns:
             df[col] = np.nan

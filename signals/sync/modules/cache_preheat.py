@@ -16,6 +16,8 @@ import pandas as pd
 from pymongo import UpdateOne
 from pymongo.database import Database
 
+from signals.core.market_time import naive_market_now
+
 logger = logging.getLogger("signals.sync.cache_preheat")
 
 
@@ -35,6 +37,14 @@ def _freq_from_name(freq: str) -> str:
         "15m": "15m",
         "30m": "30m",
     }.get(freq, freq)
+
+
+def _now() -> datetime:
+    return naive_market_now("A")
+
+
+def _today_str() -> str:
+    return _now().strftime("%Y-%m-%d")
 
 
 def _import_kline_files(db: Database, root: Path) -> int:
@@ -69,7 +79,7 @@ def _import_kline_files(db: Database, root: Path) -> int:
                 "vol": int(float(record.get("vol", 0) or 0)),
                 "amount": int(float(record.get("amount", 0) or 0)),
                 "source": "disk_kline_cache",
-                "updated_at": datetime.now(),
+                "updated_at": _now(),
             })
     if docs:
         db["bars"].insert_many(docs, ordered=False)
@@ -87,8 +97,8 @@ def _import_stock_names(db: Database, root: Path) -> int:
             "name": name,
             "code": code,
             "symbol": code,
-            "dt": datetime.now().strftime("%Y-%m-%d"),
-            "updated_at": datetime.now(),
+            "dt": _today_str(),
+            "updated_at": _now(),
             "source": "disk_name_to_code",
         }
         ops.append(UpdateOne({"name": name}, {"$set": doc}, upsert=True))
@@ -112,8 +122,8 @@ def _import_constituents(db: Database, root: Path) -> int:
             "concept_name": name,
             "symbols": symbols,
             "stock_count": len(symbols),
-            "dt": datetime.now().strftime("%Y-%m-%d"),
-            "updated_at": datetime.now(),
+            "dt": _today_str(),
+            "updated_at": _now(),
             "source": "disk_stocks_cache",
         }
         board_ops.append(UpdateOne({"board_name": name}, {"$set": doc}, upsert=True))
@@ -143,8 +153,8 @@ def _import_constituents(db: Database, root: Path) -> int:
             "symbols": symbols,
             "stock_names": stock_names,
             "stock_count": len(symbols),
-            "dt": datetime.now().strftime("%Y-%m-%d"),
-            "updated_at": datetime.now(),
+            "dt": _today_str(),
+            "updated_at": _now(),
             "source": "disk_social_concept_stocks",
             "source_code": payload.get("code") if isinstance(payload, dict) else "",
         }
@@ -161,10 +171,10 @@ def _import_social(db: Database, root: Path) -> int:
     weibo = root / ".data" / "cache" / "social_weibo_sentiment.json"
     if weibo.exists():
         data = _load_json(weibo)
-        dt = datetime.fromtimestamp(data.get("ts", datetime.now().timestamp()))
+        dt = datetime.fromtimestamp(data.get("ts", _now().timestamp()))
         db["social_weibo"].update_one(
             {"_id": "weibo_sentiment_latest"},
-            {"$set": {"dt": dt, "updated_at": datetime.now(), "source": "disk_social_weibo", **data}},
+            {"$set": {"dt": dt, "updated_at": _now(), "source": "disk_social_weibo", **data}},
             upsert=True,
         )
         ops = []
@@ -179,7 +189,7 @@ def _import_social(db: Database, root: Path) -> int:
                 "heat_grade": "cached",
                 "tag": "weibo_sentiment",
                 "dt": dt,
-                "updated_at": datetime.now(),
+                "updated_at": _now(),
                 "source": "disk_social_weibo",
             }
             ops.append(UpdateOne({"symbol": name}, {"$set": doc}, upsert=True))
@@ -190,13 +200,13 @@ def _import_social(db: Database, root: Path) -> int:
     concepts = root / ".data" / "cache" / "social_concept_list.json"
     if concepts.exists():
         data = _load_json(concepts)
-        dt = datetime.fromtimestamp(data.get("ts", datetime.now().timestamp()))
+        dt = datetime.fromtimestamp(data.get("ts", _now().timestamp()))
         records = data.get("records", [])
         db["social_comment"].update_one(
             {"_id": "concept_list_latest"},
             {"$set": {
                 "dt": dt,
-                "updated_at": datetime.now(),
+                "updated_at": _now(),
                 "source": "disk_social_concept_list",
                 "records": records,
             }},
@@ -218,8 +228,8 @@ def _import_history_docs(db: Database, root: Path) -> int:
         db[collection].update_one(
             {"_id": path.stem},
             {"$set": {
-                "dt": datetime.now().strftime("%Y-%m-%d"),
-                "updated_at": datetime.now(),
+                "dt": _today_str(),
+                "updated_at": _now(),
                 "source": "disk_cache",
                 "data": data,
             }},
@@ -233,7 +243,7 @@ def _import_history_docs(db: Database, root: Path) -> int:
                 {"_id": path.stem},
                 {"$set": {
                     "dt": path.stem,
-                    "updated_at": datetime.now(),
+                    "updated_at": _now(),
                     "source": "disk_cache",
                     "data": _load_json(path),
                 }},
@@ -259,10 +269,10 @@ def sync_cache_preheat(db: Database, proxy_url: str = None) -> dict:
             "market": "A",
             "mode": "historical",
             "collection": "disk_preheat",
-            "latest_dt": datetime.now().strftime("%Y-%m-%d"),
-            "as_of": datetime.now().strftime("%Y-%m-%d"),
+            "latest_dt": _today_str(),
+            "as_of": _today_str(),
             "stale_reason": "",
-            "updated_at": datetime.now(),
+            "updated_at": _now(),
             "result": result,
         }},
         upsert=True,

@@ -330,7 +330,7 @@ def test_terminal_stock_pool_splits_buy_entries_from_risk_controls():
         "confidence": 0.8,
         "resonance_context": {
             "direction": "buy",
-            "aligned_freqs": ["日线", "30分钟"],
+            "aligned_freqs": ["日线", "30分钟", "15分钟"],
             "conflict_freqs": [],
             "grade": "multi_period",
         },
@@ -358,6 +358,8 @@ def test_terminal_stock_pool_splits_buy_entries_from_risk_controls():
     assert [row["raw_code"] for row in split["risk"]] == ["688484"]
     assert split["focus"][0]["pool_type"] == "focus"
     assert split["focus"][0]["entry_gate_status"] == "entry_confirmed"
+    assert split["focus"][0]["rank"] == 1
+    assert split["focus"][0]["rank_reason"]
     assert split["risk"][0]["pool_type"] == "risk"
 
 
@@ -385,7 +387,75 @@ def test_terminal_stock_pool_single_period_buy_waits_in_watch_pool():
     assert split["focus"] == []
     assert split["risk"] == []
     assert split["watch"][0]["raw_code"] == "300575"
-    assert split["watch"][0]["entry_gate_status"] == "entry_waiting_resonance_confirm"
+    assert split["watch"][0]["entry_gate_status"] == "entry_waiting_upper_context"
+
+
+def test_terminal_stock_pool_daily_30m_without_right_side_waits_for_confirmation():
+    rows = {}
+    _add_reason(rows, "300575", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "daily-30m",
+        "signal_type": "三买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 120,
+        "confidence": 0.8,
+        "resonance_context": {
+            "direction": "buy",
+            "aligned_freqs": ["日线", "30分钟"],
+            "conflict_freqs": [],
+            "grade": "multi_period",
+        },
+    }, index_codes=set(), name="中旗新材")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["focus"] == []
+    assert split["watch"][0]["entry_gate_status"] == "entry_waiting_right_side_confirm"
+    assert split["watch"][0]["trader_action"] == "等待5m/15m确认"
+
+
+def test_terminal_stock_pool_entry_ready_rank_uses_timeframe_and_score_components():
+    rows = {}
+    _add_reason(rows, "300575", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "daily-ready",
+        "signal_type": "三买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 100,
+        "confidence": 0.7,
+        "resonance_context": {
+            "direction": "buy",
+            "aligned_freqs": ["日线", "30分钟", "15分钟"],
+            "conflict_freqs": [],
+            "grade": "multi_period",
+        },
+    }, index_codes=set(), name="日线确认股")
+    _add_reason(rows, "688484", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "weekly-ready",
+        "signal_type": "三买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 100,
+        "confidence": 0.7,
+        "resonance_context": {
+            "direction": "buy",
+            "aligned_freqs": ["周线", "30分钟", "15分钟"],
+            "conflict_freqs": [],
+            "grade": "multi_period",
+        },
+    }, index_codes=set(), name="周线确认股")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert [row["raw_code"] for row in split["focus"]] == ["688484", "300575"]
+    assert [row["rank"] for row in split["focus"]] == [1, 2]
+    assert "周/日线" in split["focus"][0]["rank_reason"]
 
 
 def test_terminal_stock_pool_strategy_fallback_only_goes_to_watch_pool():

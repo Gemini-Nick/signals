@@ -11,11 +11,12 @@ from __future__ import annotations
 import logging
 import json
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
 import pandas as pd
+
+from signals.core.market_time import naive_market_now
 
 from .models import DataRequest, DataResponse, normalize_as_of, resolve_mode
 
@@ -298,7 +299,7 @@ def _write_provider_health(provider: str, endpoint: str, domain: str,
         db = get_db()
         if db is None:
             return
-        now = datetime.now()
+        now = naive_market_now("A")
         update = {
             "provider": provider,
             "endpoint": endpoint,
@@ -341,7 +342,7 @@ def _write_data_freshness(domain: str, mode: str, collection: str,
                 "latest_dt": latest_dt,
                 "freshness": freshness or ("stale" if stale_reason else "fresh"),
                 "stale_reason": stale_reason,
-                "updated_at": datetime.now(),
+                "updated_at": naive_market_now("A"),
             }},
             upsert=True,
         )
@@ -582,8 +583,11 @@ def get_quote_snapshot(request: DataRequest) -> DataResponse:
             return DataResponse(data, mode, "quote_snapshots", freshness="pending", is_stale=True,
                                 latency_ms=_elapsed_ms(start), errors=["quote_snapshot_empty"])
         as_of = str((docs[0].get("dt") or docs[0].get("snapshot_at") or ""))[:10] or None
-        is_stale = any(bool(doc.get("is_stale")) or doc.get("freshness") == "stale" for doc in docs)
-        _write_data_freshness("quote", mode, "quote_snapshots", as_of, "stale_snapshot" if is_stale else "")
+        expected_as_of = normalize_as_of(request.as_of, request.market)
+        date_stale = bool(as_of and expected_as_of and as_of < expected_as_of)
+        is_stale = date_stale or any(bool(doc.get("is_stale")) or doc.get("freshness") == "stale" for doc in docs)
+        stale_reason = "older_than_market_day" if date_stale else "stale_snapshot" if is_stale else ""
+        _write_data_freshness("quote", mode, "quote_snapshots", as_of, stale_reason)
         return DataResponse(data, mode, "quote_snapshots", as_of=as_of,
                             freshness="stale" if is_stale else "fresh", is_stale=is_stale,
                             latency_ms=_elapsed_ms(start))

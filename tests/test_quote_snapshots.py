@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from signals.sync.modules.quote_snapshots import _quote_doc_from_em, _read_fullmarket_spot_quotes, _secid_for_symbol
+from signals.sync.modules.quote_snapshots import (
+    _quote_doc_from_em,
+    _quote_doc_from_ulist_row,
+    _read_fullmarket_spot_quotes,
+    _secid_for_symbol,
+)
 
 
 def test_eastmoney_secid_for_prefixed_symbols():
@@ -40,6 +45,34 @@ def test_quote_doc_from_eastmoney_payload_scales_fields():
     assert doc["freshness"] == "fresh"
     assert doc["price"] == 19.67
     assert doc["prev_close"] == 19.43
+    assert doc["change_pct"] == 1.24
+    assert doc["vol"] == 30498700
+
+
+def test_quote_doc_from_ulist_row_uses_batch_fields():
+    row = {
+        "f2": 19.67,
+        "f3": 1.24,
+        "f4": 0.24,
+        "f5": 304987,
+        "f6": 591786626.0,
+        "f7": 4.53,
+        "f8": 0.95,
+        "f12": "601958",
+        "f13": 1,
+        "f14": "金钼股份",
+        "f15": 19.86,
+        "f16": 18.98,
+        "f17": 19.33,
+        "f18": 19.43,
+    }
+
+    doc = _quote_doc_from_ulist_row("SH.601958", row, datetime(2026, 4, 30, 10, 0), "2026-04-30")
+
+    assert doc is not None
+    assert doc["source"] == "eastmoney_push2delay_ulist"
+    assert doc["trade_date"] == "2026-04-30"
+    assert doc["price"] == 19.67
     assert doc["change_pct"] == 1.24
     assert doc["vol"] == 30498700
 
@@ -123,3 +156,27 @@ def test_quote_snapshots_falls_back_to_latest_fullmarket_spot_snapshot():
     docs = _read_fullmarket_spot_quotes(db, ["SH.601958"], "2026-04-28", datetime(2026, 4, 29, 16, 0))
 
     assert docs["SH.601958"]["dt"] == "2026-04-29"
+
+
+def test_quote_snapshots_can_disable_stale_fullmarket_spot_fallback():
+    db = _Db({
+        "fullmarket_spot_snapshots": _Collection([
+            {
+                "date_key": "20260429",
+                "trade_date": "2026-04-29",
+                "code": "601958",
+                "symbol": "SH.601958",
+                "price": 19.67,
+            }
+        ])
+    })
+
+    docs = _read_fullmarket_spot_quotes(
+        db,
+        ["SH.601958"],
+        "2026-04-30",
+        datetime(2026, 4, 30, 10, 30),
+        allow_latest_fallback=False,
+    )
+
+    assert docs == {}

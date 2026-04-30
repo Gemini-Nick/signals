@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Iterable, TypeVar
 
-from signals.core.market_time import naive_market_now
+from signals.core.market_time import market_timezone, naive_market_now
 from signals.sync.task_context import get_task_env
 
 T = TypeVar("T")
@@ -78,6 +78,8 @@ def _capacity(provider: str, endpoint: str = "") -> int:
         ("SINA", "STOCK_DAILY"): 1,
         ("EASTMONEY", "QUOTE_SNAPSHOT"): 2,
         ("EASTMONEY", "PUSH2DELAY_STOCK_GET"): 2,
+        ("EASTMONEY", "PUSH2DELAY_ULIST_QUOTE"): 1,
+        ("EASTMONEY", "FULLMARKET_SPOT_SNAPSHOT"): 1,
         ("EASTMONEY", "PUSH2DELAY_CLIST_INDUSTRY"): 1,
         ("EASTMONEY", "PUSH2DELAY_CLIST_CONCEPT"): 1,
         ("EM", "PUSH2DELAY_CLIST_INDUSTRY"): 1,
@@ -113,6 +115,8 @@ def _min_interval_seconds(provider: str, endpoint: str = "") -> float:
         ("SINA", "STOCK_DAILY"): 3.0,
         ("EASTMONEY", "QUOTE_SNAPSHOT"): 0.15,
         ("EASTMONEY", "PUSH2DELAY_STOCK_GET"): 0.15,
+        ("EASTMONEY", "PUSH2DELAY_ULIST_QUOTE"): 0.3,
+        ("EASTMONEY", "FULLMARKET_SPOT_SNAPSHOT"): 1.0,
         ("EASTMONEY", "PUSH2DELAY_CLIST_INDUSTRY"): 3.0,
         ("EASTMONEY", "PUSH2DELAY_CLIST_CONCEPT"): 3.0,
         ("EM", "PUSH2DELAY_CLIST_INDUSTRY"): 3.0,
@@ -178,7 +182,7 @@ def _cooldown_seconds() -> float:
     raw = os.getenv("SIGNALS_PROVIDER_COOLDOWN_SECONDS")
     if raw is None and os.getenv("PYTEST_CURRENT_TEST"):
         return 0.1
-    raw = raw or "120,300"
+    raw = raw or "300,300"
     try:
         low, high = raw.replace(":", ",").split(",", 1)
         low_value = max(1.0, float(low))
@@ -195,13 +199,13 @@ def _risk_error(exc: BaseException) -> bool:
 
 def _coerce_dt(value) -> datetime | None:
     if isinstance(value, datetime):
-        return value.replace(tzinfo=None) if value.tzinfo else value
+        return value.astimezone(market_timezone("A")).replace(tzinfo=None) if value.tzinfo else value
     if isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return None
-        return parsed.replace(tzinfo=None) if parsed.tzinfo is None else parsed.replace(tzinfo=None)
+        return parsed.replace(tzinfo=None) if parsed.tzinfo is None else parsed.astimezone(market_timezone("A")).replace(tzinfo=None)
     return None
 
 

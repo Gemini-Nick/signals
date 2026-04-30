@@ -16,7 +16,7 @@ import pandas as pd
 from pymongo.database import Database
 
 from signals.core.macro_universe import macro_a_index_codes
-from signals.core.market_time import naive_market_now
+from signals.core.market_time import naive_market_now, to_market_naive
 from ..proxy import em_proxy
 from ..retry import sync_retry
 from .minute_sources import fetch_public_minute
@@ -130,8 +130,11 @@ def _fetch_index_docs(
     docs = []
     dt_col = "时间" if "时间" in df.columns else "datetime"
     for _, row in df.iterrows():
+        dt = to_market_naive(row[dt_col], market="A", symbol=symbol, source=source)
+        if dt is None:
+            continue
         docs.append({
-            "dt": pd.to_datetime(row[dt_col]),
+            "dt": dt,
             "meta": {"symbol": symbol, "freq": freq, "asset_type": "index", "source": source, "market": "A"},
             "open": float(row["开盘"]),
             "high": float(row["最高"]),

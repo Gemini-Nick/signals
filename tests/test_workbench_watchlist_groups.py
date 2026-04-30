@@ -1,5 +1,5 @@
 import asyncio
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 
@@ -127,6 +127,99 @@ def test_intraday_chart_aligns_date_only_custom_signal_to_bar(monkeypatch):
     assert merged["signals"][-1]["dt"] == last_same_day["time"]
     assert merged["signals"][-1]["chart_aligned"] is True
     assert merged["signals"][-1]["price"] == last_same_day["low"]
+
+
+def test_weekly_chart_aligns_custom_signal_to_containing_week(monkeypatch):
+    from signals.web.api import workbench
+
+    df = pd.DataFrame(
+        {
+            "open": [10.0, 11.0],
+            "high": [12.0, 13.0],
+            "low": [9.0, 10.5],
+            "close": [11.0, 12.5],
+            "vol": [1000, 1200],
+            "amount": [10000, 12000],
+        },
+        index=pd.to_datetime(["2026-03-13", "2026-03-20"]),
+    )
+    chart = workbench._chart_from_df(df, symbol="SZ.002759", freq="weekly", source="test_bars")
+    target_week = chart["ohlcv"][1]
+    monkeypatch.setattr(workbench, "_load_signal_pool_rows", lambda limit=200, symbol=None: [
+        {
+            "symbol": "SZ.002759",
+            "signal_date": "2026-03-18",
+            "signal_type": "自定义三买",
+            "freq": "周线",
+            "confidence": 0.88,
+            "source": "sqlite.backtest.signal_records",
+        }
+    ])
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [])
+
+    merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002759", "weekly")
+
+    assert merged["signals"][-1]["dt"] == target_week["time"]
+    assert merged["signals"][-1]["chart_aligned"] is True
+    assert merged["signals"][-1]["price"] == target_week["low"]
+
+
+def test_intraday_chart_includes_higher_timeframe_custom_context(monkeypatch):
+    from signals.web.api import workbench
+
+    df = _intraday_bars()
+    chart = workbench._chart_from_df(df, symbol="SZ.002759", freq="30min", source="test_bars")
+    monkeypatch.setattr(workbench, "_load_signal_pool_rows", lambda limit=200, symbol=None: [
+        {
+            "symbol": "SZ.002759",
+            "signal_date": "2026-03-15",
+            "signal_type": "日线自定义三买",
+            "freq": "日线",
+            "confidence": 0.88,
+            "source": "sqlite.backtest.signal_records",
+        },
+        {
+            "symbol": "SZ.002759",
+            "signal_date": "2026-03-15",
+            "signal_type": "30分钟缺口买",
+            "freq": "30分钟",
+            "confidence": 0.76,
+            "source": "sqlite.backtest.signal_records",
+        },
+    ])
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [])
+
+    merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002759", "30min")
+    by_type = {item["type"]: item for item in merged["signals"]}
+
+    assert by_type["日线自定义三买"]["display_scope"] == "higher_timeframe_context"
+    assert by_type["30分钟缺口买"]["display_scope"] == "current_timeframe"
+
+
+def test_intraday_chart_merges_terminal_technical_signals(monkeypatch):
+    from signals.web.api import workbench
+
+    df = _intraday_bars()
+    chart = workbench._chart_from_df(df, symbol="SZ.002759", freq="30min", source="test_bars")
+    monkeypatch.setattr(workbench, "_load_signal_pool_rows", lambda limit=200, symbol=None: [])
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [
+        {
+            "symbol": "SZ.002759",
+            "dt": "2026-03-15 10:30",
+            "signal_type": "MACD绿柱缩小_零下",
+            "signal_side": "buy",
+            "freq": "30分钟",
+            "confidence": 0.8,
+            "price": 10.7,
+            "technical_evidence": {"details": "30m detector"},
+        }
+    ])
+
+    merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002759", "30min")
+
+    assert merged["signals"][-1]["type"] == "MACD绿柱缩小_零下"
+    assert merged["signals"][-1]["source"] == "terminal_technical_signals"
+    assert merged["signals"][-1]["display_scope"] == "current_timeframe"
 
 
 def test_weekly_chart_uses_data_as_of_for_unfinished_current_week(monkeypatch):
@@ -335,6 +428,38 @@ def test_terminal_stock_pool_group_rows_keep_focus_risk_watch_separate(monkeypat
     assert focus[0]["entry_gate_status"] == "entry_confirmed"
     assert risk[0]["action_status"] == "risk_review"
     assert watch[0]["action_status"] == "entry_waiting_30m_confirm"
+
+
+def test_quote_overlay_marks_non_current_quote_stale(monkeypatch):
+    from signals.web.api import workbench
+
+    class _QuoteCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "symbol": "SH.600000",
+                "dt": "2026-04-29",
+                "snapshot_at": datetime(2026, 4, 29, 14, 30),
+                "source": "fullmarket_spot_snapshot",
+                "price": 10.5,
+                "change_pct": 3.2,
+                "freshness": "fresh",
+                "is_stale": False,
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"quote_snapshots": _QuoteCollection()}))
+    monkeypatch.setattr(workbench, "_market_today", lambda market="A": date(2026, 4, 30))
+    monkeypatch.setattr(workbench, "_market_now", lambda market="A": datetime(2026, 4, 30, 10, 0))
+
+    row = workbench._apply_quote_overlay({"today_change_pct": 9.9, "day_change_pct": 9.9}, "SH.600000")
+
+    assert row["quote_status"] == "stale"
+    assert row["quote_status_label"] == "行情陈旧"
+    assert row["today_change_pct"] is None
+    assert row["day_change_pct"] is None
 
 
 def test_concept_sector_preview_returns_explicit_chain_carrier(monkeypatch):

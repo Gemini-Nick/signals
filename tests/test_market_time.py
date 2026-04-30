@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from signals.core.market_time import infer_market, timestamp_range_to_dates, to_unix_seconds
+from signals.core.market_time import infer_market, timestamp_range_to_dates, to_market_naive, to_unix_seconds
 
 
 UTC = ZoneInfo("UTC")
@@ -37,3 +37,9 @@ def test_timestamp_range_to_dates_uses_target_market_day():
     end = int(datetime(2026, 4, 27, 20, 0, tzinfo=UTC).timestamp())
 
     assert timestamp_range_to_dates(start, end, symbol="US.QQQ") == ("2026-04-27", "2026-04-27")
+
+
+def test_timezone_aware_values_are_normalized_to_market_naive_time():
+    value = datetime(2026, 4, 30, 2, 30, tzinfo=UTC)
+
+    assert to_market_naive(value, symbol="SH.000001") == datetime(2026, 4, 30, 10, 30)

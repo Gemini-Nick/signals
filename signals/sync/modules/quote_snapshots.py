@@ -5,18 +5,21 @@ from __future__ import annotations
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 from pymongo import UpdateOne
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
+from signals.sync.eastmoney_observer import observe_eastmoney
 from signals.sync.provider_limits import ProviderCoolingDown, provider_call
 
 logger = logging.getLogger("signals.sync.quote_snapshots")
 _EM_ENDPOINT = "https://push2delay.eastmoney.com/api/qt/stock/get"
 _EM_FIELDS = "f43,f44,f45,f46,f47,f48,f49,f50,f57,f58,f60,f116,f117,f168,f169,f170,f171"
+_EM_ULIST_ENDPOINT = "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
+_EM_ULIST_FIELDS = "f2,f3,f4,f5,f6,f7,f8,f12,f13,f14,f15,f16,f17,f18,f20,f21"
+_MACRO_QUOTE_SYMBOLS = ("SH.000001", "SZ.399001", "SZ.399006", "SH.000300", "SH.000016")
 
 
 def _symbol_candidates(symbol: str) -> list[str]:
@@ -107,13 +110,20 @@ def _latest_pool_symbols(db: Database) -> list[str]:
     return symbols
 
 
-def _write_provider_health(db: Database, ok: bool, latency_ms: float, error: str = "") -> None:
+def _write_provider_health(
+    db: Database,
+    ok: bool,
+    latency_ms: float,
+    error: str = "",
+    *,
+    endpoint: str = "push2delay.stock.get",
+) -> None:
     now = naive_market_now("A")
     db["provider_health"].update_one(
-        {"provider": "eastmoney", "endpoint": "push2delay.stock.get", "domain": "quote"},
+        {"provider": "eastmoney", "endpoint": endpoint, "domain": "quote"},
         {"$set": {
             "provider": "eastmoney",
-            "endpoint": "push2delay.stock.get",
+            "endpoint": endpoint,
             "domain": "quote",
             "last_success_at": now if ok else None,
             "last_error_at": None if ok else now,
@@ -128,6 +138,7 @@ def _write_provider_health(db: Database, ok: bool, latency_ms: float, error: str
 
 def _write_data_freshness(db: Database, count: int, latest_dt: str | None, live_count: int, stale_count: int) -> None:
     now = naive_market_now("A")
+    lane = os.getenv("SIGNALS_CURRENT_SYNC_LANE", "quote_lane")
     if count <= 0:
         freshness = "empty"
         stale_reason = "quote_snapshot_empty"
@@ -146,6 +157,7 @@ def _write_data_freshness(db: Database, count: int, latest_dt: str | None, live_
             "domain": "quote",
             "market": "A",
             "mode": "realtime",
+            "lane": lane,
             "collection": "quote_snapshots",
             "freshness": freshness,
             "latest_dt": latest_dt,
@@ -160,6 +172,37 @@ def _write_data_freshness(db: Database, count: int, latest_dt: str | None, live_
     )
 
 
+def _mark_non_current_quotes_stale(db: Database, trading_day: str, now: datetime) -> int:
+    day_text = str(trading_day or "")[:10]
+    if not day_text:
+        return 0
+    compact_day = day_text.replace("-", "")
+    date_expr = {"$substr": [{"$toString": {"$ifNull": ["$dt", {"$ifNull": ["$trade_date", ""]}]}}, 0, 10]}
+    try:
+        result = db["quote_snapshots"].update_many(
+            {
+                "$expr": {
+                    "$and": [
+                        {"$ne": [date_expr, ""]},
+                        {"$ne": [date_expr, day_text]},
+                        {"$ne": [date_expr, compact_day]},
+                    ],
+                },
+                "freshness": {"$ne": "stale"},
+            },
+            {"$set": {
+                "freshness": "stale",
+                "is_stale": True,
+                "stale_reason": "non_current_quote_day",
+                "stale_checked_at": now,
+            }},
+        )
+        return int(getattr(result, "modified_count", 0) or 0)
+    except Exception as exc:
+        logger.debug("mark non-current quote snapshots stale failed: %s", exc)
+        return 0
+
+
 def _secid_for_symbol(symbol: str) -> str:
     raw = str(symbol or "").strip().upper()
     if "." in raw:
@@ -169,6 +212,26 @@ def _secid_for_symbol(symbol: str) -> str:
     code = raw.replace("SH", "").replace("SZ", "").replace("BJ", "")
     market_id = "1" if code.startswith(("5", "6", "9")) else "0"
     return f"{market_id}.{code}"
+
+
+def _normalize_quote_symbol(value: object) -> str:
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return ""
+    if "." in raw:
+        prefix, code = raw.split(".", 1)
+        if prefix in {"SH", "SZ", "BJ"} and code:
+            return f"{prefix}.{code}"
+    if len(raw) >= 8 and raw[:2] in {"SH", "SZ", "BJ"}:
+        return f"{raw[:2]}.{raw[2:]}"
+    code = raw.replace("SH", "").replace("SZ", "").replace("BJ", "")
+    if code.isdigit() and len(code) == 6:
+        if code.startswith(("5", "6", "9")):
+            return f"SH.{code}"
+        if code.startswith(("4", "8")):
+            return f"BJ.{code}"
+        return f"SZ.{code}"
+    return raw
 
 
 def _scale_price(value: object) -> float | None:
@@ -274,7 +337,186 @@ def _quote_doc_from_fullmarket_spot(symbol: str, row: dict, now: datetime, tradi
     }
 
 
-def _read_fullmarket_spot_quotes(db: Database, symbols: list[str], trading_day: str, now: datetime) -> dict[str, dict]:
+def _quote_doc_from_ulist_row(symbol: str, row: dict, now: datetime, trading_day: str) -> dict | None:
+    price = row.get("f2")
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0:
+        return None
+    code = str(row.get("f12") or _code_for_symbol(symbol))
+    return {
+        "_id": f"{symbol}:latest",
+        "symbol": symbol,
+        "code": code,
+        "name": str(row.get("f14") or ""),
+        "dt": trading_day,
+        "trade_date": trading_day,
+        "snapshot_at": now,
+        "source": "eastmoney_push2delay_ulist",
+        "freshness": "fresh",
+        "is_stale": False,
+        "stale_reason": "",
+        "open": row.get("f17"),
+        "high": row.get("f15"),
+        "low": row.get("f16"),
+        "close": price,
+        "price": price,
+        "prev_close": row.get("f18"),
+        "change": row.get("f4"),
+        "change_pct": row.get("f3"),
+        "turnover_pct": row.get("f8"),
+        "amplitude_pct": row.get("f7"),
+        "vol": int(float(row.get("f5") or 0) * 100),
+        "amount": float(row.get("f6") or 0),
+        "market_cap": row.get("f20"),
+        "float_market_cap": row.get("f21"),
+        "expires_at": now + timedelta(days=3),
+    }
+
+
+def _chunked(values: list[str], size: int) -> list[list[str]]:
+    return [values[idx:idx + size] for idx in range(0, len(values), size)]
+
+
+def _hot_quote_symbols(db: Database) -> list[str]:
+    symbols: list[str] = []
+
+    def add(value: object) -> None:
+        symbol = _normalize_quote_symbol(value)
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+
+    for symbol in _MACRO_QUOTE_SYMBOLS:
+        add(symbol)
+
+    try:
+        doc = db["terminal_stock_pool"].find_one(
+            {"pool": "terminal_stock_pool", "market": "A"},
+            {"stocks": 1, "focus_stocks": 1, "risk_stocks": 1, "watch_stocks": 1},
+            sort=[("updated_at", -1)],
+        ) or {}
+    except Exception:
+        doc = {}
+    for group in ("focus_stocks", "risk_stocks", "watch_stocks", "stocks"):
+        for item in doc.get(group) or []:
+            if not isinstance(item, dict):
+                continue
+            add(item.get("symbol") or item.get("code") or item.get("raw_code"))
+
+    if len(symbols) < 20:
+        for symbol in _latest_pool_symbols(db):
+            add(symbol)
+
+    try:
+        limit = max(1, min(500, int(os.getenv("EASTMONEY_ULIST_MAX_SYMBOLS", "240"))))
+    except (TypeError, ValueError):
+        limit = 240
+    return symbols[:limit]
+
+
+def _fetch_eastmoney_ulist_docs(
+    db: Database,
+    symbols: list[str],
+    now: datetime,
+    trading_day: str,
+) -> tuple[dict[str, dict], list[dict]]:
+    if not symbols:
+        return {}, []
+    try:
+        batch_size = max(1, min(100, int(os.getenv("EASTMONEY_ULIST_BATCH_SIZE", "80"))))
+    except (TypeError, ValueError):
+        batch_size = 80
+    try:
+        timeout = max(1.0, float(os.getenv("EASTMONEY_ULIST_TIMEOUT", "5")))
+    except (TypeError, ValueError):
+        timeout = 5.0
+
+    docs: dict[str, dict] = {}
+    observations: list[dict] = []
+    for batch in _chunked(symbols, batch_size):
+        secid_to_symbol = {_secid_for_symbol(symbol): symbol for symbol in batch}
+        secids = ",".join(secid_to_symbol)
+        started = time.monotonic()
+        http_status = None
+        rc = None
+        error = ""
+        returned_count = 0
+        try:
+            import requests
+
+            def request_quote():
+                session = requests.Session()
+                session.trust_env = False
+                try:
+                    response = session.get(
+                        _EM_ULIST_ENDPOINT,
+                        params={
+                            "fltt": "2",
+                            "invt": "2",
+                            "fields": _EM_ULIST_FIELDS,
+                            "secids": secids,
+                        },
+                        timeout=timeout,
+                        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+                    )
+                    response.raise_for_status()
+                    return response
+                finally:
+                    session.close()
+
+            response = provider_call(
+                "eastmoney",
+                "push2delay.ulist.quote",
+                request_quote,
+                db=db,
+                domain="quote",
+            )
+            http_status = response.status_code
+            payload = response.json()
+            rc = payload.get("rc")
+            if rc not in (0, None):
+                raise ValueError(f"rc={rc}")
+            rows = (payload.get("data") or {}).get("diff") or []
+            returned_count = len(rows)
+            for row in rows:
+                secid = f"{row.get('f13')}.{row.get('f12')}"
+                symbol = secid_to_symbol.get(secid)
+                if not symbol:
+                    continue
+                doc = _quote_doc_from_ulist_row(symbol, row, now, trading_day)
+                if doc:
+                    docs[symbol] = doc
+        except ProviderCoolingDown as exc:
+            error = f"provider_cooling_down:{exc}"
+        except Exception as exc:
+            error = f"{exc.__class__.__name__}: {exc}"
+        elapsed_ms = (time.monotonic() - started) * 1000
+        observations.append(observe_eastmoney(
+            db,
+            endpoint="push2delay.ulist.quote",
+            domain="quote",
+            request_count=1,
+            requested_symbols=len(batch),
+            returned_count=returned_count,
+            elapsed_ms=elapsed_ms,
+            http_status=http_status,
+            rc=rc,
+            error=error,
+            batch_size=batch_size,
+        ))
+    return docs, observations
+
+
+def _read_fullmarket_spot_quotes(
+    db: Database,
+    symbols: list[str],
+    trading_day: str,
+    now: datetime,
+    *,
+    allow_latest_fallback: bool = True,
+) -> dict[str, dict]:
     if not symbols:
         return {}
     date_key = str(trading_day or "").replace("-", "")[:8]
@@ -324,7 +566,7 @@ def _read_fullmarket_spot_quotes(db: Database, symbols: list[str], trading_day: 
 
     try:
         rows = read_rows(date_key)
-        if not rows:
+        if not rows and allow_latest_fallback:
             latest = db["fullmarket_spot_snapshots"].find_one(
                 {},
                 {"date_key": 1},
@@ -454,21 +696,8 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
     stale_count = 0
     errors = []
     latest_dt = None
-    timeout = float(os.getenv("QUOTE_PROVIDER_TIMEOUT", "5"))
-    max_workers = int(os.getenv("QUOTE_MAX_WORKERS", "2"))
-
-    spot_docs = _read_fullmarket_spot_quotes(db, symbols, trading_day, now)
+    spot_docs = _read_fullmarket_spot_quotes(db, symbols, trading_day, now, allow_latest_fallback=False)
     request_symbols = [symbol for symbol in symbols if symbol not in spot_docs]
-    quote_results = {}
-    latencies = []
-    if request_symbols:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_fetch_em_quote, db, symbol, timeout): symbol for symbol in request_symbols}
-            for future in as_completed(futures):
-                symbol = futures[future]
-                payload, latency_ms, error = future.result()
-                latencies.append(latency_ms)
-                quote_results[symbol] = (payload, error)
 
     ops = []
     for symbol in symbols:
@@ -480,41 +709,93 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
             processed += 1
             continue
 
-        payload, error = quote_results.get(symbol, (None, "not_requested"))
-        doc = _quote_doc_from_em(symbol, payload or {}, now, trading_day)
-        if doc:
-            live_count += 1
-            latest_dt = max(latest_dt or trading_day, trading_day)
-        else:
-            if error:
-                errors.append((symbol, error[:160]))
-            doc, dt_str = _fallback_doc_from_bars(db, symbol, now)
-            if not doc:
-                continue
-            stale_count += 1
-            latest_dt = max(latest_dt or dt_str, dt_str)
-
-        ops.append(UpdateOne({"_id": doc["_id"]}, {"$set": doc}, upsert=True))
-        processed += 1
+        stale_count += 1
+        errors.append((symbol, "eastmoney_current_quote_missing"))
+        ops.append(UpdateOne(
+            {"_id": f"{symbol}:latest"},
+            {"$set": {
+                "freshness": "stale",
+                "is_stale": True,
+                "stale_reason": "eastmoney_current_quote_missing",
+                "stale_checked_at": now,
+            }},
+            upsert=False,
+        ))
 
     if ops:
         result = db["quote_snapshots"].bulk_write(ops, ordered=False)
         inserted = int(result.upserted_count)
         modified = int(result.modified_count)
 
-    avg_latency = sum(latencies) / len(latencies) if latencies else 0
-    if not quote_results:
-        _write_provider_health(db, False, avg_latency, "quote_snapshot_empty")
-    _write_data_freshness(db, processed, latest_dt, live_count, stale_count)
+    if spot_docs:
+        _write_provider_health(db, True, 0, endpoint="fullmarket_spot_snapshot")
+    elif not symbols:
+        _write_provider_health(db, False, 0, "quote_symbol_universe_empty", endpoint="fullmarket_spot_snapshot")
+    stale_marked = _mark_non_current_quotes_stale(db, trading_day, now)
+    _write_data_freshness(db, len(symbols), latest_dt, live_count, stale_count)
     logger.info("quote snapshots: %d inserted, %d modified, %d live, %d stale", inserted, modified, live_count, stale_count)
     return {
         "inserted": inserted,
         "modified": modified,
-        "count": processed,
+        "count": len(symbols),
         "live": live_count,
         "stale": stale_count,
         "spot_snapshot": len(spot_docs),
-        "requested": len(request_symbols),
+        "requested": 0,
+        "missing_current": len(request_symbols),
         "errors": len(errors),
+        "stale_marked": stale_marked,
+        "target_collection": "quote_snapshots",
+    }
+
+
+def sync_eastmoney_ulist_quote(db: Database, proxy_url: str = None) -> dict:
+    """Refresh hot quote symbols through Eastmoney's multi-code batch endpoint."""
+    del proxy_url
+    now = naive_market_now("A")
+    try:
+        from signals.data.mongo_fallback import get_last_trading_day
+
+        trading_day = get_last_trading_day()
+    except Exception:
+        trading_day = now.date().isoformat()
+    symbols = _hot_quote_symbols(db)
+    docs, observations = _fetch_eastmoney_ulist_docs(db, symbols, now, trading_day)
+
+    inserted = 0
+    modified = 0
+    if docs:
+        ops = [UpdateOne({"_id": doc["_id"]}, {"$set": doc}, upsert=True) for doc in docs.values()]
+        result = db["quote_snapshots"].bulk_write(ops, ordered=False)
+        inserted = int(result.upserted_count)
+        modified = int(result.modified_count)
+    stale_marked = _mark_non_current_quotes_stale(db, trading_day, now)
+
+    errors = [item for item in observations if item.get("error")]
+    avg_latency = (
+        sum(float(item.get("elapsed_ms") or 0) for item in observations) / len(observations)
+        if observations else 0
+    )
+    _write_provider_health(
+        db,
+        bool(docs),
+        avg_latency,
+        errors[0].get("error", "eastmoney_ulist_empty") if errors else "",
+        endpoint="push2delay.ulist.quote",
+    )
+    missing = max(0, len(symbols) - len(docs))
+    _write_data_freshness(db, len(symbols), trading_day if docs else None, len(docs), missing)
+    status = "ok" if docs else "degraded"
+    return {
+        "module": "eastmoney_ulist_quote",
+        "status": status,
+        "inserted": inserted,
+        "modified": modified,
+        "count": len(symbols),
+        "live": len(docs),
+        "stale": missing,
+        "batches": len(observations),
+        "errors": len(errors),
+        "stale_marked": stale_marked,
         "target_collection": "quote_snapshots",
     }
