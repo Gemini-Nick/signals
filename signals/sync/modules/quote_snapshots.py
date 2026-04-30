@@ -598,6 +598,59 @@ def _read_fullmarket_spot_quotes(
     return docs
 
 
+def _read_fullmarket_no_price_symbols(db: Database, symbols: list[str], trading_day: str) -> set[str]:
+    if not symbols:
+        return set()
+    date_key = str(trading_day or "").replace("-", "")[:8]
+    by_symbol: dict[str, str] = {}
+    codes: set[str] = set()
+    normalized_symbols: set[str] = set()
+    for symbol in symbols:
+        code = _code_for_symbol(symbol)
+        if code:
+            by_symbol[code] = symbol
+            codes.add(code)
+        for candidate in _symbol_candidates(symbol):
+            if "." in candidate:
+                normalized = candidate.upper()
+                by_symbol[normalized] = symbol
+                normalized_symbols.add(normalized)
+
+    try:
+        rows = db["fullmarket_spot_snapshots"].find(
+            {
+                "date_key": date_key,
+                "$or": [
+                    {"code": {"$in": list(codes)}},
+                    {"symbol": {"$in": list(normalized_symbols)}},
+                ],
+            },
+            {"_id": 0, "code": 1, "symbol": 1, "latest": 1, "price": 1},
+        )
+    except Exception as exc:
+        logger.debug("读取 fullmarket_spot_snapshots 空报价状态失败: %s", exc)
+        return set()
+
+    no_price: set[str] = set()
+    for row in rows:
+        candidates = []
+        code = str(row.get("code") or "")
+        if code and code in by_symbol:
+            candidates.append(by_symbol[code])
+        normalized = str(row.get("symbol") or "").upper()
+        if normalized in by_symbol:
+            candidates.append(by_symbol[normalized])
+        price = row.get("price", row.get("latest"))
+        try:
+            has_price = price not in (None, "", "-") and float(price) > 0
+        except (TypeError, ValueError):
+            has_price = False
+        if has_price:
+            continue
+        no_price.update(symbol for symbol in candidates if symbol)
+    return no_price
+
+
 def _fetch_em_quote(db: Database, symbol: str, timeout: float = 5.0) -> tuple[dict | None, float, str]:
     start = time.monotonic()
     try:
@@ -698,6 +751,7 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
     latest_dt = None
     spot_docs = _read_fullmarket_spot_quotes(db, symbols, trading_day, now, allow_latest_fallback=False)
     request_symbols = [symbol for symbol in symbols if symbol not in spot_docs]
+    no_current_price_symbols = _read_fullmarket_no_price_symbols(db, request_symbols, trading_day)
 
     ops = []
     for symbol in symbols:
@@ -710,6 +764,18 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
             continue
 
         stale_count += 1
+        if symbol in no_current_price_symbols:
+            ops.append(UpdateOne(
+                {"_id": f"{symbol}:latest"},
+                {"$set": {
+                    "freshness": "stale",
+                    "is_stale": True,
+                    "stale_reason": "fullmarket_no_current_price",
+                    "stale_checked_at": now,
+                }},
+                upsert=False,
+            ))
+            continue
         errors.append((symbol, "eastmoney_current_quote_missing"))
         ops.append(UpdateOne(
             {"_id": f"{symbol}:latest"},
@@ -743,6 +809,7 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
         "spot_snapshot": len(spot_docs),
         "requested": 0,
         "missing_current": len(request_symbols),
+        "no_current_price": len(no_current_price_symbols),
         "errors": len(errors),
         "stale_marked": stale_marked,
         "target_collection": "quote_snapshots",

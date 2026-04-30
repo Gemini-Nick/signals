@@ -222,6 +222,45 @@ def test_intraday_chart_merges_terminal_technical_signals(monkeypatch):
     assert merged["signals"][-1]["display_scope"] == "current_timeframe"
 
 
+def test_terminal_technical_rows_use_latest_as_of(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Cursor(list):
+        def sort(self, *args, **kwargs):
+            return self
+
+        def limit(self, limit):
+            return _Cursor(self[:limit])
+
+    class _Collection:
+        def __init__(self):
+            self.find_query = {}
+
+        def find_one(self, query=None, projection=None, sort=None):
+            return {"as_of": "2026-04-30"}
+
+        def find(self, query=None, projection=None):
+            self.find_query = query or {}
+            rows = [
+                {"symbol": "SH.688381", "as_of": "2026-04-30", "dt": "2026-04-30 11:00"},
+                {"symbol": "SH.688381", "as_of": "2026-04-29", "dt": "2026-04-29 21:45"},
+            ]
+            return _Cursor([row for row in rows if row["as_of"] == self.find_query.get("as_of")])
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    collection = _Collection()
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"terminal_technical_signals": collection}))
+    monkeypatch.setattr(workbench, "_probe_symbol_candidates", lambda symbol, kind="stock": ["SH.688381"])
+
+    rows = workbench._load_terminal_technical_signal_rows("SH.688381")
+
+    assert collection.find_query["as_of"] == "2026-04-30"
+    assert [row["as_of"] for row in rows] == ["2026-04-30"]
+
+
 def test_weekly_chart_uses_data_as_of_for_unfinished_current_week(monkeypatch):
     from signals.web.api import workbench
 
@@ -735,6 +774,11 @@ def test_stock_minute_request_does_not_fallback_to_daily(monkeypatch):
             return {"ready": True, "active_markets": ["A"]}
 
     monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (pd.DataFrame(), "bars"))
+    monkeypatch.setattr(workbench, "_trigger_stock_chart_load", lambda symbol, raw_code, freq: {
+        "load_status": "triggered",
+        "load_triggered": True,
+        "load_eta_seconds": 10,
+    })
     monkeypatch.setattr(workbench, "_merge_signal_pool_into_chart", lambda chart, symbol, freq: chart)
     monkeypatch.setattr(workbench, "analyze_stock", lambda symbol: {"symbol": symbol, "name": "测试股份"})
     monkeypatch.setattr(workbench, "_ensure_engine", lambda: FakeEngine())
@@ -747,3 +791,172 @@ def test_stock_minute_request_does_not_fallback_to_daily(monkeypatch):
     assert payload["target"]["effective_freq"] == "30min"
     assert payload["target"]["not_ready_reason"] == "stock_minute_not_ready"
     assert payload["chart"]["meta"]["fallback_reason"] == ""
+    assert payload["chart"]["meta"]["load_status"] == "triggered"
+    assert payload["chart"]["meta"]["load_eta_seconds"] == 10
+
+
+def test_stock_30min_uses_bars_chart_not_backtest_override(monkeypatch):
+    from signals.web.api import workbench
+
+    class FakeEngine:
+        def get_status(self):
+            return {"ready": True, "active_markets": ["A"]}
+
+    async def fail_backtest(*args, **kwargs):
+        raise AssertionError("30min workbench chart should use bars cache")
+
+    df = _intraday_bars()
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (df, "bars"))
+    monkeypatch.setattr(workbench, "_trigger_stock_chart_load", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("fresh bars should not trigger load")))
+    monkeypatch.setattr(workbench, "_call_backtest_run", fail_backtest)
+    monkeypatch.setattr(workbench, "_merge_signal_pool_into_chart", lambda chart, symbol, freq: chart)
+    monkeypatch.setattr(workbench, "analyze_stock", lambda symbol: {"symbol": symbol, "name": "测试股份"})
+    monkeypatch.setattr(workbench, "_ensure_engine", lambda: FakeEngine())
+    monkeypatch.setattr(workbench, "_review_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "ready"}})
+
+    payload = asyncio.run(workbench._build_stock_target("SH.600000", "600000", "30min"))
+
+    assert payload["chart"]["meta"]["source"] == "bars"
+    assert payload["chart"]["ohlcv"][-1]["time"] == workbench._dt_to_unix(
+        df.index[-1],
+        market="A",
+        symbol="SH.600000",
+        source="bars",
+    )
+
+
+def test_stock_daily_uses_bars_chart_before_backtest(monkeypatch):
+    from signals.web.api import workbench
+
+    class FakeEngine:
+        def get_status(self):
+            return {"ready": True, "active_markets": ["A"]}
+
+    async def fail_backtest(*args, **kwargs):
+        raise AssertionError("daily workbench chart should prefer bars cache")
+
+    df = _bars()
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (df, "bars"))
+    monkeypatch.setattr(workbench, "_call_backtest_run", fail_backtest)
+    monkeypatch.setattr(workbench, "_merge_signal_pool_into_chart", lambda chart, symbol, freq: chart)
+    monkeypatch.setattr(workbench, "analyze_stock", lambda symbol: {"symbol": symbol, "name": "测试股份"})
+    monkeypatch.setattr(workbench, "_ensure_engine", lambda: FakeEngine())
+    monkeypatch.setattr(workbench, "_review_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "ready"}})
+
+    payload = asyncio.run(workbench._build_stock_target("SH.600000", "600000", "daily"))
+
+    assert payload["chart"]["meta"]["source"] == "bars"
+    assert payload["chart"]["ohlcv"][-1]["time"] == workbench._dt_to_unix(
+        df.index[-1],
+        market="A",
+        symbol="SH.600000",
+        source="bars",
+    )
+
+
+def test_stock_daily_missing_bars_triggers_loader_without_backtest(monkeypatch):
+    from signals.web.api import workbench
+
+    class FakeEngine:
+        def get_status(self):
+            return {"ready": True, "active_markets": ["A"]}
+
+    async def fail_backtest(*args, **kwargs):
+        raise AssertionError("missing bars should show not-ready and trigger cache load")
+
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (pd.DataFrame(), "bars"))
+    monkeypatch.setattr(workbench, "_call_backtest_run", fail_backtest)
+    monkeypatch.setattr(workbench, "_trigger_stock_chart_load", lambda symbol, raw_code, freq: {
+        "load_status": "triggered",
+        "load_triggered": True,
+        "load_target_freq": freq,
+        "load_eta_seconds": 15,
+        "load_retry_after_seconds": 17,
+    })
+    monkeypatch.setattr(workbench, "_merge_signal_pool_into_chart", lambda chart, symbol, freq: chart)
+    monkeypatch.setattr(workbench, "analyze_stock", lambda symbol: {"symbol": symbol, "name": "测试股份"})
+    monkeypatch.setattr(workbench, "_ensure_engine", lambda: FakeEngine())
+    monkeypatch.setattr(workbench, "_review_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "miss"}})
+
+    payload = asyncio.run(workbench._build_stock_target("SH.600000", "600000", "daily"))
+
+    assert payload["chart"]["ohlcv"] == []
+    assert payload["chart"]["meta"]["cache_status"] == "not_ready"
+    assert payload["chart"]["meta"]["not_ready_reason"] == "daily_cache_missing"
+    assert payload["chart"]["meta"]["load_status"] == "triggered"
+    assert payload["chart"]["meta"]["load_eta_seconds"] == 15
+
+
+def test_stock_30min_resamples_from_fresh_5min_when_direct_cache_lags(monkeypatch):
+    from signals.data.models import DataResponse
+    from signals.web.api import workbench
+
+    stale_30m = pd.DataFrame(
+        {
+            "open": [17.0],
+            "high": [17.4],
+            "low": [16.8],
+            "close": [17.2],
+            "vol": [1000],
+            "amount": [10000],
+        },
+        index=pd.to_datetime(["2026-04-29 15:00"]),
+    )
+    fresh_5m = pd.DataFrame(
+        {
+            "open": [17.10, 17.15, 17.18, 17.20, 17.22, 17.24, 17.26, 17.28, 17.30],
+            "high": [17.20, 17.25, 17.30, 17.35, 17.36, 17.38, 17.40, 17.42, 17.44],
+            "low": [17.00, 17.05, 17.10, 17.12, 17.14, 17.16, 17.18, 17.20, 17.22],
+            "close": [17.15, 17.18, 17.20, 17.22, 17.24, 17.26, 17.28, 17.30, 17.33],
+            "vol": [100] * 9,
+            "amount": [1000] * 9,
+        },
+        index=pd.to_datetime([
+            "2026-04-30 13:05",
+            "2026-04-30 13:10",
+            "2026-04-30 13:15",
+            "2026-04-30 13:20",
+            "2026-04-30 13:25",
+            "2026-04-30 13:30",
+            "2026-04-30 13:35",
+            "2026-04-30 13:40",
+            "2026-04-30 13:45",
+        ]),
+    )
+
+    def fake_get_kline(request):
+        if request.freq == "30m":
+            return DataResponse(
+                stale_30m,
+                mode_used="historical",
+                source="bars",
+                as_of="2026-04-29",
+                freshness="stale",
+                is_stale=True,
+            )
+        if request.freq == "5m":
+            return DataResponse(
+                fresh_5m,
+                mode_used="historical",
+                source="bars",
+                as_of="2026-04-30",
+                freshness="fresh",
+                is_stale=False,
+            )
+        raise AssertionError(f"unexpected freq {request.freq}")
+
+    monkeypatch.setattr(workbench, "get_kline", fake_get_kline)
+
+    df, source = workbench._stock_df("SH.600438", "30min")
+
+    assert source == "bars;resampled_from=5min;resampled_to=30min"
+    assert df.index[-1] == pd.Timestamp("2026-04-30 14:00")
+    assert df.iloc[-1]["open"] == 17.26
+    assert df.iloc[-1]["close"] == 17.33
+    assert df.iloc[-1]["vol"] == 300
+    assert df.attrs["as_of"] == "2026-04-30"
+    assert df.attrs["resampled_from_freq"] == "5min"
+    assert df.attrs["direct_latest_bar_time"] == "2026-04-29T15:00:00"

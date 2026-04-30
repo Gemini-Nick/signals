@@ -41,25 +41,38 @@ def build_strategy_snapshot(
     without a live MongoDB or external data provider.
     """
     now = _now_bj()
+    responses_provided = responses is not None
     responses = dict(responses or _fetch_gateway_responses())
     db = db if db is not None else _get_db_or_none()
 
     board_resp = responses.get("board")
     concept_resp = responses.get("concept")
+    chain_resp = responses.get("chain_heat")
+    terminal_pool_resp = responses.get("terminal_pool")
     market_pool_resp = responses.get("market_pool")
     quote_resp = responses.get("quote")
     signal_resp = responses.get("signal")
+    if chain_resp is None and db is not None and not responses_provided:
+        chain_resp = _latest_chain_heat_response(db)
+    if chain_resp is not None:
+        responses["chain_heat"] = chain_resp
+    if terminal_pool_resp is None and db is not None and not responses_provided:
+        terminal_pool_resp = _latest_terminal_pool_response(db)
+    if terminal_pool_resp is not None:
+        responses["terminal_pool"] = terminal_pool_resp
 
     pool = _as_dict(_response_data(market_pool_resp))
     pool_items = _pool_items(pool)
+    terminal_pool = _as_dict(_response_data(terminal_pool_resp))
     signals = _as_list(_response_data(signal_resp))
     quotes = _quote_map(_as_list(_response_data(quote_resp)))
-    themes = _build_themes(board_resp, concept_resp)
+    themes = _build_themes(board_resp, concept_resp, chain_resp)
     source_confidence = _build_source_confidence(responses, db=db)
 
     candidates, warnings = _build_candidates(
         signals=signals,
         pool_items=pool_items,
+        terminal_pool=terminal_pool,
         quotes=quotes,
         themes=themes,
         source_confidence=source_confidence,
@@ -121,8 +134,11 @@ def build_strategy_snapshot(
             "read_model": "signals.strategy.snapshot",
             "raw_sources": [
                 "market_pools",
+                "terminal_stock_pool",
+                "terminal_technical_signals",
                 "signals",
                 "quote_snapshots",
+                "chain_heat_snapshots",
                 "board_ranking",
                 "concept_ranking",
             ],
@@ -316,16 +332,221 @@ def _quote_map(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return quotes
 
 
-def _build_themes(board_resp: Any, concept_resp: Any) -> list[dict[str, Any]]:
+def _latest_chain_heat_response(db: Any) -> dict[str, Any]:
+    try:
+        latest = db["chain_heat_snapshots"].find_one(
+            {"market": "A"},
+            {"trade_minute": 1},
+            sort=[("trade_minute", -1)],
+        )
+        if not latest or latest.get("trade_minute") is None:
+            return {
+                "data": [],
+                "source": "chain_heat_snapshots",
+                "freshness": "empty",
+                "is_stale": True,
+                "errors": ["no_chain_heat_snapshots"],
+            }
+        trade_minute = latest["trade_minute"]
+        rows = list(db["chain_heat_snapshots"].find(
+            {"market": "A", "trade_minute": trade_minute},
+            {"_id": 0},
+        ).sort("rank", 1).limit(24))
+        for row in rows:
+            row["theme_symbols"] = _chain_domain_symbols_from_db(db, row)
+        as_of = str(trade_minute)[:10]
+        today = _now_bj().date().isoformat()
+        return {
+            "data": rows,
+            "source": "chain_heat_snapshots",
+            "freshness": "fresh" if as_of == today else "stale",
+            "as_of": as_of,
+            "is_stale": as_of != today,
+            "errors": [],
+        }
+    except Exception as exc:
+        return {
+            "data": [],
+            "source": "chain_heat_snapshots",
+            "freshness": "empty",
+            "is_stale": True,
+            "errors": [f"{exc.__class__.__name__}: {exc}"],
+        }
+
+
+def _chain_domain_symbols_from_db(db: Any, row: Mapping[str, Any], *, total_limit: int = 160) -> list[str]:
+    symbols: list[str] = []
+
+    def add_symbol(value: Any) -> None:
+        symbol = _normalize_symbol(value)
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+
+    for rep in row.get("representatives") or []:
+        if isinstance(rep, Mapping):
+            add_symbol(rep.get("symbol"))
+    integrated = row.get("integrated_domains") if isinstance(row.get("integrated_domains"), list) else []
+    for domain in integrated:
+        if not isinstance(domain, Mapping) or len(symbols) >= total_limit:
+            break
+        kind = str(domain.get("kind") or "")
+        name = str(domain.get("name") or "").strip()
+        if not kind or not name:
+            continue
+        collection = "concept_constituents" if kind == "concept" else "board_constituents"
+        try:
+            doc = db[collection].find_one(
+                {"$or": [{"concept_name": name}, {"board_name": name}, {"name": name}]},
+                {"symbols": 1, "stock_names": 1},
+                sort=[("updated_at", -1)],
+            ) or {}
+        except Exception:
+            doc = {}
+        add_symbol(domain.get("leader_symbol"))
+        for symbol in doc.get("symbols") or []:
+            add_symbol(symbol)
+            if len(symbols) >= total_limit:
+                break
+    return symbols[:total_limit]
+
+
+def _latest_terminal_pool_response(db: Any) -> dict[str, Any]:
+    try:
+        doc = db["terminal_stock_pool"].find_one(
+            {"pool": "terminal_stock_pool", "market": "A"},
+            {"_id": 0},
+            sort=[("updated_at", -1)],
+        )
+        if not doc:
+            return {
+                "data": {},
+                "source": "terminal_stock_pool",
+                "freshness": "empty",
+                "is_stale": True,
+                "errors": ["terminal_stock_pool_empty"],
+            }
+        as_of = str(doc.get("dt") or doc.get("updated_at") or "")[:10] or None
+        today = _now_bj().date().isoformat()
+        return {
+            "data": doc,
+            "source": "terminal_stock_pool",
+            "freshness": "fresh" if as_of == today else "stale",
+            "as_of": as_of,
+            "is_stale": as_of != today,
+            "errors": [],
+        }
+    except Exception as exc:
+        return {
+            "data": {},
+            "source": "terminal_stock_pool",
+            "freshness": "empty",
+            "is_stale": True,
+            "errors": [f"{exc.__class__.__name__}: {exc}"],
+        }
+
+
+def _chain_leader_name(row: Mapping[str, Any]) -> str:
+    representatives = row.get("representatives")
+    if isinstance(representatives, list):
+        for item in representatives:
+            if isinstance(item, Mapping):
+                name = str(item.get("name") or "").strip()
+                if name:
+                    return name
+    domains = row.get("integrated_domains")
+    if isinstance(domains, list):
+        for item in domains:
+            if isinstance(item, Mapping):
+                leader = str(item.get("leader_name") or item.get("leader_symbol") or "").strip()
+                if leader:
+                    return leader
+    return ""
+
+
+def _chain_theme_symbols(row: Mapping[str, Any]) -> list[str]:
+    symbols: list[str] = []
+
+    def add_symbol(value: Any) -> None:
+        symbol = _normalize_symbol(value)
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+
+    representatives = row.get("representatives")
+    if isinstance(representatives, list):
+        for rep in representatives:
+            if isinstance(rep, Mapping):
+                add_symbol(rep.get("symbol"))
+    for symbol in row.get("theme_symbols") or row.get("constituent_symbols") or []:
+        add_symbol(symbol)
+    domains = row.get("integrated_domains")
+    if isinstance(domains, list):
+        for domain in domains:
+            if not isinstance(domain, Mapping):
+                continue
+            add_symbol(domain.get("leader_symbol"))
+            domain_reps = domain.get("representatives")
+            if isinstance(domain_reps, list):
+                for rep in domain_reps:
+                    if isinstance(rep, Mapping):
+                        add_symbol(rep.get("symbol"))
+    return symbols
+
+
+def _build_chain_themes(chain_resp: Any) -> list[dict[str, Any]]:
+    meta = _response_meta(chain_resp)
+    rows = _as_list(_response_data(chain_resp))
+    rows.sort(key=lambda item: (_float(item.get("heat_score"), 0.0), -_float(item.get("rank"), 999.0)), reverse=True)
     themes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        name = str(row.get("chain_name") or row.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        node = str(row.get("node_name") or "").strip()
+        heat_score = _float(row.get("heat_score"))
+        change_pct = _float(row.get("change_pct"))
+        strength = heat_score if heat_score is not None else (change_pct if change_pct is not None else 0.0)
+        phase = str(row.get("phase") or "")
+        risk = "一致高潮风险" if phase in {"consensus_climax", "risk_off"} else ("产业链退潮观察" if phase == "cooling" else "")
+        symbols = _chain_theme_symbols(row)
+        themes.append({
+            "theme_id": f"chain_heat:{name}",
+            "name": name,
+            "domain": "chain_heat",
+            "rank": len(themes) + 1,
+            "strength": round(strength, 3),
+            "change_pct": round(change_pct or 0.0, 3),
+            "leader": _chain_leader_name(row),
+            "phase": phase or "watch",
+            "confidence": _confidence_from_meta(meta),
+            "risk": risk,
+            "symbols": symbols[:160],
+            "representative_symbols": symbols[:24],
+            "evidence": [{
+                "type": "chain_heat",
+                "source": meta["source"],
+                "freshness": meta["freshness"],
+                "summary": f"{name}{('/' + node) if node else ''} heat {strength:.2f}",
+            }],
+        })
+        if len(themes) >= 5:
+            break
+    return themes
+
+
+def _build_themes(board_resp: Any, concept_resp: Any, chain_resp: Any = None) -> list[dict[str, Any]]:
+    themes: list[dict[str, Any]] = _build_chain_themes(chain_resp) if chain_resp is not None else []
+    seen = {str(item.get("name") or "") for item in themes}
     for domain, resp in (("board", board_resp), ("concept", concept_resp)):
         meta = _response_meta(resp)
         rows = _as_list(_response_data(resp))
         rows.sort(key=lambda item: _float(item.get("change_pct") or item.get("pct_chg"), 0.0), reverse=True)
         for idx, row in enumerate(rows[:5]):
             name = str(row.get("board_name") or row.get("name") or row.get("concept_name") or "").strip()
-            if not name:
+            if not name or name in seen:
                 continue
+            seen.add(name)
             change_pct = _float(row.get("change_pct") or row.get("pct_chg"))
             strength = change_pct if change_pct is not None else _float(row.get("composite_score"), 0.0)
             leader = str(row.get("leader_name") or row.get("leader") or row.get("leader_symbol") or "")
@@ -355,12 +576,23 @@ def _build_candidates(
     *,
     signals: list[dict[str, Any]],
     pool_items: list[dict[str, Any]],
+    terminal_pool: Mapping[str, Any],
     quotes: dict[str, dict[str, Any]],
     themes: list[dict[str, Any]],
     source_confidence: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    terminal_candidates, terminal_warnings = _build_candidates_from_terminal_pool(
+        terminal_pool=terminal_pool,
+        quotes=quotes,
+        themes=themes,
+        source_confidence=source_confidence,
+    )
+    if terminal_candidates or terminal_warnings:
+        return terminal_candidates[:12], terminal_warnings[:10]
+
     by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for signal in signals:
+    eligible_signals = _current_live_signals(signals)
+    for signal in eligible_signals:
         symbol = _normalize_symbol(signal.get("symbol"))
         if symbol:
             by_symbol[symbol].append(signal)
@@ -405,6 +637,351 @@ def _build_candidates(
     return candidates[:12], warnings[:10]
 
 
+def _terminal_group_rows(terminal_pool: Mapping[str, Any], group: str) -> list[dict[str, Any]]:
+    rows = terminal_pool.get(group)
+    if rows is None and group == "focus_stocks":
+        rows = terminal_pool.get("stocks")
+    return [dict(item) for item in rows or [] if isinstance(item, Mapping)]
+
+
+def _build_candidates_from_terminal_pool(
+    *,
+    terminal_pool: Mapping[str, Any],
+    quotes: dict[str, dict[str, Any]],
+    themes: list[dict[str, Any]],
+    source_confidence: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not terminal_pool:
+        return [], []
+
+    top_theme = themes[0] if themes else {}
+    overall_confidence = _float(source_confidence.get("overall"), 0.5)
+    candidates: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for group, pool_type in (
+        ("focus_stocks", "focus"),
+        ("watch_stocks", "watch"),
+    ):
+        for row in _terminal_group_rows(terminal_pool, group):
+            symbol = _normalize_symbol(row.get("symbol") or row.get("code") or row.get("raw_code"))
+            if not symbol or symbol in seen:
+                continue
+            candidates.append(_candidate_from_terminal_row(
+                row=row,
+                pool_type=pool_type,
+                quote=quotes.get(symbol) or quotes.get(_symbol_digits(symbol)) or {},
+                theme=top_theme,
+                overall_confidence=overall_confidence,
+            ))
+            seen.add(symbol)
+
+    for row in _terminal_group_rows(terminal_pool, "risk_stocks"):
+        symbol = _normalize_symbol(row.get("symbol") or row.get("code") or row.get("raw_code"))
+        if not symbol:
+            continue
+        warnings.append(_candidate_from_terminal_row(
+            row=row,
+            pool_type="risk",
+            quote=quotes.get(symbol) or quotes.get(_symbol_digits(symbol)) or {},
+            theme=top_theme,
+            overall_confidence=overall_confidence,
+        ))
+
+    candidates.sort(key=lambda item: _terminal_candidate_priority(item), reverse=True)
+    warnings.sort(key=lambda item: _float(item.get("metadata", {}).get("rank_score"), 0.0), reverse=True)
+    return candidates, warnings
+
+
+def _terminal_candidate_priority(item: Mapping[str, Any]) -> tuple[float, float, float, float]:
+    metadata = _as_dict(item.get("metadata"))
+    stage_bonus = {
+        "entry_ready": 300.0,
+        "watch_preheat": 200.0,
+        "strategy_candidate": 100.0,
+    }.get(str(item.get("decision_stage") or ""), 0.0)
+    theme_bonus = 50.0 if str(item.get("theme_alignment") or "") == "theme_representative" else 0.0
+    rank = _float(metadata.get("rank"), 9999.0)
+    rank_bonus = max(0.0, 100.0 - rank)
+    return (
+        stage_bonus,
+        theme_bonus,
+        rank_bonus,
+        _float(metadata.get("rank_score") or item.get("score"), 0.0),
+    )
+
+
+def _terminal_stage(pool_type: str, row: Mapping[str, Any]) -> str:
+    if pool_type == "risk":
+        return "risk_first"
+    if pool_type == "focus":
+        return "entry_ready"
+    gate_status = str(row.get("entry_gate_status") or "")
+    blocked_by = {str(item) for item in row.get("blocked_by") or []}
+    technical = row.get("technical_evidence") if isinstance(row.get("technical_evidence"), Mapping) else {}
+    has_technical = bool(technical and technical.get("status") != "missing")
+    if gate_status == "watch_only_not_hard_buy" or "missing_buy_technical" in blocked_by or not has_technical:
+        return "strategy_candidate"
+    return "watch_preheat"
+
+
+def _terminal_missing_gates(stage: str, row: Mapping[str, Any]) -> list[str]:
+    if stage == "risk_first":
+        return ["risk_clear"]
+    if stage == "entry_ready":
+        return []
+    gate_status = str(row.get("entry_gate_status") or "")
+    blocked_by = {str(item) for item in row.get("blocked_by") or []}
+    missing: list[str] = []
+    if gate_status == "entry_waiting_30m_confirm" or "30m_missing" in blocked_by:
+        missing.append("30m_confirm")
+    if gate_status == "entry_waiting_upper_context" or "daily_or_weekly_missing" in blocked_by:
+        missing.append("upper_context")
+    if gate_status == "entry_waiting_right_side_confirm" or "5m_or_15m_missing" in blocked_by:
+        missing.append("right_side_confirm")
+    if gate_status == "entry_waiting_resonance_confirm" or "partner_period_missing" in blocked_by:
+        missing.append("resonance_confirm")
+    if gate_status == "blocked_by_period_conflict":
+        missing.append("period_conflict_clear")
+    if gate_status == "blocked_by_risk" or "risk_signal_present" in blocked_by:
+        missing.append("risk_clear")
+    if not missing and stage == "strategy_candidate":
+        missing.append("hard_technical")
+    return missing
+
+
+def _terminal_primary_blocker(stage: str, row: Mapping[str, Any], missing_gates: list[str]) -> str:
+    if stage == "risk_first":
+        return "已有风险/卖出信号"
+    if stage == "entry_ready":
+        return ""
+    action = str(row.get("trader_action") or "").strip()
+    if action:
+        return action
+    labels = {
+        "hard_technical": "缺硬技术买点",
+        "30m_confirm": "缺30m确认",
+        "upper_context": "缺日/周上级结构",
+        "right_side_confirm": "缺5m/15m右侧确认",
+        "resonance_confirm": "缺多周期共振",
+        "period_conflict_clear": "存在周期冲突",
+        "risk_clear": "风险信号未解除",
+    }
+    return labels.get(missing_gates[0], "等待确认") if missing_gates else "等待确认"
+
+
+def _terminal_recommended_action(stage: str, row: Mapping[str, Any], primary_blocker: str) -> str:
+    if stage == "risk_first":
+        return "先处理风险，再看新机会"
+    if stage == "entry_ready":
+        return "可交易复核，确认止损位和仓位上限"
+    if stage == "watch_preheat":
+        return primary_blocker or "继续观察，等最后一层确认"
+    return "策略候选先观察，等待硬技术确认"
+
+
+def _terminal_promotion_path(stage: str, row: Mapping[str, Any], missing_gates: list[str]) -> list[dict[str, str]]:
+    missing = set(missing_gates)
+    has_technical = stage in {"watch_preheat", "entry_ready"}
+    path = [
+        {"key": "source", "status": "passed", "detail": str(row.get("signal_origin") or row.get("pool_type") or "terminal_stock_pool")},
+        {
+            "key": "hard_technical",
+            "status": "passed" if has_technical else "waiting",
+            "detail": "terminal_technical_signals",
+        },
+        {
+            "key": "30m_confirm",
+            "status": "waiting" if "30m_confirm" in missing else ("passed" if has_technical else "waiting"),
+            "detail": "30m触发确认",
+        },
+        {
+            "key": "upper_context",
+            "status": "waiting" if "upper_context" in missing else ("passed" if has_technical else "waiting"),
+            "detail": "日/周结构确认",
+        },
+        {
+            "key": "right_side_confirm",
+            "status": "waiting" if "right_side_confirm" in missing else ("passed" if stage == "entry_ready" else "waiting"),
+            "detail": "5m/15m右侧确认",
+        },
+        {
+            "key": "risk_clear",
+            "status": "blocked" if "risk_clear" in missing or stage == "risk_first" else "passed",
+            "detail": "风险信号处理",
+        },
+    ]
+    if "period_conflict_clear" in missing:
+        path.append({"key": "period_conflict_clear", "status": "blocked", "detail": "周期冲突待解除"})
+    if "resonance_confirm" in missing:
+        path.append({"key": "resonance_confirm", "status": "waiting", "detail": "等待多周期共振"})
+    return path
+
+
+def _candidate_from_terminal_row(
+    *,
+    row: Mapping[str, Any],
+    pool_type: str,
+    quote: Mapping[str, Any],
+    theme: Mapping[str, Any],
+    overall_confidence: float,
+) -> dict[str, Any]:
+    symbol = _normalize_symbol(row.get("symbol") or row.get("code") or row.get("raw_code"))
+    name = str(row.get("name") or quote.get("name") or _resolved_stock_name(symbol) or "")
+    reason = str(row.get("latest_signal") or row.get("reason") or row.get("signal_origin") or pool_type)
+    stage = _terminal_stage(pool_type, row)
+    missing_gates = _terminal_missing_gates(stage, row)
+    primary_blocker = _terminal_primary_blocker(stage, row, missing_gates)
+    recommended_action = _terminal_recommended_action(stage, row, primary_blocker)
+    promotion_path = _terminal_promotion_path(stage, row, missing_gates)
+    score = _float(row.get("rank_score") or row.get("sort_score") or row.get("score"), 0.0)
+    rank_score = _float(row.get("rank_score"), score)
+    alignment = _theme_alignment(symbol, theme)
+    source_collection = f"terminal_stock_pool.{pool_type}_stocks"
+    thesis = f"{symbol} 位于{row.get('pool_type') or pool_type}层，状态是 {row.get('entry_gate_status') or stage}"
+    status = "warning" if stage == "risk_first" else ("open" if stage == "entry_ready" else "watch")
+    direction = "sell" if stage == "risk_first" else ("buy" if stage == "entry_ready" else "watch")
+    evidence = {
+        "raw_fact": {
+            "symbol": symbol,
+            "rank": row.get("rank"),
+            "pool_type": row.get("pool_type") or pool_type,
+            "entry_gate_status": row.get("entry_gate_status"),
+            "source_collections": row.get("source_collections") or [],
+        },
+        "signal_evidence": {
+            "signal_type": reason,
+            "freq": str((_as_dict(row.get("top_buy_reason")).get("freq") or _as_dict(row.get("top_risk_reason")).get("freq") or "")),
+            "score": score,
+            "confidence": overall_confidence,
+        },
+        "technical_evidence": row.get("technical_evidence") if isinstance(row.get("technical_evidence"), Mapping) else {},
+        "strategy_thesis": thesis,
+        "action_recommendation": recommended_action,
+    }
+    return {
+        "symbol": symbol,
+        "name": name,
+        "display_name": name or symbol,
+        "kind": "stock",
+        "score": round(score, 2),
+        "direction": direction,
+        "reason": reason,
+        "status": status,
+        "decision_stage": stage,
+        "missing_gates": missing_gates,
+        "primary_blocker": primary_blocker,
+        "recommended_action": recommended_action,
+        "promotion_path": promotion_path,
+        "theme_alignment": alignment,
+        "metadata": {
+            "thesis": thesis,
+            "trigger": reason,
+            "risk": str(row.get("invalidates_when") or row.get("exit_condition") or ""),
+            "next_action": recommended_action,
+            "recommended_action": recommended_action,
+            "decision_stage": stage,
+            "missing_gates": missing_gates,
+            "primary_blocker": primary_blocker,
+            "promotion_path": promotion_path,
+            "theme_alignment": alignment,
+            "theme": theme.get("name", ""),
+            "source": source_collection,
+            "source_collections": row.get("source_collections") or [],
+            "price": _float(quote.get("price") or quote.get("latest_price") or quote.get("close")),
+            "freq": str((_as_dict(row.get("top_buy_reason")).get("freq") or _as_dict(row.get("top_risk_reason")).get("freq") or "")),
+            "rank": row.get("rank"),
+            "rank_score": rank_score,
+            "pool_type": row.get("pool_type") or pool_type,
+            "entry_gate_status": row.get("entry_gate_status"),
+            "blocked_by": list(row.get("blocked_by") or []),
+            "technical_evidence": row.get("technical_evidence") if isinstance(row.get("technical_evidence"), Mapping) else {},
+            "knowledge_confirmation": row.get("knowledge_confirmation") if isinstance(row.get("knowledge_confirmation"), Mapping) else {},
+            "chain_context": row.get("chain_context") if isinstance(row.get("chain_context"), Mapping) else {},
+            "inclusion_reasons": list(row.get("inclusion_reasons") or [])[:8],
+            "evidence": evidence,
+        },
+    }
+
+
+def _candidate_decision_metadata(*, stage: str, theme_alignment: str, status: str) -> dict[str, Any]:
+    if stage == "risk_first":
+        return {
+            "decision_stage": "risk_first",
+            "missing_gates": ["risk_clear"],
+            "primary_blocker": "已有风险/卖出信号",
+            "recommended_action": "先处理风险，再看新机会",
+            "promotion_path": [
+                {"key": "source", "status": "passed", "detail": "risk signal"},
+                {"key": "risk_clear", "status": "blocked", "detail": "风险未处理"},
+            ],
+        }
+
+    missing = ["hard_technical"]
+    primary_blocker = "缺硬技术确认"
+    if theme_alignment == "theme_not_confirmed":
+        missing.append("theme_alignment")
+        primary_blocker = "缺主线产业链共振确认"
+    return {
+        "decision_stage": "strategy_candidate",
+        "missing_gates": missing,
+        "primary_blocker": primary_blocker,
+        "recommended_action": "策略候选先观察，等待硬技术确认",
+        "promotion_path": [
+            {"key": "source", "status": "passed", "detail": "strategy signal"},
+            {"key": "hard_technical", "status": "waiting", "detail": "等待30m或5m/15m右侧确认"},
+            {
+                "key": "upper_context",
+                "status": "waiting" if status != "entry_ready" else "passed",
+                "detail": "等待日/周结构确认",
+            },
+            {"key": "risk_clear", "status": "waiting", "detail": "未进入交易复核"},
+        ],
+    }
+
+
+def _theme_alignment(symbol: str, theme: Mapping[str, Any]) -> str:
+    theme_symbols = {
+        _normalize_symbol(item)
+        for item in (theme.get("symbols") or theme.get("representative_symbols") or [])
+    }
+    theme_symbols.discard("")
+    if not theme_symbols:
+        return "theme_unknown"
+    return "theme_representative" if symbol in theme_symbols else "theme_not_confirmed"
+
+
+def _signal_date_text(signal: Mapping[str, Any]) -> str:
+    return str(signal.get("signal_date") or signal.get("as_of") or signal.get("updated_at") or "")[:10]
+
+
+def _is_backtest_signal(signal: Mapping[str, Any]) -> bool:
+    source = str(signal.get("source") or "").strip().lower()
+    return source.startswith("sqlite.backtest.signal_records") or source.startswith("historical_signal_record")
+
+
+def _is_generated_daily_signal(signal: Mapping[str, Any]) -> bool:
+    source = str(signal.get("source") or "").strip().lower()
+    return source == "sync.signal_pool.generated"
+
+
+def _current_live_signals(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    live = [
+        signal for signal in signals
+        if not _is_backtest_signal(signal) and not _is_generated_daily_signal(signal)
+    ]
+    dated = [_signal_date_text(signal) for signal in live if _signal_date_text(signal)]
+    if not dated:
+        return live
+    latest_date = max(dated)
+    return [
+        signal
+        for signal in live
+        if _signal_date_text(signal) == latest_date
+    ]
+
+
 def _candidate_from_signal(
     *,
     symbol: str,
@@ -421,7 +998,13 @@ def _candidate_from_signal(
     name = str(signal.get("name") or quote.get("name") or _resolved_stock_name(symbol) or "")
     thesis = _thesis_for(symbol, signal_type, theme)
     risk = _risk_for(status, signal, theme)
-    next_action = "复核风险并设置退出条件" if status == "warning" else "打开图表复核，确认买点和止损位"
+    alignment = _theme_alignment(symbol, theme)
+    decision = _candidate_decision_metadata(
+        stage="risk_first" if status == "warning" else "strategy_candidate",
+        theme_alignment=alignment,
+        status=status,
+    )
+    next_action = decision["recommended_action"]
     evidence = {
         "raw_fact": {
             "symbol": symbol,
@@ -437,6 +1020,7 @@ def _candidate_from_signal(
         "strategy_thesis": thesis,
         "action_recommendation": next_action,
     }
+    public_status = "warning" if status == "warning" else "watch"
     return {
         "symbol": symbol,
         "name": name,
@@ -445,12 +1029,24 @@ def _candidate_from_signal(
         "score": round(score, 2),
         "direction": direction,
         "reason": signal_type,
-        "status": status,
+        "status": public_status,
+        "decision_stage": decision["decision_stage"],
+        "missing_gates": decision["missing_gates"],
+        "primary_blocker": decision["primary_blocker"],
+        "recommended_action": decision["recommended_action"],
+        "promotion_path": decision["promotion_path"],
+        "theme_alignment": alignment,
         "metadata": {
             "thesis": thesis,
             "trigger": signal_type,
             "risk": risk,
             "next_action": next_action,
+            "recommended_action": decision["recommended_action"],
+            "decision_stage": decision["decision_stage"],
+            "missing_gates": decision["missing_gates"],
+            "primary_blocker": decision["primary_blocker"],
+            "promotion_path": decision["promotion_path"],
+            "theme_alignment": alignment,
             "theme": theme.get("name", ""),
             "source": str(signal.get("source") or "signals"),
             "price": price,
@@ -472,7 +1068,13 @@ def _candidate_from_pool(
     sources = list(pool_item.get("sources") or ["market_pools"])
     name = str(quote.get("name") or _resolved_stock_name(symbol) or "")
     thesis = f"{symbol} 位于活跃池，优先观察是否与 {theme.get('name') or '当前市场主线'} 共振"
-    next_action = "等待明确技术信号，避免仅因入池直接行动"
+    alignment = _theme_alignment(symbol, theme)
+    decision = _candidate_decision_metadata(
+        stage="strategy_candidate",
+        theme_alignment=alignment,
+        status="watch",
+    )
+    next_action = decision["recommended_action"]
     return {
         "symbol": symbol,
         "name": name,
@@ -482,11 +1084,23 @@ def _candidate_from_pool(
         "direction": "watch",
         "reason": "active_pool",
         "status": "watch",
+        "decision_stage": decision["decision_stage"],
+        "missing_gates": decision["missing_gates"],
+        "primary_blocker": decision["primary_blocker"],
+        "recommended_action": decision["recommended_action"],
+        "promotion_path": decision["promotion_path"],
+        "theme_alignment": alignment,
         "metadata": {
             "thesis": thesis,
             "trigger": "active_pool",
             "risk": "只有观察池证据，缺少可执行信号",
             "next_action": next_action,
+            "recommended_action": decision["recommended_action"],
+            "decision_stage": decision["decision_stage"],
+            "missing_gates": decision["missing_gates"],
+            "primary_blocker": decision["primary_blocker"],
+            "promotion_path": decision["promotion_path"],
+            "theme_alignment": alignment,
             "theme": theme.get("name", ""),
             "sources": sources,
             "price": _float(quote.get("price") or quote.get("latest_price") or quote.get("close")),
@@ -578,11 +1192,15 @@ def _build_daily_brief(
 ) -> dict[str, Any]:
     primary = themes[0]["name"] if themes else "暂无明确主线"
     top_candidate = candidates[0]["symbol"] if candidates else ""
+    top_stage = str((candidates[0] if candidates else {}).get("decision_stage") or "")
     summary = f"{market_regime.get('label', '均衡观察')}，主线关注 {primary}"
-    if top_candidate:
-        summary += f"，优先复核 {top_candidate}"
     if warnings:
-        summary += f"，同时处理 {len(warnings)} 个风险预警"
+        summary += f"，先处理 {len(warnings)} 个风险预警"
+    if top_candidate:
+        if top_stage == "entry_ready":
+            summary += f"，可交易复核 {top_candidate}"
+        else:
+            summary += f"，策略候选观察 {top_candidate}"
     next_actions = [str(item.get("metadata", {}).get("next_action") or "") for item in candidates[:3]]
     risk_notes = [str(item.get("metadata", {}).get("risk") or "") for item in warnings[:3]]
     return {
@@ -592,6 +1210,7 @@ def _build_daily_brief(
         "market_line": str(market_regime.get("label") or ""),
         "primary_theme": primary,
         "top_candidate": top_candidate,
+        "top_candidate_stage": top_stage or ("strategy_candidate" if top_candidate else ""),
         "changed_since_last": dict(changed_since_last),
         "next_actions": [item for item in next_actions if item],
         "risk_notes": [item for item in risk_notes if item],
@@ -617,6 +1236,10 @@ def _build_decision_queue(
             "priority": "high",
             "summary": "检查是否跌破5日/20日或周线信心线，决定减仓、清仓或保留。",
             "reason": item.get("reason", ""),
+            "decision_stage": item.get("decision_stage") or metadata.get("decision_stage") or "risk_first",
+            "missing_gates": item.get("missing_gates") or metadata.get("missing_gates") or ["risk_clear"],
+            "primary_blocker": item.get("primary_blocker") or metadata.get("primary_blocker") or "已有风险/卖出信号",
+            "promotion_path": item.get("promotion_path") or metadata.get("promotion_path") or [],
             "recommended_action": "先处理风险，再看新买点",
             "next_action": metadata.get("next_action", "复核风险"),
             "operator_actions": [
@@ -631,17 +1254,31 @@ def _build_decision_queue(
         metadata = _as_dict(item.get("metadata"))
         title = item.get("display_name") or item.get("name") or item.get("symbol", "")
         status = item.get("status", "open")
+        stage = str(item.get("decision_stage") or metadata.get("decision_stage") or "")
+        strategy_candidate = stage == "strategy_candidate"
         queue.append({
             "action_id": f"signals:candidate:{item.get('symbol')}:{idx}",
             "symbol": item.get("symbol", ""),
             "name": item.get("name", ""),
-            "title": f"买入复核 · {title}",
-            "action": "review_entry",
-            "action_label": "复合买点",
+            "title": f"{'策略候选' if strategy_candidate else '买入复核'} · {title}",
+            "action": "watch_candidate" if strategy_candidate else "review_entry",
+            "action_label": "等硬技术确认" if strategy_candidate else "复合买点",
             "priority": "medium" if status == "watch" else "high",
-            "summary": "打开图表确认买点、关键均线方向和止损位；虚线阶段只观察不重仓。",
+            "summary": (
+                "候选只说明有策略来源，还没通过30m/5m/15m等硬技术确认。"
+                if strategy_candidate
+                else "打开图表确认买点、关键均线方向和止损位；虚线阶段只观察不重仓。"
+            ),
             "reason": item.get("reason", ""),
-            "recommended_action": "满足买点与风险线后再进入执行",
+            "decision_stage": stage or "strategy_candidate",
+            "missing_gates": item.get("missing_gates") or metadata.get("missing_gates") or [],
+            "primary_blocker": item.get("primary_blocker") or metadata.get("primary_blocker") or "",
+            "promotion_path": item.get("promotion_path") or metadata.get("promotion_path") or [],
+            "recommended_action": (
+                metadata.get("recommended_action")
+                or item.get("recommended_action")
+                or ("等待硬技术确认" if strategy_candidate else "满足买点与风险线后再进入执行")
+            ),
             "next_action": metadata.get("next_action", "打开图表复核"),
             "operator_actions": [
                 "打开图表",
@@ -714,7 +1351,7 @@ def _build_strategy_kpis(
 def _build_source_confidence(responses: Mapping[str, Any], *, db: Any = None) -> dict[str, Any]:
     sources = []
     scores = []
-    for key in ("board", "concept", "market_pool", "quote", "signal"):
+    for key in ("chain_heat", "terminal_pool", "board", "concept", "market_pool", "quote", "signal"):
         meta = _response_meta(responses.get(key))
         score = _confidence_from_meta(meta)
         scores.append(score)

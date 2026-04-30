@@ -213,6 +213,69 @@ def test_live_low_latency_strict_status_and_stock_selection_merge(monkeypatch):
     assert {item["module"] for item in blockers} >= {"stock_minute", "minute_readiness_probe", "market_pools", "concept_heat_minute"}
 
 
+def test_live_low_latency_keeps_closed_a_share_snapshots_usable(monkeypatch):
+    from signals import domain_pack
+    from signals.domain_pack import SignalsPack
+
+    now = datetime(2026, 4, 29, 16, 20)
+    last_a_tick = datetime(2026, 4, 29, 14, 58)
+    monkeypatch.setattr(domain_pack, "naive_market_now", lambda _market: now)
+    db = _Db({
+        "sync_log": _Collection([
+            {
+                "_id": "quote_snapshots:A:_meta",
+                "module": "quote_snapshots",
+                "status": "degraded",
+                "last_run": now,
+                "result": {"live": 105, "count": 109, "missing_current": 4},
+            },
+            {"_id": "stock_minute:A:_meta", "module": "stock_minute", "status": "ok", "last_run": last_a_tick},
+            {"_id": "index_minute:A:_meta", "module": "index_minute", "status": "ok", "last_run": last_a_tick},
+            {
+                "_id": "minute_readiness_probe:A:_meta",
+                "module": "minute_readiness_probe",
+                "status": "ok",
+                "last_run": last_a_tick,
+                "result": {"checked": 373, "not_ready": 0},
+            },
+            {"_id": "market_pools:A:_meta", "module": "market_pools", "status": "ok", "last_run": last_a_tick},
+            {
+                "_id": "board_heat_minute:A:_meta",
+                "module": "board_heat_minute",
+                "status": "ok",
+                "last_run": last_a_tick,
+                "result": {"latest_minute": "2026-04-29T14:59:00"},
+            },
+            {
+                "_id": "concept_heat_minute:A:_meta",
+                "module": "concept_heat_minute",
+                "status": "ok",
+                "last_run": last_a_tick,
+                "result": {"latest_minute": "2026-04-29T14:59:00"},
+            },
+            {
+                "_id": "chain_heat_snapshots:A:_meta",
+                "module": "chain_heat_snapshots",
+                "status": "ok",
+                "last_run": last_a_tick,
+                "result": {"latest_minute": "2026-04-29T14:59:00"},
+            },
+        ]),
+    })
+
+    live = SignalsPack()._cache_live_low_latency(db)
+
+    statuses = {item["module"]: item["status"] for item in live["modules"]}
+    assert statuses["quote_snapshots"] == "degraded"
+    assert statuses["index_minute"] == "ok"
+    assert statuses["minute_readiness_probe"] == "ok"
+    assert statuses["board_heat_minute"] == "ok"
+    assert statuses["concept_heat_minute"] == "ok"
+    assert statuses["chain_heat_snapshots"] == "ok"
+    assert live["summary"]["ok_modules"] == 7
+    assert live["summary"]["problem_modules"] == ["quote_snapshots"]
+
+
 def test_provider_health_blocker_ignores_degraded_source_with_healthy_peer():
     from signals.domain_pack import SignalsPack
 

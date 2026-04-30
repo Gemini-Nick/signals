@@ -15,6 +15,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 import config
+from signals.core.market_time import to_unix_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -605,10 +606,8 @@ def _df_to_records(df: pd.DataFrame) -> list:
 
 
 def _dt_to_unix(dt) -> int:
-    """datetime / Timestamp → unix seconds"""
-    if hasattr(dt, "timestamp"):
-        return int(dt.timestamp())
-    return int(pd.Timestamp(dt).timestamp())
+    """datetime / Timestamp → unix seconds using market-local naive semantics."""
+    return to_unix_seconds(dt, market="A")
 
 
 def _position_for_index_label(index: pd.Index, label) -> int:

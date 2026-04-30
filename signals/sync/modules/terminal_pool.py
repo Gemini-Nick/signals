@@ -639,9 +639,17 @@ def _add_signal_rows(
 
 
 def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str]) -> None:
-    limit = max(1, int(os.getenv("TERMINAL_POOL_TECHNICAL_SIGNAL_LIMIT", "1000")))
+    limit = max(1, int(os.getenv("TERMINAL_POOL_TECHNICAL_SIGNAL_LIMIT", "20000")))
+    latest = db["terminal_technical_signals"].find_one(
+        {"market": "A", "as_of": {"$exists": True}},
+        {"as_of": 1},
+        sort=[("as_of", -1), ("updated_at", -1)],
+    ) or {}
+    query: dict[str, Any] = {"market": "A"}
+    if latest.get("as_of"):
+        query["as_of"] = latest.get("as_of")
     cursor = db["terminal_technical_signals"].find(
-        {"market": "A"},
+        query,
         {
             "symbol": 1,
             "raw_code": 1,
@@ -659,7 +667,7 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
             "resonance_context": 1,
             "invalidates_when": 1,
         },
-    ).sort([("as_of", -1), ("updated_at", -1), ("total_score", -1), ("confidence", -1)]).limit(limit)
+    ).sort([("total_score", -1), ("confidence", -1), ("updated_at", -1)]).limit(limit)
     for signal in cursor:
         evidence = signal.get("technical_evidence") if isinstance(signal.get("technical_evidence"), dict) else {}
         resonance_context = signal.get("resonance_context") if isinstance(signal.get("resonance_context"), dict) else {}

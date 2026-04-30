@@ -10,6 +10,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import List
 
+import pandas as pd
 from czsc import RawBar, Freq
 
 
@@ -82,7 +83,7 @@ class MinuteCache:
         for i, (dt_str, o, h, l, c, v, a) in enumerate(rows):
             bars.append(RawBar(
                 symbol=symbol,
-                dt=datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S"),
+                dt=pd.to_datetime(dt_str),
                 id=i,
                 freq=freq_obj,
                 open=o, high=h, low=l, close=c,

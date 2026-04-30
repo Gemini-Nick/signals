@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 from czsc import Freq, RawBar
 
-from signals.core.market_time import naive_market_now
+from signals.core.market_time import naive_market_now, to_market_naive
 
 logger = logging.getLogger("signals.data.db_source")
 
@@ -54,9 +54,11 @@ def get_mongo_source():
 def _doc_to_rawbar(doc: dict, symbol: str, freq: Freq,
                    idx: int = 0) -> RawBar:
     """MongoDB 文档 → czsc.RawBar"""
+    meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+    dt = to_market_naive(doc.get("dt"), symbol=symbol, source=str(meta.get("source") or ""))
     return RawBar(
         symbol=symbol,
-        dt=doc["dt"] if isinstance(doc["dt"], datetime) else pd.to_datetime(doc["dt"]),
+        dt=pd.Timestamp(dt) if dt is not None else pd.to_datetime(doc.get("dt")),
         id=idx,
         freq=freq,
         open=float(doc["open"]),

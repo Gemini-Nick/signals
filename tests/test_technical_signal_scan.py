@@ -4,7 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from signals.sync.modules.technical_signal_scan import _coverage_by_freq, _resonance_context
+from czsc import Freq
+
+from signals.sync.modules.technical_signal_scan import _coverage_by_freq, _doc_to_rawbar, _resonance_context
 
 
 @dataclass
@@ -67,6 +69,28 @@ def test_resonance_context_marks_period_conflict():
     assert context["aligned_freqs"] == ["30分钟"]
     assert context["conflict_freqs"] == ["日线"]
     assert "周期冲突" in context["tags"]
+
+
+def test_doc_to_rawbar_preserves_market_naive_datetime():
+    raw_dt = datetime(2026, 4, 30, 13, 30)
+
+    bar = _doc_to_rawbar(
+        {
+            "dt": raw_dt,
+            "meta": {"symbol": "688381", "freq": "5分钟", "source": "sina"},
+            "open": 10,
+            "high": 11,
+            "low": 9,
+            "close": 10.5,
+            "vol": 1000,
+            "amount": 10000,
+        },
+        "SH.688381",
+        Freq.F5,
+        1,
+    )
+
+    assert bar.dt.to_pydatetime() == raw_dt
 
 
 class _Bars:

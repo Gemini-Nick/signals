@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -920,8 +920,64 @@ class SignalsPack:
         if planned > 0 and empty >= planned:
             return "partial"
         if row.get("freshness") == "stale":
+            if self._cache_a_share_low_latency_pause_ok(row):
+                return "ok"
             return "stale"
         return "ok"
+
+    def _cache_a_share_low_latency_pause_ok(self, row: Mapping[str, Any]) -> bool:
+        module = str(row.get("module") or "")
+        if module not in {
+            "stock_minute",
+            "index_minute",
+            "minute_readiness_probe",
+            "market_pools",
+            "board_heat_minute",
+            "concept_heat_minute",
+            "chain_heat_snapshots",
+        }:
+            return False
+        if not self._a_share_low_latency_paused():
+            return False
+        return self._cache_row_touched_current_market_day(row)
+
+    def _a_share_low_latency_paused(self) -> bool:
+        now = naive_market_now("A")
+        if now.weekday() >= 5:
+            return True
+        current = now.time()
+        return not (
+            datetime_time(9, 30) <= current < datetime_time(11, 30)
+            or datetime_time(13, 0) <= current < datetime_time(15, 0)
+        )
+
+    def _cache_row_touched_current_market_day(self, row: Mapping[str, Any]) -> bool:
+        today = naive_market_now("A").date()
+
+        def is_today(value: Any) -> bool:
+            dt = self._coerce_datetime(value)
+            if dt:
+                return dt.date() == today
+            text = str(value or "")
+            return bool(text and text[:10] == today.isoformat())
+
+        if is_today(row.get("latest_dt")) or is_today(row.get("last_run")):
+            return True
+        result = row.get("result")
+        if not isinstance(result, Mapping):
+            return False
+        return any(
+            is_today(result.get(key))
+            for key in (
+                "latest_dt",
+                "last_dt",
+                "latest_minute",
+                "trade_date",
+                "as_of",
+                "updated_at",
+                "last_run",
+            )
+        )
 
     def _task_progress_pct(self, status: str, summary: Mapping[str, Any], cursor: Mapping[str, Any]) -> Optional[float]:
         for source in (summary, cursor):

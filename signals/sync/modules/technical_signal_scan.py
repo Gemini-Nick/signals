@@ -12,7 +12,7 @@ import pandas as pd
 from pymongo import UpdateOne
 from pymongo.database import Database
 
-from signals.core.market_time import naive_market_now
+from signals.core.market_time import naive_market_now, to_market_naive
 
 logger = logging.getLogger("signals.sync.technical_signal_scan")
 
@@ -123,12 +123,22 @@ def _coverage_by_freq(db: Database, symbols: list[str]) -> dict[str, dict[str, A
     return coverage
 
 
+def _rawbar_dt(value: Any, *, symbol: str = "", source: str = "") -> pd.Timestamp:
+    # czsc.RawBar shifts naive Python datetime through the host timezone; keep
+    # cached market labels as pandas Timestamp to avoid local-machine drift.
+    normalized = to_market_naive(value, market="A", symbol=symbol, source=source)
+    if normalized is None:
+        return pd.to_datetime(value)
+    return pd.Timestamp(normalized)
+
+
 def _doc_to_rawbar(doc: dict[str, Any], symbol: str, freq, idx: int) -> Any:
     from czsc import RawBar
 
+    meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
     return RawBar(
         symbol=symbol,
-        dt=doc["dt"] if isinstance(doc.get("dt"), datetime) else pd.to_datetime(doc.get("dt")).to_pydatetime(),
+        dt=_rawbar_dt(doc.get("dt"), symbol=symbol, source=str(meta.get("source") or "")),
         id=idx,
         freq=freq,
         open=float(doc.get("open") or 0),

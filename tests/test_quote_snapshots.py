@@ -6,6 +6,7 @@ from datetime import datetime
 from signals.sync.modules.quote_snapshots import (
     _quote_doc_from_em,
     _quote_doc_from_ulist_row,
+    _read_fullmarket_no_price_symbols,
     _read_fullmarket_spot_quotes,
     _secid_for_symbol,
 )
@@ -180,3 +181,40 @@ def test_quote_snapshots_can_disable_stale_fullmarket_spot_fallback():
     )
 
     assert docs == {}
+
+
+def test_quote_snapshots_classifies_current_no_price_rows():
+    db = _Db({
+        "fullmarket_spot_snapshots": _Collection([
+            {
+                "date_key": "20260430",
+                "trade_date": "2026-04-30",
+                "code": "600193",
+                "symbol": "SH.600193",
+                "price": None,
+                "latest": None,
+            },
+            {
+                "date_key": "20260430",
+                "trade_date": "2026-04-30",
+                "code": "600421",
+                "symbol": "SH.600421",
+                "price": "-",
+            },
+            {
+                "date_key": "20260430",
+                "trade_date": "2026-04-30",
+                "code": "601958",
+                "symbol": "SH.601958",
+                "price": 19.67,
+            },
+        ])
+    })
+
+    no_price = _read_fullmarket_no_price_symbols(
+        db,
+        ["SH.600193", "SH.600421", "SH.601958", "SH.600999"],
+        "2026-04-30",
+    )
+
+    assert no_price == {"SH.600193", "SH.600421"}

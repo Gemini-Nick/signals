@@ -43,3 +43,11 @@ def test_timezone_aware_values_are_normalized_to_market_naive_time():
     value = datetime(2026, 4, 30, 2, 30, tzinfo=UTC)
 
     assert to_market_naive(value, symbol="SH.000001") == datetime(2026, 4, 30, 10, 30)
+
+
+def test_backtest_dt_to_unix_uses_a_share_market_timezone():
+    from signals.web2.api import backtest
+
+    value = datetime(2026, 4, 30, 15, 0)
+
+    assert backtest._dt_to_unix(value) == to_unix_seconds(value, market="A")

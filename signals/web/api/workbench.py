@@ -136,6 +136,9 @@ for _item in MINGDAO_MACRO_WATCHLIST:
 _SHELL_CACHE_TTL_SECONDS = 120.0
 _SHELL_CACHE_LOCK = threading.Lock()
 _SHELL_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None, "refreshed_at": 0.0}
+_CHART_LOAD_LOCK = threading.Lock()
+_CHART_LOAD_JOBS: dict[str, dict[str, Any]] = {}
+_CHART_LOAD_JOB_TTL_SECONDS = 120.0
 
 BUY_SIGNAL_TOKENS = ("buy", "long", "entry", "候选", "买", "突破", "启动", "三买", "一买", "二买")
 SELL_SIGNAL_TOKENS = ("sell", "short", "exit", "预警", "卖", "跌破", "止损", "风险")
@@ -305,6 +308,11 @@ def _chart_cache_meta(df: pd.DataFrame, *, source: str, freq: str) -> dict[str, 
         "stale_reason": _text(attrs.get("stale_reason")),
         "time_semantics": _text(attrs.get("time_semantics")) or ("period_data_as_of" if _canonical_freq(freq) == "weekly" and attrs.get("is_partial_period") else "bar_close_market_time"),
         "errors": list(attrs.get("gateway_errors") or []),
+        "resampled_from_freq": _text(attrs.get("resampled_from_freq")),
+        "resampled_to_freq": _text(attrs.get("resampled_to_freq")),
+        "resample_source_latest_bar_time": _text(attrs.get("resample_source_latest_bar_time")),
+        "direct_source": _text(attrs.get("direct_source")),
+        "direct_latest_bar_time": _text(attrs.get("direct_latest_bar_time")),
     }
 
 
@@ -552,8 +560,103 @@ def _resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
     return weekly
 
 
-def _stock_df(symbol: str, freq: str) -> tuple[pd.DataFrame, str]:
-    canonical = _canonical_freq(freq)
+def _df_latest_timestamp(df: pd.DataFrame) -> Optional[pd.Timestamp]:
+    if df is None or df.empty:
+        return None
+    try:
+        latest = pd.to_datetime(df.index.max(), errors="coerce")
+    except Exception:
+        return None
+    if pd.isna(latest):
+        return None
+    return pd.Timestamp(latest)
+
+
+def _a_share_bucket_close(value: Any, interval_minutes: int) -> pd.Timestamp | pd.NaT:
+    try:
+        ts = pd.to_datetime(value, errors="coerce")
+    except Exception:
+        return pd.NaT
+    if pd.isna(ts):
+        return pd.NaT
+    minute_of_day = int(ts.hour) * 60 + int(ts.minute)
+    sessions = (
+        (9 * 60 + 30, 11 * 60 + 30),
+        (13 * 60, 15 * 60),
+    )
+    for start_minute, end_minute in sessions:
+        if minute_of_day <= start_minute or minute_of_day > end_minute:
+            continue
+        offset = minute_of_day - start_minute
+        bucket_offset = ((offset + interval_minutes - 1) // interval_minutes) * interval_minutes
+        bucket_offset = max(bucket_offset, interval_minutes)
+        bucket_minute = min(start_minute + bucket_offset, end_minute)
+        return pd.Timestamp(ts.date()) + pd.Timedelta(minutes=bucket_minute)
+    return pd.NaT
+
+
+def _resample_stock_intraday_from_5min(df: pd.DataFrame, target_freq: str) -> pd.DataFrame:
+    canonical = _canonical_freq(target_freq)
+    interval = {"15min": 15, "30min": 30}.get(canonical)
+    if interval is None or df is None or df.empty:
+        return pd.DataFrame()
+    working = df.copy()
+    working["_source_dt"] = pd.to_datetime(working.index, errors="coerce")
+    working = working.dropna(subset=["_source_dt"]).sort_values("_source_dt")
+    if working.empty or "close" not in working.columns:
+        return pd.DataFrame()
+    for col in ("open", "high", "low"):
+        if col not in working.columns:
+            working[col] = working["close"]
+    for col in ("vol", "amount"):
+        if col not in working.columns:
+            working[col] = 0
+    for col in ("open", "high", "low", "close", "vol", "amount"):
+        working[col] = pd.to_numeric(working[col], errors="coerce")
+    working["open"] = working["open"].fillna(working["close"])
+    working["high"] = working["high"].fillna(working["close"])
+    working["low"] = working["low"].fillna(working["close"])
+    working = working.dropna(subset=["open", "high", "low", "close"])
+    if working.empty:
+        return pd.DataFrame()
+
+    working["_bucket_dt"] = working["_source_dt"].map(lambda value: _a_share_bucket_close(value, interval))
+    working = working.dropna(subset=["_bucket_dt"])
+    if working.empty:
+        return pd.DataFrame()
+
+    resampled = working.groupby("_bucket_dt", sort=True).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "vol": "sum",
+        "amount": "sum",
+    })
+    resampled.index = pd.DatetimeIndex(pd.to_datetime(resampled.index, errors="coerce"))
+    resampled = resampled[~resampled.index.isna()].sort_index()
+    resampled = resampled.dropna(subset=["open", "high", "low", "close"], how="any")
+    if resampled.empty:
+        return pd.DataFrame()
+
+    source_attrs = getattr(df, "attrs", {}) or {}
+    resampled.attrs.update(source_attrs)
+    latest_source_dt = pd.Timestamp(working["_source_dt"].max())
+    latest_bucket_dt = pd.Timestamp(resampled.index.max())
+    resampled.attrs["data_source"] = _text(source_attrs.get("data_source")) or "5min_resampled_intraday"
+    resampled.attrs["collection"] = _text(source_attrs.get("collection")) or "bars"
+    resampled.attrs["as_of"] = latest_source_dt.date().isoformat()
+    resampled.attrs["data_as_of"] = latest_source_dt.date().isoformat()
+    resampled.attrs["latest_bar_time"] = latest_bucket_dt.isoformat()
+    resampled.attrs["time_semantics"] = "bar_close_market_time"
+    resampled.attrs["is_partial_period"] = bool(latest_source_dt < latest_bucket_dt)
+    resampled.attrs["resampled_from_freq"] = "5min"
+    resampled.attrs["resampled_to_freq"] = canonical
+    resampled.attrs["resample_source_latest_bar_time"] = latest_source_dt.isoformat()
+    return resampled
+
+
+def _stock_kline_df(symbol: str, canonical: str) -> tuple[pd.DataFrame, str, Any]:
     response = get_kline(DataRequest(
         domain="kline",
         mode="historical",
@@ -565,9 +668,29 @@ def _stock_df(symbol: str, freq: str) -> tuple[pd.DataFrame, str]:
     ))
     df = response.data if response.data is not None else pd.DataFrame()
     df = _attach_gateway_meta(df, response, collection=response.source)
-    if df is not None and not df.empty:
-        return df, response.source
-    return df, response.source
+    return df, response.source, response
+
+
+def _stock_df(symbol: str, freq: str) -> tuple[pd.DataFrame, str]:
+    canonical = _canonical_freq(freq)
+    df, source, _ = _stock_kline_df(symbol, canonical)
+    if canonical == "weekly" and (df is None or df.empty):
+        daily_df, daily_source, _ = _stock_kline_df(symbol, "daily")
+        weekly = _resample_weekly(daily_df)
+        if weekly is not None and not weekly.empty:
+            weekly.attrs["resampled_from_freq"] = "daily"
+            weekly.attrs["resampled_to_freq"] = "weekly"
+            return weekly, f"{daily_source};resampled_from=daily;resampled_to=weekly"
+    if canonical in {"15min", "30min"}:
+        five_df, five_source, _ = _stock_kline_df(symbol, "5min")
+        resampled = _resample_stock_intraday_from_5min(five_df, canonical)
+        direct_latest = _df_latest_timestamp(df)
+        resampled_latest = _df_latest_timestamp(resampled)
+        if resampled_latest is not None and (direct_latest is None or resampled_latest > direct_latest):
+            resampled.attrs["direct_source"] = source
+            resampled.attrs["direct_latest_bar_time"] = _iso_dt(direct_latest)
+            return resampled, f"{five_source};resampled_from=5min;resampled_to={canonical}"
+    return df, source
 
 
 def _index_df(symbol: str, freq: str) -> tuple[pd.DataFrame, str]:
@@ -1383,8 +1506,17 @@ def _load_terminal_technical_signal_rows(symbol: str, *, limit: int = 300) -> li
     try:
         db = _mongo_db()
         candidates = _probe_symbol_candidates(symbol, kind="stock")
+        latest = db["terminal_technical_signals"].find_one(
+            {"symbol": {"$in": candidates}, "market": "A", "as_of": {"$exists": True}},
+            {"_id": 0, "as_of": 1},
+            sort=[("as_of", -1), ("updated_at", -1)],
+        ) or {}
+        query: dict[str, Any] = {"symbol": {"$in": candidates}}
+        latest_as_of = _text(latest.get("as_of"))
+        if latest_as_of:
+            query["as_of"] = latest_as_of
         docs = list(db["terminal_technical_signals"].find(
-            {"symbol": {"$in": candidates}},
+            query,
             {"_id": 0},
         ).sort([("dt", -1), ("updated_at", -1)]).limit(limit))
         return [dict(item) for item in docs if isinstance(item, dict)]
@@ -3480,10 +3612,10 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
                 "representative_stock_role": "preview_only_not_focus_pool",
             },
             "buy_candidates": {
-                "label": "策略候选/未硬技术确认",
-                "source_collection": "strategy_snapshots",
+                "label": "策略快照队列",
+                "source_collection": "strategy_snapshots<-terminal_stock_pool",
                 "count": len(scored),
-                "role": "strategy_candidates_not_hard_technical_focus",
+                "role": "ranked_strategy_snapshot_with_entry_ready_watch_preheat",
             },
             "focus_stocks": focus_stocks_meta,
             "risk_stocks": {
@@ -3863,8 +3995,9 @@ def _ensure_minute_bars(symbol: str, raw_code: str, freq: str) -> bool:
     }.get(requested)
     if not minute_freq:
         return True
-    df, _ = _stock_df(symbol, requested)
-    if df is not None and not df.empty:
+    df, _, _ = _stock_kline_df(symbol, requested)
+    attrs = getattr(df, "attrs", {}) or {}
+    if df is not None and not df.empty and not bool(attrs.get("gateway_is_stale")):
         return True
     code = raw_code or symbol.split(".", 1)[-1]
     if not code or not code.isdigit():
@@ -3894,6 +4027,120 @@ def _ensure_minute_bars(symbol: str, raw_code: str, freq: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _stock_chart_load_eta_seconds(freq: str) -> int:
+    canonical = _canonical_freq(freq)
+    if canonical in {"5min", "15min", "30min"}:
+        return 10
+    if canonical == "daily":
+        return 15
+    if canonical in {"weekly", "monthly"}:
+        return 20
+    return 15
+
+
+def _stock_chart_load_source(freq: str) -> str:
+    canonical = _canonical_freq(freq)
+    if canonical in {"5min", "15min", "30min"}:
+        return "stock_minute:5min"
+    if canonical in {"daily", "weekly", "monthly"}:
+        return "stock_daily"
+    return "stock_cache"
+
+
+def _stock_chart_load_key(symbol: str, freq: str) -> str:
+    return f"stock:{_text(symbol).upper()}:{_canonical_freq(freq)}"
+
+
+def _stock_chart_load_meta(symbol: str, freq: str, job: dict[str, Any], *, triggered: bool = False) -> dict[str, Any]:
+    eta = int(job.get("load_eta_seconds") or _stock_chart_load_eta_seconds(freq))
+    return {
+        "load_status": _text(job.get("load_status")) or "running",
+        "load_triggered": bool(triggered or job.get("load_triggered")),
+        "load_target_symbol": _text(symbol),
+        "load_target_freq": _canonical_freq(freq),
+        "load_source": _text(job.get("load_source")) or _stock_chart_load_source(freq),
+        "load_eta_seconds": eta,
+        "load_retry_after_seconds": max(5, min(30, eta + 2)),
+        "load_started_at": _text(job.get("load_started_at")),
+        "load_finished_at": _text(job.get("load_finished_at")),
+        "load_elapsed_seconds": job.get("load_elapsed_seconds"),
+        "load_error": _text(job.get("load_error")),
+    }
+
+
+def _load_stock_chart_data(symbol: str, raw_code: str, freq: str) -> bool:
+    canonical = _canonical_freq(freq)
+    if canonical in {"5min", "15min", "30min"}:
+        return _ensure_minute_bars(symbol, raw_code, "5min")
+    if canonical in {"daily", "weekly", "monthly"}:
+        return _ensure_daily_bars(symbol, raw_code)
+    return False
+
+
+def _trigger_stock_chart_load(symbol: str, raw_code: str, freq: str) -> dict[str, Any]:
+    canonical = _canonical_freq(freq)
+    key = _stock_chart_load_key(symbol, canonical)
+    now_monotonic = time.monotonic()
+    eta = _stock_chart_load_eta_seconds(canonical)
+    with _CHART_LOAD_LOCK:
+        existing = _CHART_LOAD_JOBS.get(key)
+        if existing:
+            age = now_monotonic - float(existing.get("monotonic_started_at") or now_monotonic)
+            status = _text(existing.get("load_status"))
+            if status in {"triggered", "running"}:
+                return _stock_chart_load_meta(symbol, canonical, existing)
+            if status == "failed" and age < 30:
+                return _stock_chart_load_meta(symbol, canonical, existing)
+            if status == "ready" and age < _CHART_LOAD_JOB_TTL_SECONDS:
+                return _stock_chart_load_meta(symbol, canonical, existing)
+
+        job = {
+            "load_status": "triggered",
+            "load_triggered": True,
+            "load_source": _stock_chart_load_source(canonical),
+            "load_eta_seconds": eta,
+            "load_started_at": _serialize_dt(_sync_now()),
+            "monotonic_started_at": now_monotonic,
+            "load_error": "",
+        }
+        _CHART_LOAD_JOBS[key] = job
+
+    def _runner() -> None:
+        started = time.monotonic()
+        with _CHART_LOAD_LOCK:
+            if key in _CHART_LOAD_JOBS:
+                _CHART_LOAD_JOBS[key]["load_status"] = "running"
+        error = ""
+        ok = False
+        try:
+            ok = _load_stock_chart_data(symbol, raw_code, canonical)
+        except Exception as exc:
+            error = f"{exc.__class__.__name__}: {exc}"
+            ok = False
+        with _CHART_LOAD_LOCK:
+            current = _CHART_LOAD_JOBS.get(key, {})
+            current.update({
+                "load_status": "ready" if ok else "failed",
+                "load_finished_at": _serialize_dt(_sync_now()),
+                "load_elapsed_seconds": round(time.monotonic() - started, 2),
+                "load_error": error if error else ("" if ok else "provider_returned_empty"),
+                "monotonic_started_at": started,
+            })
+            _CHART_LOAD_JOBS[key] = current
+
+    threading.Thread(target=_runner, name=f"stock-chart-load-{key}", daemon=True).start()
+    return _stock_chart_load_meta(symbol, canonical, job, triggered=True)
+
+
+def _attach_chart_load_meta(chart: dict[str, Any], load_meta: dict[str, Any]) -> dict[str, Any]:
+    if not load_meta:
+        return chart
+    meta = dict(chart.get("meta") or {})
+    meta.update(load_meta)
+    chart["meta"] = meta
+    return chart
 
 
 def _concept_rank_rows(concept_name: str, theme_candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4910,27 +5157,20 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
 async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str, Any]:
     requested_freq = _canonical_freq(freq)
     if requested_freq in {"daily", "weekly", "monthly"}:
-        chart = _unwrap_response(
-            await _call_backtest_run(raw_code, requested_freq, lookback=360)
-        )
-        if not isinstance(chart, dict) or chart.get("error") or not chart.get("ohlcv"):
-            df, source = _stock_df(symbol, requested_freq)
-            chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)
+        df, source = _stock_df(symbol, requested_freq)
+        chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)
     elif requested_freq == "30min":
         df, source = _stock_df(symbol, requested_freq)
         chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)
-        if chart.get("ohlcv"):
-            try:
-                candidate_chart = _unwrap_response(
-                    await _call_backtest_run(raw_code, requested_freq, lookback=360)
-                )
-                if isinstance(candidate_chart, dict) and candidate_chart.get("ohlcv") and not candidate_chart.get("error"):
-                    chart = candidate_chart
-            except Exception:
-                pass
     else:
         df, source = _stock_df(symbol, requested_freq)
         chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)
+    chart_meta = dict(chart.get("meta") or {})
+    should_load = not _chart_has_ohlcv(chart) or (
+        requested_freq in {"5min", "15min", "30min"} and bool(chart_meta.get("is_stale"))
+    )
+    if should_load:
+        chart = _attach_chart_load_meta(chart, _trigger_stock_chart_load(symbol, raw_code, requested_freq))
     chart = _mark_chart_readiness(chart, kind="stock", requested_freq=requested_freq)
     chart = _merge_signal_pool_into_chart(chart, symbol, chart.get("meta", {}).get("freq", requested_freq))
     custom_signal_diagnostics = _custom_signal_diagnostics(symbol, requested_freq, chart.get("signals", []))
