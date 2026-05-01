@@ -11,12 +11,14 @@
 import logging
 import math
 import time
+from datetime import datetime
 
 import akshare as ak
 import pandas as pd
 import requests
 from pymongo.database import Database
 from signals.core.market_time import naive_market_now
+from signals.core.trading_dates import trading_day
 
 from signals.data.board_normalizer import (
     merge_industry_sources,
@@ -143,7 +145,8 @@ def _fetch_em_board_names_resilient(kind: str) -> pd.DataFrame:
 
 
 def _today():
-    return naive_market_now("A").replace(hour=0, minute=0, second=0, microsecond=0)
+    now = naive_market_now("A")
+    return datetime.combine(trading_day("A", now=now), datetime.min.time())
 
 
 def _replace_docs(db: Database, collection: str, docs: list[dict],

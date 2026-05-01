@@ -12,6 +12,7 @@ from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
 from signals.core.scorer import FREQ_MULTIPLIER
+from signals.core.trading_dates import trading_day, trading_day_key
 from signals.sync.task_context import get_task_env
 
 logger = logging.getLogger("signals.sync.terminal_pool")
@@ -82,6 +83,14 @@ TRADE_INTENT_LABELS = {
     "wait_big_cycle": "等大周期",
     "confirmed_entry": "确认买点",
     "skip_now": "暂不参与",
+}
+TRADE_ROLE_LABELS = {
+    "mainline_attack": "主线进攻",
+    "climax_risk": "高潮别追",
+    "holding_chain": "持仓链",
+    "defensive_weight": "防守权重",
+    "second_wave": "二波观察",
+    "risk_review": "风险复核",
 }
 TRADE_INTENT_PRIORITY = {
     "confirmed_entry": 100,
@@ -201,7 +210,7 @@ def _trading_day_age(event_dt: Any, as_of: Any = None) -> int | None:
     event_date = _date_value(event_dt)
     if event_date is None:
         return None
-    as_of_date = _date_value(as_of) or naive_market_now("A").date()
+    as_of_date = _date_value(as_of) or trading_day("A")
     if event_date >= as_of_date:
         return 0
     days = 0
@@ -778,6 +787,7 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
 def _add_user_pinned(rows: dict[str, dict[str, Any]], index_codes: set[str], now) -> None:
     raw_values = os.getenv("TERMINAL_REALTIME_PRIORITY_CODES", "")
     values = raw_values.replace(";", ",").split(",") if raw_values.strip() else []
+    trade_date = trading_day_key("A", now=now)
     for value in values:
         code = _pure_a_code(value)
         _add_reason(rows, code, {
@@ -789,7 +799,7 @@ def _add_user_pinned(rows: dict[str, dict[str, Any]], index_codes: set[str], now
             "source_role": "context",
             "decision_effect": "context_only",
             "queue_lane": "context_only",
-            "as_of": now.date().isoformat(),
+            "as_of": trade_date,
             "evidence": {"raw_value": _text(value)},
         }, index_codes=index_codes)
 
@@ -1424,9 +1434,10 @@ def _add_fallback_watch_rows(rows: dict[str, dict[str, Any]], db: Database, inde
     if limit <= 0:
         return 0
     before = len(rows)
+    trade_date = trading_day_key("A", now=now)
     snapshot = _latest_strategy_snapshot(db)
     source_doc_id = _text(snapshot.get("_source_doc_id")) or "latest"
-    as_of = _text(snapshot.get("_as_of")) or now.date().isoformat()
+    as_of = _text(snapshot.get("_as_of")) or trade_date
     for item in snapshot.get("candidates") or []:
         if len(rows) - before >= limit:
             break
@@ -1461,7 +1472,7 @@ def _add_fallback_watch_rows(rows: dict[str, dict[str, Any]], db: Database, inde
         {"symbols": 1, "items": 1, "dt": 1, "updated_at": 1},
         sort=[("dt", -1), ("updated_at", -1)],
     ) or {}
-    active_as_of = _text(doc.get("dt") or doc.get("updated_at"))[:10] or now.date().isoformat()
+    active_as_of = _text(doc.get("dt") or doc.get("updated_at"))[:10] or trade_date
     active_items = [item for item in doc.get("items") or [] if isinstance(item, dict)]
     if not active_items:
         active_items = [{"symbol": symbol} for symbol in doc.get("symbols") or []]
@@ -2113,7 +2124,7 @@ def _timeframe_reads(timeframe_sides: dict[str, dict[str, Any]]) -> dict[str, di
 def _chain_position(row: dict[str, Any]) -> dict[str, Any]:
     chain = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
     evidence = chain.get("evidence") if isinstance(chain.get("evidence"), dict) else {}
-    return {
+    position = {
         "chain_id": _text(chain.get("chain_id")),
         "node_id": _text(chain.get("node_id")),
         "chain": _text(chain.get("chain_name") or evidence.get("chain_name")),
@@ -2123,6 +2134,29 @@ def _chain_position(row: dict[str, Any]) -> dict[str, Any]:
         "stage": _text(chain.get("stage") or evidence.get("stage")),
         "phase": _text(chain.get("phase") or evidence.get("phase")),
         "role": "链主" if "chain_core_rep" in row.get("source_tags", []) or "source_leader" in row.get("source_tags", []) else "弹性/成分" if any(tag in row.get("source_tags", []) for tag in ("chain_elastic_rep", "constituent_hot")) else "",
+    }
+    if any(position.get(key) for key in ("chain", "node", "board_or_concept", "role")):
+        return position
+    symbol = _text(row.get("symbol") or row.get("code") or row.get("raw_code"))
+    if not symbol:
+        return position
+    try:
+        from signals.core.chain_map import get_all_chain_positions
+
+        positions = get_all_chain_positions(symbol)
+    except Exception:
+        positions = []
+    if not positions:
+        return position
+    primary = positions[0]
+    return {
+        **position,
+        "chain": _text(getattr(primary, "chain_name", "")),
+        "node": _text(getattr(primary, "role", "")),
+        "layer": _text(getattr(primary, "position", "")),
+        "stage": _text(getattr(primary, "position", "")),
+        "role": _text(getattr(primary, "role", "")),
+        "related_chains": list(getattr(primary, "related_chains", []) or [])[:3],
     }
 
 
@@ -2212,6 +2246,105 @@ def _entry_logic_summary(
         parts.append(f"产业链: {chain}")
     if missing_condition and missing_condition != "买点路径已走通":
         parts.append(f"还差: {missing_condition}")
+    return "；".join(parts)
+
+
+def _chain_brief(chain_position: dict[str, Any]) -> str:
+    values = [
+        _text(chain_position.get("chain") or chain_position.get("board_or_concept")),
+        _text(chain_position.get("node") or chain_position.get("role")),
+    ]
+    deduped: list[str] = []
+    for value in values:
+        if value and value not in deduped:
+            deduped.append(value)
+    return " · ".join(deduped[:2])
+
+
+def _trade_role_from_context(
+    row: dict[str, Any],
+    *,
+    chain_position: dict[str, Any],
+    trade_stage: str,
+    pool_type: str,
+    blocked_by: list[str],
+) -> str:
+    phase = _text(row.get("chain_phase") or chain_position.get("phase"))
+    text = " ".join([
+        _text(chain_position.get("chain")),
+        _text(chain_position.get("node")),
+        _text(chain_position.get("board_or_concept")),
+        _text(row.get("name")),
+        _text(row.get("reason")),
+        _text(row.get("setup_explanation")),
+        _text(row.get("missing_condition")),
+        _text(row.get("trader_action")),
+    ])
+    if pool_type == "risk" or trade_stage == "skip_now":
+        if phase == "consensus_climax" or "chain_consensus_climax" in blocked_by or "高潮" in text:
+            return "climax_risk"
+        return "risk_review"
+    if phase == "consensus_climax" or "chain_consensus_climax" in blocked_by or "高潮" in text:
+        return "climax_risk"
+    if any(token in text for token in ("电池", "锂电", "隔膜", "正极", "负极", "电解液", "储能", "电新")):
+        return "holding_chain"
+    if any(token in text for token in ("煤炭", "油气", "银行", "保险", "运营商", "高股息", "红利", "电力")):
+        return "defensive_weight"
+    if any(token in text for token in ("光模块", "光通信", "CPO", "pcb", "PCB")):
+        return "second_wave"
+    if phase in {"accelerating", "warming"} or _float(row.get("theme_rank_bonus")) >= 12:
+        return "mainline_attack"
+    if trade_stage in {"dip_watch", "probe_candidate"}:
+        return "second_wave"
+    return "mainline_attack" if trade_stage == "confirmed_entry" else "second_wave"
+
+
+def _trader_read_summary(
+    row: dict[str, Any],
+    *,
+    trade_role: str,
+    chain_position: dict[str, Any],
+    trade_stage: str,
+    missing_condition: str,
+) -> str:
+    chain = _chain_brief(chain_position)
+    prefix = TRADE_ROLE_LABELS.get(trade_role, "观察")
+    if trade_role == "climax_risk":
+        return f"{chain or '主线'}：一致高潮，确认买点不再推追高，等分歧后的承接。"
+    if trade_role == "holding_chain":
+        return f"{chain or '持仓链'}：按修复节奏观察，等30m承接和5m/15m下单确认。"
+    if trade_role == "defensive_weight":
+        return f"{chain or '防守权重'}：偏稳仓/防守，不和进攻票混排，回踩爬起再看仓位。"
+    if trade_role == "second_wave":
+        return f"{chain or '上一轮主线'}：先当二波观察，退潮后等重新放量和右侧确认。"
+    if trade_role == "risk_review":
+        return f"{chain or prefix}：先复核风险，卖点/冲突解除前不当机会处理。"
+    if trade_stage == "confirmed_entry":
+        return f"{chain or prefix}：买点路径已走通，先复核位置、止损和仓位。"
+    return f"{chain or prefix}：处在观察到买点之间，{missing_condition or '等新的技术确认'}。"
+
+
+def _evidence_summary(
+    row: dict[str, Any],
+    *,
+    timeframe_sides: dict[str, dict[str, Any]],
+    chain_position: dict[str, Any],
+    missing_condition: str,
+) -> str:
+    technical = _entry_logic_summary(
+        timeframe_sides=timeframe_sides,
+        missing_condition=missing_condition,
+        chain_position=chain_position,
+    )
+    sources = "/".join(_source_collections(row)[:2])
+    chain = _chain_brief(chain_position)
+    parts = []
+    if chain:
+        parts.append(f"产业链: {chain}")
+    if sources:
+        parts.append(f"来源: {sources}")
+    if technical:
+        parts.append(f"技术: {technical}")
     return "；".join(parts)
 
 
@@ -2523,6 +2656,31 @@ def _finalize_pool_row(
         row["invalidates_when"] = row.get("invalidates_when") or "买点没走出来、信号过期或关键位被破坏"
     row["recommended_action"] = row["trader_action"]
     row["invalidation"] = row["invalidates_when"]
+    trade_role = _trade_role_from_context(
+        row,
+        chain_position=chain_position,
+        trade_stage=trade_stage,
+        pool_type=pool_type,
+        blocked_by=blocked_by,
+    )
+    row["trade_role"] = trade_role
+    row["trade_role_label"] = TRADE_ROLE_LABELS.get(trade_role, "观察")
+    row["trade_identity"] = trade_role
+    row["trade_identity_label"] = row["trade_role_label"]
+    row["trader_read"] = _trader_read_summary(
+        row,
+        trade_role=trade_role,
+        chain_position=chain_position,
+        trade_stage=trade_stage,
+        missing_condition=row["missing_condition"],
+    )
+    row["ai_trade_summary"] = row["trader_read"]
+    row["evidence_summary"] = _evidence_summary(
+        row,
+        timeframe_sides=timeframe_sides,
+        chain_position=chain_position,
+        missing_condition=row["missing_condition"],
+    )
     row["reason"] = " · ".join(
         _text(reason.get("signal_type") or reason.get("reason_type"))
         for reason in (top_buy, top_risk)
@@ -2671,6 +2829,8 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     import config
 
     now = naive_market_now("A")
+    trade_date = trading_day_key("A", now=now)
+    trade_dt = datetime.strptime(trade_date, "%Y-%m-%d")
     stock_limit = int(os.getenv("TERMINAL_REALTIME_STOCK_LIMIT", "72"))
     risk_limit = int(os.getenv("TERMINAL_RISK_STOCK_LIMIT", "72"))
     watch_limit = int(os.getenv("TERMINAL_WATCH_STOCK_LIMIT", "120"))
@@ -2777,7 +2937,8 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     pool_doc = {
         "pool": "terminal_stock_pool",
         "market": "A",
-        "dt": now.replace(hour=0, minute=0, second=0, microsecond=0),
+        "dt": trade_dt,
+        "trade_date": trade_date,
         "updated_at": now,
         "stock_limit": stock_limit,
         "risk_limit": risk_limit,
@@ -2818,6 +2979,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "pool": "terminal_realtime",
         "market": "A",
         "dt": pool_doc["dt"],
+        "trade_date": trade_date,
         "updated_at": now,
         "stocks": [row["raw_code"] for row in (focus_stocks + risk_stocks + watch_stocks + clue_stocks)[: max(stock_limit, 72)]],
         "indices": list(getattr(config, "INDEX_AK_CODES", {}).values()),
@@ -2841,8 +3003,9 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
             "lane": "workbench_lane",
             "collection": "terminal_stock_pool",
             "freshness": "fresh" if focus_stocks else "empty",
-            "latest_dt": now.date().isoformat(),
-            "as_of": now.date().isoformat(),
+            "latest_dt": trade_date,
+            "as_of": trade_date,
+            "date_key": trade_date.replace("-", ""),
             "updated_at": now,
             "stale_reason": "" if focus_stocks else "terminal_focus_stock_pool_empty",
             "count": len(focus_stocks),

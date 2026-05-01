@@ -136,6 +136,15 @@ for _item in MINGDAO_MACRO_WATCHLIST:
 _SHELL_CACHE_TTL_SECONDS = 120.0
 _SHELL_CACHE_LOCK = threading.Lock()
 _SHELL_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None, "refreshed_at": 0.0}
+
+
+def _shell_cache_usable(payload: Any, engine: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
+    if session and not session.get("ready") and engine.is_ready():
+        return False
+    return True
 _CHART_LOAD_LOCK = threading.Lock()
 _CHART_LOAD_JOBS: dict[str, dict[str, Any]] = {}
 _CHART_LOAD_JOB_TTL_SECONDS = 120.0
@@ -1382,17 +1391,6 @@ def _quote_age_seconds(doc: dict[str, Any]) -> Optional[float]:
 def _quote_day_is_stale(quote_day: str, expected_day: str, day_change_mode: str) -> bool:
     if not quote_day or not expected_day or quote_day == expected_day:
         return False
-    if day_change_mode == "daily_close":
-        try:
-            quote_date = date.fromisoformat(quote_day[:10])
-            expected_date = date.fromisoformat(expected_day[:10])
-            if quote_date > expected_date:
-                from signals.core.calendar.engine import get_calendar
-
-                if not get_calendar().is_trading_day("SSE", quote_date):
-                    return False
-        except Exception:
-            pass
     return True
 
 
@@ -1647,6 +1645,13 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "current_position",
         "trade_intent",
         "trade_intent_label",
+        "trade_role",
+        "trade_role_label",
+        "trade_identity",
+        "trade_identity_label",
+        "trader_read",
+        "ai_trade_summary",
+        "evidence_summary",
         "setup_side_label",
         "setup_explanation",
         "entry_logic_summary",
@@ -1759,6 +1764,20 @@ def _slim_shell_sector_row(row: dict[str, Any]) -> dict[str, Any]:
         "heat_source",
         "heat_target_label",
         "heat_resolution_status",
+        "rank",
+        "phase",
+        "trading_signal",
+        "heat_score",
+        "momentum_5m",
+        "momentum_15m",
+        "momentum_30m",
+        "chain_id",
+        "chain_name",
+        "node_id",
+        "node_name",
+        "layer",
+        "stage",
+        "integrated_domains",
         "latest_signal",
         "trader_action",
         "action_status",
@@ -3384,13 +3403,35 @@ def _candidate_groups_from_representatives(row: dict[str, Any]) -> dict[str, lis
 def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
     try:
         db = _mongo_db()
-        latest = db["chain_heat_snapshots"].find_one({"market": "A"}, {"trade_minute": 1}, sort=[("trade_minute", -1)])
+        expected_day = _day_change_expected_day()
+        day_start = datetime.fromisoformat(expected_day)
+        day_end = day_start + timedelta(days=1)
+        expected_query = {
+            "market": "A",
+            "$or": [
+                {"trade_date": expected_day},
+                {"dt": {"$gte": day_start, "$lt": day_end}},
+                {"trade_minute": {"$gte": day_start, "$lt": day_end}},
+            ],
+        }
+        latest = db["chain_heat_snapshots"].find_one(expected_query, {"trade_minute": 1}, sort=[("trade_minute", -1)])
+        if not latest:
+            latest = db["chain_heat_snapshots"].find_one({"market": "A"}, {"trade_minute": 1}, sort=[("trade_minute", -1)])
         if not latest or latest.get("trade_minute") is None:
             return []
         docs = list(db["chain_heat_snapshots"].find(
             {"market": "A", "trade_minute": latest["trade_minute"]},
             {"_id": 0},
-        ).sort("rank", 1).limit(limit))
+        ).sort("rank", 1).limit(limit * 3))
+        deduped_docs: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str]] = set()
+        for doc in docs:
+            key = (_text(doc.get("chain_id")), _text(doc.get("node_id")) or "default")
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped_docs.append(doc)
+        docs = deduped_docs[:limit]
     except Exception:
         return []
     rows: list[dict[str, Any]] = []
@@ -3403,11 +3444,14 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         candidate_groups = _candidate_groups_from_representatives(doc)
         graph = _chain_graph_doc(doc.get("chain_id"), doc.get("node_id"))
         viewpoint_context = _viewpoint_context_from_graph(graph)
+        doc_trade_day = _date_text(doc.get("trade_date") or doc.get("dt") or doc.get("trade_minute"))
         data_truth = _data_truth_payload(
             collection="chain_heat_snapshots",
             domain="chain_heat",
             source="chain_heat_snapshots",
             extra={
+                "as_of": doc_trade_day,
+                "latest_bar_time": _iso_dt(doc.get("trade_minute")),
                 "mapping_status": _text(doc.get("mapping_status")) or "mapped",
                 "chart_mode_default": "chain_heat",
                 "chain_key": _text(doc.get("chain_id")),
@@ -3417,7 +3461,7 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         technical_linkage = _technical_linkage_from_groups(candidate_groups)
         risk_flags = _chain_risk_flags(doc, data_truth)
         carrier = (candidate_groups.get("leaders") or candidate_groups.get("elastic") or [{}])[0]
-        day_change_as_of = _date_text(doc.get("trade_minute"))
+        day_change_as_of = doc_trade_day
         day_change_pct = _float(doc.get("change_pct")) if day_change_as_of == _day_change_expected_day() else None
         row = {
             **doc,
@@ -3816,6 +3860,175 @@ def _build_trader_task_queue(
     return deduped[:12]
 
 
+TRADE_ROLE_FILTERS = [
+    {"key": "all", "label": "全部"},
+    {"key": "mainline_attack", "label": "主线进攻"},
+    {"key": "climax_risk", "label": "高潮别追"},
+    {"key": "holding_chain", "label": "持仓链"},
+    {"key": "defensive_weight", "label": "防守权重"},
+    {"key": "second_wave", "label": "二波观察"},
+    {"key": "risk_review", "label": "风险复核"},
+]
+
+
+def _trade_role_for_shell_stock(row: dict[str, Any]) -> str:
+    explicit = _text(row.get("trade_role") or row.get("trade_identity"))
+    if explicit:
+        return explicit
+    chain = row.get("chain_position") if isinstance(row.get("chain_position"), dict) else {}
+    context = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
+    text = " ".join([
+        _text(chain.get("chain")),
+        _text(chain.get("node")),
+        _text(chain.get("board_or_concept")),
+        _text(row.get("name")),
+        _text(row.get("reason")),
+        _text(row.get("setup_explanation")),
+        _text(row.get("missing_condition")),
+        _text(row.get("trader_action")),
+    ])
+    phase = _text(row.get("chain_phase") or context.get("phase") or chain.get("phase"))
+    if _text(row.get("pool_type")) == "risk" or _text(row.get("trade_stage")) == "skip_now":
+        return "climax_risk" if phase == "consensus_climax" or "高潮" in text else "risk_review"
+    if phase == "consensus_climax" or "高潮" in text:
+        return "climax_risk"
+    if any(token in text for token in ("电池", "锂电", "隔膜", "正极", "负极", "电解液", "储能", "电新")):
+        return "holding_chain"
+    if any(token in text for token in ("煤炭", "油气", "银行", "保险", "运营商", "高股息", "红利", "电力")):
+        return "defensive_weight"
+    if any(token in text for token in ("光模块", "光通信", "CPO", "pcb", "PCB")):
+        return "second_wave"
+    if phase in {"accelerating", "warming"} or (_float(row.get("theme_rank_bonus")) or 0) >= 12:
+        return "mainline_attack"
+    if _text(row.get("trade_stage")) in {"confirmed_entry", "probe_candidate"}:
+        return "mainline_attack"
+    return "second_wave"
+
+
+def _shell_stock_chain_brief(row: dict[str, Any]) -> str:
+    chain = row.get("chain_position") if isinstance(row.get("chain_position"), dict) else {}
+    values = [
+        _text(chain.get("chain") or chain.get("board_or_concept")),
+        _text(chain.get("node") or chain.get("role")),
+    ]
+    deduped: list[str] = []
+    for value in values:
+        if value and value not in deduped:
+            deduped.append(value)
+    return " · ".join(deduped[:2])
+
+
+def _first_stock_for_role(rows: list[dict[str, Any]], role: str) -> dict[str, Any]:
+    for row in rows:
+        if _trade_role_for_shell_stock(row) == role:
+            return row
+    return {}
+
+
+def _sector_role_item(row: dict[str, Any], role: str, label: str, summary: str) -> dict[str, Any]:
+    return {
+        "role": role,
+        "label": label,
+        "name": _text(row.get("name") or row.get("label")),
+        "summary": summary,
+        "phase": _text(row.get("phase") or row.get("action_status")),
+        "as_of": _text(row.get("day_change_as_of")),
+    }
+
+
+def _stock_role_item(row: dict[str, Any], role: str, label: str, fallback_summary: str) -> dict[str, Any]:
+    return {
+        "role": role,
+        "label": label,
+        "name": _text(row.get("name") or row.get("symbol") or row.get("code")),
+        "summary": _text(row.get("trader_read") or row.get("ai_trade_summary") or row.get("setup_explanation")) or fallback_summary,
+        "chain": _shell_stock_chain_brief(row),
+        "stage": _text(row.get("stage_label") or row.get("trade_stage")),
+    }
+
+
+def _build_trade_map(
+    *,
+    sector_boards: list[dict[str, Any]],
+    focus_stocks: list[dict[str, Any]],
+    watch_stocks: list[dict[str, Any]],
+    risk_stocks: list[dict[str, Any]],
+    clue_stocks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    stock_rows = [*focus_stocks, *watch_stocks, *clue_stocks, *risk_stocks]
+    climax = next((row for row in sector_boards if _text(row.get("phase")) == "consensus_climax"), {})
+    mainline = next((row for row in sector_boards if _text(row.get("phase")) in {"accelerating", "warming"}), {})
+    retreat = next((row for row in sector_boards if _text(row.get("phase")) in {"cooling", "risk_off", "diverging"}), {})
+    holding = _first_stock_for_role(stock_rows, "holding_chain")
+    defensive = _first_stock_for_role(stock_rows, "defensive_weight")
+    second_wave = _first_stock_for_role(stock_rows, "second_wave")
+    items: list[dict[str, Any]] = []
+    if mainline:
+        items.append(_sector_role_item(mainline, "mainline_attack", "主线", "加速中，等分歧承接，不盲追。"))
+    if climax:
+        items.append(_sector_role_item(climax, "climax_risk", "高潮", "一致高潮，不追高，等分歧后的核心票。"))
+    if retreat:
+        items.append(_sector_role_item(retreat, "second_wave", "上轮", "退潮/分化后等二波。"))
+    if holding:
+        items.append(_stock_role_item(holding, "holding_chain", "持仓", "持仓链修复，等30m承接确认。"))
+    if defensive:
+        items.append(_stock_role_item(defensive, "defensive_weight", "防守", "防守权重，偏稳仓节奏。"))
+    if second_wave and not any(item.get("role") == "second_wave" for item in items):
+        items.append(_stock_role_item(second_wave, "second_wave", "二波", "上一轮主线退潮后观察二波。"))
+    counts = {item["key"]: 0 for item in TRADE_ROLE_FILTERS if item["key"] != "all"}
+    for row in stock_rows:
+        role = _trade_role_for_shell_stock(row)
+        if role in counts:
+            counts[role] += 1
+    headline = " | ".join(
+        f"{item.get('label')}: {item.get('name')}{('，' + item.get('summary')) if item.get('summary') else ''}"
+        for item in items[:5]
+        if item.get("name")
+    )
+    return {
+        "as_of": _day_change_expected_day(),
+        "day_change_mode": _a_day_change_mode(),
+        "headline": headline,
+        "items": items[:6],
+        "role_filters": TRADE_ROLE_FILTERS,
+        "role_counts": counts,
+    }
+
+
+def _build_ai_alerts(trade_map: dict[str, Any]) -> list[dict[str, Any]]:
+    alerts: list[dict[str, Any]] = []
+    for item in trade_map.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        role = _text(item.get("role"))
+        name = _text(item.get("name"))
+        if role == "climax_risk":
+            alerts.append({
+                "level": "warning",
+                "role": role,
+                "text": f"{name or '主线'}已一致高潮，确认买点不再推追高。",
+                "command": "排除高潮票",
+            })
+        elif role == "holding_chain":
+            alerts.append({
+                "level": "info",
+                "role": role,
+                "text": f"{name or '持仓链'}按修复节奏处理，只等承接确认。",
+                "command": "只看持仓链",
+            })
+    return alerts[:3]
+
+
+def _trade_command_suggestions() -> list[str]:
+    return [
+        "只看持仓链",
+        "排除高潮票",
+        "解释这只票为什么入池",
+        "列出半导体分歧后可看的核心票",
+        "哪些票不符合我当前节奏",
+    ]
+
+
 def _build_watchlist_rows(
     *,
     reports: list[dict[str, Any]],
@@ -4052,6 +4265,14 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     focus_stocks_shell = [_slim_shell_stock_row(row) for row in focus_stocks]
     risk_stocks_shell = [_slim_shell_stock_row(row) for row in risk_stocks]
     watch_stocks_shell = [_slim_shell_stock_row(row) for row in watch_stocks]
+    trade_map = _build_trade_map(
+        sector_boards=sector_boards_shell,
+        focus_stocks=focus_stocks_shell,
+        watch_stocks=watch_stocks_shell,
+        risk_stocks=risk_stocks_shell,
+        clue_stocks=scored_shell,
+    )
+    ai_alerts = _build_ai_alerts(trade_map)
 
     watchlist_directions: List[str] = []
     for report in reports[:5]:
@@ -4135,6 +4356,9 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         "watchlist_range_columns": range_columns,
         "kline_cache_coverage": _kline_cache_coverage(),
         "sync_lanes": sync_lanes,
+        "trade_map": trade_map,
+        "ai_alerts": ai_alerts,
+        "command_suggestions": _trade_command_suggestions(),
         "daily_brief": strategy_snapshot.get("daily_brief", {}),
         "decision_queue": decision_queue,
         "strategy_kpis": strategy_snapshot.get("strategy_kpis", {}),
@@ -4153,7 +4377,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
 def _build_shell_payload(engine) -> Dict[str, Any]:
     now = time.monotonic()
     cached_payload = _SHELL_CACHE.get("payload")
-    if cached_payload is not None and now < float(_SHELL_CACHE.get("expires_at") or 0):
+    if _shell_cache_usable(cached_payload, engine) and now < float(_SHELL_CACHE.get("expires_at") or 0):
         payload = dict(cached_payload)
         payload["cache"] = {
             "status": "hit",
@@ -4164,7 +4388,7 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
 
     acquired = _SHELL_CACHE_LOCK.acquire(blocking=False)
     if not acquired:
-        if cached_payload is not None:
+        if _shell_cache_usable(cached_payload, engine):
             payload = dict(cached_payload)
             payload["cache"] = {
                 "status": "stale_refreshing",
@@ -4174,7 +4398,7 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
             return payload
         with _SHELL_CACHE_LOCK:
             cached_payload = _SHELL_CACHE.get("payload")
-            if cached_payload is not None:
+            if _shell_cache_usable(cached_payload, engine):
                 payload = dict(cached_payload)
                 payload["cache"] = {
                     "status": "waited_hit",
@@ -4186,7 +4410,7 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
     try:
         refreshed_now = time.monotonic()
         cached_payload = _SHELL_CACHE.get("payload")
-        if cached_payload is not None and refreshed_now < float(_SHELL_CACHE.get("expires_at") or 0):
+        if _shell_cache_usable(cached_payload, engine) and refreshed_now < float(_SHELL_CACHE.get("expires_at") or 0):
             payload = dict(cached_payload)
             payload["cache"] = {
                 "status": "hit_after_lock",
@@ -4198,7 +4422,7 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
         _SHELL_CACHE.update({
             "payload": dict(payload),
             "refreshed_at": refreshed_now,
-            "expires_at": refreshed_now + _SHELL_CACHE_TTL_SECONDS,
+            "expires_at": refreshed_now + (_SHELL_CACHE_TTL_SECONDS if payload.get("session", {}).get("ready") else 2.0),
         })
         payload["cache"] = {
             "status": "refreshed",
@@ -5004,6 +5228,28 @@ def _summary_from_static_index(name: str, symbol: str, chart: Dict[str, Any]) ->
     summary.update(_quote_overlay_for_symbol(symbol))
     if summary.get("today_change_pct") is not None:
         summary["gain_pct"] = summary.get("today_change_pct")
+    chain_position = _stock_chain_position_summary(symbol)
+    if chain_position:
+        trade_role = _trade_role_for_stock_summary(chain_position)
+        chain_text = " · ".join(
+            value
+            for value in [_text(chain_position.get("chain")), _text(chain_position.get("node") or chain_position.get("role"))]
+            if value
+        )
+        summary.update({
+            "chain_position": chain_position,
+            "trade_role": trade_role,
+            "trade_role_label": {
+                "holding_chain": "持仓链",
+                "defensive_weight": "防守权重",
+                "second_wave": "二波观察",
+            }.get(trade_role, "观察"),
+            "trader_read": _stock_summary_trade_read(chain_position, trade_role),
+            "evidence_summary": "；".join([
+                f"产业链: {chain_text}" if chain_text else "",
+                f"图表: {summary.get('conclusion') or summary.get('latest_signal') or '等待确认'}",
+            ]).strip("；"),
+        })
     return summary
 
 
@@ -5031,6 +5277,56 @@ def _summary_from_industry(name: str, detail: Dict[str, Any], ranking) -> Dict[s
         "phase_hint": info.get("phase_hint", ""),
         "candidate_count": len(ranking.candidates) if ranking else 0,
     }
+
+
+def _stock_chain_position_summary(symbol: str) -> dict[str, Any]:
+    try:
+        from signals.core.chain_map import get_all_chain_positions
+
+        positions = get_all_chain_positions(symbol)
+    except Exception:
+        positions = []
+    if not positions:
+        return {}
+    primary = positions[0]
+    return {
+        "chain": _text(getattr(primary, "chain_name", "")),
+        "node": _text(getattr(primary, "role", "")),
+        "role": _text(getattr(primary, "role", "")),
+        "layer": _text(getattr(primary, "position", "")),
+        "stage": _text(getattr(primary, "position", "")),
+        "related_chains": list(getattr(primary, "related_chains", []) or [])[:3],
+    }
+
+
+def _trade_role_for_stock_summary(chain_position: dict[str, Any]) -> str:
+    text = " ".join([
+        _text(chain_position.get("chain")),
+        _text(chain_position.get("node")),
+        _text(chain_position.get("role")),
+    ])
+    if any(token in text for token in ("电池", "锂电", "隔膜", "正极", "负极", "电解液", "储能", "电新")):
+        return "holding_chain"
+    if any(token in text for token in ("煤炭", "油气", "银行", "保险", "运营商", "高股息", "红利", "电力")):
+        return "defensive_weight"
+    if any(token in text for token in ("光模块", "光通信", "CPO", "pcb", "PCB")):
+        return "second_wave"
+    return "second_wave"
+
+
+def _stock_summary_trade_read(chain_position: dict[str, Any], role: str) -> str:
+    chain = " · ".join(
+        value
+        for value in [_text(chain_position.get("chain")), _text(chain_position.get("node") or chain_position.get("role"))]
+        if value
+    )
+    if role == "holding_chain":
+        return f"{chain or '持仓链'}：不在当前买点池时只按修复观察，等重新进入盯盘/确认买点。"
+    if role == "defensive_weight":
+        return f"{chain or '防守权重'}：偏稳仓/防守，不和进攻票混排，没进池前只看图表位置。"
+    if role == "second_wave":
+        return f"{chain or '二波观察'}：当前不在池内，先按二波/回踩观察，等右侧重新确认。"
+    return f"{chain or '观察标的'}：当前不在机会池，先看图表证据，不作为执行买点。"
 
 
 def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any]) -> Dict[str, Any]:
@@ -5083,6 +5379,28 @@ def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any
     summary.update(_quote_overlay_for_symbol(symbol))
     if summary.get("today_change_pct") is not None:
         summary["gain_pct"] = summary.get("today_change_pct")
+    chain_position = _stock_chain_position_summary(symbol)
+    if chain_position:
+        trade_role = _trade_role_for_stock_summary(chain_position)
+        chain_text = " · ".join(
+            value
+            for value in [_text(chain_position.get("chain")), _text(chain_position.get("node") or chain_position.get("role"))]
+            if value
+        )
+        summary.update({
+            "chain_position": chain_position,
+            "trade_role": trade_role,
+            "trade_role_label": {
+                "holding_chain": "持仓链",
+                "defensive_weight": "防守权重",
+                "second_wave": "二波观察",
+            }.get(trade_role, "观察"),
+            "trader_read": _stock_summary_trade_read(chain_position, trade_role),
+            "evidence_summary": "；".join([
+                f"产业链: {chain_text}" if chain_text else "",
+                f"图表: {summary.get('conclusion') or summary.get('latest_signal') or '等待确认'}",
+            ]).strip("；"),
+        })
     return summary
 
 

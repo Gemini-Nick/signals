@@ -45,6 +45,32 @@ def test_stock_daily_end_date_skips_cn_labor_day_holiday():
     assert stock_daily._stock_daily_end_date_key(datetime(2026, 5, 1, 16, 30)) == "20260430"
 
 
+def test_stock_daily_filters_holiday_rows_before_cursor_update():
+    bars = _Collection()
+    sync = _Collection()
+
+    written = stock_daily._write_daily_docs_batch(
+        bars,
+        sync,
+        {
+            "600001": [{
+                "dt": datetime(2026, 5, 1),
+                "meta": {"symbol": "600001", "freq": "日线"},
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "close": 1,
+                "vol": 1,
+                "amount": 1,
+            }]
+        },
+    )
+
+    assert written == {}
+    assert bars.inserted == []
+    assert sync.docs == {}
+
+
 def test_stock_daily_writes_progress_cursor(monkeypatch):
     db = _DB()
     monkeypatch.setattr(stock_daily, "_get_stock_codes", lambda _db: (["600001", "600002"], "all"))

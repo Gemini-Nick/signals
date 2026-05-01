@@ -21,6 +21,7 @@ import requests
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
+from signals.core.trading_dates import is_trading_day, trading_day_key
 from ..proxy import em_proxy
 from ..provider_limits import ProviderCoolingDown, provider_call, providers_all_cooling_down
 from ..retry import sync_retry
@@ -61,15 +62,7 @@ _SPOT_BATCH_CACHE: dict[str, pd.DataFrame] = {}
 def _stock_daily_end_date_key(now: datetime | None = None) -> str:
     local = now or naive_market_now("A")
     try:
-        from signals.core.calendar.engine import get_calendar
-
-        cal = get_calendar()
-        d = local.date()
-        if not cal.is_trading_day("SSE", d) or local.time() < dt_time(9, 30):
-            d -= timedelta(days=1)
-        while not cal.is_trading_day("SSE", d):
-            d -= timedelta(days=1)
-        return d.strftime("%Y%m%d")
+        return trading_day_key("A", now=local, compact=True, open_time=dt_time(9, 30))
     except Exception:
         if local.weekday() < 5 and local.hour >= 9 and (local.hour > 9 or local.minute >= 30):
             return local.strftime("%Y%m%d")
@@ -77,6 +70,25 @@ def _stock_daily_end_date_key(now: datetime | None = None) -> str:
         while d.weekday() >= 5:
             d -= timedelta(days=1)
         return d.strftime("%Y%m%d")
+
+
+def _daily_doc_trade_date(doc: dict) -> datetime | None:
+    try:
+        parsed = pd.to_datetime(doc.get("dt"), errors="coerce")
+    except Exception:
+        return None
+    if pd.isna(parsed):
+        return None
+    return parsed.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _valid_daily_doc(doc: dict, *, end_date: str | None = None) -> bool:
+    dt = _daily_doc_trade_date(doc)
+    if dt is None:
+        return False
+    if end_date and dt.strftime("%Y%m%d") > str(end_date)[:8]:
+        return False
+    return is_trading_day("A", dt.date())
 
 
 def _shard_count() -> int:
@@ -203,6 +215,11 @@ def _stock_daily_providers_all_cooling(db: Database | None) -> bool:
 
 def _write_daily_docs_batch(bars_col, sync_col, docs_by_code: dict[str, list]) -> dict[str, int]:
     """Write several symbols in one Mongo round trip and update per-symbol cursors."""
+    docs_by_code = {
+        code: [doc for doc in docs if _valid_daily_doc(doc)]
+        for code, docs in docs_by_code.items()
+        if docs
+    }
     docs_by_code = {code: docs for code, docs in docs_by_code.items() if docs}
     if not docs_by_code:
         return {}
@@ -682,13 +699,20 @@ def _get_stock_codes(db: Database) -> tuple[list[str], str]:
     return _get_all_stock_codes(db), "all_fallback"
 
 
-def _docs_from_daily_df(code: str, df: pd.DataFrame, column_map: dict[str, str], source: str) -> list:
+def _docs_from_daily_df(
+    code: str,
+    df: pd.DataFrame,
+    column_map: dict[str, str],
+    source: str,
+    *,
+    end_date: str | None = None,
+) -> list:
     if df is None or df.empty:
         return []
     docs = []
     for _, row in df.iterrows():
         dt = row[column_map["dt"]]
-        docs.append({
+        doc = {
             "dt": pd.to_datetime(dt),
             "meta": {"symbol": code, "freq": "日线", "market": "A", "source": source},
             "open": float(row[column_map["open"]]),
@@ -698,7 +722,9 @@ def _docs_from_daily_df(code: str, df: pd.DataFrame, column_map: dict[str, str],
             "vol": int(row[column_map["vol"]]) if pd.notna(row[column_map["vol"]]) else 0,
             "amount": int(float(row[column_map["amount"]])) if pd.notna(row[column_map["amount"]]) else 0,
             "source": source,
-        })
+        }
+        if _valid_daily_doc(doc, end_date=end_date):
+            docs.append(doc)
     return docs
 
 
@@ -1003,7 +1029,7 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
                 "close": "收盘",
                 "vol": "成交量",
                 "amount": "成交额",
-            }, "tencent")
+            }, "tencent", end_date=end_date)
         except Exception as tencent_primary_exc:
             failures.append(("tencent", tencent_primary_exc))
             logger.debug("tencent daily primary failed %s: %s", code, tencent_primary_exc)
@@ -1087,11 +1113,11 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
                         "vol": "成交量",
                         "amount": "成交额",
                     }
-                    return _docs_from_daily_df(code, df, column_map, source)
+                    return _docs_from_daily_df(code, df, column_map, source, end_date=end_date)
                 except Exception as tencent_exc:
                     failures.append(("tencent", tencent_exc))
             raise _provider_failure(failures)
-    return _docs_from_daily_df(code, df, column_map, source)
+    return _docs_from_daily_df(code, df, column_map, source, end_date=end_date)
 
 
 @sync_retry
@@ -1122,7 +1148,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         len(codes), global_total, scope, shard_key,
     )
 
-    # 批量查询 sync_log，并用 bars 最新日期补齐，避免 sync_log 旧值导致重复打外部源。
+    # 批量查询 sync_log，并以 bars 最新合法交易日为准，避免节假日 cursor 污染。
     sync_docs = {
         doc["symbol"]: doc.get("last_dt")
         for doc in sync_col.find(
@@ -1134,7 +1160,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
     bars_latest = _latest_daily_dates_by_symbol(db, codes)
     for code, latest_dt in bars_latest.items():
         current = _coerce_last_dt(sync_docs.get(code))
-        if current is None or latest_dt > current:
+        if current is None or latest_dt != current:
             sync_docs[code] = latest_dt
 
     total_inserted = 0

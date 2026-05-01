@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from pymongo import UpdateOne
@@ -11,6 +11,7 @@ from pymongo.database import Database
 
 from signals.core.concept_carriers import match_industry_chains, non_chain_reason
 from signals.core.market_time import naive_market_now
+from signals.core.trading_dates import normalized_trade_minute, trading_day_key
 
 from ..retry import sync_retry
 
@@ -41,8 +42,37 @@ def _int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _date_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    return str(value or "")[:10]
+
+
+def _day_start(day_text: str) -> datetime:
+    return datetime.strptime(day_text[:10], "%Y-%m-%d")
+
+
+def _doc_trade_date(doc: dict[str, Any], fallback: Any = None) -> str:
+    return _date_text(doc.get("trade_date") or doc.get("dt") or doc.get("trade_minute") or fallback)
+
+
 def _latest_heat_docs(db: Database, kind: str) -> list[dict[str, Any]]:
-    latest = db["board_heat_ticks"].find_one({"kind": kind}, {"trade_minute": 1}, sort=[("trade_minute", -1)])
+    expected_day = trading_day_key("A")
+    day_start = _day_start(expected_day)
+    day_end = day_start + timedelta(days=1)
+    query = {
+        "kind": kind,
+        "$or": [
+            {"trade_date": expected_day},
+            {"dt": {"$gte": day_start, "$lt": day_end}},
+            {"trade_minute": {"$gte": day_start, "$lt": day_end}},
+        ],
+    }
+    latest = db["board_heat_ticks"].find_one(query, {"trade_minute": 1}, sort=[("trade_minute", -1)])
+    if not latest:
+        latest = db["board_heat_ticks"].find_one({"kind": kind}, {"trade_minute": 1}, sort=[("trade_minute", -1)])
     if not latest or latest.get("trade_minute") is None:
         return []
     return list(db["board_heat_ticks"].find({"kind": kind, "trade_minute": latest["trade_minute"]}, {"_id": 0}))
@@ -207,6 +237,7 @@ def _mapped_items(db: Database) -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     "leader_symbol": _text(doc.get("leader_symbol")),
                     "leader_change_pct": _float(doc.get("leader_change_pct")),
                     "trade_minute": doc.get("trade_minute"),
+                    "trade_date": _doc_trade_date(doc),
                     "heat_score": _row_heat_score(doc),
                     "momentum_5m": _momentum(hist, change, 5),
                     "momentum_15m": _momentum(hist, change, 15),
@@ -252,6 +283,7 @@ def _aggregate(mapped: list[dict[str, Any]], latest_minute: Any) -> list[dict[st
         m15 = round(sum(_float(item.get("momentum_15m")) for item in items[:5]) / min(len(items), 5), 3)
         m30 = round(sum(_float(item.get("momentum_30m")) for item in items[:5]) / min(len(items), 5), 3)
         mapping_confidence = round(sum(_float(item.get("mapping_confidence")) for item in items[:5]) / min(len(items), 5), 1)
+        trade_date = _doc_trade_date(top, latest_minute) or trading_day_key("A", now=now)
         phase = _phase(_float(top.get("change_pct")), up_count, down_count, m5, m15, m30)
         signal = _trading_signal(phase)
         reps: dict[str, dict[str, Any]] = {}
@@ -267,8 +299,9 @@ def _aggregate(mapped: list[dict[str, Any]], latest_minute: Any) -> list[dict[st
         )[:12]
         snapshots.append({
             "market": "A",
-            "dt": (latest_minute or now).replace(hour=0, minute=0, second=0, microsecond=0),
-            "trade_minute": latest_minute,
+            "dt": _day_start(trade_date),
+            "trade_date": trade_date,
+            "trade_minute": latest_minute or normalized_trade_minute("A", now=now),
             "updated_at": now,
             "chain_id": chain_id,
             "chain_name": top.get("chain_name"),
@@ -317,6 +350,8 @@ def sync_chain_heat_snapshots(db: Database, proxy_url: str = None) -> dict:
     snapshots = _aggregate(mapped, latest_minute)
     if not snapshots:
         now = naive_market_now("A")
+        trade_date = trading_day_key("A", now=now)
+        trade_minute = normalized_trade_minute("A", now=now)
         db["data_freshness"].update_one(
             {"domain": "chain_heat", "market": "A", "mode": "realtime", "collection": "chain_heat_snapshots"},
             {"$set": {
@@ -326,8 +361,8 @@ def sync_chain_heat_snapshots(db: Database, proxy_url: str = None) -> dict:
                 "lane": "board_lane",
                 "collection": "chain_heat_snapshots",
                 "freshness": "empty",
-                "latest_dt": now.isoformat(timespec="minutes"),
-                "as_of": now.date().isoformat(),
+                "latest_dt": trade_minute.isoformat(timespec="minutes"),
+                "as_of": trade_date,
                 "updated_at": now,
                 "stale_reason": "no_mapped_chain_heat",
                 "count": 0,
@@ -353,6 +388,7 @@ def sync_chain_heat_snapshots(db: Database, proxy_url: str = None) -> dict:
     result = db["chain_heat_snapshots"].bulk_write(ops, ordered=False)
     now = naive_market_now("A")
     written = int(result.upserted_count + result.modified_count)
+    trade_date = _doc_trade_date(snapshots[0], latest_minute) if snapshots else trading_day_key("A", now=now)
     db["data_freshness"].update_one(
         {"domain": "chain_heat", "market": "A", "mode": "realtime", "collection": "chain_heat_snapshots"},
         {"$set": {
@@ -363,7 +399,7 @@ def sync_chain_heat_snapshots(db: Database, proxy_url: str = None) -> dict:
             "collection": "chain_heat_snapshots",
             "freshness": "fresh",
             "latest_dt": latest_minute.isoformat(timespec="minutes") if latest_minute else now.isoformat(timespec="minutes"),
-            "as_of": (latest_minute or now).date().isoformat(),
+            "as_of": trade_date,
             "updated_at": now,
             "stale_reason": "",
             "count": len(snapshots),

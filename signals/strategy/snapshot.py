@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any, Mapping, Optional
 
 from signals.core.market_time import naive_market_now
+from signals.core.trading_dates import trading_day_key
 
 
 WARNING_TOKENS = ("卖", "顶", "风险", "死叉", "减仓", "跌破", "预警")
@@ -41,6 +42,7 @@ def build_strategy_snapshot(
     without a live MongoDB or external data provider.
     """
     now = _now_bj()
+    trade_date = trading_day_key("A", now=now)
     responses_provided = responses is not None
     responses = dict(responses or _fetch_gateway_responses())
     db = db if db is not None else _get_db_or_none()
@@ -99,14 +101,14 @@ def build_strategy_snapshot(
     chart_context = _build_chart_context(candidates, warnings, signals)
 
     if previous_snapshot is None:
-        previous_snapshot = _latest_previous_snapshot(db, as_of=now.date().isoformat())
+        previous_snapshot = _latest_previous_snapshot(db, as_of=trade_date)
 
     changed_since_last = _changed_since_last(
         current={"themes": themes, "candidates": candidates, "warnings": warnings},
         previous=previous_snapshot or {},
     )
     daily_brief = _build_daily_brief(
-        as_of=now.date().isoformat(),
+        as_of=trade_date,
         market_regime=market_regime,
         themes=themes,
         candidates=candidates,
@@ -117,8 +119,8 @@ def build_strategy_snapshot(
     decision_queue = _build_decision_queue(candidates, warnings)
 
     return _json_safe({
-        "snapshot_id": f"strategy:{now.date().isoformat()}",
-        "as_of": now.date().isoformat(),
+        "snapshot_id": f"strategy:{trade_date}",
+        "as_of": trade_date,
         "generated_at": now.isoformat(timespec="seconds"),
         "market_regime": market_regime,
         "themes": themes,

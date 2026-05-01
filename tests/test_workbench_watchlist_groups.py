@@ -502,7 +502,7 @@ def test_quote_overlay_marks_non_current_quote_stale(monkeypatch):
     assert row["day_change_pct"] is None
 
 
-def test_quote_overlay_treats_holiday_snapshot_after_expected_day_as_closed(monkeypatch):
+def test_quote_overlay_marks_future_holiday_snapshot_stale(monkeypatch):
     from signals.web.api import workbench
 
     class _QuoteCollection:
@@ -528,9 +528,9 @@ def test_quote_overlay_treats_holiday_snapshot_after_expected_day_as_closed(monk
 
     overlay = workbench._quote_overlay_for_symbol("SH.600000")
 
-    assert overlay["quote_status"] == "closed"
-    assert overlay["quote_status_label"] == "收盘"
-    assert overlay["quote_stale_reason"] == ""
+    assert overlay["quote_status"] == "stale"
+    assert overlay["quote_status_label"] == "行情陈旧"
+    assert "quote_day=2026-05-01, expected=2026-04-30" in overlay["quote_stale_reason"]
 
 
 def test_stock_summary_uses_daily_close_day_change_when_quote_stale(monkeypatch):
@@ -1023,3 +1023,9 @@ def test_stock_30min_resamples_from_fresh_5min_when_direct_cache_lags(monkeypatc
     assert df.attrs["as_of"] == "2026-04-30"
     assert df.attrs["resampled_from_freq"] == "5min"
     assert df.attrs["direct_latest_bar_time"] == "2026-04-29T15:00:00"
+
+
+def test_quote_future_holiday_date_is_stale_against_expected_daily_close():
+    from signals.web.api import workbench
+
+    assert workbench._quote_day_is_stale("2026-05-01", "2026-04-30", "daily_close") is True

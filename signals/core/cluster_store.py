@@ -5,12 +5,14 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from signals.core.trading_dates import is_trading_day, trading_day_key
+
 _HISTORY_DIR = Path(".data/cache/cluster_history")
 
 
 def save_result(result: dict):
     """存储当日聚类结果。"""
-    date = result.get("meta", {}).get("date", datetime.now().strftime("%Y-%m-%d"))
+    date = result.get("meta", {}).get("date") or trading_day_key("A")
     _HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     path = _HISTORY_DIR / f"{date}.json"
     with open(path, "w", encoding="utf-8") as f:
@@ -34,7 +36,7 @@ def load_week(ref_date: str = None) -> list:
     if ref_date:
         end = datetime.strptime(ref_date, "%Y-%m-%d")
     else:
-        end = datetime.now()
+        end = datetime.strptime(trading_day_key("A"), "%Y-%m-%d")
     # 本周一
     monday = end - timedelta(days=end.weekday())
 
@@ -53,11 +55,25 @@ def load_latest() -> dict | None:
     """加载最近一次的聚类结果（按文件名日期排序）。"""
     if not _HISTORY_DIR.exists():
         return None
-    files = sorted(_HISTORY_DIR.glob("*.json"), reverse=True)
+    files = [
+        path for path in sorted(_HISTORY_DIR.glob("*.json"), reverse=True)
+        if _is_trading_file(path)
+    ]
     if not files:
         return None
     with open(files[0], "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _is_trading_file(path: Path) -> bool:
+    try:
+        if path.stem[:8].isdigit() and "-" not in path.stem[:10]:
+            day = datetime.strptime(path.stem[:8], "%Y%m%d").date()
+        else:
+            day = datetime.strptime(path.stem[:10], "%Y-%m-%d").date()
+        return is_trading_day("A", day)
+    except Exception:
+        return False
 
 
 def cleanup(keep_days: int = 30):

@@ -44,6 +44,7 @@ def test_quote_doc_from_eastmoney_payload_scales_fields():
     assert doc is not None
     assert doc["source"] == "eastmoney_push2delay"
     assert doc["freshness"] == "fresh"
+    assert doc["trade_date"] == "2026-04-24"
     assert doc["price"] == 19.67
     assert doc["prev_close"] == 19.43
     assert doc["change_pct"] == 1.24
@@ -137,6 +138,7 @@ def test_quote_snapshots_reads_fullmarket_spot_snapshot():
     doc = docs["SH.601958"]
     assert doc["source"] == "fullmarket_spot_snapshot"
     assert doc["freshness"] == "fresh"
+    assert doc["trade_date"] == "2026-04-29"
     assert doc["price"] == 19.67
     assert doc["vol"] == 30498700
 

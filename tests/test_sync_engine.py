@@ -22,6 +22,11 @@ def test_schedule_window_is_only_due_inside_window():
     assert SyncEngine._schedule_due("16:00-17:30 weekday", datetime(2026, 4, 24, 17, 31)) is False
 
 
+def test_weekday_schedule_skips_cn_labor_day_holiday():
+    assert SyncEngine._schedule_due("16:00-17:30 weekday", datetime(2026, 5, 1, 16, 1)) is False
+    assert SyncEngine._schedule_due("16:00-17:30 weekday", datetime(2026, 5, 9, 16, 1)) is True
+
+
 def test_sunday_schedule_only_on_sunday():
     sunday = datetime(2026, 4, 26, 10, 1)
     friday = datetime(2026, 4, 24, 10, 1)

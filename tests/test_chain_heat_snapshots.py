@@ -46,6 +46,7 @@ def test_chain_heat_aggregate_builds_realtime_node_fields():
     assert node["trading_signal"] == "chain_acceleration"
     assert node["heat_source"] == "eastmoney_push2delay"
     assert node["taxonomy_source"] == "industry_chains.yaml"
+    assert node["trade_date"] == "2026-04-28"
     assert node["momentum_5m"] == 0.4
     assert node["representatives"][0]["symbol"] == "SH.688981"
 

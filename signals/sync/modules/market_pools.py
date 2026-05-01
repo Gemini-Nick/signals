@@ -9,6 +9,7 @@ from typing import Iterable
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
+from signals.core.trading_dates import trading_day_key
 
 logger = logging.getLogger("signals.sync.market_pools")
 
@@ -86,6 +87,7 @@ def _collect_pool_symbols(db: Database) -> dict[str, set[str]]:
 
 def _write_data_freshness(db: Database, count: int, status: str) -> None:
     now = naive_market_now("A")
+    trade_date = trading_day_key("A", now=now)
     freshness = "fresh" if count else "empty"
     db["data_freshness"].update_one(
         {"domain": "market_pool", "market": "A", "mode": "realtime", "collection": "market_pools"},
@@ -95,8 +97,9 @@ def _write_data_freshness(db: Database, count: int, status: str) -> None:
             "mode": "realtime",
             "collection": "market_pools",
             "freshness": freshness,
-            "latest_dt": now.date().isoformat() if count else None,
-            "as_of": now.date().isoformat() if count else None,
+            "latest_dt": trade_date if count else None,
+            "as_of": trade_date if count else None,
+            "date_key": trade_date.replace("-", "") if count else None,
             "updated_at": now,
             "stale_reason": "" if count else status,
         }},
@@ -108,6 +111,7 @@ def sync_market_pools(db: Database, proxy_url: str = None) -> dict:
     """Create active market pool from configured, held, signaled, and sector symbols."""
     del proxy_url
     now = naive_market_now("A")
+    trade_date = trading_day_key("A", now=now)
     sources_by_symbol = _collect_pool_symbols(db)
     source_priority = {
         "whitelist": 0,
@@ -136,9 +140,10 @@ def sync_market_pools(db: Database, proxy_url: str = None) -> dict:
         for symbol in symbols
     ]
     doc = {
-        "_id": f"active:{now.date().isoformat()}",
+        "_id": f"active:{trade_date}",
         "pool": "active",
-        "dt": now.date().isoformat(),
+        "dt": trade_date,
+        "trade_date": trade_date,
         "symbols": symbols,
         "items": items,
         "count": len(symbols),

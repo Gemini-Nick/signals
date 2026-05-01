@@ -12,6 +12,7 @@ from pymongo.database import Database
 
 from signals.core.macro_universe import macro_watchlist
 from signals.core.market_time import naive_market_now
+from signals.core.trading_dates import trading_day_key
 from signals.sync.eastmoney_observer import observe_eastmoney
 from signals.sync.provider_limits import ProviderCoolingDown, provider_call
 
@@ -276,6 +277,7 @@ def _quote_doc_from_em(symbol: str, payload: dict, now: datetime, trading_day: s
         "code": data.get("f57") or (symbol.split(".", 1)[-1] if "." in symbol else symbol),
         "name": data.get("f58") or "",
         "dt": trading_day,
+        "trade_date": trading_day,
         "snapshot_at": now,
         "source": "eastmoney_push2delay",
         "freshness": "fresh",
@@ -323,6 +325,7 @@ def _quote_doc_from_fullmarket_spot(symbol: str, row: dict, now: datetime, tradi
         "code": code,
         "name": row.get("name") or "",
         "dt": trading_day,
+        "trade_date": trading_day,
         "snapshot_at": now,
         "source": "fullmarket_spot_snapshot",
         "freshness": "fresh",
@@ -752,9 +755,7 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
     del proxy_url
     now = naive_market_now("A")
     try:
-        from signals.data.mongo_fallback import get_last_trading_day
-
-        trading_day = get_last_trading_day()
+        trading_day = trading_day_key("A", now=now)
     except Exception:
         trading_day = now.date().isoformat()
     symbols = _hot_quote_symbols(db)
@@ -841,9 +842,7 @@ def sync_eastmoney_ulist_quote(db: Database, proxy_url: str = None) -> dict:
     del proxy_url
     now = naive_market_now("A")
     try:
-        from signals.data.mongo_fallback import get_last_trading_day
-
-        trading_day = get_last_trading_day()
+        trading_day = trading_day_key("A", now=now)
     except Exception:
         trading_day = now.date().isoformat()
     symbols = _hot_quote_symbols(db)

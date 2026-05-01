@@ -7,6 +7,7 @@ charts must read these cached ticks; API requests should not fetch providers.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 import pandas as pd
@@ -14,6 +15,7 @@ from pymongo import UpdateOne
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
+from signals.core.trading_dates import normalized_trade_minute, trading_day_key
 
 from ..provider_limits import provider_call
 from ..retry import sync_retry
@@ -38,9 +40,19 @@ def _int(value: Any, default: int = 0) -> int:
     return int(parsed)
 
 
-def _tick_docs(df: pd.DataFrame, *, kind: str, now) -> list[dict[str, Any]]:
+def _tick_docs(
+    df: pd.DataFrame,
+    *,
+    kind: str,
+    now,
+    trade_date: str | None = None,
+    trade_minute: datetime | None = None,
+) -> list[dict[str, Any]]:
     if df is None or df.empty:
         return []
+    resolved_trade_date = trade_date or now.date().isoformat()
+    resolved_trade_minute = trade_minute or now.replace(second=0, microsecond=0)
+    trade_day = datetime.strptime(resolved_trade_date, "%Y-%m-%d")
     docs: list[dict[str, Any]] = []
     for rank_idx, row in df.reset_index(drop=True).iterrows():
         name = str(row.get("板块名称") or row.get("board_name") or "").strip()
@@ -52,8 +64,9 @@ def _tick_docs(df: pd.DataFrame, *, kind: str, now) -> list[dict[str, Any]]:
             "board_name": name,
             "code": str(row.get("板块代码") or row.get("code") or "").strip(),
             "source": "eastmoney_push2delay",
-            "dt": now.replace(hour=0, minute=0, second=0, microsecond=0),
-            "trade_minute": now.replace(second=0, microsecond=0),
+            "dt": trade_day,
+            "trade_date": resolved_trade_date,
+            "trade_minute": resolved_trade_minute,
             "snapshot_at": now,
             "rank_idx": int(rank_idx),
             "price": _float(row.get("最新价")),
@@ -72,6 +85,8 @@ def _tick_docs(df: pd.DataFrame, *, kind: str, now) -> list[dict[str, Any]]:
 
 def _sync_heat_kind(db: Database, *, kind: str, proxy_url: str | None = None) -> dict:
     now = naive_market_now("A")
+    trade_date = trading_day_key("A", now=now)
+    trade_minute = normalized_trade_minute("A", now=now)
     source_kind = "concept" if kind == "concept" else "industry"
     domain = "concept" if kind == "concept" else "board"
     endpoint = f"push2delay_clist_{source_kind}"
@@ -83,7 +98,7 @@ def _sync_heat_kind(db: Database, *, kind: str, proxy_url: str | None = None) ->
             db=db,
             domain=domain,
         )
-        docs = _tick_docs(df, kind=kind, now=now)
+        docs = _tick_docs(df, kind=kind, now=now, trade_date=trade_date, trade_minute=trade_minute)
         if not docs:
             _health(db, "em", endpoint, domain, False, "empty")
             return {"status": "degraded", "inserted": 0, "kind": kind, "reason": "board_heat_empty"}
@@ -112,8 +127,8 @@ def _sync_heat_kind(db: Database, *, kind: str, proxy_url: str | None = None) ->
                 "collection": "board_heat_ticks",
                 "scope": kind,
                 "freshness": "fresh",
-                "latest_dt": now.isoformat(timespec="minutes"),
-                "as_of": now.date().isoformat(),
+                "latest_dt": trade_minute.isoformat(timespec="minutes"),
+                "as_of": trade_date,
                 "updated_at": now,
                 "stale_reason": "",
                 "count": len(docs),

@@ -513,6 +513,8 @@ class TradingCalendar:
     def next_transition(self, dt: datetime) -> int:
         """Seconds until next open/close event across all instruments."""
         self._ensure_loaded()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ_UTC)
         candidates: list[datetime] = []
         for ex in self._schedules:
             tz = self._tz_for(ex)
@@ -523,22 +525,15 @@ class TradingCalendar:
                     continue
                 for sch in self._schedules[ex]:
                     for slot in sch.sessions:
-                        for slot_d in slot.days:
-                            slot_date = check_d
-                            # Find next matching weekday
-                            while slot_date.weekday() != slot_d:
-                                slot_date -= timedelta(days=1)
-                            delta = (check_d - slot_date).days
-                            if abs(delta) > 7:
-                                slot_date = check_d
-                                while slot_date.weekday() != slot_d:
-                                    slot_date += timedelta(days=1)
-                            for t in (slot.open, slot.close):
-                                candidate = datetime.combine(slot_date, t, tzinfo=tz).astimezone(TZ_UTC)
-                                if candidate > dt:
-                                    candidates.append(candidate)
-            if candidates:
-                break
+                        is_makeup = check_d in self._makeup_workdays
+                        if check_d.weekday() not in slot.days and not is_makeup:
+                            continue
+                        open_candidate = datetime.combine(check_d, slot.open, tzinfo=tz).astimezone(TZ_UTC)
+                        close_date = check_d + timedelta(days=1) if slot.close < slot.open else check_d
+                        close_candidate = datetime.combine(close_date, slot.close, tzinfo=tz).astimezone(TZ_UTC)
+                        for candidate in (open_candidate, close_candidate):
+                            if candidate > dt:
+                                candidates.append(candidate)
         if not candidates:
             return 3600
         return max(0, int((min(candidates) - dt).total_seconds()))

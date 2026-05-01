@@ -29,6 +29,7 @@ def test_board_heat_tick_docs_capture_minute_heat_fields():
         "code": "BK1036",
         "source": "eastmoney_push2delay",
         "dt": datetime(2026, 4, 27),
+        "trade_date": "2026-04-27",
         "trade_minute": datetime(2026, 4, 27, 10, 30),
         "snapshot_at": datetime(2026, 4, 27, 10, 30, 12),
         "rank_idx": 0,
@@ -43,3 +44,20 @@ def test_board_heat_tick_docs_capture_minute_heat_fields():
         "leader_symbol": "",
         "leader_change_pct": 9.8,
     }]
+
+
+def test_board_heat_tick_docs_can_use_previous_trade_day_on_holiday():
+    df = pd.DataFrame([{"板块名称": "半导体", "涨跌幅": 3.2}])
+
+    docs = _tick_docs(
+        df,
+        kind="industry",
+        now=datetime(2026, 5, 1, 15, 36),
+        trade_date="2026-04-30",
+        trade_minute=datetime(2026, 4, 30, 15, 0),
+    )
+
+    assert docs[0]["dt"] == datetime(2026, 4, 30)
+    assert docs[0]["trade_date"] == "2026-04-30"
+    assert docs[0]["trade_minute"] == datetime(2026, 4, 30, 15, 0)
+    assert docs[0]["snapshot_at"] == datetime(2026, 5, 1, 15, 36)

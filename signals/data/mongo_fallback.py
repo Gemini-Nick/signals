@@ -179,6 +179,13 @@ def get_last_trading_day(market: str = "A") -> str:
     """
     from signals.core.market_time import naive_market_now
 
+    try:
+        from signals.core.trading_dates import trading_day_key
+
+        return trading_day_key(market)
+    except Exception:
+        pass
+
     now = naive_market_now(market)
     d = now
 

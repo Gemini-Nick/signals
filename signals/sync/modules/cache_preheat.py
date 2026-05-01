@@ -17,6 +17,7 @@ from pymongo import UpdateOne
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
+from signals.core.trading_dates import is_trading_day, trading_day_key
 
 logger = logging.getLogger("signals.sync.cache_preheat")
 
@@ -44,7 +45,18 @@ def _now() -> datetime:
 
 
 def _today_str() -> str:
-    return _now().strftime("%Y-%m-%d")
+    return trading_day_key("A", now=_now())
+
+
+def _is_trading_date_stem(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        day = datetime.strptime(text[:8], "%Y%m%d").date() if text[:8].isdigit() and "-" not in text[:10] else datetime.fromisoformat(text[:10]).date()
+    except Exception:
+        return False
+    return is_trading_day("A", day)
 
 
 def _import_kline_files(db: Database, root: Path) -> int:
@@ -239,6 +251,8 @@ def _import_history_docs(db: Database, root: Path) -> int:
     cluster_dir = root / ".data" / "cache" / "cluster_history"
     if cluster_dir.exists():
         for path in cluster_dir.glob("*.json"):
+            if not _is_trading_date_stem(path.stem):
+                continue
             db["cluster_history"].update_one(
                 {"_id": path.stem},
                 {"$set": {

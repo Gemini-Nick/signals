@@ -9,6 +9,7 @@ from pymongo.database import Database
 from pymongo.errors import OperationFailure, PyMongoError
 
 from signals.core.market_time import naive_market_now
+from signals.core.trading_dates import trading_day_key
 
 logger = logging.getLogger("signals.sync.storage")
 
@@ -134,6 +135,7 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["data_freshness"], [("domain", ASCENDING), ("market", ASCENDING), ("mode", ASCENDING), ("collection", ASCENDING), ("freq", ASCENDING), ("shard_key", ASCENDING)])
     _cleanup_legacy_freshness_docs(db)
 
+    trade_date = trading_day_key("A", now=now)
     db["data_freshness"].update_one(
         {"domain": "storage", "market": "all", "mode": "system", "collection": "mongo_indexes"},
         {"$set": {
@@ -142,8 +144,8 @@ def ensure_storage_model(db: Database) -> None:
             "mode": "system",
             "collection": "mongo_indexes",
             "freshness": "fresh",
-            "latest_dt": now.date().isoformat(),
-            "as_of": now.date().isoformat(),
+            "latest_dt": trade_date,
+            "as_of": trade_date,
             "updated_at": now,
             "stale_reason": "",
         }},

@@ -791,8 +791,15 @@ class SyncEngine:
     @classmethod
     def _schedule_due(cls, schedule: str, now: datetime) -> bool:
         weekday = now.weekday()
-        if "weekday" in schedule and weekday >= 5:
-            return False
+        if "weekday" in schedule:
+            try:
+                from signals.core.trading_dates import is_trading_day
+
+                if not is_trading_day("A", now.date()):
+                    return False
+            except Exception:
+                if weekday >= 5:
+                    return False
         if "Sunday" in schedule and weekday != 6:
             return False
         start = cls._parse_schedule_time(schedule)
