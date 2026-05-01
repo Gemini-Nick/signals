@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-指数日线同步 — 11 只指数全量覆盖
+指数日线同步 — 宏观观察指数全量覆盖
 
-数据源: AKShare stock_zh_index_daily（A股 7 只）
-        + Futu/yfinance（港股 1 + 美股 3）
+数据源: AKShare stock_zh_index_daily（A股宏观观察池）
+        + yfinance（美股 3 只）
 策略: 全量覆盖（数据量小，每次全量更安全）
 频率: 工作日 16:30
 """
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import akshare as ak
 import pandas as pd
@@ -16,6 +16,7 @@ from pymongo import UpdateOne
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
+from signals.core.macro_universe import macro_a_index_codes
 from ..proxy import em_proxy
 from ..retry import sync_retry
 
@@ -47,6 +48,108 @@ def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict], re
         bars_col.delete_many({"meta.symbol": symbol, "meta.freq": freq})
         bars_col.insert_many(bars_docs, ordered=False)
     return len(index_docs)
+
+
+def _latest_daily_dt(db: Database, symbol: str) -> str:
+    doc = db["index_bars"].find_one(
+        {"meta.symbol": symbol, "meta.freq": {"$in": ["日线", "daily", "D", "1d"]}},
+        {"dt": 1},
+        sort=[("dt", -1)],
+    ) or {}
+    value = doc.get("dt")
+    try:
+        return pd.to_datetime(value).date().isoformat()
+    except Exception:
+        return ""
+
+
+def _expected_trade_day() -> str:
+    try:
+        from signals.data.mongo_fallback import get_last_trading_day
+
+        return str(get_last_trading_day("A"))[:10]
+    except Exception:
+        return naive_market_now("A").date().isoformat()
+
+
+def _minute_docs_for_day(db: Database, symbol: str, day: str) -> tuple[list[dict], str]:
+    start = datetime.fromisoformat(day)
+    end = start + timedelta(days=1)
+    for freq in ("5分钟", "5min", "15分钟", "15min", "30分钟", "30min"):
+        docs = list(db["index_bars"].find(
+            {
+                "meta.symbol": symbol,
+                "meta.freq": freq,
+                "dt": {"$gte": start, "$lt": end},
+            },
+            {"_id": 0},
+        ).sort("dt", 1))
+        if docs:
+            return docs, freq
+    return [], ""
+
+
+def _fallback_today_from_minute_bars(db: Database, index_codes: dict[str, str]) -> int:
+    """Patch today's index daily bar from verified minute cache when daily provider lags."""
+    expected_day = _expected_trade_day()
+    index_ops = []
+    bars_ops = []
+    patched = 0
+    for name, symbol in index_codes.items():
+        if _latest_daily_dt(db, symbol) == expected_day:
+            continue
+        minute_docs, source_freq = _minute_docs_for_day(db, symbol, expected_day)
+        if not minute_docs:
+            logger.warning("  ✗ %s (%s): 日线缺 %s，分钟线也缺", name, symbol, expected_day)
+            continue
+        frame = pd.DataFrame(minute_docs)
+        for column in ("open", "high", "low", "close", "vol", "amount"):
+            if column in frame.columns:
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame = frame.dropna(subset=["open", "high", "low", "close"], how="any")
+        if frame.empty:
+            continue
+        doc = {
+            "dt": datetime.fromisoformat(expected_day),
+            "meta": {
+                "symbol": symbol,
+                "freq": "日线",
+                "asset_type": "index",
+                "market": "A",
+                "source": "index_minute_rollup",
+                "derived_from_freq": source_freq,
+            },
+            "open": float(frame["open"].iloc[0]),
+            "high": float(frame["high"].max()),
+            "low": float(frame["low"].min()),
+            "close": float(frame["close"].iloc[-1]),
+            "vol": int(frame["vol"].fillna(0).sum()) if "vol" in frame.columns else 0,
+            "amount": float(frame["amount"].fillna(0).sum()) if "amount" in frame.columns else 0,
+        }
+        selector = {"meta.symbol": symbol, "meta.freq": "日线", "dt": doc["dt"]}
+        index_ops.append(UpdateOne(selector, {"$set": doc}, upsert=True))
+        bars_ops.append(UpdateOne(selector, {"$set": doc}, upsert=True))
+        db["sync_log"].update_one(
+            {"_id": f"index_daily:{symbol}"},
+            {"$set": {
+                "module": "index_daily",
+                "symbol": symbol,
+                "last_dt": doc["dt"],
+                "last_run": naive_market_now("A"),
+                "status": "ok",
+                "source": "index_minute_rollup",
+            }},
+            upsert=True,
+        )
+        patched += 1
+        logger.info("  ↳ %s: 用 %s 合成 %s 指数日线", name, source_freq, expected_day)
+    if not index_ops and not bars_ops:
+        return 0
+    if index_ops:
+        db["index_bars"].bulk_write(index_ops, ordered=False)
+    if bars_ops:
+        db["bars"].bulk_write(bars_ops, ordered=False)
+    return patched
 
 
 def _sync_a_index(db: Database, ak_codes: dict, start_date: str,
@@ -211,23 +314,25 @@ def sync_index_daily(db: Database, proxy_url: str = None) -> dict:
     """
     指数日线全量同步。
 
-    A 股 7 只 + 港股 1 只 + 美股 3 只 = 11 只指数。
+    A 股宏观观察池 + 美股 3 只指数。
     """
     import config
 
     start_date = (naive_market_now("A") - timedelta(
         days=config.INDEX_MA_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
 
-    logger.info(f"指数日线同步: 11 只指数, 起始 {start_date}")
+    a_index_codes = macro_a_index_codes()
+    logger.info(f"指数日线同步: A股 {len(a_index_codes)} 只指数, 起始 {start_date}")
 
-    a_count = _sync_a_index(db, config.INDEX_AK_CODES, start_date, proxy_url)
+    a_count = _sync_a_index(db, a_index_codes, start_date, proxy_url)
+    minute_rollup_count = _fallback_today_from_minute_bars(db, a_index_codes)
 
     # 港股恒生科技走 AKShare（同 A 股接口格式不同，这里简单处理）
     # 实际环境可能需要 Futu，此处用 yfinance 兜底
     us_count = _sync_us_index(db, config.INDEX_US_CODES)
 
-    total = a_count + us_count
+    total = a_count + us_count + minute_rollup_count
     if total == 0:
-        total = _fallback_from_existing_bars(db, config.INDEX_AK_CODES)
+        total = _fallback_from_existing_bars(db, a_index_codes)
     logger.info(f"指数日线完成: {total} bars")
-    return {"inserted": total}
+    return {"inserted": total, "minute_rollup_patched": minute_rollup_count}

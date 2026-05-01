@@ -230,6 +230,57 @@ def _float(value: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
+def _first_numeric(*values: Any) -> Optional[float]:
+    for value in values:
+        parsed = _float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _a_day_change_mode() -> str:
+    now = _market_now("A")
+    try:
+        from signals.core.market_hours import get_session_mode
+        session = get_session_mode()
+    except Exception:
+        session = None
+    if bool(getattr(session, "a_live", False)):
+        return "quote_intraday"
+    if now.weekday() < 5 and (now.hour, now.minute) >= (9, 30) and (now.hour, now.minute) < (15, 0):
+        return "quote_intraday"
+    return "daily_close"
+
+
+def _day_change_expected_day(mode: Optional[str] = None) -> str:
+    resolved_mode = mode or _a_day_change_mode()
+    if resolved_mode == "quote_intraday":
+        return _market_today("A").isoformat()
+    try:
+        from signals.data.mongo_fallback import get_last_trading_day
+        return str(get_last_trading_day("A"))[:10]
+    except Exception:
+        return _market_today("A").isoformat()
+
+
+def _df_latest_date(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return ""
+    try:
+        return pd.to_datetime(df.sort_index().index.max()).date().isoformat()
+    except Exception:
+        return ""
+
+
+def _daily_close_day_change_pct(df: pd.DataFrame) -> tuple[Optional[float], str, str]:
+    expected_day = _day_change_expected_day("daily_close")
+    latest_day = _df_latest_date(df)
+    if expected_day and latest_day and latest_day != expected_day:
+        return None, "", latest_day
+    value = _compute_day_change_pct(df)
+    return value, ("daily_bars_close" if value is not None else ""), latest_day
+
+
 def _text(value: Any) -> str:
     if value is None:
         return ""
@@ -883,6 +934,23 @@ def _board_heat_df(name: str, kind: str, freq: str) -> tuple[pd.DataFrame, str, 
     return out, "board_heat_ticks", latest, resolution
 
 
+def _latest_board_heat_day_change(kind: str, name: str) -> tuple[Optional[float], str]:
+    if not kind or not name:
+        return None, ""
+    try:
+        doc = _mongo_db()["board_heat_ticks"].find_one(
+            {"kind": kind, "name": name},
+            {"_id": 0, "change_pct": 1, "trade_minute": 1},
+            sort=[("trade_minute", -1)],
+        ) or {}
+    except Exception:
+        doc = {}
+    as_of = _date_text(doc.get("trade_minute"))
+    if as_of != _day_change_expected_day():
+        return None, as_of
+    return _float(doc.get("change_pct")), as_of
+
+
 def _board_heat_chart(name: str, kind: str, freq: str) -> tuple[dict[str, Any], dict[str, Any]]:
     df, source, latest, resolution = _board_heat_df(name, kind, freq)
     heat_name = resolution.get("heat_name") or name
@@ -1326,7 +1394,8 @@ def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
     if not doc:
         return {"quote_status": "missing", "quote_status_label": "无行情"}
 
-    expected_day = _market_today("A").isoformat()
+    day_change_mode = _a_day_change_mode()
+    expected_day = _day_change_expected_day(day_change_mode)
     quote_day = _quote_dt_text(doc)
     age_seconds = _quote_age_seconds(doc)
     stale_reason = _text(doc.get("stale_reason"))
@@ -1336,6 +1405,9 @@ def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
         label = "行情陈旧"
         if quote_day and quote_day != expected_day:
             stale_reason = stale_reason or f"quote_day={quote_day}, expected={expected_day}"
+    elif day_change_mode == "daily_close":
+        status = "closed"
+        label = "收盘"
     elif age_seconds is not None and age_seconds > 30:
         status = "delayed"
         label = "行情延迟"
@@ -1344,6 +1416,7 @@ def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
         label = "实时"
 
     overlay = {
+        "day_change_mode": day_change_mode,
         "quote_status": status,
         "quote_status_label": label,
         "quote_source": doc.get("source") or "",
@@ -1352,20 +1425,22 @@ def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
         "quote_age_seconds": age_seconds,
         "quote_stale_reason": stale_reason,
     }
-    if status in {"realtime", "delayed"}:
-        overlay.update({
-            "latest_price": doc.get("price") or doc.get("close"),
-            "day_change_pct": doc.get("change_pct"),
-            "daily_change_pct": doc.get("change_pct"),
-            "today_change_pct": doc.get("change_pct"),
-            "realtime_price": doc.get("price") or doc.get("close"),
-        })
-    else:
-        overlay.update({
-            "day_change_pct": None,
-            "daily_change_pct": None,
-            "today_change_pct": None,
-        })
+    if day_change_mode == "quote_intraday" and status in {"realtime", "delayed"}:
+        latest_price = _first_numeric(doc.get("price"), doc.get("close"))
+        change_pct = _float(doc.get("change_pct"))
+        if latest_price is not None:
+            overlay.update({
+                "latest_price": latest_price,
+                "realtime_price": latest_price,
+            })
+        if change_pct is not None:
+            overlay.update({
+                "day_change_pct": change_pct,
+                "daily_change_pct": change_pct,
+                "today_change_pct": change_pct,
+                "day_change_source": "quote_snapshots",
+                "day_change_as_of": quote_day,
+            })
     return overlay
 
 
@@ -1381,15 +1456,23 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
     normalized, raw_code = _normalize_stock_symbol(symbol)
     normalized = normalized or symbol
     df, source = _stock_df(normalized, "daily") if normalized else (pd.DataFrame(), "")
+    day_change_mode = _a_day_change_mode()
+    daily_day_change, daily_day_source, daily_as_of = _daily_close_day_change_pct(df)
+    daily_close_price = (
+        float(df["close"].iloc[-1])
+        if daily_as_of == _day_change_expected_day("daily_close") and df is not None and not df.empty and "close" in df.columns
+        else None
+    )
     metadata = dict(row.get("metadata") or {}) if isinstance(row.get("metadata"), dict) else {}
-    latest_price = (
+    latest_price = daily_close_price if day_change_mode == "daily_close" else (
         row.get("latest_price")
         or row.get("price")
         or metadata.get("price")
-        or (float(df["close"].iloc[-1]) if df is not None and not df.empty and "close" in df.columns else None)
+        or daily_close_price
     )
     enriched = dict(row)
-    day_change_pct = row.get("day_change_pct") or row.get("daily_change_pct") or row.get("change_pct") or row.get("gain_pct") or _compute_day_change_pct(df)
+    day_change_pct = daily_day_change if day_change_mode == "daily_close" else None
+    day_change_source = daily_day_source if day_change_mode == "daily_close" else ""
     latest_signal = _text(row.get("latest_signal") or row.get("signal") or row.get("reason") or row.get("direction"))
     enriched.update({
         "kind": "stock",
@@ -1401,6 +1484,9 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "latest_price": latest_price,
         "day_change_pct": day_change_pct,
         "daily_change_pct": day_change_pct,
+        "day_change_source": day_change_source,
+        "day_change_mode": day_change_mode,
+        "day_change_as_of": daily_as_of if day_change_mode == "daily_close" else "",
         "latest_signal": latest_signal or _ma_signal_from_df(df),
         "range_returns": _compute_range_returns(df, range_columns),
         "range_return_source": source,
@@ -1413,19 +1499,274 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
     return _apply_quote_overlay(enriched, normalized)
 
 
+def _slim_shell_signal_reason(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    keys = (
+        "reason_type",
+        "source_collection",
+        "source_role",
+        "signal_family",
+        "signal_side",
+        "signal_type",
+        "freq",
+        "queue_lane",
+        "actionability",
+        "decision_effect",
+        "confidence",
+        "score",
+        "as_of",
+        "event_dt",
+        "event_date",
+        "event_latest_dt",
+        "signal_age_trading_days",
+        "weight",
+    )
+    out = {key: value.get(key) for key in keys if value.get(key) not in (None, "", [], {})}
+    evidence = value.get("evidence") if isinstance(value.get("evidence"), dict) else {}
+    for key in ("direction", "freq", "signal_type"):
+        if evidence.get(key) not in (None, "", [], {}) and key not in out:
+            out[key] = evidence.get(key)
+    details = evidence.get("details")
+    if isinstance(details, str) and details:
+        out["details"] = details[:120]
+    elif isinstance(details, dict):
+        out["details"] = {
+            key: details.get(key)
+            for key in ("signal", "reason", "summary", "pattern")
+            if details.get(key) not in (None, "", [], {})
+        }
+    resonance = value.get("resonance_context") if isinstance(value.get("resonance_context"), dict) else evidence.get("resonance_context")
+    if isinstance(resonance, dict):
+        out["resonance_context"] = {
+            key: resonance.get(key)
+            for key in ("grade", "tags", "aligned_freqs", "conflict_freqs", "primary_freq", "direction", "latest_dt", "summary")
+            if resonance.get(key) not in (None, "", [], {})
+        }
+    return out
+
+
+def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "kind",
+        "label",
+        "symbol",
+        "code",
+        "raw_code",
+        "name",
+        "latest_price",
+        "day_change_pct",
+        "daily_change_pct",
+        "today_change_pct",
+        "day_change_source",
+        "day_change_mode",
+        "day_change_as_of",
+        "realtime_price",
+        "latest_signal",
+        "reason",
+        "signal",
+        "direction",
+        "range_returns",
+        "range_return_source",
+        "available_freqs",
+        "target_kind",
+        "target_label",
+        "target_symbol",
+        "target_freq",
+        "lane",
+        "second_screen_role",
+        "freshness",
+        "lane_status",
+        "source",
+        "source_collection",
+        "source_collections",
+        "source_tags",
+        "focus_reasons",
+        "trace_summary",
+        "signal_origin",
+        "signal_family",
+        "knowledge_confirmation",
+        "resonance_context",
+        "chain_context",
+        "exit_condition",
+        "invalidates_when",
+        "action_status",
+        "actionability",
+        "queue_lane",
+        "pool_type",
+        "entry_gate_status",
+        "next_action",
+        "trader_action",
+        "rank_score",
+        "sort_score",
+        "score",
+        "rank_reason",
+        "score_components",
+        "coverage_status",
+        "decision_effect",
+        "blocked_by",
+        "primary_blocker",
+        "recommended_action",
+        "missing_gates",
+        "promotion_path",
+        "strategy_semantics",
+        "intervention_side",
+        "intervention_label",
+        "opportunity_side",
+        "opportunity_label",
+        "strategy_lineage",
+        "left_setup_reasons",
+        "right_confirm_reasons",
+        "left_signal_reasons",
+        "right_signal_reasons",
+        "risk_signal_reasons",
+        "technical_signal_groups",
+        "timeframe_signal_sides",
+        "upper_timeframe_side",
+        "trade_timeframe",
+        "trade_timeframe_side",
+        "execution_timeframe_side",
+        "chain_phase",
+        "theme_rank_bonus",
+        "theme_alignment_level",
+        "event_latest_dt",
+        "signal_age_trading_days",
+        "stale_context",
+        "stale_signal_count",
+        "buy_timeframes",
+        "sell_timeframes",
+        "quote_status",
+        "quote_status_label",
+        "quote_source",
+        "quote_as_of",
+        "quote_snapshot_at",
+        "quote_age_seconds",
+        "quote_stale_reason",
+        "explanation",
+    )
+    out = {key: row.get(key) for key in keys if row.get(key) not in (None, "", [], {})}
+    reasons = [
+        _slim_shell_signal_reason(reason)
+        for reason in row.get("inclusion_reasons") or []
+        if isinstance(reason, dict)
+    ]
+    if reasons:
+        out["inclusion_reasons"] = [reason for reason in reasons if reason][:3]
+    for key in ("technical_evidence", "top_buy_reason", "top_risk_reason"):
+        slim = _slim_shell_signal_reason(row.get(key))
+        if slim:
+            out[key] = slim
+    return out
+
+
+def _slim_shell_candidate_group_rows(rows: Any, limit: int = 4) -> list[dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    keep = (
+        "symbol",
+        "raw_code",
+        "code",
+        "name",
+        "leader_tier",
+        "chain_role",
+        "attention_score",
+        "day_change_pct",
+        "latest_signal",
+        "why_watch",
+        "target_kind",
+        "target_label",
+        "target_symbol",
+        "target_freq",
+    )
+    output: list[dict[str, Any]] = []
+    for item in rows[:limit]:
+        if not isinstance(item, dict):
+            continue
+        output.append({key: item.get(key) for key in keep if item.get(key) not in (None, "", [], {})})
+    return output
+
+
+def _slim_shell_sector_row(row: dict[str, Any]) -> dict[str, Any]:
+    keep = (
+        "kind",
+        "label",
+        "name",
+        "code",
+        "latest_price",
+        "day_change_pct",
+        "daily_change_pct",
+        "day_change_source",
+        "day_change_mode",
+        "day_change_as_of",
+        "range_returns",
+        "range_return_source",
+        "target_kind",
+        "target_label",
+        "target_symbol",
+        "target_freq",
+        "lane",
+        "second_screen_role",
+        "freshness",
+        "lane_status",
+        "source",
+        "source_collection",
+        "heat_source",
+        "heat_target_label",
+        "heat_resolution_status",
+        "latest_signal",
+        "trader_action",
+        "action_status",
+        "invalidates_when",
+        "explanation",
+        "carrier",
+        "mapping_chain",
+        "data_truth",
+    )
+    out = {key: row.get(key) for key in keep if row.get(key) not in (None, "", [], {})}
+    groups = row.get("candidate_groups")
+    if isinstance(groups, dict):
+        out["candidate_groups"] = {
+            key: _slim_shell_candidate_group_rows(groups.get(key), 4 if key != "leaders" else 3)
+            for key in ("leaders", "weighted", "elastic", "source_leaders", "constituents")
+            if _slim_shell_candidate_group_rows(groups.get(key), 4 if key != "leaders" else 3)
+        }
+    preview = _slim_shell_candidate_group_rows(row.get("focus_stocks_preview"), 6)
+    if preview:
+        out["focus_stocks_preview"] = preview
+    representatives = row.get("representatives")
+    if isinstance(representatives, dict):
+        out["representatives"] = {
+            key: _slim_shell_candidate_group_rows(value, 3)
+            for key, value in representatives.items()
+            if _slim_shell_candidate_group_rows(value, 3)
+        }
+    return out
+
+
 def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) -> dict[str, Any]:
     symbol = str(row.get("symbol") or row.get("code") or row.get("label") or row.get("name") or "").strip()
     df, source = _index_df(symbol, "daily") if symbol else (pd.DataFrame(), "")
-    day_change_pct = row.get("day_change_pct") or row.get("daily_change_pct") or row.get("change_pct") or row.get("gain_pct") or row.get("intraday_change") or _compute_day_change_pct(df)
+    day_change_mode = _a_day_change_mode()
+    daily_day_change, daily_day_source, daily_as_of = _daily_close_day_change_pct(df)
+    daily_close_price = (
+        float(df["close"].iloc[-1])
+        if daily_as_of == _day_change_expected_day("daily_close") and df is not None and not df.empty and "close" in df.columns
+        else None
+    )
+    day_change_pct = daily_day_change if day_change_mode == "daily_close" else None
+    day_change_source = daily_day_source if day_change_mode == "daily_close" else ""
     enriched = dict(row)
     enriched.update({
         "kind": "index",
         "label": row.get("name") or row.get("label") or symbol,
         "name": row.get("name") or row.get("label") or symbol,
         "code": symbol,
-        "latest_price": row.get("latest_price") or (float(df["close"].iloc[-1]) if df is not None and not df.empty and "close" in df.columns else None),
+        "latest_price": daily_close_price if day_change_mode == "daily_close" else row.get("latest_price"),
         "day_change_pct": day_change_pct,
         "daily_change_pct": day_change_pct,
+        "day_change_source": day_change_source,
+        "day_change_mode": day_change_mode,
+        "day_change_as_of": daily_as_of if day_change_mode == "daily_close" else "",
         "latest_signal": _signal_or_fallback(row, df),
         "range_returns": _compute_range_returns(df, range_columns),
         "range_return_source": source,
@@ -1441,7 +1782,14 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
 def _enrich_cluster_row(row: dict[str, Any], kind: str) -> dict[str, Any]:
     enriched = dict(row)
     label = str(enriched.get("label") or enriched.get("name") or "").strip()
-    day_change_pct = enriched.get("day_change_pct") or enriched.get("daily_change_pct") or enriched.get("change_pct") or enriched.get("gain_pct") or enriched.get("strength")
+    day_change_pct = _first_numeric(
+        enriched.get("day_change_pct"),
+        enriched.get("daily_change_pct"),
+        enriched.get("today_change_pct"),
+        enriched.get("change_pct"),
+        enriched.get("gain_pct"),
+        enriched.get("strength"),
+    )
     enriched.update({
         "kind": kind,
         "label": label,
@@ -2319,14 +2667,32 @@ def _role_score(item: dict[str, Any], leader_rank: int = 0) -> float:
     return 55
 
 
-def _trend_score_for_candidate(item: dict[str, Any], symbol: str) -> tuple[float, Optional[float], str]:
+def _daily_df_for_candidate(
+    symbol: str,
+    daily_cache: Optional[dict[str, tuple[pd.DataFrame, str]]] = None,
+) -> tuple[pd.DataFrame, str]:
+    cache_key = _text(symbol).upper()
+    if daily_cache is not None and cache_key in daily_cache:
+        return daily_cache[cache_key]
+    df, source = _stock_df(symbol, "daily")
+    if daily_cache is not None and cache_key:
+        daily_cache[cache_key] = (df, source)
+    return df, source
+
+
+def _trend_score_for_candidate(
+    item: dict[str, Any],
+    symbol: str,
+    *,
+    daily_cache: Optional[dict[str, tuple[pd.DataFrame, str]]] = None,
+) -> tuple[float, Optional[float], str]:
     explicit = _float(item.get("score") or item.get("total_score") or item.get("fused_total"))
     if explicit is not None:
         return _score_0_100(explicit, 50), _float(item.get("day_change_pct")), _text(item.get("latest_signal"))
     day_change = _float(item.get("day_change_pct") or item.get("daily_change_pct") or item.get("change_pct"))
     latest_signal = _text(item.get("latest_signal") or item.get("signal") or item.get("reason"))
     if day_change is None and symbol:
-        df, _ = _stock_df(symbol, "daily")
+        df, _ = _daily_df_for_candidate(symbol, daily_cache)
         day_change = _compute_day_change_pct(df)
         if not latest_signal:
             latest_signal = _ma_signal_from_df(df)
@@ -2365,11 +2731,12 @@ def _scored_candidate_payload(
     *,
     heat_score: float,
     leader_rank: int = 0,
+    daily_cache: Optional[dict[str, tuple[pd.DataFrame, str]]] = None,
 ) -> Optional[dict[str, Any]]:
     symbol, raw_code = _candidate_symbol_fields(item)
     if not symbol:
         return None
-    trend_score, day_change, latest_signal = _trend_score_for_candidate(item, symbol)
+    trend_score, day_change, latest_signal = _trend_score_for_candidate(item, symbol, daily_cache=daily_cache)
     role_score = _role_score(item, leader_rank)
     confidence = _source_confidence_score(item)
     weight_score = round(max(role_score, _score_0_100(item.get("priority"), 0)), 2)
@@ -2388,7 +2755,7 @@ def _scored_candidate_payload(
     chain_role = _text(item.get("relation") or item.get("node_name") or item.get("representative_type"))
     risk_flags = []
     if not _text(item.get("bar_source")):
-        df, source = _stock_df(symbol, "daily")
+        df, source = _daily_df_for_candidate(symbol, daily_cache)
         if source:
             item = {**item, "bar_source": source, "bar_count": len(df)}
         else:
@@ -2418,6 +2785,60 @@ def _scored_candidate_payload(
     }
 
 
+def _candidate_score_limit() -> int:
+    try:
+        return max(20, int(os.getenv("WORKBENCH_CANDIDATE_SCORE_LIMIT", "64")))
+    except Exception:
+        return 64
+
+
+def _candidate_prefilter_rank(item: dict[str, Any], index: int) -> tuple[float, float, float, int]:
+    rep_type = _text(item.get("representative_type"))
+    source = _text(item.get("source"))
+    source_rank = {
+        "core": 100,
+        "industry_leader": 92,
+        "source_leader": 88,
+        "elastic": 82,
+        "semantic_industry_chain": 78,
+        "industry_candidate": 46,
+        "industry_constituent": 42,
+        "concept_constituent": 42,
+    }.get(rep_type, 0)
+    if source_rank == 0:
+        source_rank = {
+            "industry_leader_map": 90,
+            "concept_rank": 84,
+            "concept_ranking": 84,
+            "concept_sina": 82,
+            "concept_em": 82,
+            "concept_ths": 82,
+            "strategy_snapshot": 78,
+            "semantic_industry_chain": 76,
+            "industry_candidates": 44,
+            "industry_constituents": 40,
+            "concept_constituents": 40,
+        }.get(source, 50)
+    priority = _float(item.get("priority"), 0) or 0
+    confidence = _source_confidence_score(item)
+    return source_rank, priority, confidence, -index
+
+
+def _prioritized_candidate_inputs(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    limit = _candidate_score_limit()
+    ranked: list[tuple[tuple[float, float, float, int], dict[str, Any]]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(candidates):
+        symbol, _ = _candidate_symbol_fields(item)
+        key = (_text(symbol).upper() or f"{_text(item.get('name'))}|{_text(item.get('source'))}|{index}")
+        if key in seen:
+            continue
+        seen.add(key)
+        ranked.append((_candidate_prefilter_rank(item, index), item))
+    ranked.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in ranked[:limit]]
+
+
 def _candidate_groups(
     candidates: list[dict[str, Any]],
     *,
@@ -2432,14 +2853,15 @@ def _candidate_groups(
         "constituents": [],
     }
     core_rank = 0
-    for item in candidates:
+    daily_cache: dict[str, tuple[pd.DataFrame, str]] = {}
+    for item in _prioritized_candidate_inputs(candidates):
         rep_type = _text(item.get("representative_type"))
         source = _text(item.get("source"))
         leader_rank = 0
         if rep_type == "core":
             core_rank += 1
             leader_rank = core_rank
-        payload = _scored_candidate_payload(item, heat_score=heat_score, leader_rank=leader_rank)
+        payload = _scored_candidate_payload(item, heat_score=heat_score, leader_rank=leader_rank, daily_cache=daily_cache)
         if not payload:
             continue
         if rep_type == "core":
@@ -2551,13 +2973,8 @@ def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
             else None
         )
         carrier_day_change = _compute_day_change_pct(carrier_df)
-    board_day_change = (
-        enriched.get("day_change_pct")
-        or enriched.get("daily_change_pct")
-        or enriched.get("change_pct")
-        or enriched.get("gain_pct")
-        or enriched.get("strength")
-    )
+    board_day_change, board_day_as_of = _latest_board_heat_day_change(kind, heat_target_label)
+    board_day_change_source = "board_heat_ticks" if board_day_change is not None else ""
     board_range_returns = enriched.get("range_returns") or {}
     carrier_name = carrier_payload.get("name") or carrier_payload.get("symbol") or ""
     action_status = "观察" if carrier_payload else "退出复盘"
@@ -2602,6 +3019,9 @@ def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
         "latest_price": enriched.get("latest_price"),
         "day_change_pct": board_day_change,
         "daily_change_pct": board_day_change,
+        "day_change_source": board_day_change_source,
+        "day_change_mode": _a_day_change_mode(),
+        "day_change_as_of": board_day_as_of,
         "range_returns": board_range_returns,
         "range_return_source": enriched.get("range_return_source") or "",
         "range_return_status": "board_kline" if board_range_returns else "board_kline_missing",
@@ -2677,7 +3097,7 @@ def _aggregate_sector_board_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
 
     aggregated: list[dict[str, Any]] = []
     for items in buckets.values():
-        items.sort(key=lambda item: _float(item.get("day_change_pct") or item.get("change_pct") or item.get("gain_pct"), 0) or 0, reverse=True)
+        items.sort(key=lambda item: _float(item.get("day_change_pct"), -999), reverse=True)
         base = dict(items[0])
         chain_name = _text(base.get("chain_name"))
         node_name = _text(base.get("node_name"))
@@ -2711,7 +3131,7 @@ def _aggregate_sector_board_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
             ]).strip(" ·")
             base["trader_action"] = "观察产业链共振和链主/弹性代表"
         aggregated.append(base)
-    aggregated.sort(key=lambda item: _float(item.get("day_change_pct") or item.get("change_pct") or item.get("gain_pct"), 0) or 0, reverse=True)
+    aggregated.sort(key=lambda item: _float(item.get("day_change_pct"), -999), reverse=True)
     return aggregated
 
 
@@ -2946,6 +3366,8 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         technical_linkage = _technical_linkage_from_groups(candidate_groups)
         risk_flags = _chain_risk_flags(doc, data_truth)
         carrier = (candidate_groups.get("leaders") or candidate_groups.get("elastic") or [{}])[0]
+        day_change_as_of = _date_text(doc.get("trade_minute"))
+        day_change_pct = _float(doc.get("change_pct")) if day_change_as_of == _day_change_expected_day() else None
         row = {
             **doc,
             "group": "sector_boards",
@@ -2955,8 +3377,11 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             "name": label or target_label,
             "code": _text(doc.get("chain_id")),
             "latest_price": doc.get("heat_score"),
-            "day_change_pct": doc.get("change_pct"),
-            "daily_change_pct": doc.get("change_pct"),
+            "day_change_pct": day_change_pct,
+            "daily_change_pct": day_change_pct,
+            "day_change_source": "chain_heat_snapshots" if day_change_pct is not None else "",
+            "day_change_mode": _a_day_change_mode(),
+            "day_change_as_of": day_change_as_of,
             "range_returns": {
                 "momentum_5m": doc.get("momentum_5m"),
                 "momentum_15m": doc.get("momentum_15m"),
@@ -3028,7 +3453,7 @@ def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: 
             "risk_stocks": "TERMINAL_WORKBENCH_RISK_STOCK_LIMIT",
             "watch_stocks": "TERMINAL_WORKBENCH_WATCH_STOCK_LIMIT",
         }.get(group, "TERMINAL_WORKBENCH_FOCUS_STOCK_LIMIT")
-        default = "72" if group != "watch_stocks" else "120"
+        default = "72" if group != "watch_stocks" else "36"
         limit = max(1, int(os.getenv(env_name, default)))
     try:
         db = _mongo_db()
@@ -3555,6 +3980,12 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         focus_stocks=focus_stocks + risk_stocks,
         sector_boards=sector_boards,
     )
+    scored_shell = [_slim_shell_stock_row(row) for row in scored]
+    sell_warnings_shell = [_slim_shell_stock_row(row) for row in sell_warnings]
+    sector_boards_shell = [_slim_shell_sector_row(row) for row in sector_boards]
+    focus_stocks_shell = [_slim_shell_stock_row(row) for row in focus_stocks]
+    risk_stocks_shell = [_slim_shell_stock_row(row) for row in risk_stocks]
+    watch_stocks_shell = [_slim_shell_stock_row(row) for row in watch_stocks]
 
     watchlist_directions: List[str] = []
     for report in reports[:5]:
@@ -3565,8 +3996,8 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
             watchlist_directions.append(label)
     watchlist = _build_watchlist_rows(
         reports=reports,
-        buy_rows=scored,
-        sell_rows=sell_warnings,
+        buy_rows=scored_shell,
+        sell_rows=sell_warnings_shell,
         decision_rows=decision_queue,
         industry_top=industry_top,
         concept_top=concept_top,
@@ -3583,8 +4014,8 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         "session": session,
         "market": market_context,
         "indices": reports[:8],
-        "buy_candidates": scored,
-        "sell_warnings": sell_warnings,
+        "buy_candidates": scored_shell,
+        "sell_warnings": sell_warnings_shell,
         "cluster_summary": {
             "industry_top": industry_top,
             "concept_top": concept_top,
@@ -3593,11 +4024,11 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         },
         "watchlist_groups": {
             "macro_indices": macro_indices,
-            "sector_boards": sector_boards,
-            "buy_candidates": scored,
-            "focus_stocks": focus_stocks,
-            "risk_stocks": risk_stocks,
-            "watch_stocks": watch_stocks,
+            "sector_boards": sector_boards_shell,
+            "buy_candidates": scored_shell,
+            "focus_stocks": focus_stocks_shell,
+            "risk_stocks": risk_stocks_shell,
+            "watch_stocks": watch_stocks_shell,
         },
         "watchlist_groups_meta": {
             "macro_indices": {
@@ -4879,7 +5310,7 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
     representatives = _concept_representative_groups(carrier_candidates)
     heat_value = getattr(concept, "gain_pct", None) or theme.get("change_pct") or theme.get("strength")
     candidate_groups = _candidate_groups(carrier_candidates, heat_value=heat_value)
-    ordered_candidates = _ordered_candidate_stocks(carrier_candidates, heat_value=heat_value)
+    ordered_candidates = _flatten_candidate_groups(candidate_groups, limit=20)
     non_chain = non_chain_reason(name)
     if requested_freq in {"5min", "15min", "30min"}:
         chart, latest_heat = _board_heat_chart(name, "concept", requested_freq)

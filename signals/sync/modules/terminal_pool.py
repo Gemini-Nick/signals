@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import Counter
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from pymongo.database import Database
@@ -22,6 +23,32 @@ MACD_TOKENS = ("MACD", "零上绿柱扩大", "零下绿柱缩小")
 GAP_TOKENS = ("缺口", "突破缺口", "持续缺口", "衰竭缺口", "普通缺口")
 ENTRY_FACTOR_TOKENS = ("gap", "trend_breakout", "vol_contraction", "candle_run", "candle_accel")
 TECHNICAL_TOKENS = CHAN_TOKENS + PATTERN_TOKENS + MACD_TOKENS + GAP_TOKENS + ENTRY_FACTOR_TOKENS
+LEFT_OPPORTUNITY_TOKENS = (
+    "一买",
+    "背驰买",
+    "底背离",
+    "MACD绿柱缩小",
+    "零下绿柱缩小",
+    "头肩底",
+    "双底",
+    "缺口买:衰竭",
+    "vol_contraction",
+)
+RIGHT_OPPORTUNITY_TOKENS = (
+    "二买",
+    "三买",
+    "趋势买",
+    "突破",
+    "持续缺口",
+    "缺口买:持续",
+    "MACD绿柱扩大",
+    "零上绿柱扩大",
+    "上升三角",
+    "trend_breakout",
+    "candle_run",
+    "candle_accel",
+)
+WEAK_CONTEXT_TOKENS = ("缺口买:普通",)
 RIGHT_SIDE_FREQS = {"5分钟", "5min", "5m", "F5", "f5", "15分钟", "15min", "15m", "F15", "f15"}
 BUY_FREQ_BONUS = {"30分钟": 120, "30min": 120, "30m": 120, "15分钟": 110, "15min": 110, "15m": 110, "5分钟": 80, "5min": 80, "5m": 80}
 ENTRY_30M_FREQS = {"30分钟", "30min", "30m", "F30", "f30"}
@@ -79,6 +106,103 @@ def _float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def _date_value(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = _text(value)
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except Exception:
+        try:
+            return datetime.strptime(text[:10], "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+
+def _iso_dt(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return _text(value)
+
+
+def _trading_day_age(event_dt: Any, as_of: Any = None) -> int | None:
+    event_date = _date_value(event_dt)
+    if event_date is None:
+        return None
+    as_of_date = _date_value(as_of) or naive_market_now("A").date()
+    if event_date >= as_of_date:
+        return 0
+    days = 0
+    cursor = event_date
+    while cursor < as_of_date:
+        cursor += timedelta(days=1)
+        if cursor.weekday() < 5:
+            days += 1
+    return days
+
+
+def _reason_event_dt(reason: dict[str, Any]) -> str:
+    evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+    value = (
+        reason.get("event_dt")
+        or reason.get("dt")
+        or reason.get("signal_date")
+        or reason.get("latest_dt")
+        or evidence.get("event_dt")
+        or evidence.get("dt")
+        or evidence.get("signal_date")
+        or evidence.get("latest_dt")
+        or reason.get("as_of")
+    )
+    return _iso_dt(value)
+
+
+def _reason_age_trading_days(reason: dict[str, Any]) -> int | None:
+    return _trading_day_age(_reason_event_dt(reason), reason.get("as_of"))
+
+
+def _entry_age_limit(freq: Any) -> int:
+    text = _text(freq)
+    if _is_right_side_freq(text) or _is_30m_freq(text):
+        return 1
+    if text in {"日线", "daily", "1d", "D", "d"}:
+        return 5
+    if text in {"周线", "weekly", "1w", "W", "w"}:
+        return 20
+    return 3
+
+
+def _reason_is_current_for_entry(reason: dict[str, Any]) -> bool:
+    age = _reason_age_trading_days(reason)
+    if age is None:
+        return True
+    direct_freq = _text(reason.get("freq"))
+    freqs = [direct_freq] if direct_freq else list(_reason_freqs(reason))
+    limit = min(_entry_age_limit(freq) for freq in freqs) if freqs else 3
+    return age <= limit
+
+
+def _freshness_score_for_reason(reason: dict[str, Any] | None, max_score: float) -> float:
+    if not isinstance(reason, dict):
+        return 0.0
+    age = _reason_age_trading_days(reason)
+    if age is None:
+        return max_score * 0.6
+    direct_freq = _text(reason.get("freq"))
+    limit = max(1, _entry_age_limit(direct_freq))
+    if age <= 0:
+        return max_score
+    if age > limit:
+        return 0.0
+    return max_score * max(0.0, 1.0 - (age / (limit + 1)))
 
 
 def _freq_sort_key(freq: Any) -> tuple[int, str]:
@@ -369,6 +493,19 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
     queue_lane = _text(reason.get("queue_lane"))
     context_only = decision_effect in {"context_only", "history_pending"} or source_role == "context"
     weight = 0.0 if context_only else base_weight + BUY_FREQ_BONUS.get(freq, 0) + side_bonus + _float(reason.get("score")) * 0.05 + _float(reason.get("heat_score")) * 0.05
+    evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+    event_dt = (
+        _iso_dt(reason.get("event_dt"))
+        or _iso_dt(reason.get("dt"))
+        or _iso_dt(reason.get("signal_date"))
+        or _iso_dt(reason.get("latest_dt"))
+        or _iso_dt(evidence.get("event_dt"))
+        or _iso_dt(evidence.get("dt"))
+        or _iso_dt(evidence.get("signal_date"))
+        or _iso_dt(evidence.get("latest_dt"))
+    )
+    as_of = _text(reason.get("as_of"))
+    signal_age = _trading_day_age(event_dt or as_of, as_of)
     normalized = {
         "reason_type": reason_type,
         "weight": round(weight, 3),
@@ -387,8 +524,11 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
         "chain_id": _text(reason.get("chain_id")),
         "node_id": _text(reason.get("node_id")),
         "board_or_concept": _text(reason.get("board_or_concept")),
-        "as_of": _text(reason.get("as_of")),
-        "evidence": reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {},
+        "as_of": as_of,
+        "event_dt": event_dt,
+        "event_date": event_dt[:10] if event_dt else "",
+        "signal_age_trading_days": signal_age,
+        "evidence": evidence,
         "resonance_context": reason.get("resonance_context") if isinstance(reason.get("resonance_context"), dict) else {},
         "knowledge_status": _text(reason.get("knowledge_status")),
         "knowledge_effect": _text(reason.get("knowledge_effect")),
@@ -432,6 +572,9 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
             "score": normalized["score"],
             "confidence": normalized["confidence"],
             "as_of": normalized["as_of"],
+            "event_dt": normalized["event_dt"],
+            "event_date": normalized["event_date"],
+            "signal_age_trading_days": normalized["signal_age_trading_days"],
             "evidence": normalized["evidence"],
             "resonance_context": resonance_context,
             "actionability": normalized["actionability"],
@@ -462,6 +605,9 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
             "phase": phase,
             "effect": normalized.get("decision_effect") or _chain_decision_effect(phase),
             "as_of": normalized.get("as_of"),
+            "rank": normalized["evidence"].get("rank") if isinstance(normalized.get("evidence"), dict) else None,
+            "heat_score": normalized["evidence"].get("heat_score") if isinstance(normalized.get("evidence"), dict) else None,
+            "range_pattern": normalized["evidence"].get("range_pattern") if isinstance(normalized.get("evidence"), dict) else "",
             "evidence": normalized.get("evidence"),
         }
     if top.get("signal_side") == "sell" and top.get("decision_effect") != "context_only":
@@ -620,6 +766,7 @@ def _add_signal_rows(
             "score": 0 if reason_type == "historical_signal_record" else _float(signal.get("score") or signal.get("total_score")),
             "confidence": _float(signal.get("confidence")),
             "as_of": _text(signal.get("signal_date") or signal.get("updated_at"))[:10],
+            "event_dt": _iso_dt(signal.get("signal_date") or signal.get("updated_at")),
             "source_role": "technical_trigger" if hard_screen_signal else "context",
             "decision_effect": "history_pending" if reason_type == "historical_signal_record" else ("confirm" if hard_screen_signal else "context_only"),
             "can_create_candidate": reason_type not in {"historical_signal_record", "custom_signal"},
@@ -660,6 +807,7 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
             "score": 1,
             "total_score": 1,
             "confidence": 1,
+            "dt": 1,
             "as_of": 1,
             "updated_at": 1,
             "dedupe_key": 1,
@@ -684,6 +832,7 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
             "score": _float(signal.get("total_score") or signal.get("score")),
             "confidence": _float(signal.get("confidence")),
             "as_of": _text(signal.get("as_of") or signal.get("updated_at"))[:10],
+            "event_dt": _iso_dt(signal.get("dt")),
             "source_role": "technical_trigger",
             "resonance_context": resonance_context,
             "evidence": evidence,
@@ -892,7 +1041,16 @@ def _add_chain_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: 
                     "node_id": _text(chain.get("node_id")),
                     "board_or_concept": _text(domain.get("name")),
                     "as_of": _text(chain.get("trade_minute")),
-                    "evidence": {"phase": chain.get("phase"), "range_pattern": chain.get("range_pattern")},
+                    "evidence": {
+                        "phase": chain.get("phase"),
+                        "range_pattern": chain.get("range_pattern"),
+                        "rank": chain.get("rank"),
+                        "heat_score": chain.get("heat_score"),
+                        "leader_change_pct": chain.get("leader_change_pct"),
+                        "momentum_5m": chain.get("momentum_5m"),
+                        "momentum_15m": chain.get("momentum_15m"),
+                        "momentum_30m": chain.get("momentum_30m"),
+                    },
                 }, index_codes=index_codes, name=_text(domain.get("leader_name")))
             symbols, stock_names = _constituents_for_domain(db, domain)
             for symbol in symbols[:2]:
@@ -914,7 +1072,15 @@ def _add_chain_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: 
                     "node_id": _text(chain.get("node_id")),
                     "board_or_concept": _text(domain.get("name")),
                     "as_of": _text(chain.get("trade_minute")),
-                    "evidence": {"phase": chain.get("phase"), "range_pattern": chain.get("range_pattern")},
+                    "evidence": {
+                        "phase": chain.get("phase"),
+                        "range_pattern": chain.get("range_pattern"),
+                        "rank": chain.get("rank"),
+                        "heat_score": chain.get("heat_score"),
+                        "momentum_5m": chain.get("momentum_5m"),
+                        "momentum_15m": chain.get("momentum_15m"),
+                        "momentum_30m": chain.get("momentum_30m"),
+                    },
                 }, index_codes=index_codes, name=stock_names.get(code, ""))
                 added_constituents += 1
 
@@ -1119,15 +1285,23 @@ def _scorer_freq_multiplier(freq: Any) -> float:
 
 
 def _buy_reason_priority(reason: dict[str, Any]) -> tuple[float, float, float, float]:
-    freqs = _reason_freqs(reason)
+    direct_freq = _text(reason.get("freq"))
+    freqs = {direct_freq} if direct_freq else _reason_freqs(reason)
+    context_freqs = _reason_freqs(reason)
     readiness = 0.0
     if any(_is_30m_freq(freq) for freq in freqs):
         readiness += 1000.0
+    elif any(_is_30m_freq(freq) for freq in context_freqs):
+        readiness += 120.0
+    if any(_is_right_side_freq(freq) for freq in freqs):
+        readiness += 700.0
+    elif any(_is_right_side_freq(freq) for freq in context_freqs):
+        readiness += 90.0
     if any(_is_upper_freq(freq) for freq in freqs):
         readiness += 600.0
-    if any(_is_right_side_freq(freq) for freq in freqs):
-        readiness += 500.0
-    upper_quality = sum(_scorer_freq_multiplier(freq) for freq in freqs if _is_upper_freq(freq))
+    elif any(_is_upper_freq(freq) for freq in context_freqs):
+        readiness += 80.0
+    upper_quality = sum(_scorer_freq_multiplier(freq) for freq in context_freqs if _is_upper_freq(freq))
     return (
         readiness,
         upper_quality,
@@ -1136,10 +1310,25 @@ def _buy_reason_priority(reason: dict[str, Any]) -> tuple[float, float, float, f
     )
 
 
+def _reason_has_freq(reason: dict[str, Any], predicate) -> bool:
+    return any(predicate(freq) for freq in _reason_freqs(reason))
+
+
+def _has_current_reason_for_freq(reasons: list[dict[str, Any]], predicate) -> bool:
+    direct = [reason for reason in reasons if predicate(reason.get("freq"))]
+    if direct:
+        return any(_reason_is_current_for_entry(reason) for reason in direct)
+    return any(
+        _reason_has_freq(reason, predicate) and _reason_is_current_for_entry(reason)
+        for reason in reasons
+    )
+
+
 def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, Any] | None, dict[str, Any] | None]:
     buy_reasons = _buy_technical_reasons(row)
     risk_reasons = _risk_reasons(row)
-    top_buy = max(buy_reasons, key=_buy_reason_priority, default=None)
+    current_buy_reasons = [reason for reason in buy_reasons if _reason_is_current_for_entry(reason)]
+    top_buy = max(current_buy_reasons, key=_buy_reason_priority, default=None) or max(buy_reasons, key=_buy_reason_priority, default=None)
     top_risk = max(risk_reasons, key=lambda item: (_float(item.get("weight")), abs(_float(item.get("score")))), default=None)
     if top_risk:
         return False, "blocked_by_risk", ["risk_signal_present"], top_buy, top_risk
@@ -1157,14 +1346,23 @@ def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, An
     has_upper = any(_is_upper_freq(freq) for freq in freqs)
     has_right_side = any(_is_right_side_freq(freq) for freq in freqs)
     has_partner = any(_is_entry_partner_freq(freq) for freq in freqs)
+    fresh_30m = _has_current_reason_for_freq(buy_reasons, _is_30m_freq)
+    fresh_upper = _has_current_reason_for_freq(buy_reasons, _is_upper_freq)
+    fresh_right_side = _has_current_reason_for_freq(buy_reasons, _is_right_side_freq)
     if not has_30m:
         return False, "entry_waiting_30m_confirm", ["30m_missing"], top_buy, top_risk
+    if not fresh_30m:
+        return False, "entry_waiting_30m_confirm", ["30m_stale"], top_buy, top_risk
     if not has_upper:
         return False, "entry_waiting_upper_context", ["daily_or_weekly_missing"], top_buy, top_risk
+    if not fresh_upper:
+        return False, "entry_waiting_upper_context", ["daily_or_weekly_stale"], top_buy, top_risk
     if not has_partner:
         return False, "entry_waiting_resonance_confirm", ["partner_period_missing"], top_buy, top_risk
     if not has_right_side:
         return False, "entry_waiting_right_side_confirm", ["5m_or_15m_missing"], top_buy, top_risk
+    if not fresh_right_side:
+        return False, "entry_waiting_right_side_confirm", ["5m_or_15m_stale"], top_buy, top_risk
     return True, "entry_confirmed", [], top_buy, top_risk
 
 
@@ -1188,11 +1386,51 @@ def _context_adjust(row: dict[str, Any]) -> float:
     if knowledge.get("status") == "conflict" or knowledge.get("effect") == "block":
         adjust -= 40.0
     chain = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
+    phase = _text(chain.get("phase"))
     if chain.get("effect") == "confirm":
-        adjust += 6.0
+        adjust += 18.0
+    elif phase == "warming":
+        adjust += 8.0
     if chain.get("effect") in {"block", "exit_priority"}:
         adjust -= 25.0
     return adjust
+
+
+def _mainline_alignment_score(row: dict[str, Any]) -> float:
+    chain = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
+    if not chain:
+        return 0.0
+    evidence = chain.get("evidence") if isinstance(chain.get("evidence"), dict) else {}
+    phase = _text(chain.get("phase") or evidence.get("phase"))
+    if phase == "accelerating":
+        base = 20.0
+    elif phase == "warming":
+        base = 12.0
+    elif phase in {"consensus_climax", "risk_off"}:
+        base = -18.0
+    elif phase in {"diverging", "cooling"}:
+        base = -14.0
+    else:
+        base = 0.0
+    rank = _float(evidence.get("rank") or chain.get("rank"), 999.0)
+    rank_bonus = max(0.0, min(10.0, (31.0 - rank) * 0.4)) if rank > 0 else 0.0
+    role_bonus = 0.0
+    tags = set(row.get("source_tags") or [])
+    if "chain_core_rep" in tags or "source_leader" in tags:
+        role_bonus = 5.0
+    elif "chain_elastic_rep" in tags or "constituent_hot" in tags:
+        role_bonus = 3.0
+    return round(base + rank_bonus + role_bonus, 3)
+
+
+def _mainline_alignment_level(score: float) -> str:
+    if score >= 24:
+        return "strong_mainline"
+    if score >= 12:
+        return "mainline_confirm"
+    if score < 0:
+        return "mainline_block"
+    return "neutral"
 
 
 def _row_buy_freqs(row: dict[str, Any], top_buy: dict[str, Any]) -> set[str]:
@@ -1218,7 +1456,8 @@ def _entry_components(row: dict[str, Any], top_buy: dict[str, Any]) -> dict[str,
         "technical_score": max(0.0, _float(top_buy.get("score"))) * 0.30,
         "resonance": resonance,
         "confidence": min(1.0, _float(top_buy.get("confidence"))) * 18.0,
-        "freshness": 10.0,
+        "freshness": _freshness_score_for_reason(top_buy, 10.0),
+        "mainline_alignment": _mainline_alignment_score(row),
         "context_adjust": _context_adjust(row),
     }
     return {key: round(value, 3) for key, value in components.items()}
@@ -1234,6 +1473,7 @@ def _rank_reason(score_components: dict[str, float]) -> str:
         "resonance": "共振",
         "confidence": "置信度",
         "freshness": "新鲜度",
+        "mainline_alignment": "主线",
         "context_adjust": "观点修正",
         "sell_strength": "风险强度",
         "timeframe_severity": "级别严重度",
@@ -1261,7 +1501,7 @@ def _risk_components(row: dict[str, Any], top_risk: dict[str, Any]) -> dict[str,
     components = {
         "sell_strength": abs(_float(top_risk.get("score"))) * 0.50,
         "timeframe_severity": _freq_severity(freqs),
-        "freshness": 16.0,
+        "freshness": _freshness_score_for_reason(top_risk, 16.0),
         "chain_or_knowledge_risk": 18.0 if _text(top_risk.get("reason_type")) in {"knowledge_conflict", "chain_context", "chain_core_rep", "chain_elastic_rep"} else 0.0,
     }
     return {key: round(value, 3) for key, value in components.items()}
@@ -1278,13 +1518,251 @@ def _watch_components(row: dict[str, Any], gate_status: str) -> dict[str, float]
     elif any(tag.startswith("chain_") for tag in row.get("source_tags", [])):
         source_priority = 16.0
     proximity = 30.0 if gate_status in {"entry_waiting_30m_confirm", "entry_waiting_right_side_confirm"} else 22.0 if gate_status in {"entry_waiting_resonance_confirm", "entry_waiting_upper_context"} else 10.0
+    primary = max(
+        _buy_technical_reasons(row) + _risk_reasons(row),
+        key=lambda item: (_float(item.get("weight")), abs(_float(item.get("score")))),
+        default=None,
+    )
     components = {
         "source_priority": source_priority,
         "entry_proximity": proximity,
+        "mainline_alignment": _mainline_alignment_score(row),
         "heat_or_theme": _float(row.get("score")) * 0.05,
-        "freshness": 8.0,
+        "freshness": _freshness_score_for_reason(primary, 8.0),
     }
     return {key: round(value, 3) for key, value in components.items()}
+
+
+def _reason_signal_text(reason: dict[str, Any]) -> str:
+    evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+    details = evidence.get("details")
+    return " ".join([
+        _text(reason.get("signal_type")),
+        _text(reason.get("reason_type")),
+        _text(details if isinstance(details, str) else ""),
+        " ".join(_text(value) for value in details.values()) if isinstance(details, dict) else "",
+    ])
+
+
+def _technical_signal_family(reason: dict[str, Any]) -> str:
+    text = _reason_signal_text(reason)
+    family = _text(reason.get("signal_family"))
+    if text.startswith("形态:") or any(token in text for token in PATTERN_TOKENS):
+        return "pattern"
+    if "MACD" in text or "绿柱" in text:
+        return "macd"
+    if "缺口" in text:
+        return "gap"
+    if any(token in text for token in ENTRY_FACTOR_TOKENS):
+        return "entry_factor"
+    if any(token in text for token in ("一买", "二买", "三买", "一卖", "二卖", "三卖", "背驰", "中枢", "笔", "线段", "趋势")):
+        return "chan"
+    if family and family != "hard_technical":
+        return family
+    return family or "technical"
+
+
+def _technical_opportunity_side(reason: dict[str, Any]) -> str:
+    text = _reason_signal_text(reason)
+    signal_side = _text(reason.get("signal_side"))
+    freq = _text(reason.get("freq"))
+    if signal_side == "sell" or any(token in text for token in SELL_TOKENS):
+        return "sell"
+    if any(token in text for token in WEAK_CONTEXT_TOKENS):
+        return "context"
+    if "二买" in text and _is_upper_freq(freq):
+        return "left"
+    if any(token in text for token in RIGHT_OPPORTUNITY_TOKENS):
+        return "right"
+    if any(token in text for token in LEFT_OPPORTUNITY_TOKENS):
+        return "left"
+    if signal_side == "buy":
+        return "right" if _is_right_side_freq(freq) else "left"
+    return "context"
+
+
+def _technical_signal_group_item(reason: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "label": _text(reason.get("signal_type") or reason.get("reason_type")),
+        "family": _technical_signal_family(reason),
+        "freq": _text(reason.get("freq")),
+        "event_date": _text(reason.get("event_date")) or _reason_event_dt(reason)[:10],
+        "score": round(_float(reason.get("score")), 3),
+        "confidence": round(_float(reason.get("confidence")), 3),
+        "source_collection": _text(reason.get("source_collection")),
+    }
+
+
+def _technical_signal_groups(row: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {"left": [], "right": [], "sell": [], "context": []}
+    seen: set[str] = set()
+    for reason in row.get("inclusion_reasons") or []:
+        if not isinstance(reason, dict) or not _is_technical_reason(reason):
+            continue
+        side = _technical_opportunity_side(reason)
+        item = _technical_signal_group_item(reason)
+        key = "|".join([side, item["label"], item["freq"], item["event_date"], item["source_collection"]])
+        if key in seen:
+            continue
+        seen.add(key)
+        groups.setdefault(side, []).append(item)
+    for key in list(groups):
+        groups[key] = groups[key][:6]
+    return groups
+
+
+def _technical_signal_reason_labels(groups: dict[str, list[dict[str, Any]]], side: str) -> list[str]:
+    labels: list[str] = []
+    for item in groups.get(side, []):
+        label = _text(item.get("label"))
+        freq = _text(item.get("freq"))
+        text = f"{freq} {label}".strip()
+        if text and text not in labels:
+            labels.append(text)
+    return labels[:5]
+
+
+def _timeframe_bucket(freq: Any) -> str:
+    if _is_upper_freq(freq):
+        return "upper"
+    if _is_30m_freq(freq):
+        return "trade"
+    if _is_right_side_freq(freq):
+        return "execution"
+    return "other"
+
+
+def _bucket_side(left_items: list[dict[str, Any]], right_items: list[dict[str, Any]]) -> str:
+    if left_items and right_items:
+        return "mixed"
+    if right_items:
+        return "right"
+    if left_items:
+        return "left"
+    return "none"
+
+
+def _timeframe_signal_sides(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    buckets: dict[str, dict[str, Any]] = {
+        "upper": {"label": "日/周", "left": [], "right": []},
+        "trade": {"label": "30m", "left": [], "right": []},
+        "execution": {"label": "5m/15m", "left": [], "right": []},
+    }
+    seen: set[str] = set()
+    for reason in _buy_technical_reasons(row):
+        side = _technical_opportunity_side(reason)
+        if side not in {"left", "right"}:
+            continue
+        bucket = _timeframe_bucket(reason.get("freq"))
+        if bucket not in buckets:
+            continue
+        item = _technical_signal_group_item(reason)
+        key = "|".join([bucket, side, item["label"], item["freq"], item["event_date"]])
+        if key in seen:
+            continue
+        seen.add(key)
+        buckets[bucket][side].append(item)
+    for bucket in buckets.values():
+        bucket["left"] = bucket["left"][:4]
+        bucket["right"] = bucket["right"][:4]
+        bucket["side"] = _bucket_side(bucket["left"], bucket["right"])
+    return buckets
+
+
+def _opportunity_side_from_groups(
+    *,
+    pool_type: str,
+    entry_gate_status: str,
+    groups: dict[str, list[dict[str, Any]]],
+    top_risk: dict[str, Any] | None,
+) -> str:
+    if pool_type == "risk" or top_risk:
+        return "risk"
+    if entry_gate_status == "entry_confirmed" and groups.get("right"):
+        return "right"
+    if groups.get("left"):
+        return "left"
+    if groups.get("right"):
+        return "right"
+    return "context"
+
+
+def _opportunity_side_label(side: str) -> str:
+    labels = {
+        "left": "左侧机会",
+        "right": "右侧确认",
+        "risk": "卖点/冲突",
+        "context": "策略背景",
+    }
+    return labels.get(side, "策略背景")
+
+
+def _left_setup_reason_codes(row: dict[str, Any], top_buy: dict[str, Any] | None) -> list[str]:
+    codes: list[str] = []
+    buy_reasons = _buy_technical_reasons(row)
+    for reason in buy_reasons:
+        text = _reason_signal_text(reason)
+        freq = _text(reason.get("freq"))
+        if any(token in text for token in ("一买", "背驰买", "底背离", "MACD绿柱缩小", "衰竭缺口")):
+            codes.append("divergence_or_exhaustion")
+        if _is_upper_freq(freq):
+            codes.append("upper_timeframe_left_context")
+    if any(tag in row.get("source_tags", []) for tag in ("knowledge_confirmed", "knowledge_watch", "chain_context", "chain_core_rep", "chain_elastic_rep")):
+        codes.append("theme_or_knowledge_context")
+    if top_buy and _reason_age_trading_days(top_buy) not in (None, 0):
+        codes.append("not_same_day_trigger")
+    return list(dict.fromkeys(codes))[:4]
+
+
+def _right_confirm_reason_codes(row: dict[str, Any]) -> list[str]:
+    buy_reasons = _buy_technical_reasons(row)
+    codes: list[str] = []
+    if _has_current_reason_for_freq(buy_reasons, _is_30m_freq):
+        codes.append("trigger_30m")
+    if _has_current_reason_for_freq(buy_reasons, _is_right_side_freq):
+        codes.append("right_5m_15m")
+    if _has_current_reason_for_freq(buy_reasons, _is_upper_freq):
+        codes.append("daily_weekly_context")
+    if any("突破" in _reason_signal_text(reason) or "三买" in _reason_signal_text(reason) or "趋势买" in _reason_signal_text(reason) for reason in buy_reasons):
+        codes.append("breakout_or_trend_confirm")
+    return list(dict.fromkeys(codes))[:4]
+
+
+def _strategy_semantics(
+    row: dict[str, Any],
+    *,
+    pool_type: str,
+    entry_gate_status: str,
+    top_buy: dict[str, Any] | None,
+    top_risk: dict[str, Any] | None,
+) -> dict[str, Any]:
+    left_reasons = _left_setup_reason_codes(row, top_buy)
+    right_reasons = _right_confirm_reason_codes(row)
+    if pool_type == "risk" or top_risk:
+        intervention_side = "risk_exit"
+        lineage = ["pangge", "system"]
+        label = "风险优先"
+    elif entry_gate_status == "entry_confirmed":
+        intervention_side = "hybrid" if left_reasons else "right_confirmed"
+        lineage = ["pangge", "system"] + (["daozhang"] if left_reasons else [])
+        label = "左侧预热+右侧确认" if left_reasons else "右侧确认"
+    elif left_reasons or top_buy:
+        intervention_side = "left_setup"
+        lineage = ["daozhang", "system"]
+        label = "左侧预热"
+    else:
+        intervention_side = "context"
+        lineage = ["system"]
+        label = "策略背景"
+    semantics = {
+        "intervention_side": intervention_side,
+        "intervention_label": label,
+        "strategy_lineage": list(dict.fromkeys(lineage)),
+        "left_setup_reasons": left_reasons,
+        "right_confirm_reasons": right_reasons,
+        "risk_policy": "exit_first" if intervention_side == "risk_exit" else "risk_clear_required",
+    }
+    return semantics
 
 
 def _finalize_pool_row(
@@ -1305,14 +1783,65 @@ def _finalize_pool_row(
     row["rank_reason"] = _rank_reason(score_components)
     row["entry_gate_status"] = entry_gate_status
     row["blocked_by"] = blocked_by
+    row["missing_gates"] = blocked_by
     row["top_buy_reason"] = top_buy or {}
     row["top_risk_reason"] = top_risk or {}
     row["source_collections"] = _source_collections(row)
     row["coverage_status"] = "required_freqs_present" if entry_gate_status == "entry_confirmed" else entry_gate_status
+    technical_groups = _technical_signal_groups(row)
+    opportunity_side = _opportunity_side_from_groups(
+        pool_type=pool_type,
+        entry_gate_status=entry_gate_status,
+        groups=technical_groups,
+        top_risk=top_risk,
+    )
+    row["opportunity_side"] = opportunity_side
+    row["opportunity_label"] = _opportunity_side_label(opportunity_side)
+    row["technical_signal_groups"] = {key: value for key, value in technical_groups.items() if value}
+    row["left_signal_reasons"] = _technical_signal_reason_labels(technical_groups, "left")
+    row["right_signal_reasons"] = _technical_signal_reason_labels(technical_groups, "right")
+    row["risk_signal_reasons"] = _technical_signal_reason_labels(technical_groups, "sell")
+    timeframe_sides = _timeframe_signal_sides(row)
+    row["trade_timeframe"] = "30m"
+    row["timeframe_signal_sides"] = timeframe_sides
+    row["upper_timeframe_side"] = timeframe_sides["upper"]["side"]
+    row["trade_timeframe_side"] = timeframe_sides["trade"]["side"]
+    row["execution_timeframe_side"] = timeframe_sides["execution"]["side"]
+    row["chain_phase"] = _text((row.get("chain_context") or {}).get("phase")) if isinstance(row.get("chain_context"), dict) else ""
+    theme_rank_bonus = _mainline_alignment_score(row)
+    row["theme_rank_bonus"] = theme_rank_bonus
+    row["theme_alignment_level"] = _mainline_alignment_level(theme_rank_bonus)
+    semantics = _strategy_semantics(
+        row,
+        pool_type=pool_type,
+        entry_gate_status=entry_gate_status,
+        top_buy=top_buy,
+        top_risk=top_risk,
+    )
+    row["strategy_semantics"] = semantics
+    row["intervention_side"] = semantics["intervention_side"]
+    row["intervention_label"] = semantics["intervention_label"]
+    row["strategy_lineage"] = semantics["strategy_lineage"]
+    row["left_setup_reasons"] = semantics["left_setup_reasons"]
+    row["right_confirm_reasons"] = semantics["right_confirm_reasons"]
+    primary_reason = top_risk if pool_type == "risk" else (top_buy or top_risk)
+    if isinstance(primary_reason, dict) and primary_reason:
+        row["event_latest_dt"] = _reason_event_dt(primary_reason)
+        age = _reason_age_trading_days(primary_reason)
+        if age is not None:
+            row["signal_age_trading_days"] = age
+            row["stale_context"] = not _reason_is_current_for_entry(primary_reason)
+    stale_reasons = [
+        reason
+        for reason in row.get("inclusion_reasons") or []
+        if isinstance(reason, dict) and _is_technical_reason(reason) and not _reason_is_current_for_entry(reason)
+    ]
+    if stale_reasons:
+        row["stale_signal_count"] = len(stale_reasons)
     if pool_type == "focus":
         row["action_status"] = "entry_ready"
-        row["trader_action"] = "可试仓"
-        row["next_action"] = "可试仓"
+        row["trader_action"] = "右侧信号复核"
+        row["next_action"] = "右侧信号复核"
         row["queue_lane"] = "entry_ready"
         row["actionability"] = "entry_ready"
         row["decision_effect"] = "confirm"
@@ -1332,27 +1861,27 @@ def _finalize_pool_row(
     else:
         if entry_gate_status == "entry_waiting_30m_confirm":
             row["action_status"] = "entry_waiting_30m_confirm"
-            row["trader_action"] = "等待30m确认"
+            row["trader_action"] = "左侧信号，等30m"
             row["queue_lane"] = "watch_preheat"
         elif entry_gate_status == "entry_waiting_upper_context":
             row["action_status"] = "entry_waiting_upper_context"
-            row["trader_action"] = "等待日/周确认"
+            row["trader_action"] = "左侧信号，等日/周"
             row["queue_lane"] = "watch_preheat"
         elif entry_gate_status == "entry_waiting_right_side_confirm":
             row["action_status"] = "entry_waiting_right_side_confirm"
-            row["trader_action"] = "等待5m/15m确认"
+            row["trader_action"] = "左侧信号，等5m/15m"
             row["queue_lane"] = "watch_preheat"
         elif entry_gate_status == "entry_waiting_resonance_confirm":
             row["action_status"] = "entry_waiting_resonance_confirm"
-            row["trader_action"] = "等待共振确认"
+            row["trader_action"] = "左侧信号，等共振"
             row["queue_lane"] = "watch_preheat"
         elif entry_gate_status.startswith("blocked_by"):
             row["action_status"] = "watch_blocked"
-            row["trader_action"] = "观察/排除风险"
+            row["trader_action"] = "暂不做"
             row["queue_lane"] = "watch_preheat"
         else:
             row["action_status"] = row.get("action_status") if row.get("action_status") != "risk_review" else "watch"
-            row["trader_action"] = row.get("trader_action") or "观察/预热"
+            row["trader_action"] = row.get("trader_action") or "左侧观察"
             row["queue_lane"] = row.get("queue_lane") if row.get("queue_lane") != "risk_exit_first" else "watch_preheat"
         row["next_action"] = row["trader_action"]
         row["actionability"] = "observe_only"

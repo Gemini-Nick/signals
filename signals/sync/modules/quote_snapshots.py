@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pymongo import UpdateOne
 from pymongo.database import Database
 
+from signals.core.macro_universe import macro_watchlist
 from signals.core.market_time import naive_market_now
 from signals.sync.eastmoney_observer import observe_eastmoney
 from signals.sync.provider_limits import ProviderCoolingDown, provider_call
@@ -234,6 +235,14 @@ def _normalize_quote_symbol(value: object) -> str:
     return raw
 
 
+def _is_index_quote_symbol(symbol: str) -> bool:
+    normalized = _normalize_quote_symbol(symbol)
+    if "." not in normalized:
+        return False
+    prefix, code = normalized.split(".", 1)
+    return (prefix == "SH" and code.startswith("000")) or (prefix == "SZ" and code.startswith("399"))
+
+
 def _scale_price(value: object) -> float | None:
     try:
         if value in (None, "-", ""):
@@ -390,6 +399,12 @@ def _hot_quote_symbols(db: Database) -> list[str]:
 
     for symbol in _MACRO_QUOTE_SYMBOLS:
         add(symbol)
+    try:
+        for item in macro_watchlist():
+            if isinstance(item, dict):
+                add(item.get("symbol"))
+    except Exception:
+        logger.debug("macro quote symbols unavailable", exc_info=True)
 
     try:
         doc = db["terminal_stock_pool"].find_one(
@@ -405,14 +420,13 @@ def _hot_quote_symbols(db: Database) -> list[str]:
                 continue
             add(item.get("symbol") or item.get("code") or item.get("raw_code"))
 
-    if len(symbols) < 20:
-        for symbol in _latest_pool_symbols(db):
-            add(symbol)
+    for symbol in _latest_pool_symbols(db):
+        add(symbol)
 
     try:
-        limit = max(1, min(500, int(os.getenv("EASTMONEY_ULIST_MAX_SYMBOLS", "240"))))
+        limit = max(1, min(500, int(os.getenv("EASTMONEY_ULIST_MAX_SYMBOLS", "500"))))
     except (TypeError, ValueError):
-        limit = 240
+        limit = 500
     return symbols[:limit]
 
 
@@ -517,6 +531,7 @@ def _read_fullmarket_spot_quotes(
     *,
     allow_latest_fallback: bool = True,
 ) -> dict[str, dict]:
+    symbols = [symbol for symbol in symbols if not _is_index_quote_symbol(symbol)]
     if not symbols:
         return {}
     date_key = str(trading_day or "").replace("-", "")[:8]
@@ -599,6 +614,7 @@ def _read_fullmarket_spot_quotes(
 
 
 def _read_fullmarket_no_price_symbols(db: Database, symbols: list[str], trading_day: str) -> set[str]:
+    symbols = [symbol for symbol in symbols if not _is_index_quote_symbol(symbol)]
     if not symbols:
         return set()
     date_key = str(trading_day or "").replace("-", "")[:8]
@@ -741,7 +757,7 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
         trading_day = get_last_trading_day()
     except Exception:
         trading_day = now.date().isoformat()
-    symbols = _latest_pool_symbols(db)
+    symbols = _hot_quote_symbols(db)
     inserted = 0
     modified = 0
     processed = 0
@@ -751,11 +767,14 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
     latest_dt = None
     spot_docs = _read_fullmarket_spot_quotes(db, symbols, trading_day, now, allow_latest_fallback=False)
     request_symbols = [symbol for symbol in symbols if symbol not in spot_docs]
+    ulist_docs, observations = _fetch_eastmoney_ulist_docs(db, request_symbols, now, trading_day)
+    errors.extend((item.get("endpoint") or "push2delay.ulist.quote", item.get("error")) for item in observations if item.get("error"))
+    missing_symbols = [symbol for symbol in request_symbols if symbol not in ulist_docs]
     no_current_price_symbols = _read_fullmarket_no_price_symbols(db, request_symbols, trading_day)
 
     ops = []
     for symbol in symbols:
-        doc = spot_docs.get(symbol)
+        doc = spot_docs.get(symbol) or ulist_docs.get(symbol)
         if doc:
             live_count += 1
             latest_dt = max(latest_dt or trading_day, trading_day)
@@ -807,8 +826,9 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
         "live": live_count,
         "stale": stale_count,
         "spot_snapshot": len(spot_docs),
-        "requested": 0,
-        "missing_current": len(request_symbols),
+        "ulist": len(ulist_docs),
+        "requested": len(request_symbols),
+        "missing_current": len(missing_symbols),
         "no_current_price": len(no_current_price_symbols),
         "errors": len(errors),
         "stale_marked": stale_marked,
