@@ -502,6 +502,68 @@ def test_quote_overlay_marks_non_current_quote_stale(monkeypatch):
     assert row["day_change_pct"] is None
 
 
+def test_quote_overlay_treats_holiday_snapshot_after_expected_day_as_closed(monkeypatch):
+    from signals.web.api import workbench
+
+    class _QuoteCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "symbol": "SH.600000",
+                "dt": "2026-05-01",
+                "snapshot_at": datetime(2026, 5, 1, 14, 30),
+                "source": "fullmarket_spot_snapshot",
+                "price": 10.5,
+                "change_pct": 3.2,
+                "freshness": "fresh",
+                "is_stale": False,
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"quote_snapshots": _QuoteCollection()}))
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-04-30")
+
+    overlay = workbench._quote_overlay_for_symbol("SH.600000")
+
+    assert overlay["quote_status"] == "closed"
+    assert overlay["quote_status_label"] == "收盘"
+    assert overlay["quote_stale_reason"] == ""
+
+
+def test_stock_summary_uses_daily_close_day_change_when_quote_stale(monkeypatch):
+    from signals.web.api import workbench
+
+    daily = pd.DataFrame(
+        {"close": [25.0, 27.5]},
+        index=pd.to_datetime(["2026-04-29", "2026-04-30"]),
+    )
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-04-30")
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (daily, "daily_bars"))
+    monkeypatch.setattr(
+        workbench,
+        "_quote_overlay_for_symbol",
+        lambda symbol: {
+            "day_change_mode": "daily_close",
+            "quote_status": "stale",
+            "quote_as_of": "2026-05-01",
+            "quote_stale_reason": "quote_day=2026-05-01, expected=2026-04-30",
+        },
+    )
+
+    summary = workbench._summary_from_stock("SH.600000", {"name": "测试股"}, {"ohlcv": [{"close": 27.5}]})
+
+    assert summary["latest_price"] == 27.5
+    assert summary["day_change_pct"] == 10.0
+    assert summary["daily_change_pct"] == 10.0
+    assert summary["day_change_source"] == "daily_bars_close"
+    assert summary["day_change_as_of"] == "2026-04-30"
+    assert summary["quote_status"] == "stale"
+
+
 def test_concept_sector_preview_returns_explicit_chain_carrier(monkeypatch):
     from signals.web.api import workbench
 

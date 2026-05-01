@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from datetime import datetime
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -31,6 +32,18 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert chain.depends_on == ("board_ranking:all",)
     stock_minute = next(task for task in pm.POSTMARKET_TASKS if task.module == "stock_minute")
     assert stock_minute.env["STOCK_MINUTE_FREQS"] == "5min,15min"
+
+
+def test_postmarket_trade_date_skips_cn_labor_day_holiday():
+    assert pm._postmarket_trade_date(datetime(2026, 5, 1, 16, 30)) == "2026-04-30"
+
+
+def test_postmarket_should_not_run_on_cn_labor_day_holiday():
+    assert pm.PostmarketRunner.should_run_now(datetime(2026, 5, 1, 16, 30)) is False
+
+
+def test_postmarket_should_run_after_cn_trading_day_close():
+    assert pm.PostmarketRunner.should_run_now(datetime(2026, 4, 30, 16, 30)) is True
 
 
 class _Cursor(list):

@@ -13,7 +13,7 @@ import atexit
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 
 import akshare as ak
 import pandas as pd
@@ -56,6 +56,27 @@ _EM_SPOT_HEADERS = {
 }
 _SPOT_BATCH_LOCK = threading.Lock()
 _SPOT_BATCH_CACHE: dict[str, pd.DataFrame] = {}
+
+
+def _stock_daily_end_date_key(now: datetime | None = None) -> str:
+    local = now or naive_market_now("A")
+    try:
+        from signals.core.calendar.engine import get_calendar
+
+        cal = get_calendar()
+        d = local.date()
+        if not cal.is_trading_day("SSE", d) or local.time() < dt_time(9, 30):
+            d -= timedelta(days=1)
+        while not cal.is_trading_day("SSE", d):
+            d -= timedelta(days=1)
+        return d.strftime("%Y%m%d")
+    except Exception:
+        if local.weekday() < 5 and local.hour >= 9 and (local.hour > 9 or local.minute >= 30):
+            return local.strftime("%Y%m%d")
+        d = local - timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d.strftime("%Y%m%d")
 
 
 def _shard_count() -> int:
@@ -1087,7 +1108,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
     bars_col = db["bars"]
     sync_col = db["sync_log"]
     now = naive_market_now("A")
-    end_date = now.strftime("%Y%m%d")
+    end_date = _stock_daily_end_date_key(now)
 
     # 默认只补活跃池；全市场补仓库需要显式设置 STOCK_DAILY_SCOPE=all。
     all_codes, scope = _get_stock_codes(db)

@@ -1379,6 +1379,23 @@ def _quote_age_seconds(doc: dict[str, Any]) -> Optional[float]:
         return None
 
 
+def _quote_day_is_stale(quote_day: str, expected_day: str, day_change_mode: str) -> bool:
+    if not quote_day or not expected_day or quote_day == expected_day:
+        return False
+    if day_change_mode == "daily_close":
+        try:
+            quote_date = date.fromisoformat(quote_day[:10])
+            expected_date = date.fromisoformat(expected_day[:10])
+            if quote_date > expected_date:
+                from signals.core.calendar.engine import get_calendar
+
+                if not get_calendar().is_trading_day("SSE", quote_date):
+                    return False
+        except Exception:
+            pass
+    return True
+
+
 def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
     candidates = _quote_symbol_candidates(symbol)
     if not candidates:
@@ -1399,11 +1416,12 @@ def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
     quote_day = _quote_dt_text(doc)
     age_seconds = _quote_age_seconds(doc)
     stale_reason = _text(doc.get("stale_reason"))
-    is_stale = bool(doc.get("is_stale")) or doc.get("freshness") == "stale" or quote_day != expected_day
+    quote_day_stale = _quote_day_is_stale(quote_day, expected_day, day_change_mode)
+    is_stale = bool(doc.get("is_stale")) or doc.get("freshness") == "stale" or quote_day_stale
     if is_stale:
         status = "stale"
         label = "行情陈旧"
-        if quote_day and quote_day != expected_day:
+        if quote_day_stale:
             stale_reason = stale_reason or f"quote_day={quote_day}, expected={expected_day}"
     elif day_change_mode == "daily_close":
         status = "closed"
@@ -5038,6 +5056,30 @@ def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any
         "risk_reward": risk.get("risk_reward"),
         "position_pct": risk.get("position_pct"),
     }
+    day_change_mode = _a_day_change_mode()
+    if day_change_mode == "daily_close":
+        try:
+            daily_df, _daily_source = _stock_df(symbol, "daily")
+            daily_day_change, daily_day_source, daily_as_of = _daily_close_day_change_pct(daily_df)
+            latest_daily_close = (
+                float(daily_df["close"].iloc[-1])
+                if daily_as_of == _day_change_expected_day("daily_close")
+                and daily_df is not None
+                and not daily_df.empty
+                and "close" in daily_df.columns
+                else None
+            )
+        except Exception:
+            daily_day_change, daily_day_source, daily_as_of, latest_daily_close = None, "", "", None
+        summary.update({
+            "day_change_pct": daily_day_change,
+            "daily_change_pct": daily_day_change,
+            "day_change_source": daily_day_source,
+            "day_change_mode": day_change_mode,
+            "day_change_as_of": daily_as_of,
+        })
+        if latest_daily_close is not None:
+            summary["latest_price"] = latest_daily_close
     summary.update(_quote_overlay_for_symbol(symbol))
     if summary.get("today_change_pct") is not None:
         summary["gain_pct"] = summary.get("today_change_pct")

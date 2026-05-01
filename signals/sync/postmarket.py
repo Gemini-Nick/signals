@@ -192,6 +192,42 @@ def _naive_bj() -> datetime:
     return _now_bj().replace(tzinfo=None)
 
 
+def _local_bj(now: datetime | None = None) -> datetime:
+    now = now or _now_bj()
+    return now.astimezone(TZ_BEIJING).replace(tzinfo=None) if now.tzinfo else now
+
+
+def _is_a_share_trading_day(now: datetime | None = None) -> bool:
+    local = _local_bj(now)
+    try:
+        from signals.core.calendar.engine import get_calendar
+
+        return bool(get_calendar().is_trading_day("SSE", local.date()))
+    except Exception:
+        return local.weekday() < 5
+
+
+def _postmarket_trade_date(now: datetime | None = None) -> str:
+    local = _local_bj(now)
+    try:
+        from signals.core.calendar.engine import get_calendar
+
+        cal = get_calendar()
+        d = local.date()
+        if not cal.is_trading_day("SSE", d) or local.time() < dt_time(9, 30):
+            d -= timedelta(days=1)
+        while not cal.is_trading_day("SSE", d):
+            d -= timedelta(days=1)
+        return d.isoformat()
+    except Exception:
+        try:
+            from signals.data.mongo_fallback import get_last_trading_day
+
+            return str(get_last_trading_day("A"))[:10]
+        except Exception:
+            return local.date().isoformat()
+
+
 def _coerce_dt(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value.replace(tzinfo=None) if value.tzinfo else value
@@ -580,7 +616,7 @@ class PostmarketRunner:
         return [task for task in POSTMARKET_TASKS if task.phase == phase]
 
     def run_once(self, *, resume_run_id: str | None = None, trade_date: str | None = None, force: bool = False) -> dict[str, Any]:
-        trade_date = trade_date or _now_bj().date().isoformat()
+        trade_date = trade_date or _postmarket_trade_date()
         run_id = resume_run_id or default_run_id(trade_date)
         run_doc = self.db["sync_runs"].find_one({"_id": run_id}) or {}
         if run_doc.get("trade_date"):
@@ -681,11 +717,11 @@ class PostmarketRunner:
     @staticmethod
     def should_run_now(now: datetime | None = None) -> bool:
         now = now or _now_bj()
-        if now.weekday() >= 5:
+        if not _is_a_share_trading_day(now):
             return False
         start = _parse_hm(os.getenv("SIGNALS_POSTMARKET_START_TIME", "15:35"), dt_time(15, 35))
         end = _parse_hm(os.getenv("SIGNALS_POSTMARKET_END_TIME", "23:50"), dt_time(23, 50))
-        current = now.time()
+        current = _local_bj(now).time()
         return start <= current <= end
 
     def run_daemon(self, *, check_seconds: int | None = None) -> None:
@@ -693,9 +729,9 @@ class PostmarketRunner:
         logger.info("postmarket daemon started workers=%d check_seconds=%d", self.max_workers, check_seconds)
         while True:
             now = _now_bj()
-            trade_date = now.date().isoformat()
-            run_id = default_run_id(trade_date)
             if self.should_run_now(now):
+                trade_date = _postmarket_trade_date(now)
+                run_id = default_run_id(trade_date)
                 run_doc = self.db["sync_runs"].find_one({"_id": run_id}, {"status": 1}) or {}
                 status = run_doc.get("status")
                 if status not in RUN_TERMINAL_STATUSES or _env_bool("SIGNALS_POSTMARKET_FORCE", False):

@@ -17,3 +17,9 @@ def test_get_last_trading_day_before_open_uses_previous_workday(monkeypatch):
     monkeypatch.setattr(market_time, "naive_market_now", lambda _market: datetime(2026, 4, 29, 9, 0))
 
     assert mongo_fallback.get_last_trading_day("A") == "2026-04-28"
+
+
+def test_get_last_trading_day_skips_cn_labor_day_holiday(monkeypatch):
+    monkeypatch.setattr(market_time, "naive_market_now", lambda _market: datetime(2026, 5, 1, 16, 30))
+
+    assert mongo_fallback.get_last_trading_day("A") == "2026-04-30"

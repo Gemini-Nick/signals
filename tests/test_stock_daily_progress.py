@@ -41,6 +41,10 @@ class _DB(dict):
         return dict.__getitem__(self, name)
 
 
+def test_stock_daily_end_date_skips_cn_labor_day_holiday():
+    assert stock_daily._stock_daily_end_date_key(datetime(2026, 5, 1, 16, 30)) == "20260430"
+
+
 def test_stock_daily_writes_progress_cursor(monkeypatch):
     db = _DB()
     monkeypatch.setattr(stock_daily, "_get_stock_codes", lambda _db: (["600001", "600002"], "all"))

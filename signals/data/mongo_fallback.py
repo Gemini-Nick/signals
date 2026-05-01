@@ -18,7 +18,7 @@
 """
 import logging
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -177,11 +177,36 @@ def get_last_trading_day(market: str = "A") -> str:
     - 工作日 9:30 之前 → 上一个工作日
     - 周末/节假日 → 上一个工作日（周五）
     """
-    from datetime import timedelta
     from signals.core.market_time import naive_market_now
 
     now = naive_market_now(market)
     d = now
+
+    try:
+        from signals.core.calendar.engine import get_calendar
+
+        exchange = {
+            "A": "SSE",
+            "CN": "SSE",
+            "SH": "SSE",
+            "SZ": "SZSE",
+            "BJ": "SSE",
+            "HK": "HKEX",
+            "H": "HKEX",
+            "US": "NYSE",
+            "NYSE": "NYSE",
+            "NASDAQ": "NYSE",
+        }.get(str(market or "A").upper(), "SSE")
+        cal = get_calendar()
+        open_time = time(9, 30)
+        if cal.is_trading_day(exchange, d.date()) and d.time() >= open_time:
+            return d.strftime("%Y-%m-%d")
+        d -= timedelta(days=1)
+        while not cal.is_trading_day(exchange, d.date()):
+            d -= timedelta(days=1)
+        return d.strftime("%Y-%m-%d")
+    except Exception:
+        pass
 
     # 如果是工作日且 A 股已开盘（9:30后），用今天
     if d.weekday() < 5 and d.hour >= 9 and (d.hour > 9 or d.minute >= 30):
