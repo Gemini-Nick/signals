@@ -87,7 +87,8 @@ TRADE_INTENT_LABELS = {
 TRADE_ROLE_LABELS = {
     "mainline_attack": "主线进攻",
     "climax_risk": "高潮别追",
-    "holding_chain": "持仓链",
+    # Internal key kept for backward compatibility. This is not a real-position signal.
+    "holding_chain": "电池链观察",
     "defensive_weight": "防守权重",
     "second_wave": "二波观察",
     "risk_review": "风险复核",
@@ -2156,6 +2157,9 @@ def _chain_position(row: dict[str, Any]) -> dict[str, Any]:
         "layer": _text(getattr(primary, "position", "")),
         "stage": _text(getattr(primary, "position", "")),
         "role": _text(getattr(primary, "role", "")),
+        "source": "industry_chains.yaml",
+        "source_note": "代表标的静态映射",
+        "confidence": "representative_only",
         "related_chains": list(getattr(primary, "related_chains", []) or [])[:3],
     }
 
@@ -2312,7 +2316,7 @@ def _trader_read_summary(
     if trade_role == "climax_risk":
         return f"{chain or '主线'}：一致高潮，确认买点不再推追高，等分歧后的承接。"
     if trade_role == "holding_chain":
-        return f"{chain or '持仓链'}：按修复节奏观察，等30m承接和5m/15m下单确认。"
+        return f"{chain or '电池链'}：按产业链观察处理，不代表真实持仓；等30m承接和5m/15m下单确认。"
     if trade_role == "defensive_weight":
         return f"{chain or '防守权重'}：偏稳仓/防守，不和进攻票混排，回踩爬起再看仓位。"
     if trade_role == "second_wave":
@@ -2341,6 +2345,8 @@ def _evidence_summary(
     parts = []
     if chain:
         parts.append(f"产业链: {chain}")
+    if chain_position.get("source_note"):
+        parts.append(f"产业链来源: {chain_position.get('source_note')}")
     if sources:
         parts.append(f"来源: {sources}")
     if technical:
