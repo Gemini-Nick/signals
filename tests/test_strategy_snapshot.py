@@ -199,7 +199,7 @@ def test_strategy_snapshot_filters_backtest_and_stale_signals_from_candidates():
     assert candidate["decision_stage"] == "strategy_candidate"
     assert "hard_technical" in candidate["missing_gates"]
     assert "优先复核" not in snapshot["daily_brief"]["summary"]
-    assert "策略候选观察 SH.600460" in snapshot["daily_brief"]["summary"]
+    assert "线索池观察 SH.600460" in snapshot["daily_brief"]["summary"]
 
 
 def test_strategy_snapshot_uses_terminal_pool_before_generated_signal_pool():
@@ -289,4 +289,4 @@ def test_strategy_snapshot_uses_terminal_pool_before_generated_signal_pool():
     assert snapshot["warnings"][0]["decision_stage"] == "risk_first"
     assert snapshot["daily_brief"]["top_candidate"] == "SH.688981"
     assert "先处理 1 个风险预警" in snapshot["daily_brief"]["summary"]
-    assert "可交易复核 SH.688981" in snapshot["daily_brief"]["summary"]
+    assert "确认买点复核 SH.688981" in snapshot["daily_brief"]["summary"]

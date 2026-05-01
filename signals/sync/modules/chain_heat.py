@@ -131,9 +131,9 @@ def _trading_signal(phase: str) -> dict[str, str]:
         "accelerating": ("chain_acceleration", "产业链加速，优先复核链主和弹性代表。", "5m/15m 热度转弱或领涨股回落。"),
         "warming": ("chain_warming", "产业链升温，观察扩散和节点共振。", "节点热度回落或上涨家数收缩。"),
         "diverging": ("chain_divergence", "涨幅和广度背离，谨慎追高。", "广度修复或涨幅回落。"),
-        "consensus_climax": ("chain_consensus_climax", "产业链一致高潮，买入降级，风险优先。", "热度回落后重新出现右侧确认。"),
+        "consensus_climax": ("chain_consensus_climax", "产业链一致高潮，先别追，等热度回落后再看。", "热度回落后重新走出买点确认。"),
         "cooling": ("chain_cooling", "产业链降温，等待重新放量。", "15m/30m 动量重新转正。"),
-        "risk_off": ("chain_risk_off", "产业链风险偏弱，先处理风险。", "重新站回正涨幅且广度修复。"),
+        "risk_off": ("chain_risk_off", "产业链走弱，暂不参与。", "重新站回正涨幅且广度修复。"),
     }
     signal, action, invalidates = mapping.get(phase, mapping["warming"])
     return {"signal": signal, "trader_action": action, "invalidates_when": invalidates}

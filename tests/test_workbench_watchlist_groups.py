@@ -63,8 +63,9 @@ def test_macro_indices_have_day_and_range_returns(monkeypatch):
     assert rows[0]["target_kind"] == "index"
     assert rows[0]["target_freq"] == "30min"
     assert "5min" in rows[0]["available_freqs"]
-    assert rows[0]["day_change_pct"] is not None
-    assert rows[0]["daily_change_pct"] is not None
+    assert rows[0]["latest_price"] is not None
+    assert rows[0]["day_change_pct"] is None
+    assert rows[0]["daily_change_pct"] is None
     assert rows[0]["latest_signal"]
     assert rows[0]["range_returns"]
     assert "theme_tags" in rows[0]
@@ -444,7 +445,7 @@ def test_terminal_stock_pool_group_rows_keep_focus_risk_watch_separate(monkeypat
                         "pool_type": "watch",
                         "action_status": "entry_waiting_30m_confirm",
                         "entry_gate_status": "entry_waiting_30m_confirm",
-                        "inclusion_reasons": [{"reason_type": "fallback_watch", "signal_type": "策略候选"}],
+                        "inclusion_reasons": [{"reason_type": "fallback_watch", "signal_type": "线索池"}],
                     }
                 ],
             }
@@ -713,7 +714,7 @@ def test_trader_task_queue_excludes_legacy_buy_review_without_hard_technical():
     tasks = workbench._build_trader_task_queue(
         decision_rows=[
             {
-                "title": "买入复核 · 测试股",
+                "title": "确认买点 · 测试股",
                 "symbol": "SZ.000001",
                 "action_label": "复合买点",
                 "queue_lane": "risk_exit_first",

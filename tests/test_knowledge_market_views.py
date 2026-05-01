@@ -46,7 +46,7 @@ asset_path: "asset_paths/pangge.png"
 ---
 # 胖哥观点
 - 盘中策略是等条件，不是猜方向。
-- 趋势弱时不做左侧，要等止跌、放量或右侧确认。
+- 趋势弱时不做左侧，要等止跌、放量或下单确认。
 - 公开利好不等于可交易，要看赔率、拥挤度、参与性。
 """,
         encoding="utf-8",
@@ -65,6 +65,6 @@ asset_path: "asset_paths/pangge.png"
     combined = db["knowledge_market_views"].docs["strategy:combined:market_rules"]
     assert combined["target_type"] == "strategy_rule"
     assert combined["knowledge_effect"] == "context_only"
-    assert "右侧确认" in combined["right_side_requirement"]
+    assert "下单确认" in combined["right_side_requirement"]
     assert combined["sources"]
     assert any("pangge.png" in path for path in combined["asset_paths"])

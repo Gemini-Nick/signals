@@ -335,6 +335,16 @@ def test_terminal_stock_pool_splits_buy_entries_from_risk_controls():
             "grade": "multi_period",
         },
     }, index_codes=set(), name="中旗新材")
+    _add_reason(rows, "300575", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "buy-ready-15m",
+        "signal_type": "MACD绿柱扩大_零上",
+        "signal_side": "buy",
+        "freq": "15分钟",
+        "score": 90,
+        "confidence": 0.8,
+    }, index_codes=set(), name="中旗新材")
     _add_reason(rows, "688484", {
         "reason_type": "technical_trigger",
         "source_collection": "terminal_technical_signals",
@@ -413,7 +423,7 @@ def test_terminal_stock_pool_daily_30m_without_right_side_waits_for_confirmation
 
     assert split["focus"] == []
     assert split["watch"][0]["entry_gate_status"] == "entry_waiting_right_side_confirm"
-    assert split["watch"][0]["trader_action"] == "等待5m/15m确认"
+    assert split["watch"][0]["trader_action"] == "等下单周期确认"
 
 
 def test_terminal_stock_pool_entry_ready_rank_uses_timeframe_and_score_components():
@@ -434,6 +444,16 @@ def test_terminal_stock_pool_entry_ready_rank_uses_timeframe_and_score_component
             "grade": "multi_period",
         },
     }, index_codes=set(), name="日线确认股")
+    _add_reason(rows, "300575", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "daily-ready-15m",
+        "signal_type": "MACD绿柱扩大_零上",
+        "signal_side": "buy",
+        "freq": "15分钟",
+        "score": 90,
+        "confidence": 0.8,
+    }, index_codes=set(), name="日线确认股")
     _add_reason(rows, "688484", {
         "reason_type": "technical_trigger",
         "source_collection": "terminal_technical_signals",
@@ -449,6 +469,16 @@ def test_terminal_stock_pool_entry_ready_rank_uses_timeframe_and_score_component
             "conflict_freqs": [],
             "grade": "multi_period",
         },
+    }, index_codes=set(), name="周线确认股")
+    _add_reason(rows, "688484", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "weekly-ready-15m",
+        "signal_type": "MACD绿柱扩大_零上",
+        "signal_side": "buy",
+        "freq": "15分钟",
+        "score": 90,
+        "confidence": 0.8,
     }, index_codes=set(), name="周线确认股")
 
     split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)

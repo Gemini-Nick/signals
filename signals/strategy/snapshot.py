@@ -753,7 +753,7 @@ def _terminal_missing_gates(stage: str, row: Mapping[str, Any]) -> list[str]:
 
 def _terminal_primary_blocker(stage: str, row: Mapping[str, Any], missing_gates: list[str]) -> str:
     if stage == "risk_first":
-        return "已有风险/卖出信号"
+        return "暂不参与：已有卖点或冲突"
     if stage == "entry_ready":
         return ""
     action = str(row.get("trader_action") or "").strip()
@@ -763,7 +763,7 @@ def _terminal_primary_blocker(stage: str, row: Mapping[str, Any], missing_gates:
         "hard_technical": "缺硬技术买点",
         "30m_confirm": "缺30m确认",
         "upper_context": "缺日/周上级结构",
-        "right_side_confirm": "缺5m/15m右侧确认",
+        "right_side_confirm": "缺5m/15m下单确认",
         "resonance_confirm": "缺多周期共振",
         "period_conflict_clear": "存在周期冲突",
         "risk_clear": "风险信号未解除",
@@ -773,12 +773,12 @@ def _terminal_primary_blocker(stage: str, row: Mapping[str, Any], missing_gates:
 
 def _terminal_recommended_action(stage: str, row: Mapping[str, Any], primary_blocker: str) -> str:
     if stage == "risk_first":
-        return "先处理风险，再看新机会"
+        return "暂不参与，等冲突解除"
     if stage == "entry_ready":
-        return "可交易复核，确认止损位和仓位上限"
+        return "确认买点复核，先看止损位和仓位上限"
     if stage == "watch_preheat":
         return primary_blocker or "继续观察，等最后一层确认"
-    return "策略候选先观察，等待硬技术确认"
+    return "先放线索池，等待硬技术确认"
 
 
 def _terminal_promotion_path(stage: str, row: Mapping[str, Any], missing_gates: list[str]) -> list[dict[str, str]]:
@@ -804,7 +804,7 @@ def _terminal_promotion_path(stage: str, row: Mapping[str, Any], missing_gates: 
         {
             "key": "right_side_confirm",
             "status": "waiting" if "right_side_confirm" in missing else ("passed" if stage == "entry_ready" else "waiting"),
-            "detail": "5m/15m右侧确认",
+            "detail": "5m/15m下单确认",
         },
         {
             "key": "risk_clear",
@@ -910,8 +910,8 @@ def _candidate_decision_metadata(*, stage: str, theme_alignment: str, status: st
         return {
             "decision_stage": "risk_first",
             "missing_gates": ["risk_clear"],
-            "primary_blocker": "已有风险/卖出信号",
-            "recommended_action": "先处理风险，再看新机会",
+            "primary_blocker": "暂不参与：已有卖点或冲突",
+            "recommended_action": "暂不参与，等冲突解除",
             "promotion_path": [
                 {"key": "source", "status": "passed", "detail": "risk signal"},
                 {"key": "risk_clear", "status": "blocked", "detail": "风险未处理"},
@@ -927,10 +927,10 @@ def _candidate_decision_metadata(*, stage: str, theme_alignment: str, status: st
         "decision_stage": "strategy_candidate",
         "missing_gates": missing,
         "primary_blocker": primary_blocker,
-        "recommended_action": "策略候选先观察，等待硬技术确认",
+        "recommended_action": "先放线索池，等待硬技术确认",
         "promotion_path": [
             {"key": "source", "status": "passed", "detail": "strategy signal"},
-            {"key": "hard_technical", "status": "waiting", "detail": "等待30m或5m/15m右侧确认"},
+            {"key": "hard_technical", "status": "waiting", "detail": "等待30m买点或5m/15m下单确认"},
             {
                 "key": "upper_context",
                 "status": "waiting" if status != "entry_ready" else "passed",
@@ -1198,9 +1198,9 @@ def _build_daily_brief(
         summary += f"，先处理 {len(warnings)} 个风险预警"
     if top_candidate:
         if top_stage == "entry_ready":
-            summary += f"，可交易复核 {top_candidate}"
+            summary += f"，确认买点复核 {top_candidate}"
         else:
-            summary += f"，策略候选观察 {top_candidate}"
+            summary += f"，线索池观察 {top_candidate}"
     next_actions = [str(item.get("metadata", {}).get("next_action") or "") for item in candidates[:3]]
     risk_notes = [str(item.get("metadata", {}).get("risk") or "") for item in warnings[:3]]
     return {
@@ -1260,12 +1260,12 @@ def _build_decision_queue(
             "action_id": f"signals:candidate:{item.get('symbol')}:{idx}",
             "symbol": item.get("symbol", ""),
             "name": item.get("name", ""),
-            "title": f"{'策略候选' if strategy_candidate else '买入复核'} · {title}",
+            "title": f"{'线索池' if strategy_candidate else '确认买点'} · {title}",
             "action": "watch_candidate" if strategy_candidate else "review_entry",
             "action_label": "等硬技术确认" if strategy_candidate else "复合买点",
             "priority": "medium" if status == "watch" else "high",
             "summary": (
-                "候选只说明有策略来源，还没通过30m/5m/15m等硬技术确认。"
+                "线索只说明有来源，还没通过30m/5m/15m等硬技术确认。"
                 if strategy_candidate
                 else "打开图表确认买点、关键均线方向和止损位；虚线阶段只观察不重仓。"
             ),

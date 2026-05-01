@@ -1447,6 +1447,14 @@ def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
 def _apply_quote_overlay(row: dict[str, Any], symbol: str) -> dict[str, Any]:
     overlay = _quote_overlay_for_symbol(symbol)
     updated = dict(row)
+    if overlay.get("day_change_mode") == "quote_intraday" and overlay.get("quote_status") in {"stale", "missing"}:
+        updated.update({
+            "day_change_pct": None,
+            "daily_change_pct": None,
+            "today_change_pct": None,
+            "day_change_source": "",
+            "day_change_as_of": overlay.get("quote_as_of") or "",
+        })
     updated.update(overlay)
     return updated
 
@@ -1463,12 +1471,18 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         if daily_as_of == _day_change_expected_day("daily_close") and df is not None and not df.empty and "close" in df.columns
         else None
     )
+    cached_latest_price = (
+        float(df["close"].iloc[-1])
+        if df is not None and not df.empty and "close" in df.columns
+        else None
+    )
     metadata = dict(row.get("metadata") or {}) if isinstance(row.get("metadata"), dict) else {}
-    latest_price = daily_close_price if day_change_mode == "daily_close" else (
+    latest_price = (daily_close_price or cached_latest_price) if day_change_mode == "daily_close" else (
         row.get("latest_price")
         or row.get("price")
         or metadata.get("price")
         or daily_close_price
+        or cached_latest_price
     )
     enriched = dict(row)
     day_change_pct = daily_day_change if day_change_mode == "daily_close" else None
@@ -1610,6 +1624,20 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "missing_gates",
         "promotion_path",
         "strategy_semantics",
+        "trade_stage",
+        "stage_label",
+        "current_position",
+        "trade_intent",
+        "trade_intent_label",
+        "setup_side_label",
+        "setup_explanation",
+        "entry_logic_summary",
+        "watch_sort_priority",
+        "timeframe_reads",
+        "entry_reason",
+        "missing_condition",
+        "invalidation",
+        "chain_position",
         "intervention_side",
         "intervention_label",
         "opportunity_side",
@@ -1753,6 +1781,11 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         if daily_as_of == _day_change_expected_day("daily_close") and df is not None and not df.empty and "close" in df.columns
         else None
     )
+    cached_latest_price = (
+        float(df["close"].iloc[-1])
+        if df is not None and not df.empty and "close" in df.columns
+        else None
+    )
     day_change_pct = daily_day_change if day_change_mode == "daily_close" else None
     day_change_source = daily_day_source if day_change_mode == "daily_close" else ""
     enriched = dict(row)
@@ -1761,7 +1794,7 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "label": row.get("name") or row.get("label") or symbol,
         "name": row.get("name") or row.get("label") or symbol,
         "code": symbol,
-        "latest_price": daily_close_price if day_change_mode == "daily_close" else row.get("latest_price"),
+        "latest_price": (daily_close_price or cached_latest_price) if day_change_mode == "daily_close" else (row.get("latest_price") or cached_latest_price),
         "day_change_pct": day_change_pct,
         "daily_change_pct": day_change_pct,
         "day_change_source": day_change_source,
@@ -3518,7 +3551,7 @@ def _terminal_stock_pool_rows(range_columns: list[dict[str, Any]], limit: Option
 
 def _focus_stock_pool_meta(focus_count: int) -> dict[str, Any]:
     meta: dict[str, Any] = {
-        "label": "真实买点",
+        "label": "确认买点",
         "source_collection": "terminal_stock_pool",
         "count": focus_count,
         "empty_reason": "",
@@ -3652,9 +3685,9 @@ def _build_trader_task_queue(
     tasks: list[dict[str, Any]] = []
     allowed_lanes = {"risk_exit_first", "entry_ready", "entry_waiting_confirm"}
     lane_titles = {
-        "risk_exit_first": "风险优先",
-        "entry_ready": "入场准备",
-        "entry_waiting_confirm": "等待确认",
+        "risk_exit_first": "暂不参与",
+        "entry_ready": "确认买点",
+        "entry_waiting_confirm": "试仓候选",
     }
 
     def has_hard_technical(row: dict[str, Any]) -> bool:
@@ -3678,7 +3711,7 @@ def _build_trader_task_queue(
             _text(row.get("summary")),
             _text(row.get("trigger_reason")),
         ])
-        if any(token in text for token in ("减仓", "止盈", "风险", "卖", "跌破", "阻断")):
+        if any(token in text for token in ("减仓", "止盈", "风险", "卖", "跌破", "阻断", "暂不参与")):
             return "risk_exit_first"
         if not has_hard_technical(row):
             return ""
@@ -3715,6 +3748,10 @@ def _build_trader_task_queue(
             "name": row.get("name"),
             "action": action,
             "action_label": action,
+            "trade_stage": row.get("trade_stage"),
+            "stage_label": row.get("stage_label"),
+            "missing_condition": row.get("missing_condition"),
+            "chain_position": row.get("chain_position") if isinstance(row.get("chain_position"), dict) else {},
             "queue_lane": lane,
             "priority": "high" if lane in {"risk_exit_first", "entry_ready"} else "medium",
             "summary": row.get("reason") or row.get("latest_signal") or "",
@@ -3739,6 +3776,10 @@ def _build_trader_task_queue(
             **row,
             "action": action,
             "action_label": action,
+            "trade_stage": row.get("trade_stage"),
+            "stage_label": row.get("stage_label"),
+            "missing_condition": row.get("missing_condition"),
+            "chain_position": row.get("chain_position") if isinstance(row.get("chain_position"), dict) else {},
             "queue_lane": lane,
             "title": _text(row.get("title")) or f"{lane_titles[lane]} · {_text(row.get('symbol') or row.get('decision_id'))}",
             "trigger_reason": _text(row.get("summary") or row.get("reason") or row.get("recommended_action")),
@@ -3933,10 +3974,10 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         for item in strategy_snapshot.get("candidates", [])
         if isinstance(item, dict)
     ]
-    scored_raw = strategy_candidates or [serialize_scored_symbol(item) for item in engine.get_scored_symbols()[:8]]
-    scored = [
-        _enrich_stock_row(dict(item), range_columns) if item.get("symbol") else dict(item)
-        for item in scored_raw
+    strategy_clues = [
+        item
+        for item in strategy_candidates
+        if _text(item.get("decision_stage")) == "strategy_candidate"
     ]
     sell_warnings = [
         _enrich_stock_row(dict(item), range_columns) if isinstance(item, dict) and item.get("symbol") else dict(item)
@@ -3963,6 +4004,12 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     focus_stocks = _terminal_stock_pool_rows(range_columns)
     risk_stocks = _terminal_stock_pool_group_rows(range_columns, "risk_stocks")
     watch_stocks = _terminal_stock_pool_group_rows(range_columns, "watch_stocks")
+    clue_stocks = _terminal_stock_pool_group_rows(range_columns, "clue_stocks")
+    scored_raw = clue_stocks or strategy_clues
+    scored = [
+        _enrich_stock_row(dict(item), range_columns) if item.get("symbol") and not item.get("latest_price") else dict(item)
+        for item in scored_raw
+    ]
     focus_stocks_meta = _focus_stock_pool_meta(len(focus_stocks))
     for rows, lane in (
         (macro_indices, "quote_lane"),
@@ -3970,6 +4017,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         (focus_stocks, "signal_lane"),
         (risk_stocks, "signal_lane"),
         (watch_stocks, "signal_lane"),
+        (clue_stocks, "signal_lane"),
     ):
         for row in rows:
             row["lane_status"] = sync_lanes.get(lane, {})
@@ -4043,24 +4091,25 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
                 "representative_stock_role": "preview_only_not_focus_pool",
             },
             "buy_candidates": {
-                "label": "策略快照队列",
-                "source_collection": "strategy_snapshots<-terminal_stock_pool",
+                "label": "线索池",
+                "source_collection": "terminal_stock_pool.clue_stocks + strategy_snapshots.strategy_candidate",
                 "count": len(scored),
-                "role": "ranked_strategy_snapshot_with_entry_ready_watch_preheat",
+                "role": "source_clue_only_not_entry",
+                "empty_reason": "" if scored else "当前没有纯线索；已有硬技术的标的会进入盯盘池或确认买点。",
             },
             "focus_stocks": focus_stocks_meta,
             "risk_stocks": {
-                "label": "风险/止盈止损",
+                "label": "暂不参与",
                 "source_collection": "terminal_stock_pool.risk_stocks",
                 "count": len(risk_stocks),
-                "role": "exit_and_risk_queue_not_focus_pool",
+                "role": "skip_now_not_opportunity",
                 **{key: value for key, value in focus_stocks_meta.items() if key in {"pool_counts", "candidate_counts_by_source", "candidate_counts_by_side", "candidate_counts_by_freq", "coverage_by_freq", "coverage_status", "selection_policy", "ranking_version"}},
             },
             "watch_stocks": {
-                "label": "观察/预热",
+                "label": "盯盘池",
                 "source_collection": "terminal_stock_pool.watch_stocks",
                 "count": len(watch_stocks),
-                "role": "watch_and_minute_preheat_not_focus_pool",
+                "role": "watch_pool_dip_watch_probe_candidate",
                 **{key: value for key, value in focus_stocks_meta.items() if key in {"pool_counts", "candidate_counts_by_source", "candidate_counts_by_side", "candidate_counts_by_freq", "coverage_by_freq", "coverage_status", "selection_policy", "ranking_version"}},
             },
         },

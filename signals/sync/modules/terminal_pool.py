@@ -57,6 +57,67 @@ ENTRY_PARTNER_FREQS = ENTRY_UPPER_FREQS | RIGHT_SIDE_FREQS
 ENTRY_QUEUE_LANES = {"entry_ready", "entry_waiting_confirm", "entry_waiting_upper_context", "entry_waiting_right_side_confirm"}
 RISK_ACTION_STATUSES = {"risk_review", "chain_risk_review", "knowledge_blocked", "knowledge_conflict"}
 POOL_RANKING_VERSION = "entry_priority_v2"
+TRADE_STAGE_LABELS = {
+    "clue_pool": "线索池",
+    "watch_pool": "盯盘池",
+    "dip_watch": "低吸观察",
+    "probe_candidate": "试仓候选",
+    "confirmed_entry": "确认买点",
+    "skip_now": "暂不参与",
+}
+TRADE_STAGE_ACTIONS = {
+    "clue_pool": "先放线索池",
+    "watch_pool": "盯盘等买点",
+    "dip_watch": "低吸观察",
+    "probe_candidate": "小仓试仓复核",
+    "confirmed_entry": "确认买点复核",
+    "skip_now": "暂不参与",
+}
+TRADE_INTENT_LABELS = {
+    "clue_only": "线索来源",
+    "left_dip": "左侧低吸",
+    "right_momentum": "右侧动量",
+    "probe_candidate": "试仓候选",
+    "wait_30m": "等30m买点",
+    "wait_big_cycle": "等大周期",
+    "confirmed_entry": "确认买点",
+    "skip_now": "暂不参与",
+}
+TRADE_INTENT_PRIORITY = {
+    "confirmed_entry": 100,
+    "right_momentum": 86,
+    "probe_candidate": 78,
+    "wait_30m": 62,
+    "wait_big_cycle": 54,
+    "left_dip": 44,
+    "clue_only": 10,
+    "skip_now": 0,
+}
+TRADE_STAGE_LEGACY_DECISION = {
+    "clue_pool": "strategy_candidate",
+    "watch_pool": "watch_preheat",
+    "dip_watch": "watch_preheat",
+    "probe_candidate": "watch_preheat",
+    "confirmed_entry": "entry_ready",
+    "skip_now": "risk_first",
+}
+MISSING_GATE_LABELS = {
+    "risk_signal_present": "有卖点或冲突，先别当机会",
+    "missing_buy_technical": "还没有硬技术买点",
+    "30m_missing": "等30m买点",
+    "30m_stale": "30m信号过期，等新的30m",
+    "30m_right_side_missing": "30m还没走出确认买点",
+    "daily_or_weekly_missing": "缺日/周大周期位置",
+    "daily_or_weekly_stale": "日/周结构过期，等重新确认",
+    "partner_period_missing": "缺多周期共振",
+    "5m_or_15m_missing": "缺5m/15m下单周期",
+    "5m_or_15m_stale": "5m/15m信号过期",
+    "5m_or_15m_right_side_missing": "5m/15m还没给下单确认",
+    "chain_consensus_climax": "产业链一致高潮，别追",
+    "chain_risk_off": "产业链走弱，先不看",
+    "chain_block": "产业链风险未解除",
+}
+ENTRY_BLOCK_CHAIN_PHASES = {"consensus_climax", "risk_off"}
 FREQ_ORDER = {
     "周线": 0,
     "weekly": 0,
@@ -694,11 +755,11 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
     chain_effect = _text((row.get("chain_context") or {}).get("effect"))
     if row.get("queue_lane") in ENTRY_QUEUE_LANES and knowledge_effect in {"block", "downgrade", "exit_priority"}:
         row["action_status"] = "knowledge_blocked" if knowledge_effect == "block" else "knowledge_downgraded"
-        row["trader_action"] = "知识库阻断" if knowledge_effect == "block" else "知识库降级复核"
+        row["trader_action"] = "知识库提示暂不参与" if knowledge_effect == "block" else "知识库降级复核"
         row["next_action"] = row["trader_action"]
         row["queue_lane"] = "context_only" if knowledge_effect == "block" else "entry_waiting_confirm"
         row["actionability"] = "review_required" if knowledge_effect == "block" else "entry_waiting_confirm"
-        row["invalidates_when"] = "知识库风险解除且右侧确认重新出现"
+        row["invalidates_when"] = "知识库风险解除且买点确认重新出现"
     if row.get("queue_lane") in ENTRY_QUEUE_LANES and chain_effect in {"block", "exit_priority"}:
         row["action_status"] = "chain_risk_review"
         row["trader_action"] = "产业链风险复核"
@@ -1324,6 +1385,59 @@ def _has_current_reason_for_freq(reasons: list[dict[str, Any]], predicate) -> bo
     )
 
 
+def _has_direct_reason_for_freq(reasons: list[dict[str, Any]], predicate, *, side: str | None = None) -> bool:
+    for reason in reasons:
+        if not predicate(reason.get("freq")):
+            continue
+        if side and _technical_opportunity_side(reason) != side:
+            continue
+        return True
+    return False
+
+
+def _has_current_direct_reason_for_freq(reasons: list[dict[str, Any]], predicate, *, side: str | None = None) -> bool:
+    for reason in reasons:
+        if not predicate(reason.get("freq")) or not _reason_is_current_for_entry(reason):
+            continue
+        if side and _technical_opportunity_side(reason) != side:
+            continue
+        return True
+    return False
+
+
+def _has_reason_context_for_freq(reasons: list[dict[str, Any]], predicate, *, side: str | None = None) -> bool:
+    for reason in reasons:
+        if not _reason_has_freq(reason, predicate):
+            continue
+        if side and _technical_opportunity_side(reason) != side:
+            continue
+        return True
+    return False
+
+
+def _has_current_reason_context_for_freq(reasons: list[dict[str, Any]], predicate, *, side: str | None = None) -> bool:
+    for reason in reasons:
+        if not _reason_has_freq(reason, predicate) or not _reason_is_current_for_entry(reason):
+            continue
+        if side and _technical_opportunity_side(reason) != side:
+            continue
+        return True
+    return False
+
+
+def _chain_entry_blocker(row: dict[str, Any]) -> str:
+    chain = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
+    phase = _text(chain.get("phase"))
+    effect = _text(chain.get("effect"))
+    if effect == "block":
+        return "chain_block"
+    if effect == "exit_priority":
+        return "chain_risk_off"
+    if phase in ENTRY_BLOCK_CHAIN_PHASES:
+        return f"chain_{phase}"
+    return ""
+
+
 def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, Any] | None, dict[str, Any] | None]:
     buy_reasons = _buy_technical_reasons(row)
     risk_reasons = _risk_reasons(row)
@@ -1332,6 +1446,9 @@ def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, An
     top_risk = max(risk_reasons, key=lambda item: (_float(item.get("weight")), abs(_float(item.get("score")))), default=None)
     if top_risk:
         return False, "blocked_by_risk", ["risk_signal_present"], top_buy, top_risk
+    chain_blocker = _chain_entry_blocker(row)
+    if chain_blocker:
+        return False, "blocked_by_chain_context", [chain_blocker], top_buy, top_risk
     if not top_buy:
         return False, "watch_only_not_hard_buy", ["missing_buy_technical"], None, None
     freqs: set[str] = set()
@@ -1342,17 +1459,21 @@ def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, An
         conflict_freqs.update(_text(freq) for freq in context.get("conflict_freqs") or [] if _text(freq))
     if conflict_freqs:
         return False, "blocked_by_period_conflict", sorted(conflict_freqs, key=_freq_sort_key), top_buy, top_risk
-    has_30m = any(_is_30m_freq(freq) for freq in freqs)
+    has_30m = _has_direct_reason_for_freq(buy_reasons, _is_30m_freq)
     has_upper = any(_is_upper_freq(freq) for freq in freqs)
-    has_right_side = any(_is_right_side_freq(freq) for freq in freqs)
+    has_right_side = _has_direct_reason_for_freq(buy_reasons, _is_right_side_freq, side="right")
     has_partner = any(_is_entry_partner_freq(freq) for freq in freqs)
-    fresh_30m = _has_current_reason_for_freq(buy_reasons, _is_30m_freq)
+    fresh_30m = _has_current_direct_reason_for_freq(buy_reasons, _is_30m_freq)
+    fresh_30m_right = _has_current_direct_reason_for_freq(buy_reasons, _is_30m_freq, side="right")
     fresh_upper = _has_current_reason_for_freq(buy_reasons, _is_upper_freq)
-    fresh_right_side = _has_current_reason_for_freq(buy_reasons, _is_right_side_freq)
+    fresh_right_side = _has_current_direct_reason_for_freq(buy_reasons, _is_right_side_freq, side="right")
+    fresh_right_side_confirmed = fresh_right_side
     if not has_30m:
         return False, "entry_waiting_30m_confirm", ["30m_missing"], top_buy, top_risk
     if not fresh_30m:
         return False, "entry_waiting_30m_confirm", ["30m_stale"], top_buy, top_risk
+    if not fresh_30m_right:
+        return False, "entry_waiting_30m_confirm", ["30m_right_side_missing"], top_buy, top_risk
     if not has_upper:
         return False, "entry_waiting_upper_context", ["daily_or_weekly_missing"], top_buy, top_risk
     if not fresh_upper:
@@ -1363,6 +1484,8 @@ def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, An
         return False, "entry_waiting_right_side_confirm", ["5m_or_15m_missing"], top_buy, top_risk
     if not fresh_right_side:
         return False, "entry_waiting_right_side_confirm", ["5m_or_15m_stale"], top_buy, top_risk
+    if not fresh_right_side_confirmed:
+        return False, "entry_waiting_right_side_confirm", ["5m_or_15m_right_side_missing"], top_buy, top_risk
     return True, "entry_confirmed", [], top_buy, top_risk
 
 
@@ -1465,7 +1588,7 @@ def _entry_components(row: dict[str, Any], top_buy: dict[str, Any]) -> dict[str,
 
 def _rank_reason(score_components: dict[str, float]) -> str:
     labels = {
-        "entry_readiness": "执行确认",
+        "entry_readiness": "买点确认",
         "upper_timeframe_quality": "周/日线",
         "trigger_30m": "30m触发",
         "right_side_confirmation": "5m/15m确认",
@@ -1669,6 +1792,201 @@ def _timeframe_signal_sides(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return buckets
 
 
+def _side_is_confirming(side: str) -> bool:
+    return side in {"right", "mixed"}
+
+
+def _missing_condition(blocked_by: list[str], fallback: str = "等新的技术确认") -> str:
+    labels = [MISSING_GATE_LABELS.get(_text(code), _text(code)) for code in blocked_by if _text(code)]
+    return " / ".join(labels) or fallback
+
+
+def _stage_label(stage: str) -> str:
+    return TRADE_STAGE_LABELS.get(stage, "盯盘池")
+
+
+def _trade_stage_from_context(
+    *,
+    pool_type: str,
+    entry_gate_status: str,
+    blocked_by: list[str],
+    top_buy: dict[str, Any] | None,
+    top_risk: dict[str, Any] | None,
+    timeframe_sides: dict[str, dict[str, Any]],
+) -> str:
+    if pool_type == "risk" or top_risk or entry_gate_status.startswith("blocked_by"):
+        return "skip_now"
+    trade_side = _text(timeframe_sides.get("trade", {}).get("side"))
+    execution_side = _text(timeframe_sides.get("execution", {}).get("side"))
+    upper_side = _text(timeframe_sides.get("upper", {}).get("side"))
+    has_trade = trade_side != "none"
+    has_execution = execution_side != "none"
+    if entry_gate_status == "entry_confirmed" and _side_is_confirming(trade_side) and _side_is_confirming(execution_side):
+        return "confirmed_entry"
+    if has_trade and (entry_gate_status == "entry_waiting_right_side_confirm" or has_execution):
+        return "probe_candidate"
+    if trade_side == "left" or execution_side == "left" or upper_side == "left":
+        return "dip_watch"
+    if top_buy:
+        return "watch_pool"
+    if any(code == "missing_buy_technical" for code in blocked_by):
+        return "clue_pool"
+    return "watch_pool"
+
+
+def _timeframe_reads(timeframe_sides: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        "big_cycle": {
+            "label": "大周期",
+            "freqs": "日/周",
+            "side": _text(timeframe_sides.get("upper", {}).get("side")) or "none",
+            "status": "有方向" if _text(timeframe_sides.get("upper", {}).get("side")) != "none" else "待确认",
+            "evidence": timeframe_sides.get("upper", {}),
+        },
+        "trade_cycle": {
+            "label": "交易周期",
+            "freqs": "30m",
+            "side": _text(timeframe_sides.get("trade", {}).get("side")) or "none",
+            "status": "买点出现" if _side_is_confirming(_text(timeframe_sides.get("trade", {}).get("side"))) else "等买点",
+            "evidence": timeframe_sides.get("trade", {}),
+        },
+        "order_cycle": {
+            "label": "下单周期",
+            "freqs": "5m/15m",
+            "side": _text(timeframe_sides.get("execution", {}).get("side")) or "none",
+            "status": "可复核" if _side_is_confirming(_text(timeframe_sides.get("execution", {}).get("side"))) else "等确认",
+            "evidence": timeframe_sides.get("execution", {}),
+        },
+    }
+
+
+def _chain_position(row: dict[str, Any]) -> dict[str, Any]:
+    chain = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
+    evidence = chain.get("evidence") if isinstance(chain.get("evidence"), dict) else {}
+    return {
+        "chain_id": _text(chain.get("chain_id")),
+        "node_id": _text(chain.get("node_id")),
+        "chain": _text(chain.get("chain_name") or evidence.get("chain_name")),
+        "node": _text(chain.get("node_name") or evidence.get("node_name")),
+        "board_or_concept": _text(chain.get("board_or_concept") or evidence.get("board_or_concept")),
+        "layer": _text(chain.get("layer") or evidence.get("layer")),
+        "stage": _text(chain.get("stage") or evidence.get("stage")),
+        "phase": _text(chain.get("phase") or evidence.get("phase")),
+        "role": "链主" if "chain_core_rep" in row.get("source_tags", []) or "source_leader" in row.get("source_tags", []) else "弹性/成分" if any(tag in row.get("source_tags", []) for tag in ("chain_elastic_rep", "constituent_hot")) else "",
+    }
+
+
+def _bucket_side_labels(bucket: dict[str, Any]) -> str:
+    if not isinstance(bucket, dict):
+        return ""
+    labels: list[str] = []
+    for side_key in ("right", "left", "sell", "context"):
+        for item in bucket.get(side_key) or []:
+            if not isinstance(item, dict):
+                continue
+            freq = _text(item.get("freq"))
+            label = _text(item.get("label"))
+            if freq or label:
+                labels.append(f"{freq} {label}".strip())
+    return "、".join(labels[:3])
+
+
+def _trade_intent_from_context(
+    *,
+    pool_type: str,
+    entry_gate_status: str,
+    trade_stage: str,
+    timeframe_sides: dict[str, dict[str, Any]],
+    blocked_by: list[str],
+    top_buy: dict[str, Any] | None,
+    top_risk: dict[str, Any] | None,
+) -> str:
+    if pool_type == "risk" or top_risk or entry_gate_status.startswith("blocked_by"):
+        return "skip_now"
+    if pool_type == "focus" or entry_gate_status == "entry_confirmed":
+        return "confirmed_entry"
+    trade_side = _text(timeframe_sides.get("trade", {}).get("side"))
+    execution_side = _text(timeframe_sides.get("execution", {}).get("side"))
+    upper_side = _text(timeframe_sides.get("upper", {}).get("side"))
+    if not top_buy or any(code == "missing_buy_technical" for code in blocked_by):
+        return "clue_only"
+    if trade_side == "left" or upper_side == "left":
+        return "left_dip"
+    if entry_gate_status == "entry_waiting_right_side_confirm" or trade_stage == "probe_candidate":
+        return "probe_candidate"
+    if trade_side in {"right", "mixed"} or execution_side in {"right", "mixed"}:
+        return "right_momentum"
+    if upper_side in {"right", "mixed"}:
+        return "wait_30m"
+    if entry_gate_status == "entry_waiting_upper_context":
+        return "wait_big_cycle"
+    if entry_gate_status == "entry_waiting_30m_confirm":
+        return "wait_30m"
+    return "wait_30m"
+
+
+def _trade_intent_label(intent: str) -> str:
+    return TRADE_INTENT_LABELS.get(intent, "盯盘池")
+
+
+def _setup_explanation(intent: str, missing_condition: str) -> str:
+    if intent == "confirmed_entry":
+        return "30m买点和5m/15m下单周期都已确认，复核位置、止损和仓位。"
+    if intent == "right_momentum":
+        return "已有右侧动量或大周期走强，但30m交易买点还没补齐。"
+    if intent == "probe_candidate":
+        return "30m或上级结构有动作，离买点近，等5m/15m下单确认。"
+    if intent == "left_dip":
+        return "偏左侧低吸，只能观察承接，不能当追涨买点。"
+    if intent == "wait_big_cycle":
+        return "短周期有动作，但日/周大周期还没站住。"
+    if intent == "clue_only":
+        return "只有来源或主题线索，还没有硬技术买点。"
+    if intent == "skip_now":
+        return "已有卖点、冲突、过期或产业链高潮，暂不参与。"
+    return missing_condition or "盯盘等买点。"
+
+
+def _entry_logic_summary(
+    *,
+    timeframe_sides: dict[str, dict[str, Any]],
+    missing_condition: str,
+    chain_position: dict[str, Any],
+) -> str:
+    trade = _bucket_side_labels(timeframe_sides.get("trade", {})) or "30m未确认"
+    execution = _bucket_side_labels(timeframe_sides.get("execution", {})) or "5m/15m未确认"
+    upper = _bucket_side_labels(timeframe_sides.get("upper", {})) or "日/周未确认"
+    chain = _text(chain_position.get("chain") or chain_position.get("board_or_concept") or chain_position.get("node"))
+    parts = [f"30m: {trade}", f"5m/15m: {execution}", f"日/周: {upper}"]
+    if chain:
+        parts.append(f"产业链: {chain}")
+    if missing_condition and missing_condition != "买点路径已走通":
+        parts.append(f"还差: {missing_condition}")
+    return "；".join(parts)
+
+
+def _promotion_path_for_trade_stage(
+    row: dict[str, Any],
+    *,
+    trade_stage: str,
+    timeframe_sides: dict[str, dict[str, Any]],
+    blocked_by: list[str],
+) -> list[dict[str, Any]]:
+    source_detail = "/".join(_source_collections(row)[:2])
+    upper_side = _text(timeframe_sides.get("upper", {}).get("side"))
+    trade_side = _text(timeframe_sides.get("trade", {}).get("side"))
+    execution_side = _text(timeframe_sides.get("execution", {}).get("side"))
+    blocked = trade_stage == "skip_now"
+    return [
+        {"key": "source", "status": "passed" if source_detail else "context", "detail": source_detail},
+        {"key": "theme_alignment", "status": "passed" if row.get("theme_rank_bonus", 0) else "context", "detail": _text(row.get("theme_alignment_level"))},
+        {"key": "upper_context", "status": "waiting" if "daily_or_weekly_missing" in blocked_by else "passed" if upper_side != "none" else "context", "detail": f"大周期 {upper_side or 'none'}"},
+        {"key": "trigger_30m", "status": "waiting" if any(code.startswith("30m") for code in blocked_by) else "passed" if _side_is_confirming(trade_side) else "waiting", "detail": f"交易周期 {trade_side or 'none'}"},
+        {"key": "right_side", "status": "waiting" if any(code.startswith("5m_or_15m") for code in blocked_by) else "passed" if _side_is_confirming(execution_side) else "waiting", "detail": f"下单周期 {execution_side or 'none'}"},
+        {"key": "risk_clear", "status": "blocked" if blocked else "passed", "detail": _missing_condition(blocked_by, "无主要冲突") if blocked else "无主要冲突"},
+    ]
+
+
 def _opportunity_side_from_groups(
     *,
     pool_type: str,
@@ -1689,12 +2007,12 @@ def _opportunity_side_from_groups(
 
 def _opportunity_side_label(side: str) -> str:
     labels = {
-        "left": "左侧机会",
-        "right": "右侧确认",
-        "risk": "卖点/冲突",
-        "context": "策略背景",
+        "left": "低吸观察",
+        "right": "确认买点",
+        "risk": "暂不参与",
+        "context": "线索池",
     }
-    return labels.get(side, "策略背景")
+    return labels.get(side, "线索池")
 
 
 def _left_setup_reason_codes(row: dict[str, Any], top_buy: dict[str, Any] | None) -> list[str]:
@@ -1733,34 +2051,37 @@ def _strategy_semantics(
     *,
     pool_type: str,
     entry_gate_status: str,
+    trade_stage: str,
     top_buy: dict[str, Any] | None,
     top_risk: dict[str, Any] | None,
 ) -> dict[str, Any]:
     left_reasons = _left_setup_reason_codes(row, top_buy)
     right_reasons = _right_confirm_reason_codes(row)
-    if pool_type == "risk" or top_risk:
+    label = _stage_label(trade_stage)
+    if trade_stage == "skip_now":
         intervention_side = "risk_exit"
         lineage = ["pangge", "system"]
-        label = "风险优先"
-    elif entry_gate_status == "entry_confirmed":
+    elif trade_stage == "confirmed_entry":
         intervention_side = "hybrid" if left_reasons else "right_confirmed"
         lineage = ["pangge", "system"] + (["daozhang"] if left_reasons else [])
-        label = "左侧预热+右侧确认" if left_reasons else "右侧确认"
-    elif left_reasons or top_buy:
+    elif trade_stage in {"dip_watch", "probe_candidate"}:
         intervention_side = "left_setup"
         lineage = ["daozhang", "system"]
-        label = "左侧预热"
+    elif trade_stage == "watch_pool":
+        intervention_side = "left_setup" if left_reasons or top_buy else "context"
+        lineage = ["daozhang", "system"] if left_reasons or top_buy else ["system"]
     else:
         intervention_side = "context"
         lineage = ["system"]
-        label = "策略背景"
     semantics = {
+        "trade_stage": trade_stage,
+        "stage_label": label,
         "intervention_side": intervention_side,
         "intervention_label": label,
         "strategy_lineage": list(dict.fromkeys(lineage)),
         "left_setup_reasons": left_reasons,
         "right_confirm_reasons": right_reasons,
-        "risk_policy": "exit_first" if intervention_side == "risk_exit" else "risk_clear_required",
+        "risk_policy": "暂不参与" if intervention_side == "risk_exit" else "先看位置和买点",
     }
     return semantics
 
@@ -1811,10 +2132,56 @@ def _finalize_pool_row(
     theme_rank_bonus = _mainline_alignment_score(row)
     row["theme_rank_bonus"] = theme_rank_bonus
     row["theme_alignment_level"] = _mainline_alignment_level(theme_rank_bonus)
+    trade_stage = _trade_stage_from_context(
+        pool_type=pool_type,
+        entry_gate_status=entry_gate_status,
+        blocked_by=blocked_by,
+        top_buy=top_buy,
+        top_risk=top_risk,
+        timeframe_sides=timeframe_sides,
+    )
+    if pool_type == "focus" and entry_gate_status == "entry_confirmed":
+        trade_stage = "confirmed_entry"
+    elif pool_type == "risk":
+        trade_stage = "skip_now"
+    stage_label = _stage_label(trade_stage)
+    row["trade_stage"] = trade_stage
+    row["stage_label"] = stage_label
+    row["current_position"] = stage_label
+    row["decision_stage"] = TRADE_STAGE_LEGACY_DECISION.get(trade_stage, "watch_preheat")
+    row["timeframe_reads"] = _timeframe_reads(timeframe_sides)
+    chain_position = _chain_position(row)
+    row["chain_position"] = chain_position
+    row["missing_condition"] = _missing_condition(blocked_by, "买点路径已走通" if trade_stage == "confirmed_entry" else "等新的技术确认")
+    row["primary_blocker"] = row["missing_condition"]
+    row["recommended_action"] = TRADE_STAGE_ACTIONS.get(trade_stage, "盯盘等买点")
+    row["entry_reason"] = " / ".join(_technical_signal_reason_labels(technical_groups, "right") + _technical_signal_reason_labels(technical_groups, "left")) or row.get("reason") or stage_label
+    row["invalidation"] = row.get("invalidates_when") or "触发条件失效或关键位被破坏"
+    trade_intent = _trade_intent_from_context(
+        pool_type=pool_type,
+        entry_gate_status=entry_gate_status,
+        trade_stage=trade_stage,
+        timeframe_sides=timeframe_sides,
+        blocked_by=blocked_by,
+        top_buy=top_buy,
+        top_risk=top_risk,
+    )
+    row["trade_intent"] = trade_intent
+    row["trade_intent_label"] = _trade_intent_label(trade_intent)
+    row["setup_side_label"] = row["trade_intent_label"]
+    row["watch_sort_priority"] = TRADE_INTENT_PRIORITY.get(trade_intent, 0)
+    row["setup_explanation"] = _setup_explanation(trade_intent, row["missing_condition"])
+    row["entry_logic_summary"] = _entry_logic_summary(
+        timeframe_sides=timeframe_sides,
+        missing_condition=row["missing_condition"],
+        chain_position=chain_position,
+    )
+    row["promotion_path"] = _promotion_path_for_trade_stage(row, trade_stage=trade_stage, timeframe_sides=timeframe_sides, blocked_by=blocked_by)
     semantics = _strategy_semantics(
         row,
         pool_type=pool_type,
         entry_gate_status=entry_gate_status,
+        trade_stage=trade_stage,
         top_buy=top_buy,
         top_risk=top_risk,
     )
@@ -1824,6 +2191,7 @@ def _finalize_pool_row(
     row["strategy_lineage"] = semantics["strategy_lineage"]
     row["left_setup_reasons"] = semantics["left_setup_reasons"]
     row["right_confirm_reasons"] = semantics["right_confirm_reasons"]
+    row["opportunity_label"] = stage_label
     primary_reason = top_risk if pool_type == "risk" else (top_buy or top_risk)
     if isinstance(primary_reason, dict) and primary_reason:
         row["event_latest_dt"] = _reason_event_dt(primary_reason)
@@ -1840,53 +2208,71 @@ def _finalize_pool_row(
         row["stale_signal_count"] = len(stale_reasons)
     if pool_type == "focus":
         row["action_status"] = "entry_ready"
-        row["trader_action"] = "右侧信号复核"
-        row["next_action"] = "右侧信号复核"
+        row["trader_action"] = "确认买点复核"
+        row["next_action"] = "确认买点复核"
         row["queue_lane"] = "entry_ready"
         row["actionability"] = "entry_ready"
         row["decision_effect"] = "confirm"
         row["signal_origin"] = _text((top_buy or {}).get("reason_type")) or row.get("signal_origin")
         row["latest_signal"] = _text((top_buy or {}).get("signal_type")) or row.get("latest_signal")
-        row["invalidates_when"] = "30m买点失效、上级周期转弱或风险信号出现"
+        row["invalidates_when"] = "30m买点失效、下单周期转弱、日/周冲突或产业链高潮"
     elif pool_type == "risk":
-        row["action_status"] = "risk_review"
-        row["trader_action"] = "止盈/止损复核"
+        row["action_status"] = "skip_now"
+        row["trader_action"] = "暂不参与"
         row["next_action"] = row["trader_action"]
         row["queue_lane"] = "risk_exit_first"
         row["actionability"] = "risk_exit_first"
         row["decision_effect"] = "exit_priority"
         row["signal_origin"] = _text((top_risk or {}).get("reason_type")) or row.get("signal_origin")
         row["latest_signal"] = _text((top_risk or {}).get("signal_type")) or row.get("latest_signal")
-        row["invalidates_when"] = "风险信号解除或重新站回关键周期"
+        row["invalidates_when"] = "卖点/冲突解除，并重新走出30m和5m/15m买点"
     else:
-        if entry_gate_status == "entry_waiting_30m_confirm":
+        if trade_stage == "skip_now":
+            row["action_status"] = "skip_now"
+            row["trader_action"] = "暂不参与"
+            row["queue_lane"] = "context_only"
+        elif entry_gate_status == "entry_waiting_30m_confirm":
             row["action_status"] = "entry_waiting_30m_confirm"
-            row["trader_action"] = "左侧信号，等30m"
+            row["trader_action"] = "盯盘等30m买点"
             row["queue_lane"] = "watch_preheat"
         elif entry_gate_status == "entry_waiting_upper_context":
             row["action_status"] = "entry_waiting_upper_context"
-            row["trader_action"] = "左侧信号，等日/周"
+            row["trader_action"] = "盯盘等大周期"
             row["queue_lane"] = "watch_preheat"
         elif entry_gate_status == "entry_waiting_right_side_confirm":
             row["action_status"] = "entry_waiting_right_side_confirm"
-            row["trader_action"] = "左侧信号，等5m/15m"
+            row["trader_action"] = "等下单周期确认"
             row["queue_lane"] = "watch_preheat"
         elif entry_gate_status == "entry_waiting_resonance_confirm":
             row["action_status"] = "entry_waiting_resonance_confirm"
-            row["trader_action"] = "左侧信号，等共振"
+            row["trader_action"] = "盯盘等共振"
             row["queue_lane"] = "watch_preheat"
         elif entry_gate_status.startswith("blocked_by"):
-            row["action_status"] = "watch_blocked"
-            row["trader_action"] = "暂不做"
+            row["action_status"] = "skip_now"
+            row["trader_action"] = "暂不参与"
+            row["queue_lane"] = "context_only"
+        elif trade_stage == "clue_pool":
+            row["action_status"] = "clue_pool"
+            row["trader_action"] = "线索先放着"
             row["queue_lane"] = "watch_preheat"
+        elif trade_stage == "dip_watch":
+            row["action_status"] = "dip_watch"
+            row["trader_action"] = "低吸观察"
+            row["queue_lane"] = "watch_preheat"
+        elif trade_stage == "probe_candidate":
+            row["action_status"] = "probe_candidate"
+            row["trader_action"] = "试仓候选"
+            row["queue_lane"] = "entry_waiting_confirm"
         else:
             row["action_status"] = row.get("action_status") if row.get("action_status") != "risk_review" else "watch"
-            row["trader_action"] = row.get("trader_action") or "左侧观察"
+            row["trader_action"] = row.get("trader_action") or "盯盘观察"
             row["queue_lane"] = row.get("queue_lane") if row.get("queue_lane") != "risk_exit_first" else "watch_preheat"
         row["next_action"] = row["trader_action"]
         row["actionability"] = "observe_only"
         row["decision_effect"] = "context_only"
-        row["invalidates_when"] = row.get("invalidates_when") or "硬技术买点未确认或观察条件过期"
+        row["invalidates_when"] = row.get("invalidates_when") or "买点没走出来、信号过期或关键位被破坏"
+    row["recommended_action"] = row["trader_action"]
+    row["invalidation"] = row["invalidates_when"]
     row["reason"] = " · ".join(
         _text(reason.get("signal_type") or reason.get("reason_type"))
         for reason in (top_buy, top_risk)
@@ -1969,9 +2355,19 @@ def _split_pool_rows(
                 top_buy=top_buy,
                 top_risk=top_risk,
             ))
-    for bucket in (focus, risk, watch):
+    for bucket in (focus, risk):
         bucket.sort(key=lambda item: (_float(item.get("rank_score")), _float(item.get("score"))), reverse=True)
         _assign_pool_ranks(bucket)
+    watch.sort(
+        key=lambda item: (
+            _float(item.get("watch_sort_priority")),
+            _float(item.get("theme_rank_bonus")),
+            _float(item.get("rank_score")),
+            _float(item.get("score")),
+        ),
+        reverse=True,
+    )
+    _assign_pool_ranks(watch)
     return {
         "focus": focus[:focus_limit],
         "risk": risk[:risk_limit],
@@ -2028,6 +2424,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     stock_limit = int(os.getenv("TERMINAL_REALTIME_STOCK_LIMIT", "72"))
     risk_limit = int(os.getenv("TERMINAL_RISK_STOCK_LIMIT", "72"))
     watch_limit = int(os.getenv("TERMINAL_WATCH_STOCK_LIMIT", "120"))
+    clue_limit = int(os.getenv("TERMINAL_CLUE_STOCK_LIMIT", "36"))
     strict_sources = str(get_task_env("TERMINAL_POOL_STRICT_SOURCES", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
     include_legacy_daily = os.getenv("TERMINAL_POOL_INCLUDE_LEGACY_DAILY", "false").strip().lower() in {"1", "true", "yes", "on"}
     fallback_min = max(0, int(os.getenv("TERMINAL_POOL_FALLBACK_MIN_STOCKS", "12")))
@@ -2063,6 +2460,15 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     risk_stocks = split["risk"]
     watch_stocks = split["watch"]
     skipped_by_pool = split["skipped"]
+    all_watch_rows = watch_stocks + (skipped_by_pool.get("watch") or [])
+    clue_stocks = [
+        row
+        for row in all_watch_rows
+        if row.get("trade_intent") == "clue_only" or row.get("trade_stage") == "clue_pool"
+    ][:clue_limit]
+    clue_symbols = {row.get("symbol") for row in clue_stocks}
+    if clue_symbols:
+        watch_stocks = [row for row in watch_stocks if row.get("symbol") not in clue_symbols]
     skipped = (skipped_by_pool.get("focus") or []) + (skipped_by_pool.get("risk") or []) + (skipped_by_pool.get("watch") or [])
     candidate_meta = _candidate_meta(rows)
     focus_reason_counts = Counter(
@@ -2076,6 +2482,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "focus_selected": len(focus_stocks),
         "risk_selected": len(risk_stocks),
         "watch_selected": len(watch_stocks),
+        "clue_selected": len(clue_stocks),
     })
     technical_freshness = db["data_freshness"].find_one(
         {"domain": "technical_signal", "market": "A", "collection": "terminal_technical_signals", "coverage_by_freq": {"$exists": True}},
@@ -2090,10 +2497,12 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "stock_limit": stock_limit,
         "risk_limit": risk_limit,
         "watch_limit": watch_limit,
+        "clue_limit": clue_limit,
         "stocks": focus_stocks,
         "focus_stocks": focus_stocks,
         "risk_stocks": risk_stocks,
         "watch_stocks": watch_stocks,
+        "clue_stocks": clue_stocks,
         "skipped_stocks": skipped[:100],
         "skipped_by_pool": {key: value[:50] for key, value in skipped_by_pool.items()},
         "skipped_count": len(skipped),
@@ -2112,7 +2521,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "ranking_version": POOL_RANKING_VERSION,
         "source": "whitebox_pool_builder",
         "source_policy": "postmarket_strict_with_fallback_watch" if strict_sources and fallback_enabled else ("postmarket_strict_technical_knowledge_chain" if strict_sources else "runtime_watch_and_signal_blend"),
-        "selection_policy": "buy_entry_focus__risk_exit_separate__watch_preheat",
+        "selection_policy": "confirmed_entry__watch_left_right__clue_source_only__skip_now",
     }
     db["terminal_stock_pool"].update_one(
         {"pool": "terminal_stock_pool", "market": "A"},
@@ -2125,7 +2534,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "market": "A",
         "dt": pool_doc["dt"],
         "updated_at": now,
-        "stocks": [row["raw_code"] for row in (focus_stocks + risk_stocks + watch_stocks)[: max(stock_limit, 72)]],
+        "stocks": [row["raw_code"] for row in (focus_stocks + risk_stocks + watch_stocks + clue_stocks)[: max(stock_limit, 72)]],
         "indices": list(getattr(config, "INDEX_AK_CODES", {}).values()),
         "industries": _top_heat_names(db, "industry", 20),
         "concepts": _top_heat_names(db, "concept", 20),
@@ -2168,10 +2577,11 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         upsert=True,
     )
     logger.info(
-        "terminal stock pool: focus=%d risk=%d watch=%d candidates=%d skipped=%d",
+        "terminal stock pool: focus=%d risk=%d watch=%d clue=%d candidates=%d skipped=%d",
         len(focus_stocks),
         len(risk_stocks),
         len(watch_stocks),
+        len(clue_stocks),
         len(rows),
         len(skipped),
     )
@@ -2181,6 +2591,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "focus_stocks": len(focus_stocks),
         "risk_stocks": len(risk_stocks),
         "watch_stocks": len(watch_stocks),
+        "clue_stocks": len(clue_stocks),
         "candidates": len(rows),
         "strict_candidates": strict_candidate_count,
         "fallback_candidates": fallback_count,
