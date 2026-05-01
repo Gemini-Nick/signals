@@ -125,6 +125,11 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     *_STOCK_30M_TASKS,
     PostmarketTaskSpec("weekly_rollup", "derived", depends_on=(*_STOCK_DAILY_DEPS, "index_daily:all")),
     PostmarketTaskSpec("chain_heat_snapshots", "derived", depends_on=("board_ranking:all",)),
+    PostmarketTaskSpec(
+        "postmarket_chain_rebuild",
+        "derived",
+        depends_on=("fullmarket_spot_snapshot:all", *_STOCK_DAILY_DEPS, "board_ranking:all", *_BOARD_CONS_DEPS, "chain_heat_snapshots:all"),
+    ),
     PostmarketTaskSpec("technical_signal_scan", "derived", depends_on=(*_STOCK_DAILY_DEPS, *_STOCK_30M_DEPS, "weekly_rollup:all")),
     PostmarketTaskSpec("knowledge_market_views", "derived"),
     PostmarketTaskSpec(
@@ -136,7 +141,7 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     PostmarketTaskSpec(
         "terminal_realtime_pool",
         "terminal",
-        depends_on=("technical_signal_scan:all", "knowledge_market_views:all", "chain_heat_snapshots:all", "concept_relationship_graph:all"),
+        depends_on=("technical_signal_scan:all", "knowledge_market_views:all", "postmarket_chain_rebuild:all", "chain_heat_snapshots:all", "concept_relationship_graph:all"),
         env={"TERMINAL_POOL_STRICT_SOURCES": "true"},
     ),
     PostmarketTaskSpec("strategy_snapshot", "terminal", depends_on=("terminal_realtime_pool:all",)),

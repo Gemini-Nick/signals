@@ -82,6 +82,54 @@ def test_terminal_stock_pool_signal_origin_classification_is_explicit():
     }) == "generated_risk_signal"
 
 
+def test_trade_role_does_not_guess_from_industry_keywords():
+    from signals.sync.modules.terminal_pool import _trade_role_from_context
+
+    row = {
+        "name": "测试股票",
+        "reason": "电池 煤炭 CPO 都只是文本噪音",
+        "setup_explanation": "等确认",
+        "missing_condition": "等30m买点",
+        "trader_action": "盯盘观察",
+    }
+
+    role = _trade_role_from_context(
+        row,
+        chain_position={"chain": "来源板块", "node": "映射节点", "phase": "mapped"},
+        trade_stage="watch_pool",
+        pool_type="watch",
+        blocked_by=[],
+    )
+
+    assert role == "chain_watch"
+
+
+def test_trade_role_uses_phase_and_gate_state():
+    from signals.sync.modules.terminal_pool import _trade_role_from_context
+
+    assert _trade_role_from_context(
+        {"chain_phase": "consensus_climax"},
+        chain_position={"phase": "consensus_climax"},
+        trade_stage="watch_pool",
+        pool_type="watch",
+        blocked_by=[],
+    ) == "climax_risk"
+    assert _trade_role_from_context(
+        {"chain_phase": "cooling"},
+        chain_position={"phase": "cooling"},
+        trade_stage="watch_pool",
+        pool_type="watch",
+        blocked_by=[],
+    ) == "second_wave"
+    assert _trade_role_from_context(
+        {"chain_phase": "warming"},
+        chain_position={"phase": "warming"},
+        trade_stage="watch_pool",
+        pool_type="watch",
+        blocked_by=[],
+    ) == "mainline_attack"
+
+
 def test_terminal_stock_pool_knowledge_conflict_downgrades_technical_candidate():
     rows = {}
     _add_reason(rows, "300575", {

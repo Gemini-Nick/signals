@@ -3862,38 +3862,43 @@ def _build_trader_task_queue(
 
 TRADE_ROLE_FILTERS = [
     {"key": "all", "label": "全部"},
-    {"key": "mainline_attack", "label": "主线进攻"},
-    {"key": "climax_risk", "label": "高潮别追"},
-    {"key": "holding_chain", "label": "电池链观察"},
-    {"key": "defensive_weight", "label": "防守权重"},
-    {"key": "second_wave", "label": "二波观察"},
+    {"key": "mainline_attack", "label": "主线机会"},
+    {"key": "climax_risk", "label": "过热禁追"},
+    {"key": "second_wave", "label": "回踩再起"},
+    {"key": "defensive_weight", "label": "防守观察"},
+    {"key": "chain_watch", "label": "产业链观察"},
     {"key": "risk_review", "label": "风险复核"},
+    {"key": "ordinary_watch", "label": "线索观察"},
 ]
 
 TRADE_ROLE_DEFINITIONS = {
     "mainline_attack": {
-        "definition": "chain_heat phase=accelerating/warming，或入池股票有较强主题加分。",
-        "source": "chain_heat_snapshots + terminal_stock_pool",
+        "definition": "板块/产业链处在升温或加速，且个股不被风控和过热条件阻断。",
+        "source": "chain_heat_snapshots + terminal_stock_pool.theme_rank_bonus",
     },
     "climax_risk": {
-        "definition": "chain_heat phase=consensus_climax，或买点被 chain_consensus_climax 阻断。",
-        "source": "chain_heat_snapshots + terminal_stock_pool blockers",
+        "definition": "板块/产业链一致过热，买点被过热条件阻断，只提示风险不推追高。",
+        "source": "chain_heat_snapshots.phase + terminal_stock_pool.blocked_by",
     },
-    "holding_chain": {
-        "definition": "电池/锂电/隔膜等产业链观察标签，不代表真实持仓。",
-        "source": "industry_chains.yaml representative map + terminal_stock_pool",
+    "chain_watch": {
+        "definition": "股票已映射到东财/同花顺板块图谱，但还没满足主线、回踩、防守或确认买点条件。",
+        "source": "security_chain_memberships + terminal_stock_pool",
     },
     "defensive_weight": {
-        "definition": "煤炭、油气、银行、保险、高股息、电力等防守属性关键词或产业链映射。",
-        "source": "industry_chains.yaml + terminal_stock_pool",
+        "definition": "只接收上游数据明确标记的防守/稳仓/高股息/低波属性，不用行业词硬猜。",
+        "source": "terminal_stock_pool.exposure_bucket",
     },
     "second_wave": {
-        "definition": "退潮/分化链条或回踩后二波观察，不等于历史上轮主线已被完整验证。",
+        "definition": "板块退潮/分化后，或个股进入低吸/试仓阶段，等待重新放量和右侧确认。",
         "source": "chain_heat phase=cooling/risk_off/diverging + terminal_stock_pool",
     },
     "risk_review": {
         "definition": "进入 risk/skip_now 或卖点、冲突、阻断条件未解除。",
         "source": "terminal_stock_pool risk rows",
+    },
+    "ordinary_watch": {
+        "definition": "只有线索或技术背景，没有可交易级别的产业链/买点/风控状态。",
+        "source": "terminal_stock_pool",
     },
 }
 
@@ -3901,35 +3906,27 @@ TRADE_ROLE_DEFINITIONS = {
 def _trade_role_for_shell_stock(row: dict[str, Any]) -> str:
     explicit = _text(row.get("trade_role") or row.get("trade_identity"))
     if explicit:
-        return explicit
+        return "chain_watch" if explicit == "holding_chain" else explicit
     chain = row.get("chain_position") if isinstance(row.get("chain_position"), dict) else {}
     context = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
-    text = " ".join([
-        _text(chain.get("chain")),
-        _text(chain.get("node")),
-        _text(chain.get("board_or_concept")),
-        _text(row.get("name")),
-        _text(row.get("reason")),
-        _text(row.get("setup_explanation")),
-        _text(row.get("missing_condition")),
-        _text(row.get("trader_action")),
-    ])
     phase = _text(row.get("chain_phase") or context.get("phase") or chain.get("phase"))
+    exposure_bucket = _text(row.get("exposure_bucket") or context.get("exposure_bucket") or chain.get("exposure_bucket"))
+    has_chain = any(_text(chain.get(key) or context.get(key)) for key in ("chain", "chain_name", "node", "node_name", "board_or_concept"))
     if _text(row.get("pool_type")) == "risk" or _text(row.get("trade_stage")) == "skip_now":
-        return "climax_risk" if phase == "consensus_climax" or "高潮" in text else "risk_review"
-    if phase == "consensus_climax" or "高潮" in text:
+        return "climax_risk" if phase == "consensus_climax" else "risk_review"
+    if phase == "consensus_climax":
         return "climax_risk"
-    if any(token in text for token in ("电池", "锂电", "隔膜", "正极", "负极", "电解液", "储能", "电新")):
-        return "holding_chain"
-    if any(token in text for token in ("煤炭", "油气", "银行", "保险", "运营商", "高股息", "红利", "电力")):
+    if exposure_bucket in {"defensive", "防守", "稳仓", "高股息", "低波"}:
         return "defensive_weight"
-    if any(token in text for token in ("光模块", "光通信", "CPO", "pcb", "PCB")):
+    if phase in {"cooling", "diverging"} or _text(row.get("trade_stage")) in {"dip_watch", "probe_candidate"}:
         return "second_wave"
     if phase in {"accelerating", "warming"} or (_float(row.get("theme_rank_bonus")) or 0) >= 12:
         return "mainline_attack"
     if _text(row.get("trade_stage")) in {"confirmed_entry", "probe_candidate"}:
         return "mainline_attack"
-    return "second_wave"
+    if has_chain:
+        return "chain_watch"
+    return "ordinary_watch"
 
 
 def _shell_stock_chain_brief(row: dict[str, Any]) -> str:
@@ -3992,22 +3989,22 @@ def _build_trade_map(
     climax = next((row for row in sector_boards if _text(row.get("phase")) == "consensus_climax"), {})
     mainline = next((row for row in sector_boards if _text(row.get("phase")) in {"accelerating", "warming"}), {})
     retreat = next((row for row in sector_boards if _text(row.get("phase")) in {"cooling", "risk_off", "diverging"}), {})
-    holding = _first_stock_for_role(stock_rows, "holding_chain")
+    chain_watch = _first_stock_for_role(stock_rows, "chain_watch")
     defensive = _first_stock_for_role(stock_rows, "defensive_weight")
     second_wave = _first_stock_for_role(stock_rows, "second_wave")
     items: list[dict[str, Any]] = []
     if mainline:
-        items.append(_sector_role_item(mainline, "mainline_attack", "主线候选", "加速中，等分歧承接，不盲追。"))
+        items.append(_sector_role_item(mainline, "mainline_attack", "主线机会", "升温/加速中，只看分歧承接。"))
     if climax:
-        items.append(_sector_role_item(climax, "climax_risk", "高潮风险", "一致高潮，不追高，等分歧后的核心票。"))
+        items.append(_sector_role_item(climax, "climax_risk", "过热风险", "一致过热，不追高，等分歧后的核心票。"))
     if retreat:
-        items.append(_sector_role_item(retreat, "second_wave", "退潮/二波", "退潮/分化后等二波。"))
-    if holding:
-        items.append(_stock_role_item(holding, "holding_chain", "电池链", "电池链观察，等30m承接确认。"))
+        items.append(_sector_role_item(retreat, "second_wave", "回踩再起", "退潮/分化后等重新放量。"))
+    if chain_watch:
+        items.append(_stock_role_item(chain_watch, "chain_watch", "产业链观察", "已入东财/同花顺图谱，等30m承接确认。"))
     if defensive:
-        items.append(_stock_role_item(defensive, "defensive_weight", "防守观察", "防守权重，偏稳仓节奏。"))
+        items.append(_stock_role_item(defensive, "defensive_weight", "防守观察", "偏稳仓节奏，不和进攻票混排。"))
     if second_wave and not any(item.get("role") == "second_wave" for item in items):
-        items.append(_stock_role_item(second_wave, "second_wave", "二波观察", "退潮后观察二波。"))
+        items.append(_stock_role_item(second_wave, "second_wave", "回踩再起", "退潮后观察重新放量。"))
     counts = {item["key"]: 0 for item in TRADE_ROLE_FILTERS if item["key"] != "all"}
     for row in stock_rows:
         role = _trade_role_for_shell_stock(row)
@@ -4040,25 +4037,25 @@ def _build_ai_alerts(trade_map: dict[str, Any]) -> list[dict[str, Any]]:
             alerts.append({
                 "level": "warning",
                 "role": role,
-                "text": f"{name or '主线'}已一致高潮，确认买点不再推追高。",
-                "command": "排除高潮票",
+                "text": f"{name or '主线'}已一致过热，确认买点不再推追高。",
+                "command": "排除过热票",
             })
-        elif role == "holding_chain":
+        elif role == "chain_watch":
             alerts.append({
                 "level": "info",
                 "role": role,
-                "text": f"{name or '电池链观察'}是产业链观察标签，不代表真实持仓；只等承接确认。",
-                "command": "只看电池链观察",
+                "text": f"{name or '产业链观察'}只表示板块图谱归属，不代表真实持仓；只等承接确认。",
+                "command": "只看产业链观察",
             })
     return alerts[:3]
 
 
 def _trade_command_suggestions() -> list[str]:
     return [
-        "只看电池链观察",
-        "排除高潮票",
+        "只看产业链观察",
+        "排除过热票",
         "解释这只票为什么入池",
-        "列出半导体分歧后可看的核心票",
+        "列出主线分歧后可看的核心票",
         "哪些票不符合我当前节奏",
     ]
 
@@ -5274,9 +5271,11 @@ def _summary_from_static_index(name: str, symbol: str, chart: Dict[str, Any]) ->
             "chain_position": chain_position,
             "trade_role": trade_role,
             "trade_role_label": {
-                "holding_chain": "电池链观察",
-                "defensive_weight": "防守权重",
-                "second_wave": "二波观察",
+                "chain_watch": "产业链观察",
+                "mainline_attack": "主线机会",
+                "climax_risk": "过热禁追",
+                "defensive_weight": "防守观察",
+                "second_wave": "回踩再起",
             }.get(trade_role, "观察"),
             "trader_read": _stock_summary_trade_read(chain_position, trade_role),
             "evidence_summary": "；".join([
@@ -5338,18 +5337,14 @@ def _stock_chain_position_summary(symbol: str) -> dict[str, Any]:
 
 
 def _trade_role_for_stock_summary(chain_position: dict[str, Any]) -> str:
-    text = " ".join([
-        _text(chain_position.get("chain")),
-        _text(chain_position.get("node")),
-        _text(chain_position.get("role")),
-    ])
-    if any(token in text for token in ("电池", "锂电", "隔膜", "正极", "负极", "电解液", "储能", "电新")):
-        return "holding_chain"
-    if any(token in text for token in ("煤炭", "油气", "银行", "保险", "运营商", "高股息", "红利", "电力")):
-        return "defensive_weight"
-    if any(token in text for token in ("光模块", "光通信", "CPO", "pcb", "PCB")):
+    phase = _text(chain_position.get("phase"))
+    if phase == "consensus_climax":
+        return "climax_risk"
+    if phase in {"cooling", "diverging"}:
         return "second_wave"
-    return "second_wave"
+    if phase in {"accelerating", "warming"}:
+        return "mainline_attack"
+    return "chain_watch"
 
 
 def _stock_summary_trade_read(chain_position: dict[str, Any], role: str) -> str:
@@ -5358,12 +5353,16 @@ def _stock_summary_trade_read(chain_position: dict[str, Any], role: str) -> str:
         for value in [_text(chain_position.get("chain")), _text(chain_position.get("node") or chain_position.get("role"))]
         if value
     )
-    if role == "holding_chain":
-        return f"{chain or '电池链'}：不在当前买点池时只按产业链观察，不代表真实持仓；等重新进入盯盘/确认买点。"
+    if role == "chain_watch":
+        return f"{chain or '产业链'}：不在当前买点池时只按产业链观察，不代表真实持仓；等重新进入盯盘/确认买点。"
+    if role == "mainline_attack":
+        return f"{chain or '主线'}：按主线机会观察，等分歧承接和右侧买点确认。"
+    if role == "climax_risk":
+        return f"{chain or '主线'}：一致过热，不追高，等分歧后核心票重新承接。"
     if role == "defensive_weight":
-        return f"{chain or '防守权重'}：偏稳仓/防守，不和进攻票混排，没进池前只看图表位置。"
+        return f"{chain or '防守观察'}：偏稳仓/防守，不和进攻票混排，没进池前只看图表位置。"
     if role == "second_wave":
-        return f"{chain or '二波观察'}：当前不在池内，先按二波/回踩观察，等右侧重新确认。"
+        return f"{chain or '回踩再起'}：当前不在池内，先按回踩后二次启动观察，等右侧重新确认。"
     return f"{chain or '观察标的'}：当前不在机会池，先看图表证据，不作为执行买点。"
 
 
@@ -5429,9 +5428,11 @@ def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any
             "chain_position": chain_position,
             "trade_role": trade_role,
             "trade_role_label": {
-                "holding_chain": "电池链观察",
-                "defensive_weight": "防守权重",
-                "second_wave": "二波观察",
+                "chain_watch": "产业链观察",
+                "mainline_attack": "主线机会",
+                "climax_risk": "过热禁追",
+                "defensive_weight": "防守观察",
+                "second_wave": "回踩再起",
             }.get(trade_role, "观察"),
             "trader_read": _stock_summary_trade_read(chain_position, trade_role),
             "evidence_summary": "；".join([

@@ -7,6 +7,14 @@ from signals.sync.modules import board_cons
 from signals.sync.task_context import task_env
 
 
+class _Cursor(list):
+    def sort(self, *args, **kwargs):
+        return self
+
+    def limit(self, n):
+        return _Cursor(self[:n])
+
+
 class _Collection:
     def __init__(self):
         self.docs = {}
@@ -14,7 +22,21 @@ class _Collection:
     def find_one(self, query, projection=None, sort=None):
         if "_id" in query:
             return self.docs.get(query["_id"])
+        for doc in self.docs.values():
+            if all(doc.get(key) == value for key, value in (query or {}).items()):
+                return doc
         return None
+
+    def find(self, query=None, projection=None):
+        query = query or {}
+        rows = []
+        for doc in self.docs.values():
+            if all(doc.get(key) == value for key, value in query.items()):
+                if projection:
+                    rows.append({key: doc.get(key) for key in projection})
+                else:
+                    rows.append(dict(doc))
+        return _Cursor(rows)
 
     def update_one(self, query, update, upsert=False):
         key = query.get("_id")
@@ -49,6 +71,19 @@ def test_eastmoney_board_code_map_paginates(monkeypatch):
     assert mapping["行业0"] == "BK0000"
     assert mapping["行业B"] == "BK0002"
     assert len(mapping) == 101
+
+
+def test_board_cons_coverage_names_use_only_em_and_ths_snapshots():
+    db = _DB()
+    db["board_em"].docs["em"] = {"_id": "em", "dt": "2026-04-30", "board_name": "东财行业"}
+    db["board_ths"].docs["ths"] = {"_id": "ths", "dt": "2026-04-30", "board_name": "同花顺行业"}
+    db["board_sina"].docs["sina"] = {"_id": "sina", "dt": "2026-04-30", "board_name": "新浪行业"}
+    db["concept_em"].docs["em"] = {"_id": "em", "dt": "2026-04-30", "board_name": "东财概念"}
+    db["concept_ths"].docs["ths"] = {"_id": "ths", "dt": "2026-04-30", "board_name": "同花顺概念"}
+    db["concept_sina"].docs["sina"] = {"_id": "sina", "dt": "2026-04-30", "board_name": "新浪概念"}
+
+    assert board_cons._get_board_list(db) == ["东财行业", "同花顺行业"]
+    assert board_cons._get_concept_list(db) == ["东财概念", "同花顺概念"]
 
 
 def test_board_cons_marks_unmapped_without_retrying_fallback(monkeypatch):

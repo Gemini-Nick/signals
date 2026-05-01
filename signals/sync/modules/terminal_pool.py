@@ -85,13 +85,14 @@ TRADE_INTENT_LABELS = {
     "skip_now": "暂不参与",
 }
 TRADE_ROLE_LABELS = {
-    "mainline_attack": "主线进攻",
-    "climax_risk": "高潮别追",
-    # Internal key kept for backward compatibility. This is not a real-position signal.
-    "holding_chain": "电池链观察",
-    "defensive_weight": "防守权重",
-    "second_wave": "二波观察",
+    "mainline_attack": "主线机会",
+    "climax_risk": "过热禁追",
+    "chain_watch": "产业链观察",
+    "holding_chain": "产业链观察",
+    "defensive_weight": "防守观察",
+    "second_wave": "回踩再起",
     "risk_review": "风险复核",
+    "ordinary_watch": "线索观察",
 }
 TRADE_INTENT_PRIORITY = {
     "confirmed_entry": 100,
@@ -155,6 +156,7 @@ REASON_WEIGHTS = {
     "knowledge_confirmed": 0,
     "knowledge_conflict": 0,
     "knowledge_watch": 0,
+    "chain_membership": 0,
     "chain_context": 0,
     "chain_core_rep": 0,
     "chain_elastic_rep": 0,
@@ -487,8 +489,6 @@ def _chain_decision_effect(phase: str) -> str:
         return "confirm"
     if phase in {"consensus_climax", "risk_off"}:
         return "exit_priority"
-    if phase in {"diverging", "cooling"}:
-        return "block"
     return "context_only"
 
 
@@ -599,7 +599,15 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
         "score": _float(reason.get("score")),
         "confidence": _float(reason.get("confidence")),
         "chain_id": _text(reason.get("chain_id")),
+        "chain_name": _text(reason.get("chain_name")),
         "node_id": _text(reason.get("node_id")),
+        "node_name": _text(reason.get("node_name")),
+        "layer": _text(reason.get("layer")),
+        "stage": _text(reason.get("stage")),
+        "membership_type": _text(reason.get("membership_type")),
+        "membership_confidence": _float(reason.get("membership_confidence") or reason.get("confidence")),
+        "exposure_score": _float(reason.get("exposure_score")),
+        "evidence_sources": [item for item in reason.get("evidence_sources") or [] if _text(item)],
         "board_or_concept": _text(reason.get("board_or_concept")),
         "as_of": as_of,
         "event_dt": event_dt,
@@ -673,11 +681,19 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
             "as_of": normalized["as_of"],
             "evidence": normalized["evidence"],
         }
-    if reason_type in {"chain_context", "chain_core_rep", "chain_elastic_rep", "source_leader", "constituent_hot"}:
+    if reason_type in {"chain_membership", "chain_context", "chain_core_rep", "chain_elastic_rep", "source_leader", "constituent_hot"}:
         phase = _text(normalized["evidence"].get("phase") if isinstance(normalized.get("evidence"), dict) else "")
         row["chain_context"] = {
             "chain_id": normalized.get("chain_id"),
+            "chain_name": normalized.get("chain_name"),
             "node_id": normalized.get("node_id"),
+            "node_name": normalized.get("node_name"),
+            "layer": normalized.get("layer"),
+            "stage": normalized.get("stage"),
+            "membership_type": normalized.get("membership_type"),
+            "membership_confidence": normalized.get("membership_confidence"),
+            "exposure_score": normalized.get("exposure_score"),
+            "evidence_sources": normalized.get("evidence_sources") or [],
             "board_or_concept": normalized.get("board_or_concept"),
             "phase": phase,
             "effect": normalized.get("decision_effect") or _chain_decision_effect(phase),
@@ -1403,6 +1419,190 @@ def _add_chain_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: 
                     },
                 }, index_codes=index_codes, name=stock_names.get(code, ""))
                 added_constituents += 1
+
+
+def _latest_chain_membership_trade_date(db: Database) -> str:
+    doc = db["security_chain_memberships"].find_one(
+        {"trade_date": {"$exists": True}},
+        {"trade_date": 1},
+        sort=[("trade_date", -1), ("updated_at", -1)],
+    ) or {}
+    return _text(doc.get("trade_date"))
+
+
+def _latest_chain_rollups(db: Database, limit: int = 48) -> list[dict[str, Any]]:
+    latest = db["chain_node_security_rollups"].find_one(
+        {"trade_date": {"$exists": True}},
+        {"trade_date": 1},
+        sort=[("trade_date", -1), ("updated_at", -1)],
+    ) or {}
+    trade_date = _text(latest.get("trade_date"))
+    if not trade_date:
+        return []
+    return list(db["chain_node_security_rollups"].find(
+        {"trade_date": trade_date, "market": "A"},
+        {"_id": 0},
+    ).sort([("heat_score", -1), ("covered_security_count", -1), ("avg_confidence", -1)]).limit(limit))
+
+
+def _latest_chain_heat_by_node(db: Database) -> dict[tuple[str, str], dict[str, Any]]:
+    latest = db["chain_heat_snapshots"].find_one({"market": "A"}, {"trade_minute": 1}, sort=[("trade_minute", -1)]) or {}
+    trade_minute = latest.get("trade_minute")
+    if not trade_minute:
+        return {}
+    return {
+        (_text(row.get("chain_id")), _text(row.get("node_id"))): row
+        for row in db["chain_heat_snapshots"].find(
+            {"market": "A", "trade_minute": trade_minute},
+            {"_id": 0},
+        )
+    }
+
+
+def _chain_phase_from_rollup(rollup: dict[str, Any], heat_by_node: dict[tuple[str, str], dict[str, Any]]) -> str:
+    heat = heat_by_node.get((_text(rollup.get("chain_id")), _text(rollup.get("node_id"))), {})
+    return _text(heat.get("phase") or rollup.get("phase"))
+
+
+def _chain_effect_from_phase(phase: str) -> str:
+    if phase == "consensus_climax":
+        return "exit_priority"
+    if phase == "risk_off":
+        return "exit_priority"
+    if phase in {"accelerating", "warming"}:
+        return "confirm"
+    return "context_only"
+
+
+def _membership_reason_from_security(
+    *,
+    security: dict[str, Any],
+    rollup: dict[str, Any],
+    phase: str,
+    can_create_candidate: bool,
+) -> dict[str, Any]:
+    evidence_sources = [item for item in security.get("evidence_sources") or [] if _text(item)]
+    signal_type = {
+        "accelerating": "产业链主线加速",
+        "warming": "产业链升温",
+        "consensus_climax": "产业链一致高潮",
+        "cooling": "产业链退潮观察",
+        "diverging": "产业链分化观察",
+        "risk_off": "产业链风险退潮",
+    }.get(phase, "产业链归属")
+    effect = _chain_effect_from_phase(phase)
+    return {
+        "reason_type": "chain_membership",
+        "source_collection": "security_chain_memberships",
+        "source_doc_id": _text(security.get("security_id")) or _text(security.get("symbol")),
+        "signal_type": signal_type,
+        "signal_side": "neutral",
+        "source_role": "context",
+        "decision_effect": effect,
+        "can_create_candidate": can_create_candidate,
+        "score": _float(rollup.get("heat_score")),
+        "confidence": _float(security.get("confidence")),
+        "membership_confidence": _float(security.get("confidence")),
+        "exposure_score": _float(security.get("exposure_score")),
+        "chain_id": _text(rollup.get("chain_id")),
+        "chain_name": _text(rollup.get("chain_name")),
+        "node_id": _text(rollup.get("node_id")),
+        "node_name": _text(rollup.get("node_name")),
+        "layer": _text(rollup.get("layer")),
+        "stage": _text(rollup.get("stage")),
+        "membership_type": _text(security.get("membership_type")),
+        "board_or_concept": _text(rollup.get("node_name") or rollup.get("chain_name")),
+        "evidence_sources": evidence_sources,
+        "as_of": _text(rollup.get("trade_date")),
+        "evidence": {
+            "phase": phase,
+            "rank": rollup.get("rank") or rollup.get("coverage_rank"),
+            "heat_score": rollup.get("heat_score"),
+            "covered_security_count": rollup.get("covered_security_count"),
+            "primary_security_count": rollup.get("primary_security_count"),
+            "membership_type": security.get("membership_type"),
+            "confidence": security.get("confidence"),
+            "exposure_score": security.get("exposure_score"),
+            "evidence_sources": evidence_sources,
+            "source_policy": "postmarket_chain_rebuild",
+        },
+    }
+
+
+def _add_chain_membership_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str]) -> None:
+    heat_by_node = _latest_chain_heat_by_node(db)
+    added = 0
+    for rollup in _latest_chain_rollups(db, limit=48):
+        phase = _chain_phase_from_rollup(rollup, heat_by_node)
+        # Do not create a broad clue from cold taxonomy-only rollups. Existing
+        # technical rows are still enriched by `_attach_membership_context`.
+        hot_or_actionable = phase in {"accelerating", "warming", "consensus_climax", "cooling", "diverging", "risk_off"} or _float(rollup.get("heat_score")) > 0
+        if not hot_or_actionable:
+            continue
+        per_rollup_limit = 6 if phase in {"accelerating", "warming"} else 4
+        for security in (rollup.get("top_securities") or [])[:per_rollup_limit]:
+            if not isinstance(security, dict):
+                continue
+            reason = _membership_reason_from_security(
+                security=security,
+                rollup=rollup,
+                phase=phase,
+                can_create_candidate=True,
+            )
+            _add_reason(rows, security.get("symbol") or security.get("raw_code"), reason, index_codes=index_codes, name=_text(security.get("name")))
+            added += 1
+            if added >= 160:
+                return
+
+
+def _attach_membership_context(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str]) -> None:
+    if not rows:
+        return
+    trade_date = _latest_chain_membership_trade_date(db)
+    if not trade_date:
+        return
+    codes = sorted(rows)
+    cursor = db["security_chain_memberships"].find(
+        {"trade_date": trade_date, "raw_code": {"$in": codes}},
+        {"_id": 0},
+    ).sort([("is_primary_chain", -1), ("exposure_score", -1), ("confidence", -1)])
+    best_by_code: dict[str, dict[str, Any]] = {}
+    for row in cursor:
+        code = _text(row.get("raw_code"))
+        if code and code not in best_by_code:
+            best_by_code[code] = row
+    heat_by_node = _latest_chain_heat_by_node(db)
+    for code, membership in best_by_code.items():
+        phase = _text((heat_by_node.get((_text(membership.get("chain_id")), _text(membership.get("node_id")))) or {}).get("phase")) or "mapped"
+        rollup = {
+            "trade_date": trade_date,
+            "chain_id": membership.get("chain_id"),
+            "chain_name": membership.get("chain_name"),
+            "node_id": membership.get("node_id"),
+            "node_name": membership.get("node_name"),
+            "layer": membership.get("layer"),
+            "stage": membership.get("stage"),
+            "phase": phase,
+            "heat_score": 0,
+            "covered_security_count": 0,
+        }
+        security = {
+            "security_id": membership.get("security_id"),
+            "symbol": membership.get("symbol"),
+            "raw_code": membership.get("raw_code"),
+            "name": membership.get("name"),
+            "membership_type": membership.get("membership_type"),
+            "confidence": membership.get("confidence"),
+            "exposure_score": membership.get("exposure_score"),
+            "evidence_sources": membership.get("evidence_sources") or [],
+        }
+        reason = _membership_reason_from_security(
+            security=security,
+            rollup=rollup,
+            phase=phase,
+            can_create_candidate=False,
+        )
+        _add_reason(rows, code, reason, index_codes=index_codes, name=_text(membership.get("name")))
 
 
 def _add_active_pool(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str]) -> None:
@@ -2134,6 +2334,10 @@ def _chain_position(row: dict[str, Any]) -> dict[str, Any]:
         "layer": _text(chain.get("layer") or evidence.get("layer")),
         "stage": _text(chain.get("stage") or evidence.get("stage")),
         "phase": _text(chain.get("phase") or evidence.get("phase")),
+        "membership_type": _text(chain.get("membership_type") or evidence.get("membership_type")),
+        "membership_confidence": _float(chain.get("membership_confidence") or evidence.get("confidence")),
+        "exposure_score": _float(chain.get("exposure_score") or evidence.get("exposure_score")),
+        "evidence_sources": chain.get("evidence_sources") or evidence.get("evidence_sources") or [],
         "role": "链主" if "chain_core_rep" in row.get("source_tags", []) or "source_leader" in row.get("source_tags", []) else "弹性/成分" if any(tag in row.get("source_tags", []) for tag in ("chain_elastic_rep", "constituent_hot")) else "",
     }
     if any(position.get(key) for key in ("chain", "node", "board_or_concept", "role")):
@@ -2273,34 +2477,33 @@ def _trade_role_from_context(
     pool_type: str,
     blocked_by: list[str],
 ) -> str:
+    chain_context = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
     phase = _text(row.get("chain_phase") or chain_position.get("phase"))
-    text = " ".join([
-        _text(chain_position.get("chain")),
-        _text(chain_position.get("node")),
-        _text(chain_position.get("board_or_concept")),
-        _text(row.get("name")),
-        _text(row.get("reason")),
-        _text(row.get("setup_explanation")),
-        _text(row.get("missing_condition")),
-        _text(row.get("trader_action")),
-    ])
+    chain_evidence = chain_context.get("evidence") if isinstance(chain_context.get("evidence"), dict) else {}
+    exposure_bucket = _text(
+        row.get("exposure_bucket")
+        or chain_position.get("exposure_bucket")
+        or chain_context.get("exposure_bucket")
+        or chain_evidence.get("exposure_bucket")
+    )
+    has_chain_context = any(_text(chain_position.get(key) or chain_context.get(key)) for key in ("chain", "chain_name", "node", "node_name", "board_or_concept"))
     if pool_type == "risk" or trade_stage == "skip_now":
-        if phase == "consensus_climax" or "chain_consensus_climax" in blocked_by or "高潮" in text:
+        if phase == "consensus_climax" or "chain_consensus_climax" in blocked_by:
             return "climax_risk"
         return "risk_review"
-    if phase == "consensus_climax" or "chain_consensus_climax" in blocked_by or "高潮" in text:
+    if phase == "consensus_climax" or "chain_consensus_climax" in blocked_by:
         return "climax_risk"
-    if any(token in text for token in ("电池", "锂电", "隔膜", "正极", "负极", "电解液", "储能", "电新")):
-        return "holding_chain"
-    if any(token in text for token in ("煤炭", "油气", "银行", "保险", "运营商", "高股息", "红利", "电力")):
+    if exposure_bucket in {"defensive", "防守", "稳仓", "高股息", "低波"}:
         return "defensive_weight"
-    if any(token in text for token in ("光模块", "光通信", "CPO", "pcb", "PCB")):
+    if phase in {"cooling", "diverging"} or trade_stage in {"dip_watch", "probe_candidate"}:
         return "second_wave"
     if phase in {"accelerating", "warming"} or _float(row.get("theme_rank_bonus")) >= 12:
         return "mainline_attack"
-    if trade_stage in {"dip_watch", "probe_candidate"}:
-        return "second_wave"
-    return "mainline_attack" if trade_stage == "confirmed_entry" else "second_wave"
+    if trade_stage == "confirmed_entry":
+        return "mainline_attack"
+    if has_chain_context:
+        return "chain_watch"
+    return "ordinary_watch"
 
 
 def _trader_read_summary(
@@ -2315,12 +2518,12 @@ def _trader_read_summary(
     prefix = TRADE_ROLE_LABELS.get(trade_role, "观察")
     if trade_role == "climax_risk":
         return f"{chain or '主线'}：一致高潮，确认买点不再推追高，等分歧后的承接。"
-    if trade_role == "holding_chain":
-        return f"{chain or '电池链'}：按产业链观察处理，不代表真实持仓；等30m承接和5m/15m下单确认。"
+    if trade_role in {"chain_watch", "holding_chain"}:
+        return f"{chain or '产业链'}：只说明已进入东财/同花顺板块图谱，不代表真实持仓；等30m承接和5m/15m下单确认。"
     if trade_role == "defensive_weight":
-        return f"{chain or '防守权重'}：偏稳仓/防守，不和进攻票混排，回踩爬起再看仓位。"
+        return f"{chain or '防守观察'}：偏稳仓/防守，不和进攻票混排，回踩爬起再看仓位。"
     if trade_role == "second_wave":
-        return f"{chain or '上一轮主线'}：先当二波观察，退潮后等重新放量和右侧确认。"
+        return f"{chain or '回踩再起'}：先当回踩后二次启动观察，等重新放量和右侧确认。"
     if trade_role == "risk_review":
         return f"{chain or prefix}：先复核风险，卖点/冲突解除前不当机会处理。"
     if trade_stage == "confirmed_entry":
@@ -2673,6 +2876,16 @@ def _finalize_pool_row(
     row["trade_role_label"] = TRADE_ROLE_LABELS.get(trade_role, "观察")
     row["trade_identity"] = trade_role
     row["trade_identity_label"] = row["trade_role_label"]
+    row["primary_chain"] = _text(chain_position.get("chain"))
+    row["chain_node"] = _text(chain_position.get("node"))
+    row["chain_phase"] = _text(chain_position.get("phase") or row.get("chain_phase"))
+    row["membership_confidence"] = _float(chain_position.get("membership_confidence"))
+    row["evidence_sources"] = [item for item in chain_position.get("evidence_sources") or [] if _text(item)]
+    row["can_trade_now"] = bool(
+        pool_type == "focus"
+        and entry_gate_status == "entry_confirmed"
+        and trade_role not in {"climax_risk", "risk_review"}
+    )
     row["trader_read"] = _trader_read_summary(
         row,
         trade_role=trade_role,
@@ -2850,9 +3063,10 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     _add_user_pinned(rows, index_codes, now)
     _add_technical_signal_rows(rows, db, index_codes)
     _add_signal_rows(rows, db, index_codes, include_generated_daily=False)
-    _add_chain_rows(rows, db, index_codes)
+    _add_chain_membership_rows(rows, db, index_codes)
     _add_knowledge_rows(rows, db, index_codes)
     _add_review_clue_rows(rows, db, index_codes)
+    _attach_membership_context(rows, db, index_codes)
     strict_candidate_count = len(rows)
     fallback_count = 0
     fallback_enabled = False

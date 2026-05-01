@@ -289,8 +289,8 @@ def _unique(values: list[str]) -> list[str]:
 
 def _ranking_names(db: Database, collection: str, fields: tuple[str, ...]) -> list[str]:
     latest = db[collection].find_one(
-        {"source": "canonical"}, {"dt": 1}, sort=[("dt", -1)])
-    query = {"source": "canonical"}
+        {"source": "canonical", "source_scope": "em_ths_required"}, {"dt": 1}, sort=[("dt", -1)])
+    query = {"source": "canonical", "source_scope": "em_ths_required"}
     if latest and latest.get("dt"):
         query["dt"] = latest["dt"]
     names: list[str] = []
@@ -304,20 +304,32 @@ def _ranking_names(db: Database, collection: str, fields: tuple[str, ...]) -> li
     return _unique(names)
 
 
+def _latest_source_names(db: Database, collections: tuple[str, ...], fields: tuple[str, ...]) -> list[str]:
+    names: list[str] = []
+    for collection in collections:
+        latest = db[collection].find_one({}, {"dt": 1}, sort=[("dt", -1)])
+        if not latest or not latest.get("dt"):
+            continue
+        docs = db[collection].find({"dt": latest["dt"]}, {field: 1 for field in fields}).sort("rank_idx", 1)
+        for doc in docs:
+            for field in fields:
+                value = _text(doc.get(field))
+                if value:
+                    names.append(value)
+                    break
+    return _unique(names)
+
+
 def _get_board_list(db: Database) -> list:
-    """获取行业列表（优先最新 canonical board_ranking）。"""
+    """获取行业列表：覆盖范围只取东财 + 同花顺。"""
+
+    boards = _latest_source_names(db, ("board_em", "board_ths"), ("board_name", "name", "label"))
+    if boards:
+        return boards
 
     boards = _ranking_names(db, "board_ranking", ("board_name", "name", "label"))
     if boards:
         return boards
-
-    # 兼容旧数据：取最新 board_ths source snapshot。
-    latest = db["board_ths"].find_one({}, {"dt": 1}, sort=[("dt", -1)])
-    if latest and latest.get("dt"):
-        docs = db["board_ths"].find({"dt": latest["dt"]}, {"board_name": 1})
-        boards = [d["board_name"] for d in docs if d.get("board_name")]
-        if boards:
-            return boards
 
     # 兜底：从 AKShare 获取
     try:
@@ -331,21 +343,12 @@ def _get_board_list(db: Database) -> list:
 
 
 def _get_concept_list(db: Database) -> list[str]:
+    concepts = _latest_source_names(db, ("concept_em", "concept_ths"), ("concept_name", "board_name", "concept", "name", "label"))
+    if concepts:
+        return concepts
     concepts = _ranking_names(db, "concept_ranking", ("concept_name", "board_name", "concept", "name", "label"))
     if concepts:
         return concepts
-    for collection in ("concept_sina", "concept_em", "concept_ths"):
-        docs = db[collection].find({}, {"concept_name": 1, "board_name": 1, "concept": 1, "name": 1}).sort("dt", -1).limit(300)
-        values: list[str] = []
-        for doc in docs:
-            for field in ("concept_name", "board_name", "concept", "name"):
-                value = _text(doc.get(field))
-                if value:
-                    values.append(value)
-                    break
-        concepts = _unique(values)
-        if concepts:
-            return concepts
     try:
         df = _call_provider(ak.stock_board_concept_name_em)
         if df is not None and not df.empty:

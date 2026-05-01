@@ -383,7 +383,9 @@ def _sync_ths_concept(db: Database) -> int:
 
 def _rebuild_board_canonical(db: Database) -> int:
     dfs = {}
-    for src, col_name in [("em", "board_em"), ("ths", "board_ths"), ("sina", "board_sina")]:
+    # Canonical board coverage is restricted to Eastmoney + THS. Sina remains a
+    # supplemental quote/health source and must not expand the board universe.
+    for src, col_name in [("em", "board_em"), ("ths", "board_ths")]:
         docs = list(db[col_name].find({"dt": _today()}, {"_id": 0}))
         if docs:
             dfs[src] = pd.DataFrame(docs)
@@ -393,6 +395,7 @@ def _rebuild_board_canonical(db: Database) -> int:
     merged = merged.sort_values("change_pct", ascending=False).reset_index(drop=True)
     merged["rank_idx"] = range(len(merged))
     merged["source"] = "canonical"
+    merged["source_scope"] = "em_ths_required"
     docs = merged.to_dict("records")
     _replace_docs(db, "board_ranking", docs, {"dt": _today(), "source": "canonical"})
     db["data_freshness"].update_one(
@@ -410,9 +413,9 @@ def _rebuild_board_canonical(db: Database) -> int:
 
 
 def _rebuild_concept_canonical(db: Database) -> int:
-    # Priority: Sina broad coverage, then Eastmoney rich fields, then THS names.
+    # Canonical concept coverage is restricted to Eastmoney + THS.
     frames = []
-    for col_name in ["concept_sina", "concept_em", "concept_ths"]:
+    for col_name in ["concept_em", "concept_ths"]:
         docs = list(db[col_name].find({"dt": _today()}, {"_id": 0}))
         if docs:
             frames.append(pd.DataFrame(docs))
@@ -426,6 +429,7 @@ def _rebuild_concept_canonical(db: Database) -> int:
     merged = merged.reset_index(drop=True)
     merged["rank_idx"] = range(len(merged))
     merged["source"] = "canonical"
+    merged["source_scope"] = "em_ths_required"
     docs = merged.to_dict("records")
     _replace_docs(db, "concept_ranking", docs, {"dt": _today(), "source": "canonical"})
     db["data_freshness"].update_one(
