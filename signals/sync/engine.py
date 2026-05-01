@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 
-from signals.core.market_hours import Market, TZ_BEIJING, TZ_US_EAST, TZ_UTC, get_active_markets
+from signals.core.market_hours import Market, TZ_BEIJING, TZ_US_EAST, TZ_UTC, get_active_markets, next_live_check_seconds
 from .db import get_db, close as close_db
 
 logger = logging.getLogger("signals.sync")
@@ -852,8 +852,12 @@ class SyncEngine:
                 active_label = ",".join(market.value for market in sorted(active_markets, key=lambda item: item.value))
                 logger.info("live markets active=%s BJ=%s ET=%s", active_label, now.strftime("%Y-%m-%d %H:%M:%S"), datetime.now(TZ_US_EAST).strftime("%Y-%m-%d %H:%M:%S %Z"))
                 self._run_intraday_bundle(active_markets, now)
+                sleep_seconds = check_interval
+            else:
+                next_seconds = next_live_check_seconds(self._now_utc())
+                sleep_seconds = min(max(next_seconds, check_interval), 3600)
 
-            time.sleep(check_interval)
+            time.sleep(sleep_seconds)
 
 
 def _setup_logging(level: str = "INFO"):

@@ -1,0 +1,176 @@
+# 多市场多品种交易时段定义
+# days: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
+# open/close: 本地时间 (timezone 字段指定时区)
+
+schedules:
+  # ── 中国A股: 上交所/深交所 ──
+  - exchange: SSE
+    instrument: equity
+    market: A
+    timezone: Asia/Shanghai
+    sessions:
+      - {open: "09:30", close: "11:30", days: [0,1,2,3,4], label: "早盘"}
+      - {open: "13:00", close: "15:00", days: [0,1,2,3,4], label: "午盘"}
+
+  - exchange: SZSE
+    instrument: equity
+    market: A
+    timezone: Asia/Shanghai
+    sessions:
+      - {open: "09:30", close: "11:30", days: [0,1,2,3,4], label: "早盘"}
+      - {open: "13:00", close: "15:00", days: [0,1,2,3,4], label: "午盘"}
+
+  # ── 中国ETF期权: 上交所/深交所 ──
+  - exchange: SSE
+    instrument: equity_option
+    market: A
+    timezone: Asia/Shanghai
+    sessions:
+      - {open: "09:30", close: "11:30", days: [0,1,2,3,4], label: "早盘"}
+      - {open: "13:00", close: "15:00", days: [0,1,2,3,4], label: "午盘"}
+
+  - exchange: SZSE
+    instrument: equity_option
+    market: A
+    timezone: Asia/Shanghai
+    sessions:
+      - {open: "09:30", close: "11:30", days: [0,1,2,3,4], label: "早盘"}
+      - {open: "13:00", close: "15:00", days: [0,1,2,3,4], label: "午盘"}
+
+  # ── 中金所: 股指期货 (IF/IC/IM/IH) ──
+  - exchange: CFFEX
+    instrument: index_future
+    market: A
+    timezone: Asia/Shanghai
+    sessions:
+      - {open: "09:30", close: "11:30", days: [0,1,2,3,4], label: "早盘"}
+      - {open: "13:00", close: "15:00", days: [0,1,2,3,4], label: "午盘"}
+
+  # ── 中金所: 国债期货 ──
+  - exchange: CFFEX
+    instrument: bond_future
+    market: A
+    timezone: Asia/Shanghai
+    sessions:
+      - {open: "09:15", close: "11:30", days: [0,1,2,3,4], label: "早盘"}
+      - {open: "13:00", close: "15:15", days: [0,1,2,3,4], label: "午盘"}
+
+  # ── 中金所: 指数期权 (IO/MO) ──
+  - exchange: CFFEX
+    instrument: index_option
+    market: A
+    timezone: Asia/Shanghai
+    sessions:
+      - {open: "09:30", close: "11:30", days: [0,1,2,3,4], label: "早盘"}
+      - {open: "13:00", close: "15:00", days: [0,1,2,3,4], label: "午盘"}
+
+  # ── 商品期货夜盘: 上海期货交易所 ──
+  - exchange: SHFE
+    instrument: commodity_future
+    market: A
+    timezone: Asia/Shanghai
+    sessions:
+      - {open: "09:00", close: "10:15", days: [0,1,2,3,4], label: "日盘第一节"}
+      - {open: "10:30", close: "11:30", days: [0,1,2,3,4], label: "日盘第二节"}
+      - {open: "13:30", close: "15:00", days: [0,1,2,3,4], label: "日盘第三节"}
+      - {open: "21:00", close: "02:30", days: [0,1,2,3,4], label: "夜盘"}  # 跨日至次日
+
+  # ── 商品期货夜盘: 大连商品交易所 ──
+  - exchange: DCE
+    instrument: commodity_future
+    market: A
+    timezone: Asia/Shanghai
+    sessions:
+      - {open: "09:00", close: "10:15", days: [0,1,2,3,4], label: "日盘第一节"}
+      - {open: "10:30", close: "11:30", days: [0,1,2,3,4], label: "日盘第二节"}
+      - {open: "13:30", close: "15:00", days: [0,1,2,3,4], label: "日盘第三节"}
+      - {open: "21:00", close: "23:00", days: [0,1,2,3,4], label: "夜盘"}
+
+  # ── 商品期货夜盘: 郑州商品交易所 ──
+  - exchange: ZCE
+    instrument: commodity_future
+    market: A
+    timezone: Asia/Shanghai
+    sessions:
+      - {open: "09:00", close: "10:15", days: [0,1,2,3,4], label: "日盘第一节"}
+      - {open: "10:30", close: "11:30", days: [0,1,2,3,4], label: "日盘第二节"}
+      - {open: "13:30", close: "15:00", days: [0,1,2,3,4], label: "日盘第三节"}
+      - {open: "21:00", close: "23:00", days: [0,1,2,3,4], label: "夜盘"}
+
+  # ── 港股: 港交所证券市场 ──
+  - exchange: HKEX
+    instrument: equity
+    market: HK
+    timezone: Asia/Shanghai
+    sessions:
+      - {open: "09:30", close: "12:00", days: [0,1,2,3,4], label: "早盘"}
+      - {open: "13:00", close: "16:00", days: [0,1,2,3,4], label: "午盘"}
+
+  # ── 港股期权: 港交所 ──
+  - exchange: HKEX
+    instrument: equity_option
+    market: HK
+    timezone: Asia/Shanghai
+    sessions:
+      - {open: "09:30", close: "12:00", days: [0,1,2,3,4], label: "早盘"}
+      - {open: "13:00", close: "16:00", days: [0,1,2,3,4], label: "午盘"}
+
+  # ── 港股期货: 恒生指数等 ──
+  - exchange: HKEX
+    instrument: index_future
+    market: HK
+    timezone: Asia/Shanghai
+    sessions:
+      - {open: "09:15", close: "12:00", days: [0,1,2,3,4], label: "日盘"}
+      - {open: "13:00", close: "16:30", days: [0,1,2,3,4], label: "日盘"}
+      - {open: "17:15", close: "03:00", days: [0,1,2,3,4], label: "T+1夜盘"}  # 跨日至次日
+
+  # ── 美股: NYSE/NASDAQ ──
+  - exchange: NYSE
+    instrument: equity
+    market: US
+    timezone: America/New_York
+    sessions:
+      - {open: "09:30", close: "16:00", days: [0,1,2,3,4], label: "常规交易"}
+
+  - exchange: NASDAQ
+    instrument: equity
+    market: US
+    timezone: America/New_York
+    sessions:
+      - {open: "09:30", close: "16:00", days: [0,1,2,3,4], label: "常规交易"}
+
+  # ── 美股期权: CBOE等 ──
+  - exchange: CBOE
+    instrument: equity_option
+    market: US
+    timezone: America/New_York
+    sessions:
+      - {open: "09:30", close: "16:15", days: [0,1,2,3,4], label: "常规交易"}
+
+  - exchange: CBOE
+    instrument: index_option
+    market: US
+    timezone: America/New_York
+    sessions:
+      - {open: "09:30", close: "16:15", days: [0,1,2,3,4], label: "常规交易(SPX/VIX)"}
+      - {open: "20:15", close: "09:25", days: [0,1,2,3,4], label: "GTH全球时段(SPX/VIX)"}
+
+  # ── 美股期货: CME Globex ──
+  - exchange: CME
+    instrument: index_future
+    market: US
+    timezone: America/Chicago
+    sessions:
+      # Sunday 17:00 CT open, runs continuously to Friday 16:00 CT
+      # Daily maintenance break 16:00-17:00 CT Mon-Thu
+      - {open: "17:00", close: "16:00", days: [6], label: "周日开盘"}  # Sun open
+      - {open: "00:00", close: "16:00", days: [0], label: "周一(凌晨至收盘)"}
+      - {open: "17:00", close: "23:59", days: [0], label: "周一(17:00开盘)"}
+      - {open: "00:00", close: "16:00", days: [1], label: "周二(凌晨至收盘)"}
+      - {open: "17:00", close: "23:59", days: [1], label: "周二(17:00开盘)"}
+      - {open: "00:00", close: "16:00", days: [2], label: "周三(凌晨至收盘)"}
+      - {open: "17:00", close: "23:59", days: [2], label: "周三(17:00开盘)"}
+      - {open: "00:00", close: "16:00", days: [3], label: "周四(凌晨至收盘)"}
+      - {open: "17:00", close: "23:59", days: [3], label: "周四(17:00开盘)"}
+      - {open: "00:00", close: "16:00", days: [4], label: "周五(凌晨至收盘)"}

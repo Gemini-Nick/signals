@@ -211,3 +211,14 @@ def cache_health():
         "items": items,
         "coverage": _active_pool_coverage(db),
     }
+
+
+@router.get("/calendar")
+def calendar_health():
+    from signals.core.calendar.engine import get_calendar
+    cal = get_calendar()
+    info = cal.validate()
+    return {
+        "status": "warning" if info["warnings"] else "ok",
+        **info,
+    }

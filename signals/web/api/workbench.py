@@ -4550,6 +4550,12 @@ def _stock_chart_load_meta(symbol: str, freq: str, job: dict[str, Any], *, trigg
     }
 
 
+def _clear_stock_chart_load_job(symbol: str, freq: str) -> None:
+    key = _stock_chart_load_key(symbol, _canonical_freq(freq))
+    with _CHART_LOAD_LOCK:
+        _CHART_LOAD_JOBS.pop(key, None)
+
+
 def _load_stock_chart_data(symbol: str, raw_code: str, freq: str) -> bool:
     canonical = _canonical_freq(freq)
     if canonical in {"5min", "15min", "30min"}:
@@ -5651,6 +5657,10 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
     )
     if should_load:
         chart = _attach_chart_load_meta(chart, _trigger_stock_chart_load(symbol, raw_code, requested_freq))
+        load_status = _text((chart.get("meta") or {}).get("load_status"))
+        if load_status in {"ready", "failed"} and not _chart_has_ohlcv(chart):
+            _clear_stock_chart_load_job(symbol, requested_freq)
+            chart = _attach_chart_load_meta(chart, _trigger_stock_chart_load(symbol, raw_code, requested_freq))
     chart = _mark_chart_readiness(chart, kind="stock", requested_freq=requested_freq)
     chart = _merge_signal_pool_into_chart(chart, symbol, chart.get("meta", {}).get("freq", requested_freq))
     custom_signal_diagnostics = _custom_signal_diagnostics(symbol, requested_freq, chart.get("signals", []))

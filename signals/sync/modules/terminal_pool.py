@@ -153,7 +153,10 @@ REASON_WEIGHTS = {
     "active_pool_watch": 260,
     "recent_opened": 180,
     "fallback_watch": 160,
+    "review_sector_bullish": 420,
+    "review_sector_bearish": 0,
 }
+REVIEW_CLUE_REASON_TYPES = {"review_sector_bullish", "review_sector_bearish"}
 
 
 def _text(value: Any) -> str:
@@ -480,7 +483,10 @@ def _chain_decision_effect(phase: str) -> str:
 
 
 def _is_technical_reason(reason: dict[str, Any]) -> bool:
-    return _text(reason.get("reason_type")) in {"technical_trigger", "technical_signal"}
+    rt = _text(reason.get("reason_type"))
+    if rt in REVIEW_CLUE_REASON_TYPES:
+        return False
+    return rt in {"technical_trigger", "technical_signal"}
 
 
 def _source_doc_id(row: dict[str, Any]) -> str:
@@ -545,7 +551,7 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
     base_weight = REASON_WEIGHTS.get(reason_type, 100)
     freq = _text(reason.get("freq"))
     signal_side = _text(reason.get("signal_side"))
-    side_bonus = 180 if signal_side == "sell" else 0
+    side_bonus = 180 if signal_side == "sell" and reason_type not in REVIEW_CLUE_REASON_TYPES else 0
     decision_effect = _text(reason.get("decision_effect"))
     if not decision_effect:
         decision_effect = "exit_priority" if reason_type == "technical_trigger" and signal_side == "sell" else ("confirm" if reason_type == "technical_trigger" else "context_only")
@@ -959,6 +965,248 @@ def _add_knowledge_rows(rows: dict[str, dict[str, Any]], db: Database, index_cod
         }, index_codes=index_codes)
 
 
+BULLISH_WORDS = frozenset({"看好", "关注", "配置", "防御反击", "轮动", "有机会", "走强", "确定性", "低吸", "逢低", "启动", "修复", "主线", "重建", "升级", "机会"})
+BEARISH_WORDS = frozenset({"回避", "不追", "高潮", "阴跌", "暂不参与", "结账", "减持", "风险", "见顶", "退潮", "降温", "补涨高潮", "左侧逆势", "分化"})
+
+
+def _sector_board_map(db: Database) -> dict[str, list[str]]:
+    index: dict[str, list[str]] = {}
+    try:
+        from signals.core.concept_carriers import load_industry_chains
+        for chain in load_industry_chains().values():
+            name = chain.get("name", "")
+            if name:
+                index.setdefault(name, []).append(name)
+            for alias in chain.get("aliases") or []:
+                index.setdefault(alias, []).append(chain["name"])
+            for ind in chain.get("industries") or []:
+                index.setdefault(ind, []).append(chain["name"])
+    except Exception:
+        pass
+    hard = {
+        "银行": ["银行"],
+        "周期": ["煤炭", "石油", "有色", "钢铁", "化工"],
+        "消费": ["食品饮料", "白酒", "家电", "汽车"],
+        "医药": ["医药", "医疗器械", "中药", "创新药"],
+        "科技": ["半导体", "机器人", "人工智能", "消费电子", "计算机"],
+        "半导体": ["半导体"],
+        "机器人": ["机器人"],
+        "科创": ["科创50"],
+        "创业板": ["创业板"],
+        "恒科": ["恒生科技"],
+        "煤炭": ["煤炭"],
+        "石油": ["石油"],
+        "券商": ["证券"],
+        "光模块": ["光通信", "光模块"],
+        "光通信": ["光通信", "光模块"],
+        "中字头": ["中字头"],
+        "中船": ["船舶"],
+        "AI": ["人工智能"],
+        "医药龙头": ["医药"],
+    }
+    for k, v in hard.items():
+        existing = index.get(k, [])
+        for b in v:
+            if b not in existing:
+                existing.append(b)
+        index[k] = existing
+    return index
+
+
+def _direction_from_window(window: str) -> str:
+    b = sum(1 for w in BULLISH_WORDS if w in window)
+    s = sum(1 for w in BEARISH_WORDS if w in window)
+    if b > s:
+        return "bullish"
+    if s > b:
+        return "bearish"
+    return ""
+
+
+def _extract_sector_directions(body: str, keyword_index: dict[str, list[str]]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for keyword, board_names in keyword_index.items():
+        if len(keyword) < 2:
+            continue
+        pos = body.find(keyword)
+        if pos < 0:
+            continue
+        window = body[max(0, pos - 250):pos + len(keyword) + 250]
+        direction = _direction_from_window(window)
+        if not direction:
+            continue
+        dedupe = f"{keyword}:{direction}"
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        results.append({
+            "keyword": keyword,
+            "board_names": board_names,
+            "direction": direction,
+            "snippet": window[:200],
+        })
+    return results
+
+
+def _iter_review_notes(db: Database, since: date | None = None) -> list[dict[str, Any]]:
+    from pathlib import Path
+
+    try:
+        from signals.sync.modules.knowledge_market_views import _vault_dir as _kvault, _parse_frontmatter
+        vault_dir = _kvault()
+    except Exception:
+        vault_dir = Path.home() / "Desktop" / "知识库"
+    inbox_dir = vault_dir / "10 Inbox" / "WeChat"
+    if not inbox_dir.exists():
+        return []
+    keyword_index = _sector_board_map(db)
+    notes: list[dict[str, Any]] = []
+    for md_file in sorted(inbox_dir.rglob("*.md"), reverse=True):
+        try:
+            raw = md_file.read_text(encoding="utf-8", errors="ignore")[:80000]
+        except Exception:
+            continue
+        meta, body = _parse_frontmatter(raw)
+        title = meta.get("title", "")
+        author = (meta.get("author_focus") or "").lower()
+        if not author:
+            combined = title + body[:4000]
+            if "胖哥" in combined:
+                author = "pangge"
+            elif "道长" in combined:
+                author = "daozhang"
+        if author not in ("daozhang", "pangge"):
+            continue
+        created = meta.get("created_at", "")
+        if since and created:
+            try:
+                note_date = datetime.fromisoformat(created.replace("Z", "+00:00")).date()
+                if note_date < since:
+                    continue
+            except Exception:
+                pass
+        sectors = _extract_sector_directions(body, keyword_index)
+        if not sectors:
+            continue
+        notes.append({
+            "title": title,
+            "author": author,
+            "date": created[:10] if created else "",
+            "sectors": sectors,
+        })
+    return notes
+
+
+def _add_review_clue_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str]) -> None:
+    notes = _iter_review_notes(db)
+    if not notes:
+        return
+    for note in notes:
+        author = note["author"]
+        author_label = "道长" if author == "daozhang" else "胖哥"
+        for sector in note["sectors"]:
+            if sector["direction"] != "bullish":
+                continue
+            for board_name in sector["board_names"]:
+                doc = db["board_constituents"].find_one(
+                    {"$or": [{"_id": board_name}, {"board_name": board_name}, {"name": board_name}]},
+                    {"symbols": 1, "stock_names": 1},
+                    sort=[("updated_at", -1)],
+                ) or {}
+                symbols = list(doc.get("symbols") or [])
+                stock_names = dict(doc.get("stock_names") or {})
+                if not symbols:
+                    doc2 = db["concept_constituents"].find_one(
+                        {"$or": [{"concept_name": board_name}, {"board_name": board_name}, {"name": board_name}]},
+                        {"symbols": 1, "stock_names": 1},
+                        sort=[("updated_at", -1)],
+                    ) or {}
+                    symbols = list(doc2.get("symbols") or [])
+                    stock_names = dict(doc2.get("stock_names") or {})
+                for symbol in symbols[:8]:
+                    name = stock_names.get(symbol, "")
+                    _add_reason(rows, symbol, {
+                        "reason_type": "review_sector_bullish",
+                        "source_collection": "review_sector_clues",
+                        "source_doc_id": note.get("title", ""),
+                        "signal_type": f"{author_label}看好{board_name}",
+                        "signal_side": "buy",
+                        "source_role": "review_clue",
+                        "decision_effect": "context_only",
+                        "can_create_candidate": True,
+                        "board_or_concept": board_name,
+                        "evidence": {
+                            "author": author,
+                            "review_date": note.get("date", ""),
+                            "sector_keyword": sector.get("keyword", ""),
+                            "snippet": sector.get("snippet", ""),
+                        },
+                    }, index_codes=index_codes, name=name)
+
+
+def _has_clue_source(row: dict[str, Any]) -> bool:
+    for reason in row.get("inclusion_reasons") or []:
+        if not isinstance(reason, dict):
+            continue
+        rt = _text(reason.get("reason_type"))
+        if rt in REVIEW_CLUE_REASON_TYPES or rt in {"user_pinned", "chain_core_rep", "chain_elastic_rep", "source_leader", "knowledge_confirmed", "knowledge_watch", "fallback_watch"}:
+            return True
+    return False
+
+
+def _entry_gate_passed(row: dict[str, Any]) -> bool:
+    passed, _, _, _, _ = _entry_gate(row)
+    return passed
+
+
+def _gate_progress(row: dict[str, Any]) -> int:
+    buy_reasons = _buy_technical_reasons(row)
+    risk_reasons = _risk_reasons(row)
+    if risk_reasons:
+        return 0
+    chain_blocker = _chain_entry_blocker(row)
+    if chain_blocker:
+        return 0
+    if not buy_reasons:
+        return 0
+    freqs: set[str] = set()
+    for reason in buy_reasons:
+        freqs.update(_reason_freqs(reason))
+    score = 0
+    if any(_is_30m_freq(f) for f in freqs):
+        score += 2
+    if any(_is_upper_freq(f) for f in freqs):
+        score += 2
+    if any(_is_right_side_freq(f) for f in freqs):
+        score += 2
+    if any(_is_entry_partner_freq(f) for f in freqs):
+        score += 1
+    current_buy = [r for r in buy_reasons if _reason_is_current_for_entry(r)]
+    if current_buy:
+        score += 1
+    return score
+
+
+def _clue_quality_score(row: dict[str, Any]) -> float:
+    source_score = 0.0
+    for reason in row.get("inclusion_reasons") or []:
+        if not isinstance(reason, dict):
+            continue
+        rt = _text(reason.get("reason_type"))
+        if rt == "review_sector_bullish":
+            source_score = max(source_score, 50.0)
+        elif rt == "user_pinned":
+            source_score = max(source_score, 30.0)
+        elif rt in {"chain_core_rep", "source_leader"}:
+            source_score = max(source_score, 25.0)
+        elif rt == "knowledge_confirmed":
+            source_score = max(source_score, 15.0)
+    tech_proximity = float(_gate_progress(row)) * 8.0
+    theme_bonus = _mainline_alignment_score(row)
+    return round(source_score + tech_proximity + theme_bonus, 3)
+
+
 def _latest_strategy_snapshot(db: Database) -> dict[str, Any]:
     doc = db["strategy_snapshots"].find_one(
         {"snapshot": {"$exists": True}},
@@ -1306,7 +1554,7 @@ def _risk_reasons(row: dict[str, Any]) -> list[dict[str, Any]]:
         if signal_side == "sell" or decision_effect in {"exit_priority", "block"} or knowledge_effect in {"block", "exit_priority"}:
             reasons.append(reason)
             continue
-        if reason_type in {"generated_risk_signal", "knowledge_conflict"}:
+        if reason_type in {"generated_risk_signal", "knowledge_conflict", "review_sector_bearish"}:
             reasons.append(reason)
     return reasons
 
@@ -1814,6 +2062,8 @@ def _trade_stage_from_context(
     top_risk: dict[str, Any] | None,
     timeframe_sides: dict[str, dict[str, Any]],
 ) -> str:
+    if entry_gate_status == "clue_pool":
+        return "clue_pool"
     if pool_type == "risk" or top_risk or entry_gate_status.startswith("blocked_by"):
         return "skip_now"
     trade_side = _text(timeframe_sides.get("trade", {}).get("side"))
@@ -2436,6 +2686,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     _add_signal_rows(rows, db, index_codes, include_generated_daily=False)
     _add_chain_rows(rows, db, index_codes)
     _add_knowledge_rows(rows, db, index_codes)
+    _add_review_clue_rows(rows, db, index_codes)
     strict_candidate_count = len(rows)
     fallback_count = 0
     fallback_enabled = False
@@ -2461,11 +2712,45 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     watch_stocks = split["watch"]
     skipped_by_pool = split["skipped"]
     all_watch_rows = watch_stocks + (skipped_by_pool.get("watch") or [])
-    clue_stocks = [
-        row
-        for row in all_watch_rows
-        if row.get("trade_intent") == "clue_only" or row.get("trade_stage") == "clue_pool"
-    ][:clue_limit]
+    all_processed_symbols = {row.get("symbol") for row in (focus_stocks + risk_stocks + watch_stocks)}
+    clue_candidates = []
+    for symbol, row in rows.items():
+        if symbol in all_processed_symbols:
+            continue
+        if _risk_reasons(row):
+            continue
+        if _chain_entry_blocker(row):
+            continue
+        if _entry_gate_passed(row):
+            continue
+        if not _has_clue_source(row):
+            continue
+        clue_candidates.append(row)
+    clue_candidates.sort(key=_clue_quality_score, reverse=True)
+    clue_stocks = []
+    for row in clue_candidates[:clue_limit]:
+        row["inclusion_reasons"] = sorted(row.get("inclusion_reasons") or [], key=lambda item: _float(item.get("weight")), reverse=True)[:12]
+        entry_ok, gate_status, blocked_by, top_buy, top_risk = _entry_gate(row)
+        row = _finalize_pool_row(
+            row,
+            pool_type="watch",
+            rank_score=_clue_quality_score(row),
+            score_components={"clue_quality": _clue_quality_score(row)},
+            entry_gate_status="clue_pool",
+            blocked_by=[],
+            top_buy=top_buy,
+            top_risk=top_risk,
+        )
+        row["clue_quality_score"] = _clue_quality_score(row)
+        row["clue_sources"] = [
+            f"{'道长' if _text(r.get('evidence', {}).get('author')) == 'daozhang' else '胖哥' if _text(r.get('evidence', {}).get('author')) == 'pangge' else ''}:{_text(r.get('board_or_concept'))}"
+            for r in row.get("inclusion_reasons", [])
+            if isinstance(r, dict) and r.get("reason_type") == "review_sector_bullish" and r.get("board_or_concept")
+        ]
+        row["promotion_gates"] = blocked_by
+        clue_stocks.append(row)
+    for idx, row in enumerate(clue_stocks, start=1):
+        row["rank"] = idx
     clue_symbols = {row.get("symbol") for row in clue_stocks}
     if clue_symbols:
         watch_stocks = [row for row in watch_stocks if row.get("symbol") not in clue_symbols]

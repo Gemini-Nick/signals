@@ -520,3 +520,239 @@ def test_terminal_stock_pool_strategy_fallback_only_goes_to_watch_pool():
     assert split["risk"] == []
     assert split["watch"][0]["raw_code"] == "002812"
     assert split["watch"][0]["pool_type"] == "watch"
+
+
+def test_review_sector_bullish_creates_candidate_with_correct_weight():
+    from signals.sync.modules.terminal_pool import _add_reason, _has_clue_source, _clue_quality_score, REVIEW_CLUE_REASON_TYPES
+
+    rows = {}
+    _add_reason(rows, "600036", {
+        "reason_type": "review_sector_bullish",
+        "source_collection": "review_sector_clues",
+        "source_doc_id": "道长2026-04-27复盘",
+        "signal_type": "道长看好银行",
+        "signal_side": "buy",
+        "source_role": "review_clue",
+        "decision_effect": "context_only",
+        "can_create_candidate": True,
+        "board_or_concept": "银行",
+        "evidence": {"author": "daozhang", "review_date": "2026-04-27", "snippet": "银行防御反击"},
+    }, index_codes=set(), name="招商银行")
+
+    assert "600036" in rows
+    row = rows["600036"]
+    assert row["raw_code"] == "600036"
+    assert row["signal_origin"] == "review_sector_bullish"
+    assert _has_clue_source(row)
+    assert row["inclusion_reasons"][0]["reason_type"] == "review_sector_bullish"
+    assert row["inclusion_reasons"][0]["source_role"] == "review_clue"
+    assert row["inclusion_reasons"][0]["board_or_concept"] == "银行"
+
+
+def test_review_sector_bearish_has_zero_weight():
+    from signals.sync.modules.terminal_pool import _add_reason
+
+    rows = {}
+    _add_reason(rows, "600036", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "tech-buy",
+        "signal_type": "三买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 120,
+    }, index_codes=set(), name="招商银行")
+    _add_reason(rows, "600036", {
+        "reason_type": "review_sector_bearish",
+        "source_collection": "review_sector_clues",
+        "source_doc_id": "胖哥看空恒科",
+        "signal_type": "胖哥回避银行",
+        "signal_side": "neutral",
+        "source_role": "review_clue",
+        "decision_effect": "exit_priority",
+        "can_create_candidate": False,
+        "board_or_concept": "银行",
+        "evidence": {"author": "pangge", "review_date": "2026-04-28"},
+    }, index_codes=set(), name="招商银行")
+
+    bear_reason = [r for r in rows["600036"]["inclusion_reasons"] if r["reason_type"] == "review_sector_bearish"][0]
+    assert bear_reason["weight"] == 0.0
+
+
+def test_risk_reasons_includes_review_sector_bearish():
+    from signals.sync.modules.terminal_pool import _add_reason, _risk_reasons
+
+    rows = {}
+    _add_reason(rows, "688981", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "tech-buy",
+        "signal_type": "三买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 120,
+    }, index_codes=set(), name="中芯国际")
+    _add_reason(rows, "688981", {
+        "reason_type": "review_sector_bearish",
+        "source_collection": "review_sector_clues",
+        "source_doc_id": "胖哥看空恒科",
+        "signal_type": "胖哥回避科技",
+        "signal_side": "sell",
+        "source_role": "review_clue",
+        "decision_effect": "exit_priority",
+        "can_create_candidate": False,
+        "board_or_concept": "科技",
+        "evidence": {"author": "pangge"},
+    }, index_codes=set(), name="中芯国际")
+
+    risks = _risk_reasons(rows["688981"])
+    assert any(r["reason_type"] == "review_sector_bearish" for r in risks)
+
+
+def test_clue_quality_score_ranks_higher_with_review_source():
+    from signals.sync.modules.terminal_pool import _add_reason, _clue_quality_score
+
+    rows = {}
+    _add_reason(rows, "600036", {
+        "reason_type": "review_sector_bullish",
+        "source_collection": "review_sector_clues",
+        "source_doc_id": "道长复盘",
+        "signal_type": "道长看好银行",
+        "signal_side": "buy",
+        "source_role": "review_clue",
+        "decision_effect": "context_only",
+        "can_create_candidate": True,
+        "board_or_concept": "银行",
+        "evidence": {"author": "daozhang"},
+    }, index_codes=set(), name="招商银行")
+
+    rows2 = {}
+    _add_reason(rows2, "000858", {
+        "reason_type": "user_pinned",
+        "source_collection": "config",
+        "source_doc_id": "priority",
+        "signal_type": "用户重点观察",
+        "signal_side": "buy",
+    }, index_codes=set(), name="五粮液")
+
+    assert _clue_quality_score(rows["600036"]) > _clue_quality_score(rows2["000858"])
+
+
+def test_clue_quality_score_boosts_with_technical_proximity():
+    from signals.sync.modules.terminal_pool import _add_reason, _clue_quality_score
+
+    rows = {}
+    _add_reason(rows, "600036", {
+        "reason_type": "review_sector_bullish",
+        "source_collection": "review_sector_clues",
+        "source_doc_id": "道长复盘",
+        "signal_type": "道长看好银行",
+        "signal_side": "buy",
+        "source_role": "review_clue",
+        "decision_effect": "context_only",
+        "can_create_candidate": True,
+        "board_or_concept": "银行",
+        "evidence": {"author": "daozhang"},
+    }, index_codes=set(), name="招商银行")
+
+    score_no_tech = _clue_quality_score(rows["600036"])
+
+    _add_reason(rows, "600036", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "tech-daily",
+        "signal_type": "背驰买",
+        "signal_side": "buy",
+        "freq": "日线",
+        "score": 88,
+        "confidence": 0.7,
+    }, index_codes=set(), name="招商银行")
+
+    score_with_tech = _clue_quality_score(rows["600036"])
+    assert score_with_tech > score_no_tech
+
+
+def test_has_clue_source_detects_review_and_legacy_sources():
+    from signals.sync.modules.terminal_pool import _add_reason, _has_clue_source
+
+    rows_review = {}
+    _add_reason(rows_review, "600036", {
+        "reason_type": "review_sector_bullish",
+        "source_collection": "review_sector_clues",
+        "source_doc_id": "道长复盘",
+        "signal_type": "道长看好银行",
+        "signal_side": "buy",
+        "source_role": "review_clue",
+        "decision_effect": "context_only",
+        "can_create_candidate": True,
+        "board_or_concept": "银行",
+        "evidence": {"author": "daozhang"},
+    }, index_codes=set(), name="招商银行")
+    assert _has_clue_source(rows_review["600036"])
+
+    rows_pin = {}
+    _add_reason(rows_pin, "000858", {
+        "reason_type": "user_pinned",
+        "source_collection": "config",
+        "source_doc_id": "priority",
+        "signal_type": "用户重点观察",
+        "signal_side": "buy",
+    }, index_codes=set(), name="五粮液")
+    assert _has_clue_source(rows_pin["000858"])
+
+    rows_tech = {}
+    _add_reason(rows_tech, "300575", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "tech-1",
+        "signal_type": "三买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 120,
+    }, index_codes=set(), name="中旗新材")
+    assert not _has_clue_source(rows_tech["300575"])
+
+
+def test_gate_progress_returns_zero_for_no_technical_reasons():
+    from signals.sync.modules.terminal_pool import _add_reason, _gate_progress
+
+    rows = {}
+    _add_reason(rows, "600036", {
+        "reason_type": "review_sector_bullish",
+        "source_collection": "review_sector_clues",
+        "source_doc_id": "道长复盘",
+        "signal_type": "道长看好银行",
+        "signal_side": "buy",
+        "source_role": "review_clue",
+        "decision_effect": "context_only",
+        "can_create_candidate": True,
+        "board_or_concept": "银行",
+        "evidence": {"author": "daozhang"},
+    }, index_codes=set(), name="招商银行")
+
+    assert _gate_progress(rows["600036"]) == 0
+
+
+def test_gate_progress_scores_multi_freq_entry():
+    from signals.sync.modules.terminal_pool import _add_reason, _gate_progress
+
+    rows = {}
+    _add_reason(rows, "300575", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "daily-30m-15m",
+        "signal_type": "三买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 120,
+        "confidence": 0.8,
+        "resonance_context": {
+            "direction": "buy",
+            "aligned_freqs": ["日线", "30分钟", "15分钟"],
+            "conflict_freqs": [],
+            "grade": "multi_period",
+        },
+    }, index_codes=set(), name="中旗新材")
+
+    score = _gate_progress(rows["300575"])
+    assert score >= 5, f"Expected >=5 got {score}"

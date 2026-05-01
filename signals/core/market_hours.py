@@ -22,19 +22,17 @@
   session = get_session_mode()           # 精细时段
   if session.a_live: ...                 # A股可拉分钟线
 """
+from __future__ import annotations
+
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from enum import Enum
-from typing import Set
+from typing import Optional, Set
 from zoneinfo import ZoneInfo
 
-
-class Market(str, Enum):
-    """市场标识，与 detect_market() 返回值一致。"""
-    A = "A"
-    HK = "HK"
-    US = "US"
+logger = logging.getLogger("signals.market_hours")
 
 
 # ── 时区 ──────────────────────────────────────────────────
@@ -42,7 +40,7 @@ TZ_UTC = ZoneInfo("UTC")
 TZ_BEIJING = ZoneInfo("Asia/Shanghai")
 TZ_US_EAST = ZoneInfo("America/New_York")
 
-# ── 交易时段（本地时间）──────────────────────────────────
+# ── 交易时段（本地时间）─ fallback 用 ────────────────────
 _A_MORNING_OPEN = time(9, 30)
 _A_MORNING_CLOSE = time(11, 30)
 _A_AFTERNOON_OPEN = time(13, 0)
@@ -57,10 +55,37 @@ _US_OPEN = time(9, 30)
 _US_CLOSE = time(16, 0)
 
 
+# ── calendar engine lazy import ───────────────────────────
+_calendar: Optional[object] = None
+_calendar_load_failed = False
+
+
+def _get_calendar():
+    global _calendar, _calendar_load_failed
+    if _calendar is None and not _calendar_load_failed:
+        try:
+            from signals.core.calendar.engine import get_calendar
+            _calendar = get_calendar()
+        except Exception as e:
+            _calendar_load_failed = True
+            logger.warning("Calendar engine unavailable, falling back to weekday-only logic: %s", e)
+    return _calendar
+
+
+# ── Market enum (canonical location) ─────────────────────
+
+class Market(str, Enum):
+    A = "A"
+    HK = "HK"
+    US = "US"
+
+
 def _live_refresh_interval() -> int:
     minutes = int(os.getenv("SIGNALS_LIVE_REFRESH_MINUTES", "1"))
     return max(60, minutes * 60)
 
+
+# ── Fallback weekday-only detection ──────────────────────
 
 def _is_a_live(now_bj: datetime) -> bool:
     if now_bj.weekday() >= 5:
@@ -93,14 +118,43 @@ def _next_weekday_start(now_local: datetime, tz: ZoneInfo, start_time: time) -> 
     return candidate
 
 
+# ── Public API ────────────────────────────────────────────
+
+def get_active_markets(now_utc: datetime = None) -> Set[Market]:
+    """返回当前正在交易的市场集合（仅 equity，向后兼容）。"""
+    if now_utc is None:
+        now_utc = datetime.now(TZ_UTC)
+
+    cal = _get_calendar()
+    if cal is not None:
+        return cal.active_markets(now_utc)
+
+    # fallback
+    active: Set[Market] = set()
+    now_bj = now_utc.astimezone(TZ_BEIJING)
+    if _is_a_live(now_bj):
+        active.add(Market.A)
+    if _is_hk_live(now_bj):
+        active.add(Market.HK)
+    now_et = now_utc.astimezone(TZ_US_EAST)
+    if _is_us_live(now_et):
+        active.add(Market.US)
+    return active
+
+
 def next_live_check_seconds(now_utc: datetime = None) -> int:
     """Seconds until the next regular-session A/H/US open boundary."""
     if now_utc is None:
         now_utc = datetime.now(TZ_UTC)
+
+    cal = _get_calendar()
+    if cal is not None:
+        return cal.next_transition(now_utc)
+
+    # fallback
     now_bj = now_utc.astimezone(TZ_BEIJING)
     now_et = now_utc.astimezone(TZ_US_EAST)
     candidates: list[datetime] = []
-
     if now_bj.weekday() < 5:
         for start in (_A_MORNING_OPEN, _HK_MORNING_OPEN, _A_AFTERNOON_OPEN, _HK_AFTERNOON_OPEN):
             candidate = datetime.combine(now_bj.date(), start, tzinfo=TZ_BEIJING)
@@ -109,44 +163,16 @@ def next_live_check_seconds(now_utc: datetime = None) -> int:
     candidates.append(_next_weekday_start(now_bj, TZ_BEIJING, _A_MORNING_OPEN))
     candidates.append(_next_weekday_start(now_bj, TZ_BEIJING, _HK_MORNING_OPEN))
     candidates.append(_next_weekday_start(now_et, TZ_US_EAST, _US_OPEN))
-
     return min(_seconds_until(candidate, now_utc) for candidate in candidates if candidate.astimezone(TZ_UTC) > now_utc)
-
-
-def get_active_markets(now_utc: datetime = None) -> Set[Market]:
-    """
-    返回当前正在交易的市场集合。
-
-    :param now_utc: 可选 UTC 时间（测试用），默认取系统当前时间。
-    :return: 如 {Market.A, Market.HK} 或 {Market.US} 或空集合。
-    """
-    if now_utc is None:
-        now_utc = datetime.now(TZ_UTC)
-
-    active: Set[Market] = set()
-
-    now_bj = now_utc.astimezone(TZ_BEIJING)
-    if _is_a_live(now_bj):
-        active.add(Market.A)
-    if _is_hk_live(now_bj):
-        active.add(Market.HK)
-
-    now_et = now_utc.astimezone(TZ_US_EAST)
-    if _is_us_live(now_et):
-        active.add(Market.US)
-
-    return active
 
 
 def describe_sessions(now_utc: datetime = None) -> str:
     """返回当前市场状态的可读描述。"""
     if now_utc is None:
         now_utc = datetime.now(TZ_UTC)
-
     active = get_active_markets(now_utc)
     if not active:
         return "无市场开盘"
-
     parts = []
     if Market.A in active:
         parts.append("A股 开盘中 (09:30-11:30/13:00-15:00 北京)")
@@ -160,62 +186,61 @@ def describe_sessions(now_utc: datetime = None) -> str:
     return " | ".join(parts)
 
 
-# ── 精细市场状态（含盘前/午休/盘后/期货）──────────────
+# ── 精细市场状态 ──────────────────────────────────────────
+
+def _cal_instrument_status(exchange: str, instrument_type_str: str, now_utc: datetime) -> dict:
+    cal = _get_calendar()
+    if cal is not None:
+        from signals.core.calendar.models import InstrumentType
+        return cal.instrument_status(exchange, InstrumentType(instrument_type_str), now_utc)
+    return {"status": "未知", "icon": "⚪", "detail": ""}
+
 
 def get_market_detail(now_utc: datetime = None) -> dict:
-    """
-    返回每个市场的精细状态，供前端展示。
-
-    返回:
-        {
-            "a_stock":    {"status": "午休", "icon": "🟡", "detail": "11:30-13:00"},
-            "hk_stock":   {"status": "盘中", "icon": "🟢", "detail": "09:30-16:00"},
-            "us_stock":   {"status": "盘前", "icon": "🔵", "detail": "16:00-21:30 ET"},
-            "a_futures":  {"status": "交易中", "icon": "🟢", "detail": "IF/IC/IM 09:30-15:00"},
-            "hk_futures": {"status": "休市", "icon": "🔴", "detail": ""},
-            "us_futures": {"status": "交易中", "icon": "🟢", "detail": "ES/NQ 近24h"},
-        }
-    """
+    """返回每个市场的精细状态，供前端展示。"""
     if now_utc is None:
         now_utc = datetime.now(TZ_UTC)
 
+    cal = _get_calendar()
+    if cal is not None:
+        result = {}
+        result["a_stock"] = cal.instrument_status("SSE", "equity", now_utc)
+        result["hk_stock"] = cal.instrument_status("HKEX", "equity", now_utc)
+        result["us_stock"] = cal.instrument_status("NYSE", "equity", now_utc)
+        result["a_index_futures"] = cal.instrument_status("CFFEX", "index_future", now_utc)
+        result["a_commodity_futures"] = cal.instrument_status("SHFE", "commodity_future", now_utc)
+        result["hk_futures"] = cal.instrument_status("HKEX", "index_future", now_utc)
+        result["us_futures"] = cal.instrument_status("CME", "index_future", now_utc)
+        result["a_options"] = cal.instrument_status("SSE", "equity_option", now_utc)
+        result["us_options"] = cal.instrument_status("CBOE", "equity_option", now_utc)
+        return result
+
+    # fallback: old hardcoded detection
     now_bj = now_utc.astimezone(TZ_BEIJING)
     now_et = now_utc.astimezone(TZ_US_EAST)
-    now_hk = now_bj  # 港股同北京时区
     bj_t = now_bj.time()
     et_t = now_et.time()
     bj_wd = now_bj.weekday()
     et_wd = now_et.weekday()
 
     result = {}
-
-    # ── A 股 ──
     result["a_stock"] = _detect_a_stock(bj_t, bj_wd)
-
-    # ── 港股 ──
     result["hk_stock"] = _detect_hk_stock(bj_t, bj_wd)
-
-    # ── 美股 ──
     result["us_stock"] = _detect_us_stock(et_t, et_wd)
-
-    # ── 期货 ──
     result["a_index_futures"] = _detect_a_index_futures(bj_t, bj_wd)
     result["a_commodity_futures"] = _detect_a_commodity_futures(bj_t, bj_wd)
     result["hk_futures"] = _detect_hk_futures(bj_t, bj_wd)
     result["us_futures"] = _detect_us_futures(et_t, et_wd)
-
-    # ── 期权 ──
     result["a_options"] = _detect_a_options(bj_t, bj_wd)
     result["us_options"] = _detect_us_options(et_t, et_wd)
-
     return result
 
 
+# ── Fallback detection functions (used when calendar unavailable) ──
+
 def _detect_a_stock(bj_t, bj_wd):
-    """A 股精细状态"""
     if bj_wd >= 5:
         return {"status": "休市", "icon": "🔴", "detail": "周末"}
-
     if bj_t < time(9, 15):
         return {"status": "盘前", "icon": "🔵", "detail": "集合竞价 09:15"}
     elif bj_t < time(9, 30):
@@ -231,10 +256,8 @@ def _detect_a_stock(bj_t, bj_wd):
 
 
 def _detect_hk_stock(bj_t, bj_wd):
-    """港股精细状态（与北京时间相同）"""
     if bj_wd >= 5:
         return {"status": "休市", "icon": "🔴", "detail": "周末"}
-
     if bj_t < time(9, 0):
         return {"status": "盘前", "icon": "🔵", "detail": "开市前"}
     elif bj_t < time(9, 30):
@@ -252,10 +275,8 @@ def _detect_hk_stock(bj_t, bj_wd):
 
 
 def _detect_us_stock(et_t, et_wd):
-    """美股精细状态（Eastern Time）"""
     if et_wd >= 5:
         return {"status": "休市", "icon": "🔴", "detail": "周末"}
-
     if et_t < time(4, 0):
         return {"status": "休市", "icon": "🔴", "detail": ""}
     elif et_t < time(9, 30):
@@ -269,13 +290,8 @@ def _detect_us_stock(et_t, et_wd):
 
 
 def _detect_a_index_futures(bj_t, bj_wd):
-    """
-    A股股指期货（中金所）— IF/IC/IM/IH
-    交易时段: 09:30-11:30, 13:00-15:00（无夜盘）
-    """
     if bj_wd >= 5:
         return {"status": "休市", "icon": "🔴", "detail": "周末"}
-
     if time(9, 30) <= bj_t < time(11, 30):
         return {"status": "交易中", "icon": "🟢", "detail": "IF/IC/IM 09:30-11:30"}
     elif time(11, 30) <= bj_t < time(13, 0):
@@ -289,27 +305,14 @@ def _detect_a_index_futures(bj_t, bj_wd):
 
 
 def _detect_a_commodity_futures(bj_t, bj_wd):
-    """
-    A股商品期货 — 上期所/大商所/郑商所/广期所
-    日盘: 09:00-10:15, 10:30-11:30, 13:30-15:00
-    夜盘: 21:00-次日02:30（品种不同收盘时间不同）
-      - 铜/铝/锌等: 21:00-01:00
-      - 金/银: 21:00-02:30
-      - 螺纹/热卷等: 21:00-23:00
-    """
     if bj_wd >= 5:
-        # 周六凌晨可能仍有周五夜盘
         if bj_wd == 5 and bj_t < time(2, 30):
             return {"status": "夜盘", "icon": "🟠", "detail": "周五夜盘至02:30"}
         return {"status": "休市", "icon": "🔴", "detail": "周末"}
-
-    # 夜盘（跨日）
     if time(21, 0) <= bj_t <= time(23, 59):
         return {"status": "夜盘", "icon": "🟠", "detail": "21:00-02:30"}
     if bj_t < time(2, 30):
         return {"status": "夜盘", "icon": "🟠", "detail": "21:00-02:30"}
-
-    # 日盘
     if time(9, 0) <= bj_t < time(10, 15):
         return {"status": "交易中", "icon": "🟢", "detail": "09:00-10:15"}
     elif time(10, 15) <= bj_t < time(10, 30):
@@ -325,14 +328,8 @@ def _detect_a_commodity_futures(bj_t, bj_wd):
 
 
 def _detect_a_options(bj_t, bj_wd):
-    """
-    A股期权 — 50ETF/300ETF期权 + 沪深300指数期权(IO)
-    集合竞价: 09:15-09:25
-    交易: 09:30-11:30, 13:00-15:00（同A股，无夜盘）
-    """
     if bj_wd >= 5:
         return {"status": "休市", "icon": "🔴", "detail": "周末"}
-
     if time(9, 15) <= bj_t < time(9, 25):
         return {"status": "集合竞价", "icon": "🟡", "detail": "09:15-09:25"}
     elif time(9, 30) <= bj_t < time(11, 30):
@@ -346,17 +343,10 @@ def _detect_a_options(bj_t, bj_wd):
 
 
 def _detect_hk_futures(bj_t, bj_wd):
-    """
-    港股期货（HKEX）— 恒指(HSI)/科指(HHIT)
-    日盘: 09:15-12:00, 13:00-16:30 (北京时间)
-    夜盘(T+1): 17:15-03:00 (次日北京时间)
-    """
     if bj_wd >= 5:
-        # 周六凌晨可能仍有周五夜盘
         if bj_wd == 5 and bj_t < time(3, 0):
             return {"status": "夜盘", "icon": "🟠", "detail": "HSI 周五夜盘至03:00"}
         return {"status": "休市", "icon": "🔴", "detail": "周末"}
-
     if bj_t < time(3, 0):
         return {"status": "夜盘", "icon": "🟠", "detail": "HSI T+1 17:15-03:00"}
     elif bj_t < time(9, 15):
@@ -374,37 +364,22 @@ def _detect_hk_futures(bj_t, bj_wd):
 
 
 def _detect_us_futures(et_t, et_wd):
-    """
-    美股期货（CME Globex）— ES/NQ/YM/RTY
-    交易: 周日18:00 - 周五17:00 ET（几乎24h，每日暂停 17:00-18:00 ET）
-    """
     if et_wd == 5:
         return {"status": "休市", "icon": "🔴", "detail": "周末"}
-
     if et_wd == 6:
         if et_t >= time(18, 0):
             return {"status": "交易中", "icon": "🟢", "detail": "ES/NQ 周日18:00开盘"}
         return {"status": "休市", "icon": "🔴", "detail": "18:00 ET 开盘"}
-
     if time(17, 0) <= et_t < time(18, 0):
         return {"status": "维护", "icon": "🟡", "detail": "暂停 17:00-18:00 ET"}
-
     if et_wd == 4 and et_t >= time(17, 0):
         return {"status": "周末休市", "icon": "🔴", "detail": "周五17:00 ET收盘"}
-
     return {"status": "交易中", "icon": "🟢", "detail": "ES/NQ 近24h"}
 
 
 def _detect_us_options(et_t, et_wd):
-    """
-    美股期权（CBOE/各交易所）— 个股期权(NVDA等) + 指数期权(SPX/VIX)
-    常规: 09:30-16:00 ET
-    SPX/VIX 指数期权: 可延长至 16:15 ET
-    部分ETF期权(SPY/QQQ): 有盘前盘后（04:00-09:30, 16:00-17:30 ET）
-    """
     if et_wd >= 5:
         return {"status": "休市", "icon": "🔴", "detail": "周末"}
-
     if time(4, 0) <= et_t < time(9, 30):
         return {"status": "盘前", "icon": "🔵", "detail": "SPY/QQQ 04:00起"}
     elif time(9, 30) <= et_t < time(16, 0):
@@ -417,10 +392,9 @@ def _detect_us_options(et_t, et_wd):
         return {"status": "收盘", "icon": "🔴", "detail": ""}
 
 
-def filter_index_codes(active: Set[Market],
-                       ak_codes: dict,
-                       futu_codes: dict,
-                       us_codes: dict) -> tuple:
+# ── 指数/标的过滤 ────────────────────────────────────────
+
+def filter_index_codes(active: Set[Market], ak_codes: dict, futu_codes: dict, us_codes: dict) -> tuple:
     """根据活跃市场过滤三组指数代码字典。"""
     return (
         ak_codes if Market.A in active else {},
@@ -441,128 +415,79 @@ def filter_symbols(active: Set[Market], symbols: list) -> list:
 @dataclass
 class SessionMode:
     """精细时段模式 — 指导 WebEngine 选择数据加载策略。"""
-    name: str           # "pre_market"|"ah_intraday"|"hk_tail"|"ah_post"|"us_intraday"|"overnight"
-    a_live: bool        # A股可拉实时分钟线
-    hk_live: bool       # H股可拉实时数据
-    us_live: bool       # 美股可拉实时数据
-    label: str          # 中文标签: "盘前"|"A+H盘中"|"H股尾盘"|"盘后复盘"|"美股盘中"|"深夜"
-    refresh_interval: int   # 自动刷新间隔(秒)，0=不刷新
-    use_daily_l3: bool      # True → L3 用 review_screener (日线)
+    name: str
+    a_live: bool
+    hk_live: bool
+    us_live: bool
+    label: str
+    refresh_interval: int
+    use_daily_l3: bool
     active_markets: tuple[str, ...] = ()
     next_check_seconds: int = 0
     next_refresh_at: str = ""
 
 
-# 六时段定义 (name, a_live, hk_live, us_live, label, refresh, daily_l3)
-_SESSIONS = {
-    "pre_market":   SessionMode("pre_market",   False, False, False, "盘前",     0,   True),
-    "ah_intraday":  SessionMode("ah_intraday",  True,  True,  False, "A+H盘中",  _live_refresh_interval(), False),
-    "a_intraday":   SessionMode("a_intraday",   True,  False, False, "A股盘中",  _live_refresh_interval(), False),
-    "hk_tail":      SessionMode("hk_tail",      False, True,  False, "H股盘中",  _live_refresh_interval(), True),
-    "market_lunch": SessionMode("market_lunch", False, False, False, "午休",     0,   True),
-    "market_break": SessionMode("market_break", False, False, False, "盘间休息", 0,   True),
-    "ah_post":      SessionMode("ah_post",      False, False, False, "盘后复盘", 0,   True),
-    "us_intraday":  SessionMode("us_intraday",  False, False, True,  "美股盘中", _live_refresh_interval(), True),
-    "overnight":    SessionMode("overnight",    False, False, False, "深夜",     0,   True),
-}
-
-
-def _session_with_timing(
-    name: str,
-    a_live: bool,
-    hk_live: bool,
-    us_live: bool,
-    label: str,
-    refresh_interval: int,
-    use_daily_l3: bool,
-    now_utc: datetime,
-    active_markets: tuple[str, ...] = (),
-    next_check_seconds: int = 0,
-) -> SessionMode:
+def _session_with_timing(name, a_live, hk_live, us_live, label, refresh_interval, use_daily_l3,
+                         now_utc, active_markets=(), next_check_seconds=0):
     next_seconds = next_check_seconds or refresh_interval
     next_refresh_at = ""
     if next_seconds > 0:
         next_refresh_at = (now_utc + timedelta(seconds=next_seconds)).astimezone(TZ_BEIJING).isoformat(timespec="seconds")
-    return SessionMode(
-        name,
-        a_live,
-        hk_live,
-        us_live,
-        label,
-        refresh_interval,
-        use_daily_l3,
-        active_markets,
-        next_seconds,
-        next_refresh_at,
-    )
+    return SessionMode(name, a_live, hk_live, us_live, label, refresh_interval,
+                       use_daily_l3, active_markets, next_seconds, next_refresh_at)
 
 
 def get_session_mode(now_utc: datetime = None) -> SessionMode:
-    """
-    检测当前精细时段，返回 SessionMode。
-
-    判断逻辑（北京时间，工作日）：
-      07:00-09:30  盘前
-      09:30-15:00  A+H盘中
-      15:00-16:00  H股尾盘
-      16:00-21:30* 盘后复盘
-      21:30*-04:00 美股盘中 (*夏令时21:30，冬令时22:30，由US/Eastern判断)
-      04:00-07:00  深夜
-
-    周末/00:00-04:00需检查美股是否仍在交易（周五晚→周六凌晨算美股盘中）。
-    """
+    """检测当前精细时段，返回 SessionMode。"""
     if now_utc is None:
         now_utc = datetime.now(TZ_UTC)
 
     now_bj = now_utc.astimezone(TZ_BEIJING)
     bj_t = now_bj.time()
-    bj_wd = now_bj.weekday()   # 0=Mon ... 6=Sun
+    bj_wd = now_bj.weekday()
     active = get_active_markets(now_utc)
     active_values = tuple(market.value for market in sorted(active, key=lambda item: item.value))
     live_interval = _live_refresh_interval()
 
     if Market.US in active:
-        return _session_with_timing(
-            "us_intraday", False, False, True, "美股盘中", live_interval, True, now_utc, active_values
-        )
+        return _session_with_timing("us_intraday", False, False, True, "美股盘中",
+                                    live_interval, True, now_utc, active_values)
 
     if Market.A in active or Market.HK in active:
         a_live = Market.A in active
         hk_live = Market.HK in active
         if a_live and hk_live:
-            label = "A+H盘中"
-            name = "ah_intraday"
+            label, name = "A+H盘中", "ah_intraday"
         elif a_live:
-            label = "A股盘中"
-            name = "a_intraday"
+            label, name = "A股盘中", "a_intraday"
         else:
-            label = "H股盘中"
-            name = "hk_tail"
-        return _session_with_timing(
-            name, a_live, hk_live, False, label, live_interval, not a_live, now_utc, active_values
-        )
+            label, name = "H股盘中", "hk_tail"
+        return _session_with_timing(name, a_live, hk_live, False, label,
+                                    live_interval, not a_live, now_utc, active_values)
 
     next_check = next_live_check_seconds(now_utc)
 
-    # ── 周末（美股也不开）→ 盘后复盘 ──
     if bj_wd >= 5:
-        return _session_with_timing("ah_post", False, False, False, "盘后复盘", 0, True, now_utc, (), next_check)
+        return _session_with_timing("ah_post", False, False, False, "盘后复盘",
+                                    0, True, now_utc, (), next_check)
 
-    # ── 工作日，按北京时间分段 ──
     _T_0700 = time(7, 0)
     _T_0930 = time(9, 30)
     _T_1300 = time(13, 0)
     _T_1600 = time(16, 0)
 
     if bj_t < _T_0700:
-        # 00:00-07:00: 美股已收盘（上面已排除美股开盘），深夜或盘后
-        return _session_with_timing("overnight", False, False, False, "深夜", 0, True, now_utc, (), next_check)
+        return _session_with_timing("overnight", False, False, False, "深夜",
+                                    0, True, now_utc, (), next_check)
     elif bj_t < _T_0930:
-        return _session_with_timing("pre_market", False, False, False, "盘前", 0, True, now_utc, (), next_check)
+        return _session_with_timing("pre_market", False, False, False, "盘前",
+                                    0, True, now_utc, (), next_check)
     elif bj_t < _T_1300:
-        return _session_with_timing("market_lunch", False, False, False, "午休", 0, True, now_utc, (), next_check)
+        return _session_with_timing("market_lunch", False, False, False, "午休",
+                                    0, True, now_utc, (), next_check)
     elif bj_t < _T_1600:
-        return _session_with_timing("market_break", False, False, False, "盘间休息", 0, True, now_utc, (), next_check)
+        return _session_with_timing("market_break", False, False, False, "盘间休息",
+                                    0, True, now_utc, (), next_check)
     else:
-        # 16:00+ 到美股开盘前（上面已排除美股开盘）
-        return _session_with_timing("ah_post", False, False, False, "盘后复盘", 0, True, now_utc, (), next_check)
+        return _session_with_timing("ah_post", False, False, False, "盘后复盘",
+                                    0, True, now_utc, (), next_check)

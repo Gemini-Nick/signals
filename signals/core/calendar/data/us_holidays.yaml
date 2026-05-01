@@ -1,0 +1,65 @@
+# 美国金融市场节假日日历 2025-2026
+# 数据来源: NYSE 官方日历, CBOE 官方日历, CME Group 假日安排
+#
+# 关键差异:
+#   - NYSE 假日: CME index futures 通常仍交易 (MLK/Presidents/Memorial/Labor/Juneteenth)
+#   - CME 仅圣诞全天关闭, Good Friday/Independence/Thanksgiving/Black Friday/Christmas Eve 提前收盘
+#   - CBOE 基本遵循 NYSE, 但 SPX/VIX 有 GTH (全球时段) 在部分假日仍有限交易
+
+holidays:
+  # ═══ 2025 年 ═══
+  # --- NYSE Full Close (也适用于 CBOE equity options RTH) ---
+  - {date: "2025-01-01", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "New Year's Day"}
+  - {date: "2025-01-20", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Martin Luther King Jr. Day"}
+  - {date: "2025-02-17", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Presidents' Day"}
+  - {date: "2025-04-18", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Good Friday"}
+  - {date: "2025-05-26", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Memorial Day"}
+  - {date: "2025-06-19", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Juneteenth"}
+  - {date: "2025-07-04", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Independence Day"}
+  - {date: "2025-09-01", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Labor Day"}
+  - {date: "2025-11-27", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Thanksgiving Day"}
+  - {date: "2025-12-25", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Christmas Day"}
+
+  # --- NYSE Early Close (1:00 PM ET) ---
+  - {date: "2025-07-03", exchange: NYSE, holiday_type: early_close, early_close_time: "13:00", applies_to: [equity, equity_option], description: "Day before Independence Day"}
+  - {date: "2025-11-28", exchange: NYSE, holiday_type: early_close, early_close_time: "13:00", applies_to: [equity, equity_option], description: "Black Friday"}
+  - {date: "2025-12-24", exchange: NYSE, holiday_type: early_close, early_close_time: "13:00", applies_to: [equity, equity_option], description: "Christmas Eve"}
+
+  # --- CME Index Futures: Full Close (仅圣诞) ---
+  - {date: "2025-12-25", exchange: CME, holiday_type: full_close, applies_to: [index_future], description: "Christmas Day"}
+
+  # --- CME Index Futures: Early Close (12:15 PM CT = 1:15 PM ET) ---
+  - {date: "2025-04-18", exchange: CME, holiday_type: early_close, early_close_time: "12:15", applies_to: [index_future], description: "Good Friday"}
+  - {date: "2025-07-04", exchange: CME, holiday_type: early_close, early_close_time: "12:15", applies_to: [index_future], description: "Independence Day"}
+  - {date: "2025-11-27", exchange: CME, holiday_type: early_close, early_close_time: "12:15", applies_to: [index_future], description: "Thanksgiving Day"}
+  - {date: "2025-11-28", exchange: CME, holiday_type: early_close, early_close_time: "12:15", applies_to: [index_future], description: "Day after Thanksgiving"}
+  - {date: "2025-12-24", exchange: CME, holiday_type: early_close, early_close_time: "12:15", applies_to: [index_future], description: "Christmas Eve"}
+
+  # ═══ 2026 年 ═══
+  # --- NYSE Full Close ---
+  - {date: "2026-01-01", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "New Year's Day"}
+  - {date: "2026-01-19", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Martin Luther King Jr. Day"}
+  - {date: "2026-02-16", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Presidents' Day"}
+  - {date: "2026-04-03", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Good Friday"}
+  - {date: "2026-05-25", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Memorial Day"}
+  - {date: "2026-06-19", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Juneteenth"}
+  - {date: "2026-07-03", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Independence Day (observed)"}
+  - {date: "2026-09-07", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Labor Day"}
+  - {date: "2026-11-26", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Thanksgiving Day"}
+  - {date: "2026-12-25", exchange: NYSE, holiday_type: full_close, applies_to: [equity, equity_option], description: "Christmas Day"}
+
+  # --- NYSE Early Close (1:00 PM ET) ---
+  - {date: "2026-11-27", exchange: NYSE, holiday_type: early_close, early_close_time: "13:00", applies_to: [equity, equity_option], description: "Black Friday"}
+  - {date: "2026-12-24", exchange: NYSE, holiday_type: early_close, early_close_time: "13:00", applies_to: [equity, equity_option], description: "Christmas Eve"}
+
+  # --- CME Index Futures: Full Close (仅圣诞) ---
+  - {date: "2026-12-25", exchange: CME, holiday_type: full_close, applies_to: [index_future], description: "Christmas Day"}
+
+  # --- CME Index Futures: Early Close (12:15 PM CT) ---
+  - {date: "2026-04-03", exchange: CME, holiday_type: early_close, early_close_time: "12:15", applies_to: [index_future], description: "Good Friday"}
+  - {date: "2026-07-03", exchange: CME, holiday_type: early_close, early_close_time: "12:15", applies_to: [index_future], description: "Independence Day (observed)"}
+  - {date: "2026-11-26", exchange: CME, holiday_type: early_close, early_close_time: "12:15", applies_to: [index_future], description: "Thanksgiving Day"}
+  - {date: "2026-11-27", exchange: CME, holiday_type: early_close, early_close_time: "12:15", applies_to: [index_future], description: "Day after Thanksgiving"}
+  - {date: "2026-12-24", exchange: CME, holiday_type: early_close, early_close_time: "12:15", applies_to: [index_future], description: "Christmas Eve"}
+
+makeup_workdays: []
