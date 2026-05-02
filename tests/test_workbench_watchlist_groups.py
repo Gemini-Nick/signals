@@ -283,6 +283,8 @@ def test_weekly_chart_uses_data_as_of_for_unfinished_current_week(monkeypatch):
     assert chart["meta"]["period_end"] == "2026-05-01"
     assert chart["meta"]["data_as_of"] == "2026-04-29"
     assert chart["meta"]["time_semantics"] == "period_data_as_of"
+    assert chart["ohlcv"][-1]["volume"] == 1000
+    assert chart["ohlcv"][-1]["amount"] == 10000
     assert workbench._timestamp_date(chart["ohlcv"][-1]["time"], market="A", symbol="sh000001") == "2026-04-29"
 
 

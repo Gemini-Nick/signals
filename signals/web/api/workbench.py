@@ -422,6 +422,7 @@ def _serialize_ohlcv_df(
             "low": round(low, 4),
             "close": round(close, 4),
             "volume": int(_float(row.get("vol") or row.get("volume"), 0) or 0),
+            "amount": int(_float(row.get("amount") or row.get("turnover"), 0) or 0),
         })
     return rows
 
