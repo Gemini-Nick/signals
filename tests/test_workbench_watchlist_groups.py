@@ -137,7 +137,7 @@ def test_chart_adds_volume_expansion_signal(monkeypatch):
     df = pd.DataFrame(
         {
             "open": [10.0] * 26,
-            "high": [10.5] * 26,
+            "high": [10.5] * 25 + [11.0],
             "low": [9.8] * 26,
             "close": [10.1] * 25 + [10.8],
             "vol": [1_000_000] * 25 + [2_600_000],
@@ -152,9 +152,10 @@ def test_chart_adds_volume_expansion_signal(monkeypatch):
     merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002709", "30min")
 
     signal = merged["signals"][-1]
-    assert signal["type"] == "成交量异常放大:上攻"
+    assert signal["type"] == "放量突破"
     assert "量比" in signal["details"]
-    assert signal["source"] == "terminal_volume_signals"
+    assert signal["source"] == "terminal_volume_price_anomalies"
+    assert signal["render_pane"] == "volume"
 
 
 def test_chart_adds_extreme_volume_contraction_signal(monkeypatch):
@@ -166,9 +167,9 @@ def test_chart_adds_extreme_volume_contraction_signal(monkeypatch):
             "open": [10.0] * 26,
             "high": [10.5] * 26,
             "low": [9.8] * 26,
-            "close": [10.1] * 26,
-            "vol": [1_000_000] * 25 + [300_000],
-            "amount": [10_000_000] * 25 + [3_000_000],
+            "close": [10.1] * 23 + [10.08, 10.05, 10.02],
+            "vol": [1_000_000] * 23 + [300_000, 280_000, 260_000],
+            "amount": [10_000_000] * 23 + [3_000_000, 2_800_000, 2_600_000],
         },
         index=index,
     )
@@ -179,9 +180,10 @@ def test_chart_adds_extreme_volume_contraction_signal(monkeypatch):
     merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002709", "30min")
 
     signal = merged["signals"][-1]
-    assert signal["type"] == "成交量极致缩量"
+    assert signal["type"] == "缩量回踩"
     assert "量比" in signal["details"]
-    assert signal["source"] == "terminal_volume_signals"
+    assert signal["source"] == "terminal_volume_price_anomalies"
+    assert signal["render_pane"] == "volume"
 
 
 def test_weekly_chart_aligns_custom_signal_to_containing_week(monkeypatch):

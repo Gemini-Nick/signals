@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from difflib import SequenceMatcher
 import threading
@@ -2647,14 +2648,152 @@ def _signal_pool_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) ->
     return output
 
 
-def _volume_signal_details(volume_ratio: float, volume: float, amount: Optional[float]) -> str:
+def _trimmed_mean(values: list[float], *, trim_ratio: float = 0.1) -> Optional[float]:
+    clean = sorted(value for value in values if value and value > 0)
+    if not clean:
+        return None
+    trim = int(len(clean) * trim_ratio)
+    if trim and len(clean) > trim * 2 + 2:
+        clean = clean[trim:-trim]
+    return sum(clean) / len(clean) if clean else None
+
+
+def _log_zscore(value: float, values: list[float]) -> float:
+    clean = [math.log(max(item, 1.0)) for item in values if item and item > 0]
+    if len(clean) < 5 or value <= 0:
+        return 0.0
+    mean = sum(clean) / len(clean)
+    variance = sum((item - mean) ** 2 for item in clean) / len(clean)
+    std = math.sqrt(variance)
+    if std <= 1e-9:
+        return 0.0
+    return (math.log(max(value, 1.0)) - mean) / std
+
+
+def _volume_signal_params(freq: str) -> dict[str, Any]:
+    bucket = _freq_bucket(freq)
+    if bucket == "weekly":
+        return {
+            "window": 20, "min_history": 12, "cooldown": 1,
+            "mild_expand": 1.2, "expand": 1.6, "extreme_expand": 2.3,
+            "mild_contract": 0.78, "contract": 0.6, "extreme_contract": 0.4,
+            "expand_z": 1.3, "extreme_expand_z": 2.0, "contract_z": -1.0, "extreme_contract_z": -1.6,
+        }
+    if bucket == "daily":
+        return {
+            "window": 20, "min_history": 14, "cooldown": 2,
+            "mild_expand": 1.25, "expand": 1.8, "extreme_expand": 2.8,
+            "mild_contract": 0.8, "contract": 0.55, "extreme_contract": 0.35,
+            "expand_z": 1.5, "extreme_expand_z": 2.2, "contract_z": -1.2, "extreme_contract_z": -1.8,
+        }
+    return {
+        "window": 40, "min_history": 20, "cooldown": 3,
+        "mild_expand": 1.35, "expand": 2.0, "extreme_expand": 3.0,
+        "mild_contract": 0.78, "contract": 0.5, "extreme_contract": 0.3,
+        "expand_z": 1.7, "extreme_expand_z": 2.4, "contract_z": -1.3, "extreme_contract_z": -2.0,
+    }
+
+
+def _volume_state(volume_ratio: float, volume_z: float, params: dict[str, Any]) -> tuple[str, int]:
+    if volume_ratio >= params["extreme_expand"] or volume_z >= params["extreme_expand_z"]:
+        return "extreme_expand", 4
+    if volume_ratio >= params["expand"] or volume_z >= params["expand_z"]:
+        return "expand", 3
+    if volume_ratio >= params["mild_expand"] or volume_z >= 0.8:
+        return "mild_expand", 2
+    if volume_ratio <= params["extreme_contract"] or volume_z <= params["extreme_contract_z"]:
+        return "extreme_contract", 4
+    if volume_ratio <= params["contract"] or volume_z <= params["contract_z"]:
+        return "contract", 3
+    if volume_ratio <= params["mild_contract"] or volume_z <= -0.8:
+        return "mild_contract", 2
+    return "normal", 0
+
+
+def _bar_shape(row: dict[str, Any], previous_close: Optional[float]) -> dict[str, float]:
+    open_ = _float(row.get("open"))
+    high = _float(row.get("high"))
+    low = _float(row.get("low"))
+    close = _float(row.get("close"))
+    if open_ is None or high is None or low is None or close is None:
+        return {}
+    range_value = max(high - low, 0.000001)
+    return_pct = ((close - previous_close) / previous_close) if previous_close else 0.0
+    amplitude_pct = (range_value / previous_close) if previous_close else 0.0
+    return {
+        "open": open_,
+        "high": high,
+        "low": low,
+        "close": close,
+        "body_pct": abs(close - open_) / range_value,
+        "upper_shadow_pct": max(0.0, high - max(open_, close)) / range_value,
+        "lower_shadow_pct": max(0.0, min(open_, close) - low) / range_value,
+        "close_location": (close - low) / range_value,
+        "return_pct": return_pct,
+        "amplitude_pct": amplitude_pct,
+    }
+
+
+def _volume_signal_details(
+    *,
+    volume_ratio: float,
+    amount_ratio: Optional[float],
+    volume_z: float,
+    body_pct: float,
+    upper_shadow_pct: float,
+    context: str,
+) -> str:
     parts = [
         f"量比{volume_ratio:.2f}",
-        f"成交量{volume / 1_000_000:.2f}万手",
+        f"z{volume_z:.2f}",
     ]
-    if amount is not None and amount > 0:
-        parts.append(f"成交额{amount / 100_000_000:.2f}亿")
-    return " · ".join(parts)
+    if amount_ratio is not None and amount_ratio > 0:
+        parts.append(f"额比{amount_ratio:.2f}")
+    parts.extend([
+        f"实体{body_pct * 100:.0f}%",
+        f"上影{upper_shadow_pct * 100:.0f}%",
+        context,
+    ])
+    return " · ".join(part for part in parts if part)
+
+
+def _volume_context(
+    *,
+    state: str,
+    severity: int,
+    shape: dict[str, float],
+    break_high: bool,
+    break_low: bool,
+    range_ratio: float,
+) -> Optional[tuple[str, str, str, int]]:
+    expand = state in {"mild_expand", "expand", "extreme_expand"}
+    contract = state in {"mild_contract", "contract", "extreme_contract"}
+    body_pct = shape.get("body_pct", 0.0)
+    upper = shape.get("upper_shadow_pct", 0.0)
+    lower = shape.get("lower_shadow_pct", 0.0)
+    close_location = shape.get("close_location", 0.5)
+    return_pct = shape.get("return_pct", 0.0)
+    if expand and break_low:
+        return "放量跌破", "放量跌破前低/平台", "sell", 95
+    if expand and upper >= 0.45 and close_location <= 0.58:
+        return "放量长上影", "放量冲高回落", "sell", 90
+    if expand and body_pct <= 0.28 and abs(return_pct) <= 0.018:
+        return "放量滞涨", "放量但实体不足", "sell", 84
+    if state == "extreme_expand" and body_pct <= 0.38 and upper >= 0.28 and lower >= 0.22:
+        return "巨量无方向", "巨量分歧", "neutral", 78
+    if expand and break_high and return_pct > 0 and body_pct >= 0.45 and close_location >= 0.62:
+        return "放量突破", "放量突破近端高点", "buy", 88
+    if expand and range_ratio >= 1.5 and body_pct >= 0.45:
+        return "波动收缩后放量扩张", "量价波动同步扩张", "buy" if return_pct >= 0 else "sell", 76
+    if contract and return_pct > 0 and break_high:
+        return "价涨量缩", "价格新高但量能不确认", "neutral", 72
+    if state == "extreme_contract" and range_ratio <= 0.9 and close_location >= 0.45:
+        return "极致缩量企稳", "极致缩量且波动收敛", "neutral", 70
+    if contract and not break_low and (return_pct <= 0 or lower >= 0.35):
+        return "缩量回踩", "缩量回踩/抛压收敛", "neutral", 68
+    if severity >= 4:
+        return "巨量无方向", "量能极端但方向不足", "neutral", 66
+    return None
 
 
 def _volume_signal_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2664,54 +2803,111 @@ def _volume_signal_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) 
     source = _text(chart_meta.get("source")) or "signals"
     ohlcv = chart.get("ohlcv") if isinstance(chart.get("ohlcv"), list) else []
     rows = [row for row in ohlcv if isinstance(row, dict) and _float(row.get("volume"), 0) and row.get("time")]
-    if len(rows) < 12:
+    params = _volume_signal_params(effective_freq)
+    if len(rows) < params["min_history"] + 2:
         return []
 
     output: list[dict[str, Any]] = []
-    window = 20
-    start = max(1, len(rows) - 160)
+    recent_states: list[str] = []
+    last_emit_index = -999
+    last_emit_type = ""
+    last_emit_state = "normal"
+    last_emit_severity = 0
+    start = max(1, len(rows) - 180)
     for index in range(start, len(rows)):
-        history = rows[max(0, index - window):index]
-        volumes = [
-            volume for volume in (_float(item.get("volume"), 0) or 0 for item in history)
-            if volume and volume > 0
-        ]
-        if len(volumes) < 10:
+        history = rows[max(0, index - params["window"]):index]
+        if len(history) < params["min_history"]:
             continue
-        current_volume = _float(rows[index].get("volume"), 0) or 0
-        if current_volume <= 0:
+        volumes = [_float(item.get("volume"), 0) or 0 for item in history]
+        amounts = [_float(item.get("amount"), 0) or 0 for item in history]
+        volume = _float(rows[index].get("volume"), 0) or 0
+        amount = _float(rows[index].get("amount"), 0) or 0
+        volume_baseline = _trimmed_mean(volumes)
+        amount_baseline = _trimmed_mean(amounts)
+        if not volume_baseline or volume <= 0:
             continue
-        baseline = sum(volumes) / len(volumes)
-        if baseline <= 0:
+        volume_ratio = volume / volume_baseline
+        amount_ratio = amount / amount_baseline if amount_baseline and amount > 0 else None
+        volume_z = _log_zscore(volume, volumes)
+        state, severity = _volume_state(volume_ratio, volume_z, params)
+        recent_states.append(state)
+        if len(recent_states) > 3:
+            recent_states.pop(0)
+        if state == "normal" or severity < 2:
+            last_emit_state = "normal"
             continue
-        volume_ratio = current_volume / baseline
-        current_amount = _float(rows[index].get("amount"))
-        close = _float(rows[index].get("close"))
+        if state in {"contract", "extreme_contract"} and sum(1 for item in recent_states if item in {"contract", "extreme_contract"}) < 2:
+            continue
         previous_close = _float(rows[index - 1].get("close")) if index > 0 else None
-        ts = int(rows[index].get("time") or 0)
-        if volume_ratio >= 2.2:
-            direction = "上攻" if close is not None and previous_close is not None and close >= previous_close else "下跌"
-            signal_type = f"成交量异常放大:{direction}"
-            signal_side = "buy" if direction == "上攻" else "sell"
-        elif volume_ratio <= 0.35:
-            signal_type = "成交量极致缩量"
-            signal_side = "neutral"
-        else:
+        shape = _bar_shape(rows[index], previous_close)
+        if not shape:
             continue
+        recent_window = rows[max(0, index - min(20, params["window"])):index]
+        recent_high = max((_float(item.get("high"), 0) or 0 for item in recent_window), default=0.0)
+        recent_low = min((_float(item.get("low"), 0) or 0 for item in recent_window if _float(item.get("low"), 0)), default=0.0)
+        break_high = bool(recent_high and shape["close"] > recent_high)
+        break_low = bool(recent_low and shape["close"] < recent_low)
+        ranges = []
+        for pos, item in enumerate(history):
+            prev = _float(history[pos - 1].get("close")) if pos > 0 else _float(item.get("close"))
+            bar = _bar_shape(item, prev)
+            if bar:
+                ranges.append(bar.get("amplitude_pct", 0.0))
+        range_baseline = _trimmed_mean(ranges) or 0.0
+        range_ratio = shape["amplitude_pct"] / range_baseline if range_baseline > 0 else 1.0
+        context = _volume_context(
+            state=state,
+            severity=severity,
+            shape=shape,
+            break_high=break_high,
+            break_low=break_low,
+            range_ratio=range_ratio,
+        )
+        if context is None:
+            continue
+        signal_type, context_text, signal_side, priority = context
+        cooldown = int(params["cooldown"])
+        if index - last_emit_index < cooldown:
+            same_type = signal_type == last_emit_type
+            flip_state = (state.endswith("expand") and "contract" in last_emit_state) or ("contract" in state and last_emit_state.endswith("expand"))
+            if same_type or flip_state or severity <= last_emit_severity:
+                continue
+        ts = int(rows[index].get("time") or 0)
+        details = _volume_signal_details(
+            volume_ratio=volume_ratio,
+            amount_ratio=amount_ratio,
+            volume_z=volume_z,
+            body_pct=shape["body_pct"],
+            upper_shadow_pct=shape["upper_shadow_pct"],
+            context=context_text,
+        )
         output.append({
             "dt": ts,
             "date_str": _timestamp_date(ts, market=market, symbol=symbol, source=source),
             "type": signal_type,
-            "price": close,
-            "confidence": round(min(0.95, max(0.58, abs(volume_ratio - 1.0) / 2.0 + 0.55)), 4),
+            "price": shape.get("close"),
+            "confidence": round(min(0.95, max(0.58, 0.5 + severity * 0.08 + min(abs(volume_z), 3.0) * 0.03)), 4),
             "freq": effective_freq or _canonical_freq(freq),
-            "details": _volume_signal_details(volume_ratio, current_volume, current_amount),
-            "source": "terminal_volume_signals",
+            "details": details,
+            "source": "terminal_volume_price_anomalies",
             "pool_status": "volume_warning",
             "chart_aligned": False,
             "display_scope": "current_timeframe",
             "signal_side": signal_side,
+            "signal_family": "volume",
+            "render_pane": "volume",
+            "display_pane": "volume",
+            "volume_state": state,
+            "volume_context": context_text,
+            "volume_ratio": round(volume_ratio, 4),
+            "amount_ratio": round(amount_ratio, 4) if amount_ratio is not None else None,
+            "volume_z": round(volume_z, 4),
+            "severity": "high" if priority >= 88 else "medium" if priority >= 76 else "low",
         })
+        last_emit_index = index
+        last_emit_type = signal_type
+        last_emit_state = state
+        last_emit_severity = severity
     return output[-12:]
 
 
