@@ -2378,13 +2378,19 @@ def _chart_signal_display_scope(signal_freq: str, effective_freq: str) -> str:
     effective_bucket = _freq_bucket(effective_freq)
     if not signal_bucket or signal_bucket == effective_bucket:
         return "current_timeframe"
-    if effective_bucket in {"5min", "15min", "30min"} and _is_higher_timeframe(signal_bucket, effective_bucket):
+    if signal_bucket not in CHART_FREQ_ORDER or effective_bucket not in CHART_FREQ_ORDER:
+        return "other_timeframe"
+    if _is_higher_timeframe(signal_bucket, effective_bucket):
         return "higher_timeframe_context"
-    return "other_timeframe"
+    return "lower_timeframe_context"
 
 
 def _should_include_chart_signal(signal_freq: str, effective_freq: str) -> bool:
-    return _chart_signal_display_scope(signal_freq, effective_freq) in {"current_timeframe", "higher_timeframe_context"}
+    return _chart_signal_display_scope(signal_freq, effective_freq) in {
+        "current_timeframe",
+        "higher_timeframe_context",
+        "lower_timeframe_context",
+    }
 
 
 def _signal_counts_by_scope(signals: list[dict[str, Any]]) -> dict[str, int]:
@@ -2670,6 +2676,18 @@ def _log_zscore(value: float, values: list[float]) -> float:
     return (math.log(max(value, 1.0)) - mean) / std
 
 
+def _zscore(value: float, values: list[float]) -> float:
+    clean = [item for item in values if item is not None and math.isfinite(item)]
+    if len(clean) < 5:
+        return 0.0
+    mean = sum(clean) / len(clean)
+    variance = sum((item - mean) ** 2 for item in clean) / len(clean)
+    std = math.sqrt(variance)
+    if std <= 1e-9:
+        return 0.0
+    return (value - mean) / std
+
+
 def _volume_signal_params(freq: str) -> dict[str, Any]:
     bucket = _freq_bucket(freq)
     if bucket == "weekly":
@@ -2739,13 +2757,21 @@ def _volume_signal_details(
     volume_ratio: float,
     amount_ratio: Optional[float],
     volume_z: float,
+    return_pct: float,
+    return_z: float,
+    range_ratio: float,
     body_pct: float,
     upper_shadow_pct: float,
+    relation: str,
     context: str,
 ) -> str:
     parts = [
+        relation,
         f"量比{volume_ratio:.2f}",
         f"z{volume_z:.2f}",
+        f"涨跌{(return_pct * 100):+.2f}%",
+        f"涨跌z{return_z:.2f}",
+        f"波幅比{range_ratio:.2f}",
     ]
     if amount_ratio is not None and amount_ratio > 0:
         parts.append(f"额比{amount_ratio:.2f}")
@@ -2764,8 +2790,9 @@ def _volume_context(
     shape: dict[str, float],
     break_high: bool,
     break_low: bool,
+    return_z: float,
     range_ratio: float,
-) -> Optional[tuple[str, str, str, int]]:
+) -> Optional[tuple[str, str, str, int, str]]:
     expand = state in {"mild_expand", "expand", "extreme_expand"}
     contract = state in {"mild_contract", "contract", "extreme_contract"}
     body_pct = shape.get("body_pct", 0.0)
@@ -2773,26 +2800,37 @@ def _volume_context(
     lower = shape.get("lower_shadow_pct", 0.0)
     close_location = shape.get("close_location", 0.5)
     return_pct = shape.get("return_pct", 0.0)
+    price_up = return_pct >= 0.012 or return_z >= 0.9 or (break_high and return_pct > 0)
+    price_down = return_pct <= -0.012 or return_z <= -0.9 or (break_low and return_pct < 0)
+    price_flat = not price_up and not price_down
+    abnormal_range = range_ratio >= 1.45
+    compressed_range = range_ratio <= 0.82
     if expand and break_low:
-        return "放量跌破", "放量跌破前低/平台", "sell", 95
+        return "量价共振下杀", "放量跌破前低/平台", "sell", 95, "量价同向向下"
     if expand and upper >= 0.45 and close_location <= 0.58:
-        return "放量长上影", "放量冲高回落", "sell", 90
-    if expand and body_pct <= 0.28 and abs(return_pct) <= 0.018:
-        return "放量滞涨", "放量但实体不足", "sell", 84
+        return "量价背离冲高回落", "上冲放量但收不住", "sell", 90, "价量背离"
+    if expand and price_flat and body_pct <= 0.30:
+        return "价平量增分歧", "放量但价格不跟", "sell", 84, "价量背离"
     if state == "extreme_expand" and body_pct <= 0.38 and upper >= 0.28 and lower >= 0.22:
-        return "巨量无方向", "巨量分歧", "neutral", 78
-    if expand and break_high and return_pct > 0 and body_pct >= 0.45 and close_location >= 0.62:
-        return "放量突破", "放量突破近端高点", "buy", 88
-    if expand and range_ratio >= 1.5 and body_pct >= 0.45:
-        return "波动收缩后放量扩张", "量价波动同步扩张", "buy" if return_pct >= 0 else "sell", 76
-    if contract and return_pct > 0 and break_high:
-        return "价涨量缩", "价格新高但量能不确认", "neutral", 72
-    if state == "extreme_contract" and range_ratio <= 0.9 and close_location >= 0.45:
-        return "极致缩量企稳", "极致缩量且波动收敛", "neutral", 70
+        return "巨量分歧无方向", "巨量但多空方向不足", "neutral", 78, "量价分歧"
+    if expand and price_up and break_high and body_pct >= 0.42 and close_location >= 0.60:
+        return "量价齐升突破", "价涨放量突破近端高点", "buy", 88, "量价同向向上"
+    if expand and abnormal_range and body_pct >= 0.42:
+        if price_down:
+            return "量价同步扩跌", "放量且波动向下扩张", "sell", 80, "量价同向向下"
+        if price_up:
+            return "量价同步扩张", "价涨放量且波动扩张", "buy", 78, "量价同向向上"
+        return "量价扩张分歧", "放量扩波但方向不足", "neutral", 76, "量价分歧"
+    if contract and price_up and break_high:
+        return "价升量缩背离", "价格新高但量能不确认", "neutral", 74, "价量背离"
+    if contract and price_down and not break_low:
+        return "缩量回踩承接", "下跌缩量且未破位", "neutral", 70, "量价收敛"
+    if state == "extreme_contract" and compressed_range and close_location >= 0.45:
+        return "量价收敛企稳", "极致缩量且波动收敛", "neutral", 70, "量价收敛"
     if contract and not break_low and (return_pct <= 0 or lower >= 0.35):
-        return "缩量回踩", "缩量回踩/抛压收敛", "neutral", 68
+        return "缩量回踩承接", "缩量回踩/抛压收敛", "neutral", 68, "量价收敛"
     if severity >= 4:
-        return "巨量无方向", "量能极端但方向不足", "neutral", 66
+        return "极端量能分歧", "量能极端但方向不足", "neutral", 66, "量价分歧"
     return None
 
 
@@ -2848,24 +2886,28 @@ def _volume_signal_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) 
         break_high = bool(recent_high and shape["close"] > recent_high)
         break_low = bool(recent_low and shape["close"] < recent_low)
         ranges = []
+        returns = []
         for pos, item in enumerate(history):
             prev = _float(history[pos - 1].get("close")) if pos > 0 else _float(item.get("close"))
             bar = _bar_shape(item, prev)
             if bar:
                 ranges.append(bar.get("amplitude_pct", 0.0))
+                returns.append(bar.get("return_pct", 0.0))
         range_baseline = _trimmed_mean(ranges) or 0.0
         range_ratio = shape["amplitude_pct"] / range_baseline if range_baseline > 0 else 1.0
+        return_z = _zscore(shape["return_pct"], returns)
         context = _volume_context(
             state=state,
             severity=severity,
             shape=shape,
             break_high=break_high,
             break_low=break_low,
+            return_z=return_z,
             range_ratio=range_ratio,
         )
         if context is None:
             continue
-        signal_type, context_text, signal_side, priority = context
+        signal_type, context_text, signal_side, priority, relation = context
         cooldown = int(params["cooldown"])
         if index - last_emit_index < cooldown:
             same_type = signal_type == last_emit_type
@@ -2877,8 +2919,12 @@ def _volume_signal_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) 
             volume_ratio=volume_ratio,
             amount_ratio=amount_ratio,
             volume_z=volume_z,
+            return_pct=shape["return_pct"],
+            return_z=return_z,
+            range_ratio=range_ratio,
             body_pct=shape["body_pct"],
             upper_shadow_pct=shape["upper_shadow_pct"],
+            relation=relation,
             context=context_text,
         )
         output.append({
@@ -2899,9 +2945,13 @@ def _volume_signal_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) 
             "display_pane": "volume",
             "volume_state": state,
             "volume_context": context_text,
+            "volume_price_relation": relation,
             "volume_ratio": round(volume_ratio, 4),
             "amount_ratio": round(amount_ratio, 4) if amount_ratio is not None else None,
             "volume_z": round(volume_z, 4),
+            "return_pct": round(shape["return_pct"], 6),
+            "return_z": round(return_z, 4),
+            "range_ratio": round(range_ratio, 4),
             "severity": "high" if priority >= 88 else "medium" if priority >= 76 else "low",
         })
         last_emit_index = index
@@ -2922,7 +2972,7 @@ def _aligned_signal_bar(
     symbol: str,
     source: str,
 ) -> tuple[int, Optional[float], bool]:
-    if effective_freq in {"daily", "monthly"} or not ohlcv:
+    if not ohlcv:
         return ts, None, False
     bar_by_time = {
         int(row.get("time") or 0): row
@@ -2932,6 +2982,13 @@ def _aligned_signal_bar(
     if ts in bar_by_time:
         row = bar_by_time[ts]
         return ts, _float(row.get("close")), False
+
+    def price_for_row(row: dict[str, Any]) -> Optional[float]:
+        if _is_sell_signal(signal):
+            return _float(row.get("high") or row.get("close"))
+        if _is_buy_signal(signal):
+            return _float(row.get("low") or row.get("close"))
+        return _float(row.get("close"))
 
     signal_date = str(signal_dt or "")[:10]
     if not signal_date:
@@ -2955,13 +3012,7 @@ def _aligned_signal_bar(
         dated_rows.sort(key=lambda item: item[0])
         for row_date, row in dated_rows:
             if parsed_signal_date <= row_date:
-                if _is_sell_signal(signal):
-                    price = _float(row.get("high") or row.get("close"))
-                elif _is_buy_signal(signal):
-                    price = _float(row.get("low") or row.get("close"))
-                else:
-                    price = _float(row.get("close"))
-                return int(row.get("time") or ts), price, True
+                return int(row.get("time") or ts), price_for_row(row), True
         return ts, None, False
     same_day = [
         row for row in ohlcv
@@ -2971,14 +3022,12 @@ def _aligned_signal_bar(
     ]
     if not same_day:
         return ts, None, False
+    same_day.sort(key=lambda item: int(item.get("time") or 0))
     row = same_day[-1]
-    if _is_sell_signal(signal):
-        price = _float(row.get("high") or row.get("close"))
-    elif _is_buy_signal(signal):
-        price = _float(row.get("low") or row.get("close"))
-    else:
-        price = _float(row.get("close"))
-    return int(row.get("time") or ts), price, True
+    has_intraday_time = len(str(signal_dt or "").strip()) > 10
+    if has_intraday_time and ts and ts > 100_000:
+        row = next((item for item in same_day if int(item.get("time") or 0) >= ts), same_day[-1])
+    return int(row.get("time") or ts), price_for_row(row), True
 
 
 def _merge_signal_pool_into_chart(chart: dict[str, Any], symbol: str, freq: str) -> dict[str, Any]:

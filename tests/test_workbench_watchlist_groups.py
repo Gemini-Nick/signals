@@ -152,8 +152,9 @@ def test_chart_adds_volume_expansion_signal(monkeypatch):
     merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002709", "30min")
 
     signal = merged["signals"][-1]
-    assert signal["type"] == "放量突破"
+    assert signal["type"] == "量价齐升突破"
     assert "量比" in signal["details"]
+    assert signal["volume_price_relation"] == "量价同向向上"
     assert signal["source"] == "terminal_volume_price_anomalies"
     assert signal["render_pane"] == "volume"
 
@@ -180,8 +181,9 @@ def test_chart_adds_extreme_volume_contraction_signal(monkeypatch):
     merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002709", "30min")
 
     signal = merged["signals"][-1]
-    assert signal["type"] == "缩量回踩"
+    assert signal["type"] == "缩量回踩承接"
     assert "量比" in signal["details"]
+    assert signal["volume_price_relation"] == "量价收敛"
     assert signal["source"] == "terminal_volume_price_anomalies"
     assert signal["render_pane"] == "volume"
 
@@ -243,6 +245,14 @@ def test_intraday_chart_includes_higher_timeframe_custom_context(monkeypatch):
             "confidence": 0.76,
             "source": "sqlite.backtest.signal_records",
         },
+        {
+            "symbol": "SZ.002759",
+            "signal_date": "2026-03-15 10:45",
+            "signal_type": "5分钟右侧确认",
+            "freq": "5分钟",
+            "confidence": 0.72,
+            "source": "sqlite.backtest.signal_records",
+        },
     ])
     monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [])
 
@@ -251,6 +261,8 @@ def test_intraday_chart_includes_higher_timeframe_custom_context(monkeypatch):
 
     assert by_type["日线自定义三买"]["display_scope"] == "higher_timeframe_context"
     assert by_type["30分钟缺口买"]["display_scope"] == "current_timeframe"
+    assert by_type["5分钟右侧确认"]["display_scope"] == "lower_timeframe_context"
+    assert by_type["5分钟右侧确认"]["dt"] == chart["ohlcv"][2]["time"]
 
 
 def test_intraday_chart_merges_terminal_technical_signals(monkeypatch):
