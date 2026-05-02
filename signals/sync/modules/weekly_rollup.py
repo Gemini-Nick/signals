@@ -9,6 +9,7 @@ import pandas as pd
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
+from signals.sync.volume_units import CANONICAL_STOCK_VOLUME_UNIT
 
 logger = logging.getLogger("signals.sync.weekly_rollup")
 
@@ -74,6 +75,8 @@ def _weekly_docs(symbol: str, docs: list[dict[str, Any]], *, collection: str) ->
                 "freq": WEEKLY_FREQ,
                 "source": source,
                 "market": "A",
+                "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
+                "source_volume_unit": "daily_shares_rollup",
                 "period_end": period_end.date().isoformat(),
                 "data_as_of": data_as_of.date().isoformat(),
                 "time_semantics": "period_data_as_of" if is_partial_period else "period_end",

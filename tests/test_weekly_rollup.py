@@ -25,6 +25,8 @@ def test_weekly_docs_are_generated_from_daily_cache():
     assert len(weekly) == 1
     assert weekly[0]["meta"]["freq"] == "周线"
     assert weekly[0]["meta"]["source"] == "daily_rollup"
+    assert weekly[0]["meta"]["volume_unit"] == "shares"
+    assert weekly[0]["meta"]["source_volume_unit"] == "daily_shares_rollup"
     assert weekly[0]["open"] == 9
     assert weekly[0]["close"] == 14
     assert weekly[0]["vol"] == 500
