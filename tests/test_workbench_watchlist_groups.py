@@ -572,6 +572,46 @@ def test_manual_clue_preheat_requests_full_execution_bundle():
     assert workbench._manual_clue_preheat_freqs("daily") == ["daily", "30min", "15min", "5min"]
 
 
+def test_manual_clue_delete_requires_confirmation():
+    from fastapi import HTTPException
+    from signals.web.api import workbench
+
+    try:
+        asyncio.run(workbench.delete_workbench_manual_clue("SZ.002354"))
+    except HTTPException as exc:
+        assert exc.status_code == 409
+    else:
+        raise AssertionError("manual clue delete should require explicit confirmation")
+
+
+def test_manual_clue_delete_with_confirmation(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Result:
+        deleted_count = 1
+
+    class _ManualClues:
+        def __init__(self):
+            self.query = None
+
+        def delete_many(self, query):
+            self.query = query
+            return _Result()
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    collection = _ManualClues()
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"terminal_manual_clues": collection}))
+    monkeypatch.setattr(workbench, "_invalidate_shell_cache", lambda: None)
+
+    payload = asyncio.run(workbench.delete_workbench_manual_clue("SZ.002354", confirm=True))
+
+    assert payload == {"status": "ok", "symbol": "SZ.002354", "deleted": 1}
+    assert collection.query["$or"][0]["symbol"] == "SZ.002354"
+
+
 def test_quote_overlay_marks_non_current_quote_stale(monkeypatch):
     from signals.web.api import workbench
 

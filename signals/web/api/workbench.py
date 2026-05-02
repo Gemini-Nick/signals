@@ -6724,10 +6724,12 @@ async def add_workbench_manual_clue(payload: dict[str, Any] = Body(...)):
 
 
 @router.delete("/manual-clues/{symbol:path}")
-async def delete_workbench_manual_clue(symbol: str):
+async def delete_workbench_manual_clue(symbol: str, confirm: bool = Query(False)):
     normalized, raw_code = _normalize_stock_symbol(symbol)
     if not normalized:
         raise HTTPException(status_code=400, detail=f"无法识别股票标的: {symbol}")
+    if confirm is not True:
+        raise HTTPException(status_code=409, detail="删除临时线索需要二次确认")
 
     def _delete() -> dict[str, Any]:
         db = _mongo_db()
