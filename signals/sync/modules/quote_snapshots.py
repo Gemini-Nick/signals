@@ -15,6 +15,7 @@ from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import trading_day_key
 from signals.sync.eastmoney_observer import observe_eastmoney
 from signals.sync.provider_limits import ProviderCoolingDown, provider_call
+from signals.sync.volume_units import CANONICAL_STOCK_VOLUME_UNIT, normalize_stock_volume
 
 logger = logging.getLogger("signals.sync.quote_snapshots")
 _EM_ENDPOINT = "https://push2delay.eastmoney.com/api/qt/stock/get"
@@ -271,6 +272,7 @@ def _quote_doc_from_em(symbol: str, payload: dict, now: datetime, trading_day: s
         return None
     prev_close = _scale_price(data.get("f60"))
     change_pct = _scale_pct(data.get("f170"))
+    vol, source_volume_unit = normalize_stock_volume(data.get("f47"), source_unit="hands")
     return {
         "_id": f"{symbol}:latest",
         "symbol": symbol,
@@ -293,7 +295,10 @@ def _quote_doc_from_em(symbol: str, payload: dict, now: datetime, trading_day: s
         "change_pct": change_pct,
         "turnover_pct": _scale_pct(data.get("f168")),
         "amplitude_pct": _scale_pct(data.get("f171")),
-        "vol": int(float(data.get("f47") or 0) * 100),
+        "vol": vol,
+        "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
+        "source_vol": float(data.get("f47") or 0),
+        "source_volume_unit": source_volume_unit,
         "amount": float(data.get("f48") or 0),
         "market_cap": float(data.get("f116") or 0),
         "float_market_cap": float(data.get("f117") or 0),
@@ -319,6 +324,12 @@ def _quote_doc_from_fullmarket_spot(symbol: str, row: dict, now: datetime, tradi
     if price <= 0:
         return None
     code = str(row.get("code") or _code_for_symbol(symbol))
+    vol, source_volume_unit = normalize_stock_volume(
+        row.get("vol"),
+        source=row.get("source"),
+        source_unit=row.get("volume_unit"),
+        default_source_unit="hands",
+    )
     return {
         "_id": f"{symbol}:latest",
         "symbol": symbol,
@@ -341,7 +352,10 @@ def _quote_doc_from_fullmarket_spot(symbol: str, row: dict, now: datetime, tradi
         "change_pct": row.get("change_pct"),
         "turnover_pct": row.get("turnover_pct"),
         "amplitude_pct": row.get("amplitude_pct"),
-        "vol": int(float(row.get("vol") or 0) * 100),
+        "vol": vol,
+        "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
+        "source_vol": row.get("source_vol", row.get("vol")),
+        "source_volume_unit": row.get("source_volume_unit") or source_volume_unit,
         "amount": float(row.get("amount") or 0),
         "market_cap": float(row.get("market_cap") or 0),
         "float_market_cap": float(row.get("float_market_cap") or 0),
@@ -358,6 +372,7 @@ def _quote_doc_from_ulist_row(symbol: str, row: dict, now: datetime, trading_day
     if price <= 0:
         return None
     code = str(row.get("f12") or _code_for_symbol(symbol))
+    vol, source_volume_unit = normalize_stock_volume(row.get("f5"), source_unit="hands")
     return {
         "_id": f"{symbol}:latest",
         "symbol": symbol,
@@ -380,7 +395,10 @@ def _quote_doc_from_ulist_row(symbol: str, row: dict, now: datetime, trading_day
         "change_pct": row.get("f3"),
         "turnover_pct": row.get("f8"),
         "amplitude_pct": row.get("f7"),
-        "vol": int(float(row.get("f5") or 0) * 100),
+        "vol": vol,
+        "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
+        "source_vol": float(row.get("f5") or 0),
+        "source_volume_unit": source_volume_unit,
         "amount": float(row.get("f6") or 0),
         "market_cap": row.get("f20"),
         "float_market_cap": row.get("f21"),
@@ -422,6 +440,14 @@ def _hot_quote_symbols(db: Database) -> list[str]:
             if not isinstance(item, dict):
                 continue
             add(item.get("symbol") or item.get("code") or item.get("raw_code"))
+    try:
+        for item in db["terminal_manual_clues"].find(
+            {"active": {"$ne": False}},
+            {"symbol": 1, "raw_code": 1},
+        ).sort("updated_at", -1).limit(80):
+            add(item.get("symbol") or item.get("raw_code"))
+    except Exception:
+        logger.debug("manual clue quote symbols unavailable", exc_info=True)
 
     for symbol in _latest_pool_symbols(db):
         add(symbol)
@@ -572,6 +598,9 @@ def _read_fullmarket_spot_quotes(
                 "turnover_pct": 1,
                 "amplitude_pct": 1,
                 "vol": 1,
+                "volume_unit": 1,
+                "source_vol": 1,
+                "source_volume_unit": 1,
                 "amount": 1,
                 "open": 1,
                 "high": 1,

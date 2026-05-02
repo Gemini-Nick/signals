@@ -701,6 +701,27 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
         else:
             _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, row, "terminal_stock_pool", symbol_sources=symbol_sources)
 
+    try:
+        manual_rows = list(db["terminal_manual_clues"].find(
+            {"active": {"$ne": False}},
+            {"symbol": 1, "raw_code": 1},
+        ).sort("updated_at", -1).limit(80))
+    except Exception:
+        manual_rows = []
+    for row in manual_rows:
+        _add_candidate(
+            symbols,
+            source_counts,
+            priority_symbols,
+            pinned_symbols,
+            index_codes,
+            row.get("raw_code") or row.get("symbol"),
+            "terminal_manual_clues",
+            priority=True,
+            pinned=True,
+            symbol_sources=symbol_sources,
+        )
+
     if not symbols and postmarket_scope:
         _add_postmarket_expanded_candidates(
             db,

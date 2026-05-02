@@ -49,6 +49,9 @@ def test_quote_doc_from_eastmoney_payload_scales_fields():
     assert doc["prev_close"] == 19.43
     assert doc["change_pct"] == 1.24
     assert doc["vol"] == 30498700
+    assert doc["volume_unit"] == "shares"
+    assert doc["source_vol"] == 304987
+    assert doc["source_volume_unit"] == "hands"
 
 
 def test_quote_doc_from_ulist_row_uses_batch_fields():
@@ -77,6 +80,7 @@ def test_quote_doc_from_ulist_row_uses_batch_fields():
     assert doc["price"] == 19.67
     assert doc["change_pct"] == 1.24
     assert doc["vol"] == 30498700
+    assert doc["volume_unit"] == "shares"
 
 
 class _Collection:
@@ -141,6 +145,31 @@ def test_quote_snapshots_reads_fullmarket_spot_snapshot():
     assert doc["trade_date"] == "2026-04-29"
     assert doc["price"] == 19.67
     assert doc["vol"] == 30498700
+
+
+def test_quote_snapshots_do_not_rescale_normalized_fullmarket_volume():
+    db = _Db({
+        "fullmarket_spot_snapshots": _Collection([
+            {
+                "date_key": "20260429",
+                "trade_date": "2026-04-29",
+                "code": "601958",
+                "symbol": "SH.601958",
+                "price": 19.67,
+                "vol": 30498700,
+                "volume_unit": "shares",
+                "source_vol": 304987,
+                "source_volume_unit": "hands",
+            }
+        ])
+    })
+
+    docs = _read_fullmarket_spot_quotes(db, ["SH.601958"], "2026-04-29", datetime(2026, 4, 29, 16, 0))
+
+    doc = docs["SH.601958"]
+    assert doc["vol"] == 30498700
+    assert doc["source_vol"] == 304987
+    assert doc["source_volume_unit"] == "hands"
 
 
 def test_quote_snapshots_falls_back_to_latest_fullmarket_spot_snapshot():

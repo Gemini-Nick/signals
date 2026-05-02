@@ -16,6 +16,7 @@ from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import trading_day_key
 from signals.sync.eastmoney_observer import observe_eastmoney
 from signals.sync.provider_limits import provider_call
+from signals.sync.volume_units import CANONICAL_STOCK_VOLUME_UNIT, normalize_stock_volume
 
 logger = logging.getLogger("signals.sync.fullmarket_spot_snapshot")
 
@@ -117,6 +118,8 @@ def _doc_from_row(row: dict, *, date_key: str, trade_date: str, snapshot_at) -> 
     if not code:
         return None
     latest = _number(row.get("f2"))
+    source_vol = _number(row.get("f5"), 0.0)
+    vol, source_volume_unit = normalize_stock_volume(source_vol, source_unit="hands")
     return {
         "_id": f"{date_key}:{code}",
         "date_key": date_key,
@@ -131,7 +134,10 @@ def _doc_from_row(row: dict, *, date_key: str, trade_date: str, snapshot_at) -> 
         "price": latest,
         "change_pct": _number(row.get("f3")),
         "change": _number(row.get("f4")),
-        "vol": _number(row.get("f5"), 0.0),
+        "vol": vol,
+        "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
+        "source_vol": source_vol,
+        "source_volume_unit": source_volume_unit,
         "amount": _number(row.get("f6"), 0.0),
         "amplitude_pct": _number(row.get("f7")),
         "turnover_pct": _number(row.get("f8")),

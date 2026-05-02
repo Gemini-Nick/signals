@@ -224,7 +224,78 @@ def test_stock_daily_batch_today_uses_eastmoney_clist_snapshot(monkeypatch):
 
     assert set(docs) == {"600001"}
     assert docs["600001"][0]["source"] == "eastmoney_spot_clist_batch"
+    assert docs["600001"][0]["vol"] == 100000
+    assert docs["600001"][0]["meta"]["volume_unit"] == "shares"
+    assert docs["600001"][0]["meta"]["source_volume_unit"] == "hands"
     assert "fallback=1" in reason
+
+
+def test_stock_daily_batch_today_bootstraps_snapshot_only_codes(monkeypatch):
+    db = _DB()
+    monkeypatch.setattr(stock_daily, "naive_market_now", lambda _market: datetime(2026, 4, 30, 18, 0, 0))
+    monkeypatch.setattr(
+        stock_daily,
+        "_fetch_eastmoney_spot_batch_df",
+        lambda _db, _end_date: pd.DataFrame([
+            {
+                "代码": "920118",
+                "_pure_code": "920118",
+                "今开": 16.2,
+                "最高": 16.8,
+                "最低": 16.1,
+                "最新价": 16.5,
+                "成交量": 1200,
+                "成交额": 198000,
+                "昨收": 16.0,
+            }
+        ]),
+    )
+    monkeypatch.setattr(stock_daily, "_previous_daily_close_by_symbol", lambda _db, _codes, _end_date: {})
+
+    docs, reason = stock_daily._sync_today_from_spot_batch(
+        db,
+        ["920118"],
+        {},
+        "20260430",
+    )
+
+    assert set(docs) == {"920118"}
+    assert docs["920118"][0]["dt"] == pd.to_datetime("20260430")
+    assert docs["920118"][0]["vol"] == 120000
+    assert "snapshot_bootstrap=1" in reason
+
+
+def test_stock_daily_normalizes_provider_daily_volume_units():
+    df = pd.DataFrame([
+        {
+            "日期": "2026-04-29",
+            "开盘": 10,
+            "最高": 11,
+            "最低": 9,
+            "收盘": 10.5,
+            "成交量": 1234,
+            "成交额": 100000,
+        }
+    ])
+    docs = stock_daily._docs_from_daily_df(
+        "600001",
+        df,
+        {
+            "dt": "日期",
+            "open": "开盘",
+            "high": "最高",
+            "low": "最低",
+            "close": "收盘",
+            "vol": "成交量",
+            "amount": "成交额",
+        },
+        "tencent",
+        end_date="20260429",
+    )
+
+    assert docs[0]["vol"] == 123400
+    assert docs[0]["meta"]["volume_unit"] == "shares"
+    assert docs[0]["meta"]["source_volume_unit"] == "hands"
 
 
 def test_stock_daily_defers_shard_when_all_providers_cooling(monkeypatch):

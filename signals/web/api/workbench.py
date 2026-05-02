@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -1694,6 +1694,9 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "quote_age_seconds",
         "quote_stale_reason",
         "explanation",
+        "manual_clue",
+        "deletable",
+        "can_trade_now",
     )
     out = {key: row.get(key) for key in keys if row.get(key) not in (None, "", [], {})}
     reasons = [
@@ -3611,6 +3614,73 @@ def _terminal_stock_pool_rows(range_columns: list[dict[str, Any]], limit: Option
     return _terminal_stock_pool_group_rows(range_columns, "focus_stocks", limit)
 
 
+def _manual_clue_rows(range_columns: list[dict[str, Any]], limit: Optional[int] = None) -> list[dict[str, Any]]:
+    limit = limit or max(1, int(os.getenv("TERMINAL_WORKBENCH_MANUAL_CLUE_LIMIT", "36")))
+    try:
+        db = _mongo_db()
+        docs = list(db["terminal_manual_clues"].find(
+            {"active": {"$ne": False}},
+            {"_id": 0},
+        ).sort([("updated_at", -1), ("created_at", -1)]).limit(limit))
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for doc in docs:
+        symbol = _text(doc.get("symbol"))
+        normalized, raw_code = _normalize_stock_symbol(symbol)
+        if not normalized:
+            continue
+        row = _enrich_stock_row({
+            "symbol": normalized,
+            "raw_code": raw_code,
+            "name": doc.get("name") or _stock_name(normalized),
+            "reason": "用户临时探索，不影响自动入池",
+            "latest_signal": "手动线索",
+            "source": "terminal_manual_clues",
+        }, range_columns)
+        row.update({
+            "source_collection": "terminal_manual_clues",
+            "source_tags": ["用户探索", "临时线索"],
+            "lane": "signal_lane",
+            "freshness": "manual",
+            "signal_origin": "user_manual_exploration",
+            "signal_family": "manual_clue",
+            "action_status": "manual_review",
+            "actionability": "observe_only",
+            "queue_lane": "manual_exploration",
+            "pool_type": "clue_pool",
+            "trade_stage": "clue_pool",
+            "stage_label": "线索池",
+            "trade_role": "ordinary_watch",
+            "trade_role_label": "线索观察",
+            "trade_identity": "manual_exploration",
+            "trade_identity_label": "用户探索",
+            "trader_action": "先观察",
+            "missing_condition": "等30m承接，或5m/15m出现右侧确认",
+            "can_trade_now": False,
+            "invalidates_when": "删除手动线索，或图形证据走弱",
+            "manual_clue": True,
+            "deletable": True,
+            "explanation": "手动加入线索池；只触发单票缓存和分析，不参与自动入池排序。",
+            "trace_summary": "manual_clue:terminal_manual_clues",
+        })
+        rows.append(row)
+    return rows
+
+
+def _merge_stock_rows_by_symbol(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        key = _text(row.get("symbol") or row.get("code") or row.get("label")).upper()
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        merged.append(row)
+    return merged
+
+
 def _focus_stock_pool_meta(focus_count: int) -> dict[str, Any]:
     meta: dict[str, Any] = {
         "label": "确认买点",
@@ -4267,7 +4337,8 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     risk_stocks = _terminal_stock_pool_group_rows(range_columns, "risk_stocks")
     watch_stocks = _terminal_stock_pool_group_rows(range_columns, "watch_stocks")
     clue_stocks = _terminal_stock_pool_group_rows(range_columns, "clue_stocks")
-    scored_raw = clue_stocks or strategy_clues
+    manual_clues = _manual_clue_rows(range_columns)
+    scored_raw = _merge_stock_rows_by_symbol(manual_clues + (clue_stocks or strategy_clues))
     scored = [
         _enrich_stock_row(dict(item), range_columns) if item.get("symbol") and not item.get("latest_price") else dict(item)
         for item in scored_raw
@@ -4280,6 +4351,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         (risk_stocks, "signal_lane"),
         (watch_stocks, "signal_lane"),
         (clue_stocks, "signal_lane"),
+        (manual_clues, "signal_lane"),
     ):
         for row in rows:
             row["lane_status"] = sync_lanes.get(lane, {})
@@ -4362,9 +4434,10 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
             },
             "buy_candidates": {
                 "label": "线索池",
-                "source_collection": "terminal_stock_pool.clue_stocks + strategy_snapshots.strategy_candidate",
+                "source_collection": "terminal_manual_clues + terminal_stock_pool.clue_stocks + strategy_snapshots.strategy_candidate",
                 "count": len(scored),
                 "role": "source_clue_only_not_entry",
+                "manual_clues": len(manual_clues),
                 "empty_reason": "" if scored else "当前没有纯线索；已有硬技术的标的会进入盯盘池或确认买点。",
             },
             "focus_stocks": focus_stocks_meta,
@@ -6108,6 +6181,25 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
     }
 
 
+def _refresh_manual_clue_quote(db, symbol: str) -> dict[str, Any]:
+    try:
+        from signals.data.mongo_fallback import get_last_trading_day
+        from signals.sync.modules.quote_snapshots import _fetch_em_quote, _quote_doc_from_em
+
+        now = _sync_now()
+        trading_day = str(get_last_trading_day("A") or market_today("A"))[:10]
+        payload, latency_ms, error = _fetch_em_quote(db, symbol)
+        if not payload:
+            return {"quote_status": "failed", "quote_error": error, "latency_ms": round(latency_ms, 2)}
+        doc = _quote_doc_from_em(symbol, payload, now, trading_day)
+        if not doc:
+            return {"quote_status": "empty", "quote_error": "provider_payload_empty", "latency_ms": round(latency_ms, 2)}
+        db["quote_snapshots"].replace_one({"_id": doc["_id"]}, doc, upsert=True)
+        return {"quote_status": "ok", "quote_source": doc.get("source"), "latency_ms": round(latency_ms, 2)}
+    except Exception as exc:
+        return {"quote_status": "failed", "quote_error": f"{exc.__class__.__name__}: {exc}"[:240]}
+
+
 def _timestamp_range_to_dates(
     start: Optional[int],
     end: Optional[int],
@@ -6199,6 +6291,68 @@ async def _call_backtest_analyze(code: str, freq: str, lookback: int = 180) -> A
 async def get_workbench_shell():
     engine = _ensure_engine()
     return await run_in_threadpool(_build_shell_payload, engine)
+
+
+@router.post("/manual-clues")
+async def add_workbench_manual_clue(payload: dict[str, Any] = Body(...)):
+    symbol_text = _text(payload.get("symbol") or payload.get("label") or payload.get("query"))
+    freq = _canonical_freq(_text(payload.get("freq")) or DEFAULT_TERMINAL_FREQ)
+    symbol, raw_code = _normalize_stock_symbol(symbol_text)
+    if not symbol or not raw_code:
+        raise HTTPException(status_code=400, detail=f"无法识别股票标的: {symbol_text}")
+
+    def _add() -> dict[str, Any]:
+        db = _mongo_db()
+        now = _sync_now()
+        doc = {
+            "symbol": symbol,
+            "raw_code": raw_code,
+            "name": _stock_name(symbol),
+            "freq": freq,
+            "active": True,
+            "source": "user_search",
+            "reason": "用户从搜索栏临时纳入线索池",
+            "updated_at": now,
+        }
+        db["terminal_manual_clues"].update_one(
+            {"symbol": symbol},
+            {"$set": doc, "$setOnInsert": {"created_at": now}},
+            upsert=True,
+        )
+        quote = _refresh_manual_clue_quote(db, symbol)
+        load_meta = _trigger_stock_chart_load(symbol, raw_code, freq)
+        return {
+            "status": "ok",
+            "symbol": symbol,
+            "raw_code": raw_code,
+            "name": doc["name"],
+            "freq": freq,
+            "manual_clue": True,
+            "load": load_meta,
+            "quote": quote,
+        }
+
+    return await run_in_threadpool(_add)
+
+
+@router.delete("/manual-clues/{symbol:path}")
+async def delete_workbench_manual_clue(symbol: str):
+    normalized, raw_code = _normalize_stock_symbol(symbol)
+    if not normalized:
+        raise HTTPException(status_code=400, detail=f"无法识别股票标的: {symbol}")
+
+    def _delete() -> dict[str, Any]:
+        db = _mongo_db()
+        result = db["terminal_manual_clues"].delete_many({
+            "$or": [
+                {"symbol": normalized},
+                {"raw_code": raw_code},
+                {"symbol": symbol},
+            ]
+        })
+        return {"status": "ok", "symbol": normalized, "deleted": int(getattr(result, "deleted_count", 0) or 0)}
+
+    return await run_in_threadpool(_delete)
 
 
 @router.get("/cluster")

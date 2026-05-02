@@ -26,6 +26,7 @@ from ..proxy import em_proxy
 from ..provider_limits import ProviderCoolingDown, provider_call, providers_all_cooling_down
 from ..retry import sync_retry
 from ..task_context import get_task_env
+from ..volume_units import CANONICAL_STOCK_VOLUME_UNIT, normalize_stock_volume
 from .daily_sources import fetch_tencent_daily
 
 logger = logging.getLogger("signals.sync.stock_daily")
@@ -578,13 +579,13 @@ def _get_all_stock_codes(db: Database | None = None) -> list:
     try:
         with em_proxy(None):
             df = ak.stock_info_a_code_name()
-        return df["code"].tolist()
+        return _merge_cached_spot_codes(df["code"].tolist(), db)
     except Exception as e:
         logger.warning(f"获取股票列表失败: {e}，使用 stock_zh_a_spot_em 兜底")
         try:
             with em_proxy(None):
                 df = ak.stock_zh_a_spot_em()
-            return df["代码"].tolist()
+            return _merge_cached_spot_codes(df["代码"].tolist(), db)
         except Exception as spot_exc:
             cached = _cached_stock_universe(db)
             if cached:
@@ -595,6 +596,42 @@ def _get_all_stock_codes(db: Database | None = None) -> list:
                 )
                 return cached
             raise
+
+
+def _merge_cached_spot_codes(codes: list, db: Database | None = None) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: object) -> None:
+        code = _pure_a_code(value)
+        if code and code not in seen:
+            seen.add(code)
+            merged.append(code)
+
+    for code in codes or []:
+        add(code)
+    if db is None:
+        return merged
+    try:
+        latest = db["fullmarket_spot_snapshots"].find_one({}, {"date_key": 1}, sort=[("date_key", -1)])
+        date_key = str((latest or {}).get("date_key") or "")
+        if not date_key:
+            return merged
+        for row in db["fullmarket_spot_snapshots"].find(
+            {
+                "date_key": date_key,
+                "code": {"$regex": r"^\d{6}$"},
+                "price": {"$gt": 0},
+                "open": {"$gt": 0},
+                "high": {"$gt": 0},
+                "low": {"$gt": 0},
+            },
+            {"code": 1},
+        ):
+            add(row.get("code"))
+    except Exception as exc:
+        logger.debug("合并 fullmarket spot universe 失败: %s", exc)
+    return merged
 
 
 def _get_active_stock_codes(db: Database) -> list[str]:
@@ -712,14 +749,24 @@ def _docs_from_daily_df(
     docs = []
     for _, row in df.iterrows():
         dt = row[column_map["dt"]]
+        source_vol = row[column_map["vol"]] if pd.notna(row[column_map["vol"]]) else 0
+        vol, source_volume_unit = normalize_stock_volume(source_vol, source=source)
         doc = {
             "dt": pd.to_datetime(dt),
-            "meta": {"symbol": code, "freq": "日线", "market": "A", "source": source},
+            "meta": {
+                "symbol": code,
+                "freq": "日线",
+                "market": "A",
+                "source": source,
+                "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
+                "source_volume_unit": source_volume_unit,
+                "source_vol": float(source_vol or 0),
+            },
             "open": float(row[column_map["open"]]),
             "high": float(row[column_map["high"]]),
             "low": float(row[column_map["low"]]),
             "close": float(row[column_map["close"]]),
-            "vol": int(row[column_map["vol"]]) if pd.notna(row[column_map["vol"]]) else 0,
+            "vol": vol,
             "amount": int(float(row[column_map["amount"]])) if pd.notna(row[column_map["amount"]]) else 0,
             "source": source,
         }
@@ -765,6 +812,9 @@ def _read_persisted_spot_batch_df(db: Database | None, end_date: str) -> pd.Data
                 "code": 1,
                 "price": 1,
                 "vol": 1,
+                "volume_unit": 1,
+                "source_vol": 1,
+                "source_volume_unit": 1,
                 "amount": 1,
                 "high": 1,
                 "low": 1,
@@ -786,6 +836,9 @@ def _read_persisted_spot_batch_df(db: Database | None, end_date: str) -> pd.Data
             "代码": code,
             "最新价": row.get("price"),
             "成交量": row.get("vol"),
+            "_volume_unit": row.get("volume_unit") or "hands",
+            "_source_vol": row.get("source_vol", row.get("vol")),
+            "_source_volume_unit": row.get("source_volume_unit"),
             "成交额": row.get("amount"),
             "最高": row.get("high"),
             "最低": row.get("low"),
@@ -850,6 +903,9 @@ def _fetch_eastmoney_spot_batch_df(db: Database | None, end_date: str) -> pd.Dat
                 "代码": row.get("f12"),
                 "最新价": row.get("f2"),
                 "成交量": row.get("f5"),
+                "_volume_unit": "hands",
+                "_source_vol": row.get("f5"),
+                "_source_volume_unit": "hands",
                 "成交额": row.get("f6"),
                 "最高": row.get("f15"),
                 "最低": row.get("f16"),
@@ -908,7 +964,15 @@ def _snapshot_daily_doc(
     high = _safe_number(row.get("最高"))
     low = _safe_number(row.get("最低"))
     close = _safe_number(row.get("最新价"))
-    vol = _safe_number(row.get("成交量"), 0.0)
+    source_vol = _safe_number(row.get("_source_vol"), None)
+    if source_vol is None:
+        source_vol = _safe_number(row.get("成交量"), 0.0)
+    vol, source_volume_unit = normalize_stock_volume(
+        row.get("成交量"),
+        source="eastmoney_spot_clist_batch",
+        source_unit=row.get("_volume_unit"),
+        default_source_unit="hands",
+    )
     amount = _safe_number(row.get("成交额"), 0.0)
     if not all(value is not None and value > 0 for value in (open_price, high, low, close)):
         return None
@@ -926,12 +990,15 @@ def _snapshot_daily_doc(
             "source": "eastmoney_spot_clist_batch",
             "batch_semantics": "today_spot_ohlcv",
             "prev_close": snapshot_prev_close,
+            "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
+            "source_volume_unit": source_volume_unit,
+            "source_vol": source_vol,
         },
         "open": float(open_price),
         "high": float(high),
         "low": float(low),
         "close": float(close),
-        "vol": int(float(vol or 0)),
+        "vol": vol,
         "amount": int(float(amount or 0)),
         "source": "eastmoney_spot_clist_batch",
     }
@@ -959,9 +1026,7 @@ def _sync_today_from_spot_batch(
         return {}, "disabled"
     if naive_market_now("A").hour < _batch_today_min_hour():
         return {}, "before_batch_today_window"
-    candidates = _batch_today_candidates(codes, sync_docs, end_date)
-    if not candidates:
-        return {}, "no_today_candidates"
+    cursor_candidates = _batch_today_candidates(codes, sync_docs, end_date)
     try:
         df = _fetch_eastmoney_spot_batch_df(db, end_date)
     except Exception as exc:
@@ -970,12 +1035,22 @@ def _sync_today_from_spot_batch(
     if df is None or df.empty or "_pure_code" not in df.columns:
         return {}, "batch_snapshot_empty"
 
-    prev_close_by_code = _previous_daily_close_by_symbol(db, candidates, end_date)
     snapshot_rows = {
         str(row.get("_pure_code")): row
         for _, row in df.iterrows()
         if row.get("_pure_code")
     }
+    snapshot_bootstrap_candidates = [
+        code for code in codes
+        if code not in cursor_candidates
+        and not _coerce_last_dt(sync_docs.get(code))
+        and code in snapshot_rows
+    ]
+    candidates = cursor_candidates + snapshot_bootstrap_candidates
+    if not candidates:
+        return {}, "no_today_candidates"
+
+    prev_close_by_code = _previous_daily_close_by_symbol(db, cursor_candidates, end_date)
     docs_by_code: dict[str, list] = {}
     for code in candidates:
         row = snapshot_rows.get(code)
@@ -990,7 +1065,11 @@ def _sync_today_from_spot_batch(
         if doc:
             docs_by_code[code] = [doc]
     fallback_count = max(0, len(candidates) - len(docs_by_code))
-    return docs_by_code, f"batch_today_candidates={len(candidates)},batch_docs={len(docs_by_code)},fallback={fallback_count}"
+    return docs_by_code, (
+        f"batch_today_candidates={len(cursor_candidates)},"
+        f"snapshot_bootstrap={len(snapshot_bootstrap_candidates)},"
+        f"batch_docs={len(docs_by_code)},fallback={fallback_count}"
+    )
 
 
 def _provider_failure(failures: list[tuple[str, BaseException]]) -> BaseException:

@@ -40,6 +40,10 @@ def test_fullmarket_spot_doc_maps_quote_and_daily_fields():
     assert doc["prev_close"] == 10.25
     assert doc["change_pct"] == 2.4
     assert doc["turnover_pct"] == 1.1
+    assert doc["vol"] == 100000
+    assert doc["volume_unit"] == "shares"
+    assert doc["source_vol"] == 1000
+    assert doc["source_volume_unit"] == "hands"
 
 
 class _Collection:
@@ -80,4 +84,4 @@ def test_stock_daily_reads_persisted_fullmarket_spot_snapshot(monkeypatch):
     assert df.iloc[0]["代码"] == "600001"
     assert df.iloc[0]["最新价"] == 10.5
     assert df.iloc[0]["昨收"] == 10.25
-
+    assert df.iloc[0]["_volume_unit"] == "hands"

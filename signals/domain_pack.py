@@ -609,6 +609,7 @@ class SignalsPack:
         freqs = ["日线", "周线", "5分钟", "15分钟", "30分钟", "60分钟"]
         rows: List[Dict[str, Any]] = []
         stock_daily_progress = self._find_one(db, "sync_log", {"_id": "stock_daily:progress:_meta"}) or {}
+        daily_snapshot_coverage = self._cache_daily_snapshot_coverage(db, trade_date)
         stock_minute_doc = (
             self._find_one(db, "sync_log", {"_id": "stock_minute:selection:_meta"})
             or self._find_one(db, "sync_log", {"_id": "stock_minute:_meta"})
@@ -626,11 +627,17 @@ class SignalsPack:
                 daily_latest = latest
                 progress_total = int(stock_daily_progress.get("total") or stock_daily_progress.get("expected_codes") or 0)
                 processed = int(stock_daily_progress.get("processed") or 0)
+                valid_universe = int(daily_snapshot_coverage.get("valid_universe") or 0)
+                cached_today = int(daily_snapshot_coverage.get("cached_today") or 0)
                 symbols = progress_total
                 today_symbols = processed
                 total_bars = int(stock_daily_progress.get("inserted") or 0)
                 latest_symbol = str(stock_daily_progress.get("latest_symbol") or (latest or {}).get("meta", {}).get("symbol", ""))
                 source = "sync_log:stock_daily:progress"
+                if valid_universe > 0:
+                    symbols = valid_universe
+                    today_symbols = cached_today
+                    source = daily_snapshot_coverage.get("source") or "fullmarket_spot_snapshots+bars"
             elif freq in {"5分钟", "15分钟", "30分钟"}:
                 symbols = minute_symbols
                 today_symbols = minute_symbols
@@ -669,10 +676,47 @@ class SignalsPack:
                 "minute_universe_error": minute_universe.get("error", 0),
                 "daily_landing_rate": stock_daily_progress.get("landing_rate", 0),
                 "daily_inserted_per_min": stock_daily_progress.get("inserted_per_min", 0),
-                "daily_missing_symbols": stock_daily_progress.get("missing_symbols", 0),
+                "daily_missing_symbols": (
+                    daily.get("symbols", 0) - daily.get("today_symbols", 0)
+                    if daily_snapshot_coverage.get("valid_universe")
+                    else stock_daily_progress.get("missing_symbols", 0)
+                ),
                 "daily_deferred_symbols": stock_daily_progress.get("deferred_symbols", stock_daily_progress.get("deferred", 0)),
+                "daily_coverage_source": daily_snapshot_coverage.get("source") or "sync_log:stock_daily:progress",
+                "daily_invalid_snapshot_rows": daily_snapshot_coverage.get("invalid_rows", 0),
             },
         }
+
+    def _cache_daily_snapshot_coverage(self, db, trade_date: str) -> Dict[str, Any]:
+        date_key = str(trade_date or "").replace("-", "")[:8]
+        if not date_key:
+            return {}
+        try:
+            trade_dt = datetime.strptime(date_key, "%Y%m%d")
+        except ValueError:
+            return {}
+        valid_query = {
+            "date_key": date_key,
+            "code": {"$regex": r"^\d{6}$"},
+            "price": {"$gt": 0},
+            "open": {"$gt": 0},
+            "high": {"$gt": 0},
+            "low": {"$gt": 0},
+        }
+        try:
+            valid_codes = set(db["fullmarket_spot_snapshots"].distinct("code", valid_query))
+            if not valid_codes:
+                return {}
+            cached_codes = set(db["bars"].distinct("meta.symbol", {"meta.freq": "日线", "dt": trade_dt}))
+            invalid_rows = self._count(db, "fullmarket_spot_snapshots", {"date_key": date_key}) - len(valid_codes)
+            return {
+                "valid_universe": len(valid_codes),
+                "cached_today": len(valid_codes.intersection(cached_codes)),
+                "invalid_rows": max(0, invalid_rows),
+                "source": "fullmarket_spot_snapshots.valid_universe + bars.daily",
+            }
+        except Exception:
+            return {}
 
     def _cache_minute_universe(self, db, trade_date: str) -> Dict[str, int]:
         try:
@@ -928,6 +972,7 @@ class SignalsPack:
     def _cache_a_share_low_latency_pause_ok(self, row: Mapping[str, Any]) -> bool:
         module = str(row.get("module") or "")
         if module not in {
+            "quote_snapshots",
             "stock_minute",
             "index_minute",
             "minute_readiness_probe",
@@ -953,13 +998,33 @@ class SignalsPack:
 
     def _cache_row_touched_current_market_day(self, row: Mapping[str, Any]) -> bool:
         today = naive_market_now("A").date()
+        accepted_dates = {today.isoformat()}
+        earliest_date = today
+        try:
+            from signals.data.mongo_fallback import get_last_trading_day
+
+            last_trade_day = str(get_last_trading_day("A") or "")[:10]
+            if last_trade_day:
+                accepted_dates.add(last_trade_day)
+                earliest_date = datetime.strptime(last_trade_day, "%Y-%m-%d").date()
+        except Exception:
+            pass
 
         def is_today(value: Any) -> bool:
             dt = self._coerce_datetime(value)
             if dt:
-                return dt.date() == today
+                day = dt.date()
+                return day.isoformat() in accepted_dates or earliest_date <= day <= today
             text = str(value or "")
-            return bool(text and text[:10] == today.isoformat())
+            if not text:
+                return False
+            if text[:10] in accepted_dates:
+                return True
+            try:
+                day = datetime.strptime(text[:10], "%Y-%m-%d").date()
+                return earliest_date <= day <= today
+            except ValueError:
+                return False
 
         if is_today(row.get("latest_dt")) or is_today(row.get("last_run")):
             return True
