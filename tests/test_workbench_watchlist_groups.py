@@ -470,6 +470,108 @@ def test_terminal_stock_pool_group_rows_keep_focus_risk_watch_separate(monkeypat
     assert watch[0]["action_status"] == "entry_waiting_30m_confirm"
 
 
+def test_manual_clue_rows_reuse_stock_pool_decision_fields(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Cursor(list):
+        def sort(self, *args, **kwargs):
+            return self
+
+        def limit(self, limit):
+            return _Cursor(self[:limit])
+
+    class _ManualClues:
+        def find(self, query=None, projection=None):
+            return _Cursor([
+                {
+                    "symbol": "SZ.002354",
+                    "raw_code": "002354",
+                    "name": "天娱数科",
+                    "freq": "30min",
+                    "active": True,
+                }
+            ])
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"terminal_manual_clues": _ManualClues()}))
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (_bars(), "test_bars"))
+    monkeypatch.setattr(workbench, "_stock_chain_position_summary", lambda symbol: {})
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [
+        {
+            "symbol": "SZ.002354",
+            "dt": "2026-04-29 15:00",
+            "as_of": "2026-04-30",
+            "signal_type": "缺口买:突破",
+            "signal_side": "buy",
+            "freq": "日线",
+            "confidence": 0.65,
+            "score": 19.5,
+            "price": 5.95,
+            "resonance_context": {"grade": "conflict", "conflict_freqs": ["30分钟"]},
+        },
+        {
+            "symbol": "SZ.002354",
+            "dt": "2026-04-28 15:00",
+            "as_of": "2026-04-30",
+            "signal_type": "一买",
+            "signal_side": "buy",
+            "freq": "30分钟",
+            "confidence": 0.7,
+            "score": 28.0,
+            "price": 5.38,
+        },
+        {
+            "symbol": "SZ.002354",
+            "dt": "2026-04-24 10:30",
+            "as_of": "2026-04-30",
+            "signal_type": "形态:头肩顶",
+            "signal_side": "sell",
+            "freq": "30分钟",
+            "confidence": 0.75,
+            "score": -11.25,
+            "price": 5.57,
+        },
+    ])
+
+    rows = workbench._manual_clue_rows(workbench._watchlist_range_columns(date(2026, 4, 26)))
+
+    row = rows[0]
+    assert row["manual_clue"] is True
+    assert row["source_collection"] == "terminal_manual_clues"
+    assert "terminal_technical_signals" in row["source_collections"]
+    assert [item["badge"] for item in row["buy_timeframes"]] == ["D", "30m"]
+    assert [item["badge"] for item in row["sell_timeframes"]] == ["30m"]
+    assert row["timeframe_signal_sides"]["upper"]["side"] != "none"
+    assert row["timeframe_signal_sides"]["trade"]["side"] != "none"
+    assert row["timeframe_signal_sides"]["execution"]["side"] == "none"
+    assert {"risk_clear", "period_conflict", "right_side"} <= set(row["missing_gates"])
+    assert row["trade_stage"] == "clue_pool"
+    assert row["can_trade_now"] is False
+    assert "terminal_technical_signals" in row["evidence_summary"]
+
+
+def test_stock_chart_loader_uses_requested_minute_freq(monkeypatch):
+    from signals.web.api import workbench
+
+    calls = []
+    monkeypatch.setattr(workbench, "_ensure_minute_bars", lambda symbol, raw_code, freq: calls.append(freq) or True)
+
+    assert workbench._load_stock_chart_data("SZ.002354", "002354", "30min") is True
+    assert workbench._load_stock_chart_data("SZ.002354", "002354", "15min") is True
+
+    assert calls == ["30min", "15min"]
+
+
+def test_manual_clue_preheat_requests_full_execution_bundle():
+    from signals.web.api import workbench
+
+    assert workbench._manual_clue_preheat_freqs("30min") == ["30min", "daily", "15min", "5min"]
+    assert workbench._manual_clue_preheat_freqs("daily") == ["daily", "30min", "15min", "5min"]
+
+
 def test_quote_overlay_marks_non_current_quote_stale(monkeypatch):
     from signals.web.api import workbench
 

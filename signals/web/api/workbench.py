@@ -138,6 +138,11 @@ _SHELL_CACHE_LOCK = threading.Lock()
 _SHELL_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None, "refreshed_at": 0.0}
 
 
+def _invalidate_shell_cache() -> None:
+    with _SHELL_CACHE_LOCK:
+        _SHELL_CACHE.update({"expires_at": 0.0, "payload": None, "refreshed_at": 0.0})
+
+
 def _shell_cache_usable(payload: Any, engine: Any) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -1945,6 +1950,355 @@ def _load_terminal_technical_signal_rows(symbol: str, *, limit: int = 300) -> li
         return []
 
 
+def _manual_clue_signal_side(signal: dict[str, Any]) -> str:
+    side = _text(signal.get("signal_side")).lower()
+    if side in {"buy", "sell"}:
+        return side
+    if _is_sell_signal(signal):
+        return "sell"
+    if _is_buy_signal(signal):
+        return "buy"
+    return "context"
+
+
+def _manual_clue_signal_reason(signal: dict[str, Any]) -> dict[str, Any]:
+    evidence = signal.get("technical_evidence") if isinstance(signal.get("technical_evidence"), dict) else {}
+    signal_type = _text(signal.get("signal_type") or signal.get("type") or signal.get("reason"))
+    freq = _text(signal.get("freq") or signal.get("timeframe")) or _freq_label(DEFAULT_TERMINAL_FREQ)
+    side = _manual_clue_signal_side(signal)
+    event_dt = _iso_dt(signal.get("dt") or signal.get("signal_date") or signal.get("updated_at"))
+    score = _float(signal.get("score"), _float(signal.get("total_score"), 0) or 0) or 0
+    decision_effect = "exit_priority" if side == "sell" else "confirm" if side == "buy" else "context_only"
+    queue_lane = "risk_exit_first" if side == "sell" else "manual_signal_review"
+    return {
+        "reason_type": "technical_trigger" if side in {"buy", "sell"} else "technical_signal",
+        "weight": round(100 + abs(score), 3),
+        "source_role": "technical_trigger" if side in {"buy", "sell"} else "context",
+        "decision_effect": decision_effect,
+        "actionability": "risk_review" if side == "sell" else "manual_review",
+        "queue_lane": queue_lane,
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": _text(signal.get("dedupe_key")),
+        "signal_type": signal_type,
+        "signal_side": side,
+        "signal_family": _text(signal.get("signal_family")),
+        "freq": freq,
+        "score": score,
+        "confidence": _float(signal.get("confidence")),
+        "as_of": _text(signal.get("as_of")),
+        "event_dt": event_dt,
+        "event_date": event_dt[:10] if event_dt else "",
+        "signal_date": event_dt,
+        "price": _float(signal.get("price")),
+        "evidence": evidence,
+        "evidence_sources": ["terminal_technical_signals"],
+        "resonance_context": signal.get("resonance_context") if isinstance(signal.get("resonance_context"), dict) else {},
+        "invalidates_when": _text(signal.get("invalidates_when")),
+    }
+
+
+def _manual_clue_bucket_side(left_items: list[dict[str, Any]], right_items: list[dict[str, Any]]) -> str:
+    if left_items and right_items:
+        return "mixed"
+    if right_items:
+        return "right"
+    if left_items:
+        return "left"
+    return "none"
+
+
+def _manual_clue_fallback_groups(reasons: list[dict[str, Any]]) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {"left": [], "right": [], "sell": [], "context": []}
+    buckets: dict[str, dict[str, Any]] = {
+        "upper": {"label": "日/周", "left": [], "right": []},
+        "trade": {"label": "30m", "left": [], "right": []},
+        "execution": {"label": "5m/15m", "left": [], "right": []},
+    }
+    for reason in reasons:
+        signal_text = _text(reason.get("signal_type"))
+        side = _text(reason.get("signal_side"))
+        freq = reason.get("freq")
+        bucket_key = "upper" if _freq_bucket(freq) in {"daily", "weekly"} else "trade" if _freq_bucket(freq) == "30min" else "execution" if _freq_bucket(freq) in {"5min", "15min"} else ""
+        opportunity_side = "sell" if side == "sell" else "right" if any(token in signal_text for token in ("突破", "二买", "三买", "趋势", "扩大")) or _freq_bucket(freq) in {"5min", "15min"} else "left" if side == "buy" else "context"
+        item = {
+            "label": signal_text,
+            "family": _text(reason.get("signal_family")) or "technical",
+            "freq": _text(freq),
+            "event_date": _text(reason.get("event_date")),
+            "score": _float(reason.get("score"), 0) or 0,
+            "confidence": _float(reason.get("confidence")),
+            "source_collection": _text(reason.get("source_collection")),
+        }
+        groups.setdefault(opportunity_side, []).append(item)
+        if bucket_key and opportunity_side in {"left", "right"}:
+            buckets[bucket_key][opportunity_side].append(item)
+    for bucket in buckets.values():
+        bucket["side"] = _manual_clue_bucket_side(bucket["left"], bucket["right"])
+    return groups, buckets
+
+
+def _manual_clue_signal_groups(reasons: list[dict[str, Any]]) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
+    try:
+        from signals.sync.modules import terminal_pool
+
+        row = {"inclusion_reasons": reasons}
+        groups = terminal_pool._technical_signal_groups(row)
+        timeframe_sides = terminal_pool._timeframe_signal_sides(row)
+        return groups, timeframe_sides
+    except Exception:
+        return _manual_clue_fallback_groups(reasons)
+
+
+def _manual_clue_group_labels(groups: dict[str, list[dict[str, Any]]], side: str) -> list[str]:
+    labels: list[str] = []
+    for item in groups.get(side, []):
+        label = " ".join([_text(item.get("freq")), _text(item.get("label"))]).strip()
+        if label and label not in labels:
+            labels.append(label)
+    return labels[:5]
+
+
+def _manual_clue_missing_label(code: str) -> str:
+    return {
+        "risk_clear": "有卖点或冲突，先排雷",
+        "period_conflict": "周期冲突，等共振恢复",
+        "hard_technical": "还没有硬技术信号",
+        "upper_context": "等日/周背景确认",
+        "trigger_30m": "等30m买点",
+        "right_side": "等5m/15m下单确认",
+    }.get(code, code)
+
+
+def _manual_clue_has_conflict(reasons: list[dict[str, Any]]) -> bool:
+    for reason in reasons:
+        resonance = reason.get("resonance_context") if isinstance(reason.get("resonance_context"), dict) else {}
+        if _text(resonance.get("grade")) == "conflict":
+            return True
+        tags = [_text(item) for item in resonance.get("tags") or []]
+        if any("冲突" in item for item in tags):
+            return True
+        if resonance.get("conflict_freqs"):
+            return True
+    return False
+
+
+def _manual_clue_promotion_path(
+    *,
+    has_technical: bool,
+    timeframe_sides: dict[str, dict[str, Any]],
+    missing_gates: list[str],
+    source_detail: str,
+) -> list[dict[str, Any]]:
+    def gate_status(gate: str, present: bool) -> str:
+        if gate in missing_gates:
+            return "blocked" if gate in {"risk_clear", "period_conflict"} else "waiting"
+        return "passed" if present else "context"
+
+    upper_side = _text(timeframe_sides.get("upper", {}).get("side")) or "none"
+    trade_side = _text(timeframe_sides.get("trade", {}).get("side")) or "none"
+    execution_side = _text(timeframe_sides.get("execution", {}).get("side")) or "none"
+    return [
+        {"key": "source", "status": "passed", "detail": source_detail},
+        {"key": "hard_technical", "status": "passed" if has_technical else "waiting", "detail": "terminal_technical_signals" if has_technical else ""},
+        {"key": "upper_context", "status": gate_status("upper_context", upper_side != "none"), "detail": f"日/周 {upper_side}"},
+        {"key": "trigger_30m", "status": gate_status("trigger_30m", trade_side != "none"), "detail": f"30m {trade_side}"},
+        {"key": "right_side", "status": gate_status("right_side", execution_side != "none"), "detail": f"5m/15m {execution_side}"},
+        {"key": "risk_clear", "status": "blocked" if any(gate in missing_gates for gate in ("risk_clear", "period_conflict")) else "passed", "detail": " / ".join(_manual_clue_missing_label(gate) for gate in missing_gates if gate in {"risk_clear", "period_conflict"}) or "无主要冲突"},
+    ]
+
+
+def _manual_clue_entry_summary(timeframe_sides: dict[str, dict[str, Any]], missing_condition: str) -> str:
+    def labels(bucket: str) -> str:
+        record = timeframe_sides.get(bucket, {}) if isinstance(timeframe_sides.get(bucket), dict) else {}
+        items = []
+        for side in ("right", "left"):
+            for item in record.get(side) or []:
+                if isinstance(item, dict):
+                    text = " ".join([_text(item.get("freq")), _text(item.get("label"))]).strip()
+                    if text:
+                        items.append(text)
+        return " / ".join(items[:3])
+
+    return "；".join([
+        f"日/周: {labels('upper') or '未确认'}",
+        f"30m: {labels('trade') or '未确认'}",
+        f"5m/15m: {labels('execution') or '未确认'}",
+        f"还差: {missing_condition}" if missing_condition else "",
+    ]).strip("；")
+
+
+def _enrich_manual_clue_decision(row: dict[str, Any], symbol: str) -> dict[str, Any]:
+    signals = _load_terminal_technical_signal_rows(symbol, limit=80)
+    reasons: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for signal in signals:
+        reason = _manual_clue_signal_reason(signal)
+        if not _text(reason.get("signal_type")):
+            continue
+        key = "|".join([
+            _text(reason.get("signal_side")),
+            _text(reason.get("freq")),
+            _text(reason.get("signal_type")),
+            _text(reason.get("event_date")),
+        ])
+        if key in seen:
+            continue
+        seen.add(key)
+        reasons.append(reason)
+        if len(reasons) >= 12:
+            break
+
+    row.setdefault("source_collections", ["terminal_manual_clues"])
+    row.setdefault("source_tags", ["用户探索", "临时线索"])
+    row["inclusion_reasons"] = reasons
+    row["focus_reasons"] = _manual_clue_group_labels({"right": reasons, "left": []}, "right")[:4]
+
+    technical_groups, timeframe_sides = _manual_clue_signal_groups(reasons)
+    compact_groups = {key: value for key, value in technical_groups.items() if value}
+    row["technical_signal_groups"] = compact_groups
+    row["left_signal_reasons"] = _manual_clue_group_labels(technical_groups, "left")
+    row["right_signal_reasons"] = _manual_clue_group_labels(technical_groups, "right")
+    row["risk_signal_reasons"] = _manual_clue_group_labels(technical_groups, "sell")
+    row["timeframe_signal_sides"] = timeframe_sides
+    row["upper_timeframe_side"] = _text(timeframe_sides.get("upper", {}).get("side")) or "none"
+    row["trade_timeframe"] = "30m"
+    row["trade_timeframe_side"] = _text(timeframe_sides.get("trade", {}).get("side")) or "none"
+    row["execution_timeframe_side"] = _text(timeframe_sides.get("execution", {}).get("side")) or "none"
+
+    row["timeframe_signals"] = {}
+    row["sell_timeframe_signals"] = {}
+    row["timeframe_signal_stack"] = {}
+    for reason in reasons:
+        side = "sell" if _text(reason.get("signal_side")) == "sell" else "buy"
+        _add_timeframe_signal(row, reason, side=side)
+    buy_signals = row.get("timeframe_signals") if isinstance(row.get("timeframe_signals"), dict) else {}
+    sell_signals = row.get("sell_timeframe_signals") if isinstance(row.get("sell_timeframe_signals"), dict) else {}
+    row["buy_timeframes"] = [buy_signals[freq] for freq in BUY_FREQS if freq in buy_signals]
+    row["sell_timeframes"] = [sell_signals[freq] for freq in BUY_FREQS if freq in sell_signals]
+
+    buy_reasons = [reason for reason in reasons if _text(reason.get("signal_side")) == "buy"]
+    sell_reasons = [reason for reason in reasons if _text(reason.get("signal_side")) == "sell"]
+    has_upper = row["upper_timeframe_side"] != "none"
+    has_30m = row["trade_timeframe_side"] != "none"
+    has_execution = row["execution_timeframe_side"] != "none"
+    conflict = _manual_clue_has_conflict(reasons)
+    missing_gates: list[str] = []
+    if sell_reasons:
+        missing_gates.append("risk_clear")
+    if conflict:
+        missing_gates.append("period_conflict")
+    if not buy_reasons:
+        missing_gates.append("hard_technical")
+    else:
+        if not has_upper:
+            missing_gates.append("upper_context")
+        if not has_30m:
+            missing_gates.append("trigger_30m")
+        if not has_execution:
+            missing_gates.append("right_side")
+    missing_gates = list(dict.fromkeys(missing_gates))
+    missing_condition = " / ".join(_manual_clue_missing_label(gate) for gate in missing_gates) or "买点路径已走通，但手动探索不自动转确认买点"
+
+    top_buy = buy_reasons[0] if buy_reasons else {}
+    top_risk = sell_reasons[0] if sell_reasons else {}
+    signal_badges = [
+        *[f"卖{item.get('badge') or item.get('freq') or ''}" for item in row.get("sell_timeframes", []) if isinstance(item, dict)],
+        *[item.get("badge") or item.get("freq") or "" for item in row.get("buy_timeframes", []) if isinstance(item, dict)],
+    ]
+    evidence_bits = []
+    for side in ("right", "left", "sell"):
+        evidence_bits.extend(_manual_clue_group_labels(technical_groups, side))
+    chain_position = _stock_chain_position_summary(symbol)
+    chain_text = " · ".join(_text(chain_position.get(key)) for key in ("chain", "node") if _text(chain_position.get(key)))
+    trade_role = "risk_review" if sell_reasons or conflict else (_trade_role_for_stock_summary(chain_position) if chain_position else "ordinary_watch")
+    trade_role_label = {
+        "mainline_attack": "主线机会",
+        "climax_risk": "过热禁追",
+        "chain_watch": "产业链观察",
+        "defensive_weight": "防守观察",
+        "second_wave": "回踩再起",
+        "risk_review": "风险复核",
+        "ordinary_watch": "线索观察",
+    }.get(trade_role, "线索观察")
+
+    if sell_reasons or conflict:
+        trader_read = f"手动探索：{chain_text + '，' if chain_text else ''}有技术信号但存在卖点或周期冲突，先做风险复核，不自动推买点。"
+        trade_intent_label = "暂不参与"
+        recommended_action = "先排雷"
+    elif buy_reasons and has_30m and not has_execution:
+        trader_read = f"手动探索：{chain_text + '，' if chain_text else ''}日/周或30m已有信号，等5m/15m下单确认。"
+        trade_intent_label = "试仓候选"
+        recommended_action = "等5m/15m确认"
+    elif buy_reasons:
+        trader_read = f"手动探索：{chain_text + '，' if chain_text else ''}已有技术线索，按缺口/30m/右侧确认逐级复核。"
+        trade_intent_label = "盯盘池"
+        recommended_action = "盯盘复核"
+    else:
+        trader_read = "手动探索：当前没有命中硬技术信号，只保留线索和图表缓存。"
+        trade_intent_label = "线索来源"
+        recommended_action = "先观察"
+
+    source_collections = [*row.get("source_collections", []), "terminal_manual_clues"]
+    source_tags = [*row.get("source_tags", []), "用户探索"]
+    if reasons:
+        source_collections.append("terminal_technical_signals")
+        source_tags.append("技术信号")
+
+    row.update({
+        "source_collections": list(dict.fromkeys(source_collections)),
+        "source_tags": list(dict.fromkeys(source_tags)),
+        "focus_reasons": evidence_bits[:4],
+        "technical_evidence": top_buy or top_risk or {"status": "missing"},
+        "top_buy_reason": top_buy,
+        "top_risk_reason": top_risk,
+        "resonance_context": (top_buy or top_risk).get("resonance_context", {}) if isinstance(top_buy or top_risk, dict) else {},
+        "latest_signal": "/".join([_text(item) for item in signal_badges if _text(item)]) or (evidence_bits[0] if evidence_bits else "手动线索"),
+        "reason": " / ".join(evidence_bits[:2]) or "用户临时探索，不影响自动入池",
+        "entry_gate_status": "manual_risk_review" if sell_reasons or conflict else "manual_review",
+        "blocked_by": missing_gates,
+        "missing_gates": missing_gates,
+        "primary_blocker": missing_condition,
+        "missing_condition": missing_condition,
+        "promotion_path": _manual_clue_promotion_path(
+            has_technical=bool(reasons),
+            timeframe_sides=timeframe_sides,
+            missing_gates=missing_gates,
+            source_detail="terminal_manual_clues/terminal_technical_signals" if reasons else "terminal_manual_clues",
+        ),
+        "trade_stage": "clue_pool",
+        "stage_label": "线索池",
+        "current_position": trade_intent_label,
+        "decision_stage": "strategy_candidate",
+        "trade_role": trade_role,
+        "trade_role_label": trade_role_label,
+        "trade_identity": "manual_exploration",
+        "trade_identity_label": "用户探索",
+        "trade_intent": "skip_now" if sell_reasons or conflict else "probe_candidate" if has_30m and not has_execution else "clue_only",
+        "trade_intent_label": trade_intent_label,
+        "setup_side_label": trade_intent_label,
+        "recommended_action": recommended_action,
+        "next_action": recommended_action,
+        "trader_action": recommended_action,
+        "can_trade_now": False,
+        "trader_read": trader_read,
+        "ai_trade_summary": trader_read,
+        "evidence_summary": "；".join([
+            "手动线索: terminal_manual_clues",
+            f"技术信号: terminal_technical_signals · {' / '.join(evidence_bits[:4])}" if evidence_bits else "",
+            f"产业链: {chain_text}" if chain_text else "",
+        ]).strip("；"),
+        "entry_logic_summary": _manual_clue_entry_summary(timeframe_sides, missing_condition),
+        "setup_explanation": "手动探索只负责补缓存和解释，不写回自动股票池排序。",
+        "invalidation": (top_risk or top_buy).get("invalidates_when") or "删除手动线索，或图形证据走弱",
+        "invalidates_when": (top_risk or top_buy).get("invalidates_when") or "删除手动线索，或图形证据走弱",
+        "chain_position": chain_position,
+        "chain_context": {"evidence": chain_position} if chain_position else {},
+        "trace_summary": "manual_clue:terminal_manual_clues" + (" / technical:terminal_technical_signals" if reasons else ""),
+        "explanation": trader_read,
+    })
+    return row
+
+
 def _signal_source_text(signal: dict[str, Any]) -> str:
     parts = [
         signal.get("source"),
@@ -3641,6 +3995,7 @@ def _manual_clue_rows(range_columns: list[dict[str, Any]], limit: Optional[int] 
         row.update({
             "source_collection": "terminal_manual_clues",
             "source_tags": ["用户探索", "临时线索"],
+            "source_collections": ["terminal_manual_clues"],
             "lane": "signal_lane",
             "freshness": "manual",
             "signal_origin": "user_manual_exploration",
@@ -3664,6 +4019,7 @@ def _manual_clue_rows(range_columns: list[dict[str, Any]], limit: Optional[int] 
             "explanation": "手动加入线索池；只触发单票缓存和分析，不参与自动入池排序。",
             "trace_summary": "manual_clue:terminal_manual_clues",
         })
+        row = _enrich_manual_clue_decision(row, normalized)
         rows.append(row)
     return rows
 
@@ -4905,10 +5261,41 @@ def _clear_stock_chart_load_job(symbol: str, freq: str) -> None:
 def _load_stock_chart_data(symbol: str, raw_code: str, freq: str) -> bool:
     canonical = _canonical_freq(freq)
     if canonical in {"5min", "15min", "30min"}:
-        return _ensure_minute_bars(symbol, raw_code, "5min")
+        return _ensure_minute_bars(symbol, raw_code, canonical)
     if canonical in {"daily", "weekly", "monthly"}:
         return _ensure_daily_bars(symbol, raw_code)
     return False
+
+
+def _manual_clue_preheat_freqs(freq: str) -> list[str]:
+    canonical = _canonical_freq(freq)
+    ordered = [canonical]
+    if canonical in {"5min", "15min", "30min"}:
+        ordered.extend(["daily", "30min", "15min", "5min"])
+    elif canonical in {"daily", "weekly", "monthly"}:
+        ordered.extend(["daily", "30min", "15min", "5min"])
+    else:
+        ordered.extend(["daily", DEFAULT_TERMINAL_FREQ, "15min", "5min"])
+    output: list[str] = []
+    for item in ordered:
+        normalized = _canonical_freq(item)
+        if normalized not in output:
+            output.append(normalized)
+    return output
+
+
+def _trigger_manual_clue_cache_load(symbol: str, raw_code: str, freq: str) -> dict[str, Any]:
+    jobs = [
+        _trigger_stock_chart_load(symbol, raw_code, item)
+        for item in _manual_clue_preheat_freqs(freq)
+    ]
+    requested = _canonical_freq(freq)
+    primary = next((job for job in jobs if _text(job.get("load_target_freq")) == requested), jobs[0] if jobs else {})
+    return {
+        **primary,
+        "load_bundle": jobs,
+        "load_bundle_freqs": [job.get("load_target_freq") for job in jobs if job.get("load_target_freq")],
+    }
 
 
 def _trigger_stock_chart_load(symbol: str, raw_code: str, freq: str) -> dict[str, Any]:
@@ -6320,7 +6707,8 @@ async def add_workbench_manual_clue(payload: dict[str, Any] = Body(...)):
             upsert=True,
         )
         quote = _refresh_manual_clue_quote(db, symbol)
-        load_meta = _trigger_stock_chart_load(symbol, raw_code, freq)
+        _invalidate_shell_cache()
+        load_meta = _trigger_manual_clue_cache_load(symbol, raw_code, freq)
         return {
             "status": "ok",
             "symbol": symbol,
@@ -6350,6 +6738,7 @@ async def delete_workbench_manual_clue(symbol: str):
                 {"symbol": symbol},
             ]
         })
+        _invalidate_shell_cache()
         return {"status": "ok", "symbol": normalized, "deleted": int(getattr(result, "deleted_count", 0) or 0)}
 
     return await run_in_threadpool(_delete)
