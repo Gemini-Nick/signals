@@ -1466,6 +1466,50 @@ def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
     return overlay
 
 
+def _latest_daily_trading_values(symbol: str, chart: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    source = ""
+    latest_row: dict[str, Any] = {}
+    chart_dict = chart if isinstance(chart, dict) else {}
+    chart_meta = chart_dict.get("meta") if isinstance(chart_dict.get("meta"), dict) else {}
+    if _freq_bucket(chart_meta.get("freq")) == "daily" and isinstance(chart_dict.get("ohlcv"), list) and chart_dict.get("ohlcv"):
+        latest_row = chart_dict["ohlcv"][-1] if isinstance(chart_dict["ohlcv"][-1], dict) else {}
+        source = _text(chart_meta.get("source")) or "chart.daily"
+        as_of = _timestamp_date(
+            int(latest_row.get("time") or 0),
+            market=_text(chart_meta.get("market")) or infer_market(symbol=symbol, source=source),
+            symbol=symbol,
+            source=source,
+        )
+    else:
+        try:
+            daily_df, source = _stock_df(symbol, "daily")
+        except Exception:
+            daily_df, source = pd.DataFrame(), ""
+        if daily_df is None or daily_df.empty:
+            return {}
+        row = daily_df.iloc[-1]
+        latest_row = {
+            "volume": _float(row.get("vol") or row.get("volume"), 0) or 0,
+            "amount": _float(row.get("amount") or row.get("turnover"), 0) or 0,
+        }
+        as_of = _date_text(daily_df.index[-1])
+
+    volume = _float(latest_row.get("volume") or latest_row.get("vol"), 0) or 0
+    amount = _float(latest_row.get("amount") or latest_row.get("turnover"), 0) or 0
+    if volume <= 0 and amount <= 0:
+        return {}
+    return {
+        "day_volume": int(volume),
+        "daily_volume": int(volume),
+        "latest_daily_volume": int(volume),
+        "day_amount": int(amount),
+        "daily_amount": int(amount),
+        "latest_daily_amount": int(amount),
+        "daily_trading_value_as_of": as_of,
+        "daily_trading_value_source": source,
+    }
+
+
 def _apply_quote_overlay(row: dict[str, Any], symbol: str) -> dict[str, Any]:
     overlay = _quote_overlay_for_symbol(symbol)
     updated = dict(row)
@@ -2603,6 +2647,74 @@ def _signal_pool_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) ->
     return output
 
 
+def _volume_signal_details(volume_ratio: float, volume: float, amount: Optional[float]) -> str:
+    parts = [
+        f"量比{volume_ratio:.2f}",
+        f"成交量{volume / 1_000_000:.2f}万手",
+    ]
+    if amount is not None and amount > 0:
+        parts.append(f"成交额{amount / 100_000_000:.2f}亿")
+    return " · ".join(parts)
+
+
+def _volume_signal_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) -> list[dict[str, Any]]:
+    chart_meta = chart.get("meta") if isinstance(chart.get("meta"), dict) else {}
+    effective_freq = _freq_bucket(chart_meta.get("freq") or freq)
+    market = _text(chart_meta.get("market")) or infer_market(symbol=symbol, source=_text(chart_meta.get("source")))
+    source = _text(chart_meta.get("source")) or "signals"
+    ohlcv = chart.get("ohlcv") if isinstance(chart.get("ohlcv"), list) else []
+    rows = [row for row in ohlcv if isinstance(row, dict) and _float(row.get("volume"), 0) and row.get("time")]
+    if len(rows) < 12:
+        return []
+
+    output: list[dict[str, Any]] = []
+    window = 20
+    start = max(1, len(rows) - 160)
+    for index in range(start, len(rows)):
+        history = rows[max(0, index - window):index]
+        volumes = [
+            volume for volume in (_float(item.get("volume"), 0) or 0 for item in history)
+            if volume and volume > 0
+        ]
+        if len(volumes) < 10:
+            continue
+        current_volume = _float(rows[index].get("volume"), 0) or 0
+        if current_volume <= 0:
+            continue
+        baseline = sum(volumes) / len(volumes)
+        if baseline <= 0:
+            continue
+        volume_ratio = current_volume / baseline
+        current_amount = _float(rows[index].get("amount"))
+        close = _float(rows[index].get("close"))
+        previous_close = _float(rows[index - 1].get("close")) if index > 0 else None
+        ts = int(rows[index].get("time") or 0)
+        if volume_ratio >= 2.2:
+            direction = "上攻" if close is not None and previous_close is not None and close >= previous_close else "下跌"
+            signal_type = f"成交量异常放大:{direction}"
+            signal_side = "buy" if direction == "上攻" else "sell"
+        elif volume_ratio <= 0.35:
+            signal_type = "成交量极致缩量"
+            signal_side = "neutral"
+        else:
+            continue
+        output.append({
+            "dt": ts,
+            "date_str": _timestamp_date(ts, market=market, symbol=symbol, source=source),
+            "type": signal_type,
+            "price": close,
+            "confidence": round(min(0.95, max(0.58, abs(volume_ratio - 1.0) / 2.0 + 0.55)), 4),
+            "freq": effective_freq or _canonical_freq(freq),
+            "details": _volume_signal_details(volume_ratio, current_volume, current_amount),
+            "source": "terminal_volume_signals",
+            "pool_status": "volume_warning",
+            "chart_aligned": False,
+            "display_scope": "current_timeframe",
+            "signal_side": signal_side,
+        })
+    return output[-12:]
+
+
 def _aligned_signal_bar(
     signal: dict[str, Any],
     *,
@@ -2676,12 +2788,13 @@ def _aligned_signal_bar(
 def _merge_signal_pool_into_chart(chart: dict[str, Any], symbol: str, freq: str) -> dict[str, Any]:
     technical_signals = _terminal_technical_chart_signals(symbol, freq, chart)
     pool_signals = _signal_pool_chart_signals(symbol, freq, chart)
-    if not technical_signals and not pool_signals:
+    volume_signals = _volume_signal_chart_signals(symbol, freq, chart)
+    if not technical_signals and not pool_signals and not volume_signals:
         return chart
     existing = chart.get("signals") if isinstance(chart.get("signals"), list) else []
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in [*existing, *technical_signals, *pool_signals]:
+    for item in [*existing, *technical_signals, *pool_signals, *volume_signals]:
         if not isinstance(item, dict):
             continue
         ts = _signal_ts(item.get("dt") or item.get("time") or item.get("timestamp") or item.get("date_str") or item.get("signal_date"))
@@ -5874,6 +5987,7 @@ def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any
         })
         if latest_daily_close is not None:
             summary["latest_price"] = latest_daily_close
+    summary.update(_latest_daily_trading_values(symbol, chart))
     summary.update(_quote_overlay_for_symbol(symbol))
     if summary.get("today_change_pct") is not None:
         summary["gain_pct"] = summary.get("today_change_pct")

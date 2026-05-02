@@ -130,6 +130,60 @@ def test_intraday_chart_aligns_date_only_custom_signal_to_bar(monkeypatch):
     assert merged["signals"][-1]["price"] == last_same_day["low"]
 
 
+def test_chart_adds_volume_expansion_signal(monkeypatch):
+    from signals.web.api import workbench
+
+    index = pd.date_range("2026-03-01 10:00", periods=26, freq="30min")
+    df = pd.DataFrame(
+        {
+            "open": [10.0] * 26,
+            "high": [10.5] * 26,
+            "low": [9.8] * 26,
+            "close": [10.1] * 25 + [10.8],
+            "vol": [1_000_000] * 25 + [2_600_000],
+            "amount": [10_000_000] * 25 + [31_000_000],
+        },
+        index=index,
+    )
+    chart = workbench._chart_from_df(df, symbol="SZ.002709", freq="30min", source="test_bars")
+    monkeypatch.setattr(workbench, "_load_signal_pool_rows", lambda limit=200, symbol=None: [])
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [])
+
+    merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002709", "30min")
+
+    signal = merged["signals"][-1]
+    assert signal["type"] == "成交量异常放大:上攻"
+    assert "量比" in signal["details"]
+    assert signal["source"] == "terminal_volume_signals"
+
+
+def test_chart_adds_extreme_volume_contraction_signal(monkeypatch):
+    from signals.web.api import workbench
+
+    index = pd.date_range("2026-03-01 10:00", periods=26, freq="30min")
+    df = pd.DataFrame(
+        {
+            "open": [10.0] * 26,
+            "high": [10.5] * 26,
+            "low": [9.8] * 26,
+            "close": [10.1] * 26,
+            "vol": [1_000_000] * 25 + [300_000],
+            "amount": [10_000_000] * 25 + [3_000_000],
+        },
+        index=index,
+    )
+    chart = workbench._chart_from_df(df, symbol="SZ.002709", freq="30min", source="test_bars")
+    monkeypatch.setattr(workbench, "_load_signal_pool_rows", lambda limit=200, symbol=None: [])
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [])
+
+    merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002709", "30min")
+
+    signal = merged["signals"][-1]
+    assert signal["type"] == "成交量极致缩量"
+    assert "量比" in signal["details"]
+    assert signal["source"] == "terminal_volume_signals"
+
+
 def test_weekly_chart_aligns_custom_signal_to_containing_week(monkeypatch):
     from signals.web.api import workbench
 
