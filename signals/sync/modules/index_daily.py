@@ -295,7 +295,7 @@ def _fallback_from_existing_bars(db: Database, index_codes: dict[str, str]) -> i
             continue
         for doc in docs:
             item = dict(doc)
-            item["meta"] = {**item.get("meta", {}), "symbol": symbol, "freq": item.get("meta", {}).get("freq", "daily"), "asset_type": "index"}
+            item["meta"] = {**item.get("meta", {}), "symbol": symbol, "freq": item.get("meta", {}).get("freq", "日线"), "asset_type": "index"}
             item["source"] = item.get("source") or "bars_fallback"
             ops.append(UpdateOne(
                 {"meta.symbol": symbol, "meta.freq": item["meta"]["freq"], "dt": item["dt"]},

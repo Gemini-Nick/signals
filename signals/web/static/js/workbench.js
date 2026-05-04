@@ -412,19 +412,32 @@ function wbChartOption(data) {
     { xAxis: item.end_dt * 1000, yAxis: item.zg },
   ]);
 
-  const signalMarkPoints = signals.map(item => ({
-    name: item.type,
-    coord: [item.dt * 1000, item.price],
-    value: item.type,
-    itemStyle: {
-      color: String(item.type || '').includes('买') ? colors.up : colors.down,
-    },
-    label: {
-      color: '#fff',
-      formatter: () => String(item.type || '').slice(0, 2),
-      fontSize: 10,
-    },
-  }));
+  const signalMarkPoints = signals.map(item => {
+    const typeName = String(item.type || '');
+    const isBuy = typeName.includes('买');
+    return {
+      name: typeName,
+      coord: [item.dt * 1000, item.price],
+      value: typeName,
+      symbol: 'pin',
+      symbolRotate: isBuy ? 0 : 180,
+      symbolSize: 32,
+      itemStyle: {
+        color: isBuy ? colors.up : colors.down,
+      },
+      label: {
+        show: true,
+        color: isBuy ? colors.up : colors.down,
+        formatter: () => typeName.length > 6 ? typeName.slice(0, 6) : typeName,
+        fontSize: 11,
+        fontWeight: 700,
+        position: isBuy ? 'top' : 'bottom',
+        distance: 6,
+        textShadowBlur: 6,
+        textShadowColor: 'rgba(0,0,0,0.8)',
+      },
+    };
+  });
 
   const maColorMap = {
     MA5: colors.ma5,
@@ -447,8 +460,6 @@ function wbChartOption(data) {
         borderColor0: colors.down,
       },
       markPoint: {
-        symbol: 'circle',
-        symbolSize: 26,
         data: signalMarkPoints,
       },
     },
@@ -568,9 +579,9 @@ function wbChartOption(data) {
       iconStyle: { borderColor: colors.text },
     },
     grid: [
-      { left: 56, right: 18, top: 54, height: '54%' },
-      { left: 56, right: 18, top: '64%', height: '10%' },
-      { left: 56, right: 18, top: '79%', height: '15%' },
+      { left: 56, right: 18, top: 74, height: '50%' },
+      { left: 56, right: 18, top: '62%', height: '10%' },
+      { left: 56, right: 18, top: '77%', height: '15%' },
     ],
     xAxis: [
       {
@@ -658,6 +669,19 @@ function wbRenderChart(symbolData) {
   const option = wbChartOption(symbolData);
   WB_STATE.chart.setOption(option, true);
   wbApplyBrushHandler(WB_STATE.chart, symbolData);
+
+  const signals = symbolData.chart?.signals || [];
+  const summaryEl = document.getElementById('wb-chart-signal-summary');
+  if (signals.length && summaryEl) {
+    const recent = signals.slice(-3).reverse();
+    const parts = recent.map(s => {
+      const isBuy = String(s.type || '').includes('买');
+      return `<span style="color:${isBuy ? wbCssVar('--color-up') : wbCssVar('--color-down')}">${wbEscapeHtml(s.type || '')}</span>`;
+    });
+    summaryEl.innerHTML = `最近信号: ${parts.join(' · ')}`;
+  } else if (summaryEl) {
+    summaryEl.textContent = '';
+  }
 }
 
 function wbRenderReview(review) {

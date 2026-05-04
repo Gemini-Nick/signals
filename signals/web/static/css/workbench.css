@@ -250,8 +250,11 @@ body.workbench-body {
 
 .wb-main {
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr) 320px;
-  gap: 16px;
+  grid-template-columns:
+    clamp(220px, 16vw, 340px)
+    minmax(0, 1fr)
+    clamp(230px, 17vw, 360px);
+  gap: clamp(10px, 1.2vw, 16px);
   padding: 16px 18px 18px;
   height: calc(100vh - 86px);
 }
@@ -275,7 +278,7 @@ body.workbench-body {
 
 .wb-stage {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) 310px;
+  grid-template-rows: auto minmax(0, 1fr) clamp(200px, 26vh, 340px);
   gap: 14px;
   min-width: 0;
 }
@@ -538,6 +541,14 @@ body.workbench-body {
   font-size: 12px;
 }
 
+.wb-chart-signal-summary {
+  flex: 1;
+  text-align: center;
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+}
+
 .wb-bottom {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -749,9 +760,15 @@ body.workbench-body {
   color: var(--color-down);
 }
 
+@media (min-width: 2200px) {
+  .wb-header {
+    grid-template-columns: 340px minmax(400px, 1fr) auto;
+  }
+}
+
 @media (max-width: 1480px) {
-  .wb-main {
-    grid-template-columns: 280px minmax(0, 1fr) 300px;
+  .wb-header {
+    grid-template-columns: 240px minmax(300px, 1fr) auto;
   }
 }
 
@@ -773,7 +790,7 @@ body.workbench-body {
   }
 
   .wb-stage {
-    grid-template-rows: auto 720px 360px;
+    grid-template-rows: auto minmax(480px, 1fr) auto;
   }
 }
 
