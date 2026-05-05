@@ -167,8 +167,15 @@ def test_factor_draft_writes_qlib_style_ledger_without_fake_metrics():
     assert draft["ledger"]["experiment_id"]
     assert draft["ledger"]["recorder_id"]
     assert draft["ledger"]["tags"]["qlib_recorder_style"] is True
-    assert draft["portfolio_construction"]["us_trigger_basket"][0]["symbols"] == ["NVDA", "AMD"]
+    assert draft["portfolio_construction"]["us_trigger_basket"][0]["node_id"] == "optical_interconnect"
+    assert {"COHR", "LITE", "FN"}.issubset(
+        set(draft["portfolio_construction"]["us_trigger_basket"][0]["symbols"])
+    )
     assert draft["portfolio_construction"]["cn_reaction_basket"][0]["group"] == "光模块/CPO"
+    assert "SZ.300308" in draft["portfolio_construction"]["cn_reaction_basket"][0]["symbols"]
+    assert draft["portfolio_construction"]["cn_mapping_nodes"][0]["top_candidates"][0]["symbol"] == "SZ.300308"
+    assert draft["portfolio_construction"]["us_driver_nodes"][0]["role"] == "primary_driver"
+    assert draft["rhythm"]["status"] == "pending_kline_fusion"
     assert "T+1" in draft["portfolio_construction"]["mapping_rule"]
     workflow = draft["research_workflow"]
     assert workflow["czsc_signal_event_trade"]["event"]["signals_all"] == [
@@ -223,6 +230,36 @@ def test_dynamic_factor_draft_and_demo_validation_artifact_without_observations(
     assert result["paper_account"]["exposure"]["gross"] > 0
 
 
+def test_cross_market_optical_liquid_title_uses_chain_specific_language():
+    from signals.strategy.ai_factor_factory import create_factor_draft
+
+    draft = create_factor_draft(
+        idea="Lumentum/Coherent/Fabrinet 光器件链走强，同时 Vertiv/Eaton/nVent 数据中心液冷订单上修后，A股光模块与液冷是否存在 T+1 分化联动？",
+        persist=False,
+    )
+
+    assert draft["title"] == "美股光器件/液冷链 -> A股光模块/液冷联动因子"
+
+
+def test_rhythm_demo_keeps_metrics_empty_and_marks_demo_path():
+    from signals.strategy.ai_factor_factory import create_factor_draft, run_factor_rhythm_demo
+
+    db = _Db()
+    draft = create_factor_draft(
+        idea="Lumentum/Coherent/Fabrinet 光器件链走强，同时 Vertiv/Eaton/nVent 数据中心液冷订单上修后，A股光模块与液冷是否存在 T+1 分化联动？",
+        db=db,
+    )
+    result = run_factor_rhythm_demo(factor_id=draft["factor_id"], db=db)
+
+    assert result["metrics"] == {}
+    assert result["validation"]["verified"] is False
+    assert result["rhythm"]["mode"] == "demo"
+    assert result["rhythm"]["demo"] is True
+    assert result["rhythm"]["windows"][0]["kline_marker"]["label"] == "美股尾盘加速"
+    assert result["rhythm"]["path_samples"][0]["demo"] is True
+    assert result["rhythm"]["selected_cn_mapping"]["symbol"].startswith(("SZ.", "SH."))
+
+
 def test_single_factor_validation_computes_alphalens_metrics_and_rejects_future_leak():
     from signals.strategy.ai_factor_factory import run_factor_validation
 
@@ -248,7 +285,7 @@ def test_single_factor_validation_computes_alphalens_metrics_and_rejects_future_
 
 def test_publish_gate_controls_strategy_snapshot_pollution():
     from signals.strategy.ai_factor_factory import publish_factor, run_factor_validation
-    from signals.strategy.snapshot import build_strategy_snapshot
+    from signals.strategy.snapshot import _merge_ai_factor_candidates, build_strategy_snapshot
 
     db = _Db()
     rejected = publish_factor(
@@ -292,6 +329,30 @@ def test_publish_gate_controls_strategy_snapshot_pollution():
     assert ai_candidates
     assert ai_candidates[0]["metadata"]["next_action"] == "等待盘中触发，不自动下单"
 
+    crowded_candidates = [
+        {
+            "symbol": f"SZ.00{i:04d}",
+            "name": f"高分候选{i}",
+            "score": 300 - i,
+            "metadata": {"source": "terminal_stock_pool.focus_stocks"},
+        }
+        for i in range(12)
+    ]
+    crowded_candidates[0]["symbol"] = "SZ.300394"
+    crowded_candidates[0]["name"] = "天孚通信"
+
+    merged = _merge_ai_factor_candidates(crowded_candidates, db=db)
+
+    assert len(merged) == 12
+    assert any(
+        item.get("metadata", {}).get("source") == "ai_factor_factory"
+        for item in merged
+    )
+    overlay = next(item for item in merged if item["symbol"] == "SZ.300394")
+    assert overlay["metadata"]["source"] == "terminal_stock_pool.focus_stocks"
+    assert overlay["metadata"]["ai_factor_factory"]["source"] == "ai_factor_factory"
+    assert overlay["ai_factor_score"] > 0
+
 
 def test_strategy_ai_factor_factory_api_smoke():
     from fastapi.testclient import TestClient
@@ -306,6 +367,17 @@ def test_strategy_ai_factor_factory_api_smoke():
     assert draft.status_code == 200
     assert draft.json()["metrics"] == {}
     assert draft.json()["portfolio_construction"]["cn_reaction_basket"][0]["group"] == "低空经济"
+
+    rhythm = client.post(
+        "/api/strategy/ai-factor-factory/rhythm-demo",
+        json={
+            "persist": False,
+            "idea": "Lumentum/Coherent/Fabrinet 光器件链走强后，A股光模块/CPO 是否 T+1 承接",
+        },
+    )
+    assert rhythm.status_code == 200
+    assert rhythm.json()["rhythm"]["mode"] == "demo"
+    assert rhythm.json()["metrics"] == {}
 
     validation = client.post(
         "/api/strategy/ai-factor-factory/validate",

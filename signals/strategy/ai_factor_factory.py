@@ -13,11 +13,12 @@ import re
 from datetime import date, datetime
 from typing import Any, Mapping, Sequence
 
+from signals.core.cross_market_chains import build_ai_hardware_portfolio
 from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import trading_day_key
 
 DEFAULT_FACTOR_ID = "us_ai_hardware_to_cn_optical_cpo_memory_v1"
-DEFAULT_FACTOR_TITLE = "美股 AI 硬件 -> A股光模块/CPO/存储联动因子"
+DEFAULT_FACTOR_TITLE = "美股 AI 硬件 -> A股光模块/CPO/液冷/存储联动因子"
 REPRO_BOUNDARY = "US T close is allowed to affect A-share T+1 and later only."
 LIFECYCLE_STATES = ["idea", "draft", "specified", "validated", "observable", "published", "disabled"]
 
@@ -70,7 +71,7 @@ def create_factor_draft(
     """Create a deterministic trader-readable factor definition from an idea."""
     now = naive_market_now("A")
     db = db if db is not None else _get_db_or_none()
-    default_idea = "美股 AI 硬件上涨后，A股光模块/CPO/存储是否有次日联动"
+    default_idea = "美股 AI 硬件上涨后，A股光模块/CPO/液冷/存储是否有次日联动"
     idea_text = idea.strip() or default_idea
     explicit_factor_id = str(factor_id or "").strip()
     if explicit_factor_id == DEFAULT_FACTOR_ID and idea.strip() and idea_text != default_idea:
@@ -114,6 +115,14 @@ def create_factor_draft(
         },
         "research_workflow": research_workflow,
         "portfolio_construction": portfolio_construction,
+        "rhythm": {
+            "mode": "not_run",
+            "status": "pending_kline_fusion",
+            "demo": False,
+            "windows": portfolio_construction.get("rhythm_windows") or [],
+            "multi_timeframe_map": portfolio_construction.get("multi_timeframe_map") or {},
+            "no_auto_order": True,
+        },
         "reproducibility": _default_reproducibility(now),
         "lifecycle": {
             "state": "specified",
@@ -254,6 +263,53 @@ def run_factor_validation(
             "feedback": report["feedback"],
         },
         "repro_boundary": REPRO_BOUNDARY,
+    })
+    if persist and db is not None:
+        _upsert(db, "ai_factor_experiments", {"factor_id": factor_id}, report)
+        _upsert(db, "ai_factor_experiment_ledger", {"recorder_id": recorder_id}, ledger)
+    return _json_safe({**report, "ledger": ledger})
+
+
+def run_factor_rhythm_demo(
+    *,
+    factor_id: str = DEFAULT_FACTOR_ID,
+    idea: str = "",
+    db: Any = None,
+    persist: bool = True,
+) -> dict[str, Any]:
+    """Run a deterministic front-end rhythm simulation without creating validation metrics."""
+    now = naive_market_now("A")
+    db = db if db is not None else _get_db_or_none()
+    factor_id = _safe_factor_id(factor_id or idea or DEFAULT_FACTOR_ID)
+    existing = _latest_factor_doc(db, factor_id)
+    if idea.strip():
+        draft = create_factor_draft(idea=idea, factor_id=factor_id, db=db, persist=persist)
+        if existing:
+            draft = {**_as_dict(existing), **_as_dict(draft)}
+    else:
+        draft = existing or create_factor_draft(factor_id=factor_id, db=db, persist=persist)
+
+    portfolio = _as_dict(draft.get("portfolio_construction")) or _portfolio_construction_for_idea(
+        str(draft.get("hypothesis") or idea)
+    )
+    rhythm = _rhythm_demo_from_portfolio(portfolio)
+    experiment_id = _experiment_id(factor_id, "rhythm_demo", str(now.date()))
+    recorder_id = _recorder_id(experiment_id, "rhythm")
+    report = {
+        **_as_dict(draft),
+        "_id": factor_id,
+        "factor_id": factor_id,
+        "status": str(draft.get("status") or "specified"),
+        "updated_at": now,
+        "rhythm": rhythm,
+        "metrics": _as_dict(draft.get("metrics")),
+        "validation": _as_dict(draft.get("validation")) or {"status": "not_run", "verified": False},
+        "experiment_id": experiment_id,
+        "recorder_id": recorder_id,
+    }
+    ledger = _ledger_doc(report, stage="rhythm_demo", status="FINISHED", metrics={}, artifacts={
+        "rhythm": rhythm,
+        "portfolio_construction": portfolio,
     })
     if persist and db is not None:
         _upsert(db, "ai_factor_experiments", {"factor_id": factor_id}, report)
@@ -416,6 +472,16 @@ def _normalize_factor_doc(doc: Mapping[str, Any]) -> dict[str, Any]:
     idea_text = str(doc.get("hypothesis") or doc.get("idea") or title or factor_id)
     metrics = _as_dict(doc.get("metrics") or doc.get("validation") or doc.get("verification"))
     draft = _as_dict(doc.get("draft") or doc.get("research") or doc.get("factor_draft") or doc.get("definition"))
+    portfolio = _as_dict(doc.get("portfolio_construction"))
+    if not portfolio or (
+        _is_ai_hardware_idea(idea_text)
+        and (
+            not portfolio.get("us_driver_nodes")
+            or not portfolio.get("cn_mapping_nodes")
+            or _portfolio_uses_concept_placeholders(portfolio)
+        )
+    ):
+        portfolio = _portfolio_construction_for_idea(idea_text)
     return {
         "factor_id": factor_id or title,
         "version": str(doc.get("version") or doc.get("factor_version") or "v1"),
@@ -430,7 +496,8 @@ def _normalize_factor_doc(doc: Mapping[str, Any]) -> dict[str, Any]:
         "research": _as_dict(doc.get("research")) or _normalize_draft(draft),
         "development": _as_dict(doc.get("development")),
         "research_workflow": _as_dict(doc.get("research_workflow")) or _research_workflow_for_idea(idea_text),
-        "portfolio_construction": _as_dict(doc.get("portfolio_construction")) or _portfolio_construction_for_idea(idea_text),
+        "portfolio_construction": portfolio,
+        "rhythm": _as_dict(doc.get("rhythm")),
         "reproducibility": _as_dict(doc.get("reproducibility")),
         "lifecycle": _as_dict(doc.get("lifecycle")),
         "paper_account": _as_dict(doc.get("paper_account")),
@@ -461,6 +528,14 @@ def _sample_factor(now: datetime) -> dict[str, Any]:
         "development": create_factor_draft(db=None, persist=False)["development"],
         "research_workflow": _default_research_workflow(),
         "portfolio_construction": _default_portfolio_construction(),
+        "rhythm": {
+            "mode": "not_run",
+            "status": "pending_kline_fusion",
+            "demo": False,
+            "windows": _default_portfolio_construction().get("rhythm_windows", []),
+            "multi_timeframe_map": _default_portfolio_construction().get("multi_timeframe_map", {}),
+            "no_auto_order": True,
+        },
         "reproducibility": _default_reproducibility(now),
         "lifecycle": {"state": "idea", "states": LIFECYCLE_STATES, "next_allowed": ["specified", "disabled"]},
         "paper_account": {"enabled": False, "mode": "observe_only", "no_auto_order": True},
@@ -487,23 +562,36 @@ def _normalize_draft(draft: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _portfolio_uses_concept_placeholders(portfolio: Mapping[str, Any]) -> bool:
+    for item in _as_list(portfolio.get("cn_reaction_basket") or portfolio.get("reaction_basket")):
+        symbols = item.get("symbols")
+        if isinstance(symbols, list) and any(str(symbol).startswith("concept:") for symbol in symbols):
+            return True
+    return False
+
+
 def _draft_research_from_idea(idea_text: str) -> dict[str, Any]:
     if _is_ai_hardware_idea(idea_text):
+        portfolio = _portfolio_construction_for_idea(idea_text)
+        cn_groups = _basket_groups(portfolio.get("cn_reaction_basket"))
+        us_groups = _basket_groups(portfolio.get("us_trigger_basket"))
+        target_universe = "A股" + "、".join(cn_groups) + "高暴露股票池。" if cn_groups else "A股 AI 硬件映射股票池。"
+        trigger_groups = "、".join(us_groups) if us_groups else "美股 AI 硬件链"
         if _is_gb200_infra_idea(idea_text):
             return {
                 "idea": idea_text,
-                "why_effective": "GB200/AI server 订单变化会先反映在美股硬件链，再沿散热、铜互联、PCB 和光互联映射到 A股；有效性必须由隔夜触发、A股开盘承接和组内扩散共同确认。",
-                "target_universe": "A股液冷、铜连接/高速连接器、PCB、光模块/CPO、服务器电源和算力基础设施高暴露股票池。",
-                "trigger_condition": "NVDA/AVGO/SMCI/ANET/DELL 等美股 AI server 链 T 日强势后，A股液冷/铜连接/PCB/CPO 反应池 T+1 开盘不过热，并出现回踩承接或放量扩散。",
+                "why_effective": "GB200/AI server 订单变化会先反映在美股硬件链，再沿光互联、液冷热管理、铜互联、PCB/CCL、服务器和存储节点映射到 A股；有效性必须由隔夜触发、A股开盘承接和组内扩散共同确认。",
+                "target_universe": target_universe,
+                "trigger_condition": f"{trigger_groups} T 日强势后，A股 {('、'.join(cn_groups) or 'AI硬件映射')} 反应池 T+1 开盘不过热，并出现回踩承接或放量扩散。",
                 "avoid_condition": "高开过热、一字涨停、单票孤立拉升、板块内部分化、指数宽度恶化、海外链反转或数据源过期。",
-                "invalidation_condition": "美股 AI server 映射反转、A股液冷/铜连接/PCB 组内退潮、个股跌破开盘承接位、失败样本集中出现高开低走。",
+                "invalidation_condition": "美股 AI server 映射反转、A股映射支链组内退潮、个股跌破开盘承接位、失败样本集中出现高开低走。",
                 "proof": "demo 模式生成可复现验证 artifact；接入真实 observations 后复算 T+1/T+5/T+10/T+20、Rank IC、分位差、MFE/MAE 和失败样本。",
             }
         return {
             "idea": idea_text,
-            "why_effective": "跨市场资金会沿 AI 硬件产业链寻找 A股映射，因子必须同时满足海外景气变化、A股产业链暴露和盘中承接。",
-            "target_universe": "A股光模块、CPO、存储/HBM、PCB、算力链高暴露股票池。",
-            "trigger_condition": "美股 AI 硬件链 T 日收盘强势后，A股相关池 T+1 开盘不过热，并出现回踩承接或盘中放量确认。",
+            "why_effective": "跨市场资金会沿 AI 硬件产业链寻找 A股映射，因子必须同时满足海外节点景气变化、A股产业链暴露和盘中承接。",
+            "target_universe": target_universe,
+            "trigger_condition": f"{trigger_groups} T 日收盘强势后，A股 {('、'.join(cn_groups) or '相关')} 池 T+1 开盘不过热，并出现回踩承接或盘中放量确认。",
             "avoid_condition": "一字涨停、明显缩量、板块内部分化、高开过热、指数宽度恶化或数据源过期。",
             "invalidation_condition": "美股映射反转、A股板块退潮、个股跌破关键承接位或流动性不足。",
             "proof": "等待 Signals 复现历史样本，验证 T+1/T+5/T+10/T+20、IC、分位收益、MFE/MAE 和失败样本。",
@@ -523,6 +611,9 @@ def _draft_research_from_idea(idea_text: str) -> dict[str, Any]:
 
 def _research_workflow_for_idea(idea_text: str) -> dict[str, Any]:
     if _is_ai_hardware_idea(idea_text):
+        portfolio = _portfolio_construction_for_idea(idea_text)
+        us_groups = _basket_groups(portfolio.get("us_trigger_basket"))
+        cn_groups = _basket_groups(portfolio.get("cn_reaction_basket"))
         if _is_gb200_infra_idea(idea_text):
             return {
                 "czsc_signal_event_trade": {
@@ -531,13 +622,13 @@ def _research_workflow_for_idea(idea_text: str) -> dict[str, Any]:
                             "name": "us_gb200_server_chain_strength",
                             "layer": "signal",
                             "source": "US AI server trigger basket",
-                            "definition": "NVDA/AVGO/SMCI/ANET/DELL 相对 SOX/QQQ 的隔夜超额、上涨家数宽度和订单/新闻强度，T 日收盘后定格。",
+                            "definition": f"{('、'.join(us_groups) or '美股 AI server 触发篮子')} 相对 SOX/QQQ 的隔夜超额、上涨家数宽度和订单/新闻强度，T 日收盘后定格。",
                         },
                         {
                             "name": "cn_liquid_copper_pcb_acceptance",
                             "layer": "signal",
                             "source": "A-share liquid/copper/PCB reaction basket",
-                            "definition": "液冷、铜连接/高速连接器、PCB、光模块/CPO 反应池 T+1 开盘不过热，回踩承接或盘中放量扩散。",
+                            "definition": f"{('、'.join(cn_groups) or 'A股 AI硬件映射池')} T+1 开盘不过热，回踩承接或盘中放量扩散。",
                         },
                         {
                             "name": "risk_filter",
@@ -569,7 +660,7 @@ def _research_workflow_for_idea(idea_text: str) -> dict[str, Any]:
                 "quantaxis_local_simulation": {
                     "data": "Signals 本地数据快照；demo 模式使用确定性 GB200 映射样本，不替代真实回测。",
                     "account": "paper factor account；记录模拟持仓、收益、回撤、暴露和换手。",
-                    "portfolio": "美股 GB200/AI server 篮子只做触发源，A股液冷/铜连接/PCB/CPO 反应池才做观察组合。",
+                    "portfolio": "美股 AI 硬件篮子只做触发源，A股光互联/液冷/铜连接/PCB/服务器/存储反应池才做观察组合。",
                     "storage": "实验账本写入 ai_factor_experiment_ledger，发布门禁写入 strategy_snapshot 前。",
                 },
             }
@@ -629,66 +720,7 @@ def _research_workflow_for_idea(idea_text: str) -> dict[str, Any]:
 
 def _portfolio_construction_for_idea(idea_text: str) -> dict[str, Any]:
     if _is_ai_hardware_idea(idea_text):
-        if _is_gb200_infra_idea(idea_text):
-            return {
-                "us_trigger_basket": [
-                    {
-                        "group": "GPU/GB200",
-                        "symbols": ["NVDA", "AMD"],
-                        "weight": 0.30,
-                        "role": "AI server 需求和估值锚。",
-                    },
-                    {
-                        "group": "网络/ASIC",
-                        "symbols": ["AVGO", "ANET"],
-                        "weight": 0.25,
-                        "role": "GB200 集群网络、交换和专用芯片景气。",
-                    },
-                    {
-                        "group": "服务器/OEM",
-                        "symbols": ["SMCI", "DELL", "HPE"],
-                        "weight": 0.25,
-                        "role": "AI server 订单、交付和散热配置变化。",
-                    },
-                    {
-                        "group": "指数校准",
-                        "symbols": ["SOX", "QQQ"],
-                        "weight": 0.20,
-                        "role": "剔除半导体/纳指 beta 后的相对强度。",
-                    },
-                ],
-                "cn_reaction_basket": [
-                    {
-                        "group": "液冷/散热",
-                        "symbols": ["concept:液冷", "concept:数据中心散热"],
-                        "weight": 0.30,
-                        "role": "GB200 功耗提升对应散热方案升级映射。",
-                    },
-                    {
-                        "group": "铜连接/高速连接器",
-                        "symbols": ["concept:铜连接", "concept:高速连接器"],
-                        "weight": 0.25,
-                        "role": "机柜内高速互联和铜缆替代/补充光互联映射。",
-                    },
-                    {
-                        "group": "PCB/服务器材料",
-                        "symbols": ["concept:PCB", "concept:AI服务器材料"],
-                        "weight": 0.25,
-                        "role": "服务器、交换机和加速卡材料侧弹性。",
-                    },
-                    {
-                        "group": "光模块/CPO",
-                        "symbols": ["concept:光模块", "concept:CPO"],
-                        "weight": 0.20,
-                        "role": "集群网络高速光互联映射。",
-                    },
-                ],
-                "mapping_rule": "美股 GB200/AI server 触发篮子先算相对强度，再映射到 A股液冷、铜连接、PCB、光模块反应池；A股必须用 T+1 开盘承接或盘中量价确认二次过滤。",
-                "signal_formula": "us_strength = 0.40*AI server等权超额 + 0.25*SOX超额 + 0.20*上涨家数宽度 + 0.15*订单/新闻强度；cn_score = 产业链暴露权重 * T+1承接确认 * 放量扩散。",
-                "rebalance": "日频；US T 日收盘定格，美股信号只允许影响 A股 T+1 及之后。",
-                "portfolio_role": "触发篮子只负责方向和强度，反应篮子才进入观察池；两者都不是自动下单组合。",
-            }
-        return _default_portfolio_construction()
+        return build_ai_hardware_portfolio(idea_text)
     terms = _idea_terms(idea_text)
     while len(terms) < 4:
         terms.append(["核心资产", "产业链上游", "产业链中游", "产业链下游"][len(terms)])
@@ -741,15 +773,35 @@ def _portfolio_construction_for_idea(idea_text: str) -> dict[str, Any]:
 
 def _is_ai_hardware_idea(idea_text: str) -> bool:
     text = idea_text.lower()
-    return any(token in text for token in ("ai 硬件", "ai硬件", "nvda", "英伟达", "cpo", "光模块", "hbm", "算力"))
+    return any(token in text for token in (
+        "ai 硬件", "ai硬件", "ai server", "gb200", "nvda", "英伟达", "amd", "avgo",
+        "cohr", "coherent", "lite", "lumentum", "fn", "fabrinet", "aaoi", "cien",
+        "vrt", "vertiv", "etn", "eaton", "nvt", "nvent", "smci", "dell", "hpe",
+        "aph", "amphenol", "ttmi", "pcb", "铜连接", "液冷", "光器件",
+        "cpo", "光模块", "hbm", "算力",
+    ))
 
 
 def _is_gb200_infra_idea(idea_text: str) -> bool:
     text = idea_text.lower()
-    return any(token in text for token in ("gb200", "液冷", "铜连接", "高速连接", "pcb", "ai server", "服务器"))
+    return any(token in text for token in (
+        "gb200", "液冷", "热管理", "散热", "铜连接", "高速连接", "pcb", "ai server", "服务器",
+        "vrt", "vertiv", "etn", "eaton", "nvt", "nvent", "smci", "dell", "hpe",
+    ))
 
 
 def _factor_title_from_idea(idea_text: str, factor_id: str) -> str:
+    text = idea_text.lower()
+    has_optical = any(token in text for token in (
+        "lumentum", "lite", "coherent", "cohr", "fabrinet", "fn", "光模块", "光器件", "cpo",
+    ))
+    has_liquid = any(token in text for token in (
+        "vertiv", "vrt", "eaton", "etn", "nvent", "nvt", "液冷", "热管理", "散热",
+    ))
+    if has_optical and has_liquid:
+        return "美股光器件/液冷链 -> A股光模块/液冷联动因子"
+    if has_liquid:
+        return "美股数据中心液冷链 -> A股液冷/热管理联动因子"
     if _is_gb200_infra_idea(idea_text):
         return "GB200 AI服务器链 -> A股液冷/铜连接/PCB联动因子"
     if factor_id == DEFAULT_FACTOR_ID or _is_ai_hardware_idea(idea_text):
@@ -802,8 +854,8 @@ def _default_research_workflow() -> dict[str, Any]:
                 {
                     "name": "us_ai_hardware_strength",
                     "layer": "signal",
-                    "source": "US trigger basket",
-                    "definition": "NVDA/AMD/AVGO/SMCI/ANET 相对 SOX/QQQ 的隔夜强度、上涨家数宽度和新闻订单强度。",
+                    "source": "US AI hardware ontology trigger basket",
+                    "definition": "COHR/LITE/FN 光器件链、AVGO/ANET/MRVL 网络 ASIC、NVDA/AMD GPU、SMCI/DELL/HPE 服务器和 MU 存储节点相对 SOX/QQQ 的隔夜强度、上涨家数宽度和新闻订单强度。",
                 },
                 {
                     "name": "cn_opening_acceptance",
@@ -848,64 +900,7 @@ def _default_research_workflow() -> dict[str, Any]:
 
 
 def _default_portfolio_construction() -> dict[str, Any]:
-    return {
-        "us_trigger_basket": [
-            {
-                "group": "GPU/加速卡",
-                "symbols": ["NVDA", "AMD"],
-                "weight": 0.35,
-                "role": "AI 算力需求和估值锚",
-            },
-            {
-                "group": "ASIC/网络芯片",
-                "symbols": ["AVGO", "ANET"],
-                "weight": 0.25,
-                "role": "AI 集群网络与专用芯片景气",
-            },
-            {
-                "group": "服务器/OEM",
-                "symbols": ["SMCI", "DELL"],
-                "weight": 0.20,
-                "role": "AI server 订单和交付弹性",
-            },
-            {
-                "group": "指数校准",
-                "symbols": ["SOX", "QQQ"],
-                "weight": 0.20,
-                "role": "剔除半导体/纳指 beta 后的相对强度",
-            },
-        ],
-        "cn_reaction_basket": [
-            {
-                "group": "光模块/CPO",
-                "symbols": ["concept:光模块", "concept:CPO"],
-                "weight": 0.35,
-                "role": "海外 AI capex 对高速光互联的映射",
-            },
-            {
-                "group": "存储/HBM",
-                "symbols": ["concept:存储芯片", "concept:HBM"],
-                "weight": 0.25,
-                "role": "AI 服务器存储链映射",
-            },
-            {
-                "group": "PCB/高速连接",
-                "symbols": ["concept:PCB", "concept:高速连接器"],
-                "weight": 0.20,
-                "role": "服务器和交换机材料侧映射",
-            },
-            {
-                "group": "算力基础设施",
-                "symbols": ["concept:液冷", "concept:数据中心", "concept:算力租赁"],
-                "weight": 0.20,
-                "role": "A股本地算力链弹性和情绪扩散",
-            },
-        ],
-        "mapping_rule": "美股触发篮子先算相对强度，再映射到 A股产业链暴露；A股必须用 T+1 开盘承接或盘中量价确认二次过滤。",
-        "signal_formula": "us_strength = 0.45*AI硬件等权超额 + 0.25*SOX超额 + 0.20*上涨家数宽度 + 0.10*订单/新闻强度；cn_score = 产业链暴露权重 * T+1承接确认 * 放量确认。",
-        "rebalance": "日频；US T 日收盘定格，美股信号只允许影响 A股 T+1 及之后。",
-        "portfolio_role": "触发篮子只负责方向和强度，反应篮子才进入观察池；两者都不是自动下单组合。",
-    }
+    return build_ai_hardware_portfolio("美股 AI 硬件上涨后，A股光模块/CPO/液冷/存储是否有次日联动")
 
 
 def _normalize_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
@@ -1112,6 +1107,7 @@ def _factory_actions(active_factor_id: str) -> list[dict[str, Any]]:
     factor_id = active_factor_id or DEFAULT_FACTOR_ID
     return [
         _action("pack:signals:ai_factor:draft", "生成因子草稿", {"factor_id": factor_id}),
+        _action("pack:signals:ai_factor:rhythm", "融合K线节奏", {"factor_id": factor_id}),
         _action("pack:signals:ai_factor:validate", "运行验证", {"factor_id": factor_id}),
         _action("pack:signals:ai_factor:publish", "加入观察池", {"factor_id": factor_id, "live_enabled": True}),
         _action("pack:signals:ai_factor:disable", "停用因子", {"factor_id": factor_id}),
@@ -1126,6 +1122,77 @@ def _action(action_id: str, label: str, payload: Mapping[str, Any]) -> dict[str,
         "label": label,
         "payload": dict(payload),
         "metadata": {"workspace": "ai_factor_factory"},
+    }
+
+
+def _rhythm_demo_from_portfolio(portfolio: Mapping[str, Any]) -> dict[str, Any]:
+    windows = _as_list(portfolio.get("rhythm_windows"))
+    if not windows:
+        windows = [
+            {"window_id": "us_overnight_close", "label": "昨夜美股", "market": "US", "timeframe": "daily/60m/15m"},
+            {"window_id": "cn_call_auction", "label": "今日竞价", "market": "A", "timeframe": "集合竞价"},
+            {"window_id": "cn_open_30m", "label": "开盘30分钟", "market": "A", "timeframe": "5m/30m"},
+            {"window_id": "cn_intraday_confirm", "label": "盘中确认", "market": "A", "timeframe": "5m/30m"},
+            {"window_id": "cn_close_review", "label": "收盘复盘", "market": "A", "timeframe": "daily/30m"},
+        ]
+    demo_windows = []
+    labels = ["美股尾盘加速", "竞价不过热", "开盘回踩承接", "同链扩散确认", "收盘进入成功样本"]
+    for index, window in enumerate(windows):
+        row = _as_dict(window)
+        demo_windows.append({
+            **row,
+            "status": "demo_pass" if index != 2 else "demo_watch",
+            "demo_observation": labels[index] if index < len(labels) else "demo observation",
+            "kline_marker": {
+                "type": "event" if index != 2 else "watch",
+                "label": labels[index] if index < len(labels) else "demo",
+            },
+        })
+
+    drivers = _as_list(portfolio.get("us_driver_nodes"))
+    mappings = _as_list(portfolio.get("cn_mapping_nodes"))
+    first_driver = _as_dict(drivers[0] if drivers else {})
+    first_mapping = _as_dict(mappings[0] if mappings else {})
+    cn_candidates = _as_list(first_mapping.get("top_candidates") or first_mapping.get("core_candidates"))
+    cn_symbol = _as_dict(cn_candidates[0] if cn_candidates else {})
+    us_symbols = _string_list(first_driver.get("symbols"))
+    us_symbol = us_symbols[0] if us_symbols else ""
+
+    return {
+        "mode": "demo",
+        "demo": True,
+        "status": "rhythm_simulated",
+        "no_auto_order": True,
+        "selected_us_driver": {
+            "node_id": first_driver.get("node_id") or "",
+            "name": first_driver.get("name") or "",
+            "symbol": us_symbol,
+        },
+        "selected_cn_mapping": {
+            "source_node_id": first_mapping.get("source_node_id") or "",
+            "group": first_mapping.get("group") or "",
+            "symbol": cn_symbol.get("symbol") or "",
+            "name": cn_symbol.get("name") or "",
+        },
+        "windows": demo_windows,
+        "path_samples": [
+            {
+                "case_id": "demo:success:optical_or_liquid:001",
+                "path": "美股主驱动强 -> A股竞价不过热 -> 开盘30分钟承接 -> 盘中同链扩散",
+                "outcome": "success_observation",
+                "us_symbol": us_symbol,
+                "cn_symbol": cn_symbol.get("symbol") or "",
+                "cn_name": cn_symbol.get("name") or "",
+                "demo": True,
+            },
+            {
+                "case_id": "demo:failure:gap_fade:001",
+                "path": "美股强 -> A股高开过热 -> 开盘30分钟高开低走",
+                "outcome": "failure_boundary",
+                "failure_reason": "高开低走和组内分化时，不能只凭美股强度进入观察账户。",
+                "demo": True,
+            },
+        ],
     }
 
 

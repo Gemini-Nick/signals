@@ -9,6 +9,7 @@ from signals.strategy.ai_factor_factory import (
     create_factor_draft,
     disable_factor,
     publish_factor,
+    run_factor_rhythm_demo,
     run_factor_validation,
 )
 from signals.strategy.snapshot import get_strategy_snapshot
@@ -55,6 +56,17 @@ async def ai_factor_factory_validate(
         observations=observations,
         persist=bool(payload.get("persist", True)),
         demo_mode=demo_mode,
+    )
+
+
+@router.post("/ai-factor-factory/rhythm-demo")
+async def ai_factor_factory_rhythm_demo(
+    payload: dict[str, Any] = Body(default_factory=dict),
+):
+    return run_factor_rhythm_demo(
+        factor_id=str(payload.get("factor_id") or ""),
+        idea=str(payload.get("idea") or payload.get("hypothesis") or ""),
+        persist=bool(payload.get("persist", True)),
     )
 
 

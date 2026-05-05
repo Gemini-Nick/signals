@@ -44,6 +44,7 @@ def build_strategy_snapshot(
     now = _now_bj()
     trade_date = trading_day_key("A", now=now)
     responses_provided = responses is not None
+    db_provided = db is not None
     responses = dict(responses or _fetch_gateway_responses())
     db = db if db is not None else _get_db_or_none()
 
@@ -79,7 +80,8 @@ def build_strategy_snapshot(
         themes=themes,
         source_confidence=source_confidence,
     )
-    candidates = _merge_ai_factor_candidates(candidates, db=db)
+    if db_provided or not responses_provided:
+        candidates = _merge_ai_factor_candidates(candidates, db=db)
 
     if journal_summary is None:
         journal_summary = _journal_summary()
@@ -160,15 +162,86 @@ def _merge_ai_factor_candidates(candidates: list[dict[str, Any]], *, db: Any = N
         ai_candidates = []
     if not ai_candidates:
         return candidates
-    seen = {str(item.get("symbol") or "") for item in candidates}
-    merged = list(candidates)
+    merged_by_symbol: dict[str, dict[str, Any]] = {}
+    ai_symbols: list[str] = []
+    for item in candidates:
+        symbol = _candidate_symbol(item)
+        if symbol:
+            merged_by_symbol[symbol] = dict(item)
+
     for item in ai_candidates:
-        symbol = str(item.get("symbol") or "")
-        if symbol and symbol not in seen:
-            merged.append(item)
-            seen.add(symbol)
-    merged.sort(key=lambda item: _float(item.get("score"), 0.0), reverse=True)
-    return merged[:12]
+        symbol = _candidate_symbol(item)
+        if not symbol:
+            continue
+        ai_symbols.append(symbol)
+        if symbol in merged_by_symbol:
+            merged_by_symbol[symbol] = _merge_ai_factor_overlay(merged_by_symbol[symbol], item)
+        else:
+            merged_by_symbol[symbol] = dict(item)
+
+    ranked = sorted(merged_by_symbol.values(), key=lambda item: _float(item.get("score"), 0.0), reverse=True)
+    ai_visible: list[dict[str, Any]] = []
+    seen_ai: set[str] = set()
+    for symbol in ai_symbols:
+        if symbol in seen_ai:
+            continue
+        item = merged_by_symbol.get(symbol)
+        if item is None:
+            continue
+        ai_visible.append(item)
+        seen_ai.add(symbol)
+        if len(ai_visible) >= 3:
+            break
+
+    selected: list[dict[str, Any]] = []
+    selected_symbols: set[str] = set()
+    for item in ai_visible + ranked:
+        symbol = _candidate_symbol(item)
+        if not symbol or symbol in selected_symbols:
+            continue
+        selected.append(item)
+        selected_symbols.add(symbol)
+        if len(selected) >= 12:
+            break
+    return selected
+
+
+def _candidate_symbol(item: Mapping[str, Any]) -> str:
+    return str(item.get("symbol") or "").strip()
+
+
+def _merge_ai_factor_overlay(existing: Mapping[str, Any], ai_item: Mapping[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    existing_metadata = _as_dict(merged.get("metadata"))
+    ai_metadata = _as_dict(ai_item.get("metadata"))
+    merged["metadata"] = {
+        **existing_metadata,
+        "ai_factor_factory": ai_metadata or {"source": "ai_factor_factory"},
+    }
+    merged["evidence"] = _as_list(merged.get("evidence")) + _as_list(ai_item.get("evidence"))
+    merged["promotion_path"] = _unique_text_items(
+        list(merged.get("promotion_path") or []) + list(ai_item.get("promotion_path") or [])
+    )
+    merged["missing_gates"] = _unique_text_items(
+        list(merged.get("missing_gates") or []) + list(ai_item.get("missing_gates") or [])
+    )
+    merged["recommended_action"] = str(
+        ai_item.get("recommended_action") or merged.get("recommended_action") or ""
+    )
+    merged["ai_factor_score"] = _float(ai_item.get("score"), 0.0)
+    return merged
+
+
+def _unique_text_items(values: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        result.append(text)
+        seen.add(text)
+    return result
 
 
 def persist_strategy_snapshot(snapshot: Mapping[str, Any], *, db: Any = None) -> dict[str, Any]:

@@ -1,0 +1,215 @@
+version: 1
+chains:
+  - chain_id: us_ai_hardware
+    name: 美股AI硬件跨市场触发链
+    aliases: [AI硬件, AI server, GB200, 光模块, CPO, 液冷, 铜连接, PCB, HBM, 算力]
+    source_market: US
+    target_market: A
+    benchmark_symbols: [SOX, QQQ]
+    default_nodes:
+      - accelerator_compute
+      - networking_switch_asic
+      - optical_interconnect
+      - thermal_liquid_cooling
+      - copper_interconnect
+      - pcb_ccl_materials
+      - hbm_memory
+      - ai_server_oem_odm
+    nodes:
+      - node_id: accelerator_compute
+        name: GPU/加速卡
+        layer: upstream
+        keywords: [NVDA, NVIDIA, 英伟达, AMD, GPU, 加速卡, AI accelerator, CUDA, MI300, GB200, B200]
+        us_representatives:
+          - {symbol: NVDA, name: NVIDIA, role: chain_anchor, evidence_type: demand_anchor, priority: 100}
+          - {symbol: AMD, name: AMD, role: accelerator_competitor, evidence_type: demand_anchor, priority: 88}
+        a_share_mapping:
+          group: 算力基础设施
+          target_chain_id: computing_infrastructure
+          concepts: [算力, AI服务器, 数据中心]
+          core_representatives: [工业富联, 浪潮信息, 中科曙光]
+          elastic_representatives: [紫光股份, 拓维信息]
+          mapping_rule: GPU/加速卡景气只作为 AI 硬件总需求锚，A股需要服务器、算力或数据中心承接确认。
+          lag_rule: US_T_close_to_A_T_plus_1
+          confirmation_rule: A股算力基础设施池 T+1 开盘不过热，且组内成交额扩散。
+          confidence: 0.80
+
+      - node_id: networking_switch_asic
+        name: 网络交换/ASIC
+        layer: midstream
+        keywords: [AVGO, Broadcom, 博通, ANET, Arista, MRVL, Marvell, ASIC, 交换机, 以太网, silicon photonics, 硅光]
+        us_representatives:
+          - {symbol: AVGO, name: Broadcom, role: network_asic_anchor, evidence_type: network_asic_silicon_photonics, priority: 98}
+          - {symbol: ANET, name: Arista Networks, role: switch_anchor, evidence_type: ai_ethernet_switch, priority: 92}
+          - {symbol: MRVL, name: Marvell, role: custom_silicon, evidence_type: custom_asic_dsp, priority: 86}
+        a_share_mapping:
+          group: 交换机/光互联
+          target_chain_id: telecom_network
+          concepts: [交换机, CPO, 硅光, 数据中心网络]
+          core_representatives: [中兴通讯, 紫光股份]
+          elastic_representatives: [中际旭创, 新易盛, 天孚通信]
+          mapping_rule: AVGO/ANET/MRVL 代表网络 ASIC、交换和硅光证据，不应被当成纯光模块标的。
+          lag_rule: US_T_close_to_A_T_plus_1
+          confirmation_rule: A股网络设备和光互联池 T+1 同步放量，而不是单票孤立拉升。
+          confidence: 0.76
+
+      - node_id: optical_interconnect
+        name: 光器件/光模块/CPO
+        layer: midstream
+        keywords: [COHR, Coherent, LITE, Lumentum, FN, Fabrinet, AAOI, CIEN, Ciena, 光模块, 光器件, CPO, 硅光, 800G, 1.6T, optical, photonics]
+        us_representatives:
+          - {symbol: COHR, name: Coherent, role: optical_component_anchor, evidence_type: optical_price_proxy, priority: 100}
+          - {symbol: LITE, name: Lumentum, role: optical_component_anchor, evidence_type: optical_price_proxy, priority: 96}
+          - {symbol: FN, name: Fabrinet, role: optical_manufacturing, evidence_type: optical_supply_chain_proxy, priority: 92}
+          - {symbol: AAOI, name: Applied Optoelectronics, role: optical_module_elastic, evidence_type: optical_price_proxy, priority: 84}
+          - {symbol: CIEN, name: Ciena, role: optical_network_equipment, evidence_type: optical_network_proxy, priority: 78}
+        a_share_mapping:
+          group: 光模块/CPO
+          target_chain_id: optical_module
+          concepts: [光模块, CPO, 硅光, 800G, 1.6T]
+          core_representatives: [中际旭创, 新易盛, 天孚通信]
+          elastic_representatives: [光迅科技, 源杰科技, 联特科技]
+          mapping_rule: COHR/LITE/FN/AAOI/CIEN 是光器件和光模块直接触发源；AVGO 只能作为网络 ASIC/硅光旁证。
+          lag_rule: US_T_close_to_A_T_plus_1
+          confirmation_rule: A股光模块/CPO 池 T+1 开盘不过热，龙头和弹性标的出现量价承接。
+          confidence: 0.88
+
+      - node_id: copper_interconnect
+        name: 铜互联/高速连接器
+        layer: midstream
+        keywords: [APH, Amphenol, TEL, TE Connectivity, GLW, Corning, 铜连接, 铜缆, 高速连接器, backplane, cable]
+        us_representatives:
+          - {symbol: APH, name: Amphenol, role: connector_anchor, evidence_type: connector_price_proxy, priority: 96}
+          - {symbol: TEL, name: TE Connectivity, role: connector_anchor, evidence_type: connector_price_proxy, priority: 90}
+          - {symbol: GLW, name: Corning, role: materials_optical_copper, evidence_type: materials_proxy, priority: 76}
+        a_share_mapping:
+          group: 铜连接/高速连接器
+          target_chain_id: copper_interconnect
+          concepts: [铜连接, 高速连接器, 高速铜缆, 服务器连接器]
+          core_representatives: [沃尔核材, 神宇股份, 兆龙互连]
+          elastic_representatives: [鼎通科技, 立讯精密, 博创科技]
+          mapping_rule: APH/TEL/GLW 代表高速互联、连接器和材料证据，A股需要铜连接或高速连接器池确认。
+          lag_rule: US_T_close_to_A_T_plus_1
+          confirmation_rule: A股铜连接池 T+1 不高开低走，且与 PCB/AI server 池联动。
+          confidence: 0.78
+
+      - node_id: pcb_ccl_materials
+        name: PCB/CCL/服务器材料
+        layer: midstream
+        keywords: [TTMI, TTM Technologies, SANM, Sanmina, FLEX, Jabil, JBL, PCB, CCL, 覆铜板, 服务器材料]
+        us_representatives:
+          - {symbol: TTMI, name: TTM Technologies, role: pcb_anchor, evidence_type: pcb_price_proxy, priority: 96}
+          - {symbol: SANM, name: Sanmina, role: electronics_manufacturing, evidence_type: server_supply_chain_proxy, priority: 82}
+          - {symbol: FLEX, name: Flex, role: electronics_manufacturing, evidence_type: server_supply_chain_proxy, priority: 78}
+          - {symbol: JBL, name: Jabil, role: electronics_manufacturing, evidence_type: server_supply_chain_proxy, priority: 74}
+        a_share_mapping:
+          group: PCB/CCL
+          target_chain_id: pcb_ccl
+          concepts: [PCB, CCL, 覆铜板, AI服务器材料]
+          core_representatives: [胜宏科技, 沪电股份, 深南电路]
+          elastic_representatives: [生益科技, 景旺电子, 金安国纪]
+          mapping_rule: TTMI/SANM/FLEX/JBL 是 PCB、EMS 和服务器材料侧证据，不能混成光模块或液冷。
+          lag_rule: US_T_close_to_A_T_plus_1
+          confirmation_rule: A股 PCB/CCL 池 T+1 与服务器链同步放量，低位补涨优于高开追价。
+          confidence: 0.80
+
+      - node_id: thermal_liquid_cooling
+        name: 液冷/热管理/数据中心电力
+        layer: midstream
+        keywords: [VRT, Vertiv, ETN, Eaton, NVT, nVent, 液冷, 热管理, CDU, 冷板, 数据中心散热, power, cooling]
+        us_representatives:
+          - {symbol: VRT, name: Vertiv, role: datacenter_power_cooling_anchor, evidence_type: cooling_power_price_proxy, priority: 100}
+          - {symbol: ETN, name: Eaton, role: datacenter_power_anchor, evidence_type: power_cooling_proxy, priority: 92}
+          - {symbol: NVT, name: nVent, role: enclosure_thermal_anchor, evidence_type: enclosure_thermal_proxy, priority: 86}
+          - {symbol: SMCI, name: Super Micro Computer, role: rack_server_conditional, evidence_type: liquid_cooled_rack_condition, priority: 72}
+          - {symbol: DELL, name: Dell Technologies, role: rack_server_conditional, evidence_type: liquid_cooled_rack_condition, priority: 68}
+          - {symbol: HPE, name: Hewlett Packard Enterprise, role: rack_server_conditional, evidence_type: liquid_cooled_rack_condition, priority: 64}
+        a_share_mapping:
+          group: 液冷/热管理
+          target_chain_id: thermal_liquid_cooling
+          concepts: [液冷, 数据中心散热, 热管理, 服务器电源]
+          core_representatives: [英维克, 申菱环境, 高澜股份]
+          elastic_representatives: [同飞股份, 佳力图, 依米康]
+          mapping_rule: VRT/ETN/NVT 是液冷和数据中心电力热管理直接证据；SMCI/DELL/HPE 只有在 rack-scale 或 liquid-cooled server 线索出现时才作为条件证据。
+          lag_rule: US_T_close_to_A_T_plus_1
+          confirmation_rule: A股液冷/热管理池 T+1 需要开盘承接和组内扩散，不能只看 AI server OEM 股价。
+          confidence: 0.86
+
+      - node_id: hbm_memory
+        name: HBM/存储
+        layer: upstream
+        keywords: [MU, Micron, HBM, DRAM, NAND, 存储, 高带宽内存, memory]
+        us_representatives:
+          - {symbol: MU, name: Micron, role: memory_anchor, evidence_type: memory_price_proxy, priority: 94}
+          - {symbol: WDC, name: Western Digital, role: storage_elastic, evidence_type: storage_price_proxy, priority: 72}
+        a_share_mapping:
+          group: 存储/HBM
+          target_chain_id: semiconductor
+          concepts: [存储芯片, HBM, DRAM, NAND]
+          core_representatives: [兆易创新, 北京君正, 澜起科技]
+          elastic_representatives: [香农芯创, 佰维存储, 德明利]
+          mapping_rule: MU/WDC 作为存储周期和 HBM 旁证，A股映射需要存储芯片池自身承接。
+          lag_rule: US_T_close_to_A_T_plus_1
+          confirmation_rule: A股存储池 T+1 开盘不过热并出现持续成交额扩散。
+          confidence: 0.74
+
+      - node_id: foundry_packaging
+        name: 晶圆代工/先进封装
+        layer: upstream
+        keywords: [TSM, TSMC, ASML, AMAT, LRCX, KLAC, CoWoS, 先进封装, 封测, 晶圆代工]
+        us_representatives:
+          - {symbol: TSM, name: TSMC, role: foundry_packaging_anchor, evidence_type: foundry_packaging_proxy, priority: 96}
+          - {symbol: ASML, name: ASML, role: lithography_anchor, evidence_type: semiconductor_capex_proxy, priority: 86}
+          - {symbol: AMAT, name: Applied Materials, role: equipment_anchor, evidence_type: semiconductor_capex_proxy, priority: 78}
+          - {symbol: LRCX, name: Lam Research, role: equipment_anchor, evidence_type: semiconductor_capex_proxy, priority: 74}
+        a_share_mapping:
+          group: 半导体设备/先进封装
+          target_chain_id: semiconductor
+          concepts: [先进封装, 封测, 半导体设备, 晶圆代工]
+          core_representatives: [长电科技, 通富微电, 北方华创]
+          elastic_representatives: [中微公司, 华海清科, 芯碁微装]
+          mapping_rule: foundry/CoWoS 和半导体设备是供给约束证据，不能直接替代光模块或液冷因子。
+          lag_rule: US_T_close_to_A_T_plus_1
+          confirmation_rule: A股半导体设备/封测池 T+1 需要独立承接，避免被 AI server 总 beta 污染。
+          confidence: 0.68
+
+      - node_id: ai_server_oem_odm
+        name: AI服务器/OEM/ODM
+        layer: downstream
+        keywords: [SMCI, Supermicro, DELL, HPE, server, rack, NVL, GB200 NVL, AI服务器, ODM, OEM]
+        us_representatives:
+          - {symbol: SMCI, name: Super Micro Computer, role: ai_server_anchor, evidence_type: ai_server_price_proxy, priority: 94}
+          - {symbol: DELL, name: Dell Technologies, role: ai_server_oem, evidence_type: ai_server_price_proxy, priority: 86}
+          - {symbol: HPE, name: Hewlett Packard Enterprise, role: ai_server_oem, evidence_type: ai_server_price_proxy, priority: 78}
+        a_share_mapping:
+          group: AI服务器/算力基础设施
+          target_chain_id: computing_infrastructure
+          concepts: [AI服务器, 算力, 数据中心, 服务器电源]
+          core_representatives: [工业富联, 浪潮信息, 中科曙光]
+          elastic_representatives: [紫光股份, 拓维信息, 科华数据]
+          mapping_rule: SMCI/DELL/HPE 只代表 AI server OEM/ODM 和 rack 交付证据；映射液冷必须叠加 VRT/ETN/NVT 或液冷订单线索。
+          lag_rule: US_T_close_to_A_T_plus_1
+          confirmation_rule: A股服务器/算力池 T+1 与液冷、PCB、连接器至少一条支链共振。
+          confidence: 0.76
+
+      - node_id: hyperscaler_capex_terminal
+        name: 云厂商capex终端证据
+        layer: terminal
+        terminal_evidence_only: true
+        keywords: [MSFT, Microsoft, AMZN, Amazon, AWS, GOOGL, Google, META, Oracle, ORCL, capex, 云厂商, 资本开支]
+        us_representatives:
+          - {symbol: MSFT, name: Microsoft, role: hyperscaler_capex, evidence_type: terminal_capex_evidence, priority: 90}
+          - {symbol: AMZN, name: Amazon, role: hyperscaler_capex, evidence_type: terminal_capex_evidence, priority: 88}
+          - {symbol: GOOGL, name: Alphabet, role: hyperscaler_capex, evidence_type: terminal_capex_evidence, priority: 86}
+          - {symbol: META, name: Meta Platforms, role: hyperscaler_capex, evidence_type: terminal_capex_evidence, priority: 84}
+          - {symbol: ORCL, name: Oracle, role: hyperscaler_capex, evidence_type: terminal_capex_evidence, priority: 72}
+        a_share_mapping:
+          group: 终端capex证据
+          target_chain_id: terminal_capex
+          concepts: [云计算, 数据中心, AI capex]
+          core_representatives: []
+          elastic_representatives: []
+          mapping_rule: hyperscaler 只用于解释总需求和财报 capex，不直接生成 A股候选股票池。
+          lag_rule: US_T_close_to_A_T_plus_1
+          confirmation_rule: 只作为上游硬件链的背景证据，不单独进入观察池。
+          confidence: 0.60
