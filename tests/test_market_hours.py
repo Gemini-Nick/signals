@@ -89,16 +89,14 @@ def test_spring_festival_all_cn_closed():
     assert detail["a_options"]["status"] == "休市"
 
 
-def test_cn_makeup_workday_saturday():
-    """2026-02-14 Saturday = makeup workday for Spring Festival. CN opens."""
+def test_cn_makeup_workday_saturday_still_exchange_closed():
+    """2026-02-14 Saturday is an adjusted workday, but exchanges stay closed."""
     now = bj_dt(2026, 2, 14, 10, 0)
-    assert Market.A in get_active_markets(now)
-    # HK is also open (not a HK holiday)
-    assert Market.HK in get_active_markets(now)
+    assert get_active_markets(now) == set()
 
     detail = get_market_detail(now)
-    assert detail["a_stock"]["status"] in ("盘中", "交易中")
-    assert detail["a_index_futures"]["status"] in ("盘中", "交易中")
+    assert detail["a_stock"]["status"] == "休市"
+    assert detail["a_index_futures"]["status"] == "休市"
 
 
 def test_regular_saturday_cn_closed():
@@ -117,13 +115,16 @@ def test_cn_national_day_holiday():
     assert detail["hk_stock"]["status"] == "休市"  # HK also closed for National Day
 
 
-def test_cn_makeup_workday_sunday_sep():
-    """2026-09-20 Sunday = makeup workday for National Day. CN opens."""
+def test_cn_makeup_workday_sunday_still_exchange_closed():
+    """2026-09-20 Sunday is an adjusted workday, but exchanges stay closed."""
     now = bj_dt(2026, 9, 20, 10, 0)
-    # HK should not be affected by CN makeup (HK doesn't have makeup days)
-    # But HK is open on regular Sunday... no, HK is closed Sundays too
-    # CN makeup only affects CN exchanges
-    assert Market.A in get_active_markets(now)
+    assert get_active_markets(now) == set()
+
+
+def test_labor_day_makeup_saturday_still_exchange_closed():
+    """2026-05-09 is an adjusted workday, but the exchange公告 says weekend closed."""
+    now = bj_dt(2026, 5, 9, 10, 0)
+    assert get_active_markets(now) == set()
 
 
 # ═══ US holiday tests ═══

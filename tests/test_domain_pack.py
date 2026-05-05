@@ -281,13 +281,19 @@ def test_live_low_latency_uses_effective_trade_day_on_holiday(monkeypatch):
     from signals.data import mongo_fallback
     from signals.domain_pack import SignalsPack
 
-    now = datetime(2026, 5, 2, 9, 30)
+    now = datetime(2026, 5, 1, 10, 0)
     last_trade_tick = datetime(2026, 4, 30, 15, 0)
     monkeypatch.setattr(domain_pack, "naive_market_now", lambda _market: now)
     monkeypatch.setattr(mongo_fallback, "get_last_trading_day", lambda _market="A": "2026-04-30")
     db = _Db({
         "sync_log": _Collection([
-            {"_id": "quote_snapshots:A:_meta", "module": "quote_snapshots", "status": "degraded", "last_run": now},
+            {
+                "_id": "quote_snapshots:A:_meta",
+                "module": "quote_snapshots",
+                "status": "degraded",
+                "last_run": now,
+                "result": {"count": 310, "live": 305, "missing_current": 5, "errors": 0},
+            },
             {"_id": "stock_minute:A:_meta", "module": "stock_minute", "status": "ok", "last_run": last_trade_tick},
             {"_id": "index_minute:A:_meta", "module": "index_minute", "status": "ok", "last_run": last_trade_tick},
             {
@@ -325,13 +331,17 @@ def test_live_low_latency_uses_effective_trade_day_on_holiday(monkeypatch):
     live = SignalsPack()._cache_live_low_latency(db)
 
     statuses = {item["module"]: item["status"] for item in live["modules"]}
+    assert statuses["quote_snapshots"] == "ok"
     assert statuses["stock_minute"] == "ok"
     assert statuses["index_minute"] == "ok"
     assert statuses["minute_readiness_probe"] == "ok"
     assert statuses["board_heat_minute"] == "ok"
     assert statuses["concept_heat_minute"] == "ok"
     assert statuses["chain_heat_snapshots"] == "ok"
-    assert live["summary"]["problem_modules"] == ["quote_snapshots"]
+    assert live["summary"]["ok_modules"] == 8
+    assert live["summary"]["strict_status"] == "ok"
+    assert live["summary"]["problem_modules"] == []
+    assert SignalsPack()._cache_blockers(live, {"tasks": []}, []) == []
 
 
 def test_provider_health_blocker_ignores_degraded_source_with_healthy_peer():

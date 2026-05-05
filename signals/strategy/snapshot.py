@@ -79,6 +79,7 @@ def build_strategy_snapshot(
         themes=themes,
         source_confidence=source_confidence,
     )
+    candidates = _merge_ai_factor_candidates(candidates, db=db)
 
     if journal_summary is None:
         journal_summary = _journal_summary()
@@ -141,12 +142,33 @@ def build_strategy_snapshot(
                 "signals",
                 "quote_snapshots",
                 "chain_heat_snapshots",
+                "ai_factor_experiments",
                 "board_ranking",
                 "concept_ranking",
             ],
             "fallback_policy": ".data caches are import/compat sources, not dashboard truth",
         },
     })
+
+
+def _merge_ai_factor_candidates(candidates: list[dict[str, Any]], *, db: Any = None) -> list[dict[str, Any]]:
+    try:
+        from signals.strategy.ai_factor_factory import build_ai_factor_strategy_candidates
+
+        ai_candidates = build_ai_factor_strategy_candidates(db=db)
+    except Exception:
+        ai_candidates = []
+    if not ai_candidates:
+        return candidates
+    seen = {str(item.get("symbol") or "") for item in candidates}
+    merged = list(candidates)
+    for item in ai_candidates:
+        symbol = str(item.get("symbol") or "")
+        if symbol and symbol not in seen:
+            merged.append(item)
+            seen.add(symbol)
+    merged.sort(key=lambda item: _float(item.get("score"), 0.0), reverse=True)
+    return merged[:12]
 
 
 def persist_strategy_snapshot(snapshot: Mapping[str, Any], *, db: Any = None) -> dict[str, Any]:

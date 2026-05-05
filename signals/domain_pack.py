@@ -239,6 +239,7 @@ class SignalsPack:
         status = self._dashboard_status(connector_health)
         overview = self._overview(backtest_summary, strategy_snapshot)
         cache_status = self._cache_status()
+        ai_factor_factory = self._ai_factor_factory()
         return {
             "pack_id": "signals",
             "title": "Signals",
@@ -262,6 +263,7 @@ class SignalsPack:
             "strategy_kpis": strategy_snapshot.get("strategy_kpis", {}),
             "source_confidence": strategy_snapshot.get("source_confidence", {}),
             "cache_status": cache_status,
+            "ai_factor_factory": ai_factor_factory,
         }
 
     def _operator_actions(self) -> List[Dict[str, Any]]:
@@ -942,7 +944,7 @@ class SignalsPack:
             if key in doc:
                 row[key] = _json_safe(doc.get(key))
         row["status"] = self._cache_effective_module_status(row)
-        if row["status"] != row.get("raw_status") and not row.get("degraded_reason"):
+        if row["status"] != "ok" and row["status"] != row.get("raw_status") and not row.get("degraded_reason"):
             row["degraded_reason"] = "strict_low_latency_status"
         return row
 
@@ -950,6 +952,14 @@ class SignalsPack:
         status = str(row.get("raw_status") or row.get("status") or "missing").lower()
         if not status:
             return "missing"
+        pause_ok = self._cache_a_share_low_latency_pause_ok(row)
+        if pause_ok and self._a_share_low_latency_non_trading_day():
+            if status in {"ok", "partial", "degraded", "stale", "warm", "fresh"}:
+                return "ok"
+        if pause_ok and status in {"stale", "warm", "fresh"}:
+            return "ok"
+        if pause_ok and status == "ok" and row.get("freshness") == "stale":
+            return "ok"
         if status != "ok":
             return status
         error_msg = str(row.get("error_msg") or "").lower()
@@ -964,7 +974,7 @@ class SignalsPack:
         if planned > 0 and empty >= planned:
             return "partial"
         if row.get("freshness") == "stale":
-            if self._cache_a_share_low_latency_pause_ok(row):
+            if pause_ok:
                 return "ok"
             return "stale"
         return "ok"
@@ -988,6 +998,8 @@ class SignalsPack:
 
     def _a_share_low_latency_paused(self) -> bool:
         now = naive_market_now("A")
+        if self._a_share_low_latency_non_trading_day(now):
+            return True
         if now.weekday() >= 5:
             return True
         current = now.time()
@@ -995,6 +1007,15 @@ class SignalsPack:
             datetime_time(9, 30) <= current < datetime_time(11, 30)
             or datetime_time(13, 0) <= current < datetime_time(15, 0)
         )
+
+    def _a_share_low_latency_non_trading_day(self, now: datetime | None = None) -> bool:
+        now = now or naive_market_now("A")
+        try:
+            from signals.core.trading_dates import is_trading_day
+
+            return not is_trading_day("A", now.date())
+        except Exception:
+            return now.weekday() >= 5
 
     def _cache_row_touched_current_market_day(self, row: Mapping[str, Any]) -> bool:
         today = naive_market_now("A").date()
@@ -1285,6 +1306,21 @@ class SignalsPack:
                 "decision_queue": [],
                 "strategy_kpis": {},
                 "source_confidence": {"overall": 0, "sources": []},
+            }
+
+    def _ai_factor_factory(self) -> Dict[str, Any]:
+        try:
+            from signals.strategy.ai_factor_factory import build_ai_factor_factory
+
+            factory = build_ai_factor_factory()
+            return dict(factory) if isinstance(factory, Mapping) else {}
+        except Exception as exc:
+            return {
+                "title": "AI因子工厂",
+                "summary": {"total": 0, "verified": 0, "live_enabled": 0, "draft": 0},
+                "factors": [],
+                "active_factor_id": "",
+                "error": f"ai_factor_factory_error:{exc.__class__.__name__}",
             }
 
     def _snapshot_source_freshness(self, snapshot: Mapping[str, Any], source_name: str) -> str:
