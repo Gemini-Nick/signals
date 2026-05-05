@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from datetime import date, datetime
 from typing import Any, Mapping, Sequence
 
@@ -69,39 +70,40 @@ def create_factor_draft(
     """Create a deterministic trader-readable factor definition from an idea."""
     now = naive_market_now("A")
     db = db if db is not None else _get_db_or_none()
-    idea_text = idea.strip() or "美股 AI 硬件上涨后，A股光模块/CPO/存储是否有次日联动"
-    factor_id = _safe_factor_id(factor_id or idea_text)
+    default_idea = "美股 AI 硬件上涨后，A股光模块/CPO/存储是否有次日联动"
+    idea_text = idea.strip() or default_idea
+    explicit_factor_id = str(factor_id or "").strip()
+    if explicit_factor_id == DEFAULT_FACTOR_ID and idea.strip() and idea_text != default_idea:
+        explicit_factor_id = ""
+    factor_id = _safe_factor_id(explicit_factor_id or idea_text)
     version = "v1"
     experiment_id = _experiment_id(factor_id, "research", idea_text)
     recorder_id = _recorder_id(experiment_id, "draft")
+    research = _draft_research_from_idea(idea_text)
+    portfolio_construction = _portfolio_construction_for_idea(idea_text)
+    research_workflow = _research_workflow_for_idea(idea_text)
     doc = {
         "_id": factor_id,
         "factor_id": factor_id,
         "version": version,
-        "title": DEFAULT_FACTOR_TITLE if factor_id == DEFAULT_FACTOR_ID else idea_text[:48],
+        "title": _factor_title_from_idea(idea_text, factor_id),
         "hypothesis": idea_text,
         "status": "specified",
         "approval_status": "not_requested",
         "live_enabled": False,
         "updated_at": now,
         "last_verified_at": "",
-        "research": {
-            "idea": idea_text,
-            "why_effective": "跨市场资金会沿 AI 硬件产业链寻找 A股映射，因子必须同时满足海外景气变化、A股产业链暴露和盘中承接。",
-            "target_universe": "A股光模块、CPO、存储/HBM、PCB、算力链高暴露股票池。",
-            "trigger_condition": "美股 AI 硬件链 T 日收盘强势后，A股相关池 T+1 开盘不过热，并出现回踩承接或盘中放量确认。",
-            "avoid_condition": "一字涨停、明显缩量、板块内部分化、高开过热、指数宽度恶化或数据源过期。",
-            "invalidation_condition": "美股映射反转、A股板块退潮、个股跌破关键承接位或流动性不足。",
-            "proof": "等待 Signals 复现历史样本，验证 T+1/T+5/T+10/T+20、IC、分位收益、MFE/MAE 和失败样本。",
-        },
+        "draft": _normalize_draft(research),
+        "research": research,
         "development": {
             "factor_definition": {
-                "inputs": ["NVDA", "AMD", "AVGO", "SMCI", "SOX", "QQQ"],
-                "mapped_universe": ["光模块", "CPO", "存储/HBM", "PCB", "算力链"],
+                "inputs": _basket_symbols(portfolio_construction.get("us_trigger_basket")),
+                "mapped_universe": _basket_groups(portfolio_construction.get("cn_reaction_basket")),
                 "signal_layer": "US AI hardware overnight strength",
-                "factor_layer": "A-share industry-chain mapped exposure plus opening acceptance",
-                "event_layer": "cross_market_ai_hardware_mapping_confirmed",
+                "factor_layer": "A-share mapped exposure plus opening acceptance",
+                "event_layer": "idea_mapping_confirmed",
                 "trade_observation_layer": "pre-market pool / intraday alert only",
+                "idea_terms": _idea_terms(idea_text),
             },
             "czsc_layering": {
                 "signal": "atomic cross-market and intraday acceptance signals",
@@ -110,6 +112,8 @@ def create_factor_draft(
                 "trade": "manual review or paper observation; never automatic order",
             },
         },
+        "research_workflow": research_workflow,
+        "portfolio_construction": portfolio_construction,
         "reproducibility": _default_reproducibility(now),
         "lifecycle": {
             "state": "specified",
@@ -137,6 +141,8 @@ def create_factor_draft(
     }
     ledger = _ledger_doc(doc, stage="research_development", status="FINISHED", metrics={}, artifacts={
         "factor_definition": doc["development"]["factor_definition"],
+        "research_workflow": doc["research_workflow"],
+        "portfolio_construction": doc["portfolio_construction"],
         "reproducibility": doc["reproducibility"],
     })
     if persist and db is not None:
@@ -148,22 +154,49 @@ def create_factor_draft(
 def run_factor_validation(
     *,
     factor_id: str = DEFAULT_FACTOR_ID,
+    idea: str = "",
     observations: Sequence[Mapping[str, Any]] | None = None,
     db: Any = None,
     persist: bool = True,
+    demo_mode: bool = True,
 ) -> dict[str, Any]:
     """Run single-factor validation from structured observations."""
     now = naive_market_now("A")
     db = db if db is not None else _get_db_or_none()
-    factor_id = _safe_factor_id(factor_id or DEFAULT_FACTOR_ID)
-    draft = _latest_factor_doc(db, factor_id) or create_factor_draft(
-        factor_id=factor_id,
-        db=db,
-        persist=persist,
-    )
-    rows = list(observations or _load_validation_samples(db, factor_id))
+    factor_id = _safe_factor_id(factor_id or idea or DEFAULT_FACTOR_ID)
+    idea_text = idea.strip()
+    existing_draft = _latest_factor_doc(db, factor_id)
+    if idea_text:
+        draft = create_factor_draft(
+            idea=idea_text,
+            factor_id=factor_id,
+            db=db,
+            persist=persist,
+        )
+        if existing_draft:
+            draft = {
+                **_as_dict(existing_draft),
+                **_as_dict(draft),
+                "approval_status": existing_draft.get("approval_status") or draft.get("approval_status"),
+                "live_enabled": bool(existing_draft.get("live_enabled")),
+            }
+    else:
+        draft = existing_draft or create_factor_draft(
+            factor_id=factor_id,
+            db=db,
+            persist=persist,
+        )
+    sample_source = "observations" if observations is not None else "ai_factor_validation_samples"
+    rows = list(observations) if observations is not None else _load_validation_samples(db, factor_id)
+    if not rows and demo_mode:
+        rows = _demo_validation_samples(
+            factor_id,
+            {**_as_dict(draft), "hypothesis": idea_text or draft.get("hypothesis") or draft.get("title")},
+        )
+        sample_source = "demo"
     valid_rows, rejected_rows = _enforce_repro_boundary(rows)
     metrics = _compute_single_factor_metrics(valid_rows)
+    validation_artifact = _validation_artifact(metrics, valid_rows, rejected_rows)
     validation_status = "validated" if metrics.get("verified") else "not_enough_samples"
     experiment_id = _experiment_id(factor_id, "validation", str(len(rows)))
     recorder_id = _recorder_id(experiment_id, "alphalens")
@@ -181,16 +214,20 @@ def run_factor_validation(
         "validation": {
             "status": validation_status,
             "verified": bool(metrics.get("verified")),
+            "mode": "demo" if sample_source == "demo" else "observed",
+            "sample_source": sample_source,
             "sample_count": int(metrics.get("sample_count") or 0),
             "rejected_sample_count": len(rejected_rows),
             "rejected_reason": "future_leak_boundary" if rejected_rows else "",
+            "rejected_future_leak": validation_artifact["rejected_future_leak"],
+            "artifact": validation_artifact,
             "engine_refs": [
                 "signals.core.backtest.SignalJournal",
                 "signals.core.backtest.ForwardEvaluator",
                 "signals.core.backtest.BacktestReport",
             ],
         },
-        "failure_samples": _failure_samples(valid_rows),
+        "failure_samples": validation_artifact["failure_samples"],
         "watchlist_symbols": _watchlist_from_rows(valid_rows),
         "feedback": _feedback(metrics, len(rejected_rows)),
         "reproducibility": {
@@ -200,6 +237,7 @@ def run_factor_validation(
         },
         "paper_account": {
             **_as_dict(draft.get("paper_account")),
+            **validation_artifact["paper_account"],
             "enabled": bool(metrics.get("verified")),
             "mode": "paper_observation",
             "no_auto_order": True,
@@ -211,6 +249,7 @@ def run_factor_validation(
     ledger = _ledger_doc(report, stage="feedback_validation", status="FINISHED", metrics=metrics, artifacts={
         "validation_report": {
             "metrics": metrics,
+            "artifact": validation_artifact,
             "failure_samples": report["failure_samples"],
             "feedback": report["feedback"],
         },
@@ -231,6 +270,7 @@ def publish_factor(
 ) -> dict[str, Any]:
     """Publish a validated factor into the strategy snapshot gate."""
     db = db if db is not None else _get_db_or_none()
+    factor_id = _safe_factor_id(factor_id or DEFAULT_FACTOR_ID)
     factor = _latest_factor_doc(db, factor_id)
     metrics = _as_dict(factor.get("metrics") if factor else {})
     if not factor or not metrics.get("verified") or int(metrics.get("sample_count") or 0) <= 0:
@@ -373,13 +413,14 @@ def _normalize_factor_doc(doc: Mapping[str, Any]) -> dict[str, Any]:
     title = str(doc.get("title") or doc.get("name") or factor_id).strip()
     if not factor_id and not title:
         return {}
+    idea_text = str(doc.get("hypothesis") or doc.get("idea") or title or factor_id)
     metrics = _as_dict(doc.get("metrics") or doc.get("validation") or doc.get("verification"))
     draft = _as_dict(doc.get("draft") or doc.get("research") or doc.get("factor_draft") or doc.get("definition"))
     return {
         "factor_id": factor_id or title,
         "version": str(doc.get("version") or doc.get("factor_version") or "v1"),
         "title": title,
-        "hypothesis": str(doc.get("hypothesis") or doc.get("idea") or ""),
+        "hypothesis": idea_text,
         "status": str(doc.get("status") or doc.get("publication_status") or "idea"),
         "approval_status": str(doc.get("approval_status") or ""),
         "live_enabled": bool(doc.get("live_enabled") or doc.get("enabled")),
@@ -388,6 +429,8 @@ def _normalize_factor_doc(doc: Mapping[str, Any]) -> dict[str, Any]:
         "draft": _normalize_draft(draft),
         "research": _as_dict(doc.get("research")) or _normalize_draft(draft),
         "development": _as_dict(doc.get("development")),
+        "research_workflow": _as_dict(doc.get("research_workflow")) or _research_workflow_for_idea(idea_text),
+        "portfolio_construction": _as_dict(doc.get("portfolio_construction")) or _portfolio_construction_for_idea(idea_text),
         "reproducibility": _as_dict(doc.get("reproducibility")),
         "lifecycle": _as_dict(doc.get("lifecycle")),
         "paper_account": _as_dict(doc.get("paper_account")),
@@ -416,6 +459,8 @@ def _sample_factor(now: datetime) -> dict[str, Any]:
         "last_verified_at": "",
         "draft": _normalize_draft(create_factor_draft(db=None, persist=False)["research"]),
         "development": create_factor_draft(db=None, persist=False)["development"],
+        "research_workflow": _default_research_workflow(),
+        "portfolio_construction": _default_portfolio_construction(),
         "reproducibility": _default_reproducibility(now),
         "lifecycle": {"state": "idea", "states": LIFECYCLE_STATES, "next_allowed": ["specified", "disabled"]},
         "paper_account": {"enabled": False, "mode": "observe_only", "no_auto_order": True},
@@ -442,6 +487,427 @@ def _normalize_draft(draft: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _draft_research_from_idea(idea_text: str) -> dict[str, Any]:
+    if _is_ai_hardware_idea(idea_text):
+        if _is_gb200_infra_idea(idea_text):
+            return {
+                "idea": idea_text,
+                "why_effective": "GB200/AI server 订单变化会先反映在美股硬件链，再沿散热、铜互联、PCB 和光互联映射到 A股；有效性必须由隔夜触发、A股开盘承接和组内扩散共同确认。",
+                "target_universe": "A股液冷、铜连接/高速连接器、PCB、光模块/CPO、服务器电源和算力基础设施高暴露股票池。",
+                "trigger_condition": "NVDA/AVGO/SMCI/ANET/DELL 等美股 AI server 链 T 日强势后，A股液冷/铜连接/PCB/CPO 反应池 T+1 开盘不过热，并出现回踩承接或放量扩散。",
+                "avoid_condition": "高开过热、一字涨停、单票孤立拉升、板块内部分化、指数宽度恶化、海外链反转或数据源过期。",
+                "invalidation_condition": "美股 AI server 映射反转、A股液冷/铜连接/PCB 组内退潮、个股跌破开盘承接位、失败样本集中出现高开低走。",
+                "proof": "demo 模式生成可复现验证 artifact；接入真实 observations 后复算 T+1/T+5/T+10/T+20、Rank IC、分位差、MFE/MAE 和失败样本。",
+            }
+        return {
+            "idea": idea_text,
+            "why_effective": "跨市场资金会沿 AI 硬件产业链寻找 A股映射，因子必须同时满足海外景气变化、A股产业链暴露和盘中承接。",
+            "target_universe": "A股光模块、CPO、存储/HBM、PCB、算力链高暴露股票池。",
+            "trigger_condition": "美股 AI 硬件链 T 日收盘强势后，A股相关池 T+1 开盘不过热，并出现回踩承接或盘中放量确认。",
+            "avoid_condition": "一字涨停、明显缩量、板块内部分化、高开过热、指数宽度恶化或数据源过期。",
+            "invalidation_condition": "美股映射反转、A股板块退潮、个股跌破关键承接位或流动性不足。",
+            "proof": "等待 Signals 复现历史样本，验证 T+1/T+5/T+10/T+20、IC、分位收益、MFE/MAE 和失败样本。",
+        }
+    terms = _idea_terms(idea_text)
+    theme = "、".join(terms[:3]) if terms else "该主题"
+    return {
+        "idea": idea_text,
+        "why_effective": f"将「{idea_text}」拆成可复现触发源、A股反应篮子和承接确认，观察资金是否沿 {theme} 扩散。",
+        "target_universe": f"A股 {theme} 相关股票池，并保留同产业链补涨、上游供给和下游应用候选。",
+        "trigger_condition": f"触发源在 T 日出现政策、订单、价格、海外映射或资金强度后，A股 {theme} 篮子 T+1 不高开过热，并出现量价承接。",
+        "avoid_condition": "一字涨停、缩量冲高、同组扩散失败、指数宽度恶化、流动性不足或数据源过期。",
+        "invalidation_condition": f"{theme} 主线回落、触发源反转、个股跌破承接位、分位收益转负或失败样本集中出现。",
+        "proof": "demo 模式先生成可见验证 artifact；接入真实 observations 后复算 T+1/T+5/T+10/T+20、Rank IC、分位差、MAE 和失败样本。",
+    }
+
+
+def _research_workflow_for_idea(idea_text: str) -> dict[str, Any]:
+    if _is_ai_hardware_idea(idea_text):
+        if _is_gb200_infra_idea(idea_text):
+            return {
+                "czsc_signal_event_trade": {
+                    "signals": [
+                        {
+                            "name": "us_gb200_server_chain_strength",
+                            "layer": "signal",
+                            "source": "US AI server trigger basket",
+                            "definition": "NVDA/AVGO/SMCI/ANET/DELL 相对 SOX/QQQ 的隔夜超额、上涨家数宽度和订单/新闻强度，T 日收盘后定格。",
+                        },
+                        {
+                            "name": "cn_liquid_copper_pcb_acceptance",
+                            "layer": "signal",
+                            "source": "A-share liquid/copper/PCB reaction basket",
+                            "definition": "液冷、铜连接/高速连接器、PCB、光模块/CPO 反应池 T+1 开盘不过热，回踩承接或盘中放量扩散。",
+                        },
+                        {
+                            "name": "risk_filter",
+                            "layer": "signal_not",
+                            "source": "market risk",
+                            "definition": "海外映射反转、高开低走、组内分化、指数宽度恶化或未来函数边界不通过时禁止进入事件。",
+                        },
+                    ],
+                    "event": {
+                        "operate": "LO",
+                        "signals_all": ["us_gb200_server_chain_strength", "cn_liquid_copper_pcb_acceptance"],
+                        "signals_any": ["volume_confirmation", "opening_pullback_support", "theme_breadth_expansion"],
+                        "signals_not": ["risk_filter"],
+                        "next": "event true -> paper observation only",
+                    },
+                    "trade_observation": {
+                        "position": "watch_pool_candidate",
+                        "entry": "加入盘前池/盘中提醒，不自动下单",
+                        "exit": "失效条件触发后停用或回到失败样本修正",
+                    },
+                },
+                "vnpy_lifecycle": [
+                    {"state": "created", "action": "保存 GB200 映射因子实例、触发篮子、反应池和参数", "gate": "factor_id 唯一，参数可复现"},
+                    {"state": "inited", "action": "固定 US T close -> A股 T+1 as-of 边界并加载样本", "gate": "数据长度、as-of、成本、滑点通过"},
+                    {"state": "validated", "action": "运行单因子验证", "gate": "样本数、Rank IC、分层收益、失败样本通过"},
+                    {"state": "trading_false", "action": "进入 paper factor account 模拟观察", "gate": "只记录模拟持仓、收益、回撤和暴露"},
+                    {"state": "disabled", "action": "失败样本或失效条件触发后停用", "gate": "不会污染策略页盘前池"},
+                ],
+                "quantaxis_local_simulation": {
+                    "data": "Signals 本地数据快照；demo 模式使用确定性 GB200 映射样本，不替代真实回测。",
+                    "account": "paper factor account；记录模拟持仓、收益、回撤、暴露和换手。",
+                    "portfolio": "美股 GB200/AI server 篮子只做触发源，A股液冷/铜连接/PCB/CPO 反应池才做观察组合。",
+                    "storage": "实验账本写入 ai_factor_experiment_ledger，发布门禁写入 strategy_snapshot 前。",
+                },
+            }
+        return _default_research_workflow()
+    terms = _idea_terms(idea_text)
+    theme = "、".join(terms[:2]) if terms else "idea basket"
+    return {
+        "czsc_signal_event_trade": {
+            "signals": [
+                {
+                    "name": "idea_trigger_strength",
+                    "layer": "signal",
+                    "source": "dynamic trigger basket",
+                    "definition": f"围绕「{idea_text}」提取政策、订单、价格、海外映射或新闻强度。",
+                },
+                {
+                    "name": "cn_basket_acceptance",
+                    "layer": "signal",
+                    "source": "dynamic A-share reaction basket",
+                    "definition": f"{theme} 反应篮子 T+1 开盘不过热，盘中有放量、回踩承接或组内扩散。",
+                },
+                {
+                    "name": "risk_filter",
+                    "layer": "signal_not",
+                    "source": "market risk",
+                    "definition": "高开低走、单票一字、指数宽度恶化、同组分化或未来函数边界不通过时禁止进入事件。",
+                },
+            ],
+            "event": {
+                "operate": "LO",
+                "signals_all": ["idea_trigger_strength", "cn_basket_acceptance"],
+                "signals_any": ["volume_confirmation", "opening_pullback_support", "theme_breadth_expansion"],
+                "signals_not": ["risk_filter"],
+                "next": "event true -> paper observation only",
+            },
+            "trade_observation": {
+                "position": "watch_pool_candidate",
+                "entry": "加入盘前池/盘中提醒，不自动下单",
+                "exit": "失效条件触发后停用或回到研究修正",
+            },
+        },
+        "vnpy_lifecycle": [
+            {"state": "created", "action": "保存动态因子实例和参数", "gate": "factor_id 唯一，idea/basket 可复现"},
+            {"state": "inited", "action": "加载或生成 demo 样本并计算指标", "gate": "样本、as-of、成本、滑点通过"},
+            {"state": "validated", "action": "运行单因子验证", "gate": "样本数、Rank IC、分层收益、失败样本通过"},
+            {"state": "trading_false", "action": "进入模拟观察", "gate": "只记录 paper account，不发真实委托"},
+            {"state": "disabled", "action": "停用或回到修正", "gate": "失效条件、数据漂移或人工否决"},
+        ],
+        "quantaxis_local_simulation": {
+            "data": "Signals 本地 Mongo/缓存数据快照；demo 模式使用确定性样本，不替代真实回测。",
+            "account": "paper factor account；记录模拟持仓、收益、回撤、暴露和换手。",
+            "portfolio": "触发篮子只做信号源，A股反应篮子才做观察组合。",
+            "storage": "实验账本写入 ai_factor_experiment_ledger，发布门禁写入 strategy_snapshot 前。",
+        },
+    }
+
+
+def _portfolio_construction_for_idea(idea_text: str) -> dict[str, Any]:
+    if _is_ai_hardware_idea(idea_text):
+        if _is_gb200_infra_idea(idea_text):
+            return {
+                "us_trigger_basket": [
+                    {
+                        "group": "GPU/GB200",
+                        "symbols": ["NVDA", "AMD"],
+                        "weight": 0.30,
+                        "role": "AI server 需求和估值锚。",
+                    },
+                    {
+                        "group": "网络/ASIC",
+                        "symbols": ["AVGO", "ANET"],
+                        "weight": 0.25,
+                        "role": "GB200 集群网络、交换和专用芯片景气。",
+                    },
+                    {
+                        "group": "服务器/OEM",
+                        "symbols": ["SMCI", "DELL", "HPE"],
+                        "weight": 0.25,
+                        "role": "AI server 订单、交付和散热配置变化。",
+                    },
+                    {
+                        "group": "指数校准",
+                        "symbols": ["SOX", "QQQ"],
+                        "weight": 0.20,
+                        "role": "剔除半导体/纳指 beta 后的相对强度。",
+                    },
+                ],
+                "cn_reaction_basket": [
+                    {
+                        "group": "液冷/散热",
+                        "symbols": ["concept:液冷", "concept:数据中心散热"],
+                        "weight": 0.30,
+                        "role": "GB200 功耗提升对应散热方案升级映射。",
+                    },
+                    {
+                        "group": "铜连接/高速连接器",
+                        "symbols": ["concept:铜连接", "concept:高速连接器"],
+                        "weight": 0.25,
+                        "role": "机柜内高速互联和铜缆替代/补充光互联映射。",
+                    },
+                    {
+                        "group": "PCB/服务器材料",
+                        "symbols": ["concept:PCB", "concept:AI服务器材料"],
+                        "weight": 0.25,
+                        "role": "服务器、交换机和加速卡材料侧弹性。",
+                    },
+                    {
+                        "group": "光模块/CPO",
+                        "symbols": ["concept:光模块", "concept:CPO"],
+                        "weight": 0.20,
+                        "role": "集群网络高速光互联映射。",
+                    },
+                ],
+                "mapping_rule": "美股 GB200/AI server 触发篮子先算相对强度，再映射到 A股液冷、铜连接、PCB、光模块反应池；A股必须用 T+1 开盘承接或盘中量价确认二次过滤。",
+                "signal_formula": "us_strength = 0.40*AI server等权超额 + 0.25*SOX超额 + 0.20*上涨家数宽度 + 0.15*订单/新闻强度；cn_score = 产业链暴露权重 * T+1承接确认 * 放量扩散。",
+                "rebalance": "日频；US T 日收盘定格，美股信号只允许影响 A股 T+1 及之后。",
+                "portfolio_role": "触发篮子只负责方向和强度，反应篮子才进入观察池；两者都不是自动下单组合。",
+            }
+        return _default_portfolio_construction()
+    terms = _idea_terms(idea_text)
+    while len(terms) < 4:
+        terms.append(["核心资产", "产业链上游", "产业链中游", "产业链下游"][len(terms)])
+    trigger_basket = [
+        {
+            "group": "外部催化",
+            "symbols": [f"event:{terms[0]}", "event:政策/订单/价格"],
+            "weight": 0.35,
+            "role": "捕捉 idea 的外部触发源和景气变化。",
+        },
+        {
+            "group": "市场确认",
+            "symbols": ["index:沪深300", "index:创业板指", "breadth:theme"],
+            "weight": 0.25,
+            "role": "过滤纯个股噪音，确认市场宽度和风险偏好。",
+        },
+        {
+            "group": "同类映射",
+            "symbols": [f"concept:{term}" for term in terms[1:3]],
+            "weight": 0.25,
+            "role": "观察相邻概念和产业链映射是否同步扩散。",
+        },
+        {
+            "group": "新闻/资金强度",
+            "symbols": ["signal:news_strength", "signal:money_flow"],
+            "weight": 0.15,
+            "role": "用新闻热度和资金流强度做二次确认。",
+        },
+    ]
+    cn_reaction_basket = [
+        {
+            "group": term,
+            "symbols": [f"concept:{term}", f"basket:{term}"],
+            "weight": [0.35, 0.25, 0.20, 0.20][index],
+            "role": f"观察 {term} 在 A股中的承接、扩散和失败样本。",
+        }
+        for index, term in enumerate(terms[:4])
+    ]
+    return {
+        "us_trigger_basket": trigger_basket,
+        "cn_reaction_basket": cn_reaction_basket,
+        "trigger_basket": trigger_basket,
+        "reaction_basket": cn_reaction_basket,
+        "mapping_rule": f"将「{idea_text}」先拆成触发篮子，再映射到 A股反应篮子；A股必须用 T+1 开盘承接或盘中量价确认二次过滤。",
+        "signal_formula": "idea_strength = 0.35*外部催化 + 0.25*市场确认 + 0.25*同类映射 + 0.15*新闻/资金强度；cn_score = 反应篮子权重 * T+1承接确认 * 放量确认。",
+        "rebalance": "日频；T 日触发源定格，只允许影响 A股 T+1 及之后。",
+        "portfolio_role": "触发篮子只负责方向和强度，反应篮子才进入观察池；两者都不是自动下单组合。",
+    }
+
+
+def _is_ai_hardware_idea(idea_text: str) -> bool:
+    text = idea_text.lower()
+    return any(token in text for token in ("ai 硬件", "ai硬件", "nvda", "英伟达", "cpo", "光模块", "hbm", "算力"))
+
+
+def _is_gb200_infra_idea(idea_text: str) -> bool:
+    text = idea_text.lower()
+    return any(token in text for token in ("gb200", "液冷", "铜连接", "高速连接", "pcb", "ai server", "服务器"))
+
+
+def _factor_title_from_idea(idea_text: str, factor_id: str) -> str:
+    if _is_gb200_infra_idea(idea_text):
+        return "GB200 AI服务器链 -> A股液冷/铜连接/PCB联动因子"
+    if factor_id == DEFAULT_FACTOR_ID or _is_ai_hardware_idea(idea_text):
+        return DEFAULT_FACTOR_TITLE
+    return idea_text[:48]
+
+
+def _idea_terms(idea_text: str, limit: int = 4) -> list[str]:
+    known_terms = [
+        "低空经济", "eVTOL", "无人机", "通航", "机器人", "人形机器人", "减速器", "伺服",
+        "光模块", "CPO", "存储", "HBM", "PCB", "算力", "液冷", "数据中心",
+        "券商", "银行", "保险", "地产", "煤炭", "有色", "黄金", "铜", "锂电", "固态电池",
+        "光伏", "风电", "半导体", "芯片", "消费电子", "医药", "创新药", "军工", "卫星互联网",
+    ]
+    lowered = idea_text.lower()
+    terms: list[str] = []
+    for term in known_terms:
+        if term.lower() in lowered and term not in terms:
+            terms.append(term)
+    for part in re.split(r"[\s,，、/；;:：。！？\-\+()（）]+", idea_text):
+        token = part.strip()
+        if not token or token in terms:
+            continue
+        if token in {"A股", "美股", "因子", "联动", "是否", "验证", "策略", "观察"}:
+            continue
+        if 2 <= len(token) <= 12:
+            terms.append(token)
+        if len(terms) >= limit:
+            break
+    return terms[:limit]
+
+
+def _basket_symbols(basket: Any) -> list[str]:
+    symbols: list[str] = []
+    for item in _as_list(basket):
+        raw_symbols = item.get("symbols")
+        if isinstance(raw_symbols, list):
+            symbols.extend(str(symbol) for symbol in raw_symbols if symbol)
+    return _unique_strings(symbols)
+
+
+def _basket_groups(basket: Any) -> list[str]:
+    return _unique_strings(str(item.get("group") or "") for item in _as_list(basket))
+
+
+def _default_research_workflow() -> dict[str, Any]:
+    return {
+        "czsc_signal_event_trade": {
+            "signals": [
+                {
+                    "name": "us_ai_hardware_strength",
+                    "layer": "signal",
+                    "source": "US trigger basket",
+                    "definition": "NVDA/AMD/AVGO/SMCI/ANET 相对 SOX/QQQ 的隔夜强度、上涨家数宽度和新闻订单强度。",
+                },
+                {
+                    "name": "cn_opening_acceptance",
+                    "layer": "signal",
+                    "source": "A-share reaction basket",
+                    "definition": "T+1 开盘不过热，回踩承接或盘中放量确认，且概念池内部扩散不塌缩。",
+                },
+                {
+                    "name": "risk_filter",
+                    "layer": "signal_not",
+                    "source": "market risk",
+                    "definition": "一字涨停、高开低走、板块退潮、指数宽度恶化、数据源过期时禁止进入事件。",
+                },
+            ],
+            "event": {
+                "operate": "LO",
+                "signals_all": ["us_ai_hardware_strength", "cn_opening_acceptance"],
+                "signals_any": ["volume_confirmation", "opening_pullback_support"],
+                "signals_not": ["risk_filter"],
+                "next": "event true -> paper observation only",
+            },
+            "trade_observation": {
+                "position": "watch_pool_candidate",
+                "entry": "加入盘前池/盘中提醒，不自动下单",
+                "exit": "失效条件触发后停用或回到研究修正",
+            },
+        },
+        "vnpy_lifecycle": [
+            {"state": "created", "action": "保存因子实例和参数", "gate": "factor_id 唯一，参数可复现"},
+            {"state": "inited", "action": "加载历史样本并计算指标", "gate": "数据长度、as-of、成本、滑点通过"},
+            {"state": "validated", "action": "运行单因子验证", "gate": "样本数、IC、分层收益、失败样本通过"},
+            {"state": "trading_false", "action": "进入模拟观察", "gate": "只记录 paper account，不发真实委托"},
+            {"state": "disabled", "action": "停用或回到修正", "gate": "失效条件、数据漂移或人工否决"},
+        ],
+        "quantaxis_local_simulation": {
+            "data": "Signals 本地 Mongo/缓存数据快照；美股/A股日历按 as-of 固定。",
+            "account": "paper factor account；记录模拟持仓、收益、回撤、暴露和换手。",
+            "portfolio": "美股篮子只做触发源，A股反应池才做观察组合。",
+            "storage": "实验账本写入 ai_factor_experiment_ledger，发布门禁写入 strategy_snapshot 前。",
+        },
+    }
+
+
+def _default_portfolio_construction() -> dict[str, Any]:
+    return {
+        "us_trigger_basket": [
+            {
+                "group": "GPU/加速卡",
+                "symbols": ["NVDA", "AMD"],
+                "weight": 0.35,
+                "role": "AI 算力需求和估值锚",
+            },
+            {
+                "group": "ASIC/网络芯片",
+                "symbols": ["AVGO", "ANET"],
+                "weight": 0.25,
+                "role": "AI 集群网络与专用芯片景气",
+            },
+            {
+                "group": "服务器/OEM",
+                "symbols": ["SMCI", "DELL"],
+                "weight": 0.20,
+                "role": "AI server 订单和交付弹性",
+            },
+            {
+                "group": "指数校准",
+                "symbols": ["SOX", "QQQ"],
+                "weight": 0.20,
+                "role": "剔除半导体/纳指 beta 后的相对强度",
+            },
+        ],
+        "cn_reaction_basket": [
+            {
+                "group": "光模块/CPO",
+                "symbols": ["concept:光模块", "concept:CPO"],
+                "weight": 0.35,
+                "role": "海外 AI capex 对高速光互联的映射",
+            },
+            {
+                "group": "存储/HBM",
+                "symbols": ["concept:存储芯片", "concept:HBM"],
+                "weight": 0.25,
+                "role": "AI 服务器存储链映射",
+            },
+            {
+                "group": "PCB/高速连接",
+                "symbols": ["concept:PCB", "concept:高速连接器"],
+                "weight": 0.20,
+                "role": "服务器和交换机材料侧映射",
+            },
+            {
+                "group": "算力基础设施",
+                "symbols": ["concept:液冷", "concept:数据中心", "concept:算力租赁"],
+                "weight": 0.20,
+                "role": "A股本地算力链弹性和情绪扩散",
+            },
+        ],
+        "mapping_rule": "美股触发篮子先算相对强度，再映射到 A股产业链暴露；A股必须用 T+1 开盘承接或盘中量价确认二次过滤。",
+        "signal_formula": "us_strength = 0.45*AI硬件等权超额 + 0.25*SOX超额 + 0.20*上涨家数宽度 + 0.10*订单/新闻强度；cn_score = 产业链暴露权重 * T+1承接确认 * 放量确认。",
+        "rebalance": "日频；US T 日收盘定格，美股信号只允许影响 A股 T+1 及之后。",
+        "portfolio_role": "触发篮子只负责方向和强度，反应篮子才进入观察池；两者都不是自动下单组合。",
+    }
+
+
 def _normalize_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
     normalized = {
         "verified": bool(metrics.get("verified")),
@@ -456,6 +922,8 @@ def _normalize_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
         "ic": _float(metrics.get("ic")),
         "rank_ic": _float(metrics.get("rank_ic")),
         "long_short_return": _float(metrics.get("long_short_return")),
+        "t_plus_5": _float(metrics.get("t_plus_5") or metrics.get("avg_return_t5") or metrics.get("return_t5")),
+        "long_short_quantile_spread": _float(metrics.get("long_short_quantile_spread") or metrics.get("long_short_return")),
         "turnover": _float(metrics.get("turnover")),
         "fitness": _float(metrics.get("fitness"), 0),
         "return_unit": str(metrics.get("return_unit") or "decimal"),
@@ -526,6 +994,8 @@ def _compute_single_factor_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[st
         "fitness": _fitness(primary_returns, long_short),
         "return_unit": "decimal",
     }
+    metrics["t_plus_5"] = metrics["avg_return_t5"]
+    metrics["long_short_quantile_spread"] = metrics["long_short_return"]
     return {key: value for key, value in metrics.items() if value is not None}
 
 
@@ -659,6 +1129,187 @@ def _action(action_id: str, label: str, payload: Mapping[str, Any]) -> dict[str,
     }
 
 
+def _demo_validation_samples(factor_id: str, draft: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Deterministic demo samples for the frontend workflow.
+
+    These rows are intentionally marked as demo observations.  They exercise
+    the same validation path as real observations, including future-leak
+    rejection, but they are not a substitute for production data.
+    """
+    idea_text = str(draft.get("hypothesis") or draft.get("title") or "")
+    if _is_gb200_infra_idea(idea_text):
+        rows = [
+            ("2026-03-18", "2026-03-19", "SZ.002837", "英维克", "液冷/散热", 0.14, -0.006, -0.026, -0.018, -0.010, 0.018, -0.052, "高开后组内未扩散，午后资金回流光模块。"),
+            ("2026-03-21", "2026-03-24", "SH.688629", "华丰科技", "铜连接/高速连接器", 0.27, 0.002, -0.008, 0.004, 0.012, 0.032, -0.035, "海外触发强但 A股高开过热，T+5 未兑现。"),
+            ("2026-03-25", "2026-03-26", "SZ.002463", "沪电股份", "PCB/服务器材料", 0.41, 0.006, 0.014, 0.026, 0.031, 0.054, -0.021, ""),
+            ("2026-03-28", "2026-03-31", "SZ.300476", "胜宏科技", "PCB/服务器材料", 0.55, 0.011, 0.027, 0.039, 0.048, 0.071, -0.018, ""),
+            ("2026-04-02", "2026-04-03", "SZ.300502", "新易盛", "光模块/CPO", 0.68, 0.016, 0.041, 0.057, 0.066, 0.093, -0.015, ""),
+            ("2026-04-07", "2026-04-08", "SZ.300308", "中际旭创", "光模块/CPO", 0.82, 0.023, 0.058, 0.071, 0.086, 0.118, -0.014, ""),
+            ("2026-04-10", "2026-04-13", "SZ.300394", "天孚通信", "光模块/CPO", 0.94, 0.031, 0.076, 0.091, 0.112, 0.146, -0.010, ""),
+            ("2026-04-15", "2026-04-15", "SZ.999999", "未来函数样本", "bad", 0.99, 0.050, 0.220, 0.260, 0.300, 0.320, -0.004, "US T close 不能影响 A股 T 日。"),
+        ]
+    else:
+        terms = _idea_terms(idea_text)
+        theme = terms[0] if terms else "主题"
+        rows = [
+            ("2026-03-18", "2026-03-19", "SZ.000001", f"{theme}失败样本A", theme, 0.12, -0.004, -0.018, -0.014, -0.006, 0.020, -0.050, "开盘承接不足，组内扩散失败。"),
+            ("2026-03-22", "2026-03-23", "SZ.000002", f"{theme}失败样本B", theme, 0.28, 0.000, -0.004, 0.006, 0.010, 0.028, -0.036, "触发源有效但 A股高开过热。"),
+            ("2026-03-25", "2026-03-26", "SZ.000003", f"{theme}样本C", theme, 0.43, 0.006, 0.012, 0.023, 0.028, 0.048, -0.022, ""),
+            ("2026-03-29", "2026-03-30", "SZ.000004", f"{theme}样本D", theme, 0.58, 0.011, 0.026, 0.034, 0.043, 0.063, -0.018, ""),
+            ("2026-04-02", "2026-04-03", "SZ.000005", f"{theme}样本E", theme, 0.76, 0.019, 0.044, 0.055, 0.069, 0.087, -0.014, ""),
+            ("2026-04-08", "2026-04-09", "SZ.000006", f"{theme}样本F", theme, 0.91, 0.027, 0.066, 0.082, 0.104, 0.133, -0.012, ""),
+            ("2026-04-12", "2026-04-12", "SZ.999999", "未来函数样本", "bad", 0.99, 0.050, 0.200, 0.250, 0.300, 0.310, -0.004, "T 日触发源不能影响 T 日 A股。"),
+        ]
+    return [
+        {
+            "factor_id": factor_id,
+            "us_signal_date": us_date,
+            "cn_trade_date": cn_date,
+            "symbol": symbol,
+            "name": name,
+            "group": group,
+            "factor_value": factor_value,
+            "return_t1": return_t1,
+            "return_t5": return_t5,
+            "return_t10": return_t10,
+            "return_t20": return_t20,
+            "mfe": mfe,
+            "mae": mae,
+            "failure_reason": reason,
+            "sample_mode": "demo",
+        }
+        for us_date, cn_date, symbol, name, group, factor_value, return_t1, return_t5,
+        return_t10, return_t20, mfe, mae, reason in rows
+    ]
+
+
+def _validation_artifact(
+    metrics: Mapping[str, Any],
+    valid_rows: Sequence[Mapping[str, Any]],
+    rejected_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    failure_samples = _failure_samples(valid_rows)
+    rejected_future_leak = [_sample_preview(row) for row in rejected_rows[:8]]
+    for sample in rejected_future_leak:
+        sample["reason"] = "rejected_future_leak_boundary"
+    return {
+        "metrics": dict(metrics),
+        "sample_count": int(metrics.get("sample_count") or 0),
+        "win_rate": metrics.get("win_rate"),
+        "T+5": metrics.get("avg_return_t5"),
+        "t_plus_5": metrics.get("t_plus_5") or metrics.get("avg_return_t5"),
+        "rank_ic": metrics.get("rank_ic"),
+        "long_short_quantile_spread": metrics.get("long_short_quantile_spread") or metrics.get("long_short_return"),
+        "mae": metrics.get("mae"),
+        "sample_preview": [_sample_preview(row) for row in valid_rows[:8]],
+        "failure_samples": failure_samples,
+        "rejected_future_leak": {
+            "count": len(rejected_rows),
+            "samples": rejected_future_leak,
+            "boundary": REPRO_BOUNDARY,
+        },
+        "paper_account": _paper_account_from_rows(valid_rows, metrics),
+    }
+
+
+def _sample_preview(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "us_signal_date": str(row.get("us_signal_date") or row.get("us_as_of") or ""),
+        "cn_trade_date": str(row.get("cn_trade_date") or row.get("trade_date") or ""),
+        "symbol": str(row.get("symbol") or ""),
+        "name": str(row.get("name") or row.get("symbol") or ""),
+        "group": str(row.get("group") or row.get("industry") or row.get("concept") or ""),
+        "factor_value": _round(_row_float(row, "factor_value", "score", "signal_strength"), 4),
+        "return_t5": _round(_row_float(row, "return_t5", "forward_return_t5"), 4),
+        "sample_mode": str(row.get("sample_mode") or ""),
+        "reason": str(row.get("failure_reason") or row.get("reason") or ""),
+    }
+
+
+def _paper_account_from_rows(rows: Sequence[Mapping[str, Any]], metrics: Mapping[str, Any]) -> dict[str, Any]:
+    if not metrics.get("verified"):
+        return {
+            "enabled": False,
+            "mode": "observe_only",
+            "no_auto_order": True,
+            "equity_curve": [],
+            "positions": [],
+            "trades": [],
+        }
+    starting_cash = 1_000_000.0
+    equity = starting_cash
+    peak = starting_cash
+    max_drawdown = 0.0
+    equity_curve: list[dict[str, Any]] = []
+    trades: list[dict[str, Any]] = []
+    weighted_exposures: list[float] = []
+    exposure_by_group: dict[str, float] = {}
+    sorted_rows = sorted(
+        rows,
+        key=lambda row: str(row.get("cn_trade_date") or row.get("trade_date") or row.get("date") or ""),
+    )
+    for row in sorted_rows:
+        factor_value = _row_float(row, "factor_value", "score", "signal_strength") or 0.0
+        return_t5 = _row_float(row, "return_t5", "forward_return_t5") or 0.0
+        target_weight = min(0.16, max(0.04, factor_value * 0.14))
+        pnl = equity * target_weight * return_t5
+        equity += pnl
+        peak = max(peak, equity)
+        drawdown = (equity / peak - 1.0) if peak else 0.0
+        max_drawdown = min(max_drawdown, drawdown)
+        weighted_exposures.append(target_weight)
+        trade_date = str(row.get("cn_trade_date") or row.get("trade_date") or row.get("date") or "")
+        group = str(row.get("group") or row.get("industry") or row.get("concept") or "ungrouped")
+        exposure_by_group[group] = exposure_by_group.get(group, 0.0) + target_weight
+        equity_curve.append({
+            "date": trade_date,
+            "equity": _round(equity, 2),
+            "drawdown": _round(drawdown, 4),
+            "paper_pnl": _round(pnl, 2),
+        })
+        trades.append({
+            "date": trade_date,
+            "symbol": str(row.get("symbol") or ""),
+            "name": str(row.get("name") or row.get("symbol") or ""),
+            "group": group,
+            "target_weight": _round(target_weight, 4),
+            "return_t5": _round(return_t5, 4),
+            "paper_pnl": _round(pnl, 2),
+            "action": "observe",
+        })
+    positions = [
+        {
+            "symbol": item.get("symbol"),
+            "name": item.get("name"),
+            "group": item.get("group"),
+            "target_weight": _round(min(0.16, max(0.04, _float(item.get("score"), 0) / 100 * 0.14)), 4),
+            "return_t5": item.get("return_t5"),
+        }
+        for item in _watchlist_from_rows(rows, limit=6)
+    ]
+    return {
+        "enabled": True,
+        "mode": "paper_observation",
+        "no_auto_order": True,
+        "starting_cash": _round(starting_cash, 2),
+        "ending_equity": _round(equity, 2),
+        "total_return": _round(equity / starting_cash - 1.0, 4),
+        "max_drawdown": _round(max_drawdown, 4),
+        "gross_exposure": _avg(weighted_exposures),
+        "exposure": {
+            "gross": _avg(weighted_exposures),
+            "net": _avg(weighted_exposures),
+            "by_group": {key: _round(value, 4) for key, value in exposure_by_group.items()},
+        },
+        "turnover": _round(metrics.get("turnover"), 4),
+        "equity_curve": equity_curve,
+        "curve": equity_curve,
+        "positions": positions,
+        "holdings": positions,
+        "trades": trades[:12],
+    }
+
+
 def _default_reproducibility(now: datetime) -> dict[str, Any]:
     return {
         "calendar": "A-share trading calendar",
@@ -760,6 +1411,15 @@ def _string_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value if item is not None]
     return []
+
+
+def _unique_strings(values: Any) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def _float(value: Any, default: Any = None) -> Any:

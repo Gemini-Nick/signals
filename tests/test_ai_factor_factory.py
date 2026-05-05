@@ -167,12 +167,60 @@ def test_factor_draft_writes_qlib_style_ledger_without_fake_metrics():
     assert draft["ledger"]["experiment_id"]
     assert draft["ledger"]["recorder_id"]
     assert draft["ledger"]["tags"]["qlib_recorder_style"] is True
+    assert draft["portfolio_construction"]["us_trigger_basket"][0]["symbols"] == ["NVDA", "AMD"]
+    assert draft["portfolio_construction"]["cn_reaction_basket"][0]["group"] == "光模块/CPO"
+    assert "T+1" in draft["portfolio_construction"]["mapping_rule"]
+    workflow = draft["research_workflow"]
+    assert workflow["czsc_signal_event_trade"]["event"]["signals_all"] == [
+        "us_ai_hardware_strength",
+        "cn_opening_acceptance",
+    ]
+    assert workflow["vnpy_lifecycle"][1]["state"] == "inited"
+    assert "paper factor account" in workflow["quantaxis_local_simulation"]["account"]
 
     factory = build_ai_factor_factory(db=db, include_sample=False)
 
     assert factory["summary"]["requires_validation"] == 1
     assert factory["summary"]["live_enabled"] == 0
     assert factory["data_lineage"]["no_auto_order"] is True
+
+
+def test_dynamic_factor_draft_and_demo_validation_artifact_without_observations():
+    from signals.strategy.ai_factor_factory import create_factor_draft, run_factor_validation
+
+    db = _Db()
+    draft = create_factor_draft(
+        idea="低空经济政策催化后，A股 eVTOL 和无人机是否扩散",
+        db=db,
+    )
+
+    assert draft["title"].startswith("低空经济")
+    assert "低空经济" in draft["research"]["target_universe"]
+    assert draft["portfolio_construction"]["cn_reaction_basket"][0]["group"] == "低空经济"
+    assert "event:低空经济" in draft["portfolio_construction"]["us_trigger_basket"][0]["symbols"]
+    assert draft["development"]["factor_definition"]["mapped_universe"][0] == "低空经济"
+
+    result = run_factor_validation(
+        factor_id=draft["factor_id"],
+        db=db,
+        demo_mode=True,
+    )
+    artifact = result["validation"]["artifact"]
+
+    assert result["status"] == "validated"
+    assert result["validation"]["mode"] == "demo"
+    assert artifact["sample_count"] > 0
+    assert artifact["win_rate"] > 0
+    assert artifact["T+5"] > 0
+    assert artifact["rank_ic"] > 0.9
+    assert artifact["long_short_quantile_spread"] > 0
+    assert artifact["mae"] < 0
+    assert artifact["failure_samples"]
+    assert artifact["rejected_future_leak"]["count"] == 1
+    assert artifact["rejected_future_leak"]["samples"][0]["reason"] == "rejected_future_leak_boundary"
+    assert result["paper_account"]["equity_curve"]
+    assert result["paper_account"]["positions"]
+    assert result["paper_account"]["exposure"]["gross"] > 0
 
 
 def test_single_factor_validation_computes_alphalens_metrics_and_rejects_future_leak():
@@ -253,18 +301,22 @@ def test_strategy_ai_factor_factory_api_smoke():
 
     draft = client.post(
         "/api/strategy/ai-factor-factory/draft",
-        json={"persist": False, "idea": "美股 AI 硬件到 A股 CPO 联动"},
+        json={"persist": False, "idea": "低空经济政策催化后，A股 eVTOL 和无人机是否扩散"},
     )
     assert draft.status_code == 200
     assert draft.json()["metrics"] == {}
+    assert draft.json()["portfolio_construction"]["cn_reaction_basket"][0]["group"] == "低空经济"
 
     validation = client.post(
         "/api/strategy/ai-factor-factory/validate",
         json={
             "persist": False,
-            "factor_id": "us_ai_hardware_to_cn_optical_cpo_memory_v1",
-            "observations": _samples(),
+            "idea": "低空经济政策催化后，A股 eVTOL 和无人机是否扩散",
+            "demo_mode": True,
         },
     )
     assert validation.status_code == 200
-    assert validation.json()["metrics"]["sample_count"] == 5
+    body = validation.json()
+    assert body["validation"]["mode"] == "demo"
+    assert body["metrics"]["sample_count"] > 0
+    assert body["validation"]["artifact"]["paper_account"]["positions"]

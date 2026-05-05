@@ -46,10 +46,15 @@ async def ai_factor_factory_validate(
     observations = payload.get("observations")
     if not isinstance(observations, list):
         observations = None
+    demo_mode = _payload_bool(payload.get("demo_mode"), default=observations is None)
+    if str(payload.get("mode") or "").lower() == "demo":
+        demo_mode = True
     return run_factor_validation(
         factor_id=str(payload.get("factor_id") or ""),
+        idea=str(payload.get("idea") or payload.get("hypothesis") or ""),
         observations=observations,
         persist=bool(payload.get("persist", True)),
+        demo_mode=demo_mode,
     )
 
 
@@ -72,3 +77,18 @@ async def ai_factor_factory_disable(
         factor_id=str(payload.get("factor_id") or ""),
         reason=str(payload.get("reason") or ""),
     )
+
+
+def _payload_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "demo"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
