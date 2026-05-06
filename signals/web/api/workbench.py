@@ -136,22 +136,116 @@ for _item in MINGDAO_MACRO_WATCHLIST:
     INDEX_NAME_ALIASES.setdefault(_symbol.upper(), (_name, _symbol))
 
 _SHELL_CACHE_TTL_SECONDS = 120.0
-_SHELL_CACHE_LOCK = threading.Lock()
-_SHELL_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None, "refreshed_at": 0.0}
+_SHELL_CACHE_LOCK = threading.RLock()
+_SHELL_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None, "refreshed_at": 0.0, "quote_watermark": ""}
+_SHELL_QUOTE_REFRESH_GROUPS = ("indices", "watchlist", "buy_candidates", "sell_warnings")
 
 
 def _invalidate_shell_cache() -> None:
     with _SHELL_CACHE_LOCK:
-        _SHELL_CACHE.update({"expires_at": 0.0, "payload": None, "refreshed_at": 0.0})
+        _SHELL_CACHE.update({"expires_at": 0.0, "payload": None, "refreshed_at": 0.0, "quote_watermark": ""})
 
 
-def _shell_cache_usable(payload: Any, engine: Any) -> bool:
+def _quote_snapshot_watermark() -> str:
+    try:
+        doc = _mongo_db()["quote_snapshots"].find_one(
+            {"snapshot_at": {"$ne": None}},
+            {"_id": 0, "snapshot_at": 1},
+            sort=[("snapshot_at", -1)],
+        ) or {}
+    except Exception:
+        return ""
+    value = doc.get("snapshot_at")
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value or "")
+
+
+def _shell_cache_usable(payload: Any, engine: Any, quote_watermark: Optional[str] = None) -> bool:
     if not isinstance(payload, dict):
         return False
     session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
     if session and not session.get("ready") and engine.is_ready():
         return False
     return True
+
+
+def _shell_cache_ttl_seconds(payload: dict[str, Any]) -> float:
+    session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
+    has_read_model = any(
+        payload.get(key)
+        for key in (
+            "watchlist_groups",
+            "buy_candidates",
+            "sell_warnings",
+            "cluster_summary",
+            "daily_brief",
+            "strategy_kpis",
+        )
+    )
+    if session.get("ready") or has_read_model:
+        return _SHELL_CACHE_TTL_SECONDS
+    return 2.0
+
+
+def _shell_row_quote_symbol(row: dict[str, Any]) -> str:
+    for key in ("target_symbol", "symbol", "raw_code", "code"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _refresh_shell_row_quote_overlay(row: Any, overlay_cache: dict[str, dict[str, Any]]) -> Any:
+    if not isinstance(row, dict):
+        return row
+    symbol = _shell_row_quote_symbol(row)
+    if not symbol:
+        return row
+    kind = str(row.get("target_kind") or row.get("kind") or "").strip().lower()
+    if kind and kind not in {"stock", "index"}:
+        return row
+    if symbol not in overlay_cache:
+        overlay_cache[symbol] = _quote_overlay_for_symbol(symbol)
+    return _apply_quote_overlay(row, symbol, overlay_cache[symbol])
+
+
+def _refresh_shell_payload_quote_overlays(payload: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(payload)
+    overlay_cache: dict[str, dict[str, Any]] = {}
+    for group in _SHELL_QUOTE_REFRESH_GROUPS:
+        rows = updated.get(group)
+        if isinstance(rows, list):
+            updated[group] = [_refresh_shell_row_quote_overlay(row, overlay_cache) for row in rows]
+
+    groups = updated.get("watchlist_groups")
+    if isinstance(groups, dict):
+        refreshed_groups: dict[str, Any] = {}
+        for group_key, rows in groups.items():
+            if isinstance(rows, list):
+                refreshed_groups[group_key] = [_refresh_shell_row_quote_overlay(row, overlay_cache) for row in rows]
+            else:
+                refreshed_groups[group_key] = rows
+        updated["watchlist_groups"] = refreshed_groups
+    return updated
+
+
+def _payload_from_shell_cache(cached_payload: dict[str, Any], status: str, now: float, quote_watermark: str) -> dict[str, Any]:
+    payload = dict(cached_payload)
+    cache_quote_watermark = str(_SHELL_CACHE.get("quote_watermark") or "")
+    cache_status = status
+    if quote_watermark != cache_quote_watermark:
+        payload = _refresh_shell_payload_quote_overlays(payload)
+        cache_status = f"{status}_quote_overlay"
+        with _SHELL_CACHE_LOCK:
+            _SHELL_CACHE.update({"payload": dict(payload), "quote_watermark": quote_watermark})
+    payload["cache"] = {
+        "status": cache_status,
+        "age_seconds": round(now - float(_SHELL_CACHE.get("refreshed_at") or now), 2),
+        "ttl_seconds": _SHELL_CACHE_TTL_SECONDS,
+        "quote_watermark": quote_watermark,
+    }
+    return payload
 _CHART_LOAD_LOCK = threading.Lock()
 _CHART_LOAD_JOBS: dict[str, dict[str, Any]] = {}
 _CHART_LOAD_JOB_TTL_SECONDS = 120.0
@@ -1113,7 +1207,30 @@ def _compute_day_change_pct(df: pd.DataFrame) -> Optional[float]:
     return round((latest - previous) / previous * 100, 2)
 
 
-def _intraday_day_change_from_df(df: pd.DataFrame) -> tuple[Optional[float], Optional[float], str]:
+def _previous_close_from_daily_df(df: pd.DataFrame, latest_ts: Any) -> Optional[float]:
+    if df is None or df.empty or "close" not in df.columns:
+        return None
+    try:
+        latest_date = pd.to_datetime(latest_ts).date()
+        working = df.sort_index().copy()
+        parsed_index = pd.to_datetime(working.index, errors="coerce")
+        prior = working[parsed_index.date < latest_date]
+        if prior.empty and len(working) > 1:
+            prior = working.iloc[:-1]
+        closes = pd.to_numeric(prior["close"], errors="coerce").dropna()
+    except Exception:
+        return None
+    if closes.empty:
+        return None
+    previous = float(closes.iloc[-1])
+    return previous if previous > 0 else None
+
+
+def _intraday_day_change_from_df(
+    df: pd.DataFrame,
+    *,
+    previous_close: Optional[float] = None,
+) -> tuple[Optional[float], Optional[float], str]:
     if df is None or df.empty or "close" not in df.columns:
         return None, None, ""
     working = df.sort_index().copy()
@@ -1121,14 +1238,23 @@ def _intraday_day_change_from_df(df: pd.DataFrame) -> tuple[Optional[float], Opt
         latest_ts = pd.to_datetime(working.index.max())
     except Exception:
         return None, None, ""
-    same_day = working[pd.to_datetime(working.index, errors="coerce").date == latest_ts.date()]
+    try:
+        parsed_index = pd.to_datetime(working.index, errors="coerce")
+        valid_times = [ts.time() for ts in parsed_index if not pd.isna(ts)]
+        if not valid_times or all(item.hour == 0 and item.minute == 0 and item.second == 0 for item in valid_times):
+            return None, None, latest_ts.date().isoformat()
+    except Exception:
+        return None, None, latest_ts.date().isoformat()
+    same_day = working[parsed_index.date == latest_ts.date()]
     if same_day.empty:
         same_day = working
     closes = pd.to_numeric(same_day["close"], errors="coerce").dropna()
     if closes.empty:
         return None, None, latest_ts.date().isoformat()
     latest = float(closes.iloc[-1])
-    if "open" in same_day.columns:
+    if previous_close is not None and previous_close > 0:
+        baseline = previous_close
+    elif "open" in same_day.columns:
         opens = pd.to_numeric(same_day["open"], errors="coerce").dropna()
         baseline = float(opens.iloc[0]) if not opens.empty else None
     else:
@@ -1175,7 +1301,18 @@ def _shortest_realtime_day_change(kind: str, symbol: str) -> dict[str, Any]:
                 return {}
         except Exception:
             continue
-        value, latest_price, as_of = _intraday_day_change_from_df(df)
+        latest_ts = _df_latest_timestamp(df)
+        previous_close: Optional[float] = None
+        try:
+            if latest_ts is not None and kind == "index":
+                daily_df, _daily_source = _index_df(target, "daily")
+                previous_close = _previous_close_from_daily_df(daily_df, latest_ts)
+            elif latest_ts is not None and kind == "stock":
+                daily_df, _daily_source = _stock_df(target, "daily")
+                previous_close = _previous_close_from_daily_df(daily_df, latest_ts)
+        except Exception:
+            previous_close = None
+        value, latest_price, as_of = _intraday_day_change_from_df(df, previous_close=previous_close)
         if value is None:
             continue
         return {
@@ -1595,13 +1732,26 @@ def _latest_daily_trading_values(symbol: str, chart: Optional[dict[str, Any]] = 
     }
 
 
-def _apply_quote_overlay(row: dict[str, Any], symbol: str) -> dict[str, Any]:
-    overlay = _quote_overlay_for_symbol(symbol)
+def _apply_quote_overlay(row: dict[str, Any], symbol: str, overlay: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    overlay = overlay if isinstance(overlay, dict) else _quote_overlay_for_symbol(symbol)
     updated = dict(row)
+    quote_change = _float(overlay.get("day_change_pct"))
+    if overlay.get("day_change_mode") == "quote_intraday" and overlay.get("quote_status") in {"realtime", "delayed"} and quote_change is not None:
+        updated.update(overlay)
+        updated.update({
+            "day_change_pct": quote_change,
+            "daily_change_pct": quote_change,
+            "today_change_pct": quote_change,
+            "gain_pct": quote_change,
+            "day_change_source": overlay.get("day_change_source") or "quote_snapshots",
+            "day_change_as_of": overlay.get("day_change_as_of") or overlay.get("quote_as_of") or updated.get("day_change_as_of"),
+            "day_change_freq": "",
+        })
+        return updated
     if _has_minute_day_change(updated):
         quote_only = {
             key: value for key, value in overlay.items()
-            if key not in {"latest_price", "realtime_price", "day_change_pct", "daily_change_pct", "today_change_pct", "gain_pct", "day_change_source", "day_change_mode", "day_change_as_of"}
+            if key not in {"latest_price", "realtime_price", "day_change_pct", "daily_change_pct", "today_change_pct", "gain_pct", "day_change_source", "day_change_mode", "day_change_as_of", "day_change_freq"}
         }
         updated.update(quote_only)
         return updated
@@ -1617,10 +1767,57 @@ def _apply_quote_overlay(row: dict[str, Any], symbol: str) -> dict[str, Any]:
     return updated
 
 
-def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) -> dict[str, Any]:
+def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]], *, lightweight: bool = False) -> dict[str, Any]:
     symbol = str(row.get("symbol") or row.get("code") or row.get("label") or "").strip()
     normalized, raw_code = _normalize_stock_symbol(symbol)
     normalized = normalized or symbol
+    metadata = dict(row.get("metadata") or {}) if isinstance(row.get("metadata"), dict) else {}
+    latest_signal = _text(row.get("latest_signal") or row.get("signal") or row.get("reason") or row.get("direction"))
+    if lightweight:
+        day_change_pct = _first_numeric(
+            row.get("day_change_pct"),
+            row.get("today_change_pct"),
+            row.get("daily_change_pct"),
+            row.get("gain_pct"),
+            row.get("change_pct"),
+            metadata.get("change_pct"),
+        )
+        latest_price = _first_numeric(
+            row.get("latest_price"),
+            row.get("price"),
+            row.get("close"),
+            metadata.get("price"),
+            metadata.get("close"),
+        )
+        range_returns = row.get("range_returns") if isinstance(row.get("range_returns"), dict) else {}
+        enriched = dict(row)
+        enriched.update({
+            "kind": "stock",
+            "label": normalized,
+            "symbol": normalized,
+            "code": normalized,
+            "raw_code": raw_code or normalized.split(".")[-1],
+            "name": _stock_name(normalized, row),
+            "latest_price": latest_price,
+            "day_change_pct": day_change_pct,
+            "daily_change_pct": day_change_pct,
+            "today_change_pct": day_change_pct,
+            "gain_pct": day_change_pct if day_change_pct is not None else row.get("gain_pct"),
+            "day_change_source": row.get("day_change_source") or ("row_snapshot" if day_change_pct is not None else ""),
+            "day_change_mode": row.get("day_change_mode") or _a_day_change_mode(),
+            "day_change_as_of": row.get("day_change_as_of") or row.get("as_of") or row.get("event_date") or "",
+            "day_change_freq": row.get("day_change_freq") or "",
+            "latest_signal": latest_signal or "待观察",
+            "range_returns": range_returns,
+            "range_return_source": row.get("range_return_source") or ("row_snapshot" if range_returns else ""),
+            "available_freqs": UI_FREQS,
+            "target_kind": "stock",
+            "target_label": normalized,
+            "target_symbol": normalized,
+            "target_freq": DEFAULT_TERMINAL_FREQ,
+        })
+        return _apply_quote_overlay(enriched, normalized)
+
     df, source = _stock_df(normalized, "daily") if normalized else (pd.DataFrame(), "")
     day_change_mode = _a_day_change_mode()
     daily_day_change, daily_day_source, daily_as_of = _daily_close_day_change_pct(df)
@@ -1634,8 +1831,11 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         if df is not None and not df.empty and "close" in df.columns
         else None
     )
-    minute_change = _shortest_realtime_day_change("stock", normalized)
-    metadata = dict(row.get("metadata") or {}) if isinstance(row.get("metadata"), dict) else {}
+    minute_change = (
+        _shortest_realtime_day_change("stock", normalized)
+        if day_change_mode != "daily_close" or daily_day_change is None
+        else {}
+    )
     latest_price = minute_change.get("latest_price") or ((daily_close_price or cached_latest_price) if day_change_mode == "daily_close" else (
         row.get("latest_price")
         or row.get("price")
@@ -1648,7 +1848,6 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
     day_change_source = minute_change.get("day_change_source") if minute_change else (daily_day_source if day_change_mode == "daily_close" else "")
     effective_day_change_mode = minute_change.get("day_change_mode") if minute_change else day_change_mode
     day_change_as_of = minute_change.get("day_change_as_of") if minute_change else (daily_as_of if day_change_mode == "daily_close" else "")
-    latest_signal = _text(row.get("latest_signal") or row.get("signal") or row.get("reason") or row.get("direction"))
     enriched.update({
         "kind": "stock",
         "label": normalized,
@@ -1659,8 +1858,8 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "latest_price": latest_price,
         "day_change_pct": day_change_pct,
         "daily_change_pct": day_change_pct,
-        "today_change_pct": minute_change.get("today_change_pct") if minute_change else None,
-        "gain_pct": minute_change.get("gain_pct") if minute_change else row.get("gain_pct"),
+        "today_change_pct": minute_change.get("today_change_pct") if minute_change else (daily_day_change if day_change_mode == "daily_close" else None),
+        "gain_pct": minute_change.get("gain_pct") if minute_change else (daily_day_change if day_change_mode == "daily_close" else row.get("gain_pct")),
         "day_change_source": day_change_source,
         "day_change_mode": effective_day_change_mode,
         "day_change_as_of": day_change_as_of,
@@ -1974,7 +2173,11 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         if df is not None and not df.empty and "close" in df.columns
         else None
     )
-    minute_change = _shortest_realtime_day_change("index", symbol)
+    minute_change = (
+        _shortest_realtime_day_change("index", symbol)
+        if day_change_mode != "daily_close" or daily_day_change is None
+        else {}
+    )
     day_change_pct = minute_change.get("day_change_pct") if minute_change else (daily_day_change if day_change_mode == "daily_close" else None)
     day_change_source = minute_change.get("day_change_source") if minute_change else (daily_day_source if day_change_mode == "daily_close" else "")
     effective_day_change_mode = minute_change.get("day_change_mode") if minute_change else day_change_mode
@@ -1988,8 +2191,8 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "latest_price": minute_change.get("latest_price") or ((daily_close_price or cached_latest_price) if day_change_mode == "daily_close" else (row.get("latest_price") or cached_latest_price)),
         "day_change_pct": day_change_pct,
         "daily_change_pct": day_change_pct,
-        "today_change_pct": minute_change.get("today_change_pct") if minute_change else None,
-        "gain_pct": minute_change.get("gain_pct") if minute_change else row.get("gain_pct"),
+        "today_change_pct": minute_change.get("today_change_pct") if minute_change else (daily_day_change if day_change_mode == "daily_close" else None),
+        "gain_pct": minute_change.get("gain_pct") if minute_change else (daily_day_change if day_change_mode == "daily_close" else row.get("gain_pct")),
         "day_change_source": day_change_source,
         "day_change_mode": effective_day_change_mode,
         "day_change_as_of": day_change_as_of,
@@ -3692,13 +3895,14 @@ def _trend_score_for_candidate(
     symbol: str,
     *,
     daily_cache: Optional[dict[str, tuple[pd.DataFrame, str]]] = None,
+    allow_kline: bool = True,
 ) -> tuple[float, Optional[float], str]:
     explicit = _float(item.get("score") or item.get("total_score") or item.get("fused_total"))
     if explicit is not None:
         return _score_0_100(explicit, 50), _float(item.get("day_change_pct")), _text(item.get("latest_signal"))
     day_change = _float(item.get("day_change_pct") or item.get("daily_change_pct") or item.get("change_pct"))
     latest_signal = _text(item.get("latest_signal") or item.get("signal") or item.get("reason"))
-    if day_change is None and symbol:
+    if day_change is None and symbol and allow_kline:
         df, _ = _daily_df_for_candidate(symbol, daily_cache)
         day_change = _compute_day_change_pct(df)
         if not latest_signal:
@@ -3739,11 +3943,17 @@ def _scored_candidate_payload(
     heat_score: float,
     leader_rank: int = 0,
     daily_cache: Optional[dict[str, tuple[pd.DataFrame, str]]] = None,
+    lightweight: bool = False,
 ) -> Optional[dict[str, Any]]:
     symbol, raw_code = _candidate_symbol_fields(item)
     if not symbol:
         return None
-    trend_score, day_change, latest_signal = _trend_score_for_candidate(item, symbol, daily_cache=daily_cache)
+    trend_score, day_change, latest_signal = _trend_score_for_candidate(
+        item,
+        symbol,
+        daily_cache=daily_cache,
+        allow_kline=not lightweight,
+    )
     role_score = _role_score(item, leader_rank)
     confidence = _source_confidence_score(item)
     weight_score = round(max(role_score, _score_0_100(item.get("priority"), 0)), 2)
@@ -3761,7 +3971,7 @@ def _scored_candidate_payload(
     leader_tier = _candidate_leader_tier(item, leader_rank)
     chain_role = _text(item.get("relation") or item.get("node_name") or item.get("representative_type"))
     risk_flags = []
-    if not _text(item.get("bar_source")):
+    if not lightweight and not _text(item.get("bar_source")):
         df, source = _daily_df_for_candidate(symbol, daily_cache)
         if source:
             item = {**item, "bar_source": source, "bar_count": len(df)}
@@ -4306,7 +4516,7 @@ def _chain_risk_flags(row: dict[str, Any], data_truth: dict[str, Any]) -> list[s
     return flags
 
 
-def _candidate_groups_from_representatives(row: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+def _candidate_groups_from_representatives(row: dict[str, Any], *, lightweight: bool = False) -> dict[str, list[dict[str, Any]]]:
     groups: dict[str, list[dict[str, Any]]] = {
         "leaders": [],
         "weighted": [],
@@ -4332,7 +4542,7 @@ def _candidate_groups_from_representatives(row: dict[str, Any]) -> dict[str, lis
             "layer": row.get("layer"),
             "stage": row.get("stage"),
         }
-        payload = _scored_candidate_payload(item, heat_score=heat_score) or item
+        payload = _scored_candidate_payload(item, heat_score=heat_score, lightweight=lightweight) or item
         if rep.get("representative_type") == "core":
             groups["leaders"].append(payload)
             groups["weighted"].append(payload)
@@ -4385,7 +4595,7 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         target_kind = _text(primary.get("kind")) or "industry"
         target_label = _text(primary.get("name")) or _text(doc.get("node_name") or doc.get("chain_name"))
         label = " · ".join([item for item in [_text(doc.get("chain_name")), _text(doc.get("node_name"))] if item])
-        candidate_groups = _candidate_groups_from_representatives(doc)
+        candidate_groups = _candidate_groups_from_representatives(doc, lightweight=True)
         graph = _chain_graph_doc(doc.get("chain_id"), doc.get("node_id"))
         viewpoint_context = _viewpoint_context_from_graph(graph)
         doc_trade_day = _date_text(doc.get("trade_date") or doc.get("dt") or doc.get("trade_minute"))
@@ -4519,7 +4729,7 @@ def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: 
         fallback_only = bool(reasons) and all(reason.get("reason_type") == "fallback_watch" for reason in reasons)
         if group == "focus_stocks" and (fallback_only or (item.get("signal_origin") == "fallback_watch" and not has_technical)):
             continue
-        row = _enrich_stock_row(dict(item), range_columns)
+        row = _enrich_stock_row(dict(item), range_columns, lightweight=True)
         row["lane"] = "signal_lane"
         row["second_screen_role"] = "actionable_focus_stock" if group == "focus_stocks" else group
         row["focus_reasons"] = [
@@ -4578,7 +4788,7 @@ def _manual_clue_rows(range_columns: list[dict[str, Any]], limit: Optional[int] 
             "reason": "用户临时探索，不影响自动入池",
             "latest_signal": "手动线索",
             "source": "terminal_manual_clues",
-        }, range_columns)
+        }, range_columns, lightweight=True)
         row.update({
             "source_collection": "terminal_manual_clues",
             "source_tags": ["用户探索", "临时线索"],
@@ -4622,6 +4832,13 @@ def _merge_stock_rows_by_symbol(rows: list[dict[str, Any]]) -> list[dict[str, An
             seen.add(key)
         merged.append(row)
     return merged
+
+
+def _enrich_scored_stock_rows(rows: list[dict[str, Any]], range_columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        _enrich_stock_row(dict(item), range_columns, lightweight=True) if item.get("symbol") else dict(item)
+        for item in rows
+    ]
 
 
 def _focus_stock_pool_meta(focus_count: int) -> dict[str, Any]:
@@ -4753,6 +4970,14 @@ def _kline_cache_coverage() -> dict[str, Any]:
         coverage["status"] = "unavailable"
         coverage["error"] = exc.__class__.__name__
     return coverage
+
+
+def _kline_cache_coverage_shell_summary() -> dict[str, Any]:
+    return {
+        "status": "deferred",
+        "reason": "full_kline_coverage_is_expensive_for_shell_init",
+        "collections": [],
+    }
 
 
 def _build_trader_task_queue(
@@ -5104,14 +5329,14 @@ def _build_watchlist_rows(
         row = _enrich_index_row(report, range_columns)
         add(row, "index")
     for row in buy_rows:
-        enriched = _enrich_stock_row(dict(row), range_columns)
+        enriched = _enrich_stock_row(dict(row), range_columns, lightweight=True)
         add(enriched, "stock")
     for row in sell_rows:
-        enriched = _enrich_stock_row(dict(row), range_columns)
+        enriched = _enrich_stock_row(dict(row), range_columns, lightweight=True)
         add(enriched, "stock")
     for row in decision_rows:
         if row.get("symbol"):
-            enriched = _enrich_stock_row(dict(row), range_columns)
+            enriched = _enrich_stock_row(dict(row), range_columns, lightweight=True)
             add(enriched, "stock")
     for row in industry_top:
         add(_enrich_cluster_row(dict(row), "industry"), "industry")
@@ -5259,7 +5484,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         if _text(item.get("decision_stage")) == "strategy_candidate"
     ]
     sell_warnings = [
-        _enrich_stock_row(dict(item), range_columns) if isinstance(item, dict) and item.get("symbol") else dict(item)
+        _enrich_stock_row(dict(item), range_columns, lightweight=True) if isinstance(item, dict) and item.get("symbol") else dict(item)
         for item in strategy_snapshot.get("warnings", [])
         if isinstance(item, dict)
     ]
@@ -5286,10 +5511,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     clue_stocks = _terminal_stock_pool_group_rows(range_columns, "clue_stocks")
     manual_clues = _manual_clue_rows(range_columns)
     scored_raw = _merge_stock_rows_by_symbol(manual_clues + (clue_stocks or strategy_clues))
-    scored = [
-        _enrich_stock_row(dict(item), range_columns) if item.get("symbol") and not item.get("latest_price") else dict(item)
-        for item in scored_raw
-    ]
+    scored = _enrich_scored_stock_rows(scored_raw, range_columns)
     focus_stocks_meta = _focus_stock_pool_meta(len(focus_stocks))
     for rows, lane in (
         (macro_indices, "quote_lane"),
@@ -5405,7 +5627,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         },
         "watchlist": watchlist,
         "watchlist_range_columns": range_columns,
-        "kline_cache_coverage": _kline_cache_coverage(),
+        "kline_cache_coverage": _kline_cache_coverage_shell_summary(),
         "sync_lanes": sync_lanes,
         "trade_map": trade_map,
         "ai_alerts": ai_alerts,
@@ -5427,58 +5649,40 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
 
 def _build_shell_payload(engine) -> Dict[str, Any]:
     now = time.monotonic()
+    quote_watermark = _quote_snapshot_watermark()
     cached_payload = _SHELL_CACHE.get("payload")
-    if _shell_cache_usable(cached_payload, engine) and now < float(_SHELL_CACHE.get("expires_at") or 0):
-        payload = dict(cached_payload)
-        payload["cache"] = {
-            "status": "hit",
-            "age_seconds": round(now - float(_SHELL_CACHE.get("refreshed_at") or now), 2),
-            "ttl_seconds": _SHELL_CACHE_TTL_SECONDS,
-        }
-        return payload
+    if _shell_cache_usable(cached_payload, engine, quote_watermark=quote_watermark) and now < float(_SHELL_CACHE.get("expires_at") or 0):
+        return _payload_from_shell_cache(cached_payload, "hit", now, quote_watermark)
 
     acquired = _SHELL_CACHE_LOCK.acquire(blocking=False)
     if not acquired:
-        if _shell_cache_usable(cached_payload, engine):
-            payload = dict(cached_payload)
-            payload["cache"] = {
-                "status": "stale_refreshing",
-                "age_seconds": round(now - float(_SHELL_CACHE.get("refreshed_at") or now), 2),
-                "ttl_seconds": _SHELL_CACHE_TTL_SECONDS,
-            }
-            return payload
+        if _shell_cache_usable(cached_payload, engine, quote_watermark=quote_watermark):
+            return _payload_from_shell_cache(cached_payload, "stale_refreshing", now, quote_watermark)
         with _SHELL_CACHE_LOCK:
             cached_payload = _SHELL_CACHE.get("payload")
-            if _shell_cache_usable(cached_payload, engine):
-                payload = dict(cached_payload)
-                payload["cache"] = {
-                    "status": "waited_hit",
-                    "age_seconds": round(time.monotonic() - float(_SHELL_CACHE.get("refreshed_at") or time.monotonic()), 2),
-                    "ttl_seconds": _SHELL_CACHE_TTL_SECONDS,
-                }
-                return payload
+            quote_watermark = _quote_snapshot_watermark()
+            if _shell_cache_usable(cached_payload, engine, quote_watermark=quote_watermark):
+                return _payload_from_shell_cache(cached_payload, "waited_hit", time.monotonic(), quote_watermark)
 
     try:
         refreshed_now = time.monotonic()
+        quote_watermark = _quote_snapshot_watermark()
         cached_payload = _SHELL_CACHE.get("payload")
-        if _shell_cache_usable(cached_payload, engine) and refreshed_now < float(_SHELL_CACHE.get("expires_at") or 0):
-            payload = dict(cached_payload)
-            payload["cache"] = {
-                "status": "hit_after_lock",
-                "age_seconds": round(refreshed_now - float(_SHELL_CACHE.get("refreshed_at") or refreshed_now), 2),
-                "ttl_seconds": _SHELL_CACHE_TTL_SECONDS,
-            }
-            return payload
+        if _shell_cache_usable(cached_payload, engine, quote_watermark=quote_watermark) and refreshed_now < float(_SHELL_CACHE.get("expires_at") or 0):
+            return _payload_from_shell_cache(cached_payload, "hit_after_lock", refreshed_now, quote_watermark)
         payload = _build_shell_payload_uncached(engine)
+        ttl_seconds = _shell_cache_ttl_seconds(payload)
         _SHELL_CACHE.update({
             "payload": dict(payload),
             "refreshed_at": refreshed_now,
-            "expires_at": refreshed_now + (_SHELL_CACHE_TTL_SECONDS if payload.get("session", {}).get("ready") else 2.0),
+            "expires_at": refreshed_now + ttl_seconds,
+            "quote_watermark": quote_watermark,
         })
         payload["cache"] = {
             "status": "refreshed",
             "age_seconds": 0,
-            "ttl_seconds": _SHELL_CACHE_TTL_SECONDS,
+            "ttl_seconds": ttl_seconds,
+            "quote_watermark": quote_watermark,
         }
         return payload
     finally:
@@ -5776,12 +5980,14 @@ def _ensure_minute_bars(symbol: str, raw_code: str, freq: str) -> bool:
     if not code or not code.isdigit():
         return False
     try:
+        from signals.sync.modules.minute_change import recalculate_minute_change_pct
         from signals.sync.modules.stock_minute import _sync_one_minute
 
-        docs = _sync_one_minute(code, minute_freq)
+        db = _mongo_db()
+        docs = _sync_one_minute(code, minute_freq, db=db)
         if not docs:
             return False
-        db = _mongo_db()
+        docs = recalculate_minute_change_pct(db, code, docs, asset_type="stock")
         db["bars"].delete_many({"meta.symbol": code, "meta.freq": minute_freq})
         db["bars"].insert_many(docs, ordered=False)
         db["sync_log"].update_one(
@@ -6289,7 +6495,37 @@ def _summary_from_index(report: Dict[str, Any], chart: Dict[str, Any]) -> Dict[s
         "style_switch": style_switch.suggestion if style_switch else "",
     }
     symbol = str(report.get("symbol") or "")
-    summary.update(_shortest_realtime_day_change("index", symbol))
+    day_change_mode = _a_day_change_mode()
+    daily_day_change = None
+    if day_change_mode == "daily_close":
+        try:
+            daily_df, _daily_source = _index_df(symbol, "daily")
+            daily_day_change, daily_day_source, daily_as_of = _daily_close_day_change_pct(daily_df)
+            latest_daily_close = (
+                float(daily_df["close"].iloc[-1])
+                if daily_as_of == _day_change_expected_day("daily_close")
+                and daily_df is not None
+                and not daily_df.empty
+                and "close" in daily_df.columns
+                else None
+            )
+        except Exception:
+            daily_day_change, daily_day_source, daily_as_of, latest_daily_close = None, "", "", None
+        if daily_day_change is not None:
+            summary.update({
+                "day_change_pct": daily_day_change,
+                "daily_change_pct": daily_day_change,
+                "today_change_pct": daily_day_change,
+                "gain_pct": daily_day_change,
+                "day_change_source": daily_day_source,
+                "day_change_mode": day_change_mode,
+                "day_change_as_of": daily_as_of,
+                "day_change_freq": "",
+            })
+        if latest_daily_close is not None:
+            summary["latest_price"] = latest_daily_close
+    if day_change_mode != "daily_close" or daily_day_change is None:
+        summary.update(_shortest_realtime_day_change("index", symbol))
     summary = _apply_quote_overlay(summary, symbol)
     if summary.get("today_change_pct") is not None:
         summary["gain_pct"] = summary.get("today_change_pct")
@@ -6309,7 +6545,37 @@ def _summary_from_static_index(name: str, symbol: str, chart: Dict[str, Any]) ->
         "latest_signal": "",
         "key_levels": [],
     }
-    summary.update(_shortest_realtime_day_change("index", symbol))
+    day_change_mode = _a_day_change_mode()
+    daily_day_change = None
+    if day_change_mode == "daily_close":
+        try:
+            daily_df, _daily_source = _index_df(symbol, "daily")
+            daily_day_change, daily_day_source, daily_as_of = _daily_close_day_change_pct(daily_df)
+            latest_daily_close = (
+                float(daily_df["close"].iloc[-1])
+                if daily_as_of == _day_change_expected_day("daily_close")
+                and daily_df is not None
+                and not daily_df.empty
+                and "close" in daily_df.columns
+                else None
+            )
+        except Exception:
+            daily_day_change, daily_day_source, daily_as_of, latest_daily_close = None, "", "", None
+        if daily_day_change is not None:
+            summary.update({
+                "day_change_pct": daily_day_change,
+                "daily_change_pct": daily_day_change,
+                "today_change_pct": daily_day_change,
+                "gain_pct": daily_day_change,
+                "day_change_source": daily_day_source,
+                "day_change_mode": day_change_mode,
+                "day_change_as_of": daily_as_of,
+                "day_change_freq": "",
+            })
+        if latest_daily_close is not None:
+            summary["latest_price"] = latest_daily_close
+    if day_change_mode != "daily_close" or daily_day_change is None:
+        summary.update(_shortest_realtime_day_change("index", symbol))
     summary = _apply_quote_overlay(summary, symbol)
     if summary.get("today_change_pct") is not None:
         summary["gain_pct"] = summary.get("today_change_pct")
@@ -6447,8 +6713,9 @@ def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any
         "risk_reward": risk.get("risk_reward"),
         "position_pct": risk.get("position_pct"),
     }
-    minute_change = _shortest_realtime_day_change("stock", symbol)
     day_change_mode = _a_day_change_mode()
+    minute_change = {}
+    daily_day_change = None
     if day_change_mode == "daily_close":
         try:
             daily_df, _daily_source = _stock_df(symbol, "daily")
@@ -6467,12 +6734,16 @@ def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any
             summary.update({
                 "day_change_pct": daily_day_change,
                 "daily_change_pct": daily_day_change,
+                "today_change_pct": daily_day_change,
                 "day_change_source": daily_day_source,
                 "day_change_mode": day_change_mode,
                 "day_change_as_of": daily_as_of,
+                "day_change_freq": "",
             })
         if latest_daily_close is not None and not minute_change:
             summary["latest_price"] = latest_daily_close
+    if day_change_mode != "daily_close" or daily_day_change is None:
+        minute_change = _shortest_realtime_day_change("stock", symbol)
     if minute_change:
         summary.update(minute_change)
     summary.update(_latest_daily_trading_values(symbol, chart))

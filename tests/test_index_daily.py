@@ -1,0 +1,132 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from datetime import datetime
+
+from signals.sync.modules import index_daily
+
+
+class _DeleteResult:
+    def __init__(self, deleted_count: int):
+        self.deleted_count = deleted_count
+
+
+class _InsertManyResult:
+    def __init__(self, inserted_ids: list[int]):
+        self.inserted_ids = inserted_ids
+
+
+class _FakeCollection:
+    def __init__(self):
+        self.deleted_queries = []
+        self.inserted_docs = []
+        self.ordered = None
+
+    def delete_many(self, query):
+        self.deleted_queries.append(query)
+        return _DeleteResult(1)
+
+    def insert_many(self, docs, ordered=False):
+        self.inserted_docs.extend(docs)
+        self.ordered = ordered
+        return _InsertManyResult(list(range(len(docs))))
+
+
+def test_index_daily_replaces_exact_docs_without_timeseries_update():
+    dt = datetime(2026, 5, 6)
+    stale = {
+        "_id": "old-id",
+        "dt": dt,
+        "meta": {"symbol": "sh000001", "freq": "日线", "source": "akshare"},
+        "close": 3330.0,
+    }
+    latest = {
+        "_id": "new-id",
+        "dt": dt,
+        "meta": {"symbol": "sh000001", "freq": "日线", "source": "index_minute_rollup"},
+        "close": 3342.0,
+    }
+    other = {
+        "dt": dt,
+        "meta": {"symbol": "sz399006", "freq": "日线", "source": "index_minute_rollup"},
+        "close": 2142.0,
+    }
+    col = _FakeCollection()
+
+    written = index_daily._replace_exact_bar_docs(col, [stale, latest, other])
+
+    assert written == 2
+    assert col.deleted_queries == [
+        {"meta.symbol": "sh000001", "meta.freq": "日线", "dt": {"$in": [dt]}},
+        {"meta.symbol": "sz399006", "meta.freq": "日线", "dt": {"$in": [dt]}},
+    ]
+    assert col.inserted_docs == [
+        {k: v for k, v in latest.items() if k != "_id"},
+        other,
+    ]
+    assert col.ordered is False
+
+
+def test_index_daily_builds_provisional_close_from_quote_snapshot():
+    quote = {
+        "symbol": "SH.000001",
+        "code": "000001",
+        "dt": "2026-05-06",
+        "snapshot_at": datetime(2026, 5, 6, 15, 37, 37),
+        "source": "eastmoney_push2delay_ulist",
+        "freshness": "fresh",
+        "is_stale": False,
+        "open": 4135.45,
+        "high": 4166.15,
+        "low": 4129.91,
+        "close": 4160.17,
+        "prev_close": 4112.16,
+        "change": 48.01,
+        "change_pct": 1.1675,
+        "vol": 70117748000,
+        "amount": 1465903193400.0,
+    }
+
+    doc = index_daily._daily_doc_from_quote_snapshot("sh000001", "2026-05-06", quote)
+
+    assert doc is not None
+    assert doc["dt"] == datetime(2026, 5, 6)
+    assert doc["close"] == 4160.17
+    assert doc["change_pct"] == 1.1675
+    assert doc["pct_chg"] == 1.1675
+    assert doc["meta"]["source"] == "eastmoney_push2delay_ulist"
+    assert doc["meta"]["source_type"] == "direct_quote_ohlcv"
+    assert doc["meta"]["quality"] == "provisional_close"
+    assert doc["meta"]["quote_symbol"] == "SH.000001"
+
+
+def test_index_daily_rejects_stale_or_wrong_day_quote_snapshot():
+    stale = {
+        "symbol": "SH.000001",
+        "dt": "2026-05-06",
+        "freshness": "stale",
+        "open": 1,
+        "high": 1,
+        "low": 1,
+        "close": 1,
+    }
+    wrong_day = {
+        "symbol": "SH.000001",
+        "dt": "2026-04-30",
+        "freshness": "fresh",
+        "open": 1,
+        "high": 1,
+        "low": 1,
+        "close": 1,
+    }
+
+    assert index_daily._daily_doc_from_quote_snapshot("sh000001", "2026-05-06", stale) is None
+    assert index_daily._daily_doc_from_quote_snapshot("sh000001", "2026-05-06", wrong_day) is None
+
+
+def test_index_daily_quote_candidates_do_not_match_stock_code_collision():
+    candidates = index_daily._quote_candidates_for_index("sh000001")
+
+    assert "SH.000001" in candidates
+    assert "sh000001" in candidates
+    assert "000001" not in candidates

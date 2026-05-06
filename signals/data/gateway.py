@@ -114,10 +114,11 @@ def _bars_df_from_docs(docs: list[dict], source: str) -> pd.DataFrame:
     latest_meta = latest_doc.get("meta") if isinstance(latest_doc.get("meta"), dict) else {}
     df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
     df = df.dropna(subset=["dt"]).sort_values("dt").set_index("dt")
-    for col in ["open", "high", "low", "close", "vol", "amount"]:
+    numeric_cols = ["open", "high", "low", "close", "vol", "amount", "prev_close", "change_pct", "pct_chg"]
+    for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    keep = [c for c in ["open", "high", "low", "close", "vol", "amount"] if c in df.columns]
+    keep = [c for c in numeric_cols if c in df.columns]
     df = df[keep] if keep else df
     df.attrs["data_source"] = source
     if not df.empty:

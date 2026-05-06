@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 
 import akshare as ak
 import pandas as pd
-from pymongo import UpdateOne
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
@@ -25,6 +24,38 @@ logger = logging.getLogger("signals.sync.index_daily")
 
 def _pure_index_code(symbol: str) -> str:
     return str(symbol).replace("sh", "").replace("sz", "").replace("SH", "").replace("SZ", "")
+
+
+def _number(value, default: float | None = None) -> float | None:
+    if value in (None, "", "-"):
+        return default
+    parsed = pd.to_numeric(value, errors="coerce")
+    if pd.isna(parsed):
+        return default
+    return float(parsed)
+
+
+def _quote_symbol_for_index(symbol: str) -> str:
+    pure = _pure_index_code(symbol)
+    prefix = str(symbol or "")[:2].upper()
+    if prefix in {"SH", "SZ", "BJ"}:
+        return f"{prefix}.{pure}"
+    if pure.startswith(("5", "6", "9", "0")):
+        return f"SH.{pure}"
+    return f"SZ.{pure}"
+
+
+def _quote_candidates_for_index(symbol: str) -> list[str]:
+    dotted = _quote_symbol_for_index(symbol)
+    compact = dotted.replace(".", "")
+    return list(dict.fromkeys([
+        dotted,
+        compact,
+        compact.lower(),
+        symbol,
+        str(symbol).upper(),
+        str(symbol).lower(),
+    ]))
 
 
 def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict], replace_bars: bool = True) -> int:
@@ -50,6 +81,37 @@ def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict], re
     return len(index_docs)
 
 
+def _replace_exact_bar_docs(col, docs: list[dict]) -> int:
+    """Replace exact bar measurements without UpdateOne; Mongo time-series rejects non-multi updates."""
+    if not docs:
+        return 0
+
+    deduped: dict[tuple[str, str, object], dict] = {}
+    for doc in docs:
+        item = dict(doc)
+        item.pop("_id", None)
+        meta = item.get("meta") or {}
+        symbol = meta.get("symbol")
+        freq = meta.get("freq")
+        dt = item.get("dt")
+        if not symbol or not freq or dt is None:
+            continue
+        deduped[(str(symbol), str(freq), dt)] = item
+
+    prepared = list(deduped.values())
+    if not prepared:
+        return 0
+
+    grouped: dict[tuple[str, str], list[object]] = {}
+    for symbol, freq, dt in deduped:
+        grouped.setdefault((symbol, freq), []).append(dt)
+
+    for (symbol, freq), dts in grouped.items():
+        col.delete_many({"meta.symbol": symbol, "meta.freq": freq, "dt": {"$in": dts}})
+    col.insert_many(prepared, ordered=False)
+    return len(prepared)
+
+
 def _latest_daily_dt(db: Database, symbol: str) -> str:
     doc = db["index_bars"].find_one(
         {"meta.symbol": symbol, "meta.freq": {"$in": ["日线", "daily", "D", "1d"]}},
@@ -61,6 +123,19 @@ def _latest_daily_dt(db: Database, symbol: str) -> str:
         return pd.to_datetime(value).date().isoformat()
     except Exception:
         return ""
+
+
+def _previous_daily_close(db: Database, symbol: str, day: str) -> float | None:
+    try:
+        dt = datetime.fromisoformat(day)
+        doc = db["index_bars"].find_one(
+            {"meta.symbol": symbol, "meta.freq": {"$in": ["日线", "daily", "D", "1d"]}, "dt": {"$lt": dt}},
+            {"close": 1},
+            sort=[("dt", -1)],
+        ) or {}
+        return _number(doc.get("close"))
+    except Exception:
+        return None
 
 
 def _expected_trade_day() -> str:
@@ -89,11 +164,121 @@ def _minute_docs_for_day(db: Database, symbol: str, day: str) -> tuple[list[dict
     return [], ""
 
 
+def _quote_day_text(doc: dict) -> str:
+    value = doc.get("dt") or doc.get("trade_date") or doc.get("snapshot_at")
+    if hasattr(value, "date"):
+        return value.date().isoformat()
+    return str(value or "")[:10]
+
+
+def _daily_doc_from_quote_snapshot(symbol: str, expected_day: str, quote_doc: dict) -> dict | None:
+    if not quote_doc:
+        return None
+    if quote_doc.get("is_stale") or quote_doc.get("freshness") == "stale":
+        return None
+    quote_day = _quote_day_text(quote_doc)
+    if quote_day != expected_day:
+        return None
+
+    open_price = _number(quote_doc.get("open"))
+    high = _number(quote_doc.get("high"))
+    low = _number(quote_doc.get("low"))
+    close = _number(quote_doc.get("close"), _number(quote_doc.get("price")))
+    if not all(value is not None and value > 0 for value in (open_price, high, low, close)):
+        return None
+
+    change_pct = _number(quote_doc.get("change_pct"))
+    change = _number(quote_doc.get("change"))
+    prev_close = _number(quote_doc.get("prev_close"))
+    source = quote_doc.get("source") or "quote_snapshots"
+    meta = {
+        "symbol": symbol,
+        "freq": "日线",
+        "asset_type": "index",
+        "market": "A",
+        "source": source,
+        "source_type": "direct_quote_ohlcv",
+        "quality": "provisional_close",
+        "trade_date": expected_day,
+        "quote_symbol": quote_doc.get("symbol") or _quote_symbol_for_index(symbol),
+        "quote_snapshot_at": quote_doc.get("snapshot_at"),
+        "fallback_reason": "historical_daily_lagged_expected_trade_day",
+    }
+    doc = {
+        "dt": datetime.fromisoformat(expected_day),
+        "meta": meta,
+        "open": float(open_price),
+        "high": float(high),
+        "low": float(low),
+        "close": float(close),
+        "vol": int(_number(quote_doc.get("vol"), 0) or 0),
+        "amount": float(_number(quote_doc.get("amount"), 0) or 0),
+        "source": source,
+    }
+    if prev_close is not None:
+        doc["prev_close"] = float(prev_close)
+    if change is not None:
+        doc["change"] = float(change)
+    if change_pct is not None:
+        doc["change_pct"] = float(change_pct)
+        doc["pct_chg"] = float(change_pct)
+    return doc
+
+
+def _fallback_today_from_quote_snapshots(db: Database, index_codes: dict[str, str]) -> int:
+    """Patch today's index daily bar from post-close quote snapshots before minute rollup."""
+    expected_day = _expected_trade_day()
+    index_docs = []
+    bars_docs = []
+    patched = 0
+    for name, symbol in index_codes.items():
+        if _latest_daily_dt(db, symbol) == expected_day:
+            continue
+        candidates = _quote_candidates_for_index(symbol)
+        try:
+            quote_doc = db["quote_snapshots"].find_one(
+                {"symbol": {"$in": candidates}},
+                {"_id": 0},
+                sort=[("snapshot_at", -1), ("dt", -1)],
+            ) or {}
+        except Exception as exc:
+            logger.debug("  ✗ %s (%s): quote snapshot lookup failed: %s", name, symbol, exc)
+            quote_doc = {}
+        doc = _daily_doc_from_quote_snapshot(symbol, expected_day, quote_doc)
+        if not doc:
+            continue
+        index_docs.append(doc)
+        bars_docs.append(dict(doc))
+        db["sync_log"].update_one(
+            {"_id": f"index_daily:{symbol}"},
+            {"$set": {
+                "module": "index_daily",
+                "symbol": symbol,
+                "last_dt": doc["dt"],
+                "last_run": naive_market_now("A"),
+                "status": "ok",
+                "source": doc["meta"]["source"],
+                "source_type": "direct_quote_ohlcv",
+                "fallback_source": doc["meta"]["source"],
+                "fallback_reason": doc["meta"]["fallback_reason"],
+                "quality": doc["meta"]["quality"],
+            }},
+            upsert=True,
+        )
+        patched += 1
+        logger.info("  ↳ %s: 用 quote 收盘快照补 %s 指数日线 close=%.3f", name, expected_day, doc["close"])
+    if index_docs:
+        _replace_exact_bar_docs(db["index_bars"], index_docs)
+    if bars_docs:
+        _replace_exact_bar_docs(db["bars"], bars_docs)
+    return patched
+
+
 def _fallback_today_from_minute_bars(db: Database, index_codes: dict[str, str]) -> int:
     """Patch today's index daily bar from verified minute cache when daily provider lags."""
     expected_day = _expected_trade_day()
-    index_ops = []
-    bars_ops = []
+    index_docs = []
+    bars_docs = []
     patched = 0
     for name, symbol in index_codes.items():
         if _latest_daily_dt(db, symbol) == expected_day:
@@ -117,7 +302,10 @@ def _fallback_today_from_minute_bars(db: Database, index_codes: dict[str, str]) 
                 "asset_type": "index",
                 "market": "A",
                 "source": "index_minute_rollup",
+                "source_type": "derived",
+                "quality": "estimated_close",
                 "derived_from_freq": source_freq,
+                "rollup_reason": "direct_daily_and_quote_missing",
             },
             "open": float(frame["open"].iloc[0]),
             "high": float(frame["high"].max()),
@@ -126,9 +314,15 @@ def _fallback_today_from_minute_bars(db: Database, index_codes: dict[str, str]) 
             "vol": int(frame["vol"].fillna(0).sum()) if "vol" in frame.columns else 0,
             "amount": float(frame["amount"].fillna(0).sum()) if "amount" in frame.columns else 0,
         }
-        selector = {"meta.symbol": symbol, "meta.freq": "日线", "dt": doc["dt"]}
-        index_ops.append(UpdateOne(selector, {"$set": doc}, upsert=True))
-        bars_ops.append(UpdateOne(selector, {"$set": doc}, upsert=True))
+        previous_close = _previous_daily_close(db, symbol, expected_day)
+        if previous_close:
+            change_pct = round((doc["close"] - previous_close) / previous_close * 100.0, 4)
+            doc["prev_close"] = float(previous_close)
+            doc["change"] = round(doc["close"] - previous_close, 4)
+            doc["change_pct"] = change_pct
+            doc["pct_chg"] = change_pct
+        index_docs.append(doc)
+        bars_docs.append(dict(doc))
         db["sync_log"].update_one(
             {"_id": f"index_daily:{symbol}"},
             {"$set": {
@@ -138,17 +332,19 @@ def _fallback_today_from_minute_bars(db: Database, index_codes: dict[str, str]) 
                 "last_run": naive_market_now("A"),
                 "status": "ok",
                 "source": "index_minute_rollup",
+                "source_type": "derived",
+                "quality": "estimated_close",
             }},
             upsert=True,
         )
         patched += 1
         logger.info("  ↳ %s: 用 %s 合成 %s 指数日线", name, source_freq, expected_day)
-    if not index_ops and not bars_ops:
+    if not index_docs and not bars_docs:
         return 0
-    if index_ops:
-        db["index_bars"].bulk_write(index_ops, ordered=False)
-    if bars_ops:
-        db["bars"].bulk_write(bars_ops, ordered=False)
+    if index_docs:
+        _replace_exact_bar_docs(db["index_bars"], index_docs)
+    if bars_docs:
+        _replace_exact_bar_docs(db["bars"], bars_docs)
     return patched
 
 
@@ -280,7 +476,7 @@ def _sync_us_index(db: Database, us_codes: dict):
 
 def _fallback_from_existing_bars(db: Database, index_codes: dict[str, str]) -> int:
     """Seed index_bars from already cached bars when external providers fail."""
-    ops = []
+    copied_docs = []
     for name, symbol in index_codes.items():
         pure = _pure_index_code(symbol)
         candidates = [symbol, pure, symbol.upper(), symbol.lower()]
@@ -297,16 +493,11 @@ def _fallback_from_existing_bars(db: Database, index_codes: dict[str, str]) -> i
             item = dict(doc)
             item["meta"] = {**item.get("meta", {}), "symbol": symbol, "freq": item.get("meta", {}).get("freq", "日线"), "asset_type": "index"}
             item["source"] = item.get("source") or "bars_fallback"
-            ops.append(UpdateOne(
-                {"meta.symbol": symbol, "meta.freq": item["meta"]["freq"], "dt": item["dt"]},
-                {"$set": item},
-                upsert=True,
-            ))
+            copied_docs.append(item)
         logger.info("  ↳ %s: copied %d cached bars into index_bars", name, len(docs))
-    if not ops:
+    if not copied_docs:
         return 0
-    result = db["index_bars"].bulk_write(ops, ordered=False)
-    return int(result.upserted_count + result.modified_count)
+    return _replace_exact_bar_docs(db["index_bars"], copied_docs)
 
 
 @sync_retry(max_attempts=5, min_wait=3)
@@ -325,14 +516,19 @@ def sync_index_daily(db: Database, proxy_url: str = None) -> dict:
     logger.info(f"指数日线同步: A股 {len(a_index_codes)} 只指数, 起始 {start_date}")
 
     a_count = _sync_a_index(db, a_index_codes, start_date, proxy_url)
+    quote_close_count = _fallback_today_from_quote_snapshots(db, a_index_codes)
     minute_rollup_count = _fallback_today_from_minute_bars(db, a_index_codes)
 
     # 港股恒生科技走 AKShare（同 A 股接口格式不同，这里简单处理）
     # 实际环境可能需要 Futu，此处用 yfinance 兜底
     us_count = _sync_us_index(db, config.INDEX_US_CODES)
 
-    total = a_count + us_count + minute_rollup_count
+    total = a_count + us_count + quote_close_count + minute_rollup_count
     if total == 0:
         total = _fallback_from_existing_bars(db, a_index_codes)
     logger.info(f"指数日线完成: {total} bars")
-    return {"inserted": total, "minute_rollup_patched": minute_rollup_count}
+    return {
+        "inserted": total,
+        "quote_close_patched": quote_close_count,
+        "minute_rollup_patched": minute_rollup_count,
+    }

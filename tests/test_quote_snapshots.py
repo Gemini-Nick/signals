@@ -47,7 +47,8 @@ def test_quote_doc_from_eastmoney_payload_scales_fields():
     assert doc["trade_date"] == "2026-04-24"
     assert doc["price"] == 19.67
     assert doc["prev_close"] == 19.43
-    assert doc["change_pct"] == 1.24
+    assert doc["change"] == 0.24
+    assert doc["change_pct"] == 1.2352
     assert doc["vol"] == 30498700
     assert doc["volume_unit"] == "shares"
     assert doc["source_vol"] == 304987
@@ -78,7 +79,8 @@ def test_quote_doc_from_ulist_row_uses_batch_fields():
     assert doc["source"] == "eastmoney_push2delay_ulist"
     assert doc["trade_date"] == "2026-04-30"
     assert doc["price"] == 19.67
-    assert doc["change_pct"] == 1.24
+    assert doc["change"] == 0.24
+    assert doc["change_pct"] == 1.2352
     assert doc["vol"] == 30498700
     assert doc["volume_unit"] == "shares"
 
@@ -111,6 +113,43 @@ def test_quote_doc_from_ulist_row_tolerates_preopen_dash_fields():
     assert doc["amount"] == 0.0
     assert doc["open"] == 0.0
     assert doc["vol"] == 0
+
+
+def test_quote_doc_recomputes_stale_provider_change_fields():
+    payload = {
+        "rc": 0,
+        "data": {
+            "f43": 1967,
+            "f44": 1986,
+            "f45": 1898,
+            "f46": 1933,
+            "f47": 304987,
+            "f48": 591786626.0,
+            "f57": "601958",
+            "f58": "金钼股份",
+            "f60": 1943,
+            "f169": 999,
+            "f170": 999,
+        },
+    }
+    row = {
+        "f2": 19.67,
+        "f3": 99.9,
+        "f4": 9.99,
+        "f5": 304987,
+        "f6": 591786626.0,
+        "f12": "601958",
+        "f14": "金钼股份",
+        "f18": 19.43,
+    }
+
+    em_doc = _quote_doc_from_em("SH.601958", payload, datetime(2026, 4, 30, 10, 0), "2026-04-30")
+    ulist_doc = _quote_doc_from_ulist_row("SH.601958", row, datetime(2026, 4, 30, 10, 0), "2026-04-30")
+
+    assert em_doc["change"] == 0.24
+    assert em_doc["change_pct"] == 1.2352
+    assert ulist_doc["change"] == 0.24
+    assert ulist_doc["change_pct"] == 1.2352
 
 
 class _Collection:

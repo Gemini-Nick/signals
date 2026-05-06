@@ -38,12 +38,36 @@ def test_fullmarket_spot_doc_maps_quote_and_daily_fields():
     assert doc["price"] == 10.5
     assert doc["open"] == 10.1
     assert doc["prev_close"] == 10.25
-    assert doc["change_pct"] == 2.4
+    assert doc["change"] == 0.25
+    assert doc["change_pct"] == 2.439
     assert doc["turnover_pct"] == 1.1
     assert doc["vol"] == 100000
     assert doc["volume_unit"] == "shares"
     assert doc["source_vol"] == 1000
     assert doc["source_volume_unit"] == "hands"
+
+
+def test_fullmarket_spot_doc_recomputes_stale_provider_change_fields():
+    row = {
+        "f12": "600001",
+        "f14": "测试股份",
+        "f2": 10.5,
+        "f3": 99.9,
+        "f4": 9.99,
+        "f5": 1000,
+        "f6": 100000,
+        "f18": 10.25,
+    }
+
+    doc = fullmarket_spot_snapshot._doc_from_row(
+        row,
+        date_key="20260429",
+        trade_date="2026-04-29",
+        snapshot_at=datetime(2026, 4, 29, 15, 30),
+    )
+
+    assert doc["change"] == 0.25
+    assert doc["change_pct"] == 2.439
 
 
 class _Collection:

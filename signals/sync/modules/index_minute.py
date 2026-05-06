@@ -20,6 +20,7 @@ from signals.core.macro_universe import macro_a_index_codes
 from signals.core.market_time import naive_market_now, to_market_naive
 from ..proxy import em_proxy
 from ..retry import sync_retry
+from .minute_change import recalculate_minute_change_pct
 from .minute_sources import fetch_public_minute
 
 logger = logging.getLogger("signals.sync.index_minute")
@@ -86,6 +87,23 @@ def _upsert_tail_docs(col, symbol: str, freq: str, docs: list[dict]) -> dict:
     }
 
 
+def _replace_tail_docs(col, symbol: str, freq: str, docs: list[dict]) -> dict:
+    if not docs:
+        return {"written": 0, "inserted": 0, "deleted": 0, "skipped_existing": 0}
+    deduped = {doc["dt"]: dict(doc) for doc in docs}
+    prepared = list(deduped.values())
+    dts = list(deduped)
+    selector = {"meta.symbol": symbol, "meta.freq": freq, "dt": {"$in": dts}}
+    deleted = int(col.delete_many(selector).deleted_count)
+    inserted = len(col.insert_many(prepared, ordered=False).inserted_ids)
+    return {
+        "written": inserted,
+        "inserted": inserted,
+        "deleted": deleted,
+        "skipped_existing": max(0, deleted - inserted),
+    }
+
+
 def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict]) -> dict:
     if not docs:
         return {
@@ -95,6 +113,7 @@ def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict]) ->
             "compat_inserted": 0,
             "compat_modified": 0,
             "compat_written": 0,
+            "compat_deleted": 0,
             "skipped_existing": 0,
             "compat_skipped_existing": 0,
             "bar_count": 0,
@@ -105,14 +124,15 @@ def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict]) ->
         item["meta"] = {**item.get("meta", {}), "symbol": symbol, "freq": freq, "asset_type": "index", "market": "A"}
         prepared.append(item)
     primary = _upsert_tail_docs(db["index_bars"], symbol, freq, prepared)
-    compat = _upsert_tail_docs(db["bars"], symbol, freq, prepared)
+    compat = _replace_tail_docs(db["bars"], symbol, freq, prepared)
     return {
         "inserted": primary["inserted"],
         "modified": primary["modified"],
         "written": primary["written"],
         "compat_inserted": compat["inserted"],
-        "compat_modified": compat["modified"],
+        "compat_modified": 0,
         "compat_written": compat["written"],
+        "compat_deleted": compat["deleted"],
         "skipped_existing": primary["skipped_existing"],
         "compat_skipped_existing": compat["skipped_existing"],
         "bar_count": len(prepared),
@@ -174,6 +194,7 @@ def _fetch_index_docs(
             "vol": int(row["成交量"]) if pd.notna(row["成交量"]) else 0,
             "amount": int(float(row["成交额"])) if pd.notna(row.get("成交额", 0)) else 0,
         })
+    docs = recalculate_minute_change_pct(db, symbol, docs, asset_type="index")
     return docs, source
 
 
@@ -187,6 +208,7 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
     compat_modified = 0
     written_total = 0
     compat_written_total = 0
+    compat_deleted = 0
     skipped_existing = 0
     errors = []
     empty = 0
@@ -225,6 +247,7 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
                 "compat_inserted": 0,
                 "compat_modified": 0,
                 "compat_written": 0,
+                "compat_deleted": 0,
                 "skipped_existing": 0,
             }
 
@@ -272,6 +295,7 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
                 compat_modified += int(result.get("compat_modified") or 0)
                 written_total += int(result.get("written") or 0)
                 compat_written_total += int(result.get("compat_written") or 0)
+                compat_deleted += int(result.get("compat_deleted") or 0)
                 skipped_existing += int(result.get("skipped_existing") or 0)
             except Exception as exc:
                 errors.append({"name": name, "symbol": symbol, "freq": freq, "error": str(exc)[:240]})
@@ -284,6 +308,7 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
         "compat_inserted": compat_inserted,
         "compat_modified": compat_modified,
         "compat_written": compat_written_total,
+        "compat_deleted": compat_deleted,
         "skipped_existing": skipped_existing,
         "errors": len(errors),
         "empty": empty,

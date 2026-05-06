@@ -23,6 +23,7 @@ from signals.core.market_time import naive_market_now, to_market_naive
 from ..proxy import em_proxy
 from ..retry import sync_retry
 from ..task_context import get_task_env
+from .minute_change import recalculate_minute_change_pct
 from .minute_sources import fetch_public_minute, stock_to_market_symbol
 
 logger = logging.getLogger("signals.sync.stock_minute")
@@ -888,7 +889,7 @@ def _sync_one_minute(code: str, freq: str, proxy_url: str = None, *, tail_count:
             "vol": int(row["成交量"]) if pd.notna(row["成交量"]) else 0,
             "amount": int(float(row["成交额"])) if pd.notna(row["成交额"]) else 0,
         })
-    return docs
+    return recalculate_minute_change_pct(db, code, docs, asset_type="stock")
 
 
 def _insert_new_minute_docs(bars_col, code: str, freq: str, docs: list[dict]) -> dict:

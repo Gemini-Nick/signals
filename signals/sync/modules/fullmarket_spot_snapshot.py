@@ -73,6 +73,24 @@ def _number(value, default: float | None = None) -> float | None:
         return default
 
 
+def _computed_change(latest, prev_close, fallback=None) -> float | None:
+    latest_value = _number(latest)
+    prev_value = _number(prev_close)
+    if latest_value is not None and prev_value not in (None, 0):
+        return round(latest_value - prev_value, 4)
+    fallback_value = _number(fallback)
+    return round(fallback_value, 4) if fallback_value is not None else None
+
+
+def _computed_change_pct(latest, prev_close, fallback=None) -> float | None:
+    latest_value = _number(latest)
+    prev_value = _number(prev_close)
+    if latest_value is not None and prev_value not in (None, 0):
+        return round((latest_value - prev_value) / prev_value * 100.0, 4)
+    fallback_value = _number(fallback)
+    return round(fallback_value, 4) if fallback_value is not None else None
+
+
 def _symbol_for_code(code: str) -> str:
     raw = str(code or "").strip()
     if raw.startswith(("5", "6", "9")):
@@ -119,6 +137,9 @@ def _doc_from_row(row: dict, *, date_key: str, trade_date: str, snapshot_at) -> 
     if not code:
         return None
     latest = _number(row.get("f2"))
+    prev_close = _number(row.get("f18"))
+    change = _computed_change(latest, prev_close, row.get("f4"))
+    change_pct = _computed_change_pct(latest, prev_close, row.get("f3"))
     source_vol = _number(row.get("f5"), 0.0)
     vol, source_volume_unit = normalize_stock_volume(source_vol, source_unit="hands")
     return {
@@ -133,8 +154,8 @@ def _doc_from_row(row: dict, *, date_key: str, trade_date: str, snapshot_at) -> 
         "market_id": row.get("f13"),
         "latest": latest,
         "price": latest,
-        "change_pct": _number(row.get("f3")),
-        "change": _number(row.get("f4")),
+        "change_pct": change_pct,
+        "change": change,
         "vol": vol,
         "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
         "source_vol": source_vol,
@@ -145,7 +166,7 @@ def _doc_from_row(row: dict, *, date_key: str, trade_date: str, snapshot_at) -> 
         "high": _number(row.get("f15")),
         "low": _number(row.get("f16")),
         "open": _number(row.get("f17")),
-        "prev_close": _number(row.get("f18")),
+        "prev_close": prev_close,
         "market_cap": _number(row.get("f20")),
         "float_market_cap": _number(row.get("f21")),
         "raw": {key: row.get(key) for key in _EM_FIELDS.split(",")},

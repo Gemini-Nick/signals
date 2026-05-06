@@ -49,11 +49,54 @@ def test_watchlist_range_columns_include_all_key_presets():
     assert len(columns) > 4
 
 
+def test_shell_cache_refreshes_quote_overlay_when_quote_watermark_changes(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Engine:
+        def is_ready(self):
+            return True
+
+    engine = _Engine()
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {
+        "day_change_mode": "quote_intraday",
+        "quote_status": "realtime",
+        "day_change_pct": 2.5,
+        "daily_change_pct": 2.5,
+        "today_change_pct": 2.5,
+        "latest_price": 10.25,
+        "realtime_price": 10.25,
+        "day_change_source": "quote_snapshots",
+        "day_change_as_of": "2026-05-06",
+    })
+    try:
+        cached_payload = {
+            "session": {"ready": True},
+            "buy_candidates": [{"kind": "stock", "symbol": "SZ.002709", "latest_price": 10.0, "day_change_pct": 1.0}],
+        }
+        workbench._SHELL_CACHE.update({
+            "expires_at": 999999.0,
+            "payload": cached_payload,
+            "refreshed_at": 1.0,
+            "quote_watermark": "old",
+        })
+
+        assert workbench._shell_cache_usable(cached_payload, engine, quote_watermark="new") is True
+        payload = workbench._payload_from_shell_cache(cached_payload, "hit", 10.0, "new")
+
+        assert payload["cache"]["status"] == "hit_quote_overlay"
+        assert payload["buy_candidates"][0]["latest_price"] == 10.25
+        assert payload["buy_candidates"][0]["day_change_pct"] == 2.5
+        assert workbench._SHELL_CACHE["quote_watermark"] == "new"
+    finally:
+        workbench._invalidate_shell_cache()
+
+
 def test_macro_indices_have_day_and_range_returns(monkeypatch):
     from signals.web.api import workbench
 
     df = _bars()
     monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (df, "test_index_bars"))
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {"quote_status": "missing", "quote_status_label": "无行情"})
 
     columns = workbench._watchlist_range_columns(date(2026, 4, 26))
     rows = workbench._build_macro_index_rows(reports=[], range_columns=columns)
@@ -714,6 +757,83 @@ def test_quote_overlay_marks_non_current_quote_stale(monkeypatch):
     assert row["day_change_pct"] is None
 
 
+def test_quote_overlay_prefers_realtime_quote_over_minute_change(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(
+        workbench,
+        "_quote_overlay_for_symbol",
+        lambda symbol: {
+            "day_change_mode": "quote_intraday",
+            "quote_status": "realtime",
+            "quote_status_label": "实时",
+            "latest_price": 1691.07,
+            "realtime_price": 1691.07,
+            "day_change_pct": 7.64,
+            "daily_change_pct": 7.64,
+            "today_change_pct": 7.64,
+            "day_change_source": "quote_snapshots",
+            "day_change_as_of": "2026-05-06",
+        },
+    )
+
+    row = workbench._apply_quote_overlay(
+        {
+            "latest_price": 1692.61,
+            "day_change_pct": 3.57,
+            "daily_change_pct": 3.57,
+            "today_change_pct": 3.57,
+            "gain_pct": 3.57,
+            "day_change_mode": "minute_intraday",
+            "day_change_source": "index_bars:5min",
+            "day_change_freq": "5min",
+        },
+        "sh000688",
+    )
+
+    assert row["latest_price"] == 1691.07
+    assert row["day_change_pct"] == 7.64
+    assert row["daily_change_pct"] == 7.64
+    assert row["today_change_pct"] == 7.64
+    assert row["gain_pct"] == 7.64
+    assert row["day_change_mode"] == "quote_intraday"
+    assert row["day_change_source"] == "quote_snapshots"
+    assert row["day_change_freq"] == ""
+
+
+def test_lightweight_stock_row_uses_quote_without_kline(monkeypatch):
+    from signals.web.api import workbench
+
+    def _unexpected_stock_df(*args, **kwargs):
+        raise AssertionError("lightweight shell rows must not load kline data")
+
+    monkeypatch.setattr(workbench, "_stock_df", _unexpected_stock_df)
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(
+        workbench,
+        "_quote_overlay_for_symbol",
+        lambda symbol: {
+            "day_change_mode": "quote_intraday",
+            "quote_status": "realtime",
+            "quote_status_label": "实时",
+            "latest_price": 10.5,
+            "realtime_price": 10.5,
+            "day_change_pct": 3.2,
+            "daily_change_pct": 3.2,
+            "today_change_pct": 3.2,
+            "day_change_source": "quote_snapshots",
+            "day_change_as_of": "2026-05-06",
+        },
+    )
+
+    row = workbench._enrich_stock_row({"symbol": "SH.600000", "latest_signal": "一买"}, [], lightweight=True)
+
+    assert row["latest_price"] == 10.5
+    assert row["day_change_pct"] == 3.2
+    assert row["day_change_source"] == "quote_snapshots"
+    assert row["range_returns"] == {}
+
+
 def test_quote_overlay_marks_future_holiday_snapshot_stale(monkeypatch):
     from signals.web.api import workbench
 
@@ -774,6 +894,145 @@ def test_stock_summary_uses_daily_close_day_change_when_quote_stale(monkeypatch)
     assert summary["day_change_source"] == "daily_bars_close"
     assert summary["day_change_as_of"] == "2026-04-30"
     assert summary["quote_status"] == "stale"
+
+
+def test_stock_row_uses_daily_close_day_change_after_close(monkeypatch):
+    from signals.web.api import workbench
+
+    daily = pd.DataFrame(
+        {"open": [100.0, 110.0], "close": [100.0, 110.0]},
+        index=pd.to_datetime(["2026-04-29", "2026-04-30"]),
+    )
+    minute_5 = pd.DataFrame(
+        {"open": [100.0, 101.0], "close": [101.0, 103.0]},
+        index=pd.to_datetime(["2026-04-30 09:35", "2026-04-30 09:40"]),
+    )
+
+    def fake_stock_df(symbol, freq):
+        return (minute_5, "bars") if freq == "5min" else (daily, "daily_bars")
+
+    monkeypatch.setattr(workbench, "_stock_df", fake_stock_df)
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-04-30")
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {"quote_status": "stale", "quote_status_label": "行情陈旧"})
+
+    row = workbench._enrich_stock_row({"symbol": "SH.600000", "name": "测试股"}, [])
+
+    assert row["day_change_pct"] == 10.0
+    assert row["daily_change_pct"] == 10.0
+    assert row["today_change_pct"] == 10.0
+    assert row["day_change_mode"] == "daily_close"
+    assert row["day_change_freq"] == ""
+    assert row["latest_price"] == 110.0
+    assert row["quote_status"] == "stale"
+
+
+def test_index_row_uses_daily_close_day_change_after_close(monkeypatch):
+    from signals.web.api import workbench
+
+    daily = pd.DataFrame(
+        {"open": [3000.0, 3300.0], "close": [3000.0, 3300.0]},
+        index=pd.to_datetime(["2026-04-29", "2026-04-30"]),
+    )
+    minute_5 = pd.DataFrame(
+        {"open": [3000.0, 3010.0], "close": [3010.0, 3060.0]},
+        index=pd.to_datetime(["2026-04-30 09:35", "2026-04-30 09:40"]),
+    )
+
+    def fake_index_df(symbol, freq):
+        return (minute_5, "index_bars") if freq == "5min" else (daily, "index_daily")
+
+    monkeypatch.setattr(workbench, "_index_df", fake_index_df)
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-04-30")
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {"quote_status": "missing", "quote_status_label": "无行情"})
+
+    row = workbench._enrich_index_row({"symbol": "sh000001", "name": "上证指数"}, [])
+
+    assert row["day_change_pct"] == 10.0
+    assert row["daily_change_pct"] == 10.0
+    assert row["today_change_pct"] == 10.0
+    assert row["day_change_mode"] == "daily_close"
+    assert row["day_change_freq"] == ""
+    assert row["latest_price"] == 3300.0
+
+
+def test_index_intraday_day_change_uses_previous_daily_close(monkeypatch):
+    from signals.web.api import workbench
+
+    daily = pd.DataFrame(
+        {"open": [1000.0, 1080.0], "close": [1000.0, 1100.0]},
+        index=pd.to_datetime(["2026-04-29", "2026-04-30"]),
+    )
+    minute_5 = pd.DataFrame(
+        {"open": [1200.0, 1205.0], "close": [1205.0, 1210.0]},
+        index=pd.to_datetime(["2026-05-06 09:35", "2026-05-06 09:40"]),
+    )
+
+    def fake_index_df(symbol, freq):
+        return (minute_5, "index_bars") if freq == "5min" else (daily, "index_daily")
+
+    monkeypatch.setattr(workbench, "_index_df", fake_index_df)
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {"quote_status": "missing", "quote_status_label": "无行情"})
+
+    row = workbench._enrich_index_row({"symbol": "sh000688", "name": "科创50"}, [])
+
+    assert row["latest_price"] == 1210.0
+    assert row["day_change_pct"] == 10.0
+    assert row["daily_change_pct"] == 10.0
+    assert row["today_change_pct"] == 10.0
+    assert row["day_change_source"] == "index_bars:5min"
+
+
+def test_scored_stock_rows_refresh_even_when_stale_price_present(monkeypatch):
+    from signals.web.api import workbench
+
+    def fake_enrich(row, range_columns, **kwargs):
+        row.update({
+            "latest_price": 62.1,
+            "day_change_pct": 2.51,
+            "day_change_mode": "quote_intraday",
+            "day_change_source": "quote_snapshots",
+        })
+        return row
+
+    monkeypatch.setattr(workbench, "_enrich_stock_row", fake_enrich)
+
+    rows = workbench._enrich_scored_stock_rows(
+        [{"symbol": "SZ.002709", "name": "天赐材料", "latest_price": 61.78, "day_change_pct": 1.98}],
+        [],
+    )
+
+    assert rows[0]["latest_price"] == 62.1
+    assert rows[0]["day_change_pct"] == 2.51
+
+
+def test_sector_preview_prefers_shortest_board_heat_minute(monkeypatch):
+    from signals.web.api import workbench
+
+    def fake_board_heat_chart(name, kind, freq):
+        value = {"5min": 2.4, "15min": 1.8, "30min": 1.2}[freq]
+        return (
+            {"ohlcv": [{"time": 1777530000, "close": value}], "meta": {"freq": freq}},
+            {"change_pct": value, "trade_minute": datetime(2026, 4, 30, 9, 40), "source": "test_heat"},
+        )
+
+    monkeypatch.setattr(workbench, "resolve_board_heat_name", lambda kind, label: {"query": label, "heat_name": label, "status": "exact"})
+    monkeypatch.setattr(workbench, "_industry_carrier_candidates", lambda name, leader_name="": [])
+    monkeypatch.setattr(workbench, "_candidate_groups", lambda candidates, heat_value=None: {})
+    monkeypatch.setattr(workbench, "_latest_board_heat_day_change", lambda kind, name: (9.9, "2026-04-30"))
+    monkeypatch.setattr(workbench, "_board_heat_chart", fake_board_heat_chart)
+
+    row = workbench._sector_board_preview({"label": "半导体", "change_pct": 9.9}, "industry")
+
+    assert row["day_change_pct"] == 2.4
+    assert row["daily_change_pct"] == 2.4
+    assert row["today_change_pct"] == 2.4
+    assert row["gain_pct"] == 2.4
+    assert row["day_change_mode"] == "minute_intraday"
+    assert row["day_change_freq"] == "5min"
+    assert row["day_change_source"] == "board_heat_ticks"
 
 
 def test_concept_sector_preview_returns_explicit_chain_carrier(monkeypatch):

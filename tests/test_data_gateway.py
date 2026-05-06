@@ -142,6 +142,29 @@ def test_kline_prefers_bars_before_legacy(monkeypatch):
     assert calls["legacy"] == 0
 
 
+def test_bars_df_from_docs_preserves_cached_change_fields():
+    from signals.data import gateway
+
+    df = gateway._bars_df_from_docs([
+        {
+            "dt": "2026-05-06 09:35:00",
+            "open": "10.0",
+            "high": "10.5",
+            "low": "9.9",
+            "close": "10.4",
+            "vol": "1000",
+            "amount": "10400",
+            "prev_close": "10.0",
+            "change_pct": "4.0",
+            "pct_chg": "4.0",
+        }
+    ], "bars")
+
+    assert list(df.columns) == ["open", "high", "low", "close", "vol", "amount", "prev_close", "change_pct", "pct_chg"]
+    assert df.iloc[0]["prev_close"] == 10.0
+    assert df.iloc[0]["change_pct"] == 4.0
+
+
 def test_index_bars_prefers_index_collection(monkeypatch):
     from signals.data import gateway
 

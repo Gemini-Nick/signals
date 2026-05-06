@@ -26,6 +26,33 @@ class _FakeCollection:
         return self.result
 
 
+class _DeleteResult:
+    def __init__(self, deleted_count: int):
+        self.deleted_count = deleted_count
+
+
+class _InsertManyResult:
+    def __init__(self, inserted_ids: list[int]):
+        self.inserted_ids = inserted_ids
+
+
+class _FakeRefreshCollection:
+    def __init__(self, deleted_count: int = 0):
+        self.deleted_count = deleted_count
+        self.deleted_query = None
+        self.inserted_docs = []
+        self.ordered = None
+
+    def delete_many(self, query):
+        self.deleted_query = query
+        return _DeleteResult(self.deleted_count)
+
+    def insert_many(self, docs, ordered=False):
+        self.inserted_docs.extend(docs)
+        self.ordered = ordered
+        return _InsertManyResult(list(range(len(docs))))
+
+
 def test_index_minute_worker_count_is_constrained(monkeypatch):
     monkeypatch.setenv("INDEX_MINUTE_WORKERS", "99")
     assert index_minute._worker_count() == 6
@@ -100,6 +127,29 @@ def test_index_minute_upserts_tail_docs_to_refresh_live_bars():
     assert op._filter == {"meta.symbol": "sh000688", "meta.freq": "30分钟", "dt": dt}
     assert op._doc == {"$set": doc}
     assert op._upsert is True
+
+
+def test_index_minute_replaces_tail_docs_for_timeseries_compat_collection():
+    dt = datetime(2026, 5, 6, 11, 30)
+    earlier = {
+        "dt": dt,
+        "meta": {"symbol": "sh000688", "freq": "30分钟", "source": "tencent"},
+        "open": 1699.0,
+        "high": 1700.0,
+        "low": 1698.0,
+        "close": 1699.0,
+        "vol": 189909,
+        "amount": 9517179,
+    }
+    latest = {**earlier, "meta": {**earlier["meta"], "source": "sina"}, "close": 1700.0, "vol": 103525700}
+    col = _FakeRefreshCollection(deleted_count=1)
+
+    result = index_minute._replace_tail_docs(col, "sh000688", "30分钟", [earlier, latest])
+
+    assert result == {"written": 1, "inserted": 1, "deleted": 1, "skipped_existing": 0}
+    assert col.deleted_query == {"meta.symbol": "sh000688", "meta.freq": "30分钟", "dt": {"$in": [dt]}}
+    assert col.inserted_docs == [latest]
+    assert col.ordered is False
 
 
 def test_index_minute_universe_includes_macro_watchlist_a_indices_only():

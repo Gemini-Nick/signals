@@ -13,6 +13,7 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     stock_daily = [task for task in pm.POSTMARKET_TASKS if task.module == "stock_daily"]
     stock_30m = [task for task in pm.POSTMARKET_TASKS if task.module == "stock_30m_fullmarket"]
     board_cons = [task for task in pm.POSTMARKET_TASKS if task.module == "board_cons"]
+    index_daily = next(task for task in pm.POSTMARKET_TASKS if task.module == "index_daily")
     weekly = next(task for task in pm.POSTMARKET_TASKS if task.module == "weekly_rollup")
     technical_scan = next(task for task in pm.POSTMARKET_TASKS if task.module == "technical_signal_scan")
     chain = next(task for task in pm.POSTMARKET_TASKS if task.module == "chain_heat_snapshots")
@@ -24,6 +25,7 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert {task.shard_key for task in stock_30m} == {f"shard_{idx:02d}" for idx in range(16)}
     assert all(task.env["STOCK_DAILY_SCOPE"] == "all" for task in stock_daily)
     assert all(task.depends_on == ("fullmarket_spot_snapshot:all",) for task in stock_daily)
+    assert index_daily.depends_on == ("quote_snapshots:all",)
     assert all(task.task_key in technical_scan.depends_on for task in stock_30m)
     assert {task.shard_key for task in board_cons} == {"board", "concept"}
     assert all(task.depends_on == ("board_ranking:all",) for task in board_cons)

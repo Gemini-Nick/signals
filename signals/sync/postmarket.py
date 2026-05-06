@@ -118,7 +118,7 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     PostmarketTaskSpec("fullmarket_spot_snapshot", "market_data"),
     PostmarketTaskSpec("market_pools", "market_data"),
     PostmarketTaskSpec("quote_snapshots", "market_data"),
-    PostmarketTaskSpec("index_daily", "market_data"),
+    PostmarketTaskSpec("index_daily", "market_data", depends_on=("quote_snapshots:all",)),
     *_STOCK_DAILY_TASKS,
     PostmarketTaskSpec("board_ranking", "market_data"),
     *_BOARD_CONS_TASKS,

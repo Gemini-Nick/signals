@@ -275,6 +275,33 @@ def _float_or_default(value: object, default: float = 0.0) -> float:
         return default
 
 
+def _float_or_none(value: object) -> float | None:
+    try:
+        if value in (None, "-", ""):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _computed_change(price: object, prev_close: object, fallback: object = None) -> float | None:
+    price_value = _float_or_none(price)
+    prev_value = _float_or_none(prev_close)
+    if price_value is not None and prev_value not in (None, 0):
+        return round(price_value - prev_value, 4)
+    fallback_value = _float_or_none(fallback)
+    return round(fallback_value, 4) if fallback_value is not None else None
+
+
+def _computed_change_pct(price: object, prev_close: object, fallback: object = None) -> float | None:
+    price_value = _float_or_none(price)
+    prev_value = _float_or_none(prev_close)
+    if price_value is not None and prev_value not in (None, 0):
+        return round((price_value - prev_value) / prev_value * 100.0, 4)
+    fallback_value = _float_or_none(fallback)
+    return round(fallback_value, 4) if fallback_value is not None else None
+
+
 def _quote_doc_from_em(symbol: str, payload: dict, now: datetime, trading_day: str) -> dict | None:
     data = payload.get("data") if isinstance(payload, dict) else None
     if not data:
@@ -283,7 +310,8 @@ def _quote_doc_from_em(symbol: str, payload: dict, now: datetime, trading_day: s
     if price is None or price <= 0:
         return None
     prev_close = _scale_price(data.get("f60"))
-    change_pct = _scale_pct(data.get("f170"))
+    change = _computed_change(price, prev_close, _scale_price(data.get("f169")))
+    change_pct = _computed_change_pct(price, prev_close, _scale_pct(data.get("f170")))
     vol, source_volume_unit = normalize_stock_volume(data.get("f47"), source_unit="hands")
     return {
         "_id": f"{symbol}:latest",
@@ -303,7 +331,7 @@ def _quote_doc_from_em(symbol: str, payload: dict, now: datetime, trading_day: s
         "close": price,
         "price": price,
         "prev_close": prev_close,
-        "change": _scale_price(data.get("f169")),
+        "change": change,
         "change_pct": change_pct,
         "turnover_pct": _scale_pct(data.get("f168")),
         "amplitude_pct": _scale_pct(data.get("f171")),
@@ -335,6 +363,9 @@ def _quote_doc_from_fullmarket_spot(symbol: str, row: dict, now: datetime, tradi
         return None
     if price <= 0:
         return None
+    prev_close = _float_or_none(row.get("prev_close"))
+    change = _computed_change(price, prev_close, row.get("change"))
+    change_pct = _computed_change_pct(price, prev_close, row.get("change_pct"))
     code = str(row.get("code") or _code_for_symbol(symbol))
     vol, source_volume_unit = normalize_stock_volume(
         row.get("vol"),
@@ -359,9 +390,9 @@ def _quote_doc_from_fullmarket_spot(symbol: str, row: dict, now: datetime, tradi
         "low": row.get("low"),
         "close": price,
         "price": price,
-        "prev_close": row.get("prev_close"),
-        "change": row.get("change"),
-        "change_pct": row.get("change_pct"),
+        "prev_close": prev_close,
+        "change": change,
+        "change_pct": change_pct,
         "turnover_pct": row.get("turnover_pct"),
         "amplitude_pct": row.get("amplitude_pct"),
         "vol": vol,
@@ -380,6 +411,9 @@ def _quote_doc_from_ulist_row(symbol: str, row: dict, now: datetime, trading_day
     if price <= 0:
         return None
     code = str(row.get("f12") or _code_for_symbol(symbol))
+    prev_close = _float_or_default(row.get("f18"))
+    change = _computed_change(price, prev_close, row.get("f4"))
+    change_pct = _computed_change_pct(price, prev_close, row.get("f3"))
     vol, source_volume_unit = normalize_stock_volume(row.get("f5"), source_unit="hands")
     return {
         "_id": f"{symbol}:latest",
@@ -398,9 +432,9 @@ def _quote_doc_from_ulist_row(symbol: str, row: dict, now: datetime, trading_day
         "low": _float_or_default(row.get("f16")),
         "close": price,
         "price": price,
-        "prev_close": _float_or_default(row.get("f18")),
-        "change": _float_or_default(row.get("f4")),
-        "change_pct": _float_or_default(row.get("f3")),
+        "prev_close": prev_close,
+        "change": change,
+        "change_pct": change_pct,
         "turnover_pct": _float_or_default(row.get("f8")),
         "amplitude_pct": _float_or_default(row.get("f7")),
         "vol": vol,
