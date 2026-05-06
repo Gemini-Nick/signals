@@ -30,6 +30,7 @@ MODULES = [
     "index_minute",
     "stock_minute",
     "minute_readiness_probe",
+    "intraday_technical_signal_scan",
     "market_pools",
     "strategy_snapshot",
     "board_heat_minute",
@@ -130,13 +131,26 @@ def _runtime_mode() -> dict[str, Any]:
     now = datetime.now(TZ_BEIJING)
     weekday = now.weekday() < 5
     current = now.time()
-    intraday = weekday and time(9, 15) <= current <= time(15, 5)
+    pre_market = weekday and time(7, 0) <= current < time(9, 15)
+    auction_quote = weekday and time(9, 15) <= current < time(9, 30)
+    intraday = weekday and time(9, 30) <= current <= time(15, 5)
     postmarket = weekday and time(15, 5) < current <= time(23, 30)
-    mode = "intraday_low_latency" if intraday else "postmarket_backfill" if postmarket else "off_hours"
+    if pre_market:
+        mode = "pre_market"
+    elif auction_quote:
+        mode = "auction_quote"
+    elif intraday:
+        mode = "intraday_low_latency"
+    elif postmarket:
+        mode = "postmarket_backfill"
+    else:
+        mode = "off_hours"
     return {
         "mode": mode,
         "beijing_time": now.isoformat(timespec="seconds"),
-        "intraday": intraday,
+        "intraday": intraday or auction_quote,
+        "pre_market": pre_market,
+        "auction_quote": auction_quote,
         "postmarket": postmarket,
     }
 

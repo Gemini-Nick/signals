@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 
 from pymongo import UpdateOne
 from pymongo.database import Database
@@ -23,6 +23,7 @@ _EM_FIELDS = "f43,f44,f45,f46,f47,f48,f49,f50,f57,f58,f60,f116,f117,f168,f169,f1
 _EM_ULIST_ENDPOINT = "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
 _EM_ULIST_FIELDS = "f2,f3,f4,f5,f6,f7,f8,f12,f13,f14,f15,f16,f17,f18,f20,f21"
 _MACRO_QUOTE_SYMBOLS = ("SH.000001", "SZ.399001", "SZ.399006", "SH.000300", "SH.000016")
+QUOTE_TRADING_DAY_OPEN = dt_time(9, 15)
 
 
 def _symbol_candidates(symbol: str) -> list[str]:
@@ -142,6 +143,7 @@ def _write_provider_health(
 def _write_data_freshness(db: Database, count: int, latest_dt: str | None, live_count: int, stale_count: int) -> None:
     now = naive_market_now("A")
     lane = os.getenv("SIGNALS_CURRENT_SYNC_LANE", "quote_lane")
+    date_key = str(latest_dt or "").replace("-", "")[:8]
     if count <= 0:
         freshness = "empty"
         stale_reason = "quote_snapshot_empty"
@@ -165,6 +167,7 @@ def _write_data_freshness(db: Database, count: int, latest_dt: str | None, live_
             "freshness": freshness,
             "latest_dt": latest_dt,
             "as_of": latest_dt,
+            "date_key": date_key,
             "updated_at": now,
             "stale_reason": stale_reason,
             "count": count,
@@ -263,6 +266,15 @@ def _scale_pct(value: object) -> float | None:
         return None
 
 
+def _float_or_default(value: object, default: float = 0.0) -> float:
+    try:
+        if value in (None, "-", ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _quote_doc_from_em(symbol: str, payload: dict, now: datetime, trading_day: str) -> dict | None:
     data = payload.get("data") if isinstance(payload, dict) else None
     if not data:
@@ -297,11 +309,11 @@ def _quote_doc_from_em(symbol: str, payload: dict, now: datetime, trading_day: s
         "amplitude_pct": _scale_pct(data.get("f171")),
         "vol": vol,
         "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
-        "source_vol": float(data.get("f47") or 0),
+        "source_vol": _float_or_default(data.get("f47")),
         "source_volume_unit": source_volume_unit,
-        "amount": float(data.get("f48") or 0),
-        "market_cap": float(data.get("f116") or 0),
-        "float_market_cap": float(data.get("f117") or 0),
+        "amount": _float_or_default(data.get("f48")),
+        "market_cap": _float_or_default(data.get("f116")),
+        "float_market_cap": _float_or_default(data.get("f117")),
         "expires_at": now + timedelta(days=3),
     }
 
@@ -364,11 +376,7 @@ def _quote_doc_from_fullmarket_spot(symbol: str, row: dict, now: datetime, tradi
 
 
 def _quote_doc_from_ulist_row(symbol: str, row: dict, now: datetime, trading_day: str) -> dict | None:
-    price = row.get("f2")
-    try:
-        price = float(price)
-    except (TypeError, ValueError):
-        return None
+    price = _float_or_default(row.get("f2"), default=0.0)
     if price <= 0:
         return None
     code = str(row.get("f12") or _code_for_symbol(symbol))
@@ -385,23 +393,23 @@ def _quote_doc_from_ulist_row(symbol: str, row: dict, now: datetime, trading_day
         "freshness": "fresh",
         "is_stale": False,
         "stale_reason": "",
-        "open": row.get("f17"),
-        "high": row.get("f15"),
-        "low": row.get("f16"),
+        "open": _float_or_default(row.get("f17")),
+        "high": _float_or_default(row.get("f15")),
+        "low": _float_or_default(row.get("f16")),
         "close": price,
         "price": price,
-        "prev_close": row.get("f18"),
-        "change": row.get("f4"),
-        "change_pct": row.get("f3"),
-        "turnover_pct": row.get("f8"),
-        "amplitude_pct": row.get("f7"),
+        "prev_close": _float_or_default(row.get("f18")),
+        "change": _float_or_default(row.get("f4")),
+        "change_pct": _float_or_default(row.get("f3")),
+        "turnover_pct": _float_or_default(row.get("f8")),
+        "amplitude_pct": _float_or_default(row.get("f7")),
         "vol": vol,
         "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
-        "source_vol": float(row.get("f5") or 0),
+        "source_vol": _float_or_default(row.get("f5")),
         "source_volume_unit": source_volume_unit,
-        "amount": float(row.get("f6") or 0),
-        "market_cap": row.get("f20"),
-        "float_market_cap": row.get("f21"),
+        "amount": _float_or_default(row.get("f6")),
+        "market_cap": _float_or_default(row.get("f20")),
+        "float_market_cap": _float_or_default(row.get("f21")),
         "expires_at": now + timedelta(days=3),
     }
 
@@ -784,7 +792,7 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
     del proxy_url
     now = naive_market_now("A")
     try:
-        trading_day = trading_day_key("A", now=now)
+        trading_day = trading_day_key("A", now=now, open_time=QUOTE_TRADING_DAY_OPEN)
     except Exception:
         trading_day = now.date().isoformat()
     symbols = _hot_quote_symbols(db)
@@ -871,7 +879,7 @@ def sync_eastmoney_ulist_quote(db: Database, proxy_url: str = None) -> dict:
     del proxy_url
     now = naive_market_now("A")
     try:
-        trading_day = trading_day_key("A", now=now)
+        trading_day = trading_day_key("A", now=now, open_time=QUOTE_TRADING_DAY_OPEN)
     except Exception:
         trading_day = now.date().isoformat()
     symbols = _hot_quote_symbols(db)

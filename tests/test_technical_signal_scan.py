@@ -6,7 +6,14 @@ from datetime import datetime
 
 from czsc import Freq
 
-from signals.sync.modules.technical_signal_scan import _coverage_by_freq, _doc_to_rawbar, _resonance_context
+from signals.sync.modules.technical_signal_scan import (
+    INTRADAY_SCAN_SCOPE,
+    _coverage_by_freq,
+    _doc_to_rawbar,
+    _resampled_5m_docs,
+    _resonance_context,
+    _symbols_for_scope,
+)
 
 
 @dataclass
@@ -120,6 +127,31 @@ class _Db(dict):
         return super().__getitem__(key)
 
 
+class _Cursor(list):
+    def sort(self, key, direction=None):
+        if isinstance(key, list):
+            field, order = key[0]
+            reverse = order < 0
+        else:
+            field, reverse = key, direction == -1
+        return _Cursor(sorted(self, key=lambda item: item.get(field), reverse=reverse))
+
+    def limit(self, n):
+        return _Cursor(self[:n])
+
+
+class _Collection:
+    def __init__(self, doc=None, docs=None):
+        self.doc = doc or {}
+        self.docs = docs or []
+
+    def find_one(self, query=None, projection=None, sort=None):
+        return self.doc
+
+    def find(self, query=None, projection=None):
+        return _Cursor(self.docs)
+
+
 def test_coverage_by_freq_marks_30m_incomplete_and_15m_on_demand():
     db = _Db({
         "bars": _Bars([
@@ -138,3 +170,46 @@ def test_coverage_by_freq_marks_30m_incomplete_and_15m_on_demand():
     assert coverage["30分钟"]["status"] == "coverage_incomplete"
     assert coverage["30分钟"]["missing_count"] == 1
     assert coverage["15分钟"]["status"] == "on_demand_missing"
+
+
+def test_intraday_scope_uses_stock_minute_selection_then_terminal_pool():
+    db = _Db({
+        "sync_log": _Collection(doc={
+            "selected_symbols": ["300001", "300002"],
+            "priority_symbols": ["300002"],
+        }),
+        "terminal_stock_pool": _Collection(doc={
+            "focus_stocks": [{"raw_code": "300003"}],
+            "watch_stocks": [{"symbol": "SZ.300004"}],
+            "clue_stocks": [{"code": "300002"}],
+        }),
+    })
+
+    symbols, source = _symbols_for_scope(db, INTRADAY_SCAN_SCOPE)
+
+    assert symbols == ["300002", "300001", "300003", "300004"]
+    assert source == "stock_minute_selection+terminal_stock_pool"
+
+
+def test_resampled_5m_docs_builds_intraday_30m_bars():
+    docs = []
+    for idx, minute in enumerate(range(30, 150, 5), start=1):
+        hour = 9 + minute // 60
+        minute_value = minute % 60
+        docs.append({
+            "dt": datetime(2026, 5, 6, hour, minute_value),
+            "open": idx,
+            "high": idx + 1,
+            "low": idx - 1,
+            "close": idx + 0.5,
+            "vol": 100,
+            "amount": 1000,
+        })
+    db = _Db({"bars": _Collection(docs=docs)})
+
+    resampled = _resampled_5m_docs(db, "300001", "30分钟", limit=20)
+
+    assert resampled
+    assert resampled[-1]["meta"]["freq"] == "30分钟"
+    assert resampled[-1]["meta"]["source"] == "5min_resampled_intraday"
+    assert resampled[-1]["dt"] == datetime(2026, 5, 6, 11, 30)

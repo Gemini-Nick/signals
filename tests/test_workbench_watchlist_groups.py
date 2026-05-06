@@ -1027,6 +1027,79 @@ def test_static_index_minute_request_does_not_fallback_to_daily(monkeypatch):
     assert payload["chart"]["meta"]["not_ready_reason"] == "index_minute_not_ready"
 
 
+def test_static_index_reference_candidates_include_multi_timeframe_signals(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (_intraday_bars(), "index_bars"))
+    monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "hit"}})
+    monkeypatch.setattr(workbench, "_ensure_engine", lambda: (_ for _ in ()).throw(RuntimeError("engine unavailable")))
+    monkeypatch.setattr(workbench, "_recent_custom_signal_candidates", lambda limit=10: [
+        {"symbol": "SZ.002759", "name": "天际股份", "relation": "指数参考"}
+    ])
+    monkeypatch.setattr(workbench, "_load_signal_pool_rows", lambda limit=200, symbol=None: [])
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [
+        {
+            "symbol": "SZ.002759",
+            "dt": "2026-04-24 15:00",
+            "signal_type": "周线三买",
+            "signal_side": "buy",
+            "freq": "周线",
+            "confidence": 0.8,
+            "score": 30,
+            "source": "terminal_technical_signals",
+        },
+        {
+            "symbol": "SZ.002759",
+            "dt": "2026-04-24 15:00",
+            "signal_type": "日线一卖",
+            "signal_side": "sell",
+            "freq": "日线",
+            "confidence": 0.7,
+            "score": 24,
+            "source": "terminal_technical_signals",
+        },
+        {
+            "symbol": "SZ.002759",
+            "dt": "2026-04-24 10:30",
+            "signal_type": "30分钟二买",
+            "signal_side": "buy",
+            "freq": "30分钟",
+            "confidence": 0.75,
+            "score": 28,
+            "source": "terminal_technical_signals",
+        },
+        {
+            "symbol": "SZ.002759",
+            "dt": "2026-04-24 10:15",
+            "signal_type": "15分钟背驰卖",
+            "signal_side": "sell",
+            "freq": "15分钟",
+            "confidence": 0.65,
+            "score": 21,
+            "source": "terminal_technical_signals",
+        },
+        {
+            "symbol": "SZ.002759",
+            "dt": "2026-04-24 10:05",
+            "signal_type": "5分钟右侧确认",
+            "signal_side": "buy",
+            "freq": "5分钟",
+            "confidence": 0.62,
+            "score": 18,
+            "source": "terminal_technical_signals",
+        },
+    ])
+
+    payload = asyncio.run(workbench._build_static_index_target("科创50", "sh000688", "30min"))
+
+    candidate = payload["candidate_stocks"][0]
+    assert [item["badge"] for item in candidate["buy_timeframes"]] == ["W", "30m", "5m"]
+    assert [item["badge"] for item in candidate["sell_timeframes"]] == ["D", "15m"]
+    assert candidate["latest_signal"] == "卖D/卖15m/W/30m/5m"
+    assert candidate["reference_signal_count"] == 5
+    assert {item["freq"] for item in payload["related_custom_signals"]} >= {"weekly", "daily", "30min", "15min", "5min"}
+
+
 def test_us_index_minute_request_is_explicitly_unsupported(monkeypatch):
     from signals.web.api import workbench
 

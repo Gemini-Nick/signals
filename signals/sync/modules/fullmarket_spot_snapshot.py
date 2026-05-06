@@ -6,7 +6,7 @@ import logging
 import math
 import os
 import time
-from datetime import timedelta
+from datetime import time as dt_time, timedelta
 
 import requests
 from pymongo import UpdateOne
@@ -23,6 +23,7 @@ logger = logging.getLogger("signals.sync.fullmarket_spot_snapshot")
 _EM_CLIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 _EM_FIELDS = "f2,f3,f4,f5,f6,f7,f8,f12,f13,f14,f15,f16,f17,f18,f20,f21"
 _EM_FS = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048"
+QUOTE_TRADING_DAY_OPEN = dt_time(9, 15)
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -190,8 +191,8 @@ def sync_fullmarket_spot_snapshot(db: Database, proxy_url: str = None) -> dict:
     del proxy_url
     started = time.monotonic()
     now = naive_market_now("A")
-    trade_date = trading_day_key("A", now=now)
-    date_key = trading_day_key("A", now=now, compact=True)
+    trade_date = trading_day_key("A", now=now, open_time=QUOTE_TRADING_DAY_OPEN)
+    date_key = trading_day_key("A", now=now, compact=True, open_time=QUOTE_TRADING_DAY_OPEN)
     try:
         rows = fetch_eastmoney_spot_rows(db)
     except Exception as exc:

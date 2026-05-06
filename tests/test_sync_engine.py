@@ -27,6 +27,17 @@ def test_weekday_schedule_skips_cn_labor_day_holiday():
     assert SyncEngine._schedule_due("16:00-17:30 weekday", datetime(2026, 5, 9, 16, 1)) is True
 
 
+def test_a_quote_preopen_window_is_trading_day_only():
+    assert SyncEngine._a_quote_preopen_active(datetime(2026, 5, 6, 9, 15)) is True
+    assert SyncEngine._a_quote_preopen_active(datetime(2026, 5, 6, 9, 29)) is True
+    assert SyncEngine._a_quote_preopen_active(datetime(2026, 5, 6, 9, 30)) is False
+    assert SyncEngine._a_quote_preopen_active(datetime(2026, 5, 1, 9, 20)) is False
+
+
+def test_quote_preopen_sleep_wakes_at_auction_start():
+    assert SyncEngine._seconds_until_a_quote_preopen(datetime(2026, 5, 6, 9, 1)) == 14 * 60
+
+
 def test_sunday_schedule_only_on_sunday():
     sunday = datetime(2026, 4, 26, 10, 1)
     friday = datetime(2026, 4, 24, 10, 1)
@@ -224,16 +235,21 @@ def test_signal_lane_intraday_runs_readiness_probe():
         calls.append("minute_readiness_probe")
         return {"inserted": 1}
 
+    def intraday_scan_fn(db, proxy_url=None):
+        calls.append("intraday_technical_signal_scan")
+        return {"inserted": 1}
+
     engine.module_map = {
         "stock_minute": (stock_fn, ""),
         "index_minute": (index_fn, ""),
         "minute_readiness_probe": (readiness_fn, ""),
+        "intraday_technical_signal_scan": (intraday_scan_fn, ""),
     }
     engine.proxy_url = None
 
     results = engine._run_intraday_bundle({Market.A}, datetime(2026, 4, 27, 10, 0))
 
-    assert calls == ["index_minute", "stock_minute", "minute_readiness_probe"]
+    assert calls == ["index_minute", "stock_minute", "minute_readiness_probe", "intraday_technical_signal_scan"]
     assert [item["module"] for item in results] == calls
 
 
@@ -334,12 +350,12 @@ def test_workbench_lane_intraday_rebuilds_terminal_stock_pool():
         calls.append("market_pools")
         return {"inserted": 1}
 
-    def strategy_snapshot(db, proxy_url=None):
-        calls.append("strategy_snapshot")
-        return {"inserted": 1}
-
     def terminal_realtime_pool(db, proxy_url=None):
         calls.append("terminal_realtime_pool")
+        return {"inserted": 1}
+
+    def strategy_snapshot(db, proxy_url=None):
+        calls.append("strategy_snapshot")
         return {"inserted": 1}
 
     engine.module_map = {
@@ -351,7 +367,7 @@ def test_workbench_lane_intraday_rebuilds_terminal_stock_pool():
 
     results = engine._run_intraday_bundle({Market.A}, datetime(2026, 4, 27, 10, 0))
 
-    assert calls == ["market_pools", "strategy_snapshot", "terminal_realtime_pool"]
+    assert calls == ["market_pools", "terminal_realtime_pool", "strategy_snapshot"]
     assert [item["module"] for item in results] == calls
 
 

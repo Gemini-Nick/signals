@@ -83,6 +83,36 @@ def test_quote_doc_from_ulist_row_uses_batch_fields():
     assert doc["volume_unit"] == "shares"
 
 
+def test_quote_doc_from_ulist_row_tolerates_preopen_dash_fields():
+    row = {
+        "f2": 12.05,
+        "f3": 0.0,
+        "f4": 0.0,
+        "f5": "-",
+        "f6": "-",
+        "f7": 0.0,
+        "f8": 0.0,
+        "f12": "601857",
+        "f13": 1,
+        "f14": "中国石油",
+        "f15": "-",
+        "f16": "-",
+        "f17": "-",
+        "f18": 12.05,
+        "f20": "-",
+        "f21": "-",
+    }
+
+    doc = _quote_doc_from_ulist_row("SH.601857", row, datetime(2026, 5, 6, 9, 16), "2026-05-06")
+
+    assert doc is not None
+    assert doc["price"] == 12.05
+    assert doc["source_vol"] == 0.0
+    assert doc["amount"] == 0.0
+    assert doc["open"] == 0.0
+    assert doc["vol"] == 0
+
+
 class _Collection:
     def __init__(self, rows):
         self.rows = rows

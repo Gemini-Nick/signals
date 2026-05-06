@@ -2,8 +2,8 @@
 """
 指数分钟线同步 — 宏观观察指数 5M/15M/30M
 
-数据源: Sina/Tencent 公共分钟线；东财指数分钟线可显式开启为最后兜底
-策略: 全量覆盖（数据量小，近 5 天窗口）
+数据源: Sina 公共分钟线；Tencent 指数单位不一致，仅显式开启时兜底；东财可显式开启为最后兜底
+策略: 尾部 upsert，刷新实时未收盘 K 线并覆盖旧的错误来源缓存
 频率: 工作日 16:00
 """
 import logging
@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import akshare as ak
 import pandas as pd
+from pymongo import UpdateOne
 from pymongo.database import Database
 
 from signals.core.macro_universe import macro_a_index_codes
@@ -53,36 +54,65 @@ def _tail_count_for_freq(freq: str) -> int:
     return _int_env(f"INDEX_MINUTE_TAIL_COUNT_{suffix}", generic, min_value=40, max_value=500)
 
 
-def _insert_new_docs(col, symbol: str, freq: str, docs: list[dict]) -> dict:
+def _minute_providers() -> tuple[str, ...]:
+    configured = os.getenv("INDEX_MINUTE_PROVIDERS", "").strip()
+    if configured:
+        providers = tuple(item.strip().lower() for item in configured.replace(";", ",").split(",") if item.strip())
+        if providers:
+            return providers
+    if os.getenv("INDEX_MINUTE_TENCENT_FALLBACK", "false").lower() in {"1", "true", "yes", "on"}:
+        return ("sina", "tencent")
+    return ("sina",)
+
+
+def _upsert_tail_docs(col, symbol: str, freq: str, docs: list[dict]) -> dict:
     if not docs:
-        return {"inserted": 0, "skipped_existing": 0}
-    latest = col.find_one(
-        {"meta.symbol": symbol, "meta.freq": freq},
-        {"dt": 1},
-        sort=[("dt", -1)],
-    )
-    latest_dt = latest.get("dt") if latest else None
-    new_docs = [doc for doc in docs if latest_dt is None or doc["dt"] > latest_dt]
-    inserted = 0
-    if new_docs:
-        result = col.insert_many([dict(item) for item in new_docs], ordered=False)
-        inserted = len(result.inserted_ids)
-    return {"inserted": inserted, "skipped_existing": len(docs) - len(new_docs)}
+        return {"written": 0, "inserted": 0, "modified": 0, "matched": 0, "upserted": 0, "skipped_existing": 0}
+    ops = []
+    for doc in docs:
+        selector = {"meta.symbol": symbol, "meta.freq": freq, "dt": doc["dt"]}
+        ops.append(UpdateOne(selector, {"$set": dict(doc)}, upsert=True))
+    result = col.bulk_write(ops, ordered=False)
+    upserted = len(getattr(result, "upserted_ids", {}) or {})
+    modified = int(getattr(result, "modified_count", 0) or 0)
+    matched = int(getattr(result, "matched_count", 0) or 0)
+    return {
+        "written": upserted + modified,
+        "inserted": upserted,
+        "modified": modified,
+        "matched": matched,
+        "upserted": upserted,
+        "skipped_existing": max(0, matched - modified),
+    }
 
 
 def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict]) -> dict:
     if not docs:
-        return {"inserted": 0, "compat_inserted": 0, "skipped_existing": 0}
+        return {
+            "inserted": 0,
+            "modified": 0,
+            "written": 0,
+            "compat_inserted": 0,
+            "compat_modified": 0,
+            "compat_written": 0,
+            "skipped_existing": 0,
+            "compat_skipped_existing": 0,
+            "bar_count": 0,
+        }
     prepared = []
     for doc in docs:
         item = dict(doc)
         item["meta"] = {**item.get("meta", {}), "symbol": symbol, "freq": freq, "asset_type": "index", "market": "A"}
         prepared.append(item)
-    primary = _insert_new_docs(db["index_bars"], symbol, freq, prepared)
-    compat = _insert_new_docs(db["bars"], symbol, freq, prepared)
+    primary = _upsert_tail_docs(db["index_bars"], symbol, freq, prepared)
+    compat = _upsert_tail_docs(db["bars"], symbol, freq, prepared)
     return {
         "inserted": primary["inserted"],
+        "modified": primary["modified"],
+        "written": primary["written"],
         "compat_inserted": compat["inserted"],
+        "compat_modified": compat["modified"],
+        "compat_written": compat["written"],
         "skipped_existing": primary["skipped_existing"],
         "compat_skipped_existing": compat["skipped_existing"],
         "bar_count": len(prepared),
@@ -103,6 +133,7 @@ def _fetch_index_docs(
         df, source = fetch_public_minute(
             symbol,
             period,
+            providers=_minute_providers(),
             timeout=_PUBLIC_TIMEOUT,
             datalen=tail_count,
             count=tail_count,
@@ -152,6 +183,10 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
     sync_col = db["sync_log"]
     inserted = 0
     compat_inserted = 0
+    modified = 0
+    compat_modified = 0
+    written_total = 0
+    compat_written_total = 0
     skipped_existing = 0
     errors = []
     empty = 0
@@ -175,13 +210,23 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
                     "last_run": naive_market_now("A"),
                     "status": "empty",
                     "incremental": True,
-                    "write_mode": "insert_new",
+                    "write_mode": "upsert_tail",
+                    "providers": list(_minute_providers()),
                     "tail_count": tail_counts[freq],
                     "elapsed": round(time.monotonic() - started, 3),
                 }},
                 upsert=True,
             )
-            return {"status": "empty", "inserted": 0, "compat_inserted": 0, "skipped_existing": 0}
+            return {
+                "status": "empty",
+                "inserted": 0,
+                "modified": 0,
+                "written": 0,
+                "compat_inserted": 0,
+                "compat_modified": 0,
+                "compat_written": 0,
+                "skipped_existing": 0,
+            }
 
         written = _write_index_docs(db, symbol, freq, docs)
         sync_col.update_one(
@@ -195,17 +240,22 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
                 "status": "ok",
                 "bar_count": written["bar_count"],
                 "inserted": written["inserted"],
+                "modified": written["modified"],
+                "written": written["written"],
                 "compat_inserted": written["compat_inserted"],
+                "compat_modified": written["compat_modified"],
+                "compat_written": written["compat_written"],
                 "skipped_existing": written["skipped_existing"],
                 "source": source,
                 "incremental": True,
-                "write_mode": "insert_new",
+                "write_mode": "upsert_tail",
+                "providers": list(_minute_providers()),
                 "tail_count": tail_counts[freq],
                 "elapsed": round(time.monotonic() - started, 3),
             }},
             upsert=True,
         )
-        logger.info("  ✓ %s %s: inserted=%d skipped_existing=%d", name, freq, written["inserted"], written["skipped_existing"])
+        logger.info("  ✓ %s %s: written=%d inserted=%d modified=%d skipped_existing=%d", name, freq, written["written"], written["inserted"], written["modified"], written["skipped_existing"])
         return {"status": "ok", **written}
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -218,6 +268,10 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
                     empty += 1
                 inserted += int(result.get("inserted") or 0)
                 compat_inserted += int(result.get("compat_inserted") or 0)
+                modified += int(result.get("modified") or 0)
+                compat_modified += int(result.get("compat_modified") or 0)
+                written_total += int(result.get("written") or 0)
+                compat_written_total += int(result.get("compat_written") or 0)
                 skipped_existing += int(result.get("skipped_existing") or 0)
             except Exception as exc:
                 errors.append({"name": name, "symbol": symbol, "freq": freq, "error": str(exc)[:240]})
@@ -225,7 +279,11 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
 
     return {
         "inserted": inserted,
+        "modified": modified,
+        "written": written_total,
         "compat_inserted": compat_inserted,
+        "compat_modified": compat_modified,
+        "compat_written": compat_written_total,
         "skipped_existing": skipped_existing,
         "errors": len(errors),
         "empty": empty,
@@ -233,7 +291,8 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
         "tail_counts": tail_counts,
         "planned_calls": len(tasks),
         "incremental": True,
-        "write_mode": "insert_new",
+        "write_mode": "upsert_tail",
+        "providers": list(_minute_providers()),
     }
 
 
@@ -256,19 +315,25 @@ def sync_index_minute(db: Database, proxy_url: str = None) -> dict:
             "planned_calls": result.get("planned_calls", 0),
             "failed_calls": result.get("errors", 0),
             "empty_calls": result.get("empty", 0),
-            "written": result.get("inserted", 0),
+            "inserted": result.get("inserted", 0),
+            "modified": result.get("modified", 0),
+            "written": result.get("written", 0),
             "skipped_existing": result.get("skipped_existing", 0),
             "tail_counts": result.get("tail_counts", {}),
             "result": result,
             "error_msg": "" if status == "ok" else "index_minute_partial",
             "degraded_reason": "" if status == "ok" else "empty_or_failed_index_minute_calls",
+            "write_mode": "upsert_tail",
+            "providers": list(_minute_providers()),
         }},
         upsert=True,
     )
 
     logger.info(
-        "指数分钟线完成: inserted=%d skipped_existing=%d failed=%d",
+        "指数分钟线完成: written=%d inserted=%d modified=%d skipped_existing=%d failed=%d",
+        result["written"],
         result["inserted"],
+        result["modified"],
         result["skipped_existing"],
         result["errors"],
     )

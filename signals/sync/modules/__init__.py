@@ -19,7 +19,7 @@ from .strategy_snapshot import sync_strategy_snapshot
 from .minute_readiness import sync_minute_readiness_probe
 from .weekly_rollup import sync_weekly_rollup
 from .terminal_pool import sync_terminal_realtime_pool
-from .technical_signal_scan import sync_technical_signal_scan
+from .technical_signal_scan import sync_intraday_technical_signal_scan, sync_technical_signal_scan
 from .knowledge_market_views import sync_knowledge_market_views
 from .concept_relationship_graph import sync_concept_relationship_graph
 from .calendar_validate import sync_calendar_validate
@@ -37,6 +37,7 @@ ALL_MODULES = [
     ("concept_heat_minute", sync_concept_heat_minute, "15:05 weekday"),
     ("chain_heat_snapshots", sync_chain_heat_snapshots, "15:06 weekday"),
     ("minute_readiness_probe", sync_minute_readiness_probe, "15:10 weekday"),
+    ("intraday_technical_signal_scan", sync_intraday_technical_signal_scan, "live only"),
     ("stock_daily",   sync_stock_daily,   "16:00-17:30 weekday"),
     ("stock_30m_fullmarket", sync_stock_30m_fullmarket, "17:00-20:30 weekday"),
     ("index_daily",   sync_index_daily,   "16:00-17:30 weekday"),

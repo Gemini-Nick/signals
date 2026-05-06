@@ -62,6 +62,7 @@ MODULE_TARGETS = {
     "chain_heat_snapshots": ("chain_heat_snapshots",),
     "concept_relationship_graph": ("concept_relationship_graph",),
     "technical_signal_scan": ("terminal_technical_signals",),
+    "intraday_technical_signal_scan": ("terminal_technical_signals",),
     "knowledge_market_views": ("knowledge_market_views",),
     "minute_readiness_probe": ("minute_readiness",),
     "weekly_rollup": ("bars", "index_bars"),
@@ -117,15 +118,19 @@ REALTIME_MODULES = {
     "minute_readiness_probe",
     "board_ranking",
     "strategy_snapshot",
+    "intraday_technical_signal_scan",
 }
 
 EMPTY_OK_MODULES = {
     "technical_signal_scan",
+    "intraday_technical_signal_scan",
     "knowledge_market_views",
     "concept_relationship_graph",
 }
 
 SYNC_TZ = ZoneInfo(os.getenv("SIGNALS_SYNC_TIMEZONE", "Asia/Shanghai"))
+QUOTE_PREOPEN_START = dt_time(9, 15)
+QUOTE_PREOPEN_END = dt_time(9, 30)
 
 
 def _env_seconds(name: str, default: int, *, minimum: int = 60) -> int:
@@ -173,9 +178,10 @@ LIVE_SYNC_PLANS = {
         LiveSyncPlan("index_minute", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 120, 20),
         LiveSyncPlan("stock_minute", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 240, 30),
         LiveSyncPlan("minute_readiness_probe", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 60, 35),
+        LiveSyncPlan("intraday_technical_signal_scan", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 240, 38),
         LiveSyncPlan("market_pools", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 60, 40),
-        LiveSyncPlan("strategy_snapshot", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 90, 50),
-        LiveSyncPlan("terminal_realtime_pool", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 120, 55),
+        LiveSyncPlan("terminal_realtime_pool", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 120, 50),
+        LiveSyncPlan("strategy_snapshot", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 90, 55),
         LiveSyncPlan("board_heat_minute", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 180, 60),
         LiveSyncPlan("concept_heat_minute", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 180, 65),
         LiveSyncPlan("chain_heat_snapshots", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 90, 70),
@@ -227,6 +233,7 @@ BOOTSTRAP_LANE_MODULES = {
     "cache_preheat": {"workbench_lane"},
     "signal_pool": {"workbench_lane"},
     "technical_signal_scan": {"workbench_lane"},
+    "intraday_technical_signal_scan": {"signal_lane"},
     "knowledge_market_views": {"workbench_lane"},
     "concept_relationship_graph": {"workbench_lane"},
     "stock_30m_fullmarket": {"workbench_lane"},
@@ -773,6 +780,8 @@ class SyncEngine:
         if self.enabled_lanes is not None:
             return results
         for name, fn, schedule in self.modules:
+            if schedule == "live only":
+                continue
             if not self._module_allowed_for_lanes(name):
                 continue
             plan = LANE_MAINTENANCE_PLANS.get(name)
@@ -824,6 +833,33 @@ class SyncEngine:
             return False
         return now.time() >= start
 
+    @staticmethod
+    def _is_a_trading_day(day) -> bool:
+        try:
+            from signals.core.trading_dates import is_trading_day
+
+            return bool(is_trading_day("A", day))
+        except Exception:
+            return day.weekday() < 5
+
+    @classmethod
+    def _a_quote_preopen_active(cls, now: datetime) -> bool:
+        if not cls._is_a_trading_day(now.date()):
+            return False
+        return QUOTE_PREOPEN_START <= now.time() < QUOTE_PREOPEN_END
+
+    @classmethod
+    def _seconds_until_a_quote_preopen(cls, now: datetime) -> int:
+        if not cls._is_a_trading_day(now.date()):
+            return 24 * 60 * 60
+        start = datetime.combine(now.date(), QUOTE_PREOPEN_START)
+        if now < start:
+            return max(0, int((start - now).total_seconds()))
+        return 24 * 60 * 60
+
+    def _quote_preopen_enabled(self) -> bool:
+        return self.enabled_lanes is not None and self.enabled_lanes <= {"quote_lane"}
+
     def bootstrap_preheat(self) -> list[dict]:
         """Run conservative startup preheat for empty critical collections."""
         checks = [
@@ -867,6 +903,9 @@ class SyncEngine:
             now = self._now()
             today = now.strftime("%Y-%m-%d")
             active_markets = get_active_markets(self._now_utc())
+            quote_preopen = self._quote_preopen_enabled() and self._a_quote_preopen_active(now)
+            if not active_markets and quote_preopen:
+                active_markets = {Market.A}
 
             if self.enabled_lanes is None:
                 self._run_scheduled_modules(now, today)
@@ -878,6 +917,8 @@ class SyncEngine:
                 sleep_seconds = check_interval
             else:
                 next_seconds = next_live_check_seconds(self._now_utc())
+                if self._quote_preopen_enabled():
+                    next_seconds = min(next_seconds, self._seconds_until_a_quote_preopen(now))
                 sleep_seconds = min(max(next_seconds, check_interval), 3600)
 
             time.sleep(sleep_seconds)

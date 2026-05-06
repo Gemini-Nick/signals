@@ -53,7 +53,8 @@ router = APIRouter(prefix="/api/workbench", tags=["workbench"])
 UI_FREQS = ["30min", "15min", "5min", "daily", "weekly"]
 DEFAULT_TERMINAL_FREQ = "30min"
 MINUTE_FREQS = {"5min", "5m", "15min", "15m", "30min", "30m"}
-BUY_FREQS = ["daily", "30min", "15min", "5min"]
+REALTIME_DAY_CHANGE_FREQS = ("5min", "15min", "30min")
+BUY_FREQS = ["weekly", "daily", "30min", "15min", "5min"]
 CHART_FREQ_ORDER = {"weekly": 0, "daily": 1, "30min": 2, "15min": 3, "5min": 4}
 SECOND_SCREEN_LANES = {
     "quote_lane": {
@@ -1112,6 +1113,89 @@ def _compute_day_change_pct(df: pd.DataFrame) -> Optional[float]:
     return round((latest - previous) / previous * 100, 2)
 
 
+def _intraday_day_change_from_df(df: pd.DataFrame) -> tuple[Optional[float], Optional[float], str]:
+    if df is None or df.empty or "close" not in df.columns:
+        return None, None, ""
+    working = df.sort_index().copy()
+    try:
+        latest_ts = pd.to_datetime(working.index.max())
+    except Exception:
+        return None, None, ""
+    same_day = working[pd.to_datetime(working.index, errors="coerce").date == latest_ts.date()]
+    if same_day.empty:
+        same_day = working
+    closes = pd.to_numeric(same_day["close"], errors="coerce").dropna()
+    if closes.empty:
+        return None, None, latest_ts.date().isoformat()
+    latest = float(closes.iloc[-1])
+    if "open" in same_day.columns:
+        opens = pd.to_numeric(same_day["open"], errors="coerce").dropna()
+        baseline = float(opens.iloc[0]) if not opens.empty else None
+    else:
+        baseline = float(closes.iloc[0]) if len(closes) >= 1 else None
+    if baseline is None or baseline <= 0:
+        return None, latest, latest_ts.date().isoformat()
+    return round((latest - baseline) / baseline * 100, 2), latest, latest_ts.date().isoformat()
+
+
+def _shortest_realtime_day_change(kind: str, symbol: str) -> dict[str, Any]:
+    target = _text(symbol)
+    if not target:
+        return {}
+    for freq in REALTIME_DAY_CHANGE_FREQS:
+        try:
+            if kind == "index":
+                df, source = _index_df(target, freq)
+            elif kind == "stock":
+                df, source = _stock_df(target, freq)
+            elif kind in {"industry", "concept"}:
+                chart, latest_heat = _board_heat_chart(target, kind, freq)
+                value = _float(latest_heat.get("change_pct"))
+                if value is None:
+                    continue
+                latest_price = _first_numeric(
+                    latest_heat.get("change_pct"),
+                    (chart.get("ohlcv") or [{}])[-1].get("close") if chart.get("ohlcv") else None,
+                )
+                as_of = _date_text(latest_heat.get("trade_minute")) or _date_text(
+                    (chart.get("ohlcv") or [{}])[-1].get("time") if chart.get("ohlcv") else None
+                )
+                return {
+                    "day_change_pct": value,
+                    "daily_change_pct": value,
+                    "today_change_pct": value,
+                    "gain_pct": value,
+                    "latest_price": latest_price,
+                    "day_change_source": "board_heat_ticks",
+                    "day_change_mode": "minute_intraday",
+                    "day_change_as_of": as_of,
+                    "day_change_freq": freq,
+                }
+            else:
+                return {}
+        except Exception:
+            continue
+        value, latest_price, as_of = _intraday_day_change_from_df(df)
+        if value is None:
+            continue
+        return {
+            "day_change_pct": value,
+            "daily_change_pct": value,
+            "today_change_pct": value,
+            "gain_pct": value,
+            "latest_price": latest_price,
+            "day_change_source": f"{source or 'bars'}:{freq}",
+            "day_change_mode": "minute_intraday",
+            "day_change_as_of": as_of,
+            "day_change_freq": freq,
+        }
+    return {}
+
+
+def _has_minute_day_change(row: dict[str, Any]) -> bool:
+    return _text(row.get("day_change_mode")) == "minute_intraday" or _text(row.get("day_change_freq")) in REALTIME_DAY_CHANGE_FREQS
+
+
 def _ma_signal_from_df(df: pd.DataFrame) -> str:
     if df is None or df.empty or "close" not in df.columns:
         return "数据待预热"
@@ -1514,6 +1598,13 @@ def _latest_daily_trading_values(symbol: str, chart: Optional[dict[str, Any]] = 
 def _apply_quote_overlay(row: dict[str, Any], symbol: str) -> dict[str, Any]:
     overlay = _quote_overlay_for_symbol(symbol)
     updated = dict(row)
+    if _has_minute_day_change(updated):
+        quote_only = {
+            key: value for key, value in overlay.items()
+            if key not in {"latest_price", "realtime_price", "day_change_pct", "daily_change_pct", "today_change_pct", "gain_pct", "day_change_source", "day_change_mode", "day_change_as_of"}
+        }
+        updated.update(quote_only)
+        return updated
     if overlay.get("day_change_mode") == "quote_intraday" and overlay.get("quote_status") in {"stale", "missing"}:
         updated.update({
             "day_change_pct": None,
@@ -1543,17 +1634,20 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         if df is not None and not df.empty and "close" in df.columns
         else None
     )
+    minute_change = _shortest_realtime_day_change("stock", normalized)
     metadata = dict(row.get("metadata") or {}) if isinstance(row.get("metadata"), dict) else {}
-    latest_price = (daily_close_price or cached_latest_price) if day_change_mode == "daily_close" else (
+    latest_price = minute_change.get("latest_price") or ((daily_close_price or cached_latest_price) if day_change_mode == "daily_close" else (
         row.get("latest_price")
         or row.get("price")
         or metadata.get("price")
         or daily_close_price
         or cached_latest_price
-    )
+    ))
     enriched = dict(row)
-    day_change_pct = daily_day_change if day_change_mode == "daily_close" else None
-    day_change_source = daily_day_source if day_change_mode == "daily_close" else ""
+    day_change_pct = minute_change.get("day_change_pct") if minute_change else (daily_day_change if day_change_mode == "daily_close" else None)
+    day_change_source = minute_change.get("day_change_source") if minute_change else (daily_day_source if day_change_mode == "daily_close" else "")
+    effective_day_change_mode = minute_change.get("day_change_mode") if minute_change else day_change_mode
+    day_change_as_of = minute_change.get("day_change_as_of") if minute_change else (daily_as_of if day_change_mode == "daily_close" else "")
     latest_signal = _text(row.get("latest_signal") or row.get("signal") or row.get("reason") or row.get("direction"))
     enriched.update({
         "kind": "stock",
@@ -1565,9 +1659,12 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "latest_price": latest_price,
         "day_change_pct": day_change_pct,
         "daily_change_pct": day_change_pct,
+        "today_change_pct": minute_change.get("today_change_pct") if minute_change else None,
+        "gain_pct": minute_change.get("gain_pct") if minute_change else row.get("gain_pct"),
         "day_change_source": day_change_source,
-        "day_change_mode": day_change_mode,
-        "day_change_as_of": daily_as_of if day_change_mode == "daily_close" else "",
+        "day_change_mode": effective_day_change_mode,
+        "day_change_as_of": day_change_as_of,
+        "day_change_freq": minute_change.get("day_change_freq") if minute_change else "",
         "latest_signal": latest_signal or _ma_signal_from_df(df),
         "range_returns": _compute_range_returns(df, range_columns),
         "range_return_source": source,
@@ -1877,20 +1974,26 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         if df is not None and not df.empty and "close" in df.columns
         else None
     )
-    day_change_pct = daily_day_change if day_change_mode == "daily_close" else None
-    day_change_source = daily_day_source if day_change_mode == "daily_close" else ""
+    minute_change = _shortest_realtime_day_change("index", symbol)
+    day_change_pct = minute_change.get("day_change_pct") if minute_change else (daily_day_change if day_change_mode == "daily_close" else None)
+    day_change_source = minute_change.get("day_change_source") if minute_change else (daily_day_source if day_change_mode == "daily_close" else "")
+    effective_day_change_mode = minute_change.get("day_change_mode") if minute_change else day_change_mode
+    day_change_as_of = minute_change.get("day_change_as_of") if minute_change else (daily_as_of if day_change_mode == "daily_close" else "")
     enriched = dict(row)
     enriched.update({
         "kind": "index",
         "label": row.get("name") or row.get("label") or symbol,
         "name": row.get("name") or row.get("label") or symbol,
         "code": symbol,
-        "latest_price": (daily_close_price or cached_latest_price) if day_change_mode == "daily_close" else (row.get("latest_price") or cached_latest_price),
+        "latest_price": minute_change.get("latest_price") or ((daily_close_price or cached_latest_price) if day_change_mode == "daily_close" else (row.get("latest_price") or cached_latest_price)),
         "day_change_pct": day_change_pct,
         "daily_change_pct": day_change_pct,
+        "today_change_pct": minute_change.get("today_change_pct") if minute_change else None,
+        "gain_pct": minute_change.get("gain_pct") if minute_change else row.get("gain_pct"),
         "day_change_source": day_change_source,
-        "day_change_mode": day_change_mode,
-        "day_change_as_of": daily_as_of if day_change_mode == "daily_close" else "",
+        "day_change_mode": effective_day_change_mode,
+        "day_change_as_of": day_change_as_of,
+        "day_change_freq": minute_change.get("day_change_freq") if minute_change else "",
         "latest_signal": _signal_or_fallback(row, df),
         "range_returns": _compute_range_returns(df, range_columns),
         "range_return_source": source,
@@ -2480,6 +2583,7 @@ def _related_custom_signals_from_candidates(
     current_freq = _freq_bucket(requested_freq)
     related: list[dict[str, Any]] = []
     seen_symbols: set[str] = set()
+    seen_signals: set[str] = set()
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
@@ -2487,31 +2591,148 @@ def _related_custom_signals_from_candidates(
         if not symbol or symbol in seen_symbols:
             continue
         seen_symbols.add(symbol)
-        rows = _custom_signal_rows(symbol, limit=200)
+        candidate_reference_signals = candidate.get("reference_signals") if isinstance(candidate.get("reference_signals"), list) else []
+        rows = (
+            [dict(item) for item in candidate_reference_signals if isinstance(item, dict)]
+            if candidate_reference_signals
+            else [
+                *(_load_terminal_technical_signal_rows(symbol, limit=80) or []),
+                *_custom_signal_rows(symbol, limit=200),
+            ]
+        )
         if not rows:
             continue
-        preferred = [
+        current_rows = [
             row for row in rows
             if _freq_bucket(row.get("freq") or row.get("timeframe")) in {current_freq, ""}
-        ] or rows
-        for row in preferred[:2]:
+        ]
+        preferred = [*current_rows, *[row for row in rows if row not in current_rows]]
+        preferred.sort(
+            key=lambda item: (
+                0 if _freq_bucket(item.get("freq") or item.get("timeframe")) == current_freq else 1,
+                CHART_FREQ_ORDER.get(_freq_bucket(item.get("freq") or item.get("timeframe")), 99),
+                _text(item.get("dt") or item.get("signal_date") or item.get("updated_at")),
+            )
+        )
+        for row in preferred[:6]:
             signal_type = _text(row.get("signal_type") or row.get("type") or row.get("reason"))
+            if not signal_type:
+                continue
+            freq = _freq_bucket(row.get("freq") or row.get("timeframe"))
+            signal_date = row.get("signal_date") or row.get("dt") or row.get("updated_at")
+            key = "|".join([symbol, freq, signal_type, _text(signal_date)[:10]])
+            if key in seen_signals:
+                continue
+            seen_signals.add(key)
             related.append({
                 "symbol": symbol,
                 "name": _text(candidate.get("name") or candidate.get("stock_name")) or _stock_name(symbol),
                 "relation": _text(candidate.get("relation") or candidate.get("role") or candidate.get("representative_type")),
                 "type": signal_type,
                 "signal_type": signal_type,
-                "freq": _freq_bucket(row.get("freq") or row.get("timeframe")),
+                "freq": freq,
                 "date_str": _signal_date(row),
-                "signal_date": row.get("signal_date") or row.get("dt") or row.get("updated_at"),
-                "source": row.get("source") or "signals.signal_pool",
-                "details": _signal_details(row),
+                "signal_date": signal_date,
+                "source": row.get("source") or ("terminal_technical_signals" if row.get("signal_family") or row.get("technical_evidence") else "signals.signal_pool"),
+                "details": _text(row.get("details")) or _signal_details(row),
                 "confidence": _float(row.get("confidence")),
+                "score": _float(row.get("score") or row.get("total_score")),
+                "price": _float(row.get("price")),
+                "signal_side": _manual_clue_signal_side(row),
             })
             if len(related) >= limit:
                 return related
     return related
+
+
+def _enrich_reference_candidate_signals(
+    candidates: list[dict[str, Any]],
+    requested_freq: str,
+    *,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for candidate in candidates[:limit]:
+        if not isinstance(candidate, dict):
+            continue
+        row = dict(candidate)
+        symbol, raw_code = _candidate_stock_symbol(row)
+        if not symbol:
+            output.append(row)
+            continue
+        row.setdefault("symbol", symbol)
+        row.setdefault("code", symbol)
+        row.setdefault("raw_code", raw_code or symbol.split(".", 1)[-1])
+        row.setdefault("name", _stock_name(symbol, row))
+        row["timeframe_signals"] = dict(row.get("timeframe_signals") if isinstance(row.get("timeframe_signals"), dict) else {})
+        row["sell_timeframe_signals"] = dict(row.get("sell_timeframe_signals") if isinstance(row.get("sell_timeframe_signals"), dict) else {})
+        row["timeframe_signal_stack"] = dict(row.get("timeframe_signal_stack") if isinstance(row.get("timeframe_signal_stack"), dict) else {})
+
+        reference_rows = [
+            *(_load_terminal_technical_signal_rows(symbol, limit=80) or []),
+            *_load_signal_pool_rows(limit=120, symbol=symbol),
+        ]
+        reference_signals: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for signal in reference_rows:
+            side = _manual_clue_signal_side(signal)
+            if side not in {"buy", "sell"}:
+                continue
+            signal_type = _text(signal.get("signal_type") or signal.get("type") or signal.get("reason"))
+            if not signal_type:
+                continue
+            freq = _freq_bucket(signal.get("freq") or signal.get("timeframe"))
+            key = "|".join([
+                side,
+                freq,
+                signal_type,
+                _text(signal.get("dt") or signal.get("signal_date") or signal.get("updated_at"))[:10],
+            ])
+            if key in seen:
+                continue
+            seen.add(key)
+            _add_timeframe_signal(row, signal, side=side)
+            reference_signals.append({
+                "symbol": symbol,
+                "name": row.get("name"),
+                "type": signal_type,
+                "signal_type": signal_type,
+                "freq": freq,
+                "side": side,
+                "signal_side": side,
+                "date_str": _signal_date(signal),
+                "signal_date": signal.get("signal_date") or signal.get("dt") or signal.get("updated_at"),
+                "source": signal.get("source") or ("terminal_technical_signals" if signal.get("signal_family") or signal.get("technical_evidence") else "signals.signal_pool"),
+                "details": _signal_details(signal),
+                "confidence": _float(signal.get("confidence")),
+                "score": _float(signal.get("score") or signal.get("total_score")),
+                "price": _float(signal.get("price")),
+            })
+
+        buy_signals = row.get("timeframe_signals") if isinstance(row.get("timeframe_signals"), dict) else {}
+        sell_signals = row.get("sell_timeframe_signals") if isinstance(row.get("sell_timeframe_signals"), dict) else {}
+        row["buy_timeframes"] = [buy_signals[freq] for freq in BUY_FREQS if freq in buy_signals]
+        row["sell_timeframes"] = [sell_signals[freq] for freq in BUY_FREQS if freq in sell_signals]
+        row["signal_stack"] = {
+            freq: row.get("timeframe_signal_stack", {}).get(freq)
+            for freq in BUY_FREQS
+            if isinstance(row.get("timeframe_signal_stack"), dict) and row.get("timeframe_signal_stack", {}).get(freq)
+        }
+        if reference_signals:
+            row["reference_signals"] = reference_signals[:8]
+            row["reference_signal_count"] = len(reference_signals)
+            sell_badges = [f"卖{item.get('badge') or item.get('freq') or ''}" for item in row.get("sell_timeframes", []) if isinstance(item, dict)]
+            buy_badges = [item.get("badge") or item.get("freq") or "" for item in row.get("buy_timeframes", []) if isinstance(item, dict)]
+            row["latest_signal"] = "/".join([badge for badge in sell_badges + buy_badges if badge]) or row.get("latest_signal")
+            row["evidence_summary"] = "参考个股买卖点: " + " / ".join(
+                [
+                    " ".join([_freq_badge(item.get("freq")), _text(item.get("type") or item.get("signal_type"))]).strip()
+                    for item in reference_signals[:4]
+                    if isinstance(item, dict)
+                ]
+            )
+        output.append(row)
+    return output
 
 
 def _recent_custom_signal_candidates(*, limit: int = 10) -> list[dict[str, Any]]:
@@ -3759,8 +3980,12 @@ def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
             else None
         )
         carrier_day_change = _compute_day_change_pct(carrier_df)
+    minute_change = _shortest_realtime_day_change(kind, heat_target_label)
     board_day_change, board_day_as_of = _latest_board_heat_day_change(kind, heat_target_label)
-    board_day_change_source = "board_heat_ticks" if board_day_change is not None else ""
+    if minute_change:
+        board_day_change = minute_change.get("day_change_pct")
+        board_day_as_of = _text(minute_change.get("day_change_as_of"))
+    board_day_change_source = _text(minute_change.get("day_change_source")) if minute_change else ("board_heat_ticks" if board_day_change is not None else "")
     board_range_returns = enriched.get("range_returns") or {}
     carrier_name = carrier_payload.get("name") or carrier_payload.get("symbol") or ""
     action_status = "观察" if carrier_payload else "退出复盘"
@@ -3805,9 +4030,12 @@ def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
         "latest_price": enriched.get("latest_price"),
         "day_change_pct": board_day_change,
         "daily_change_pct": board_day_change,
+        "today_change_pct": minute_change.get("today_change_pct") if minute_change else None,
+        "gain_pct": minute_change.get("gain_pct") if minute_change else enriched.get("gain_pct"),
         "day_change_source": board_day_change_source,
-        "day_change_mode": _a_day_change_mode(),
+        "day_change_mode": minute_change.get("day_change_mode") if minute_change else _a_day_change_mode(),
         "day_change_as_of": board_day_as_of,
+        "day_change_freq": minute_change.get("day_change_freq") if minute_change else "",
         "range_returns": board_range_returns,
         "range_return_source": enriched.get("range_return_source") or "",
         "range_return_status": "board_kline" if board_range_returns else "board_kline_missing",
@@ -4446,6 +4674,10 @@ def _focus_stock_pool_meta(focus_count: int) -> dict[str, Any]:
                 empty_reason = "terminal_technical_signals=0"
             elif run.get("status") == "partial":
                 empty_reason = "postmarket partial"
+            elif int(doc.get("candidate_count") or 0) > 0 or doc.get("watch_stocks") or doc.get("clue_stocks") or doc.get("risk_stocks"):
+                empty_reason = _text(freshness.get("stale_reason"))
+                if empty_reason in {"", "terminal_stock_pool_empty", "terminal_focus_stock_pool_empty"}:
+                    empty_reason = "当前没有通过确认买点闸门；标的已进入盯盘池/线索池等待30m与5m/15m确认。"
             else:
                 empty_reason = _text(freshness.get("stale_reason")) or "terminal_stock_pool_empty"
         meta.update({
@@ -6056,7 +6288,9 @@ def _summary_from_index(report: Dict[str, Any], chart: Dict[str, Any]) -> Dict[s
         "key_levels": chart_report.get("key_levels") or ma_context.get("key_levels") or [],
         "style_switch": style_switch.suggestion if style_switch else "",
     }
-    summary.update(_quote_overlay_for_symbol(str(report.get("symbol") or "")))
+    symbol = str(report.get("symbol") or "")
+    summary.update(_shortest_realtime_day_change("index", symbol))
+    summary = _apply_quote_overlay(summary, symbol)
     if summary.get("today_change_pct") is not None:
         summary["gain_pct"] = summary.get("today_change_pct")
     return summary
@@ -6075,7 +6309,8 @@ def _summary_from_static_index(name: str, symbol: str, chart: Dict[str, Any]) ->
         "latest_signal": "",
         "key_levels": [],
     }
-    summary.update(_quote_overlay_for_symbol(symbol))
+    summary.update(_shortest_realtime_day_change("index", symbol))
+    summary = _apply_quote_overlay(summary, symbol)
     if summary.get("today_change_pct") is not None:
         summary["gain_pct"] = summary.get("today_change_pct")
     chain_position = _stock_chain_position_summary(symbol)
@@ -6114,7 +6349,7 @@ def _summary_from_industry(name: str, detail: Dict[str, Any], ranking) -> Dict[s
         conclusion = "行业趋势偏强，可结合候选股观察入场。"
     elif report.get("has_sell_signal"):
         conclusion = "行业处于分歧或退潮，优先防守。"
-    return {
+    summary = {
         "title": name,
         "subtitle": info.get("rotation_line", ""),
         "latest_price": detail.get("ohlcv", [{}])[-1].get("close", 0) if detail.get("ohlcv") else 0,
@@ -6130,6 +6365,10 @@ def _summary_from_industry(name: str, detail: Dict[str, Any], ranking) -> Dict[s
         "phase_hint": info.get("phase_hint", ""),
         "candidate_count": len(ranking.candidates) if ranking else 0,
     }
+    minute_change = _shortest_realtime_day_change("industry", name)
+    if minute_change:
+        summary.update(minute_change)
+    return summary
 
 
 def _stock_chain_position_summary(symbol: str) -> dict[str, Any]:
@@ -6208,6 +6447,7 @@ def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any
         "risk_reward": risk.get("risk_reward"),
         "position_pct": risk.get("position_pct"),
     }
+    minute_change = _shortest_realtime_day_change("stock", symbol)
     day_change_mode = _a_day_change_mode()
     if day_change_mode == "daily_close":
         try:
@@ -6223,17 +6463,20 @@ def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any
             )
         except Exception:
             daily_day_change, daily_day_source, daily_as_of, latest_daily_close = None, "", "", None
-        summary.update({
-            "day_change_pct": daily_day_change,
-            "daily_change_pct": daily_day_change,
-            "day_change_source": daily_day_source,
-            "day_change_mode": day_change_mode,
-            "day_change_as_of": daily_as_of,
-        })
-        if latest_daily_close is not None:
+        if not minute_change:
+            summary.update({
+                "day_change_pct": daily_day_change,
+                "daily_change_pct": daily_day_change,
+                "day_change_source": daily_day_source,
+                "day_change_mode": day_change_mode,
+                "day_change_as_of": daily_as_of,
+            })
+        if latest_daily_close is not None and not minute_change:
             summary["latest_price"] = latest_daily_close
+    if minute_change:
+        summary.update(minute_change)
     summary.update(_latest_daily_trading_values(symbol, chart))
-    summary.update(_quote_overlay_for_symbol(symbol))
+    summary = _apply_quote_overlay(summary, symbol)
     if summary.get("today_change_pct") is not None:
         summary["gain_pct"] = summary.get("today_change_pct")
     chain_position = _stock_chain_position_summary(symbol)
@@ -6280,6 +6523,7 @@ async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
     plan = _plan_for_index(engine, name)
     analysis_target = _top_candidate_symbol(engine)
     candidate_stocks = [serialize_scored_symbol(item) for item in engine.get_scored_symbols()[:10]]
+    candidate_stocks = _enrich_reference_candidate_signals(candidate_stocks, requested_freq)
     related_custom_signals = _related_custom_signals_from_candidates(candidate_stocks, requested_freq)
 
     return {
@@ -6328,6 +6572,7 @@ async def _build_static_index_target(name: str, symbol: str, freq: str) -> Dict[
         candidate_stocks = []
     if not candidate_stocks:
         candidate_stocks = _recent_custom_signal_candidates(limit=10)
+    candidate_stocks = _enrich_reference_candidate_signals(candidate_stocks, requested_freq)
     related_custom_signals = _related_custom_signals_from_candidates(candidate_stocks, requested_freq)
     return {
         "target": {
@@ -6419,6 +6664,8 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
             },
         )
         related_custom_signals = _related_custom_signals_from_candidates(ordered_candidates, requested_freq)
+        minute_change = _shortest_realtime_day_change("industry", heat_target_label)
+        heat_change = minute_change.get("day_change_pct") if minute_change else latest_heat.get("change_pct")
         return {
             "target": {
                 "kind": "industry",
@@ -6450,9 +6697,16 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
             "summary": {
                 "title": name,
                 "subtitle": "行业热度K线/涨跌幅OHLC",
-                "latest_price": chart.get("ohlcv", [{}])[-1].get("close", 0) if chart.get("ohlcv") else 0,
+                "latest_price": minute_change.get("latest_price") if minute_change else (chart.get("ohlcv", [{}])[-1].get("close", 0) if chart.get("ohlcv") else 0),
                 "conclusion": "行业图形来自东财板块快照 change_pct 重采样，不是成分股价格K线。" if heat_ready else "行业分钟热度缓存未就绪。",
-                "gain_pct": latest_heat.get("change_pct"),
+                "gain_pct": heat_change,
+                "day_change_pct": heat_change,
+                "daily_change_pct": heat_change,
+                "today_change_pct": minute_change.get("today_change_pct") if minute_change else None,
+                "day_change_source": minute_change.get("day_change_source") if minute_change else ("board_heat_ticks" if latest_heat.get("change_pct") is not None else ""),
+                "day_change_mode": minute_change.get("day_change_mode") if minute_change else _a_day_change_mode(),
+                "day_change_as_of": minute_change.get("day_change_as_of") if minute_change else _date_text(latest_heat.get("trade_minute")),
+                "day_change_freq": minute_change.get("day_change_freq") if minute_change else requested_freq,
                 "composite_score": getattr(ranking, "composite_score", 0) if ranking else 0,
                 "leader": latest_heat.get("leader_name", ""),
                 "up_count": latest_heat.get("up_count"),
@@ -6604,6 +6858,8 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
             },
         )
         related_custom_signals = _related_custom_signals_from_candidates(ordered_candidates, requested_freq)
+        minute_change = _shortest_realtime_day_change("concept", heat_target_label)
+        heat_change = minute_change.get("day_change_pct") if minute_change else (latest_heat.get("change_pct") or heat_value)
         return {
             "target": {
                 "kind": "concept",
@@ -6635,9 +6891,16 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
             "summary": {
                 "title": name,
                 "subtitle": "概念热度K线/涨跌幅OHLC",
-                "latest_price": chart.get("ohlcv", [{}])[-1].get("close", 0) if chart.get("ohlcv") else 0,
+                "latest_price": minute_change.get("latest_price") if minute_change else (chart.get("ohlcv", [{}])[-1].get("close", 0) if chart.get("ohlcv") else 0),
                 "conclusion": "概念图形来自东财概念快照 change_pct 重采样，不是成分股价格K线。" if heat_ready else "概念分钟热度缓存未就绪。",
-                "gain_pct": latest_heat.get("change_pct") or heat_value,
+                "gain_pct": heat_change,
+                "day_change_pct": heat_change,
+                "daily_change_pct": heat_change,
+                "today_change_pct": minute_change.get("today_change_pct") if minute_change else None,
+                "day_change_source": minute_change.get("day_change_source") if minute_change else ("board_heat_ticks" if latest_heat.get("change_pct") is not None else ""),
+                "day_change_mode": minute_change.get("day_change_mode") if minute_change else _a_day_change_mode(),
+                "day_change_as_of": minute_change.get("day_change_as_of") if minute_change else _date_text(latest_heat.get("trade_minute")),
+                "day_change_freq": minute_change.get("day_change_freq") if minute_change else requested_freq,
                 "leader": latest_heat.get("leader_name", ""),
                 "up_count": latest_heat.get("up_count"),
                 "down_count": latest_heat.get("down_count"),
