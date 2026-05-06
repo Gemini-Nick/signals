@@ -153,7 +153,7 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
         env={
             "STOCK_MINUTE_SCOPE": "postmarket_candidates",
             "STOCK_MINUTE_FREQS": "5min,15min",
-            "STOCK_MINUTE_POSTMARKET_MAX_CODES": "120",
+            "STOCK_MINUTE_POSTMARKET_MAX_CODES": "240",
         },
     ),
     PostmarketTaskSpec("index_minute", "minute_preheat", depends_on=("terminal_realtime_pool:all",)),

@@ -82,6 +82,11 @@ def test_stock_daily_tencent_empty_returns_without_akshare(monkeypatch):
     assert stock_daily._sync_one_stock("600423", "20260427", "20260427") == []
 
 
+def test_stock_daily_provider_prefix_maps_bj_920_codes():
+    assert stock_daily._daily_provider_prefix("920118") == "bj"
+    assert stock_daily._daily_provider_prefix("900901") == "sh"
+
+
 def test_get_all_stock_codes_falls_back_to_cached_universe(monkeypatch):
     db = _DB({
         "sync_log": _Collection([

@@ -242,14 +242,14 @@ chains:
 
   - chain_id: ai_compute
     name: AI算力/数据中心产业链
-    aliases: [AI, 算力, 数据中心, 服务器, 液冷, 东数西算, ChatGPT, DeepSeek, 多模态, 百度概念, 国产软件, 信息安全, 电子支付, 安防服务]
+    aliases: [AI, 算力, 数据中心, 服务器, 算力租赁, 智算中心, GPU云, IDC算力服务, 液冷, 东数西算, ChatGPT, DeepSeek, 多模态, 百度概念, 国产软件, 信息安全, 电子支付, 安防服务]
     industries: [计算机设备, 软件开发, 通信设备, 通信服务, 互联网服务]
     default_node_id: ai_server
     nodes:
       - node_id: ai_server
         name: AI服务器/数据中心
         layer: midstream
-        keywords: [AI, 算力, 数据中心, 服务器, 液冷, 东数西算, ChatGPT, DeepSeek, 多模态, 百度概念, 国产软件, 信息安全, 电子支付, 安防服务]
+        keywords: [AI服务器, 服务器, 数据中心硬件, 算力基础设施, 整机柜, 东数西算, ChatGPT, DeepSeek, 多模态, 国产软件, 信息安全, 电子支付, 安防服务]
         core_representatives:
           - {symbol: SZ.000977, name: 浪潮信息, relation: AI服务器链主, source_note: AI算力链主代表, priority: 100}
           - {symbol: SH.601138, name: 工业富联, relation: AI服务器/算力硬件链主, source_note: AI算力链主代表, priority: 98}
@@ -261,6 +261,18 @@ chains:
           - {symbol: SH.600050, name: 中国联通, relation: 数据中心/通信运营弹性标的, source_note: AI算力弹性代表, priority: 76}
           - {symbol: SZ.002261, name: 拓维信息, relation: 国产算力/服务器弹性标的, source_note: AI算力弹性代表, priority: 72}
           - {symbol: SZ.002335, name: 科华数据, relation: 数据中心电源/算力基础设施弹性标的, source_note: AI算力弹性代表, priority: 70}
+      - node_id: compute_service_operator
+        name: 算力租赁/智算云服务
+        layer: downstream
+        keywords: [算力租赁, 智算中心, 智算云, GPU云, GPU租赁, IDC算力服务, 算力服务, 算力运营, AIDC, 云算力, 推理算力服务]
+        core_representatives:
+          - {symbol: SH.603019, name: 中科曙光, relation: 智算中心/算力服务运营, source_note: 算力服务链主代表, priority: 96}
+          - {symbol: SH.600050, name: 中国联通, relation: 云网融合/算力服务运营, source_note: 算力服务运营商代表, priority: 92}
+          - {symbol: SH.600941, name: 中国移动, relation: 云计算/智算中心运营, source_note: 算力服务运营商代表, priority: 90}
+        elastic_representatives:
+          - {symbol: SZ.300442, name: 润泽科技, relation: IDC/智算中心运营弹性标的, source_note: 算力租赁弹性代表, priority: 88}
+          - {symbol: SZ.300383, name: 光环新网, relation: IDC/云计算服务弹性标的, source_note: 算力服务弹性代表, priority: 84}
+          - {symbol: SZ.300738, name: 奥飞数据, relation: IDC/算力基础设施弹性标的, source_note: 算力服务弹性代表, priority: 82}
 
   - chain_id: thermal_liquid_cooling
     name: 液冷/热管理产业链
@@ -388,21 +400,43 @@ chains:
           - {symbol: SH.601766, name: 中国中车, relation: 轨道交通装备弹性标的, source_note: 军工弹性代表, priority: 78}
 
   - chain_id: nonferrous
-    name: 有色/贵金属产业链
-    aliases: [有色, 铜, 铝, 黄金, 贵金属, 钴, 镍, 稀土, 小金属, 工业金属]
-    industries: [有色金属, 工业金属, 小金属, 能源金属, 金属新材料]
-    default_node_id: metal_resource
+    name: 有色金属产业链
+    aliases: [有色, 铜, 铝, 黄金, 贵金属, 白银, 钴, 镍, 稀土, 工业金属]
+    industries: [有色金属, 工业金属, 金属新材料]
+    default_node_id: industrial_metals
     nodes:
-      - node_id: metal_resource
-        name: 金属资源
+      - node_id: industrial_metals
+        name: 工业金属
         layer: upstream
-        keywords: [有色, 铜, 铝, 黄金, 贵金属, 钴, 镍, 稀土, 小金属, 工业金属]
+        keywords: [有色, 铜, 铝, 锌, 铅, 工业金属]
         core_representatives:
           - {symbol: SH.601899, name: 紫金矿业, relation: 铜金矿产链主, source_note: 有色链主代表, priority: 100}
+          - {symbol: SH.600362, name: 江西铜业, relation: 铜产业链主, source_note: 工业金属链主代表, priority: 96}
           - {symbol: SH.601600, name: 中国铝业, relation: 铝链主, source_note: 有色链主代表, priority: 92}
         elastic_representatives:
-          - {symbol: SH.600111, name: 北方稀土, relation: 稀土弹性标的, source_note: 有色弹性代表, priority: 88}
-          - {symbol: SZ.002460, name: 赣锋锂业, relation: 小金属/锂弹性标的, source_note: 有色弹性代表, priority: 78}
+          - {symbol: SZ.000807, name: 云铝股份, relation: 铝弹性标的, source_note: 工业金属弹性代表, priority: 88}
+          - {symbol: SZ.000630, name: 铜陵有色, relation: 铜弹性标的, source_note: 工业金属弹性代表, priority: 84}
+      - node_id: precious_metals
+        name: 贵金属
+        layer: upstream
+        keywords: [黄金, 贵金属, 白银, 金矿]
+        core_representatives:
+          - {symbol: SH.600547, name: 山东黄金, relation: 黄金矿产链主, source_note: 贵金属链主代表, priority: 98}
+          - {symbol: SH.600489, name: 中金黄金, relation: 黄金链主, source_note: 贵金属链主代表, priority: 94}
+        elastic_representatives:
+          - {symbol: SH.600988, name: 赤峰黄金, relation: 黄金弹性标的, source_note: 贵金属弹性代表, priority: 88}
+          - {symbol: SZ.002155, name: 湖南黄金, relation: 黄金/锑弹性标的, source_note: 贵金属弹性代表, priority: 84}
+      - node_id: rare_earth_minor
+        name: 稀土/小金属
+        layer: upstream
+        keywords: [稀土, 钴, 镍, 钨, 钼, 锑, 小金属]
+        core_representatives:
+          - {symbol: SH.600111, name: 北方稀土, relation: 稀土链主, source_note: 稀土链主代表, priority: 96}
+          - {symbol: SH.603993, name: 洛阳钼业, relation: 钼钴链主, source_note: 小金属链主代表, priority: 92}
+          - {symbol: SH.601958, name: 金钼股份, relation: 钼产业链主, source_note: 小金属链主代表, priority: 88}
+        elastic_representatives:
+          - {symbol: SZ.000960, name: 锡业股份, relation: 锡金属弹性标的, source_note: 小金属弹性代表, priority: 84}
+          - {symbol: SH.600549, name: 厦门钨业, relation: 钨稀土弹性标的, source_note: 小金属弹性代表, priority: 82}
 
   - chain_id: chemical
     name: 基础化工产业链

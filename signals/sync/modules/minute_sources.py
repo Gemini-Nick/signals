@@ -28,6 +28,8 @@ def stock_to_market_symbol(code: str) -> str:
         return raw
 
     pure = raw.replace("sh", "").replace("sz", "").replace("bj", "")
+    if pure.startswith("920"):
+        return f"bj{pure}"
     if pure.startswith(("6", "5", "9")):
         return f"sh{pure}"
     if pure.startswith(("0", "2", "3")):

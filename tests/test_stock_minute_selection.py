@@ -243,6 +243,40 @@ def test_postmarket_minute_selection_merges_terminal_skipped_and_signal_sources(
     assert meta["source_counts"]["chain_domain_leaders"] == 1
 
 
+def test_postmarket_minute_selection_pins_visible_chain_representatives(monkeypatch):
+    monkeypatch.setenv("STOCK_MINUTE_SCOPE", "postmarket_candidates")
+    monkeypatch.setenv("STOCK_MINUTE_POSTMARKET_MAX_CODES", "3")
+
+    db = _Db({
+        "terminal_stock_pool": _Collection(doc={"stocks": []}),
+        "terminal_technical_signals": _Collection(docs=[
+            {"raw_code": "300001"},
+            {"raw_code": "300002"},
+            {"raw_code": "300003"},
+            {"raw_code": "300004"},
+        ]),
+        "knowledge_market_views": _Collection(docs=[
+            {"raw_code": "300005"},
+            {"raw_code": "300006"},
+        ]),
+        "chain_heat_snapshots": _Collection(
+            doc={"trade_minute": "2026-05-06 14:59"},
+            docs=[{
+                "representatives": [{"symbol": "SH.601899"}],
+                "integrated_domains": [{"leader_symbol": "SZ.002466"}],
+            }],
+        ),
+        "sync_log": _Collection(),
+    })
+
+    selected, meta = stock_minute._get_active_symbols_with_meta(db)
+
+    assert {"601899", "002466"} <= set(selected)
+    assert set(meta["pinned_symbols"]) == {"601899", "002466"}
+    assert meta["source_counts"]["chain_representatives"] == 1
+    assert meta["source_counts"]["chain_domain_leaders"] == 1
+
+
 def test_split_current_minute_tasks_skips_already_closed_bars():
     tasks = [("300001", "5分钟"), ("300001", "15分钟"), ("300002", "5分钟")]
     expected = {

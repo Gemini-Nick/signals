@@ -6,6 +6,11 @@ import pandas as pd
 from signals.sync.modules import minute_sources
 
 
+def test_stock_to_market_symbol_maps_bj_920_codes():
+    assert minute_sources.stock_to_market_symbol("920118") == "bj920118"
+    assert minute_sources.stock_to_market_symbol("900901") == "sh900901"
+
+
 def test_fetch_public_minute_passes_tail_limits_to_provider(monkeypatch):
     calls = []
 

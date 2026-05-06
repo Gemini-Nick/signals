@@ -15,6 +15,31 @@ def _top_symbol(concept: str) -> str:
 def test_lithium_resource_uses_upstream_carrier():
     assert _top_symbol("锂") == "SZ.002466"
     assert "能源金属" in industry_hints_for_concept("锂")
+    rows = preferred_concept_carriers("锂")
+    assert rows[0]["chain_id"] == "lithium_battery"
+    assert rows[0]["node_id"] == "lithium_resource"
+    assert all(row["symbol"] != "SZ.002460" or row["chain_id"] == "lithium_battery" for row in rows[:4])
+
+
+def test_precious_metals_do_not_use_lithium_resource_representatives():
+    rows = preferred_concept_carriers("贵金属")
+    assert rows
+    assert rows[0]["chain_id"] == "nonferrous"
+    assert rows[0]["node_id"] == "precious_metals"
+    assert "SZ.002460" not in {row["symbol"] for row in rows[:4]}
+
+
+def test_compute_service_operator_is_separate_from_hardware_and_chips():
+    for concept in ["算力租赁", "智算中心", "GPU云", "IDC算力服务"]:
+        rows = preferred_concept_carriers(concept)
+        assert rows
+        assert rows[0]["chain_id"] == "ai_compute"
+        assert rows[0]["node_id"] == "compute_service_operator"
+
+    storage = preferred_concept_carriers("存储")
+    assert storage and storage[0]["node_id"] == "memory_chip"
+    chip = preferred_concept_carriers("芯片")
+    assert chip and chip[0]["chain_id"] == "semiconductor"
 
 
 def test_segment_concepts_prefer_matching_chain_stage():

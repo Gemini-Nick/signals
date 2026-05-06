@@ -23,7 +23,7 @@ from signals.core.market_time import (
     timestamp_range_to_dates,
     to_unix_seconds,
 )
-from signals.core.concept_carriers import non_chain_reason
+from signals.core.concept_carriers import load_industry_chains, non_chain_reason
 from signals.core.macro_universe import (
     macro_index_themes,
     macro_watchlist,
@@ -1669,19 +1669,24 @@ def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
         "quote_age_seconds": age_seconds,
         "quote_stale_reason": stale_reason,
     }
+    quote_latest_price = _first_numeric(doc.get("price"), doc.get("close"))
+    quote_change_pct = _float(doc.get("change_pct"))
+    if not is_stale:
+        if quote_latest_price is not None:
+            overlay["quote_price"] = quote_latest_price
+        if quote_change_pct is not None:
+            overlay["quote_change_pct"] = quote_change_pct
     if day_change_mode == "quote_intraday" and status in {"realtime", "delayed"}:
-        latest_price = _first_numeric(doc.get("price"), doc.get("close"))
-        change_pct = _float(doc.get("change_pct"))
-        if latest_price is not None:
+        if quote_latest_price is not None:
             overlay.update({
-                "latest_price": latest_price,
-                "realtime_price": latest_price,
+                "latest_price": quote_latest_price,
+                "realtime_price": quote_latest_price,
             })
-        if change_pct is not None:
+        if quote_change_pct is not None:
             overlay.update({
-                "day_change_pct": change_pct,
-                "daily_change_pct": change_pct,
-                "today_change_pct": change_pct,
+                "day_change_pct": quote_change_pct,
+                "daily_change_pct": quote_change_pct,
+                "today_change_pct": quote_change_pct,
                 "day_change_source": "quote_snapshots",
                 "day_change_as_of": quote_day,
             })
@@ -1763,6 +1768,24 @@ def _apply_quote_overlay(row: dict[str, Any], symbol: str, overlay: Optional[dic
             "day_change_source": "",
             "day_change_as_of": overlay.get("quote_as_of") or "",
         })
+    if overlay.get("day_change_mode") == "daily_close" and overlay.get("quote_status") == "closed":
+        quote_price = _first_numeric(overlay.get("quote_price"), overlay.get("latest_price"), overlay.get("realtime_price"))
+        quote_change = _first_numeric(overlay.get("quote_change_pct"), overlay.get("day_change_pct"))
+        if _first_numeric(updated.get("latest_price"), updated.get("price"), updated.get("close")) is None and quote_price is not None:
+            updated.update({
+                "latest_price": quote_price,
+                "realtime_price": quote_price,
+            })
+        if _first_numeric(updated.get("day_change_pct"), updated.get("daily_change_pct"), updated.get("today_change_pct")) is None and quote_change is not None:
+            updated.update({
+                "day_change_pct": quote_change,
+                "daily_change_pct": quote_change,
+                "today_change_pct": quote_change,
+                "gain_pct": quote_change,
+                "day_change_source": "quote_snapshots",
+                "day_change_as_of": overlay.get("quote_as_of") or updated.get("day_change_as_of"),
+                "day_change_freq": "",
+            })
     updated.update(overlay)
     return updated
 
@@ -3799,6 +3822,8 @@ def _industry_carrier_candidates(name: str, leader_name: str = "") -> list[dict[
             "name": _text(item.get("name")) or _stock_name(symbol),
         })
 
+    for item in _chain_rebuild_board_candidates(name, "industry"):
+        add(item)
     if leader_name:
         add({
             "name": leader_name,
@@ -5848,6 +5873,127 @@ def _mongo_db():
     return get_db()
 
 
+def _chain_rebuild_board_candidates(name: str, kind: str, limit: int = 20) -> list[dict[str, Any]]:
+    query_name = _text(name)
+    if not query_name:
+        return []
+    board_kind = "concept" if kind == "concept" else "industry"
+    try:
+        db = _mongo_db()
+        mapping = db["source_board_chain_mappings"].find_one(
+            {
+                "kind": board_kind,
+                "mapping_status": "mapped",
+                "$or": [{"canonical_name": query_name}, {"raw_name": query_name}],
+            },
+            {"_id": 0},
+            sort=[("trade_date", -1), ("updated_at", -1), ("confidence", -1)],
+        ) or {}
+    except Exception:
+        return []
+    chain_id = _text(mapping.get("chain_id"))
+    node_id = _text(mapping.get("node_id"))
+    if not chain_id or not node_id:
+        return []
+    current_chain = load_industry_chains().get(chain_id) or {}
+    if node_id not in (current_chain.get("nodes_by_id") or {}):
+        return []
+    trade_date = _text(mapping.get("trade_date"))
+    try:
+        db = _mongo_db()
+        rollup_query = {"market": "A", "chain_id": chain_id, "node_id": node_id}
+        if trade_date:
+            rollup_query["trade_date"] = trade_date
+        rollup = db["chain_node_security_rollups"].find_one(
+            rollup_query,
+            {"_id": 0},
+            sort=[("trade_date", -1), ("coverage_rank", 1), ("updated_at", -1)],
+        ) or {}
+        if not rollup and trade_date:
+            rollup = db["chain_node_security_rollups"].find_one(
+                {"market": "A", "chain_id": chain_id, "node_id": node_id},
+                {"_id": 0},
+                sort=[("trade_date", -1), ("coverage_rank", 1), ("updated_at", -1)],
+            ) or {}
+        top_rows = [item for item in (rollup.get("top_securities") or []) if isinstance(item, dict)]
+        if not top_rows:
+            top_rows = list(db["security_chain_memberships"].find(
+                {"market": "A", "chain_id": chain_id, "node_id": node_id},
+                {"_id": 0},
+            ).sort([("trade_date", -1), ("is_primary_chain", -1), ("exposure_score", -1), ("confidence", -1)]).limit(limit))
+    except Exception:
+        top_rows = []
+        rollup = {}
+    rows: list[dict[str, Any]] = []
+    for index, item in enumerate(top_rows[:limit]):
+        symbol, raw_code = _stock_symbol_from_code_or_name(item.get("raw_code") or item.get("symbol"), item.get("name"))
+        if not symbol:
+            continue
+        representative_type = "core" if item.get("is_primary_chain") or index < 3 else f"{board_kind}_constituent"
+        rows.append({
+            "symbol": symbol,
+            "raw_code": raw_code or symbol.split(".", 1)[-1],
+            "name": _text(item.get("name")) or _stock_name(symbol),
+            "source": "chain_rebuild_rollup",
+            "relation": " / ".join(part for part in [_text(mapping.get("chain_name")), _text(mapping.get("node_name"))] if part),
+            "representative_type": representative_type,
+            "priority": round(140 - index + _float(item.get("exposure_score"), 0), 3),
+            "chain_id": chain_id,
+            "chain_name": mapping.get("chain_name") or rollup.get("chain_name"),
+            "node_id": node_id,
+            "node_name": mapping.get("node_name") or rollup.get("node_name"),
+            "layer": mapping.get("layer") or rollup.get("layer"),
+            "stage": mapping.get("stage") or rollup.get("stage"),
+            "confidence": item.get("confidence") or mapping.get("confidence"),
+            "exposure_score": item.get("exposure_score"),
+            "is_primary_chain": item.get("is_primary_chain"),
+            "source_note": "盘后全局产业链重塑优先映射",
+            "evidence_sources": item.get("evidence_sources") or mapping.get("evidence_sources") or [],
+            "mapping_source": "source_board_chain_mappings",
+            "trade_date": trade_date or rollup.get("trade_date"),
+        })
+    return rows
+
+
+def _stock_chain_membership_summary(symbol: str) -> dict[str, Any]:
+    raw_symbol = _text(symbol).upper()
+    raw_code = raw_symbol.split(".", 1)[-1] if "." in raw_symbol else raw_symbol
+    if not raw_code:
+        return {}
+    try:
+        db = _mongo_db()
+        row = db["security_chain_memberships"].find_one(
+            {
+                "market": "A",
+                "$or": [
+                    {"symbol": raw_symbol},
+                    {"raw_code": raw_code},
+                    {"symbol": symbol},
+                ],
+            },
+            {"_id": 0},
+            sort=[("trade_date", -1), ("is_primary_chain", -1), ("exposure_score", -1), ("confidence", -1)],
+        ) or {}
+    except Exception:
+        return {}
+    if not row:
+        return {}
+    return {
+        "chain": _text(row.get("chain_name")),
+        "node": _text(row.get("node_name")),
+        "role": _text(row.get("role") or row.get("node_name")),
+        "layer": _text(row.get("layer")),
+        "stage": _text(row.get("stage")),
+        "source": "security_chain_memberships",
+        "source_note": "盘后全局产业链重塑主归属",
+        "confidence": row.get("confidence"),
+        "exposure_score": row.get("exposure_score"),
+        "is_primary_chain": bool(row.get("is_primary_chain")),
+        "trade_date": _text(row.get("trade_date")),
+        "related_chains": [],
+    }
+
+
 def _serialize_dt(value: Any) -> str:
     if value is None:
         return ""
@@ -6346,6 +6492,15 @@ def _concept_carrier_candidates(
             candidates[-1].update(extra)
 
     if not non_chain:
+        for item in _chain_rebuild_board_candidates(concept_name, "concept"):
+            add(
+                symbol=_text(item.get("symbol")),
+                raw_code=_text(item.get("raw_code")),
+                name=_text(item.get("name")),
+                source=_text(item.get("source")),
+                relation=_text(item.get("relation")),
+                extra=item,
+            )
         for item in _preferred_concept_carriers(concept_name, theme_candidates, related_industries):
             add(
                 symbol=_text(item.get("symbol")),
@@ -6638,6 +6793,9 @@ def _summary_from_industry(name: str, detail: Dict[str, Any], ranking) -> Dict[s
 
 
 def _stock_chain_position_summary(symbol: str) -> dict[str, Any]:
+    membership = _stock_chain_membership_summary(symbol)
+    if membership:
+        return membership
     try:
         from signals.core.chain_map import get_all_chain_positions
 
@@ -6792,10 +6950,6 @@ async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
     chart = _chart_from_df(df, symbol=str(report.get("symbol") or name), freq=requested_freq, source=source)
     chart = _mark_chart_readiness(chart, kind="index", requested_freq=requested_freq)
     plan = _plan_for_index(engine, name)
-    analysis_target = _top_candidate_symbol(engine)
-    candidate_stocks = [serialize_scored_symbol(item) for item in engine.get_scored_symbols()[:10]]
-    candidate_stocks = _enrich_reference_candidate_signals(candidate_stocks, requested_freq)
-    related_custom_signals = _related_custom_signals_from_candidates(candidate_stocks, requested_freq)
 
     return {
         "target": {
@@ -6816,15 +6970,15 @@ async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
         "plan": plan,
         "review": _review_context(engine, "index", name),
         "trade": _trade_context(None),
-        "analysis_target": analysis_target,
-        "candidate_stocks": candidate_stocks,
+        "analysis_target": "",
+        "candidate_stocks": [],
         "custom_signal_count": 0,
         "direct_custom_signal_count": 0,
         "visible_custom_signal_count": 0,
         "hidden_custom_signal_count": 0,
         "available_custom_signal_freqs": [],
         "hidden_reasons": ["index_has_no_direct_custom_signal"],
-        "related_custom_signals": related_custom_signals,
+        "related_custom_signals": [],
     }
 
 
@@ -6837,14 +6991,8 @@ async def _build_static_index_target(name: str, symbol: str, freq: str) -> Dict[
     summary["latest_signal"] = summary.get("latest_signal") or _ma_signal_from_df(df)
     try:
         engine = _ensure_engine()
-        candidate_stocks = [serialize_scored_symbol(item) for item in engine.get_scored_symbols()[:10]]
     except Exception:
         engine = None
-        candidate_stocks = []
-    if not candidate_stocks:
-        candidate_stocks = _recent_custom_signal_candidates(limit=10)
-    candidate_stocks = _enrich_reference_candidate_signals(candidate_stocks, requested_freq)
-    related_custom_signals = _related_custom_signals_from_candidates(candidate_stocks, requested_freq)
     return {
         "target": {
             "kind": "index",
@@ -6865,14 +7013,14 @@ async def _build_static_index_target(name: str, symbol: str, freq: str) -> Dict[
         "review": _review_context(engine, "index", name) if engine is not None else {},
         "trade": _trade_context(None),
         "analysis_target": "",
-        "candidate_stocks": candidate_stocks,
+        "candidate_stocks": [],
         "custom_signal_count": 0,
         "direct_custom_signal_count": 0,
         "visible_custom_signal_count": 0,
         "hidden_custom_signal_count": 0,
         "available_custom_signal_freqs": [],
         "hidden_reasons": ["index_has_no_direct_custom_signal"],
-        "related_custom_signals": related_custom_signals,
+        "related_custom_signals": [],
     }
 
 
@@ -6968,6 +7116,7 @@ async def _build_industry_target(engine, name: str, freq: str) -> Dict[str, Any]
             "summary": {
                 "title": name,
                 "subtitle": "行业热度K线/涨跌幅OHLC",
+                "latest_signal": _text(latest_heat.get("trading_signal") or latest_heat.get("latest_signal")) or ("行业热度观察" if heat_ready else "行业热度缓存未就绪"),
                 "latest_price": minute_change.get("latest_price") if minute_change else (chart.get("ohlcv", [{}])[-1].get("close", 0) if chart.get("ohlcv") else 0),
                 "conclusion": "行业图形来自东财板块快照 change_pct 重采样，不是成分股价格K线。" if heat_ready else "行业分钟热度缓存未就绪。",
                 "gain_pct": heat_change,
@@ -7162,6 +7311,7 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
             "summary": {
                 "title": name,
                 "subtitle": "概念热度K线/涨跌幅OHLC",
+                "latest_signal": _text(latest_heat.get("trading_signal") or latest_heat.get("latest_signal")) or ("概念热度观察" if heat_ready else "概念热度缓存未就绪"),
                 "latest_price": minute_change.get("latest_price") if minute_change else (chart.get("ohlcv", [{}])[-1].get("close", 0) if chart.get("ohlcv") else 0),
                 "conclusion": "概念图形来自东财概念快照 change_pct 重采样，不是成分股价格K线。" if heat_ready else "概念分钟热度缓存未就绪。",
                 "gain_pct": heat_change,

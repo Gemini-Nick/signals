@@ -131,7 +131,8 @@ def _phase(change_pct: float, up_count: int, down_count: int, m5: float, m15: fl
         return "risk_off"
     if m15 < -0.5 or m30 < -0.8:
         return "cooling"
-    if change_pct >= 3.0 and breadth_ratio >= 0.82 and m5 < 0.15:
+    extended_momentum = m15 >= 0.6 or m30 >= 1.0
+    if change_pct >= 3.0 and breadth_ratio >= 0.82 and m5 < 0.15 and extended_momentum:
         return "consensus_climax"
     if change_pct >= 1.0 and breadth <= 0:
         return "diverging"
@@ -385,6 +386,18 @@ def sync_chain_heat_snapshots(db: Database, proxy_url: str = None) -> dict:
         )
         for doc in snapshots
     ]
+    trade_minute = snapshots[0].get("trade_minute")
+    valid_nodes = [
+        {"chain_id": doc["chain_id"], "node_id": doc["node_id"]}
+        for doc in snapshots
+    ]
+    stale_deleted = 0
+    if trade_minute is not None and valid_nodes:
+        stale_deleted = int(db["chain_heat_snapshots"].delete_many({
+            "market": "A",
+            "trade_minute": trade_minute,
+            "$nor": valid_nodes,
+        }).deleted_count)
     result = db["chain_heat_snapshots"].bulk_write(ops, ordered=False)
     now = naive_market_now("A")
     written = int(result.upserted_count + result.modified_count)
@@ -407,5 +420,5 @@ def sync_chain_heat_snapshots(db: Database, proxy_url: str = None) -> dict:
         }},
         upsert=True,
     )
-    logger.info("chain heat snapshots: %d nodes, written=%d", len(snapshots), written)
-    return {"status": "ok", "inserted": written, "nodes": len(snapshots), **meta}
+    logger.info("chain heat snapshots: %d nodes, written=%d, stale_deleted=%d", len(snapshots), written, stale_deleted)
+    return {"status": "ok", "inserted": written, "nodes": len(snapshots), "stale_deleted": stale_deleted, **meta}

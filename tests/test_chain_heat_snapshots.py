@@ -80,3 +80,34 @@ def test_chain_heat_marks_consensus_climax_as_risk_context():
 
     assert snapshots[0]["phase"] == "consensus_climax"
     assert snapshots[0]["trading_signal"] == "chain_consensus_climax"
+
+
+def test_chain_heat_recent_jump_without_extension_is_not_climax():
+    latest = datetime(2026, 5, 6, 14, 30)
+    rows = [{
+        "kind": "industry",
+        "name": "贵金属",
+        "source": "eastmoney_push2delay",
+        "rank": 1,
+        "change_pct": 5.56,
+        "up_count": 90,
+        "down_count": 8,
+        "leader_name": "测试龙头",
+        "leader_change_pct": 9.8,
+        "trade_minute": latest,
+        "heat_score": 88,
+        "momentum_5m": 0.02,
+        "momentum_15m": -0.03,
+        "momentum_30m": 0.08,
+        "chain_id": "nonferrous",
+        "chain_name": "有色金属产业链",
+        "node_id": "precious_metals",
+        "node_name": "贵金属",
+        "mapping_confidence": 92,
+        "representatives": [],
+    }]
+
+    snapshots = _aggregate(rows, latest)
+
+    assert snapshots[0]["phase"] == "warming"
+    assert snapshots[0]["trading_signal"] == "chain_warming"

@@ -308,10 +308,30 @@ def _add_postmarket_expanded_candidates(
             for chain in cursor:
                 for rep in chain.get("representatives") or []:
                     if isinstance(rep, dict):
-                        _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, rep.get("symbol"), "chain_representatives", symbol_sources=symbol_sources)
+                        _add_candidate(
+                            symbols,
+                            source_counts,
+                            priority_symbols,
+                            pinned_symbols,
+                            index_codes,
+                            rep.get("symbol"),
+                            "chain_representatives",
+                            pinned=True,
+                            symbol_sources=symbol_sources,
+                        )
                 for domain in chain.get("integrated_domains") or []:
                     if isinstance(domain, dict):
-                        _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, domain.get("leader_symbol"), "chain_domain_leaders", symbol_sources=symbol_sources)
+                        _add_candidate(
+                            symbols,
+                            source_counts,
+                            priority_symbols,
+                            pinned_symbols,
+                            index_codes,
+                            domain.get("leader_symbol"),
+                            "chain_domain_leaders",
+                            pinned=True,
+                            symbol_sources=symbol_sources,
+                        )
     except Exception as exc:
         logger.debug("postmarket chain minute candidates skipped: %s", exc)
 

@@ -71,6 +71,20 @@ def test_stock_daily_filters_holiday_rows_before_cursor_update():
     assert sync.docs == {}
 
 
+def test_stock_daily_batch_today_candidates_skip_cn_labor_day_gap():
+    candidates = stock_daily._batch_today_candidates(
+        ["600001", "600002", "600003"],
+        {
+            "600001": datetime(2026, 4, 30),
+            "600002": datetime(2026, 4, 29),
+            "600003": datetime(2026, 5, 6),
+        },
+        "20260506",
+    )
+
+    assert candidates == ["600001"]
+
+
 def test_stock_daily_writes_progress_cursor(monkeypatch):
     db = _DB()
     monkeypatch.setattr(stock_daily, "_get_stock_codes", lambda _db: (["600001", "600002"], "all"))
@@ -129,6 +143,26 @@ def test_stock_daily_uses_bars_latest_to_skip_network(monkeypatch):
     assert result["errors"] == 0
 
 
+def test_stock_daily_empty_provider_docs_do_not_count_as_covered(monkeypatch):
+    db = _DB()
+    monkeypatch.setenv("STOCK_DAILY_BATCH_TODAY_ENABLED", "false")
+    monkeypatch.setattr(stock_daily, "_get_stock_codes", lambda _db: (["920118"], "all"))
+    monkeypatch.setattr(stock_daily, "_latest_daily_dates_by_symbol", lambda _db, _codes: {})
+    monkeypatch.setattr(stock_daily, "_progress_interval", lambda: 1)
+    monkeypatch.setattr(stock_daily, "_BATCH_WORKERS", 1)
+    monkeypatch.setattr(stock_daily, "_CALL_INTERVAL", 0)
+    monkeypatch.setattr(stock_daily, "_stock_daily_providers_all_cooling", lambda _db: False)
+    monkeypatch.setattr(stock_daily, "_sync_one_stock", lambda *args, **kwargs: [])
+
+    result = stock_daily.sync_stock_daily(db)
+
+    assert result["status"] == "partial"
+    assert result["errors"] == 1
+    assert result["covered_codes"] == 0
+    assert result["coverage_pct"] == 0
+    assert result["sample_errors"] == [("920118", "empty_docs")]
+
+
 def test_stock_daily_batch_today_skips_single_symbol_fetch(monkeypatch):
     db = _DB()
     calls = []
@@ -180,7 +214,7 @@ def test_stock_daily_batch_today_skips_single_symbol_fetch(monkeypatch):
 
 def test_stock_daily_batch_today_uses_eastmoney_clist_snapshot(monkeypatch):
     db = _DB()
-    monkeypatch.setattr(stock_daily, "naive_market_now", lambda _market: datetime(2026, 4, 29, 18, 0, 0))
+    monkeypatch.setattr(stock_daily, "naive_market_now", lambda _market: datetime(2026, 5, 6, 18, 0, 0))
     monkeypatch.setattr(
         stock_daily,
         "_fetch_eastmoney_spot_batch_df",
@@ -218,12 +252,14 @@ def test_stock_daily_batch_today_uses_eastmoney_clist_snapshot(monkeypatch):
     docs, reason = stock_daily._sync_today_from_spot_batch(
         db,
         ["600001", "600002"],
-        {"600001": datetime(2026, 4, 28), "600002": datetime(2026, 4, 28)},
-        "20260429",
+        {"600001": datetime(2026, 4, 30), "600002": datetime(2026, 4, 30)},
+        "20260506",
     )
 
     assert set(docs) == {"600001"}
     assert docs["600001"][0]["source"] == "eastmoney_spot_clist_batch"
+    assert docs["600001"][0]["meta"]["quality"] == "provisional_close"
+    assert docs["600001"][0]["meta"]["source_type"] == "direct_quote_ohlcv"
     assert docs["600001"][0]["vol"] == 100000
     assert docs["600001"][0]["meta"]["volume_unit"] == "shares"
     assert docs["600001"][0]["meta"]["source_volume_unit"] == "hands"

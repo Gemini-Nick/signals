@@ -160,6 +160,18 @@ def _batch_prev_close_tolerance() -> float:
         return 0.02
 
 
+def _next_trading_day_key_after(value) -> str | None:
+    last_dt = _coerce_last_dt(value)
+    if last_dt is None:
+        return None
+    day = last_dt.date() + timedelta(days=1)
+    for _ in range(20):
+        if is_trading_day("A", day):
+            return day.strftime("%Y%m%d")
+        day += timedelta(days=1)
+    return None
+
+
 def _spot_batch_page_size() -> int:
     try:
         # Eastmoney accepts larger pz values but still returns at most 100 rows.
@@ -988,6 +1000,8 @@ def _snapshot_daily_doc(
             "freq": "日线",
             "market": "A",
             "source": "eastmoney_spot_clist_batch",
+            "source_type": "direct_quote_ohlcv",
+            "quality": "provisional_close",
             "batch_semantics": "today_spot_ohlcv",
             "prev_close": snapshot_prev_close,
             "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
@@ -1010,8 +1024,9 @@ def _batch_today_candidates(codes: list[str], sync_docs: dict[str, object], end_
         last_dt = _coerce_last_dt(sync_docs.get(code))
         if not last_dt:
             continue
-        inc_start = (last_dt + timedelta(days=1)).strftime("%Y%m%d")
-        if inc_start == end_date:
+        if last_dt.strftime("%Y%m%d") >= str(end_date)[:8]:
+            continue
+        if _next_trading_day_key_after(last_dt) == str(end_date)[:8]:
             candidates.append(code)
     return candidates
 
@@ -1079,6 +1094,14 @@ def _provider_failure(failures: list[tuple[str, BaseException]]) -> BaseExceptio
     return RuntimeError(message)
 
 
+def _daily_provider_prefix(code: str) -> str:
+    if str(code or "").startswith(("4", "8", "920")):
+        return "bj"
+    if str(code or "").startswith(("5", "6", "9")):
+        return "sh"
+    return "sz"
+
+
 def _sync_one_stock(code: str, last_dt: str, end_date: str,
                     proxy_url: str = None, db: Database | None = None) -> list:
     """同步单只股票日线，返回文档列表"""
@@ -1141,7 +1164,7 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
     except Exception as em_exc:
         failures.append(("eastmoney", em_exc))
         source = "sina"
-        prefix = "sh" if code.startswith(("5", "6", "9")) else ("bj" if code.startswith(("4", "8")) else "sz")
+        prefix = _daily_provider_prefix(code)
         attempted.add("sina")
         try:
             df = provider_call(
@@ -1361,6 +1384,9 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
                     if len(pending_docs) >= write_batch_symbols:
                         latest_written = _flush_pending()
                         total_inserted += latest_written
+                elif status == "ok":
+                    latest_status = "empty_docs"
+                    errors.append((code, "empty_docs"))
                 elif status != "ok":
                     if str(status).startswith("deferred/"):
                         deferred.append((code, str(status)[:240]))

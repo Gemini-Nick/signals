@@ -834,6 +834,36 @@ def test_lightweight_stock_row_uses_quote_without_kline(monkeypatch):
     assert row["range_returns"] == {}
 
 
+def test_lightweight_stock_row_uses_closed_quote_without_kline(monkeypatch):
+    from signals.web.api import workbench
+
+    def _unexpected_stock_df(*args, **kwargs):
+        raise AssertionError("lightweight shell rows must not load kline data")
+
+    monkeypatch.setattr(workbench, "_stock_df", _unexpected_stock_df)
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
+    monkeypatch.setattr(
+        workbench,
+        "_quote_overlay_for_symbol",
+        lambda symbol: {
+            "day_change_mode": "daily_close",
+            "quote_status": "closed",
+            "quote_status_label": "收盘",
+            "quote_price": 62.09,
+            "quote_change_pct": 4.67,
+            "quote_source": "fullmarket_spot_snapshot",
+            "quote_as_of": "2026-05-06",
+        },
+    )
+
+    row = workbench._enrich_stock_row({"symbol": "SH.688400", "latest_signal": "一买"}, [], lightweight=True)
+
+    assert row["latest_price"] == 62.09
+    assert row["day_change_pct"] == 4.67
+    assert row["day_change_source"] == "quote_snapshots"
+    assert row["day_change_as_of"] == "2026-05-06"
+
+
 def test_quote_overlay_marks_future_holiday_snapshot_stale(monkeypatch):
     from signals.web.api import workbench
 
@@ -1177,6 +1207,142 @@ def test_concept_target_returns_scored_candidate_groups(monkeypatch):
     assert isinstance(leader["risk_flags"], list)
 
 
+def test_concept_click_uses_chain_rebuild_rollups_before_yaml(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Cursor(list):
+        def sort(self, *args, **kwargs):
+            return self
+
+        def limit(self, n):
+            return _Cursor(self[:n])
+
+    class _Collection:
+        def __init__(self, doc=None, docs=None):
+            self.doc = doc or {}
+            self.docs = docs or []
+
+        def find_one(self, query=None, projection=None, sort=None):
+            return self.doc
+
+        def find(self, query=None, projection=None):
+            return _Cursor(self.docs)
+
+    class _Db(dict):
+        def __missing__(self, key):
+            self[key] = _Collection()
+            return self[key]
+
+        def list_collection_names(self):
+            return list(self.keys())
+
+    db = _Db({
+        "source_board_chain_mappings": _Collection(doc={
+            "trade_date": "2026-04-30",
+            "kind": "concept",
+            "canonical_name": "锂",
+            "mapping_status": "mapped",
+            "chain_id": "lithium_battery",
+            "chain_name": "电新/锂电池产业链",
+            "node_id": "lithium_resource",
+            "node_name": "锂资源",
+            "layer": "upstream",
+            "stage": "上游",
+            "confidence": 96,
+        }),
+        "chain_node_security_rollups": _Collection(doc={
+            "trade_date": "2026-04-30",
+            "chain_id": "lithium_battery",
+            "node_id": "lithium_resource",
+            "top_securities": [
+                {"symbol": "SZ.002466", "raw_code": "002466", "name": "天齐锂业", "is_primary_chain": True, "exposure_score": 108, "confidence": 96},
+                {"symbol": "SZ.002460", "raw_code": "002460", "name": "赣锋锂业", "is_primary_chain": True, "exposure_score": 106, "confidence": 96},
+            ],
+        }),
+    })
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: db)
+
+    rows = workbench._concept_carrier_candidates("锂", [], [])
+
+    assert rows[0]["source"] == "chain_rebuild_rollup"
+    assert rows[0]["symbol"] == "SZ.002466"
+    assert rows[0]["chain_id"] == "lithium_battery"
+    assert rows[0]["node_id"] == "lithium_resource"
+
+
+def test_chain_rebuild_candidates_ignore_stale_taxonomy_nodes(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Collection:
+        def __init__(self, doc=None):
+            self.doc = doc or {}
+
+        def find_one(self, query=None, projection=None, sort=None):
+            return self.doc
+
+    class _Db(dict):
+        def __missing__(self, key):
+            self[key] = _Collection()
+            return self[key]
+
+    db = _Db({
+        "source_board_chain_mappings": _Collection(doc={
+            "trade_date": "2026-04-30",
+            "kind": "industry",
+            "canonical_name": "贵金属",
+            "mapping_status": "mapped",
+            "chain_id": "nonferrous",
+            "chain_name": "有色/贵金属产业链",
+            "node_id": "metal_resource",
+            "node_name": "金属资源",
+            "confidence": 96,
+        }),
+        "chain_node_security_rollups": _Collection(doc={
+            "top_securities": [
+                {"symbol": "SZ.002460", "raw_code": "002460", "name": "赣锋锂业", "is_primary_chain": True},
+            ],
+        }),
+    })
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: db)
+
+    assert workbench._chain_rebuild_board_candidates("贵金属", "industry") == []
+
+
+def test_stock_chain_summary_prefers_security_membership(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Collection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "trade_date": "2026-04-30",
+                "symbol": "SZ.002466",
+                "raw_code": "002466",
+                "chain_id": "lithium_battery",
+                "chain_name": "电新/锂电池产业链",
+                "node_id": "lithium_resource",
+                "node_name": "锂资源",
+                "layer": "upstream",
+                "stage": "上游",
+                "role": "锂资源",
+                "confidence": 96,
+                "exposure_score": 108,
+                "is_primary_chain": True,
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"security_chain_memberships": _Collection()}))
+
+    summary = workbench._stock_chain_position_summary("SZ.002466")
+
+    assert summary["source"] == "security_chain_memberships"
+    assert summary["chain"] == "电新/锂电池产业链"
+    assert summary["node"] == "锂资源"
+    assert summary["is_primary_chain"] is True
+
+
 def test_trader_task_queue_is_action_oriented():
     from signals.web.api import workbench
 
@@ -1286,77 +1452,63 @@ def test_static_index_minute_request_does_not_fallback_to_daily(monkeypatch):
     assert payload["chart"]["meta"]["not_ready_reason"] == "index_minute_not_ready"
 
 
-def test_static_index_reference_candidates_include_multi_timeframe_signals(monkeypatch):
+def test_static_index_targets_do_not_use_recent_stock_candidate_fallback(monkeypatch):
     from signals.web.api import workbench
 
     monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (_intraday_bars(), "index_bars"))
     monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "hit"}})
     monkeypatch.setattr(workbench, "_ensure_engine", lambda: (_ for _ in ()).throw(RuntimeError("engine unavailable")))
     monkeypatch.setattr(workbench, "_recent_custom_signal_candidates", lambda limit=10: [
-        {"symbol": "SZ.002759", "name": "天际股份", "relation": "指数参考"}
-    ])
-    monkeypatch.setattr(workbench, "_load_signal_pool_rows", lambda limit=200, symbol=None: [])
-    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [
-        {
-            "symbol": "SZ.002759",
-            "dt": "2026-04-24 15:00",
-            "signal_type": "周线三买",
-            "signal_side": "buy",
-            "freq": "周线",
-            "confidence": 0.8,
-            "score": 30,
-            "source": "terminal_technical_signals",
-        },
-        {
-            "symbol": "SZ.002759",
-            "dt": "2026-04-24 15:00",
-            "signal_type": "日线一卖",
-            "signal_side": "sell",
-            "freq": "日线",
-            "confidence": 0.7,
-            "score": 24,
-            "source": "terminal_technical_signals",
-        },
-        {
-            "symbol": "SZ.002759",
-            "dt": "2026-04-24 10:30",
-            "signal_type": "30分钟二买",
-            "signal_side": "buy",
-            "freq": "30分钟",
-            "confidence": 0.75,
-            "score": 28,
-            "source": "terminal_technical_signals",
-        },
-        {
-            "symbol": "SZ.002759",
-            "dt": "2026-04-24 10:15",
-            "signal_type": "15分钟背驰卖",
-            "signal_side": "sell",
-            "freq": "15分钟",
-            "confidence": 0.65,
-            "score": 21,
-            "source": "terminal_technical_signals",
-        },
-        {
-            "symbol": "SZ.002759",
-            "dt": "2026-04-24 10:05",
-            "signal_type": "5分钟右侧确认",
-            "signal_side": "buy",
-            "freq": "5分钟",
-            "confidence": 0.62,
-            "score": 18,
-            "source": "terminal_technical_signals",
-        },
+        {"symbol": "SH.601958", "name": "金钼股份", "relation": "最近自定义信号"}
     ])
 
-    payload = asyncio.run(workbench._build_static_index_target("科创50", "sh000688", "30min"))
+    payloads = [
+        asyncio.run(workbench._build_static_index_target("上证指数", "sh000001", "30min")),
+        asyncio.run(workbench._build_static_index_target("创业板指", "sz399006", "30min")),
+        asyncio.run(workbench._build_static_index_target("科创50", "sh000688", "30min")),
+    ]
 
-    candidate = payload["candidate_stocks"][0]
-    assert [item["badge"] for item in candidate["buy_timeframes"]] == ["W", "30m", "5m"]
-    assert [item["badge"] for item in candidate["sell_timeframes"]] == ["D", "15m"]
-    assert candidate["latest_signal"] == "卖D/卖15m/W/30m/5m"
-    assert candidate["reference_signal_count"] == 5
-    assert {item["freq"] for item in payload["related_custom_signals"]} >= {"weekly", "daily", "30min", "15min", "5min"}
+    for payload in payloads:
+        assert payload["target"]["kind"] == "index"
+        assert payload["candidate_stocks"] == []
+        assert payload["related_custom_signals"] == []
+        assert "金钼股份" not in str(payload)
+
+
+def test_engine_index_target_does_not_use_global_scored_stock_candidates(monkeypatch):
+    from signals.layers.index_report import IndexReport
+    from signals.web.api import workbench
+
+    class Engine:
+        review_state = type("ReviewState", (), {
+            "completed": False,
+            "is_running": False,
+            "phase": "",
+            "phase_detail": "",
+            "error": "",
+            "start_date": "",
+            "start_label": "",
+            "timing": {},
+            "index_reports": [],
+        })()
+
+        def get_index_reports(self):
+            return [IndexReport(name="上证指数", symbol="sh000001")]
+
+        def get_scored_symbols(self):
+            raise AssertionError("index target must not read global stock candidates")
+
+    monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (_intraday_bars(), "index_bars"))
+    monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "hit"}})
+    monkeypatch.setattr(workbench, "_plan_for_index", lambda *args, **kwargs: None)
+    monkeypatch.setattr(workbench, "_summary_from_index", lambda report, chart: {"title": report["name"]})
+
+    payload = asyncio.run(workbench._build_index_target(Engine(), "上证指数", "30min"))
+
+    assert payload["target"]["kind"] == "index"
+    assert payload["analysis_target"] == ""
+    assert payload["candidate_stocks"] == []
+    assert payload["related_custom_signals"] == []
 
 
 def test_us_index_minute_request_is_explicitly_unsupported(monkeypatch):

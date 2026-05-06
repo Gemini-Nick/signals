@@ -34,6 +34,7 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert chain.depends_on == ("board_ranking:all",)
     stock_minute = next(task for task in pm.POSTMARKET_TASKS if task.module == "stock_minute")
     assert stock_minute.env["STOCK_MINUTE_FREQS"] == "5min,15min"
+    assert stock_minute.env["STOCK_MINUTE_POSTMARKET_MAX_CODES"] == "240"
 
 
 def test_postmarket_trade_date_skips_cn_labor_day_holiday():
