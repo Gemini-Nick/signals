@@ -177,6 +177,16 @@ def _normalize_node(node: dict[str, Any]) -> dict[str, Any]:
             for item in node.get("elastic_representatives") or []
             if isinstance(item, dict)
         ],
+        "upstream_representatives": [
+            _normalize_representative(item, "upstream")
+            for item in node.get("upstream_representatives") or []
+            if isinstance(item, dict)
+        ],
+        "downstream_representatives": [
+            _normalize_representative(item, "downstream")
+            for item in node.get("downstream_representatives") or []
+            if isinstance(item, dict)
+        ],
     }
 
 
@@ -396,6 +406,8 @@ def preferred_carrier_symbols() -> list[str]:
             reps = [
                 *(node.get("core_representatives") or []),
                 *(node.get("elastic_representatives") or []),
+                *(node.get("upstream_representatives") or []),
+                *(node.get("downstream_representatives") or []),
             ]
             for rep in reps:
                 symbol = _normalize_symbol(rep.get("symbol"))

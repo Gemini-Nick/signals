@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from signals.sync.modules.quote_snapshots import (
+    _a_quote_symbols,
     _quote_doc_from_em,
     _quote_doc_from_ulist_row,
     _read_fullmarket_no_price_symbols,
@@ -17,6 +18,12 @@ def test_eastmoney_secid_for_prefixed_symbols():
     assert _secid_for_symbol("SZ.000001") == "0.000001"
     assert _secid_for_symbol("SH.000300") == "1.000300"
     assert _secid_for_symbol("SZ.399001") == "0.399001"
+
+
+def test_a_quote_symbols_filters_non_a_symbols_before_eastmoney():
+    symbols = ["SH.600000", "600001", "BJ.920118", "HK.00050", "US.AAPL", "SZ.399001"]
+
+    assert _a_quote_symbols(symbols) == ["SH.600000", "SH.600001", "BJ.920118", "SZ.399001"]
 
 
 def test_quote_doc_from_eastmoney_payload_scales_fields():

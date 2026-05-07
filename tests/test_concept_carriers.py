@@ -45,9 +45,13 @@ def test_compute_service_operator_is_separate_from_hardware_and_chips():
 def test_segment_concepts_prefer_matching_chain_stage():
     assert _top_symbol("电解液") == "SZ.002709"
     electrolyte = preferred_concept_carriers("电解液")
-    assert [row["symbol"] for row in electrolyte[:3]] == ["SZ.002709", "SZ.002407", "SZ.002759"]
+    assert [row["symbol"] for row in electrolyte[:4]] == ["SZ.002709", "SH.603026", "SZ.300037", "SZ.002407"]
     assert electrolyte[0]["representative_type"] == "core"
     assert electrolyte[0]["node_id"] == "electrolyte"
+    pvdf = preferred_concept_carriers("PVDF")
+    assert pvdf
+    assert pvdf[0]["node_id"] == "pvdf_binder"
+    assert pvdf[0]["symbol"] == "SZ.002407"
     assert _top_symbol("光模块") == "SZ.300308"
     optical = preferred_concept_carriers("光模块")
     assert [row["symbol"] for row in optical[:3]] == ["SZ.300308", "SZ.300502", "SZ.300394"]

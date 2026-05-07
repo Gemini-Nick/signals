@@ -11,30 +11,60 @@ from signals.sync import postmarket as pm
 def test_default_postmarket_tasks_split_long_market_data_tasks():
     spot = next(task for task in pm.POSTMARKET_TASKS if task.module == "fullmarket_spot_snapshot")
     stock_daily = [task for task in pm.POSTMARKET_TASKS if task.module == "stock_daily"]
+    hk_stock_daily = [task for task in pm.POSTMARKET_TASKS if task.module == "hk_stock_daily"]
     stock_30m = [task for task in pm.POSTMARKET_TASKS if task.module == "stock_30m_fullmarket"]
     board_cons = [task for task in pm.POSTMARKET_TASKS if task.module == "board_cons"]
     index_daily = next(task for task in pm.POSTMARKET_TASKS if task.module == "index_daily")
     weekly = next(task for task in pm.POSTMARKET_TASKS if task.module == "weekly_rollup")
     technical_scan = next(task for task in pm.POSTMARKET_TASKS if task.module == "technical_signal_scan")
     chain = next(task for task in pm.POSTMARKET_TASKS if task.module == "chain_heat_snapshots")
+    chain_rebuild = next(task for task in pm.POSTMARKET_TASKS if task.module == "postmarket_chain_rebuild")
 
     assert spot.phase == "market_data"
     assert len(stock_daily) == 16
+    assert len(hk_stock_daily) == 8
     assert len(stock_30m) == 16
     assert {task.shard_key for task in stock_daily} == {f"shard_{idx:02d}" for idx in range(16)}
+    assert {task.shard_key for task in hk_stock_daily} == {f"shard_{idx:02d}" for idx in range(8)}
     assert {task.shard_key for task in stock_30m} == {f"shard_{idx:02d}" for idx in range(16)}
     assert all(task.env["STOCK_DAILY_SCOPE"] == "all" for task in stock_daily)
+    assert all(task.env["HK_STOCK_DAILY_SCOPE"] == "all" for task in hk_stock_daily)
+    assert all(task.phase == "hk_market_data" for task in hk_stock_daily)
+    assert all(task.blocks_run is False for task in hk_stock_daily)
+    assert all(task.blocks_run is False for task in stock_30m)
     assert all(task.depends_on == ("fullmarket_spot_snapshot:all",) for task in stock_daily)
     assert index_daily.depends_on == ("quote_snapshots:all",)
-    assert all(task.task_key in technical_scan.depends_on for task in stock_30m)
+    assert all(task.task_key not in technical_scan.depends_on for task in stock_30m)
+    assert not (set(task.task_key for task in hk_stock_daily) & set(technical_scan.depends_on))
     assert {task.shard_key for task in board_cons} == {"board", "concept"}
     assert all(task.depends_on == ("board_ranking:all",) for task in board_cons)
     assert set(task.task_key for task in stock_daily).issubset(set(weekly.depends_on))
+    assert not (set(task.task_key for task in hk_stock_daily) & set(weekly.depends_on))
+    assert technical_scan.env["TECHNICAL_SIGNAL_SCAN_MARKETS"] == "A"
+    assert technical_scan.env["TECHNICAL_SIGNAL_SCAN_REQUIRED_FREQS"] == "日线,周线"
     assert not (set(task.task_key for task in board_cons) & set(chain.depends_on))
+    assert chain.phase == "chain_context"
     assert chain.depends_on == ("board_ranking:all",)
-    stock_minute = next(task for task in pm.POSTMARKET_TASKS if task.module == "stock_minute")
-    assert stock_minute.env["STOCK_MINUTE_FREQS"] == "5min,15min"
-    assert stock_minute.env["STOCK_MINUTE_POSTMARKET_MAX_CODES"] == "240"
+    assert chain_rebuild.phase == "chain_context"
+    assert pm.POSTMARKET_PHASES.index("chain_context") < pm.POSTMARKET_PHASES.index("derived")
+    assert pm.POSTMARKET_PHASES.index("minute_preheat") < pm.POSTMARKET_PHASES.index("minute_fullmarket")
+    assert pm.POSTMARKET_PHASES.index("minute_fullmarket") < pm.POSTMARKET_PHASES.index("hk_market_data")
+    stock_minute_tasks = [task for task in pm.POSTMARKET_TASKS if task.module == "stock_minute"]
+    chain_minute = next(task for task in stock_minute_tasks if task.shard_key == "chain_representatives")
+    terminal_minute = next(task for task in stock_minute_tasks if task.shard_key == "all")
+    readiness = next(task for task in pm.POSTMARKET_TASKS if task.module == "minute_readiness_probe")
+    assert chain_minute.phase == "chain_context"
+    assert chain_minute.depends_on == ("chain_heat_snapshots:all", "postmarket_chain_rebuild:all")
+    assert chain_minute.env["STOCK_MINUTE_POSTMARKET_MAX_CODES"] == "160"
+    assert chain_minute.env["STOCK_MINUTE_POSTMARKET_ROLLUP_LIMIT"] == "40"
+    assert chain_minute.env["STOCK_MINUTE_WORKERS"] == "4"
+    assert chain_minute.env["STOCK_MINUTE_CALL_INTERVAL"] == "0.15"
+    assert terminal_minute.phase == "minute_preheat"
+    assert terminal_minute.env["STOCK_MINUTE_FREQS"] == "5min,15min"
+    assert terminal_minute.env["STOCK_MINUTE_POSTMARKET_MAX_CODES"] == "240"
+    assert terminal_minute.env["STOCK_MINUTE_WORKERS"] == "6"
+    assert terminal_minute.env["STOCK_MINUTE_CALL_INTERVAL"] == "0.15"
+    assert readiness.blocks_run is False
 
 
 def test_postmarket_trade_date_skips_cn_labor_day_holiday():
@@ -47,6 +77,10 @@ def test_postmarket_should_not_run_on_cn_labor_day_holiday():
 
 def test_postmarket_should_run_after_cn_trading_day_close():
     assert pm.PostmarketRunner.should_run_now(datetime(2026, 4, 30, 16, 30)) is True
+
+
+def test_postmarket_waits_for_hk_close_by_default():
+    assert pm.PostmarketRunner.should_run_now(datetime(2026, 4, 30, 15, 50)) is False
 
 
 class _Cursor(list):
@@ -217,6 +251,36 @@ def test_postmarket_runner_marks_superseded_tasks_obsolete(monkeypatch):
     assert current["task_key"] == "stock_daily:shard_00"
 
 
+def test_postmarket_resets_completed_task_when_dependencies_change(monkeypatch):
+    tasks_v1 = (
+        pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00"),
+        pm.PostmarketTaskSpec("weekly_rollup", "derived", depends_on=("stock_daily:shard_00",)),
+    )
+    tasks_v2 = (
+        pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00"),
+        pm.PostmarketTaskSpec("hk_stock_daily", "market_data", shard_key="shard_00"),
+        pm.PostmarketTaskSpec("weekly_rollup", "derived", depends_on=("stock_daily:shard_00", "hk_stock_daily:shard_00")),
+    )
+    db = _Db()
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks_v1)
+    runner._init_tasks("postmarket:2026-04-28", "2026-04-28")
+    db["sync_tasks"].update_one(
+        {"_id": "postmarket:2026-04-28:weekly_rollup:all"},
+        {"$set": {"status": "ok", "result_summary": {"status": "ok"}, "error_msg": ""}},
+    )
+
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks_v2)
+    runner._init_tasks("postmarket:2026-04-28", "2026-04-28")
+
+    weekly = db["sync_tasks"].docs["postmarket:2026-04-28:weekly_rollup:all"]
+    assert weekly["status"] == "pending"
+    assert weekly["depends_on"] == ["stock_daily:shard_00", "hk_stock_daily:shard_00"]
+    assert weekly["result_summary"] == {}
+    assert weekly["error_msg"] == "task_spec_changed"
+
+
 def test_postmarket_completed_run_is_not_repeated(monkeypatch):
     tasks = (pm.PostmarketTaskSpec("alpha", "data"),)
     monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
@@ -305,6 +369,145 @@ def test_postmarket_stock_daily_cooling_partial_unlocks_downstream(monkeypatch):
     assert result["status"] == "ok"
     assert calls == ["stock_daily", "weekly_rollup"]
     assert db["sync_tasks"].docs["postmarket:2026-04-28:weekly_rollup:all"]["status"] == "ok"
+
+
+def test_postmarket_hk_daily_error_does_not_block_a_scan(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00"),
+        pm.PostmarketTaskSpec("weekly_rollup", "derived", depends_on=("stock_daily:shard_00",)),
+        pm.PostmarketTaskSpec("technical_signal_scan", "derived", depends_on=("stock_daily:shard_00", "weekly_rollup:all")),
+        pm.PostmarketTaskSpec("hk_stock_daily", "hk_market_data", shard_key="shard_00", blocks_run=False),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data", "derived", "hk_market_data"))
+    monkeypatch.setenv("SIGNALS_POSTMARKET_RUN_OPTIONAL_TASKS", "true")
+
+    calls = []
+
+    def stock_daily(db, proxy_url=None):
+        calls.append("stock_daily")
+        return {"status": "ok"}
+
+    def hk_stock_daily(db, proxy_url=None):
+        calls.append("hk_stock_daily")
+        return {"status": "error", "error_msg": "hk_universe_empty"}
+
+    def weekly_rollup(db, proxy_url=None):
+        calls.append("weekly_rollup")
+        return {"status": "ok"}
+
+    def technical_signal_scan(db, proxy_url=None):
+        calls.append("technical_signal_scan")
+        return {"status": "ok"}
+
+    db = _Db()
+    engine = _Engine(db, {
+        "stock_daily": (stock_daily, ""),
+        "hk_stock_daily": (hk_stock_daily, ""),
+        "weekly_rollup": (weekly_rollup, ""),
+        "technical_signal_scan": (technical_signal_scan, ""),
+    })
+    runner = pm.PostmarketRunner(engine, max_workers=2)
+
+    result = runner.run_once(trade_date="2026-04-28")
+
+    assert result["status"] == "ok"
+    assert "technical_signal_scan" in calls
+    assert "weekly_rollup" in calls
+    assert set(calls) == {"stock_daily", "weekly_rollup", "technical_signal_scan", "hk_stock_daily"}
+    assert db["sync_tasks"].docs["postmarket:2026-04-28:hk_stock_daily:shard_00"]["status"] == "error"
+    assert result["incomplete_tasks"] == 0
+    assert result["optional_incomplete_tasks"] == 1
+
+
+def test_postmarket_skips_optional_tasks_by_default(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("alpha", "data"),
+        pm.PostmarketTaskSpec("optional_probe", "data", blocks_run=False),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("data",))
+    monkeypatch.delenv("SIGNALS_POSTMARKET_RUN_OPTIONAL_TASKS", raising=False)
+    calls = []
+
+    def ok(name):
+        def inner(db, proxy_url=None):
+            calls.append(name)
+            return {"status": "ok"}
+        return inner
+
+    db = _Db()
+    engine = _Engine(db, {"alpha": (ok("alpha"), ""), "optional_probe": (ok("optional_probe"), "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(trade_date="2026-04-28")
+
+    assert result["status"] == "ok"
+    assert calls == ["alpha"]
+    assert result["incomplete_tasks"] == 0
+    assert result["optional_incomplete_tasks"] == 1
+
+
+def test_postmarket_runs_optional_tasks_when_enabled(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("alpha", "data"),
+        pm.PostmarketTaskSpec("optional_probe", "data", blocks_run=False),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("data",))
+    monkeypatch.setenv("SIGNALS_POSTMARKET_RUN_OPTIONAL_TASKS", "true")
+    calls = []
+
+    def ok(name):
+        def inner(db, proxy_url=None):
+            calls.append(name)
+            return {"status": "ok"}
+        return inner
+
+    db = _Db()
+    engine = _Engine(db, {"alpha": (ok("alpha"), ""), "optional_probe": (ok("optional_probe"), "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(trade_date="2026-04-28")
+
+    assert result["status"] == "ok"
+    assert calls == ["alpha", "optional_probe"]
+    assert result["optional_incomplete_tasks"] == 0
+
+
+def test_postmarket_30m_fullmarket_runs_after_signal_pools(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00"),
+        pm.PostmarketTaskSpec("weekly_rollup", "derived", depends_on=("stock_daily:shard_00",)),
+        pm.PostmarketTaskSpec("technical_signal_scan", "derived", depends_on=("stock_daily:shard_00", "weekly_rollup:all")),
+        pm.PostmarketTaskSpec("signal_pool", "derived", depends_on=("technical_signal_scan:all",)),
+        pm.PostmarketTaskSpec("stock_30m_fullmarket", "minute_fullmarket", shard_key="shard_00", depends_on=("stock_daily:shard_00",)),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data", "derived", "minute_fullmarket"))
+
+    calls = []
+
+    def ok(name):
+        def inner(db, proxy_url=None):
+            calls.append(name)
+            return {"status": "ok"}
+        return inner
+
+    db = _Db()
+    engine = _Engine(db, {
+        "stock_daily": (ok("stock_daily"), ""),
+        "weekly_rollup": (ok("weekly_rollup"), ""),
+        "technical_signal_scan": (ok("technical_signal_scan"), ""),
+        "signal_pool": (ok("signal_pool"), ""),
+        "stock_30m_fullmarket": (ok("stock_30m_fullmarket"), ""),
+    })
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(trade_date="2026-04-28")
+
+    assert result["status"] == "ok"
+    assert calls.index("signal_pool") < calls.index("stock_30m_fullmarket")
 
 
 def test_postmarket_effectively_done_stock_daily_degraded_is_not_repeated(monkeypatch):

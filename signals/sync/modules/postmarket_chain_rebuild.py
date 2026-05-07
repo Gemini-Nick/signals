@@ -18,7 +18,7 @@ from typing import Any
 from pymongo import UpdateOne
 from pymongo.database import Database
 
-from signals.core.concept_carriers import match_industry_chains, non_chain_reason
+from signals.core.concept_carriers import load_industry_chains, match_industry_chains, non_chain_reason
 from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import trading_day_key
 
@@ -33,6 +33,7 @@ REQUIRED_BOARD_SOURCES = {"ths", "em"}
 
 MAPPING_CONFIDENCE_THRESHOLD = 60
 ROLLUP_TOP_SECURITY_LIMIT = 30
+REPRESENTATIVE_TYPE_RANK = {"core": 2, "elastic": 1}
 
 
 def _text(value: Any) -> str:
@@ -94,6 +95,132 @@ def _security_id(symbol: str) -> str:
         return f"US:{value.split('.', 1)[1]}"
     code = _pure_a_code(value)
     return f"A:{_prefixed_a_symbol(code).split('.', 1)[0]}:{code}" if code else value
+
+
+def _representative_rank(value: Any) -> int:
+    return REPRESENTATIVE_TYPE_RANK.get(_text(value), 0)
+
+
+def _membership_sort_key(row: dict[str, Any]) -> tuple[float, float, float, float, float]:
+    return (
+        float(_representative_rank(row.get("representative_type"))),
+        _float(row.get("representative_priority")),
+        1.0 if row.get("is_primary_chain") else 0.0,
+        _float(row.get("exposure_score")),
+        _float(row.get("confidence")),
+    )
+
+
+def _taxonomy_representatives_by_node() -> dict[tuple[str, str], dict[str, dict[str, Any]]]:
+    reps_by_node: dict[tuple[str, str], dict[str, dict[str, Any]]] = defaultdict(dict)
+    for chain_id, chain in load_industry_chains().items():
+        for node in chain.get("nodes") or []:
+            node_id = _text(node.get("node_id"))
+            if not node_id:
+                continue
+            node_key = (chain_id, node_id)
+            for rep_type, rep_key in (("core", "core_representatives"), ("elastic", "elastic_representatives")):
+                for rep in node.get(rep_key) or []:
+                    code = _pure_a_code(rep.get("symbol"))
+                    if not code:
+                        continue
+                    current = reps_by_node[node_key].get(code) or {}
+                    candidate = {
+                        "symbol": _prefixed_a_symbol(code),
+                        "raw_code": code,
+                        "name": _text(rep.get("name")),
+                        "representative_type": rep_type,
+                        "representative_priority": int(rep.get("priority") or 0),
+                        "representative_relation": _text(rep.get("relation")),
+                        "source_note": _text(rep.get("source_note")),
+                    }
+                    if _membership_sort_key(candidate) > _membership_sort_key(current):
+                        reps_by_node[node_key][code] = candidate
+    return reps_by_node
+
+
+def _apply_taxonomy_representative(row: dict[str, Any], rep: dict[str, Any] | None) -> None:
+    if not rep:
+        return
+    current = {
+        "representative_type": row.get("representative_type"),
+        "representative_priority": row.get("representative_priority"),
+    }
+    if _membership_sort_key(rep) >= _membership_sort_key(current):
+        row["representative_type"] = rep.get("representative_type")
+        row["representative_priority"] = rep.get("representative_priority")
+        row["representative_relation"] = rep.get("representative_relation")
+        row["source_note"] = rep.get("source_note")
+    row["taxonomy_representative"] = True
+    if rep.get("name") and not _text(row.get("name")):
+        row["name"] = rep.get("name")
+    if _text(rep.get("representative_relation")):
+        row["role"] = rep.get("representative_relation")
+    if rep.get("representative_type") == "core":
+        row["membership_type"] = "core"
+    row.setdefault("evidence_sources", [])
+    row["evidence_sources"].extend(["industry_chains.yaml", "semantic_industry_chain"])
+
+
+def _seed_taxonomy_memberships(
+    grouped: dict[tuple[str, str, str], dict[str, Any]],
+    *,
+    trade_date: str,
+    now: datetime,
+    security_master: dict[str, dict[str, Any]],
+    security_names: dict[str, str],
+    reps_by_node: dict[tuple[str, str], dict[str, dict[str, Any]]],
+) -> None:
+    chains = load_industry_chains()
+    for (chain_id, node_id), reps_by_code in reps_by_node.items():
+        chain = chains.get(chain_id) or {}
+        node = (chain.get("nodes_by_id") or {}).get(node_id) or {}
+        for code, rep in reps_by_code.items():
+            master = security_master.get(code)
+            if not master:
+                continue
+            symbol = _text(master.get("symbol")) or _prefixed_a_symbol(code)
+            sid = _text(master.get("security_id")) or _security_id(symbol)
+            stock_name = _text(master.get("name") or security_names.get(code) or rep.get("name"))
+            issuer = _text(master.get("issuer_id")) or _issuer_id(market="A", symbol=symbol, code=code, name=stock_name)
+            key = (sid, chain_id, node_id)
+            row = grouped.get(key)
+            if row is None:
+                confidence = 98 if rep.get("representative_type") == "core" else 92
+                row = {
+                    "_id": f"{trade_date}:{sid}:{chain_id}:{node_id}",
+                    "trade_date": trade_date,
+                    "security_id": sid,
+                    "issuer_id": issuer,
+                    "market": "A",
+                    "symbol": symbol,
+                    "raw_code": code,
+                    "name": stock_name,
+                    "chain_id": chain_id,
+                    "chain_name": chain.get("name"),
+                    "node_id": node_id,
+                    "node_name": node.get("name"),
+                    "layer": node.get("layer"),
+                    "stage": node.get("stage"),
+                    "role": node.get("stage") or node.get("layer") or "",
+                    "membership_type": "core" if rep.get("representative_type") == "core" else "theme",
+                    "confidence": confidence,
+                    "exposure_score": _exposure_score(kind="concept", confidence=confidence, source_count=0),
+                    "is_primary_chain": False,
+                    "source_boards": [],
+                    "evidence_sources": ["industry_chains.yaml", "semantic_industry_chain"],
+                    "evidence_docs": [{
+                        "collection": "industry_chains.yaml",
+                        "chain_id": chain_id,
+                        "node_id": node_id,
+                        "representative_type": rep.get("representative_type"),
+                    }],
+                    "as_of": trade_date,
+                    "stale_level": "fresh",
+                    "updated_at": now,
+                }
+                grouped[key] = row
+            _apply_taxonomy_representative(row, rep)
 
 
 def _issuer_id(*, market: str, symbol: str, code: str, name: str) -> str:
@@ -296,6 +423,7 @@ def _build_memberships(
     security_names: dict[str, str],
 ) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    reps_by_node = _taxonomy_representatives_by_node()
     for catalog, mapping, match in mappings:
         name = _text(catalog.get("canonical_name"))
         kind = _text(catalog.get("kind"))
@@ -314,7 +442,10 @@ def _build_memberships(
             master = security_master.get(code)
             stock_name = _text(stock_names.get(code) or stock_names.get(symbol) or security_names.get(code) or (master or {}).get("name"))
             issuer = (master or {}).get("issuer_id") or _issuer_id(market="A", symbol=symbol, code=code, name=stock_name)
-            key = (sid, _text(mapping.get("chain_id")), _text(mapping.get("node_id")))
+            chain_id = _text(mapping.get("chain_id"))
+            node_id = _text(mapping.get("node_id"))
+            node_key = (chain_id, node_id)
+            key = (sid, chain_id, node_id)
             row = grouped.get(key)
             if row is None:
                 row = {
@@ -371,6 +502,16 @@ def _build_memberships(
                 _float(row.get("exposure_score")),
                 _exposure_score(kind=kind, confidence=int(row["confidence"]), source_count=source_count),
             )
+            _apply_taxonomy_representative(row, reps_by_node.get(node_key, {}).get(code))
+
+    _seed_taxonomy_memberships(
+        grouped,
+        trade_date=trade_date,
+        now=now,
+        security_master=security_master,
+        security_names=security_names,
+        reps_by_node=reps_by_node,
+    )
 
     by_security: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in grouped.values():
@@ -379,7 +520,7 @@ def _build_memberships(
         row["evidence_docs"] = row["evidence_docs"][:10]
         by_security[row["security_id"]].append(row)
     for rows in by_security.values():
-        primary = max(rows, key=lambda item: (_float(item.get("exposure_score")), _float(item.get("confidence"))), default=None)
+        primary = max(rows, key=_membership_sort_key, default=None)
         if primary:
             primary["is_primary_chain"] = True
     return list(grouped.values())
@@ -413,7 +554,7 @@ def _rollup_docs(
     docs: list[dict[str, Any]] = []
     for (market, chain_id, node_id), rows in grouped.items():
         heat = heat_by_node.get((chain_id, node_id), {})
-        top = sorted(rows, key=lambda item: (_float(item.get("exposure_score")), _float(item.get("confidence"))), reverse=True)[:ROLLUP_TOP_SECURITY_LIMIT]
+        top = sorted(rows, key=_membership_sort_key, reverse=True)[:ROLLUP_TOP_SECURITY_LIMIT]
         docs.append({
             "_id": f"{trade_date}:{market}:{chain_id}:{node_id}",
             "trade_date": trade_date,
@@ -436,6 +577,12 @@ def _rollup_docs(
                     "raw_code": row.get("raw_code"),
                     "name": row.get("name"),
                     "membership_type": row.get("membership_type"),
+                    "representative_type": row.get("representative_type"),
+                    "representative_priority": row.get("representative_priority"),
+                    "representative_relation": row.get("representative_relation"),
+                    "taxonomy_representative": bool(row.get("taxonomy_representative")),
+                    "role": row.get("role"),
+                    "source_note": row.get("source_note"),
                     "confidence": row.get("confidence"),
                     "exposure_score": row.get("exposure_score"),
                     "is_primary_chain": row.get("is_primary_chain"),

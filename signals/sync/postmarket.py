@@ -32,6 +32,7 @@ class PostmarketTaskSpec:
     shard_key: str = "all"
     depends_on: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict)
+    blocks_run: bool = True
 
     @property
     def task_key(self) -> str:
@@ -61,6 +62,25 @@ def _stock_daily_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
                 "STOCK_DAILY_SHARD_INDEX": str(idx),
                 "STOCK_DAILY_SHARD_KEY": f"shard_{idx:02d}",
             },
+        )
+        for idx in range(shard_count)
+    )
+
+
+def _hk_stock_daily_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
+    shard_count = _const_env_int("SIGNALS_POSTMARKET_HK_STOCK_DAILY_SHARDS", 8, minimum=1, maximum=64)
+    return tuple(
+        PostmarketTaskSpec(
+            "hk_stock_daily",
+            "hk_market_data",
+            shard_key=f"shard_{idx:02d}",
+            env={
+                "HK_STOCK_DAILY_SCOPE": "all",
+                "HK_STOCK_DAILY_SHARD_COUNT": str(shard_count),
+                "HK_STOCK_DAILY_SHARD_INDEX": str(idx),
+                "HK_STOCK_DAILY_SHARD_KEY": f"shard_{idx:02d}",
+            },
+            blocks_run=False,
         )
         for idx in range(shard_count)
     )
@@ -99,16 +119,20 @@ def _stock_30m_fullmarket_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
                 "STOCK_30M_FULLMARKET_SHARD_KEY": f"shard_{idx:02d}",
                 "STOCK_30M_FULLMARKET_MAX_CODES_PER_RUN": "500",
                 "STOCK_30M_FULLMARKET_CALL_INTERVAL": "0.1",
+                "STOCK_MINUTE_STRICT_PUBLIC_ERRORS": "true",
                 "SIGNALS_PROVIDER_JITTER_SECONDS": "0,0.15",
             },
+            blocks_run=False,
         )
         for idx in range(shard_count)
     )
 
 
 _STOCK_DAILY_TASKS = _stock_daily_shard_tasks()
+_HK_STOCK_DAILY_TASKS = _hk_stock_daily_shard_tasks()
 _BOARD_CONS_TASKS = _board_cons_shard_tasks()
 _STOCK_DAILY_DEPS = tuple(task.task_key for task in _STOCK_DAILY_TASKS)
+_HK_STOCK_DAILY_DEPS = tuple(task.task_key for task in _HK_STOCK_DAILY_TASKS)
 _BOARD_CONS_DEPS = tuple(task.task_key for task in _BOARD_CONS_TASKS)
 _STOCK_30M_TASKS = _stock_30m_fullmarket_shard_tasks()
 _STOCK_30M_DEPS = tuple(task.task_key for task in _STOCK_30M_TASKS)
@@ -122,15 +146,38 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     *_STOCK_DAILY_TASKS,
     PostmarketTaskSpec("board_ranking", "market_data"),
     *_BOARD_CONS_TASKS,
-    *_STOCK_30M_TASKS,
-    PostmarketTaskSpec("weekly_rollup", "derived", depends_on=(*_STOCK_DAILY_DEPS, "index_daily:all")),
-    PostmarketTaskSpec("chain_heat_snapshots", "derived", depends_on=("board_ranking:all",)),
+    PostmarketTaskSpec("chain_heat_snapshots", "chain_context", depends_on=("board_ranking:all",)),
     PostmarketTaskSpec(
         "postmarket_chain_rebuild",
-        "derived",
+        "chain_context",
         depends_on=("fullmarket_spot_snapshot:all", *_STOCK_DAILY_DEPS, "board_ranking:all", *_BOARD_CONS_DEPS, "chain_heat_snapshots:all"),
     ),
-    PostmarketTaskSpec("technical_signal_scan", "derived", depends_on=(*_STOCK_DAILY_DEPS, *_STOCK_30M_DEPS, "weekly_rollup:all")),
+    PostmarketTaskSpec(
+        "stock_minute",
+        "chain_context",
+        shard_key="chain_representatives",
+        depends_on=("chain_heat_snapshots:all", "postmarket_chain_rebuild:all"),
+        env={
+            "STOCK_MINUTE_SCOPE": "postmarket_candidates",
+            "STOCK_MINUTE_FREQS": "5min,15min",
+            "STOCK_MINUTE_POSTMARKET_MAX_CODES": "160",
+            "STOCK_MINUTE_POSTMARKET_CHAIN_LIMIT": "80",
+            "STOCK_MINUTE_POSTMARKET_ROLLUP_LIMIT": "40",
+            "STOCK_MINUTE_WORKERS": "4",
+            "STOCK_MINUTE_CALL_INTERVAL": "0.15",
+        },
+    ),
+    PostmarketTaskSpec("weekly_rollup", "derived", depends_on=(*_STOCK_DAILY_DEPS, "index_daily:all")),
+    PostmarketTaskSpec(
+        "technical_signal_scan",
+        "derived",
+        depends_on=(*_STOCK_DAILY_DEPS, "weekly_rollup:all"),
+        env={
+            "TECHNICAL_SIGNAL_SCAN_MARKETS": "A",
+            "TECHNICAL_SIGNAL_SCAN_REQUIRED_FREQS": "日线,周线",
+            "TECHNICAL_SIGNAL_SCAN_OPTIONAL_FREQS": "30分钟,15分钟,5分钟",
+        },
+    ),
     PostmarketTaskSpec("knowledge_market_views", "derived"),
     PostmarketTaskSpec(
         "concept_relationship_graph",
@@ -154,10 +201,19 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
             "STOCK_MINUTE_SCOPE": "postmarket_candidates",
             "STOCK_MINUTE_FREQS": "5min,15min",
             "STOCK_MINUTE_POSTMARKET_MAX_CODES": "240",
+            "STOCK_MINUTE_WORKERS": "6",
+            "STOCK_MINUTE_CALL_INTERVAL": "0.15",
         },
     ),
     PostmarketTaskSpec("index_minute", "minute_preheat", depends_on=("terminal_realtime_pool:all",)),
-    PostmarketTaskSpec("minute_readiness_probe", "minute_preheat", depends_on=("stock_minute:all", "index_minute:all")),
+    PostmarketTaskSpec(
+        "minute_readiness_probe",
+        "minute_preheat",
+        depends_on=("stock_minute:all", "index_minute:all"),
+        blocks_run=False,
+    ),
+    *_STOCK_30M_TASKS,
+    *_HK_STOCK_DAILY_TASKS,
 )
 
 POSTMARKET_PHASES: tuple[str, ...] = tuple(dict.fromkeys(task.phase for task in POSTMARKET_TASKS))
@@ -287,6 +343,7 @@ def _summarize_result(result: Any) -> dict[str, Any]:
         "sample_errors",
         "sample_deferred",
         "source_counts",
+        "markets",
         "unmapped",
         "skipped_fresh",
         "skip_reason_counts",
@@ -351,7 +408,7 @@ def _dependency_status_ok(task_doc: dict[str, Any]) -> bool:
         return True
     if status not in {"partial", "degraded"}:
         return False
-    if str(task_doc.get("module") or "") == "stock_daily":
+    if str(task_doc.get("module") or "") in {"stock_daily", "hk_stock_daily"}:
         return _stock_daily_dependency_ok(task_doc)
     return False
 
@@ -370,6 +427,7 @@ class PostmarketRunner:
         self.max_workers = max_workers or _env_int("SIGNALS_POSTMARKET_WORKERS", 8, minimum=1)
         self.module_semaphores = {
             "stock_daily": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_STOCK_DAILY_WORKERS", 2, minimum=1)),
+            "hk_stock_daily": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_HK_STOCK_DAILY_WORKERS", 2, minimum=1)),
             "stock_30m_fullmarket": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_STOCK_30M_WORKERS", 4, minimum=1)),
             "board_cons": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_BOARD_CONS_WORKERS", 2, minimum=1)),
         }
@@ -438,32 +496,49 @@ class PostmarketRunner:
         for order, spec in enumerate(POSTMARKET_TASKS):
             task_id = self._task_id(run_id, spec)
             current_ids.add(task_id)
-            self.db["sync_tasks"].update_one(
+            current = self.db["sync_tasks"].find_one(
                 {"_id": task_id},
-                {
-                    "$set": {
-                        "run_id": run_id,
-                        "trade_date": trade_date,
-                        "module": spec.module,
-                        "task_key": spec.task_key,
-                        "phase": spec.phase,
-                        "shard_key": spec.shard_key,
-                        "depends_on": list(spec.depends_on),
-                        "order": order,
-                        "updated_at": now,
-                    },
-                    "$setOnInsert": {
-                        "status": "pending",
-                        "attempts": 0,
-                        "cursor": {},
-                        "result_summary": {},
-                        "error_msg": "",
-                        "started_at": None,
-                        "finished_at": None,
-                    },
-                },
-                upsert=True,
+                {"phase": 1, "depends_on": 1, "status": 1},
+            ) or {}
+            spec_changed = bool(current) and (
+                str(current.get("phase") or "") != spec.phase
+                or tuple(current.get("depends_on") or ()) != tuple(spec.depends_on)
+                or bool(current.get("blocks_run", True)) != spec.blocks_run
             )
+            set_values: dict[str, Any] = {
+                "run_id": run_id,
+                "trade_date": trade_date,
+                "module": spec.module,
+                "task_key": spec.task_key,
+                "phase": spec.phase,
+                "shard_key": spec.shard_key,
+                "depends_on": list(spec.depends_on),
+                "blocks_run": spec.blocks_run,
+                "order": order,
+                "updated_at": now,
+            }
+            if spec_changed:
+                set_values.update({
+                    "status": "pending",
+                    "owner_pid": "",
+                    "cursor": {},
+                    "result_summary": {},
+                    "error_msg": "task_spec_changed",
+                    "started_at": None,
+                    "finished_at": None,
+                })
+            update_doc: dict[str, Any] = {"$set": set_values}
+            if not current:
+                update_doc["$setOnInsert"] = {
+                    "status": "pending",
+                    "attempts": 0,
+                    "cursor": {},
+                    "result_summary": {},
+                    "error_msg": "",
+                    "started_at": None,
+                    "finished_at": None,
+                }
+            self.db["sync_tasks"].update_one({"_id": task_id}, update_doc, upsert=True)
         for doc in self.db["sync_tasks"].find({"run_id": run_id}, {"_id": 1, "status": 1}):
             task_id = str(doc.get("_id") or "")
             if task_id in current_ids:
@@ -636,9 +711,14 @@ class PostmarketRunner:
             logger.warning("postmarket released stale tasks: run=%s released=%d", run_id, released)
 
         results: list[dict[str, Any]] = []
+        run_optional_tasks = _env_bool("SIGNALS_POSTMARKET_RUN_OPTIONAL_TASKS", False)
         blocked: set[str] = set()
         for phase in POSTMARKET_PHASES:
             phase_specs = self._phase_specs(phase)
+            if not run_optional_tasks:
+                phase_specs = [spec for spec in phase_specs if spec.blocks_run]
+            if not phase_specs:
+                continue
             attempted: set[str] = set()
             while True:
                 self._heartbeat(run_id, phase)
@@ -691,10 +771,22 @@ class PostmarketRunner:
 
         task_docs = list(self.db["sync_tasks"].find(
             {"run_id": run_id},
-            {"module": 1, "status": 1, "phase": 1, "updated_at": 1, "result_summary": 1},
+            {"module": 1, "task_key": 1, "status": 1, "phase": 1, "updated_at": 1, "result_summary": 1},
         ))
-        incomplete = [doc for doc in task_docs if not _task_effectively_done(doc)]
-        status = "ok" if not incomplete and not blocked else "partial"
+        blocking_task_keys = {task.task_key for task in POSTMARKET_TASKS if task.blocks_run}
+        incomplete = [
+            doc
+            for doc in task_docs
+            if str(doc.get("task_key") or "") in blocking_task_keys and not _task_effectively_done(doc)
+        ]
+        optional_incomplete = [
+            doc
+            for doc in task_docs
+            if str(doc.get("task_key") or "") not in blocking_task_keys and not _task_effectively_done(doc)
+        ]
+        blocked_critical = {task_key for task_key in blocked if task_key in blocking_task_keys}
+        blocked_optional = {task_key for task_key in blocked if task_key not in blocking_task_keys}
+        status = "ok" if not incomplete and not blocked_critical else "partial"
         now = _naive_bj()
         self.db["sync_runs"].update_one(
             {"_id": run_id},
@@ -704,9 +796,11 @@ class PostmarketRunner:
                 "heartbeat_at": now,
                 "updated_at": now,
                 "finished_at": now,
-                "blocked_tasks": sorted(blocked),
+                "blocked_tasks": sorted(blocked_critical),
+                "optional_blocked_tasks": sorted(blocked_optional),
                 "ok_tasks": len(task_docs) - len(incomplete),
                 "incomplete_tasks": len(incomplete),
+                "optional_incomplete_tasks": len(optional_incomplete),
             }},
         )
         return {
@@ -714,9 +808,11 @@ class PostmarketRunner:
             "trade_date": trade_date,
             "status": status,
             "results": results,
-            "blocked_tasks": sorted(blocked),
+            "blocked_tasks": sorted(blocked_critical),
+            "optional_blocked_tasks": sorted(blocked_optional),
             "ok_tasks": len(task_docs) - len(incomplete),
             "incomplete_tasks": len(incomplete),
+            "optional_incomplete_tasks": len(optional_incomplete),
         }
 
     @staticmethod
@@ -724,7 +820,7 @@ class PostmarketRunner:
         now = now or _now_bj()
         if not _is_a_share_trading_day(now):
             return False
-        start = _parse_hm(os.getenv("SIGNALS_POSTMARKET_START_TIME", "15:35"), dt_time(15, 35))
+        start = _parse_hm(os.getenv("SIGNALS_POSTMARKET_START_TIME", "16:10"), dt_time(16, 10))
         end = _parse_hm(os.getenv("SIGNALS_POSTMARKET_END_TIME", "23:50"), dt_time(23, 50))
         current = _local_bj(now).time()
         return start <= current <= end

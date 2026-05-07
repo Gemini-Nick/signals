@@ -1207,6 +1207,44 @@ def test_concept_target_returns_scored_candidate_groups(monkeypatch):
     assert isinstance(leader["risk_flags"], list)
 
 
+def test_concept_minute_target_falls_back_to_chain_carrier_when_heat_missing(monkeypatch):
+    from signals.web.api import workbench
+
+    class FakeEngine:
+        def get_concepts(self):
+            return []
+
+    async def fake_stock_target(symbol, raw_code, freq):
+        return {
+            "target": {"kind": "stock", "label": symbol, "symbol": symbol, "requested_freq": freq},
+            "chart": {
+                "ohlcv": [{"time": "2026-05-06 15:00", "open": 1, "high": 2, "low": 1, "close": 2, "volume": 100}],
+                "meta": {"source": "bars", "freq": freq},
+            },
+            "summary": {"title": "中科曙光"},
+            "signals": [],
+            "plan": None,
+            "review": {},
+            "trade": {},
+        }
+
+    monkeypatch.setattr(workbench, "_concept_theme_candidates", lambda name: [])
+    monkeypatch.setattr(workbench, "_concept_rank_rows", lambda name, themes: [])
+    monkeypatch.setattr(workbench, "_concept_constituent_symbols", lambda name, themes: [])
+    monkeypatch.setattr(workbench, "_industry_constituent_symbols", lambda name: [])
+    monkeypatch.setattr(workbench, "_board_heat_chart", lambda name, kind, freq: ({"ohlcv": [], "meta": {"source": "board_heat_ticks", "freq": freq}}, {}))
+    monkeypatch.setattr(workbench, "_build_stock_target", fake_stock_target)
+
+    payload = asyncio.run(workbench._build_concept_target(FakeEngine(), "算力租赁", "30min"))
+
+    assert payload["target"]["kind"] == "concept"
+    assert payload["target"]["carrier_kind"] == "stock"
+    assert payload["target"]["fallback_reason"] == "concept_heat_not_ready"
+    assert payload["chart"]["ohlcv"]
+    assert payload["candidate_stocks"][0]["chain_id"] == "ai_compute"
+    assert payload["candidate_stocks"][0]["node_id"] == "compute_service_operator"
+
+
 def test_concept_click_uses_chain_rebuild_rollups_before_yaml(monkeypatch):
     from signals.web.api import workbench
 
@@ -1308,6 +1346,84 @@ def test_chain_rebuild_candidates_ignore_stale_taxonomy_nodes(monkeypatch):
     assert workbench._chain_rebuild_board_candidates("贵金属", "industry") == []
 
 
+def test_electrolyte_relation_groups_include_upstream_and_downstream(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (_bars(), "unit_test"))
+
+    candidates = workbench._taxonomy_adjacent_chain_candidates("lithium_battery", "electrolyte")
+    groups = workbench._candidate_groups(candidates, heat_value=5.0)
+
+    upstream_symbols = {item["symbol"] for item in groups["upstream"]}
+    downstream_symbols = {item["symbol"] for item in groups["downstream"]}
+
+    assert {"SZ.002407", "SZ.002709", "SH.603026"} <= upstream_symbols
+    assert {"SZ.300750", "SZ.300014"} <= downstream_symbols
+    assert groups["upstream"][0]["chain_relation_type"] == "upstream"
+    assert groups["downstream"][0]["chain_relation_type"] == "downstream"
+
+    concept_candidates = workbench._concept_carrier_candidates("电解液", [], [])
+    concept_groups = workbench._candidate_groups(concept_candidates, heat_value=5.0)
+    assert {"SZ.002407", "SZ.002709"} <= {item["symbol"] for item in concept_groups["upstream"]}
+    assert "SZ.300750" in {item["symbol"] for item in concept_groups["downstream"]}
+
+
+def test_chain_heat_sector_docs_keep_chain_diversity():
+    from signals.web.api import workbench
+
+    docs = [
+        {"chain_id": "semi", "node_id": "foundry", "rank": 1},
+        {"chain_id": "semi", "node_id": "equipment", "rank": 2},
+        {"chain_id": "semi", "node_id": "materials", "rank": 3},
+        {"chain_id": "lithium", "node_id": "resource", "rank": 4},
+        {"chain_id": "lithium", "node_id": "cathode", "rank": 5},
+        {"chain_id": "ai_compute", "node_id": "operator", "rank": 6},
+    ]
+
+    rows = workbench._diversify_chain_heat_docs(docs, limit=5, max_nodes_per_chain=2)
+
+    assert [row["node_id"] for row in rows[:5]] == [
+        "foundry",
+        "equipment",
+        "resource",
+        "cathode",
+        "operator",
+    ]
+    assert sum(1 for row in rows if row["chain_id"] == "semi") == 2
+
+
+def test_chain_backed_concept_skips_generic_industry_leaders(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_chain_rebuild_board_candidates", lambda name, kind: [])
+    monkeypatch.setattr(workbench, "_concept_rank_rows", lambda name, themes: [])
+    monkeypatch.setattr(workbench, "_concept_constituent_symbols", lambda name, themes: [])
+    monkeypatch.setattr(workbench, "_industry_constituent_symbols", lambda name: [])
+
+    rows = workbench._concept_carrier_candidates("锂", [], ["化学原料", "化学制品"])
+
+    assert any(row.get("node_id") == "lithium_resource" for row in rows)
+    assert "industry_leader_map" not in {row.get("source") for row in rows}
+    assert "SH.600309" not in {row.get("symbol") for row in rows}
+    assert "SZ.002648" not in {row.get("symbol") for row in rows}
+
+
+def test_compute_leasing_skips_hardware_and_game_industry_leaders(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_chain_rebuild_board_candidates", lambda name, kind: [])
+    monkeypatch.setattr(workbench, "_concept_rank_rows", lambda name, themes: [])
+    monkeypatch.setattr(workbench, "_concept_constituent_symbols", lambda name, themes: [])
+    monkeypatch.setattr(workbench, "_industry_constituent_symbols", lambda name: [])
+
+    rows = workbench._concept_carrier_candidates("算力租赁", [], ["计算机设备", "软件开发", "互联网服务"])
+    symbols = {row.get("symbol") for row in rows}
+
+    assert any(row.get("node_id") == "compute_service_operator" for row in rows)
+    assert "industry_leader_map" not in {row.get("source") for row in rows}
+    assert not {"SZ.000977", "SZ.002230", "SZ.002555"} & symbols
+
+
 def test_stock_chain_summary_prefers_security_membership(monkeypatch):
     from signals.web.api import workbench
 
@@ -1338,9 +1454,79 @@ def test_stock_chain_summary_prefers_security_membership(monkeypatch):
     summary = workbench._stock_chain_position_summary("SZ.002466")
 
     assert summary["source"] == "security_chain_memberships"
+    assert summary["chain_id"] == "lithium_battery"
+    assert summary["node_id"] == "lithium_resource"
     assert summary["chain"] == "电新/锂电池产业链"
     assert summary["node"] == "锂资源"
     assert summary["is_primary_chain"] is True
+
+
+def test_stock_chain_context_exposes_same_node_candidate_groups(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Cursor(list):
+        def sort(self, *args, **kwargs):
+            return self
+
+        def limit(self, limit):
+            return _Cursor(self[:limit])
+
+    class _Collection:
+        def __init__(self, doc=None, rows=None):
+            self.doc = doc or {}
+            self.rows = rows or []
+
+        def find_one(self, query=None, projection=None, sort=None):
+            return self.doc
+
+        def find(self, query=None, projection=None):
+            return _Cursor(self.rows)
+
+    class _Db(dict):
+        def __missing__(self, key):
+            self[key] = _Collection()
+            return self[key]
+
+    membership = {
+        "trade_date": "2026-05-06",
+        "symbol": "SH.688400",
+        "raw_code": "688400",
+        "chain_id": "robotics",
+        "chain_name": "机器人/自动化产业链",
+        "node_id": "automation",
+        "node_name": "自动化/机器人",
+        "layer": "midstream",
+        "stage": "中游",
+        "role": "中游",
+        "confidence": 96,
+        "exposure_score": 106,
+        "is_primary_chain": True,
+    }
+    db = _Db({
+        "security_chain_memberships": _Collection(doc=membership),
+        "chain_node_security_rollups": _Collection(doc={
+            "trade_date": "2026-05-06",
+            "chain_id": "robotics",
+            "node_id": "automation",
+            "top_securities": [
+                {"symbol": "SH.688218", "raw_code": "688218", "name": "江苏北人", "is_primary_chain": True, "exposure_score": 110, "confidence": 96},
+                {"symbol": "SZ.002698", "raw_code": "002698", "name": "博实股份", "is_primary_chain": True, "exposure_score": 110, "confidence": 96},
+                {"symbol": "SH.688400", "raw_code": "688400", "name": "凌云光", "is_primary_chain": True, "exposure_score": 106, "confidence": 96},
+            ],
+        }),
+    })
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: db)
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (_bars(), "test_daily"))
+
+    position = workbench._stock_chain_position_summary("SH.688400")
+    context = workbench._stock_chain_context(position)
+
+    assert context["chain_name"] == "机器人/自动化产业链"
+    assert context["node_name"] == "自动化/机器人"
+    assert context["mapping_chain"]["chain_id"] == "robotics"
+    assert context["candidate_groups"]["leaders"]
+    assert {row["symbol"] for row in context["candidate_groups"]["leaders"]} >= {"SH.688218", "SZ.002698"}
+    assert context["focus_stocks_preview"]
 
 
 def test_trader_task_queue_is_action_oriented():

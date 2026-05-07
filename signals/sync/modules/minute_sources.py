@@ -188,6 +188,8 @@ def fetch_public_minute(
     endpoint: str = "stock_minute",
 ) -> tuple[pd.DataFrame, str]:
     """Fetch public minute bars and return (dataframe, provider)."""
+    if symbol.lower().startswith("bj"):
+        providers = ("sina",)
     errors: list[str] = []
     for provider in providers:
         try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import config
+import pytest
 from signals.sync.modules import stock_minute
 from signals.sync.task_context import task_env
 
@@ -78,6 +79,15 @@ def test_stock_minute_worker_count_is_constrained(monkeypatch):
     assert stock_minute._worker_count() == 1
 
 
+def test_stock_minute_runtime_timing_reads_task_env(monkeypatch):
+    monkeypatch.setenv("STOCK_MINUTE_CALL_INTERVAL", "0.5")
+    monkeypatch.setenv("STOCK_MINUTE_TIMEOUT", "5")
+
+    with task_env({"STOCK_MINUTE_CALL_INTERVAL": "0.15", "STOCK_MINUTE_TIMEOUT": "3"}):
+        assert stock_minute._call_interval() == 0.15
+        assert stock_minute._public_timeout() == 3.0
+
+
 def test_stock_minute_tail_count_defaults_and_overrides(monkeypatch):
     monkeypatch.delenv("STOCK_MINUTE_TAIL_COUNT", raising=False)
     monkeypatch.delenv("STOCK_MINUTE_TAIL_COUNT_5", raising=False)
@@ -92,6 +102,17 @@ def test_stock_minute_tail_count_defaults_and_overrides(monkeypatch):
     monkeypatch.setenv("STOCK_MINUTE_TAIL_COUNT_30", "90")
     assert stock_minute._tail_count_for_freq("5分钟") == 80
     assert stock_minute._tail_count_for_freq("30分钟") == 90
+
+
+def test_stock_minute_strict_public_errors_reraises(monkeypatch):
+    def fake_fetch_public_minute(*args, **kwargs):
+        raise RuntimeError("sina: provider_cooling_down")
+
+    monkeypatch.setattr(stock_minute, "fetch_public_minute", fake_fetch_public_minute)
+
+    with task_env({"STOCK_MINUTE_STRICT_PUBLIC_ERRORS": "true"}):
+        with pytest.raises(RuntimeError, match="provider_cooling_down"):
+            stock_minute._sync_one_minute("920118", "30分钟", db=None)
 
 
 def test_stock_minute_cap_splits_intraday_and_close(monkeypatch):
@@ -201,6 +222,7 @@ def test_postmarket_minute_selection_consumes_pending_universe_before_cached():
 def test_postmarket_minute_selection_merges_terminal_skipped_and_signal_sources(monkeypatch):
     monkeypatch.setenv("STOCK_MINUTE_SCOPE", "postmarket_candidates")
     monkeypatch.setenv("STOCK_MINUTE_POSTMARKET_MAX_CODES", "10")
+    monkeypatch.setattr(stock_minute, "_iter_static_chain_representative_symbols", lambda: [])
 
     db = _Db({
         "terminal_stock_pool": _Collection(doc={
@@ -233,7 +255,7 @@ def test_postmarket_minute_selection_merges_terminal_skipped_and_signal_sources(
 
     selected, meta = stock_minute._get_active_symbols_with_meta(db)
 
-    assert selected == ["300001", "300002", "300003", "300004", "300005", "300006"]
+    assert selected == ["300005", "300006", "300001", "300002", "300003", "300004"]
     assert meta["minute_scope"] == "postmarket_candidates"
     assert meta["rotation_policy"] == "postmarket_expanded_candidate_preheat"
     assert meta["source_counts"]["terminal_stock_pool_skipped"] == 1
@@ -246,6 +268,7 @@ def test_postmarket_minute_selection_merges_terminal_skipped_and_signal_sources(
 def test_postmarket_minute_selection_pins_visible_chain_representatives(monkeypatch):
     monkeypatch.setenv("STOCK_MINUTE_SCOPE", "postmarket_candidates")
     monkeypatch.setenv("STOCK_MINUTE_POSTMARKET_MAX_CODES", "3")
+    monkeypatch.setattr(stock_minute, "_iter_static_chain_representative_symbols", lambda: [])
 
     db = _Db({
         "terminal_stock_pool": _Collection(doc={"stocks": []}),
@@ -266,15 +289,75 @@ def test_postmarket_minute_selection_pins_visible_chain_representatives(monkeypa
                 "integrated_domains": [{"leader_symbol": "SZ.002466"}],
             }],
         ),
+        "chain_node_security_rollups": _Collection(
+            doc={"trade_date": "2026-05-06"},
+            docs=[{
+                "top_securities": [
+                    {"symbol": "SH.600941", "raw_code": "600941", "name": "中国移动"},
+                ],
+            }],
+        ),
         "sync_log": _Collection(),
     })
 
     selected, meta = stock_minute._get_active_symbols_with_meta(db)
 
-    assert {"601899", "002466"} <= set(selected)
-    assert set(meta["pinned_symbols"]) == {"601899", "002466"}
+    assert {"601899", "002466", "600941"} <= set(selected)
+    assert set(meta["pinned_symbols"]) == {"601899", "002466", "600941"}
+    assert meta["source_counts"]["chain_rebuild_rollups"] == 1
     assert meta["source_counts"]["chain_representatives"] == 1
     assert meta["source_counts"]["chain_domain_leaders"] == 1
+
+
+def test_postmarket_minute_selection_pins_static_chain_representatives(monkeypatch):
+    monkeypatch.setenv("STOCK_MINUTE_SCOPE", "postmarket_candidates")
+    monkeypatch.setenv("STOCK_MINUTE_POSTMARKET_MAX_CODES", "3")
+    monkeypatch.setattr(
+        stock_minute,
+        "_iter_static_chain_representative_symbols",
+        lambda: ["SH.600941", "SH.600050", "SH.603019"],
+    )
+
+    db = _Db({
+        "terminal_stock_pool": _Collection(doc={"stocks": []}),
+        "chain_heat_snapshots": _Collection(),
+        "chain_node_security_rollups": _Collection(),
+        "sync_log": _Collection(),
+    })
+
+    selected, meta = stock_minute._get_active_symbols_with_meta(db)
+
+    assert selected == ["600941", "600050", "603019"]
+    assert set(meta["pinned_symbols"]) == {"600941", "600050", "603019"}
+    assert meta["source_counts"]["semantic_industry_chain_representatives"] == 3
+
+
+def test_pinned_candidate_source_promotes_existing_terminal_symbol(monkeypatch):
+    monkeypatch.setenv("STOCK_MINUTE_SCOPE", "postmarket_candidates")
+    monkeypatch.setenv("STOCK_MINUTE_POSTMARKET_MAX_CODES", "2")
+    monkeypatch.setattr(
+        stock_minute,
+        "_iter_static_chain_representative_symbols",
+        lambda: ["SH.600941", "SH.600050"],
+    )
+
+    db = _Db({
+        "terminal_stock_pool": _Collection(doc={
+            "stocks": [
+                {"raw_code": "300001"},
+                {"raw_code": "600941"},
+                {"raw_code": "300002"},
+            ],
+        }),
+        "chain_heat_snapshots": _Collection(),
+        "chain_node_security_rollups": _Collection(),
+        "sync_log": _Collection(),
+    })
+
+    selected, meta = stock_minute._get_active_symbols_with_meta(db)
+
+    assert selected == ["600941", "600050"]
+    assert set(meta["pinned_symbols"]) == {"600941", "600050"}
 
 
 def test_split_current_minute_tasks_skips_already_closed_bars():

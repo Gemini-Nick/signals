@@ -19,12 +19,31 @@ chains:
       - node_id: electrolyte
         name: 电解液
         layer: midstream
-        keywords: [电解液, 六氟磷酸锂, PVDF, 氟化工, 下游, 碳酸锂下游]
+        keywords: [电解液, 六氟磷酸锂, 电解液溶剂, 锂电添加剂, 电解液添加剂, VC添加剂, FEC添加剂, DMC, EMC, DEC, LiFSI, 锂盐]
         core_representatives:
           - {symbol: SZ.002709, name: 天赐材料, relation: 电解液/六氟磷酸锂链主, source_note: 电解液链主代表, priority: 100}
+          - {symbol: SH.603026, name: 石大胜华, relation: 电解液溶剂/添加剂链主, source_note: 电解液材料链主代表, priority: 96}
+          - {symbol: SZ.300037, name: 新宙邦, relation: 电解液/添加剂链主, source_note: 电解液链主代表, priority: 94}
         elastic_representatives:
-          - {symbol: SZ.002407, name: 多氟多, relation: 六氟磷酸锂/PVDF弹性标的, source_note: 电解液弹性代表, priority: 90}
+          - {symbol: SZ.002407, name: 多氟多, relation: 六氟磷酸锂弹性标的, source_note: 电解液锂盐弹性代表, priority: 90}
           - {symbol: SZ.002759, name: 天际股份, relation: 六氟磷酸锂弹性标的, source_note: 碳酸锂产业链下游弹性代表, priority: 84}
+        upstream_representatives:
+          - {symbol: SZ.002407, name: 多氟多, relation: 六氟磷酸锂/锂盐上游, source_note: 电解液上游锂盐代表, priority: 94}
+          - {symbol: SZ.002709, name: 天赐材料, relation: 六氟磷酸锂/电解液配套上游, source_note: 电解液上游材料代表, priority: 92}
+          - {symbol: SH.603026, name: 石大胜华, relation: 电解液溶剂上游, source_note: 电解液溶剂代表, priority: 90}
+        downstream_representatives:
+          - {symbol: SZ.300750, name: 宁德时代, relation: 动力/储能电池下游, source_note: 电解液下游电池厂代表, priority: 100}
+          - {symbol: SZ.300014, name: 亿纬锂能, relation: 动力/储能电池下游, source_note: 电解液下游电池厂代表, priority: 92}
+          - {symbol: SZ.002074, name: 国轩高科, relation: 动力电池下游, source_note: 电解液下游电池厂代表, priority: 88}
+      - node_id: pvdf_binder
+        name: PVDF/锂电氟材料
+        layer: midstream
+        keywords: [PVDF, 锂电PVDF, 粘结剂, 氟聚合物, 锂电氟材料]
+        core_representatives:
+          - {symbol: SZ.002407, name: 多氟多, relation: PVDF/锂电氟材料链主, source_note: PVDF链主代表, priority: 94}
+        elastic_representatives:
+          - {symbol: SZ.300343, name: ST联创, relation: PVDF弹性标的, source_note: PVDF弹性代表, priority: 82}
+          - {symbol: SH.600673, name: 东阳光, relation: 氟材料/PVDF弹性标的, source_note: 锂电氟材料弹性代表, priority: 78}
       - node_id: cathode
         name: 正极材料
         layer: midstream

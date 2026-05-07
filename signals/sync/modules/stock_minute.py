@@ -28,10 +28,7 @@ from .minute_sources import fetch_public_minute, stock_to_market_symbol
 
 logger = logging.getLogger("signals.sync.stock_minute")
 
-_CALL_INTERVAL = float(os.getenv("STOCK_MINUTE_CALL_INTERVAL", "0.5"))
-_PUBLIC_TIMEOUT = float(os.getenv("STOCK_MINUTE_TIMEOUT", "5"))
 _MINUTE_FREQS = ["5分钟", "15分钟", "30分钟"]
-_ENABLE_EASTMONEY_FALLBACK = os.getenv("STOCK_MINUTE_EASTMONEY_FALLBACK", "false").lower() == "true"
 _DEFAULT_PRIORITY_CODES = "688802,300575"
 _DEFAULT_TAIL_COUNTS = {"5分钟": 240, "15分钟": 160, "30分钟": 120}
 
@@ -65,8 +62,27 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _float_env(name: str, default: float, *, min_value: float = 0.0, max_value: float | None = None) -> float:
+    try:
+        value = float(get_task_env(name, os.getenv(name, str(default))) or default)
+    except (TypeError, ValueError):
+        value = default
+    value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
 def _env_value(name: str, default: str = "") -> str:
     return str(get_task_env(name, os.getenv(name, default)) or default)
+
+
+def _call_interval() -> float:
+    return _float_env("STOCK_MINUTE_CALL_INTERVAL", 0.5, min_value=0.0, max_value=10.0)
+
+
+def _public_timeout() -> float:
+    return _float_env("STOCK_MINUTE_TIMEOUT", 5.0, min_value=1.0, max_value=30.0)
 
 
 def _worker_count() -> int:
@@ -185,6 +201,15 @@ def _iter_configured_extra_symbols() -> list[str]:
     return symbols
 
 
+def _iter_static_chain_representative_symbols() -> list[str]:
+    try:
+        from signals.core.concept_carriers import preferred_carrier_symbols
+
+        return preferred_carrier_symbols()
+    except Exception:
+        return []
+
+
 def _env_symbol_values(*names: str, default: str = "") -> list[str]:
     values: list[str] = []
     raw = default
@@ -241,12 +266,25 @@ def _add_candidate(
     code = _pure_a_code(value)
     if not code or code in index_codes:
         return ""
-    if code not in symbols:
-        symbols.append(code)
     if priority:
         priority_symbols.add(code)
     if pinned:
         pinned_symbols.add(code)
+    if code in symbols:
+        if pinned:
+            symbols.remove(code)
+            insert_at = 0
+            while insert_at < len(symbols) and symbols[insert_at] in pinned_symbols:
+                insert_at += 1
+            symbols.insert(insert_at, code)
+    else:
+        if pinned:
+            insert_at = 0
+            while insert_at < len(symbols) and symbols[insert_at] in pinned_symbols:
+                insert_at += 1
+            symbols.insert(insert_at, code)
+        else:
+            symbols.append(code)
     if source:
         source_counts[source] = source_counts.get(source, 0) + 1
         if symbol_sources is not None:
@@ -276,6 +314,20 @@ def _add_postmarket_expanded_candidates(
     tech_limit = _int_env("STOCK_MINUTE_POSTMARKET_TECHNICAL_LIMIT", 500, min_value=1, max_value=2000)
     knowledge_limit = _int_env("STOCK_MINUTE_POSTMARKET_KNOWLEDGE_LIMIT", 300, min_value=1, max_value=1000)
     chain_limit = _int_env("STOCK_MINUTE_POSTMARKET_CHAIN_LIMIT", 120, min_value=1, max_value=500)
+    rollup_limit = _int_env("STOCK_MINUTE_POSTMARKET_ROLLUP_LIMIT", 120, min_value=1, max_value=500)
+
+    for symbol in _iter_static_chain_representative_symbols():
+        _add_candidate(
+            symbols,
+            source_counts,
+            priority_symbols,
+            pinned_symbols,
+            index_codes,
+            symbol,
+            "semantic_industry_chain_representatives",
+            pinned=True,
+            symbol_sources=symbol_sources,
+        )
 
     try:
         cursor = db["terminal_technical_signals"].find(
@@ -296,6 +348,31 @@ def _add_postmarket_expanded_candidates(
             _add_candidate(symbols, source_counts, priority_symbols, pinned_symbols, index_codes, doc.get("raw_code") or doc.get("symbol"), "knowledge_market_views", symbol_sources=symbol_sources)
     except Exception as exc:
         logger.debug("postmarket knowledge minute candidates skipped: %s", exc)
+
+    try:
+        latest = db["chain_node_security_rollups"].find_one({"market": "A"}, {"trade_date": 1}, sort=[("trade_date", -1)]) or {}
+        trade_date = latest.get("trade_date")
+        if trade_date:
+            cursor = db["chain_node_security_rollups"].find(
+                {"market": "A", "trade_date": trade_date},
+                {"top_securities": 1},
+            ).sort([("coverage_rank", 1), ("heat_score", -1)]).limit(rollup_limit)
+            for rollup in cursor:
+                for item in rollup.get("top_securities") or []:
+                    if isinstance(item, dict):
+                        _add_candidate(
+                            symbols,
+                            source_counts,
+                            priority_symbols,
+                            pinned_symbols,
+                            index_codes,
+                            item.get("raw_code") or item.get("symbol"),
+                            "chain_rebuild_rollups",
+                            pinned=True,
+                            symbol_sources=symbol_sources,
+                        )
+    except Exception as exc:
+        logger.debug("postmarket chain rebuild minute candidates skipped: %s", exc)
 
     try:
         latest = db["chain_heat_snapshots"].find_one({"market": "A"}, {"trade_minute": 1}, sort=[("trade_minute", -1)]) or {}
@@ -876,14 +953,16 @@ def _sync_one_minute(code: str, freq: str, proxy_url: str = None, *, tail_count:
         df, source = fetch_public_minute(
             stock_to_market_symbol(code),
             period,
-            timeout=_PUBLIC_TIMEOUT,
+            timeout=_public_timeout(),
             datalen=tail_count,
             count=tail_count,
             db=db,
             endpoint="stock_minute",
         )
     except Exception as public_error:
-        if not _ENABLE_EASTMONEY_FALLBACK:
+        if _bool_env("STOCK_MINUTE_STRICT_PUBLIC_ERRORS", False):
+            raise
+        if not _bool_env("STOCK_MINUTE_EASTMONEY_FALLBACK", False):
             logger.warning("公共分钟线失败，跳过东财兜底 %s %s: %s", code, freq, public_error)
             return []
         logger.warning("公共分钟线失败，显式尝试东财兜底 %s %s: %s", code, freq, public_error)
@@ -1015,7 +1094,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
     def sync_one(code: str, freq: str) -> dict:
         started = time.monotonic()
         docs = _sync_one_minute(code, freq, proxy_url, tail_count=tail_counts[freq], db=db)
-        time.sleep(_CALL_INTERVAL)
+        time.sleep(_call_interval())
         if not docs:
             sync_col.update_one(
                 {"_id": f"stock_minute:{code}:{freq}"},

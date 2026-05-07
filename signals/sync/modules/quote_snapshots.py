@@ -240,6 +240,20 @@ def _normalize_quote_symbol(value: object) -> str:
     return raw
 
 
+def _is_a_quote_symbol(value: object) -> bool:
+    normalized = _normalize_quote_symbol(value)
+    return normalized.startswith(("SH.", "SZ.", "BJ."))
+
+
+def _a_quote_symbols(symbols: list[str]) -> list[str]:
+    filtered: list[str] = []
+    for symbol in symbols:
+        normalized = _normalize_quote_symbol(symbol)
+        if normalized and _is_a_quote_symbol(normalized) and normalized not in filtered:
+            filtered.append(normalized)
+    return filtered
+
+
 def _is_index_quote_symbol(symbol: str) -> bool:
     normalized = _normalize_quote_symbol(symbol)
     if "." not in normalized:
@@ -457,7 +471,7 @@ def _hot_quote_symbols(db: Database) -> list[str]:
 
     def add(value: object) -> None:
         symbol = _normalize_quote_symbol(value)
-        if symbol and symbol not in symbols:
+        if symbol and _is_a_quote_symbol(symbol) and symbol not in symbols:
             symbols.append(symbol)
 
     for symbol in _MACRO_QUOTE_SYMBOLS:
@@ -507,6 +521,7 @@ def _fetch_eastmoney_ulist_docs(
     now: datetime,
     trading_day: str,
 ) -> tuple[dict[str, dict], list[dict]]:
+    symbols = _a_quote_symbols(symbols)
     if not symbols:
         return {}, []
     try:
@@ -602,7 +617,7 @@ def _read_fullmarket_spot_quotes(
     *,
     allow_latest_fallback: bool = True,
 ) -> dict[str, dict]:
-    symbols = [symbol for symbol in symbols if not _is_index_quote_symbol(symbol)]
+    symbols = [symbol for symbol in _a_quote_symbols(symbols) if not _is_index_quote_symbol(symbol)]
     if not symbols:
         return {}
     date_key = str(trading_day or "").replace("-", "")[:8]
@@ -688,7 +703,7 @@ def _read_fullmarket_spot_quotes(
 
 
 def _read_fullmarket_no_price_symbols(db: Database, symbols: list[str], trading_day: str) -> set[str]:
-    symbols = [symbol for symbol in symbols if not _is_index_quote_symbol(symbol)]
+    symbols = [symbol for symbol in _a_quote_symbols(symbols) if not _is_index_quote_symbol(symbol)]
     if not symbols:
         return set()
     date_key = str(trading_day or "").replace("-", "")[:8]
@@ -742,6 +757,9 @@ def _read_fullmarket_no_price_symbols(db: Database, symbols: list[str], trading_
 
 
 def _fetch_em_quote(db: Database, symbol: str, timeout: float = 5.0) -> tuple[dict | None, float, str]:
+    symbol = _normalize_quote_symbol(symbol)
+    if not _is_a_quote_symbol(symbol):
+        return None, 0.0, "non_a_quote_symbol"
     start = time.monotonic()
     try:
         import requests
@@ -829,7 +847,7 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
         trading_day = trading_day_key("A", now=now, open_time=QUOTE_TRADING_DAY_OPEN)
     except Exception:
         trading_day = now.date().isoformat()
-    symbols = _hot_quote_symbols(db)
+    symbols = _a_quote_symbols(_hot_quote_symbols(db))
     inserted = 0
     modified = 0
     processed = 0
@@ -916,7 +934,7 @@ def sync_eastmoney_ulist_quote(db: Database, proxy_url: str = None) -> dict:
         trading_day = trading_day_key("A", now=now, open_time=QUOTE_TRADING_DAY_OPEN)
     except Exception:
         trading_day = now.date().isoformat()
-    symbols = _hot_quote_symbols(db)
+    symbols = _a_quote_symbols(_hot_quote_symbols(db))
     docs, observations = _fetch_eastmoney_ulist_docs(db, symbols, now, trading_day)
 
     inserted = 0

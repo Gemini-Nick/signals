@@ -8,6 +8,7 @@ from czsc import Freq
 
 from signals.sync.modules.technical_signal_scan import (
     INTRADAY_SCAN_SCOPE,
+    POSTMARKET_SCAN_SCOPE,
     _coverage_by_freq,
     _doc_to_rawbar,
     _resampled_5m_docs,
@@ -170,6 +171,42 @@ def test_coverage_by_freq_marks_30m_incomplete_and_15m_on_demand():
     assert coverage["30分钟"]["status"] == "coverage_incomplete"
     assert coverage["30分钟"]["missing_count"] == 1
     assert coverage["15分钟"]["status"] == "on_demand_missing"
+
+
+def test_postmarket_scope_defaults_to_a_hk_daily_symbols():
+    db = _Db({
+        "bars": _Bars([
+            {"meta": {"symbol": "000001", "freq": "日线", "market": "A"}, "dt": datetime(2026, 4, 28)},
+            {"meta": {"symbol": "HK.00700", "freq": "日线", "market": "HK"}, "dt": datetime(2026, 4, 28)},
+            {"meta": {"symbol": "US.AAPL", "freq": "日线", "market": "US"}, "dt": datetime(2026, 4, 28)},
+        ]),
+    })
+
+    symbols, source = _symbols_for_scope(db, POSTMARKET_SCAN_SCOPE)
+
+    assert symbols == ["000001", "HK.00700"]
+    assert source == "daily_bars:A+HK"
+
+
+def test_coverage_by_freq_supports_daily_weekly_a_hk_scan():
+    db = _Db({
+        "bars": _Bars([
+            {"meta": {"symbol": "000001", "freq": "日线", "market": "A"}, "dt": datetime(2026, 4, 28)},
+            {"meta": {"symbol": "HK.00700", "freq": "日线", "market": "HK"}, "dt": datetime(2026, 4, 28)},
+            {"meta": {"symbol": "HK.00700", "freq": "周线", "market": "HK"}, "dt": datetime(2026, 4, 24)},
+        ]),
+    })
+
+    coverage = _coverage_by_freq(
+        db,
+        ["000001", "HK.00700"],
+        required_freqs=("日线", "周线"),
+        optional_freqs=(),
+    )
+
+    assert coverage["日线"]["status"] == "complete"
+    assert coverage["周线"]["status"] == "coverage_incomplete"
+    assert coverage["周线"]["missing_count"] == 1
 
 
 def test_intraday_scope_uses_stock_minute_selection_then_terminal_pool():

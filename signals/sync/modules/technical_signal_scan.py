@@ -27,6 +27,7 @@ MINUTE_FREQS = {
 REQUIRED_FULL_FREQS = ("日线", "周线", "30分钟")
 OPTIONAL_ON_DEMAND_FREQS = ("15分钟", "5分钟")
 INTRADAY_SCAN_SCOPE = "intraday_active"
+POSTMARKET_SCAN_SCOPE = "postmarket"
 FREQ_ORDER = {
     "周线": 0,
     "weekly": 0,
@@ -66,6 +67,12 @@ def _env_int(name: str, default: int, *, minimum: int = 0, maximum: int | None =
     return value
 
 
+def _env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = _env_text(name, ",".join(default))
+    values = [value.strip() for value in raw.replace(";", ",").split(",") if value.strip()]
+    return tuple(values) if values else default
+
+
 def _pure_a_code(symbol: Any) -> str:
     raw = str(symbol or "").strip().upper()
     if not raw:
@@ -75,7 +82,40 @@ def _pure_a_code(symbol: Any) -> str:
     return pure if pure.isdigit() and len(pure) == 6 else ""
 
 
+def _pure_hk_code(symbol: Any) -> str:
+    raw = str(symbol or "").strip().upper()
+    if not raw:
+        return ""
+    if "." in raw:
+        raw = raw.split(".", 1)[1]
+    raw = raw.replace("HK", "").strip()
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    return digits.zfill(5) if digits and len(digits) <= 5 else ""
+
+
+def _symbol_market(symbol: Any) -> str:
+    raw = str(symbol or "").strip().upper()
+    if raw.startswith("HK.") or _pure_hk_code(raw) and not _pure_a_code(raw):
+        return "HK"
+    return "A"
+
+
+def _raw_symbol_code(symbol: Any) -> str:
+    return _pure_hk_code(symbol) if _symbol_market(symbol) == "HK" else _pure_a_code(symbol)
+
+
+def _canonical_symbol(symbol: Any) -> str:
+    market = _symbol_market(symbol)
+    if market == "HK":
+        code = _pure_hk_code(symbol)
+        return f"HK.{code}" if code else ""
+    return _pure_a_code(symbol)
+
+
 def _prefixed_symbol(symbol: Any) -> str:
+    if _symbol_market(symbol) == "HK":
+        code = _pure_hk_code(symbol)
+        return f"HK.{code}" if code else str(symbol or "").strip()
     code = _pure_a_code(symbol)
     if not code:
         return str(symbol or "").strip()
@@ -86,19 +126,42 @@ def _prefixed_symbol(symbol: Any) -> str:
     return f"SZ.{code}"
 
 
-def _symbols_with_daily(db: Database) -> list[str]:
+def _symbol_query_values(symbol: str) -> list[str]:
+    market = _symbol_market(symbol)
+    code = _raw_symbol_code(symbol)
+    if not code:
+        return [str(symbol or "").strip()]
+    if market == "HK":
+        return [f"HK.{code}", code]
+    return [code, _prefixed_symbol(code)]
+
+
+def _scan_markets(scan_scope: str | None = None) -> tuple[str, ...]:
+    default = ("A",) if scan_scope == INTRADAY_SCAN_SCOPE else ("A", "HK")
+    markets = tuple(value.upper() for value in _env_list("TECHNICAL_SIGNAL_SCAN_MARKETS", default))
+    normalized = tuple("HK" if value in {"H", "HK"} else "A" for value in markets if value in {"A", "CN", "SH", "SZ", "BJ", "H", "HK"})
+    return tuple(dict.fromkeys(normalized)) or default
+
+
+def _symbols_with_daily(db: Database, *, markets: tuple[str, ...] | None = None) -> list[str]:
+    allowed_markets = set(markets or ("A", "HK"))
     symbols = db["bars"].distinct("meta.symbol", {"meta.freq": {"$in": DAILY_FREQS}})
-    clean = sorted({_pure_a_code(symbol) for symbol in symbols if _pure_a_code(symbol)})
+    clean = sorted({
+        canonical
+        for symbol in symbols
+        for canonical in (_canonical_symbol(symbol),)
+        if canonical and _symbol_market(canonical) in allowed_markets
+    })
     max_symbols = _env_int("TECHNICAL_SIGNAL_SCAN_MAX_SYMBOLS", 0)
     if max_symbols > 0:
         return clean[:max_symbols]
     return clean
 
 
-def _append_symbol(out: list[str], value: Any) -> None:
-    code = _pure_a_code(value)
-    if code and code not in out:
-        out.append(code)
+def _append_symbol(out: list[str], value: Any, *, allowed_markets: tuple[str, ...] = ("A",)) -> None:
+    symbol = _canonical_symbol(value)
+    if symbol and _symbol_market(symbol) in set(allowed_markets) and symbol not in out:
+        out.append(symbol)
 
 
 def _symbols_from_stock_minute_selection(db: Database) -> list[str]:
@@ -143,7 +206,7 @@ def _scan_scope(scope: str | None = None) -> str:
     market = _env_text("SIGNALS_CURRENT_SYNC_MARKET")
     if lane == "signal_lane" and market == "A":
         return INTRADAY_SCAN_SCOPE
-    return "postmarket"
+    return POSTMARKET_SCAN_SCOPE
 
 
 def _symbols_for_scope(db: Database, scope: str) -> tuple[list[str], str]:
@@ -155,7 +218,8 @@ def _symbols_for_scope(db: Database, scope: str) -> tuple[list[str], str]:
             _append_symbol(symbols, value)
         limit = _env_int("TECHNICAL_SIGNAL_INTRADAY_MAX_SYMBOLS", 120, minimum=1, maximum=500)
         return symbols[:limit], "stock_minute_selection+terminal_stock_pool"
-    return _symbols_with_daily(db), "daily_bars"
+    markets = _scan_markets(scope)
+    return _symbols_with_daily(db, markets=markets), f"daily_bars:{'+'.join(markets)}"
 
 
 def _freq_aliases(label: str) -> list[str]:
@@ -166,18 +230,25 @@ def _freq_aliases(label: str) -> list[str]:
     return MINUTE_FREQS.get(label, [label])
 
 
-def _coverage_by_freq(db: Database, symbols: list[str]) -> dict[str, dict[str, Any]]:
-    symbol_set = {_pure_a_code(symbol) for symbol in symbols if _pure_a_code(symbol)}
+def _coverage_by_freq(
+    db: Database,
+    symbols: list[str],
+    *,
+    required_freqs: tuple[str, ...] = REQUIRED_FULL_FREQS,
+    optional_freqs: tuple[str, ...] = OPTIONAL_ON_DEMAND_FREQS,
+) -> dict[str, dict[str, Any]]:
+    symbol_set = {_canonical_symbol(symbol) for symbol in symbols if _canonical_symbol(symbol)}
     total = len(symbol_set)
     coverage: dict[str, dict[str, Any]] = {}
-    for label in (*REQUIRED_FULL_FREQS, *OPTIONAL_ON_DEMAND_FREQS):
+    required_set = set(required_freqs)
+    for label in (*required_freqs, *optional_freqs):
         aliases = _freq_aliases(label)
         try:
             raw_symbols = db["bars"].distinct("meta.symbol", {"meta.freq": {"$in": aliases}})
             covered = {
-                _pure_a_code(symbol)
+                _canonical_symbol(symbol)
                 for symbol in raw_symbols
-                if _pure_a_code(symbol) in symbol_set
+                if _canonical_symbol(symbol) in symbol_set
             }
             latest = db["bars"].find_one(
                 {"meta.freq": {"$in": aliases}},
@@ -188,7 +259,7 @@ def _coverage_by_freq(db: Database, symbols: list[str]) -> dict[str, dict[str, A
             covered = set()
             latest = {}
         missing_count = max(0, total - len(covered))
-        required = label in REQUIRED_FULL_FREQS
+        required = label in required_set
         coverage[label] = {
             "freq": label,
             "required": required,
@@ -206,7 +277,7 @@ def _coverage_by_freq(db: Database, symbols: list[str]) -> dict[str, dict[str, A
 def _rawbar_dt(value: Any, *, symbol: str = "", source: str = "") -> pd.Timestamp:
     # czsc.RawBar shifts naive Python datetime through the host timezone; keep
     # cached market labels as pandas Timestamp to avoid local-machine drift.
-    normalized = to_market_naive(value, market="A", symbol=symbol, source=source)
+    normalized = to_market_naive(value, market=_symbol_market(symbol), symbol=symbol, source=source)
     if normalized is None:
         return pd.to_datetime(value)
     return pd.Timestamp(normalized)
@@ -216,9 +287,11 @@ def _doc_to_rawbar(doc: dict[str, Any], symbol: str, freq, idx: int) -> Any:
     from czsc import RawBar
 
     meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+    market = str(meta.get("market") or _symbol_market(symbol))
+    normalized_dt = to_market_naive(doc.get("dt"), market=market, symbol=symbol, source=str(meta.get("source") or ""))
     return RawBar(
         symbol=symbol,
-        dt=_rawbar_dt(doc.get("dt"), symbol=symbol, source=str(meta.get("source") or "")),
+        dt=pd.Timestamp(normalized_dt) if normalized_dt is not None else _rawbar_dt(doc.get("dt"), symbol=symbol, source=str(meta.get("source") or "")),
         id=idx,
         freq=freq,
         open=float(doc.get("open") or 0),
@@ -300,8 +373,8 @@ def _resampled_5m_docs(db: Database, symbol: str, label: str, *, limit: int) -> 
 
 def _load_bars(db: Database, symbol: str, freq_values: list[str], freq, *, limit: int, label: str = "", resample_intraday: bool = False) -> list[Any]:
     docs = list(db["bars"].find(
-        {"meta.symbol": symbol, "meta.freq": {"$in": freq_values}},
-        {"_id": 0, "dt": 1, "open": 1, "high": 1, "low": 1, "close": 1, "vol": 1, "amount": 1},
+        {"meta.symbol": {"$in": _symbol_query_values(symbol)}, "meta.freq": {"$in": freq_values}},
+        {"_id": 0, "dt": 1, "meta": 1, "open": 1, "high": 1, "low": 1, "close": 1, "vol": 1, "amount": 1},
     ).sort("dt", -1).limit(limit))
     if resample_intraday and label in {"15分钟", "30分钟"}:
         resampled = _resampled_5m_docs(db, symbol, label, limit=limit)
@@ -410,7 +483,8 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
     from signals.core.detectors import detect_all_signals
     from signals.core.scorer import SIGNAL_WEIGHTS, score_signals
 
-    resample_intraday = scan_scope == INTRADAY_SCAN_SCOPE
+    market = _symbol_market(symbol)
+    resample_intraday = scan_scope == INTRADAY_SCAN_SCOPE and market == "A"
     bars_by_freq: list[tuple[str, Any, list[Any], int]] = [
         ("日线", Freq.D, _load_bars(db, symbol, DAILY_FREQS, Freq.D, limit=360, label="日线"), 200),
         ("周线", Freq.W, _load_bars(db, symbol, WEEKLY_FREQS, Freq.W, limit=180, label="周线"), 100),
@@ -434,7 +508,7 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
         return []
 
     scored = score_signals(_prefixed_symbol(symbol), events)
-    now = naive_market_now("A")
+    now = naive_market_now(market)
     buy_freqs = sorted({event.freq for event in events if _event_side(event, SIGNAL_WEIGHTS) == "buy"}, key=_freq_sort_key)
     sell_freqs = sorted({event.freq for event in events if _event_side(event, SIGNAL_WEIGHTS) == "sell"}, key=_freq_sort_key)
     docs: list[dict[str, Any]] = []
@@ -453,8 +527,8 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
         docs.append({
             "dedupe_key": dedupe_key,
             "symbol": _prefixed_symbol(symbol),
-            "raw_code": _pure_a_code(symbol),
-            "market": "A",
+            "raw_code": _raw_symbol_code(symbol),
+            "market": market,
             "freq": event.freq,
             "dt": dt_value,
             "as_of": now.date().isoformat(),
@@ -486,10 +560,14 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
 
 
 def _sync_technical_signal_scan(db: Database, proxy_url: str = None, *, scope: str | None = None) -> dict:
-    """Scan cached A-share hard-technical bars and publish explainable signals."""
+    """Scan cached hard-technical bars and publish explainable A/H signals."""
     del proxy_url
-    now = naive_market_now("A")
     scan_scope = _scan_scope(scope)
+    scan_markets = _scan_markets(scan_scope)
+    primary_market = scan_markets[0] if scan_markets else "A"
+    now = naive_market_now(primary_market)
+    required_freqs = _env_list("TECHNICAL_SIGNAL_SCAN_REQUIRED_FREQS", REQUIRED_FULL_FREQS)
+    optional_freqs = _env_list("TECHNICAL_SIGNAL_SCAN_OPTIONAL_FREQS", OPTIONAL_ON_DEMAND_FREQS)
     try:
         symbols, symbol_source = _symbols_for_scope(db, scan_scope)
     except Exception as exc:
@@ -502,10 +580,13 @@ def _sync_technical_signal_scan(db: Database, proxy_url: str = None, *, scope: s
             "signals": 0,
             "failed": 0,
             "scan_scope": scan_scope,
+            "markets": list(scan_markets),
+            "required_freqs": list(required_freqs),
+            "optional_freqs": list(optional_freqs),
             "symbol_source": "empty",
             "error_msg": "symbol_universe_empty",
         }
-    coverage_by_freq = _coverage_by_freq(db, symbols)
+    coverage_by_freq = _coverage_by_freq(db, symbols, required_freqs=required_freqs, optional_freqs=optional_freqs)
     skipped_by_freq = {
         freq: {
             "missing_symbols": int(meta.get("missing_count") or 0),
@@ -517,7 +598,7 @@ def _sync_technical_signal_scan(db: Database, proxy_url: str = None, *, scope: s
     }
     required_complete = all(
         coverage_by_freq.get(freq, {}).get("status") == "complete"
-        for freq in REQUIRED_FULL_FREQS
+        for freq in required_freqs
     )
     is_full_market_complete = bool(scan_scope != INTRADAY_SCAN_SCOPE and required_complete)
     if scan_scope == INTRADAY_SCAN_SCOPE:
@@ -551,11 +632,12 @@ def _sync_technical_signal_scan(db: Database, proxy_url: str = None, *, scope: s
 
     freshness_mode = "realtime" if scan_scope == INTRADAY_SCAN_SCOPE else "postmarket"
     freshness_lane = _env_text("SIGNALS_CURRENT_SYNC_LANE", "signal_lane" if scan_scope == INTRADAY_SCAN_SCOPE else "postmarket")
+    freshness_market = "A" if "A" in scan_markets else primary_market
     db["data_freshness"].update_one(
-        {"domain": "technical_signal", "market": "A", "mode": freshness_mode, "collection": "terminal_technical_signals"},
+        {"domain": "technical_signal", "market": freshness_market, "mode": freshness_mode, "collection": "terminal_technical_signals"},
         {"$set": {
             "domain": "technical_signal",
-            "market": "A",
+            "market": freshness_market,
             "mode": freshness_mode,
             "lane": freshness_lane,
             "collection": "terminal_technical_signals",
@@ -569,8 +651,9 @@ def _sync_technical_signal_scan(db: Database, proxy_url: str = None, *, scope: s
             "failed_symbols": failed,
             "scan_scope": scan_scope,
             "symbol_source": symbol_source,
-            "required_freqs": list(REQUIRED_FULL_FREQS),
-            "optional_freqs": list(OPTIONAL_ON_DEMAND_FREQS),
+            "markets": list(scan_markets),
+            "required_freqs": list(required_freqs),
+            "optional_freqs": list(optional_freqs),
             "coverage_by_freq": coverage_by_freq,
             "skipped_by_freq": skipped_by_freq,
             "is_full_market_complete": is_full_market_complete,
@@ -588,8 +671,9 @@ def _sync_technical_signal_scan(db: Database, proxy_url: str = None, *, scope: s
         "failed": failed,
         "scan_scope": scan_scope,
         "symbol_source": symbol_source,
-        "required_freqs": list(REQUIRED_FULL_FREQS),
-        "optional_freqs": list(OPTIONAL_ON_DEMAND_FREQS),
+        "markets": list(scan_markets),
+        "required_freqs": list(required_freqs),
+        "optional_freqs": list(optional_freqs),
         "coverage_by_freq": coverage_by_freq,
         "skipped_by_freq": skipped_by_freq,
         "is_full_market_complete": is_full_market_complete,
@@ -599,7 +683,7 @@ def _sync_technical_signal_scan(db: Database, proxy_url: str = None, *, scope: s
 
 
 def sync_technical_signal_scan(db: Database, proxy_url: str = None) -> dict:
-    """Scan cached A-share hard-technical bars and publish explainable signals."""
+    """Scan cached postmarket hard-technical bars and publish explainable signals."""
     return _sync_technical_signal_scan(db, proxy_url=proxy_url)
 
 

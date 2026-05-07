@@ -11,6 +11,27 @@ def test_stock_to_market_symbol_maps_bj_920_codes():
     assert minute_sources.stock_to_market_symbol("900901") == "sh900901"
 
 
+def test_fetch_public_minute_uses_sina_only_for_bj_symbols(monkeypatch):
+    calls = []
+
+    def fake_sina(symbol, period, *, timeout, datalen):
+        calls.append(("sina", symbol, period, datalen))
+        return pd.DataFrame([{"时间": "2026-05-06 15:00", "收盘": 10}])
+
+    def fake_tencent(symbol, period, *, timeout, count):
+        calls.append(("tencent", symbol, period, count))
+        return pd.DataFrame([{"时间": "2026-05-06 15:00", "收盘": 10}])
+
+    monkeypatch.setattr(minute_sources, "fetch_sina_minute", fake_sina)
+    monkeypatch.setattr(minute_sources, "fetch_tencent_minute", fake_tencent)
+
+    df, source = minute_sources.fetch_public_minute("bj920118", "30", datalen=88, count=77)
+
+    assert source == "sina"
+    assert not df.empty
+    assert calls == [("sina", "bj920118", "30", 88)]
+
+
 def test_fetch_public_minute_passes_tail_limits_to_provider(monkeypatch):
     calls = []
 

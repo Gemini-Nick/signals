@@ -226,6 +226,18 @@ def _stock_daily_providers_all_cooling(db: Database | None) -> bool:
         return False
 
 
+def _is_timeseries_collection(col) -> bool:
+    try:
+        db = getattr(col, "database", None)
+        name = getattr(col, "name", "")
+        if db is None or not name:
+            return False
+        info = next(db.list_collections(filter={"name": name}), None)
+        return bool((info or {}).get("options", {}).get("timeseries"))
+    except Exception:
+        return False
+
+
 def _write_daily_docs_batch(bars_col, sync_col, docs_by_code: dict[str, list]) -> dict[str, int]:
     """Write several symbols in one Mongo round trip and update per-symbol cursors."""
     docs_by_code = {
@@ -256,11 +268,16 @@ def _write_daily_docs_batch(bars_col, sync_col, docs_by_code: dict[str, list]) -
     except Exception as exc:
         logger.debug("批量查询已有日线失败，继续尝试写入: %s", exc)
 
-    new_docs = [
-        doc for doc in all_docs
-        if (str((doc.get("meta") or {}).get("symbol") or ""), doc.get("dt")) not in existing_keys
-    ]
     written_by_code = {code: 0 for code in docs_by_code}
+    new_docs = []
+    existing_docs = []
+    for doc in all_docs:
+        symbol = str((doc.get("meta") or {}).get("symbol") or "")
+        key = (symbol, doc.get("dt"))
+        if key in existing_keys:
+            existing_docs.append(doc)
+        else:
+            new_docs.append(doc)
     if new_docs:
         result = bars_col.insert_many(new_docs, ordered=False)
         inserted_count = len(getattr(result, "inserted_ids", []) or [])
@@ -268,6 +285,26 @@ def _write_daily_docs_batch(bars_col, sync_col, docs_by_code: dict[str, list]) -
             symbol = str((doc.get("meta") or {}).get("symbol") or "")
             if symbol in written_by_code:
                 written_by_code[symbol] += 1
+    bars_is_timeseries = _is_timeseries_collection(bars_col)
+    for doc in existing_docs:
+        meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+        symbol = str(meta.get("symbol") or "")
+        if not symbol:
+            continue
+        try:
+            query = {"meta.symbol": symbol, "meta.freq": "日线", "dt": doc.get("dt")}
+            if bars_is_timeseries:
+                bars_col.delete_many(query)
+                bars_col.insert_many([{key: value for key, value in doc.items() if key != "_id"}], ordered=False)
+            else:
+                bars_col.update_one(
+                    query,
+                    {"$set": {key: value for key, value in doc.items() if key != "_id"}},
+                    upsert=True,
+                )
+            written_by_code[symbol] = written_by_code.get(symbol, 0) + 1
+        except Exception as exc:
+            logger.debug("更新已有日线失败 %s %s: %s", symbol, doc.get("dt"), exc)
 
     now = naive_market_now("A")
     for code, docs in docs_by_code.items():
@@ -993,6 +1030,11 @@ def _snapshot_daily_doc(
         prev_gap = abs(snapshot_prev_close - previous_close) / previous_close
         if prev_gap > _batch_prev_close_tolerance():
             return None
+    change = None
+    change_pct = None
+    if snapshot_prev_close and snapshot_prev_close > 0:
+        change = round(float(close) - float(snapshot_prev_close), 4)
+        change_pct = round((float(close) - float(snapshot_prev_close)) / float(snapshot_prev_close) * 100.0, 4)
     return {
         "dt": pd.to_datetime(end_date),
         "meta": {
@@ -1012,10 +1054,57 @@ def _snapshot_daily_doc(
         "high": float(high),
         "low": float(low),
         "close": float(close),
+        "prev_close": float(snapshot_prev_close) if snapshot_prev_close is not None else None,
+        "change": change,
+        "change_pct": change_pct,
+        "pct_chg": change_pct,
         "vol": vol,
         "amount": int(float(amount or 0)),
         "source": "eastmoney_spot_clist_batch",
     }
+
+
+def _current_daily_quote_refresh_candidates(db: Database, codes: list[str], end_date: str) -> list[str]:
+    """Current-day provider daily bars can be adjusted; refresh them from close quotes."""
+    if not codes:
+        return []
+    try:
+        trade_dt = pd.to_datetime(end_date).to_pydatetime()
+        rows = db["bars"].find(
+            {
+                "meta.freq": "日线",
+                "meta.symbol": {"$in": codes},
+                "dt": trade_dt,
+            },
+            {
+                "meta.symbol": 1,
+                "meta.source": 1,
+                "meta.source_type": 1,
+                "meta.prev_close": 1,
+                "prev_close": 1,
+                "change_pct": 1,
+                "pct_chg": 1,
+            },
+        )
+    except Exception as exc:
+        logger.debug("读取当日日线 quote refresh candidates 失败: %s", exc)
+        return []
+    refresh: set[str] = set()
+    for row in rows:
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        code = _pure_a_code(meta.get("symbol"))
+        if not code:
+            continue
+        source_type = str(meta.get("source_type") or "")
+        source = str(meta.get("source") or "")
+        prev_close = _safe_number(row.get("prev_close"))
+        if prev_close is None:
+            prev_close = _safe_number(meta.get("prev_close"))
+        change_pct = _safe_number(row.get("change_pct"))
+        pct_chg = _safe_number(row.get("pct_chg"))
+        if source_type != "direct_quote_ohlcv" or source != "eastmoney_spot_clist_batch" or not prev_close or change_pct is None or pct_chg is None:
+            refresh.add(code)
+    return [code for code in codes if code in refresh]
 
 
 def _batch_today_candidates(codes: list[str], sync_docs: dict[str, object], end_date: str) -> list[str]:
@@ -1061,11 +1150,16 @@ def _sync_today_from_spot_batch(
         and not _coerce_last_dt(sync_docs.get(code))
         and code in snapshot_rows
     ]
-    candidates = cursor_candidates + snapshot_bootstrap_candidates
+    current_refresh_candidates = [
+        code
+        for code in _current_daily_quote_refresh_candidates(db, codes, end_date)
+        if code in snapshot_rows and code not in set(cursor_candidates) and code not in set(snapshot_bootstrap_candidates)
+    ]
+    candidates = cursor_candidates + snapshot_bootstrap_candidates + current_refresh_candidates
     if not candidates:
         return {}, "no_today_candidates"
 
-    prev_close_by_code = _previous_daily_close_by_symbol(db, cursor_candidates, end_date)
+    prev_close_by_code = _previous_daily_close_by_symbol(db, [*cursor_candidates, *current_refresh_candidates], end_date)
     docs_by_code: dict[str, list] = {}
     for code in candidates:
         row = snapshot_rows.get(code)
@@ -1083,6 +1177,7 @@ def _sync_today_from_spot_batch(
     return docs_by_code, (
         f"batch_today_candidates={len(cursor_candidates)},"
         f"snapshot_bootstrap={len(snapshot_bootstrap_candidates)},"
+        f"current_refresh={len(current_refresh_candidates)},"
         f"batch_docs={len(docs_by_code)},fallback={fallback_count}"
     )
 

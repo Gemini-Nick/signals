@@ -260,10 +260,58 @@ def test_stock_daily_batch_today_uses_eastmoney_clist_snapshot(monkeypatch):
     assert docs["600001"][0]["source"] == "eastmoney_spot_clist_batch"
     assert docs["600001"][0]["meta"]["quality"] == "provisional_close"
     assert docs["600001"][0]["meta"]["source_type"] == "direct_quote_ohlcv"
+    assert docs["600001"][0]["prev_close"] == 10.0
+    assert docs["600001"][0]["change_pct"] == 5.0
     assert docs["600001"][0]["vol"] == 100000
     assert docs["600001"][0]["meta"]["volume_unit"] == "shares"
     assert docs["600001"][0]["meta"]["source_volume_unit"] == "hands"
     assert "fallback=1" in reason
+
+
+def test_stock_daily_batch_today_refreshes_existing_provider_current_day(monkeypatch):
+    db = _DB()
+    current_doc = {
+        "dt": datetime(2026, 5, 6),
+        "meta": {"symbol": "600001", "freq": "日线", "source": "tencent"},
+        "close": 9.8,
+    }
+
+    def fake_current_refresh(_db, codes, end_date):
+        assert codes == ["600001"]
+        assert end_date == "20260506"
+        return ["600001"]
+
+    monkeypatch.setattr(stock_daily, "naive_market_now", lambda _market: datetime(2026, 5, 6, 18, 0, 0))
+    monkeypatch.setattr(stock_daily, "_current_daily_quote_refresh_candidates", fake_current_refresh)
+    monkeypatch.setattr(stock_daily, "_previous_daily_close_by_symbol", lambda _db, _codes, _end_date: {"600001": 10.0})
+    monkeypatch.setattr(
+        stock_daily,
+        "_fetch_eastmoney_spot_batch_df",
+        lambda _db, _end_date: pd.DataFrame([{
+            "代码": "600001",
+            "_pure_code": "600001",
+            "今开": 10.1,
+            "最高": 10.8,
+            "最低": 10.0,
+            "最新价": 10.5,
+            "成交量": 1000,
+            "成交额": 100000,
+            "昨收": 10.0,
+        }]),
+    )
+
+    docs, reason = stock_daily._sync_today_from_spot_batch(
+        db,
+        ["600001"],
+        {"600001": datetime(2026, 5, 6)},
+        "20260506",
+    )
+
+    assert current_doc["close"] == 9.8
+    assert set(docs) == {"600001"}
+    assert docs["600001"][0]["source"] == "eastmoney_spot_clist_batch"
+    assert docs["600001"][0]["close"] == 10.5
+    assert "current_refresh=1" in reason
 
 
 def test_stock_daily_batch_today_bootstraps_snapshot_only_codes(monkeypatch):

@@ -37,6 +37,8 @@ def _daily_docs(db: Database, collection: str, symbol: str) -> list[dict[str, An
 def _weekly_docs(symbol: str, docs: list[dict[str, Any]], *, collection: str) -> list[dict[str, Any]]:
     if not docs:
         return []
+    source_meta = next((doc.get("meta") for doc in docs if isinstance(doc.get("meta"), dict)), {}) or {}
+    market = str(source_meta.get("market") or ("HK" if str(symbol).upper().startswith("HK.") else "A")).upper()
     df = pd.DataFrame(docs)
     if df.empty or "dt" not in df.columns:
         return []
@@ -74,7 +76,7 @@ def _weekly_docs(symbol: str, docs: list[dict[str, Any]], *, collection: str) ->
                 "symbol": symbol,
                 "freq": WEEKLY_FREQ,
                 "source": source,
-                "market": "A",
+                "market": market,
                 "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
                 "source_volume_unit": "daily_shares_rollup",
                 "period_end": period_end.date().isoformat(),

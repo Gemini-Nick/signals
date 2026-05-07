@@ -3877,7 +3877,8 @@ def _source_confidence_score(item: dict[str, Any]) -> float:
         return _score_0_100(item.get("confidence"), 65)
     source = _text(item.get("source"))
     rep_type = _text(item.get("representative_type"))
-    if source == "semantic_industry_chain" or rep_type in {"core", "elastic"}:
+    relation_type = _text(item.get("chain_relation_type"))
+    if source == "semantic_industry_chain" or rep_type in {"core", "elastic", "upstream", "downstream"} or relation_type in {"upstream", "downstream"}:
         return 90
     if source in {"concept_rank", "concept_sina", "concept_em", "concept_ths", "strategy_snapshot"}:
         return 78
@@ -3888,7 +3889,10 @@ def _source_confidence_score(item: dict[str, Any]) -> float:
 
 def _role_score(item: dict[str, Any], leader_rank: int = 0) -> float:
     rep_type = _text(item.get("representative_type"))
+    relation_type = _text(item.get("chain_relation_type"))
     source = _text(item.get("source"))
+    if relation_type in {"upstream", "downstream"} or rep_type in {"upstream", "downstream"}:
+        return 76
     if rep_type == "core":
         return max(82, 102 - leader_rank * 6)
     if source == "industry_leader_map" or rep_type == "industry_leader":
@@ -3948,7 +3952,12 @@ def _trend_score_for_candidate(
 
 def _candidate_leader_tier(item: dict[str, Any], leader_rank: int) -> str:
     rep_type = _text(item.get("representative_type"))
+    relation_type = _text(item.get("chain_relation_type"))
     source = _text(item.get("source"))
+    if relation_type == "upstream" or rep_type == "upstream":
+        return "上游"
+    if relation_type == "downstream" or rep_type == "downstream":
+        return "下游"
     if rep_type == "core":
         return ["龙头", "龙二", "龙三"][min(max(leader_rank - 1, 0), 2)]
     if source == "industry_leader_map" or rep_type == "industry_leader":
@@ -4036,9 +4045,12 @@ def _candidate_score_limit() -> int:
 
 def _candidate_prefilter_rank(item: dict[str, Any], index: int) -> tuple[float, float, float, int]:
     rep_type = _text(item.get("representative_type"))
+    relation_type = _text(item.get("chain_relation_type"))
     source = _text(item.get("source"))
     source_rank = {
         "core": 100,
+        "upstream": 90,
+        "downstream": 86,
         "industry_leader": 92,
         "source_leader": 88,
         "elastic": 82,
@@ -4047,6 +4059,10 @@ def _candidate_prefilter_rank(item: dict[str, Any], index: int) -> tuple[float, 
         "industry_constituent": 42,
         "concept_constituent": 42,
     }.get(rep_type, 0)
+    if relation_type == "upstream":
+        source_rank = max(source_rank, 90)
+    elif relation_type == "downstream":
+        source_rank = max(source_rank, 86)
     if source_rank == 0:
         source_rank = {
             "industry_leader_map": 90,
@@ -4072,7 +4088,10 @@ def _prioritized_candidate_inputs(candidates: list[dict[str, Any]]) -> list[dict
     seen: set[str] = set()
     for index, item in enumerate(candidates):
         symbol, _ = _candidate_symbol_fields(item)
+        relation_type = _text(item.get("chain_relation_type"))
         key = (_text(symbol).upper() or f"{_text(item.get('name'))}|{_text(item.get('source'))}|{index}")
+        if relation_type in {"upstream", "downstream"}:
+            key = f"{key}:{relation_type}"
         if key in seen:
             continue
         seen.add(key)
@@ -4088,9 +4107,11 @@ def _candidate_groups(
 ) -> dict[str, list[dict[str, Any]]]:
     heat_score = _board_heat_score(heat_value)
     groups: dict[str, list[dict[str, Any]]] = {
+        "upstream": [],
         "leaders": [],
         "weighted": [],
         "elastic": [],
+        "downstream": [],
         "source_leaders": [],
         "constituents": [],
     }
@@ -4106,7 +4127,12 @@ def _candidate_groups(
         payload = _scored_candidate_payload(item, heat_score=heat_score, leader_rank=leader_rank, daily_cache=daily_cache)
         if not payload:
             continue
-        if rep_type == "core":
+        relation_type = _text(item.get("chain_relation_type"))
+        if relation_type == "upstream" or rep_type == "upstream":
+            groups["upstream"].append(payload)
+        elif relation_type == "downstream" or rep_type == "downstream":
+            groups["downstream"].append(payload)
+        elif rep_type == "core":
             groups["leaders"].append(payload)
             groups["weighted"].append(payload)
         elif source == "industry_leader_map" or rep_type == "industry_leader":
@@ -4125,7 +4151,7 @@ def _candidate_groups(
 
 
 def _flatten_candidate_groups(groups: dict[str, list[dict[str, Any]]], limit: int = 20) -> list[dict[str, Any]]:
-    ordered_keys = ["leaders", "weighted", "elastic", "source_leaders", "constituents"]
+    ordered_keys = ["leaders", "upstream", "weighted", "elastic", "downstream", "source_leaders", "constituents"]
     output: list[dict[str, Any]] = []
     seen: set[str] = set()
     for key in ordered_keys:
@@ -4579,6 +4605,43 @@ def _candidate_groups_from_representatives(row: dict[str, Any], *, lightweight: 
     return groups
 
 
+def _chain_heat_max_nodes_per_chain() -> int:
+    try:
+        return max(1, int(os.getenv("WORKBENCH_CHAIN_HEAT_MAX_NODES_PER_CHAIN", "2")))
+    except Exception:
+        return 2
+
+
+def _diversify_chain_heat_docs(
+    docs: list[dict[str, Any]],
+    *,
+    limit: int,
+    max_nodes_per_chain: int = 2,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    overflow: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    chain_counts: dict[str, int] = {}
+    for doc in docs:
+        chain_id = _text(doc.get("chain_id"))
+        node_id = _text(doc.get("node_id")) or "default"
+        key = (chain_id, node_id)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        chain_key = chain_id or node_id
+        if chain_counts.get(chain_key, 0) < max_nodes_per_chain:
+            selected.append(doc)
+            chain_counts[chain_key] = chain_counts.get(chain_key, 0) + 1
+        else:
+            overflow.append(doc)
+        if len(selected) >= limit:
+            break
+    if len(selected) < limit:
+        selected.extend(overflow[: limit - len(selected)])
+    return selected[:limit]
+
+
 def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
     try:
         db = _mongo_db()
@@ -4601,16 +4664,12 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         docs = list(db["chain_heat_snapshots"].find(
             {"market": "A", "trade_minute": latest["trade_minute"]},
             {"_id": 0},
-        ).sort("rank", 1).limit(limit * 3))
-        deduped_docs: list[dict[str, Any]] = []
-        seen_keys: set[tuple[str, str]] = set()
-        for doc in docs:
-            key = (_text(doc.get("chain_id")), _text(doc.get("node_id")) or "default")
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            deduped_docs.append(doc)
-        docs = deduped_docs[:limit]
+        ).sort("rank", 1).limit(limit * 5))
+        docs = _diversify_chain_heat_docs(
+            docs,
+            limit=limit,
+            max_nodes_per_chain=_chain_heat_max_nodes_per_chain(),
+        )
     except Exception:
         return []
     rows: list[dict[str, Any]] = []
@@ -5873,6 +5932,44 @@ def _mongo_db():
     return get_db()
 
 
+def _taxonomy_adjacent_chain_candidates(chain_id: str, node_id: str) -> list[dict[str, Any]]:
+    chain = load_industry_chains().get(_text(chain_id)) or {}
+    node = (chain.get("nodes_by_id") or {}).get(_text(node_id)) or {}
+    if not node:
+        return []
+    rows: list[dict[str, Any]] = []
+    relation_labels = {
+        "upstream": "上游",
+        "downstream": "下游",
+    }
+    for relation_type, rep_key in (("upstream", "upstream_representatives"), ("downstream", "downstream_representatives")):
+        for rep in node.get(rep_key) or []:
+            symbol, raw_code = _stock_symbol_from_code_or_name(rep.get("symbol"), rep.get("name"))
+            if not symbol:
+                continue
+            rows.append({
+                "symbol": symbol,
+                "raw_code": raw_code or symbol.split(".", 1)[-1],
+                "name": _text(rep.get("name")) or _stock_name(symbol),
+                "source": "semantic_industry_chain_relation",
+                "relation": _text(rep.get("relation")) or relation_labels.get(relation_type, relation_type),
+                "representative_type": relation_type,
+                "chain_relation_type": relation_type,
+                "priority": int(rep.get("priority") or 0),
+                "base_priority": int(rep.get("priority") or 0),
+                "chain_id": chain.get("chain_id"),
+                "chain_name": chain.get("name"),
+                "node_id": node.get("node_id"),
+                "node_name": node.get("name"),
+                "layer": node.get("layer"),
+                "stage": node.get("stage"),
+                "confidence": 92,
+                "source_note": _text(rep.get("source_note")) or f"{node.get('name')} {relation_labels.get(relation_type, relation_type)}代表",
+                "evidence_sources": ["industry_chains.yaml", "semantic_industry_chain_relation"],
+            })
+    return rows
+
+
 def _chain_rebuild_board_candidates(name: str, kind: str, limit: int = 20) -> list[dict[str, Any]]:
     query_name = _text(name)
     if not query_name:
@@ -5925,11 +6022,13 @@ def _chain_rebuild_board_candidates(name: str, kind: str, limit: int = 20) -> li
         top_rows = []
         rollup = {}
     rows: list[dict[str, Any]] = []
+    seen_relation_keys: set[tuple[str, str]] = set()
     for index, item in enumerate(top_rows[:limit]):
         symbol, raw_code = _stock_symbol_from_code_or_name(item.get("raw_code") or item.get("symbol"), item.get("name"))
         if not symbol:
             continue
-        representative_type = "core" if item.get("is_primary_chain") or index < 3 else f"{board_kind}_constituent"
+        seen_relation_keys.add((symbol.upper(), ""))
+        representative_type = _text(item.get("representative_type")) or ("core" if item.get("is_primary_chain") or index < 3 else f"{board_kind}_constituent")
         rows.append({
             "symbol": symbol,
             "raw_code": raw_code or symbol.split(".", 1)[-1],
@@ -5946,10 +6045,24 @@ def _chain_rebuild_board_candidates(name: str, kind: str, limit: int = 20) -> li
             "stage": mapping.get("stage") or rollup.get("stage"),
             "confidence": item.get("confidence") or mapping.get("confidence"),
             "exposure_score": item.get("exposure_score"),
+            "representative_priority": item.get("representative_priority"),
+            "representative_relation": item.get("representative_relation"),
+            "taxonomy_representative": bool(item.get("taxonomy_representative")),
             "is_primary_chain": item.get("is_primary_chain"),
-            "source_note": "盘后全局产业链重塑优先映射",
+            "source_note": item.get("source_note") or "盘后全局产业链重塑优先映射",
             "evidence_sources": item.get("evidence_sources") or mapping.get("evidence_sources") or [],
             "mapping_source": "source_board_chain_mappings",
+            "trade_date": trade_date or rollup.get("trade_date"),
+        })
+    for item in _taxonomy_adjacent_chain_candidates(chain_id, node_id):
+        symbol = _text(item.get("symbol")).upper()
+        relation_type = _text(item.get("chain_relation_type"))
+        if not symbol or (symbol, relation_type) in seen_relation_keys:
+            continue
+        seen_relation_keys.add((symbol, relation_type))
+        rows.append({
+            **item,
+            "mapping_source": "industry_chains.yaml",
             "trade_date": trade_date or rollup.get("trade_date"),
         })
     return rows
@@ -5979,8 +6092,12 @@ def _stock_chain_membership_summary(symbol: str) -> dict[str, Any]:
     if not row:
         return {}
     return {
+        "chain_id": _text(row.get("chain_id")),
         "chain": _text(row.get("chain_name")),
+        "chain_name": _text(row.get("chain_name")),
+        "node_id": _text(row.get("node_id")),
         "node": _text(row.get("node_name")),
+        "node_name": _text(row.get("node_name")),
         "role": _text(row.get("role") or row.get("node_name")),
         "layer": _text(row.get("layer")),
         "stage": _text(row.get("stage")),
@@ -5991,6 +6108,117 @@ def _stock_chain_membership_summary(symbol: str) -> dict[str, Any]:
         "is_primary_chain": bool(row.get("is_primary_chain")),
         "trade_date": _text(row.get("trade_date")),
         "related_chains": [],
+    }
+
+
+def _stock_chain_candidate_inputs(chain_position: dict[str, Any], limit: int = 20) -> list[dict[str, Any]]:
+    chain_id = _text(chain_position.get("chain_id"))
+    node_id = _text(chain_position.get("node_id"))
+    if not chain_id or not node_id:
+        return []
+    trade_date = _text(chain_position.get("trade_date"))
+    try:
+        db = _mongo_db()
+        rollup_query = {"market": "A", "chain_id": chain_id, "node_id": node_id}
+        if trade_date:
+            rollup_query["trade_date"] = trade_date
+        rollup = db["chain_node_security_rollups"].find_one(
+            rollup_query,
+            {"_id": 0},
+            sort=[("trade_date", -1), ("coverage_rank", 1), ("updated_at", -1)],
+        ) or {}
+        if not rollup and trade_date:
+            rollup = db["chain_node_security_rollups"].find_one(
+                {"market": "A", "chain_id": chain_id, "node_id": node_id},
+                {"_id": 0},
+                sort=[("trade_date", -1), ("coverage_rank", 1), ("updated_at", -1)],
+            ) or {}
+        top_rows = [item for item in (rollup.get("top_securities") or []) if isinstance(item, dict)]
+        if not top_rows:
+            top_rows = list(db["security_chain_memberships"].find(
+                {"market": "A", "chain_id": chain_id, "node_id": node_id},
+                {"_id": 0},
+            ).sort([("trade_date", -1), ("is_primary_chain", -1), ("exposure_score", -1), ("confidence", -1)]).limit(limit))
+    except Exception:
+        top_rows = []
+        rollup = {}
+    rows: list[dict[str, Any]] = []
+    seen_relation_keys: set[tuple[str, str]] = set()
+    chain_name = _text(chain_position.get("chain_name") or chain_position.get("chain") or rollup.get("chain_name"))
+    node_name = _text(chain_position.get("node_name") or chain_position.get("node") or rollup.get("node_name"))
+    for index, item in enumerate(top_rows[:limit]):
+        symbol, raw_code = _stock_symbol_from_code_or_name(item.get("raw_code") or item.get("symbol"), item.get("name"))
+        if not symbol:
+            continue
+        seen_relation_keys.add((symbol.upper(), ""))
+        representative_type = _text(item.get("representative_type")) or ("core" if item.get("is_primary_chain") or index < 3 else "chain_constituent")
+        rows.append({
+            "symbol": symbol,
+            "raw_code": raw_code or symbol.split(".", 1)[-1],
+            "name": _text(item.get("name")) or _stock_name(symbol),
+            "source": "security_chain_memberships",
+            "relation": " / ".join(part for part in [chain_name, node_name] if part),
+            "representative_type": representative_type,
+            "priority": round(140 - index + _float(item.get("exposure_score"), 0), 3),
+            "chain_id": chain_id,
+            "chain_name": chain_name,
+            "node_id": node_id,
+            "node_name": node_name,
+            "layer": _text(chain_position.get("layer") or rollup.get("layer")),
+            "stage": _text(chain_position.get("stage") or rollup.get("stage")),
+            "confidence": item.get("confidence") or chain_position.get("confidence"),
+            "exposure_score": item.get("exposure_score"),
+            "representative_priority": item.get("representative_priority"),
+            "representative_relation": item.get("representative_relation"),
+            "taxonomy_representative": bool(item.get("taxonomy_representative")),
+            "is_primary_chain": item.get("is_primary_chain"),
+            "source_note": item.get("source_note") or "盘后全局产业链重塑同节点标的",
+            "evidence_sources": item.get("evidence_sources") or [],
+            "trade_date": trade_date or _text(rollup.get("trade_date")),
+        })
+    for item in _taxonomy_adjacent_chain_candidates(chain_id, node_id):
+        symbol = _text(item.get("symbol")).upper()
+        relation_type = _text(item.get("chain_relation_type"))
+        if not symbol or (symbol, relation_type) in seen_relation_keys:
+            continue
+        seen_relation_keys.add((symbol, relation_type))
+        rows.append({
+            **item,
+            "source": "semantic_industry_chain_relation",
+            "trade_date": trade_date or _text(rollup.get("trade_date")),
+        })
+    return rows
+
+
+def _stock_chain_context(chain_position: dict[str, Any]) -> dict[str, Any]:
+    if not chain_position:
+        return {}
+    chain_name = _text(chain_position.get("chain_name") or chain_position.get("chain"))
+    node_name = _text(chain_position.get("node_name") or chain_position.get("node") or chain_position.get("role"))
+    candidates = _stock_chain_candidate_inputs(chain_position)
+    candidate_groups = _candidate_groups(candidates, heat_value=chain_position.get("exposure_score")) if candidates else {}
+    return {
+        **chain_position,
+        "chain_name": chain_name,
+        "node_name": node_name,
+        "mapping_status": _text(chain_position.get("source")) or "security_chain_memberships",
+        "mapping_chain": {
+            "chain_id": _text(chain_position.get("chain_id")),
+            "chain_name": chain_name,
+            "node_id": _text(chain_position.get("node_id")),
+            "node_name": node_name,
+            "layer": _text(chain_position.get("layer")),
+            "stage": _text(chain_position.get("stage")),
+            "confidence": chain_position.get("confidence"),
+            "source_note": chain_position.get("source_note"),
+        },
+        "candidate_groups": candidate_groups,
+        "focus_stocks_preview": _flatten_candidate_groups(candidate_groups, limit=6) if candidate_groups else [],
+        "data_truth": {
+            "collection": "security_chain_memberships",
+            "as_of": _text(chain_position.get("trade_date")),
+            "mapping_status": _text(chain_position.get("source")) or "security_chain_memberships",
+        },
     }
 
 
@@ -6367,6 +6595,18 @@ def _concept_constituent_symbols(concept_name: str, theme_candidates: list[dict[
     return symbols
 
 
+def _has_chain_backed_candidates(candidates: list[dict[str, Any]]) -> bool:
+    chain_sources = {"chain_rebuild_rollup", "semantic_industry_chain"}
+    for item in candidates:
+        if (
+            _text(item.get("source")) in chain_sources
+            and _text(item.get("chain_id"))
+            and _text(item.get("node_id"))
+        ):
+            return True
+    return False
+
+
 def _industry_leader_candidate(industry_name: str) -> Optional[dict[str, Any]]:
     try:
         from signals.layers.industry import _INDUSTRY_LEADERS
@@ -6523,6 +6763,22 @@ def _concept_carrier_candidates(
                     "evidence_sources": item.get("evidence_sources"),
                 },
             )
+        seen_nodes: set[tuple[str, str]] = set()
+        for item in list(candidates):
+            chain_id = _text(item.get("chain_id"))
+            node_id = _text(item.get("node_id"))
+            if not chain_id or not node_id or (chain_id, node_id) in seen_nodes:
+                continue
+            seen_nodes.add((chain_id, node_id))
+            for adjacent in _taxonomy_adjacent_chain_candidates(chain_id, node_id):
+                add(
+                    symbol=_text(adjacent.get("symbol")),
+                    raw_code=_text(adjacent.get("raw_code")),
+                    name=_text(adjacent.get("name")),
+                    source=_text(adjacent.get("source")),
+                    relation=_text(adjacent.get("relation")),
+                    extra=adjacent,
+                )
 
     for row in _concept_rank_rows(concept_name, theme_candidates):
         add(
@@ -6552,7 +6808,7 @@ def _concept_carrier_candidates(
             extra={"representative_type": "concept_constituent"},
         )
 
-    if not non_chain:
+    if not non_chain and not _has_chain_backed_candidates(candidates):
         for industry in related_industries:
             leader = _industry_leader_candidate(industry)
             if leader:
@@ -6586,6 +6842,9 @@ def _representative_payload(item: dict[str, Any]) -> dict[str, Any]:
         "source": item.get("source"),
         "source_note": item.get("source_note"),
         "representative_type": item.get("representative_type"),
+        "representative_priority": item.get("representative_priority"),
+        "representative_relation": item.get("representative_relation"),
+        "chain_relation_type": item.get("chain_relation_type"),
         "priority": item.get("priority"),
         "base_priority": item.get("base_priority"),
         "chain_id": item.get("chain_id"),
@@ -6744,6 +7003,7 @@ def _summary_from_static_index(name: str, symbol: str, chart: Dict[str, Any]) ->
         )
         summary.update({
             "chain_position": chain_position,
+            "chain_context": _stock_chain_context(chain_position),
             "trade_role": trade_role,
             "trade_role_label": {
                 "chain_watch": "产业链观察",
@@ -6918,6 +7178,7 @@ def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any
         )
         summary.update({
             "chain_position": chain_position,
+            "chain_context": _stock_chain_context(chain_position),
             "trade_role": trade_role,
             "trade_role_label": {
                 "chain_watch": "产业链观察",
@@ -7261,6 +7522,55 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
     candidate_groups = _candidate_groups(carrier_candidates, heat_value=heat_value)
     ordered_candidates = _flatten_candidate_groups(candidate_groups, limit=20)
     non_chain = non_chain_reason(name)
+
+    async def fallback_to_concept_carrier(reason: str) -> Optional[Dict[str, Any]]:
+        if non_chain:
+            return None
+        fallback = _preview_carrier(carrier_candidates)
+        if not fallback:
+            return None
+        symbol, raw_code = _candidate_symbol_fields(fallback)
+        if not symbol:
+            return None
+        payload = await _build_stock_target(symbol, raw_code, requested_freq)
+        stock_title = payload.get("summary", {}).get("title") or fallback.get("name") or symbol
+        payload["target"] = {
+            **payload.get("target", {}),
+            "kind": "concept",
+            "label": name,
+            "symbol": symbol,
+            **_target_time_fields(symbol=symbol, source=payload.get("chart", {}).get("meta", {}).get("source", "")),
+            "requested_freq": requested_freq,
+            "carrier_kind": "stock",
+            "carrier_symbol": symbol,
+            "mapping_status": "mapped",
+            "unmapped_reason": "",
+            "fallback_reason": reason,
+            **_target_diagnostics("stock", symbol, requested_freq),
+        }
+        payload["summary"] = {
+            **payload.get("summary", {}),
+            "title": name,
+            "subtitle": f"概念承接 -> {stock_title}({symbol})",
+            "conclusion": f"{name} 概念热度分钟缓存未就绪，已用产业链代表股 {stock_title} 承接图形复核。",
+            "representatives": representatives,
+            "candidate_groups": candidate_groups,
+            "carrier": _representative_payload(fallback),
+            "fallback_reason": reason,
+            "mapping_chain": {
+                "query": name,
+                "concepts": [name],
+                "industries": related[:5],
+                "mapping_status": "carrier_fallback",
+                "candidate_count": len(carrier_candidates),
+            },
+        }
+        payload["candidate_groups"] = candidate_groups
+        payload["candidate_stocks"] = ordered_candidates
+        payload["analysis_target"] = symbol
+        payload["hidden_reasons"] = ["concept_heat_chart_fallback_to_carrier"]
+        return payload
+
     if requested_freq in {"5min", "15min", "30min"}:
         chart, latest_heat = _board_heat_chart(name, "concept", requested_freq)
         heat_target_label = _text(latest_heat.get("heat_target_label")) or name
@@ -7280,6 +7590,12 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
         related_custom_signals = _related_custom_signals_from_candidates(ordered_candidates, requested_freq)
         minute_change = _shortest_realtime_day_change("concept", heat_target_label)
         heat_change = minute_change.get("day_change_pct") if minute_change else (latest_heat.get("change_pct") or heat_value)
+        if not heat_ready:
+            carrier_payload = await fallback_to_concept_carrier("concept_heat_not_ready")
+            if carrier_payload is not None:
+                carrier_payload["data_truth"] = data_truth
+                carrier_payload["related_custom_signals"] = related_custom_signals
+                return carrier_payload
         return {
             "target": {
                 "kind": "concept",
