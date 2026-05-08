@@ -64,6 +64,14 @@ def test_segment_concepts_prefer_matching_chain_stage():
     assert _top_symbol("光模块") == "SZ.300308"
     optical = preferred_concept_carriers("光模块")
     assert [row["symbol"] for row in optical[:3]] == ["SZ.300308", "SZ.300502", "SZ.300394"]
+    ocs = preferred_concept_carriers("OCS光")
+    assert ocs
+    assert ocs[0]["symbol"] == "SH.688195"
+    assert ocs[0]["node_id"] == "ocs_optical_switch"
+    for concept in ["OCS", "光交换", "光开关"]:
+        matches = match_industry_chains(concept)
+        assert matches
+        assert matches[0]["node_id"] == "ocs_optical_switch"
     assert _top_symbol("猪肉") == "SZ.002714"
 
 

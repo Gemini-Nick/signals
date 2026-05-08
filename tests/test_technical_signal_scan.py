@@ -96,10 +96,14 @@ def test_ma_alignment_marks_reclaim_and_above_key_daily_averages():
     assert alignment["above_ma5"] is True
     assert alignment["above_ma10"] is True
     assert alignment["above_ma20"] is True
+    assert alignment["above_ma21"] is True
     assert alignment["reclaim_ma20"] is True
     assert alignment["above_count"] == 3
+    assert alignment["fib_above_count"] >= 1
+    assert alignment["fib_support_score"] > 0
     assert alignment["score"] > 0
     assert "站上20日线" in alignment["tags"]
+    assert "Fibonacci均线支撑" in alignment["tags"]
 
 
 def test_doc_to_rawbar_preserves_market_naive_datetime():

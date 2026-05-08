@@ -13,6 +13,15 @@ def test_tianji_taxonomy_representative_lives_under_lipf6_not_electrolyte():
     assert "六氟磷酸锂" in tianji["representative_relation"]
 
 
+def test_tengjing_taxonomy_representative_lives_under_ocs_optical_switch():
+    reps = rebuild._taxonomy_representatives_by_node()
+
+    tengjing = reps[("optical_module", "ocs_optical_switch")]["688195"]
+    assert tengjing["symbol"] == "SH.688195"
+    assert tengjing["representative_type"] == "core"
+    assert "OCS" in tengjing["representative_relation"]
+
+
 def test_rollup_prefers_chain_role_before_heat_exposure():
     rows = [
         {

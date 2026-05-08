@@ -28,6 +28,8 @@ REQUIRED_FULL_FREQS = ("日线", "周线", "30分钟")
 OPTIONAL_ON_DEMAND_FREQS = ("15分钟", "5分钟")
 INTRADAY_SCAN_SCOPE = "intraday_active"
 POSTMARKET_SCAN_SCOPE = "postmarket"
+PRIMARY_MA_PERIODS = (5, 10, 20)
+FIBONACCI_MA_PERIODS = (8, 13, 21, 34, 55, 89)
 FREQ_ORDER = {
     "周线": 0,
     "weekly": 0,
@@ -528,7 +530,11 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
     }
     stand_weights = {5: 6.0, 10: 10.0, 20: 16.0}
     reclaim_weights = {5: 4.0, 10: 7.0, 20: 11.0}
-    for period in (5, 10, 20):
+    fib_weights = {8: 2.0, 13: 2.5, 21: 3.0, 34: 4.0, 55: 5.0, 89: 6.0}
+    fib_support_score = 0.0
+    fib_above_count = 0
+    fib_reclaim_count = 0
+    for period in PRIMARY_MA_PERIODS + FIBONACCI_MA_PERIODS:
         ma_value = _rolling_ma(closes, period)
         if ma_value is None:
             continue
@@ -542,14 +548,25 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
         out[f"near_ma{period}"] = near
         out[f"reclaim_ma{period}"] = reclaim
         out[f"distance_ma{period}_pct"] = round(distance_pct, 3)
-        if above:
-            above_count += 1
-            score += stand_weights[period]
-        elif near:
-            score += stand_weights[period] * 0.5
-        if reclaim:
-            reclaim_count += 1
-            score += reclaim_weights[period]
+        if period in stand_weights:
+            if above:
+                above_count += 1
+                score += stand_weights[period]
+            elif near:
+                score += stand_weights[period] * 0.5
+            if reclaim:
+                reclaim_count += 1
+                score += reclaim_weights[period]
+        elif period in fib_weights:
+            weight = fib_weights[period]
+            if above:
+                fib_above_count += 1
+                fib_support_score += weight
+            elif near:
+                fib_support_score += weight * 0.55
+            if reclaim:
+                fib_reclaim_count += 1
+                fib_support_score += min(4.0, weight)
     ma5 = out.get("ma5")
     ma10 = out.get("ma10")
     ma20 = out.get("ma20")
@@ -581,9 +598,14 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
         tags.append("重新站上均线")
     if out.get("ma_stack") == "bullish":
         tags.append("均线多头")
+    if fib_support_score > 0:
+        tags.append("Fibonacci均线支撑")
     out["above_count"] = above_count
     out["reclaim_count"] = reclaim_count
-    out["score"] = round(max(0.0, min(60.0, score)), 3)
+    out["fib_above_count"] = fib_above_count
+    out["fib_reclaim_count"] = fib_reclaim_count
+    out["fib_support_score"] = round(min(16.0, fib_support_score), 3)
+    out["score"] = round(max(0.0, min(60.0, score + out["fib_support_score"])), 3)
     out["summary"] = " / ".join(tags[:5]) if tags else "均线未确认"
     out["tags"] = tags[:6]
     return out

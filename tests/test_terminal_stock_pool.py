@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from signals.sync.modules.terminal_pool import _add_fallback_watch_rows, _add_reason, _add_signal_rows, _add_user_pinned, _reason_type_for_signal, _selected_rows, _split_pool_rows
+from signals.sync.modules.terminal_pool import _add_fallback_watch_rows, _add_reason, _add_signal_rows, _add_user_pinned, _default_opportunity_candidate_rows, _entry_age_limit, _fib_ma_support_score_from_alignment, _reason_is_current_for_entry, _reason_type_for_signal, _selected_rows, _split_pool_rows
 
 
 class _Cursor(list):
@@ -28,7 +28,7 @@ class _Db(dict):
         return super().__getitem__(key)
 
 
-def _ma_alignment(*, above5=True, above10=True, above20=True, near10=False, near20=False, score=44):
+def _ma_alignment(*, above5=True, above10=True, above20=True, near10=False, near20=False, score=44, fib=False):
     return {
         "above_ma5": above5,
         "above_ma10": above10,
@@ -38,6 +38,23 @@ def _ma_alignment(*, above5=True, above10=True, above20=True, near10=False, near
         "reclaim_ma5": False,
         "reclaim_ma10": False,
         "reclaim_ma20": False,
+        **({
+            "ma21": 10.0,
+            "ma34": 9.8,
+            "ma55": 9.5,
+            "above_ma21": True,
+            "above_ma34": True,
+            "above_ma55": True,
+            "near_ma21": True,
+            "near_ma34": False,
+            "near_ma55": False,
+            "reclaim_ma21": False,
+            "reclaim_ma34": False,
+            "reclaim_ma55": False,
+            "fib_above_count": 3,
+            "fib_reclaim_count": 0,
+            "fib_support_score": 8.0,
+        } if fib else {}),
         "ma_stack": "bullish" if above5 and above10 and above20 else "mixed",
         "ma20_direction": "向上",
         "above_count": sum(1 for value in (above5, above10, above20) if value),
@@ -907,6 +924,83 @@ def test_terminal_stock_pool_defensive_sector_relaxes_when_broad_market_falls():
     assert row["score_components"]["defensive_lenient_policy"] == 12.0
 
 
+def test_terminal_stock_pool_mainline_concept_overrides_defensive_industry():
+    rows = {}
+    _add_reason(rows, "300918", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "nanshan-30m",
+        "signal_type": "二买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 96,
+        "confidence": 0.85,
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="南山智尚")
+    _add_reason(rows, "300918", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "nanshan-15m",
+        "signal_type": "二买",
+        "signal_side": "buy",
+        "freq": "15分钟",
+        "score": 96,
+        "confidence": 0.85,
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="南山智尚")
+    _add_reason(rows, "300918", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "nanshan-daily",
+        "signal_type": "一买",
+        "signal_side": "buy",
+        "freq": "日线",
+        "score": 92,
+        "confidence": 0.8,
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="南山智尚")
+    _add_reason(rows, "300918", {
+        "reason_type": "chain_membership",
+        "source_collection": "security_chain_memberships",
+        "source_doc_id": "textile-industry",
+        "signal_type": "产业链归属",
+        "signal_side": "neutral",
+        "source_role": "context",
+        "decision_effect": "context_only",
+        "chain_id": "textile_light",
+        "chain_name": "纺织轻工产业链",
+        "node_id": "textile_light_core",
+        "node_name": "纺织/轻工",
+        "board_or_concept": "纺织/轻工",
+        "evidence": {"phase": "warming", "rank": 5, "heat_score": 78},
+    }, index_codes=set(), name="南山智尚")
+    _add_reason(rows, "300918", {
+        "reason_type": "constituent_hot",
+        "source_collection": "concept_constituents",
+        "source_doc_id": "机器人概念",
+        "signal_type": "产业链升温",
+        "signal_side": "neutral",
+        "source_role": "context",
+        "decision_effect": "confirm",
+        "chain_id": "robotics",
+        "chain_name": "机器人/自动化产业链",
+        "node_id": "robotics",
+        "node_name": "机器人",
+        "board_or_concept": "机器人概念",
+        "evidence": {"phase": "warming", "rank": 2, "heat_score": 91},
+    }, index_codes=set(), name="南山智尚")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    row = split["focus"][0]
+    assert row["raw_code"] == "300918"
+    assert row["sector_policy"] == "mainline_lenient"
+    assert row["sector_policy_matched_token"] == "机器人"
+    assert row["sector_policy_source"] == "概念/题材"
+    assert "覆盖防守行业" in row["sector_policy_reason"]
+    assert "defensive_strict_policy" not in row["score_components"]
+
+
 def test_terminal_stock_pool_watch_rank_uses_signal_ma_and_hot_sector_not_intent_priority():
     rows = {}
     _add_reason(rows, "300201", {
@@ -947,6 +1041,332 @@ def test_terminal_stock_pool_watch_rank_uses_signal_ma_and_hot_sector_not_intent
     assert set(split["watch"][0]["score_components"]) >= {"buy_point_quality", "ma_alignment", "hot_sector"}
     assert split["watch"][0]["rank_score"] > split["watch"][1]["rank_score"]
     assert split["watch"][0]["watch_sort_priority"] < split["watch"][1]["watch_sort_priority"]
+
+
+def test_terminal_stock_pool_freshness_limits_match_watch_horizon():
+    assert _entry_age_limit("5分钟") == 0
+    assert _entry_age_limit("15分钟") == 0
+    assert _entry_age_limit("30分钟") == 1
+    assert _entry_age_limit("日线") == 2
+    assert _entry_age_limit("周线") == 5
+    assert _reason_is_current_for_entry({"freq": "15分钟", "event_dt": "2026-05-08", "as_of": "2026-05-08"})
+    assert not _reason_is_current_for_entry({"freq": "15分钟", "event_dt": "2026-05-07", "as_of": "2026-05-08"})
+    assert _reason_is_current_for_entry({"freq": "30分钟", "event_dt": "2026-05-07", "as_of": "2026-05-08"})
+    assert not _reason_is_current_for_entry({"freq": "30分钟", "event_dt": "2026-05-06", "as_of": "2026-05-08"})
+    assert _reason_is_current_for_entry({"freq": "日线", "event_dt": "2026-05-06", "as_of": "2026-05-08"})
+    assert not _reason_is_current_for_entry({"freq": "日线", "event_dt": "2026-05-05", "as_of": "2026-05-08"})
+    assert _reason_is_current_for_entry({"freq": "周线", "event_dt": "2026-05-01", "as_of": "2026-05-08"})
+    assert not _reason_is_current_for_entry({"freq": "周线", "event_dt": "2026-04-30", "as_of": "2026-05-08"})
+
+
+def test_terminal_stock_pool_default_candidates_require_fresh_30m_daily_or_weekly_anchor():
+    rows = {}
+    _add_reason(rows, "300501", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "only-5m",
+        "signal_type": "趋势买",
+        "signal_side": "buy",
+        "freq": "5分钟",
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="只有五分钟")
+    _add_reason(rows, "300502", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "stale-daily",
+        "signal_type": "一买",
+        "signal_side": "buy",
+        "freq": "日线",
+        "event_dt": "2026-05-05",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="过期日线")
+    _add_reason(rows, "300503", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "fresh-daily",
+        "signal_type": "一买",
+        "signal_side": "buy",
+        "freq": "日线",
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="日线锚点")
+    _add_reason(rows, "300503", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "fresh-5m",
+        "signal_type": "趋势买",
+        "signal_side": "buy",
+        "freq": "5分钟",
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="日线锚点")
+    _add_reason(rows, "300504", {
+        "reason_type": "review_sector_bullish",
+        "source_collection": "review_sector_clues",
+        "source_doc_id": "clue",
+        "signal_type": "复盘线索",
+        "signal_side": "buy",
+        "as_of": "2026-05-08",
+    }, index_codes=set(), name="纯线索")
+    _add_reason(rows, "300506", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "weak-30m",
+        "signal_type": "MACD绿柱扩大_零上",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="三十分钟MACD")
+    _add_reason(rows, "300507", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "strong-30m",
+        "signal_type": "趋势买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="三十分钟强买点")
+    _add_reason(rows, "300505", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "fresh-st",
+        "signal_type": "一买",
+        "signal_side": "buy",
+        "freq": "日线",
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="*ST测试")
+
+    filtered = _default_opportunity_candidate_rows(rows)
+
+    assert set(filtered) == {"300503", "300507"}
+    assert {reason["freq"] for reason in filtered["300503"]["inclusion_reasons"]} == {"日线", "5分钟"}
+
+
+def test_terminal_stock_pool_watch_rank_prefers_daily_then_30m_weekly_execution():
+    rows = {}
+    for code, freq, name in (
+        ("300401", "日线", "日线优先股"),
+        ("300402", "30分钟", "三十分钟股"),
+        ("300403", "周线", "周线股"),
+        ("300404", "15分钟", "执行周期股"),
+    ):
+        _add_reason(rows, code, {
+            "reason_type": "technical_trigger",
+            "source_collection": "terminal_technical_signals",
+            "source_doc_id": f"{code}-{freq}",
+            "signal_type": "二买",
+            "signal_side": "buy",
+            "freq": freq,
+            "score": 80,
+            "confidence": 0.7,
+            "event_dt": "2026-05-08",
+            "as_of": "2026-05-08",
+            "ma_alignment": _ma_alignment(above5=True, above10=False, above20=False, score=18),
+        }, index_codes=set(), name=name)
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert [row["raw_code"] for row in split["watch"][:4]] == ["300401", "300402", "300403", "300404"]
+    assert [row["score_components"]["timeframe_priority"] for row in split["watch"][:4]] == [34.0, 28.0, 20.0, 12.0]
+
+
+def test_terminal_stock_pool_scores_fibonacci_ma_support_separately():
+    assert _fib_ma_support_score_from_alignment(_ma_alignment(fib=True)) > 0
+
+    rows = {}
+    _add_reason(rows, "300421", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "fib-daily",
+        "signal_type": "一买",
+        "signal_side": "buy",
+        "freq": "日线",
+        "score": 80,
+        "confidence": 0.7,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(above5=False, above10=False, above20=False, score=10, fib=True),
+    }, index_codes=set(), name="Fib支撑股")
+    _add_reason(rows, "300422", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "plain-daily",
+        "signal_type": "一买",
+        "signal_side": "buy",
+        "freq": "日线",
+        "score": 80,
+        "confidence": 0.7,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(above5=False, above10=True, above20=True, score=10),
+    }, index_codes=set(), name="普通支撑股")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    by_code = {row["raw_code"]: row for row in split["focus"]}
+    assert by_code["300421"]["score_components"]["fib_ma_support"] > 0
+    assert by_code["300422"]["score_components"]["fib_ma_support"] == 0
+    assert "Fibonacci均线" in by_code["300421"]["rank_reason"]
+
+
+def test_terminal_stock_pool_watch_rank_rewards_multi_period_and_indicator_breadth():
+    rows = {}
+    _add_reason(rows, "300411", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "broad-daily",
+        "signal_type": "二买",
+        "signal_side": "buy",
+        "freq": "日线",
+        "score": 80,
+        "confidence": 0.7,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(above5=True, above10=False, above20=False, score=18),
+    }, index_codes=set(), name="多指标股")
+    _add_reason(rows, "300411", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "broad-30m",
+        "signal_type": "趋势买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 80,
+        "confidence": 0.7,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(above5=True, above10=False, above20=False, score=18),
+    }, index_codes=set(), name="多指标股")
+    _add_reason(rows, "300412", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "single-daily",
+        "signal_type": "二买",
+        "signal_side": "buy",
+        "freq": "日线",
+        "score": 80,
+        "confidence": 0.7,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(above5=True, above10=False, above20=False, score=18),
+    }, index_codes=set(), name="单指标股")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert [row["raw_code"] for row in split["watch"][:2]] == ["300411", "300412"]
+    assert split["watch"][0]["score_components"]["multi_period_bonus"] == 8.0
+    assert split["watch"][0]["score_components"]["indicator_breadth"] == 8.0
+    assert split["watch"][1]["score_components"]["multi_period_bonus"] == 0.0
+    assert split["watch"][1]["score_components"]["indicator_breadth"] == 4.0
+
+
+def test_terminal_stock_pool_stale_resonance_context_does_not_count_as_fresh_periods():
+    rows = {}
+    stale_resonance = {
+        "direction": "buy",
+        "aligned_freqs": ["周线", "日线", "5分钟"],
+        "conflict_freqs": [],
+        "grade": "strong_resonance",
+        "latest_dt": "2026-05-08T14:40:00",
+        "primary_freq": "5分钟",
+    }
+    _add_reason(rows, "600391", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "fresh-5m",
+        "signal_type": "MACD绿柱扩大_零上",
+        "signal_side": "buy",
+        "freq": "5分钟",
+        "score": 120,
+        "confidence": 0.9,
+        "event_dt": "2026-05-08T14:40:00",
+        "as_of": "2026-05-08",
+        "resonance_context": stale_resonance,
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="航发科技")
+    _add_reason(rows, "600391", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "stale-daily",
+        "signal_type": "一买",
+        "signal_side": "buy",
+        "freq": "日线",
+        "score": 120,
+        "confidence": 0.7,
+        "event_dt": "2026-04-29T10:00:00",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="航发科技")
+    _add_reason(rows, "600391", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "stale-weekly",
+        "signal_type": "MACD绿柱扩大_零上",
+        "signal_side": "buy",
+        "freq": "周线",
+        "score": 120,
+        "confidence": 0.8,
+        "event_dt": "2026-04-30T10:00:00",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="航发科技")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    row = split["watch"][0]
+    assert row["raw_code"] == "600391"
+    assert row["score_components"]["timeframe_priority"] == 12.0
+    assert row["score_components"]["multi_period_bonus"] == 0.0
+    assert row["score_components"]["indicator_breadth"] == 4.0
+    assert row["upper_timeframe_side"] == "none"
+    assert row["right_signal_reasons"] == ["5分钟 MACD绿柱扩大_零上"]
+    assert row["stale_signal_count"] == 2
+
+
+def test_terminal_stock_pool_stale_intraday_signal_does_not_score_as_buy_point_or_ma():
+    rows = {}
+    _add_reason(rows, "300301", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "stale-15m",
+        "signal_type": "二买",
+        "signal_side": "buy",
+        "freq": "15分钟",
+        "score": 120,
+        "confidence": 0.95,
+        "event_dt": "2026-05-07",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="过期分钟股")
+    _add_chain_context(
+        rows,
+        "300301",
+        chain_name="机器人产业链",
+        node_name="人形机器人",
+        phase="warming",
+        rank=2,
+        name="过期分钟股",
+    )
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    row = split["watch"][0]
+    assert row["raw_code"] == "300301"
+    assert row["score_components"]["buy_point_quality"] == 0.0
+    assert row["score_components"]["ma_alignment"] == 0.0
+    assert row["score_components"]["hot_sector"] > 0.0
+    assert row["stale_signal_count"] == 1
 
 
 def test_terminal_stock_pool_defensive_full_confirmation_ranks_behind_mainline():
@@ -1055,9 +1475,10 @@ def test_terminal_stock_pool_entry_ready_rank_uses_timeframe_and_score_component
 
     split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
 
-    assert [row["raw_code"] for row in split["focus"]] == ["688484", "300575"]
+    assert [row["raw_code"] for row in split["focus"]] == ["300575", "688484"]
     assert [row["rank"] for row in split["focus"]] == [1, 2]
-    assert "周/日线" in split["focus"][0]["rank_reason"]
+    assert "周期优先级" in split["focus"][0]["rank_reason"]
+    assert "周/日线" not in split["focus"][0]["rank_reason"]
 
 
 def test_terminal_stock_pool_strategy_fallback_only_goes_to_watch_pool():

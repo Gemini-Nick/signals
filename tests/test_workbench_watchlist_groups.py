@@ -19,6 +19,21 @@ def _bars():
     )
 
 
+def _bars_current():
+    index = pd.date_range("2026-01-01", periods=160, freq="D")
+    return pd.DataFrame(
+        {
+            "open": range(80, 240),
+            "high": range(81, 241),
+            "low": range(79, 239),
+            "close": range(80, 240),
+            "vol": [1000] * 160,
+            "amount": [10000] * 160,
+        },
+        index=index,
+    )
+
+
 def _intraday_bars():
     index = pd.to_datetime([
         "2026-03-15 10:00",
@@ -47,6 +62,73 @@ def test_watchlist_range_columns_include_all_key_presets():
 
     assert {"ytd", "1w", "1m", "3m", "924", "deepseek", "tariff"} <= set(keys)
     assert len(columns) > 4
+
+
+def test_lightweight_stock_row_requires_fresh_range_returns(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (_bars(), "test_daily_bars"))
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {"quote_status": "missing", "quote_status_label": "无行情"})
+
+    row = workbench._enrich_stock_row(
+        {
+            "symbol": "SZ.000001",
+            "name": "平安银行",
+            "day_change_pct": 1.23,
+            "range_returns": {"ytd": -99.0},
+            "range_return_source": "terminal_stock_pool",
+        },
+        [
+            {"key": "ytd", "label": "2026年以来", "start_date": "2026-01-01"},
+            {"key": "custom", "label": "自定义", "start_date": "2026-02-01"},
+        ],
+        lightweight=True,
+    )
+
+    assert row["range_returns"]["ytd"] == 98.75
+    assert row["range_returns"]["custom"] == 43.24
+    assert row["range_return_source"] == "test_daily_bars"
+
+
+def test_lightweight_stock_row_computes_no_trade_current_range(monkeypatch):
+    from signals.web.api import workbench
+
+    class _SpotCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "date_key": "20260508",
+                "trade_date": "2026-05-08",
+                "symbol": "SZ.002898",
+                "code": "002898",
+                "price": None,
+                "latest": None,
+                "prev_close": 159.0,
+                "vol": 0,
+                "amount": 0,
+                "source": "eastmoney_push2delay_clist",
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"fullmarket_spot_snapshots": _SpotCollection()}))
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode="quote_intraday": "2026-05-08")
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (_bars(), "test_daily_bars"))
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {"quote_status": "missing", "quote_status_label": "无行情"})
+
+    row = workbench._enrich_stock_row(
+        {"symbol": "SZ.002898", "name": "*ST赛隆"},
+        [
+            {"key": "ytd", "label": "2026年以来", "start_date": "2026-01-01"},
+            {"key": "1w", "label": "最近一周(2026-05-01)", "start_date": "2026-05-01"},
+        ],
+        lightweight=True,
+    )
+
+    assert row["range_returns"]["ytd"] == 98.75
+    assert row["range_returns"]["1w"] == 0.0
+    assert row["range_return_source"] == "test_daily_bars;current_no_trade=eastmoney_push2delay_clist"
 
 
 def test_shell_cache_refreshes_quote_overlay_when_quote_watermark_changes(monkeypatch):
@@ -568,7 +650,7 @@ def test_terminal_stock_pool_group_rows_keep_focus_risk_watch_separate(monkeypat
             return super().__getitem__(key)
 
     monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"terminal_stock_pool": _Collection()}))
-    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (_bars(), "test_bars"))
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (_bars_current(), "test_bars"))
     columns = workbench._watchlist_range_columns(date(2026, 4, 26))
 
     focus = workbench._terminal_stock_pool_group_rows(columns, "focus_stocks")
@@ -722,7 +804,7 @@ def test_manual_clue_rows_reuse_stock_pool_decision_fields(monkeypatch):
             return super().__getitem__(key)
 
     monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"terminal_manual_clues": _ManualClues()}))
-    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (_bars(), "test_bars"))
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (_bars_current(), "test_bars"))
     monkeypatch.setattr(workbench, "_stock_chain_position_summary", lambda symbol: {})
     monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [
         {
@@ -770,7 +852,7 @@ def test_manual_clue_rows_reuse_stock_pool_decision_fields(monkeypatch):
     assert [item["badge"] for item in row["buy_timeframes"]] == ["D", "30m"]
     assert [item["badge"] for item in row["sell_timeframes"]] == ["30m"]
     assert row["timeframe_signal_sides"]["upper"]["side"] != "none"
-    assert row["timeframe_signal_sides"]["trade"]["side"] != "none"
+    assert row["timeframe_signal_sides"]["trade"]["side"] == "none"
     assert row["timeframe_signal_sides"]["execution"]["side"] == "none"
     assert {"risk_clear", "period_conflict", "right_side"} <= set(row["missing_gates"])
     assert row["trade_stage"] == "skip_now"
@@ -2127,6 +2209,151 @@ def test_stock_chain_summary_overrides_stale_taxonomy_membership(monkeypatch):
     assert summary["node_id"] == "lipf6_lithium_salt"
     assert summary["node"] == "六氟磷酸锂/锂盐"
     assert summary["stale_membership_node_id"] == "electrolyte"
+
+
+def test_stock_chain_summary_prefers_static_ocs_rep_over_broad_consumer_membership(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Collection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "trade_date": "2026-05-08",
+                "symbol": "SH.688195",
+                "raw_code": "688195",
+                "chain_id": "consumer_electronics",
+                "chain_name": "消费电子/华为链",
+                "node_id": "electronics",
+                "node_name": "消费电子/华为链",
+                "layer": "midstream",
+                "stage": "中游",
+                "role": "中游",
+                "confidence": 96,
+                "exposure_score": 114,
+                "is_primary_chain": True,
+                "taxonomy_representative": False,
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"security_chain_memberships": _Collection()}))
+
+    summary = workbench._stock_chain_position_summary("SH.688195")
+
+    assert summary["source"] == "industry_chains.yaml"
+    assert summary["chain_id"] == "optical_module"
+    assert summary["node_id"] == "ocs_optical_switch"
+    assert summary["node"] == "OCS光交换/光器件"
+    assert summary["representative_type"] == "core"
+    assert summary["stale_membership_node_id"] == "electronics"
+
+
+def test_stock_chain_summary_exposes_active_driver_and_multi_concepts(monkeypatch):
+    from signals.web.api import workbench
+
+    rows = [
+        {
+            "trade_date": "2026-05-08",
+            "symbol": "SH.688195",
+            "raw_code": "688195",
+            "chain_id": "consumer_electronics",
+            "chain_name": "消费电子/华为链",
+            "node_id": "electronics",
+            "node_name": "消费电子/华为链",
+            "layer": "midstream",
+            "role": "中游",
+            "confidence": 96,
+            "exposure_score": 114,
+            "is_primary_chain": True,
+            "source_boards": [
+                {"source_board_id": "em:industry:光学元件", "name": "光学元件", "kind": "industry", "source": "em", "confidence": 96},
+                {"source_board_id": "em:concept:华为概念", "name": "华为概念", "kind": "concept", "source": "em", "confidence": 96},
+            ],
+        },
+        {
+            "trade_date": "2026-05-08",
+            "symbol": "SH.688195",
+            "raw_code": "688195",
+            "chain_id": "optical_module",
+            "chain_name": "光模块/CPO产业链",
+            "node_id": "optical_module_core",
+            "node_name": "光模块/CPO",
+            "layer": "midstream",
+            "confidence": 96,
+            "exposure_score": 104,
+            "is_primary_chain": False,
+            "source_boards": [
+                {"source_board_id": "em:concept:光通信模块", "name": "光通信模块", "kind": "concept", "source": "em", "confidence": 96},
+                {"source_board_id": "em:concept:光纤概念", "name": "光纤概念", "kind": "concept", "source": "em", "confidence": 96},
+            ],
+        },
+        {
+            "trade_date": "2026-05-08",
+            "symbol": "SH.688195",
+            "raw_code": "688195",
+            "chain_id": "new_energy_vehicle",
+            "chain_name": "新能源汽车产业链",
+            "node_id": "vehicle",
+            "node_name": "整车/智能汽车",
+            "layer": "terminal",
+            "confidence": 96,
+            "exposure_score": 104,
+            "is_primary_chain": False,
+            "source_boards": [
+                {"source_board_id": "em:concept:激光雷达", "name": "激光雷达", "kind": "concept", "source": "em", "confidence": 96},
+            ],
+        },
+    ]
+    catalog = {
+        "em:industry:光学元件": {"trade_date": "2026-05-08", "change_pct": 3.41, "kind": "industry", "source": "em"},
+        "em:concept:光通信模块": {"trade_date": "2026-05-08", "change_pct": 2.51, "kind": "concept", "source": "em"},
+        "em:concept:光纤概念": {"trade_date": "2026-05-08", "change_pct": 2.45, "kind": "concept", "source": "em"},
+        "em:concept:激光雷达": {"trade_date": "2026-05-08", "change_pct": 2.60, "kind": "concept", "source": "em"},
+        "em:concept:华为概念": {"trade_date": "2026-05-08", "change_pct": 0.93, "kind": "concept", "source": "em"},
+    }
+
+    class _Cursor(list):
+        def sort(self, spec):
+            return self
+
+        def limit(self, count):
+            return _Cursor(self[:count])
+
+    class _MembershipCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return rows[0]
+
+        def find(self, query=None, projection=None):
+            return _Cursor(rows)
+
+    class _CatalogCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            for clause in (query or {}).get("$or", []):
+                value = clause.get("source_board_id") or clause.get("canonical_name") or clause.get("raw_name")
+                if value in catalog:
+                    return catalog[value]
+            return {}
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({
+        "security_chain_memberships": _MembershipCollection(),
+        "source_board_catalog": _CatalogCollection(),
+    }))
+
+    summary = workbench._stock_chain_position_summary("SH.688195")
+
+    assert summary["node_id"] == "ocs_optical_switch"
+    assert summary["active_driver_concept"]["name"] == "光学元件"
+    assert summary["active_driver_concept"]["change_pct"] == 3.41
+    assert summary["primary_chain_driver"]["name"] == "光通信模块"
+    assert summary["primary_chain_driver"]["change_pct"] == 2.51
+    assert "华为概念" in [item["name"] for item in summary["concept_driver_candidates"]]
+    assert "消费电子/华为链" in summary["related_chains"]
+    assert "当日最强板块是 光学元件 +3.41%" in summary["driver_summary"]
 
 
 def test_stock_chain_context_exposes_same_node_candidate_groups(monkeypatch):

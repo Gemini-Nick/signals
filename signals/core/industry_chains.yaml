@@ -125,7 +125,7 @@ chains:
 
   - chain_id: optical_module
     name: 光模块/CPO产业链
-    aliases: [光模块, 光通信模块, CPO, 硅光, 高速光模块, 光芯片, 光纤概念, 高速铜缆]
+    aliases: [光模块, 光通信模块, CPO, 硅光, 高速光模块, 光芯片, 光纤概念, OCS, OCS光, 光交换, 光开关, 高速铜缆]
     industries: [光通信模块]
     default_node_id: optical_module_core
     nodes:
@@ -140,6 +140,14 @@ chains:
         elastic_representatives:
           - {symbol: SZ.002281, name: 光迅科技, relation: 光芯片/光器件弹性标的, source_note: 光模块弹性代表, priority: 86}
           - {symbol: SH.688498, name: 源杰科技, relation: 激光器芯片弹性标的, source_note: 光模块弹性代表, priority: 80}
+      - node_id: ocs_optical_switch
+        name: OCS光交换/光器件
+        layer: midstream
+        keywords: [OCS, OCS光, 光交换, 光开关, 光路交换, 光电交换, 光器件, 光学器件]
+        core_representatives:
+          - {symbol: SH.688195, name: 腾景科技, relation: OCS光交换/精密光学元件核心标的, source_note: OCS光交换/光器件核心代表, priority: 94}
+        elastic_representatives:
+          - {symbol: SZ.300548, name: 博创科技, relation: 光通信模块/光器件弹性标的, source_note: OCS光交换/光器件弹性代表, priority: 82}
 
   - chain_id: telecom_network
     name: 通信网络/5G产业链
@@ -401,6 +409,7 @@ chains:
           - {symbol: SH.600031, name: 三一重工, relation: 工程机械/智能制造弹性标的, source_note: 机器人弹性代表, priority: 86}
           - {symbol: SZ.002747, name: 埃斯顿, relation: 工业机器人弹性标的, source_note: 机器人弹性代表, priority: 82}
           - {symbol: SH.688017, name: 绿的谐波, relation: 谐波减速器弹性标的, source_note: 机器人弹性代表, priority: 80}
+          - {symbol: SZ.300918, name: 南山智尚, relation: 人形机器人腱绳/智能触觉材料弹性标的, source_note: 机器人材料弹性代表, priority: 78}
 
   - chain_id: consumer_electronics
     name: 消费电子/华为链

@@ -1233,6 +1233,99 @@ def _compute_range_returns(df: pd.DataFrame, columns: list[dict[str, Any]]) -> d
     return result
 
 
+def _range_return_column_keys(columns: list[dict[str, Any]]) -> list[str]:
+    keys: list[str] = []
+    for column in columns:
+        key = str(column.get("key") or "").strip()
+        if key and column.get("start_date"):
+            keys.append(key)
+    return keys
+
+
+def _stock_current_no_trade_close(symbol: str) -> tuple[pd.Timestamp, float, str] | None:
+    expected_day = _day_change_expected_day("quote_intraday") or _market_today("A").isoformat()
+    date_key = expected_day.replace("-", "")[:8]
+    if not date_key:
+        return None
+    candidates = _quote_symbol_candidates(symbol)
+    codes = _fullmarket_code_candidates(candidates)
+    dot_symbols = [candidate.upper() for candidate in candidates if "." in str(candidate or "")]
+    try:
+        row = _mongo_db()["fullmarket_spot_snapshots"].find_one(
+            {
+                "date_key": date_key,
+                "$or": [
+                    {"code": {"$in": codes}},
+                    {"symbol": {"$in": dot_symbols}},
+                ],
+            },
+            {"_id": 0},
+            sort=[("snapshot_at", -1)],
+        ) or {}
+    except Exception:
+        return None
+    if _date_text(row.get("trade_date") or expected_day) != expected_day:
+        return None
+    price = _first_numeric(row.get("price"), row.get("latest"), row.get("close"))
+    prev_close = _float(row.get("prev_close"))
+    vol = _first_numeric(row.get("vol"), row.get("volume"))
+    amount = _first_numeric(row.get("amount"), row.get("turnover"))
+    if price is not None or prev_close is None or prev_close <= 0:
+        return None
+    if (vol is not None and vol > 0) or (amount is not None and amount > 0):
+        return None
+    return pd.Timestamp(expected_day), float(prev_close), _text(row.get("source")) or "fullmarket_spot_snapshots"
+
+
+def _with_current_no_trade_close(symbol: str, df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    carry = _stock_current_no_trade_close(symbol)
+    if not carry:
+        return df, ""
+    carry_dt, carry_close, source = carry
+    working = df.copy() if df is not None else pd.DataFrame()
+    latest_dt = _df_latest_timestamp(working)
+    if latest_dt is not None and pd.Timestamp(latest_dt).normalize() >= carry_dt.normalize():
+        return working, ""
+    carried_row = {
+        "open": carry_close,
+        "high": carry_close,
+        "low": carry_close,
+        "close": carry_close,
+        "vol": 0,
+        "amount": 0,
+    }
+    if working.empty:
+        return pd.DataFrame([carried_row], index=pd.DatetimeIndex([carry_dt], name="dt")), source
+    working.loc[carry_dt] = {key: carried_row.get(key, 0) for key in working.columns}
+    return working.sort_index(), source
+
+
+def _compute_stock_range_returns_required(
+    symbol: str,
+    range_columns: list[dict[str, Any]],
+) -> tuple[dict[str, Any], str]:
+    required_keys = _range_return_column_keys(range_columns)
+    if not required_keys:
+        return {}, ""
+    if not symbol:
+        raise RuntimeError("range_returns_required_without_symbol")
+    try:
+        df, computed_source = _stock_df(symbol, "daily")
+    except Exception as exc:
+        raise RuntimeError(f"range_returns_kline_load_failed:{symbol}:{exc.__class__.__name__}: {exc}") from exc
+    if df is None or df.empty or "close" not in df.columns:
+        raise RuntimeError(f"range_returns_kline_empty:{symbol}")
+    df, carry_source = _with_current_no_trade_close(symbol, df)
+    computed = _compute_range_returns(df, range_columns)
+    missing_keys = [key for key in required_keys if key not in computed or computed.get(key) is None]
+    if missing_keys:
+        raise RuntimeError(f"range_returns_incomplete:{symbol}:{','.join(missing_keys)}")
+    source = computed_source or "daily_bars"
+    if carry_source:
+        source = f"{source};current_no_trade={carry_source}"
+    return computed, source
+
+
 def _compute_day_change_pct(df: pd.DataFrame) -> Optional[float]:
     if df is None or df.empty or "close" not in df.columns:
         return None
@@ -2019,7 +2112,10 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]], 
             metadata.get("price"),
             metadata.get("close"),
         )
-        range_returns = row.get("range_returns") if isinstance(row.get("range_returns"), dict) else {}
+        range_returns, range_return_source = _compute_stock_range_returns_required(
+            normalized,
+            range_columns,
+        )
         enriched = dict(row)
         enriched.update({
             "kind": "stock",
@@ -2039,7 +2135,7 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]], 
             "day_change_freq": row.get("day_change_freq") or "",
             "latest_signal": latest_signal or "待观察",
             "range_returns": range_returns,
-            "range_return_source": row.get("range_return_source") or ("row_snapshot" if range_returns else ""),
+            "range_return_source": range_return_source,
             "available_freqs": UI_FREQS,
             "target_kind": "stock",
             "target_label": normalized,
@@ -2293,6 +2389,7 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "sector_policy_label",
         "sector_policy_reason",
         "sector_policy_matched_token",
+        "sector_policy_source",
         "broad_market_label",
         "broad_market_context",
         "ma_alignment",
@@ -6789,10 +6886,8 @@ def _taxonomy_representative_position_summary(symbol: str) -> dict[str, Any]:
     return primary
 
 
-def _membership_is_stale_taxonomy_representative(membership: dict[str, Any], taxonomy: dict[str, Any]) -> bool:
+def _membership_should_yield_to_taxonomy_representative(membership: dict[str, Any], taxonomy: dict[str, Any]) -> bool:
     if not membership or not taxonomy:
-        return False
-    if not membership.get("taxonomy_representative"):
         return False
     if (
         _text(membership.get("chain_id")) == _text(taxonomy.get("chain_id"))
@@ -6807,32 +6902,203 @@ def _membership_is_stale_taxonomy_representative(membership: dict[str, Any], tax
         _representative_rank_for_summary(taxonomy.get("representative_type")),
         int(taxonomy.get("representative_priority") or 0),
     )
-    return taxonomy_key >= membership_key
+    if membership.get("taxonomy_representative"):
+        return taxonomy_key >= membership_key
+    if not _text(membership.get("representative_type")):
+        return taxonomy_key >= (3, 85)
+    return taxonomy_key > membership_key
 
 
-def _stock_chain_membership_summary(symbol: str) -> dict[str, Any]:
+def _stock_chain_membership_rows(symbol: str, limit: int = 12) -> list[dict[str, Any]]:
     raw_symbol = _text(symbol).upper()
     raw_code = raw_symbol.split(".", 1)[-1] if "." in raw_symbol else raw_symbol
     if not raw_code:
-        return {}
+        return []
     try:
         db = _mongo_db()
-        row = db["security_chain_memberships"].find_one(
-            {
-                "market": "A",
-                "$or": [
-                    {"symbol": raw_symbol},
-                    {"raw_code": raw_code},
-                    {"symbol": symbol},
-                ],
-            },
+        query = {
+            "market": "A",
+            "$or": [
+                {"symbol": raw_symbol},
+                {"raw_code": raw_code},
+                {"symbol": symbol},
+            ],
+        }
+        first = db["security_chain_memberships"].find_one(
+            query,
             {"_id": 0},
             sort=[("trade_date", -1), ("is_primary_chain", -1), ("exposure_score", -1), ("confidence", -1)],
         ) or {}
     except Exception:
+        return []
+    if not first:
+        return []
+    trade_date = _text(first.get("trade_date"))
+    if not trade_date:
+        return [first]
+    try:
+        cursor = db["security_chain_memberships"].find(
+            {**query, "trade_date": trade_date},
+            {"_id": 0},
+        ).sort([("is_primary_chain", -1), ("exposure_score", -1), ("confidence", -1)]).limit(limit)
+        rows = [row for row in cursor if isinstance(row, dict)]
+        return rows or [first]
+    except Exception:
+        return [first]
+
+
+def _source_board_names(row: dict[str, Any], limit: int = 6) -> list[str]:
+    names: list[str] = []
+    for item in row.get("source_boards") or []:
+        if not isinstance(item, dict):
+            continue
+        name = _text(item.get("name"))
+        if name and name not in names:
+            names.append(name)
+        if len(names) >= limit:
+            break
+    return names
+
+
+def _stock_chain_related_positions(rows: list[dict[str, Any]], primary: dict[str, Any]) -> list[dict[str, Any]]:
+    primary_key = (_text(primary.get("chain_id")), _text(primary.get("node_id")))
+    related: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        key = (_text(row.get("chain_id")), _text(row.get("node_id")))
+        if not key[0] or not key[1] or key == primary_key or key in seen:
+            continue
+        seen.add(key)
+        related.append({
+            "chain_id": key[0],
+            "chain_name": _text(row.get("chain_name")),
+            "node_id": key[1],
+            "node_name": _text(row.get("node_name")),
+            "confidence": row.get("confidence"),
+            "exposure_score": row.get("exposure_score"),
+            "membership_type": _text(row.get("membership_type")),
+            "source_board_names": _source_board_names(row),
+        })
+    return related[:6]
+
+
+def _stock_chain_board_driver_candidates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    board_rows: dict[str, dict[str, Any]] = {}
+    trade_date = _text((rows[0] if rows else {}).get("trade_date"))
+    try:
+        db = _mongo_db()
+    except Exception:
+        db = None
+    for row in rows:
+        for source_board in row.get("source_boards") or []:
+            if not isinstance(source_board, dict):
+                continue
+            name = _text(source_board.get("name"))
+            source_board_id = _text(source_board.get("source_board_id"))
+            if not name and not source_board_id:
+                continue
+            key = source_board_id or name
+            candidate = {
+                "name": name,
+                "source_board_id": source_board_id,
+                "kind": _text(source_board.get("kind")),
+                "source": _text(source_board.get("source")),
+                "chain_id": _text(row.get("chain_id")),
+                "chain_name": _text(row.get("chain_name")),
+                "node_id": _text(row.get("node_id")),
+                "node_name": _text(row.get("node_name")),
+                "mapping_confidence": source_board.get("confidence") or row.get("confidence"),
+                "membership_type": _text(row.get("membership_type")),
+            }
+            existing = board_rows.get(key)
+            if not existing or _float(candidate.get("mapping_confidence")) > _float(existing.get("mapping_confidence")):
+                board_rows[key] = candidate
+
+    for candidate in board_rows.values():
+        catalog = {}
+        if db is not None:
+            try:
+                clauses = []
+                if candidate.get("source_board_id"):
+                    clauses.append({"source_board_id": candidate.get("source_board_id")})
+                if candidate.get("name"):
+                    clauses.extend([
+                        {"canonical_name": candidate.get("name")},
+                        {"raw_name": candidate.get("name")},
+                    ])
+                query = {"$or": clauses} if clauses else {}
+                if trade_date:
+                    query = {**query, "trade_date": trade_date}
+                catalog = db["source_board_catalog"].find_one(
+                    query,
+                    {"_id": 0, "change_pct": 1, "rank_idx": 1, "source": 1, "kind": 1, "trade_date": 1, "canonical_name": 1},
+                    sort=[("trade_date", -1), ("updated_at", -1)],
+                ) or {}
+            except Exception:
+                catalog = {}
+        if catalog:
+            candidate["change_pct"] = _float(catalog.get("change_pct"))
+            candidate["rank_idx"] = catalog.get("rank_idx")
+            candidate["catalog_trade_date"] = _text(catalog.get("trade_date"))
+            candidate["kind"] = _text(catalog.get("kind")) or candidate.get("kind")
+            candidate["source"] = _text(catalog.get("source")) or candidate.get("source")
+        else:
+            candidate["change_pct"] = None
+        candidate["is_non_chain_theme"] = bool(non_chain_reason(candidate.get("name")))
+
+    def sort_key(item: dict[str, Any]) -> tuple[float, float, float, float]:
+        change = item.get("change_pct")
+        has_change = 1.0 if change is not None else 0.0
+        concept_bonus = 0.15 if _text(item.get("kind")) == "concept" else 0.0
+        chain_penalty = -0.4 if item.get("is_non_chain_theme") else 0.0
+        return (
+            has_change,
+            _float(change) + concept_bonus + chain_penalty,
+            _float(item.get("mapping_confidence")),
+            1.0 if _text(item.get("kind")) == "concept" else 0.0,
+        )
+
+    candidates = list(board_rows.values())
+    candidates.sort(key=sort_key, reverse=True)
+    return candidates[:12]
+
+
+def _select_chain_driver(candidates: list[dict[str, Any]], chain_id: str) -> dict[str, Any]:
+    chain = _text(chain_id)
+    if not chain:
         return {}
-    if not row:
+    for item in candidates:
+        if _text(item.get("chain_id")) == chain and item.get("change_pct") is not None:
+            return item
+    for item in candidates:
+        if _text(item.get("chain_id")) == chain:
+            return item
+    return {}
+
+
+def _stock_chain_driver_summary(active: dict[str, Any], chain_driver: dict[str, Any]) -> str:
+    active_name = _text(active.get("name"))
+    chain_name = _text(chain_driver.get("name"))
+    if not active_name:
+        return ""
+    active_change = active.get("change_pct")
+    active_text = f"{active_name} {float(active_change):+.2f}%" if active_change is not None else active_name
+    if chain_driver and chain_name and chain_name != active_name:
+        chain_change = chain_driver.get("change_pct")
+        chain_text = f"{chain_name} {float(chain_change):+.2f}%" if chain_change is not None else chain_name
+        return f"当日最强板块是 {active_text}；主链相关驱动是 {chain_text}。"
+    return f"当日最强板块是 {active_text}。"
+
+
+def _stock_chain_membership_summary(symbol: str) -> dict[str, Any]:
+    rows = _stock_chain_membership_rows(symbol)
+    if not rows:
         return {}
+    row = rows[0]
+    related_positions = _stock_chain_related_positions(rows, row)
+    driver_candidates = _stock_chain_board_driver_candidates(rows)
+    active_driver = driver_candidates[0] if driver_candidates else {}
+    chain_driver = _select_chain_driver(driver_candidates, _text(row.get("chain_id")))
     return {
         "chain_id": _text(row.get("chain_id")),
         "chain": _text(row.get("chain_name")),
@@ -6853,7 +7119,13 @@ def _stock_chain_membership_summary(symbol: str) -> dict[str, Any]:
         "representative_priority": row.get("representative_priority"),
         "representative_relation": _text(row.get("representative_relation")),
         "taxonomy_representative": bool(row.get("taxonomy_representative")),
-        "related_chains": [],
+        "source_board_names": _source_board_names(row),
+        "concept_driver_candidates": driver_candidates,
+        "active_driver_concept": active_driver,
+        "primary_chain_driver": chain_driver,
+        "driver_summary": _stock_chain_driver_summary(active_driver, chain_driver),
+        "secondary_chain_positions": related_positions,
+        "related_chains": [item["chain_name"] for item in related_positions if item.get("chain_name")][:3],
     }
 
 
@@ -7802,9 +8074,32 @@ def _summary_from_industry(name: str, detail: Dict[str, Any], ranking) -> Dict[s
 def _stock_chain_position_summary(symbol: str) -> dict[str, Any]:
     membership = _stock_chain_membership_summary(symbol)
     taxonomy = _taxonomy_representative_position_summary(symbol)
-    if _membership_is_stale_taxonomy_representative(membership, taxonomy):
+    if _membership_should_yield_to_taxonomy_representative(membership, taxonomy):
+        secondary_positions = []
+        if membership:
+            secondary_positions.append({
+                "chain_id": membership.get("chain_id"),
+                "chain_name": membership.get("chain_name") or membership.get("chain"),
+                "node_id": membership.get("node_id"),
+                "node_name": membership.get("node_name") or membership.get("node"),
+                "confidence": membership.get("confidence"),
+                "exposure_score": membership.get("exposure_score"),
+                "membership_type": "broad_primary_membership",
+                "source_board_names": membership.get("source_board_names") or [],
+            })
+            secondary_positions.extend(membership.get("secondary_chain_positions") or [])
+        related_chains = [item.get("chain_name") for item in secondary_positions if item.get("chain_name")]
+        driver_candidates = membership.get("concept_driver_candidates") or []
+        active_driver = (driver_candidates[0] if driver_candidates else {}) if isinstance(driver_candidates, list) else {}
+        chain_driver = _select_chain_driver(driver_candidates if isinstance(driver_candidates, list) else [], taxonomy.get("chain_id"))
         return {
             **taxonomy,
+            "secondary_chain_positions": secondary_positions[:6],
+            "related_chains": list(dict.fromkeys(related_chains))[:3],
+            "concept_driver_candidates": driver_candidates if isinstance(driver_candidates, list) else [],
+            "active_driver_concept": active_driver,
+            "primary_chain_driver": chain_driver,
+            "driver_summary": _stock_chain_driver_summary(active_driver, chain_driver),
             "source_note": _text(taxonomy.get("source_note")) or "当前静态产业链映射覆盖旧重塑结果",
             "stale_membership_source": "security_chain_memberships",
             "stale_membership_chain_id": membership.get("chain_id"),
