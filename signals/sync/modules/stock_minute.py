@@ -521,24 +521,35 @@ def _upsert_minute_preheat_universe(
     now = naive_market_now("A")
     col = db["minute_preheat_universe"]
     written = 0
+    dropped = 0
+    active_symbols = set(symbols)
     try:
         for idx, code in enumerate(symbols):
             sources = sorted(symbol_sources.get(code) or [])
+            existing = col.find_one({"_id": f"{trade_date}:{code}"}, {"status": 1}) or {}
+            set_values = {
+                "trade_date": trade_date,
+                "market": "A",
+                "symbol": code,
+                "order": idx,
+                "sources": sources,
+                "source_counts": source_counts,
+                "priority": code in priority_symbols,
+                "pinned": code in pinned_symbols,
+                "max_per_run": max_symbols,
+                "updated_at": now,
+            }
+            if str(existing.get("status") or "") == "dropped":
+                set_values.update({
+                    "status": "pending",
+                    "freq_status": {},
+                    "skipped_reason": "",
+                    "revived_at": now,
+                })
             col.update_one(
                 {"_id": f"{trade_date}:{code}"},
                 {
-                    "$set": {
-                        "trade_date": trade_date,
-                        "market": "A",
-                        "symbol": code,
-                        "order": idx,
-                        "sources": sources,
-                        "source_counts": source_counts,
-                        "priority": code in priority_symbols,
-                        "pinned": code in pinned_symbols,
-                        "max_per_run": max_symbols,
-                        "updated_at": now,
-                    },
+                    "$set": set_values,
                     "$setOnInsert": {
                         "status": "pending",
                         "freq_status": {},
@@ -549,9 +560,25 @@ def _upsert_minute_preheat_universe(
                 upsert=True,
             )
             written += 1
+        for row in col.find({"trade_date": trade_date}, {"_id": 1, "symbol": 1, "status": 1}):
+            code = _pure_a_code(row.get("symbol"))
+            status = str(row.get("status") or "pending")
+            if code in active_symbols or status == "dropped":
+                continue
+            col.update_one(
+                {"_id": row.get("_id")},
+                {"$set": {
+                    "status": "dropped",
+                    "selected_current_run": False,
+                    "skipped_reason": "not_in_current_postmarket_universe",
+                    "dropped_at": now,
+                    "updated_at": now,
+                }},
+            )
+            dropped += 1
     except Exception:
-        return {"written": written, "total": len(symbols)}
-    return {"written": written, "total": len(symbols)}
+        return {"written": written, "total": len(symbols), "dropped": dropped}
+    return {"written": written, "total": len(symbols), "dropped": dropped}
 
 
 def _select_postmarket_minute_symbols(
@@ -675,13 +702,15 @@ def _minute_universe_summary(db: Database, trade_date: str | None = None) -> dic
     counts = defaultdict(int)
     for row in rows:
         counts[str(row.get("status") or "pending")] += 1
-    total = sum(counts.values())
+    active_statuses = ("cached", "pending", "running", "error", "stale")
+    total = sum(counts[status] for status in active_statuses)
     return {
         "total": total,
         "cached": counts["cached"],
         "pending": counts["pending"],
         "running": counts["running"],
         "error": counts["error"],
+        "dropped": counts["dropped"],
     }
 
 

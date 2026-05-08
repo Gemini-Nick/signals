@@ -518,7 +518,7 @@ class PostmarketRunner:
             current_ids.add(task_id)
             current = self.db["sync_tasks"].find_one(
                 {"_id": task_id},
-                {"phase": 1, "depends_on": 1, "status": 1},
+                {"phase": 1, "depends_on": 1, "blocks_run": 1, "status": 1},
             ) or {}
             spec_changed = bool(current) and (
                 str(current.get("phase") or "") != spec.phase
@@ -717,7 +717,10 @@ class PostmarketRunner:
 
     def _has_retryable_incomplete_tasks(self, run_id: str, *, include_optional: bool = False) -> bool:
         blocking_task_keys = {task.task_key for task in POSTMARKET_TASKS if task.blocks_run}
-        for doc in self.db["sync_tasks"].find({"run_id": run_id}, {"task_key": 1, "status": 1}):
+        for doc in self.db["sync_tasks"].find(
+            {"run_id": run_id},
+            {"task_key": 1, "module": 1, "status": 1, "result_summary": 1},
+        ):
             if not include_optional and str(doc.get("task_key") or "") not in blocking_task_keys:
                 continue
             status = str(doc.get("status") or "pending")
@@ -736,7 +739,14 @@ class PostmarketRunner:
         if not _env_bool("SIGNALS_POSTMARKET_CONTINUE_MINUTE_PREHEAT", True):
             return 0
         before = self._minute_preheat_pending_count(trade_date)
-        if before <= 0 or "stock_minute" not in self.engine.module_map:
+        if before <= 0:
+            self.db["sync_runs"].update_one(
+                {"_id": run_id},
+                {"$set": {"minute_preheat_pending": 0, "updated_at": _naive_bj()}},
+                upsert=True,
+            )
+            return 0
+        if "stock_minute" not in self.engine.module_map:
             return 0
 
         spec = next(
@@ -783,14 +793,37 @@ class PostmarketRunner:
                 break
         return completed
 
-    def run_once(self, *, resume_run_id: str | None = None, trade_date: str | None = None, force: bool = False) -> dict[str, Any]:
+    def _continue_terminal_run(self, trade_date: str, run_id: str) -> bool:
+        continued = self._continue_minute_preheat_universe(trade_date, run_id) > 0
+        if (
+            _env_bool("SIGNALS_POSTMARKET_CONTINUE_OPTIONAL_TASKS", True)
+            and self._has_retryable_incomplete_tasks(run_id, include_optional=True)
+        ):
+            logger.info("postmarket continue optional tasks run=%s", run_id)
+            self.run_once(resume_run_id=run_id, trade_date=trade_date, run_optional_tasks=True)
+            continued = True
+        return continued
+
+    def run_once(
+        self,
+        *,
+        resume_run_id: str | None = None,
+        trade_date: str | None = None,
+        force: bool = False,
+        run_optional_tasks: bool | None = None,
+    ) -> dict[str, Any]:
         trade_date = trade_date or _postmarket_trade_date()
         run_id = resume_run_id or default_run_id(trade_date)
         run_doc = self.db["sync_runs"].find_one({"_id": run_id}) or {}
         if run_doc.get("trade_date"):
             trade_date = str(run_doc["trade_date"])
-        continue_terminal_optional = (
+        run_optional_tasks_enabled = (
             _env_bool("SIGNALS_POSTMARKET_RUN_OPTIONAL_TASKS", False)
+            if run_optional_tasks is None
+            else bool(run_optional_tasks)
+        )
+        continue_terminal_optional = (
+            run_optional_tasks_enabled
             and self._has_retryable_incomplete_tasks(run_id, include_optional=True)
         )
         if run_doc.get("status") in RUN_TERMINAL_STATUSES and not force and not continue_terminal_optional:
@@ -803,11 +836,10 @@ class PostmarketRunner:
             logger.warning("postmarket released stale tasks: run=%s released=%d", run_id, released)
 
         results: list[dict[str, Any]] = []
-        run_optional_tasks = _env_bool("SIGNALS_POSTMARKET_RUN_OPTIONAL_TASKS", False)
         blocked: set[str] = set()
         for phase in POSTMARKET_PHASES:
             phase_specs = self._phase_specs(phase)
-            if not run_optional_tasks:
+            if not run_optional_tasks_enabled:
                 phase_specs = [spec for spec in phase_specs if spec.blocks_run]
             if not phase_specs:
                 continue
@@ -936,6 +968,13 @@ class PostmarketRunner:
         run_doc = self.db["sync_runs"].find_one({"_id": run_id}, {"status": 1, "trade_date": 1}) or {}
         status = str(run_doc.get("status") or "missing")
         if status in RUN_TERMINAL_STATUSES:
+            if self._minute_preheat_pending_count(trade_date) > 0:
+                return run_id, trade_date, status
+            if (
+                _env_bool("SIGNALS_POSTMARKET_CONTINUE_OPTIONAL_TASKS", True)
+                and self._has_retryable_incomplete_tasks(run_id, include_optional=True)
+            ):
+                return run_id, trade_date, status
             return None
         return run_id, trade_date, status
 
@@ -953,18 +992,14 @@ class PostmarketRunner:
                     logger.info("postmarket trigger run=%s previous_status=%s", run_id, status or "missing")
                     self.run_once(trade_date=trade_date, force=_env_bool("SIGNALS_POSTMARKET_FORCE", False))
                 else:
-                    self._continue_minute_preheat_universe(trade_date, run_id)
-                    if (
-                        _env_bool("SIGNALS_POSTMARKET_CONTINUE_OPTIONAL_TASKS", True)
-                        and self._has_retryable_incomplete_tasks(run_id, include_optional=True)
-                    ):
-                        logger.info("postmarket continue optional tasks run=%s", run_id)
-                        with self._with_env({"SIGNALS_POSTMARKET_RUN_OPTIONAL_TASKS": "true"}):
-                            self.run_once(resume_run_id=run_id, trade_date=trade_date)
+                    self._continue_terminal_run(trade_date, run_id)
             else:
                 target = self.catchup_target(now)
                 if target:
                     run_id, trade_date, status = target
-                    logger.info("postmarket catchup trigger run=%s previous_status=%s", run_id, status)
-                    self.run_once(resume_run_id=run_id, trade_date=trade_date)
+                    if status in RUN_TERMINAL_STATUSES:
+                        self._continue_terminal_run(trade_date, run_id)
+                    else:
+                        logger.info("postmarket catchup trigger run=%s previous_status=%s", run_id, status)
+                        self.run_once(resume_run_id=run_id, trade_date=trade_date)
             time.sleep(check_seconds)

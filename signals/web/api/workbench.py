@@ -183,6 +183,20 @@ def _quote_snapshot_watermark() -> str:
         parts.append(f"fullmarket_spot_snapshots:{spot_value.isoformat()}")
     elif spot_value:
         parts.append(f"fullmarket_spot_snapshots:{spot_value}")
+    try:
+        pool_doc = db["terminal_stock_pool"].find_one(
+            {"pool": "terminal_stock_pool", "market": "A"},
+            {"_id": 0, "updated_at": 1, "ranking_version": 1},
+            sort=[("updated_at", -1)],
+        ) or {}
+    except Exception:
+        pool_doc = {}
+    pool_value = pool_doc.get("updated_at")
+    pool_version = _text(pool_doc.get("ranking_version"))
+    if isinstance(pool_value, datetime):
+        parts.append(f"terminal_stock_pool:{pool_value.isoformat()}:{pool_version}")
+    elif pool_value:
+        parts.append(f"terminal_stock_pool:{pool_value}:{pool_version}")
     return "|".join(parts)
 
 

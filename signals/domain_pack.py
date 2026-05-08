@@ -676,6 +676,7 @@ class SignalsPack:
                 "minute_universe_pending": minute_universe.get("pending", 0),
                 "minute_universe_running": minute_universe.get("running", 0),
                 "minute_universe_error": minute_universe.get("error", 0),
+                "minute_universe_dropped": minute_universe.get("dropped", 0),
                 "daily_landing_rate": stock_daily_progress.get("landing_rate", 0),
                 "daily_inserted_per_min": stock_daily_progress.get("inserted_per_min", 0),
                 "daily_missing_symbols": (
@@ -729,7 +730,8 @@ class SignalsPack:
         for row in rows:
             status = str(row.get("status") or "pending")
             counts[status] = counts.get(status, 0) + 1
-        counts["total"] = sum(counts.values())
+        active_statuses = ("cached", "pending", "running", "error", "stale")
+        counts["total"] = sum(counts.get(status, 0) for status in active_statuses)
         return counts
 
     def _cache_minute_not_ready_samples(self, db, limit: int = 8) -> List[Dict[str, Any]]:
