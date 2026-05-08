@@ -304,6 +304,55 @@ def test_postmarket_completed_run_is_not_repeated(monkeypatch):
     assert calls == ["alpha"]
 
 
+def test_postmarket_completed_run_can_continue_optional_tasks(monkeypatch):
+    monkeypatch.setenv("SIGNALS_POSTMARKET_RUN_OPTIONAL_TASKS", "true")
+    tasks = (
+        pm.PostmarketTaskSpec("alpha", "data"),
+        pm.PostmarketTaskSpec("beta", "optional", blocks_run=False),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("data", "optional"))
+
+    calls = []
+
+    def beta(db, proxy_url=None):
+        calls.append("beta")
+        return {"status": "ok"}
+
+    db = _Db()
+    db["sync_runs"].docs["postmarket:2026-04-28"] = {
+        "_id": "postmarket:2026-04-28",
+        "run_id": "postmarket:2026-04-28",
+        "trade_date": "2026-04-28",
+        "status": "ok",
+    }
+    db["sync_tasks"].docs["postmarket:2026-04-28:alpha:all"] = {
+        "_id": "postmarket:2026-04-28:alpha:all",
+        "run_id": "postmarket:2026-04-28",
+        "task_key": "alpha:all",
+        "module": "alpha",
+        "phase": "data",
+        "status": "ok",
+    }
+    db["sync_tasks"].docs["postmarket:2026-04-28:beta:all"] = {
+        "_id": "postmarket:2026-04-28:beta:all",
+        "run_id": "postmarket:2026-04-28",
+        "task_key": "beta:all",
+        "module": "beta",
+        "phase": "optional",
+        "status": "pending",
+        "blocks_run": False,
+    }
+    engine = _Engine(db, {"beta": (beta, "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(resume_run_id="postmarket:2026-04-28")
+
+    assert result["status"] == "ok"
+    assert calls == ["beta"]
+    assert db["sync_tasks"].docs["postmarket:2026-04-28:beta:all"]["status"] == "ok"
+
+
 def test_postmarket_same_phase_dependency_runs_after_parent_finishes(monkeypatch):
     tasks = (
         pm.PostmarketTaskSpec("alpha", "derived"),
@@ -369,6 +418,82 @@ def test_postmarket_stock_daily_cooling_partial_unlocks_downstream(monkeypatch):
     assert result["status"] == "ok"
     assert calls == ["stock_daily", "weekly_rollup"]
     assert db["sync_tasks"].docs["postmarket:2026-04-28:weekly_rollup:all"]["status"] == "ok"
+
+
+def test_postmarket_stock_daily_sparse_errors_unlock_downstream(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00"),
+        pm.PostmarketTaskSpec("weekly_rollup", "derived", depends_on=("stock_daily:shard_00",)),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data", "derived"))
+
+    calls = []
+
+    def stock_daily(db, proxy_url=None):
+        calls.append("stock_daily")
+        return {
+            "status": "partial",
+            "processed": 100,
+            "total": 100,
+            "progress_pct": 100.0,
+            "coverage_pct": 96.0,
+            "errors": 4,
+            "deferred": 0,
+            "cooling_down": 0,
+        }
+
+    def weekly_rollup(db, proxy_url=None):
+        calls.append("weekly_rollup")
+        return {"status": "ok"}
+
+    db = _Db()
+    engine = _Engine(db, {"stock_daily": (stock_daily, ""), "weekly_rollup": (weekly_rollup, "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(trade_date="2026-04-28")
+
+    assert result["status"] == "ok"
+    assert calls == ["stock_daily", "weekly_rollup"]
+    assert db["sync_tasks"].docs["postmarket:2026-04-28:weekly_rollup:all"]["status"] == "ok"
+
+
+def test_postmarket_stock_daily_many_errors_blocks_downstream(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00"),
+        pm.PostmarketTaskSpec("weekly_rollup", "derived", depends_on=("stock_daily:shard_00",)),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data", "derived"))
+
+    calls = []
+
+    def stock_daily(db, proxy_url=None):
+        calls.append("stock_daily")
+        return {
+            "status": "partial",
+            "processed": 100,
+            "total": 100,
+            "progress_pct": 100.0,
+            "coverage_pct": 60.0,
+            "errors": 40,
+            "deferred": 0,
+            "cooling_down": 0,
+        }
+
+    def weekly_rollup(db, proxy_url=None):
+        calls.append("weekly_rollup")
+        return {"status": "ok"}
+
+    db = _Db()
+    engine = _Engine(db, {"stock_daily": (stock_daily, ""), "weekly_rollup": (weekly_rollup, "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(trade_date="2026-04-28")
+
+    assert result["status"] == "partial"
+    assert calls == ["stock_daily"]
+    assert db["sync_tasks"].docs["postmarket:2026-04-28:weekly_rollup:all"]["status"] == "pending"
 
 
 def test_postmarket_hk_daily_error_does_not_block_a_scan(monkeypatch):
@@ -624,3 +749,83 @@ def test_postmarket_heartbeats_running_tasks_during_long_phase(monkeypatch):
     assert result["status"] == "ok"
     assert any(count == 1 for _run_id, _phase, count in heartbeats)
     assert db["sync_tasks"].docs["postmarket:2026-04-28:alpha:all"]["status"] == "ok"
+
+
+def test_postmarket_catchup_target_resumes_previous_trading_day_partial():
+    db = _Db()
+    db["sync_runs"].docs["postmarket:2026-05-07"] = {
+        "_id": "postmarket:2026-05-07",
+        "status": "partial",
+        "trade_date": "2026-05-07",
+    }
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+
+    target = runner.catchup_target(datetime(2026, 5, 8, 9, 10))
+
+    assert target == ("postmarket:2026-05-07", "2026-05-07", "partial")
+
+
+def test_postmarket_catchup_target_starts_missing_previous_trading_day():
+    runner = pm.PostmarketRunner(_Engine(_Db(), {}), max_workers=1)
+
+    target = runner.catchup_target(datetime(2026, 5, 8, 9, 10))
+
+    assert target == ("postmarket:2026-05-07", "2026-05-07", "missing")
+
+
+def test_postmarket_catchup_target_ignores_ok_previous_trading_day():
+    db = _Db()
+    db["sync_runs"].docs["postmarket:2026-05-07"] = {
+        "_id": "postmarket:2026-05-07",
+        "status": "ok",
+        "trade_date": "2026-05-07",
+    }
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+
+    target = runner.catchup_target(datetime(2026, 5, 8, 9, 10))
+
+    assert target is None
+
+
+def test_postmarket_continues_minute_preheat_universe(monkeypatch):
+    monkeypatch.setenv("SIGNALS_POSTMARKET_CONTINUE_MINUTE_BATCHES", "1")
+    tasks = (
+        pm.PostmarketTaskSpec(
+            "stock_minute",
+            "minute_preheat",
+            env={
+                "STOCK_MINUTE_SCOPE": "postmarket_candidates",
+                "STOCK_MINUTE_FREQS": "5min,15min",
+                "STOCK_MINUTE_POSTMARKET_MAX_CODES": "240",
+            },
+        ),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+
+    calls = []
+
+    def stock_minute(db, proxy_url=None):
+        calls.append("stock_minute")
+        for doc in db["minute_preheat_universe"].docs.values():
+            if doc.get("trade_date") == "2026-05-08" and doc.get("status") == "pending":
+                doc["status"] = "cached"
+        return {"status": "ok"}
+
+    db = _Db()
+    db["minute_preheat_universe"].docs["2026-05-08:300001"] = {
+        "_id": "2026-05-08:300001",
+        "trade_date": "2026-05-08",
+        "status": "pending",
+    }
+    db["minute_preheat_universe"].docs["2026-05-08:300002"] = {
+        "_id": "2026-05-08:300002",
+        "trade_date": "2026-05-08",
+        "status": "cached",
+    }
+    runner = pm.PostmarketRunner(_Engine(db, {"stock_minute": (stock_minute, "")}), max_workers=1)
+
+    completed = runner._continue_minute_preheat_universe("2026-05-08", "postmarket:2026-05-08")
+
+    assert completed == 1
+    assert calls == ["stock_minute"]
+    assert db["sync_runs"].docs["postmarket:2026-05-08"]["minute_preheat_pending"] == 0

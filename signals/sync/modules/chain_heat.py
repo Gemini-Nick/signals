@@ -9,6 +9,7 @@ from typing import Any
 from pymongo import UpdateOne
 from pymongo.database import Database
 
+from signals.core.chain_mapping_rules import filter_mapping_matches as _filter_mapping_matches
 from signals.core.concept_carriers import match_industry_chains, non_chain_reason
 from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import normalized_trade_minute, trading_day_key
@@ -184,7 +185,8 @@ def _representatives(match: dict[str, Any]) -> list[dict[str, Any]]:
             "priority": _int(rep.get("priority")),
             "source_note": _text(rep.get("source_note")),
         })
-    reps.sort(key=lambda item: (item["representative_type"] == "core", item["priority"]), reverse=True)
+    tier = {"core": 4, "upstream": 3, "downstream": 2, "elastic": 1}
+    reps.sort(key=lambda item: (tier.get(item["representative_type"], 0), item["priority"]), reverse=True)
     return reps
 
 
@@ -205,6 +207,7 @@ def _mapped_items(db: Database) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     unmapped = 0
     non_chain = 0
     low_confidence = 0
+    ambiguous_industry_only = 0
     for kind, docs in docs_by_kind.items():
         for doc in docs:
             name = _text(doc.get("name"))
@@ -217,6 +220,13 @@ def _mapped_items(db: Database) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             matches = [item for item in match_industry_chains(name) if _int(item.get("confidence")) >= 60]
             if not matches:
                 unmapped += 1
+                continue
+            matches, filter_reason = _filter_mapping_matches(matches)
+            if not matches:
+                if filter_reason == "ambiguous_industry_only":
+                    ambiguous_industry_only += 1
+                else:
+                    unmapped += 1
                 continue
             best_score = _int(matches[0].get("score"))
             for match in matches:
@@ -250,6 +260,7 @@ def _mapped_items(db: Database) -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     "layer": _text(match.get("layer")),
                     "stage": _text(match.get("stage")),
                     "mapping_confidence": _int(match.get("confidence")),
+                    "mapping_type": "semantic_taxonomy",
                     "hit_terms": match.get("hit_terms") or [],
                     "evidence_sources": match.get("evidence_sources") or [],
                     "representatives": _representatives(match),
@@ -261,6 +272,7 @@ def _mapped_items(db: Database) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         "unmapped_count": unmapped,
         "non_chain_count": non_chain,
         "low_confidence_count": low_confidence,
+        "ambiguous_industry_only_count": ambiguous_industry_only,
     }
     return mapped, meta
 
@@ -295,7 +307,10 @@ def _aggregate(mapped: list[dict[str, Any]], latest_minute: Any) -> list[dict[st
                     reps[symbol] = dict(rep)
         representatives = sorted(
             reps.values(),
-            key=lambda item: (item.get("representative_type") == "core", _int(item.get("priority"))),
+            key=lambda item: (
+                {"core": 4, "upstream": 3, "downstream": 2, "elastic": 1}.get(_text(item.get("representative_type")), 0),
+                _int(item.get("priority")),
+            ),
             reverse=True,
         )[:12]
         snapshots.append({

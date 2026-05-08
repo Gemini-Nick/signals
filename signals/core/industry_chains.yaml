@@ -3,34 +3,47 @@ chains:
   - chain_id: lithium_battery
     name: 电新/锂电池产业链
     aliases: [锂, 锂矿, 盐湖提锂, 锂电, 锂电池, 动力电池, 固态电池, 钠电池, 复合集流体]
-    industries: [能源金属, 小金属, 电池, 化学原料, 化学制品, 汽车整车, 其他电源设备]
+    industries: [能源金属, 电池]
     default_node_id: lithium_resource
     nodes:
       - node_id: lithium_resource
         name: 锂资源
         layer: upstream
-        keywords: [锂, 锂矿, 锂资源, 盐湖提锂, 锂盐, 碳酸锂, 能源金属, 小金属]
+        keywords: [锂, 锂矿, 锂资源, 盐湖提锂, 锂盐, 碳酸锂, 能源金属]
         core_representatives:
           - {symbol: SZ.002466, name: 天齐锂业, relation: 能源金属/锂资源, source_note: 产业链链主代表, priority: 100}
           - {symbol: SZ.002460, name: 赣锋锂业, relation: 小金属/锂资源, source_note: 产业链链主代表, priority: 98}
         elastic_representatives:
           - {symbol: SZ.002240, name: 盛新锂能, relation: 锂矿/锂盐弹性标的, source_note: 锂资源弹性代表, priority: 92}
           - {symbol: SZ.000792, name: 盐湖股份, relation: 盐湖提锂弹性标的, source_note: 锂资源弹性代表, priority: 90}
+      - node_id: lipf6_lithium_salt
+        name: 六氟磷酸锂/锂盐
+        layer: midstream
+        keywords: [六氟磷酸锂, 六氟, 6F, LiPF6, 电解质锂盐, LiFSI]
+        core_representatives:
+          - {symbol: SZ.002407, name: 多氟多, relation: 六氟磷酸锂/锂盐链主, source_note: 6F锂盐链主代表, priority: 100}
+          - {symbol: SZ.002759, name: 天际股份, relation: 六氟磷酸锂/6F核心标的, source_note: 6F锂盐核心代表, priority: 96}
+        elastic_representatives:
+          - {symbol: SZ.002709, name: 天赐材料, relation: 六氟磷酸锂/电解液一体化弹性标的, source_note: 6F锂盐一体化代表, priority: 88}
+        upstream_representatives:
+          - {symbol: SZ.002466, name: 天齐锂业, relation: 锂资源/锂盐上游, source_note: 6F锂盐上游锂资源代表, priority: 96}
+          - {symbol: SZ.002460, name: 赣锋锂业, relation: 锂资源/锂盐上游, source_note: 6F锂盐上游锂资源代表, priority: 94}
+        downstream_representatives:
+          - {symbol: SZ.002709, name: 天赐材料, relation: 电解液下游承接, source_note: 6F下游电解液链主代表, priority: 100}
+          - {symbol: SZ.300037, name: 新宙邦, relation: 电解液下游承接, source_note: 6F下游电解液链主代表, priority: 94}
+          - {symbol: SH.603026, name: 石大胜华, relation: 电解液溶剂/添加剂承接, source_note: 6F下游电解液材料代表, priority: 90}
       - node_id: electrolyte
         name: 电解液
         layer: midstream
-        keywords: [电解液, 六氟磷酸锂, 电解液溶剂, 锂电添加剂, 电解液添加剂, VC添加剂, FEC添加剂, DMC, EMC, DEC, LiFSI, 锂盐]
+        keywords: [电解液, 电解液溶剂, 锂电添加剂, 电解液添加剂, VC添加剂, FEC添加剂, DMC, EMC, DEC]
         core_representatives:
-          - {symbol: SZ.002709, name: 天赐材料, relation: 电解液/六氟磷酸锂链主, source_note: 电解液链主代表, priority: 100}
+          - {symbol: SZ.002709, name: 天赐材料, relation: 电解液链主, source_note: 电解液链主代表, priority: 100}
           - {symbol: SH.603026, name: 石大胜华, relation: 电解液溶剂/添加剂链主, source_note: 电解液材料链主代表, priority: 96}
           - {symbol: SZ.300037, name: 新宙邦, relation: 电解液/添加剂链主, source_note: 电解液链主代表, priority: 94}
-        elastic_representatives:
-          - {symbol: SZ.002407, name: 多氟多, relation: 六氟磷酸锂弹性标的, source_note: 电解液锂盐弹性代表, priority: 90}
-          - {symbol: SZ.002759, name: 天际股份, relation: 六氟磷酸锂弹性标的, source_note: 碳酸锂产业链下游弹性代表, priority: 84}
+        elastic_representatives: []
         upstream_representatives:
-          - {symbol: SZ.002407, name: 多氟多, relation: 六氟磷酸锂/锂盐上游, source_note: 电解液上游锂盐代表, priority: 94}
-          - {symbol: SZ.002709, name: 天赐材料, relation: 六氟磷酸锂/电解液配套上游, source_note: 电解液上游材料代表, priority: 92}
-          - {symbol: SH.603026, name: 石大胜华, relation: 电解液溶剂上游, source_note: 电解液溶剂代表, priority: 90}
+          - {symbol: SZ.002407, name: 多氟多, relation: 六氟磷酸锂/锂盐上游, source_note: 电解液上游6F锂盐代表, priority: 94}
+          - {symbol: SZ.002759, name: 天际股份, relation: 六氟磷酸锂/6F上游, source_note: 电解液上游6F锂盐代表, priority: 92}
         downstream_representatives:
           - {symbol: SZ.300750, name: 宁德时代, relation: 动力/储能电池下游, source_note: 电解液下游电池厂代表, priority: 100}
           - {symbol: SZ.300014, name: 亿纬锂能, relation: 动力/储能电池下游, source_note: 电解液下游电池厂代表, priority: 92}
@@ -69,7 +82,7 @@ chains:
       - node_id: battery_cell
         name: 电池
         layer: downstream
-        keywords: [电池, 动力电池, 储能电池, 固态电池, 钠电池, 锂电池, 复合集流体]
+        keywords: [电池, 动力电池, 储能电池, 固态电池, 钠电池, 钠离子电池, 刀片电池, 麒麟电池, 锂电池, 复合集流体]
         core_representatives:
           - {symbol: SZ.300750, name: 宁德时代, relation: 动力电池/储能电池链主, source_note: 电池链主代表, priority: 100}
           - {symbol: SZ.300014, name: 亿纬锂能, relation: 动力电池/储能, source_note: 电池链主代表, priority: 92}
@@ -79,7 +92,7 @@ chains:
       - node_id: storage_inverter
         name: 储能/逆变器
         layer: downstream
-        keywords: [储能, 逆变器, 储能系统, 电源设备]
+        keywords: [逆变器, 储能系统]
         core_representatives:
           - {symbol: SZ.300274, name: 阳光电源, relation: 逆变器/储能系统链主, source_note: 储能逆变器链主代表, priority: 98}
         elastic_representatives:
@@ -87,21 +100,21 @@ chains:
       - node_id: vehicle_terminal
         name: 整车终端
         layer: terminal
-        keywords: [新能源整车, 新能源汽车, 整车终端, 比亚迪]
+        keywords: [整车终端, 电池终端, 比亚迪]
         core_representatives:
           - {symbol: SZ.002594, name: 比亚迪, relation: 新能源整车/电池终端, source_note: 整车终端链主代表, priority: 96}
         elastic_representatives: []
 
   - chain_id: electric_equipment_new_energy
     name: 电力设备新能源产业链
-    aliases: [电新, 电力设备新能源, 新能源设备, 新能源发电, 电源设备]
+    aliases: [电新, 电力设备新能源, 新能源设备, 新能源发电, 电源设备, 超级电容]
     industries: [电池, 光伏设备, 风电设备, 电网设备, 其他电源设备, 能源金属]
     default_node_id: broad_equipment
     nodes:
       - node_id: broad_equipment
         name: 电新综合
         layer: midstream
-        keywords: [电新, 电力设备新能源, 新能源设备, 新能源发电, 电源设备]
+        keywords: [电新, 电力设备新能源, 新能源设备, 新能源发电, 电源设备, 超级电容]
         core_representatives:
           - {symbol: SZ.300750, name: 宁德时代, relation: 动力/储能电池链主, source_note: 电新默认链主代表, priority: 100}
           - {symbol: SZ.300274, name: 阳光电源, relation: 逆变器/储能系统, source_note: 电新默认链主代表, priority: 96}
@@ -112,14 +125,14 @@ chains:
 
   - chain_id: optical_module
     name: 光模块/CPO产业链
-    aliases: [光模块, CPO, 硅光, 高速光模块, 光芯片, 高速铜缆]
-    industries: [通信设备, 元件, 光学光电子, 消费电子]
+    aliases: [光模块, 光通信模块, CPO, 硅光, 高速光模块, 光芯片, 光纤概念, 高速铜缆]
+    industries: [光通信模块]
     default_node_id: optical_module_core
     nodes:
       - node_id: optical_module_core
         name: 光模块/CPO
         layer: midstream
-        keywords: [光模块, CPO, 硅光, 800G, 1.6T, 高速光模块]
+        keywords: [光模块, 光通信模块, CPO, 硅光, 800G, 1.6T, 高速光模块, 光纤概念]
         core_representatives:
           - {symbol: SZ.300308, name: 中际旭创, relation: 高速光模块/CPO链主, source_note: 光模块链主代表, priority: 100}
           - {symbol: SZ.300502, name: 新易盛, relation: 高速光模块链主, source_note: 光模块链主代表, priority: 96}
@@ -130,14 +143,14 @@ chains:
 
   - chain_id: telecom_network
     name: 通信网络/5G产业链
-    aliases: [通信, 通信设备, 5G, 5G概念, 6G, 物联网, 宽带提速, 卫星通信]
+    aliases: [通信, 通信设备, 5G, 5G概念, 6G, 物联网, 宽带提速, 卫星通信, F5G, F5G概念, IPv6, VPN, WiFi, UWB概念, 毫米波概念, ETC]
     industries: [通信设备, 通信服务, 互联网服务]
     default_node_id: telecom_equipment
     nodes:
       - node_id: telecom_equipment
         name: 通信设备/网络建设
         layer: midstream
-        keywords: [通信, 通信设备, 5G, 5G概念, 6G, 物联网, 宽带提速, 卫星通信]
+        keywords: [通信, 通信设备, 5G, 5G概念, 6G, 物联网, 宽带提速, 卫星通信, F5G, F5G概念, IPv6, VPN, WiFi, UWB概念, 毫米波概念, ETC]
         core_representatives:
           - {symbol: SZ.000063, name: 中兴通讯, relation: 通信设备/5G链主, source_note: 通信网络链主代表, priority: 100}
         elastic_representatives:
@@ -147,21 +160,21 @@ chains:
 
   - chain_id: semiconductor
     name: 半导体产业链
-    aliases: [半导体, 芯片, 集成电路, 华为海思, 高带宽内存, HBM]
+    aliases: [半导体, 芯片, 集成电路, 华为海思, 中芯概念, 高带宽内存, HBM, AI芯片, 国产芯片, EDA, EDA概念, IGBT, IGBT概念, 功率半导体, 分立器件, 玻璃基板]
     industries: [半导体, 元件, 电子化学品, 消费电子, 其他电子]
     default_node_id: wafer_foundry
     nodes:
       - node_id: wafer_foundry
         name: 晶圆制造
         layer: midstream
-        keywords: [半导体, 芯片, 集成电路, 晶圆制造, 晶圆代工]
+        keywords: [半导体, 芯片, 集成电路, 晶圆制造, 晶圆代工, 中芯概念]
         core_representatives:
           - {symbol: SH.688981, name: 中芯国际, relation: 晶圆代工链主, source_note: 半导体默认链主代表, priority: 100}
         elastic_representatives: []
       - node_id: chip_design
         name: 芯片设计
         layer: downstream
-        keywords: [设计, 芯片设计, CIS, MCU, 华为海思]
+        keywords: [设计, 芯片设计, CIS, MCU, 华为海思, AI芯片, 国产芯片, EDA, EDA概念]
         core_representatives:
           - {symbol: SH.603501, name: 韦尔股份, relation: 芯片设计/CIS, source_note: 半导体设计链主代表, priority: 92}
           - {symbol: SH.603986, name: 兆易创新, relation: 存储芯片/MCU, source_note: 半导体设计链主代表, priority: 90}
@@ -169,7 +182,7 @@ chains:
       - node_id: memory_chip
         name: 存储芯片
         layer: downstream
-        keywords: [存储芯片, 存储, DRAM, NAND, MCU, 高带宽内存, HBM]
+        keywords: [存储芯片, 存储, DRAM, NAND, 高带宽内存, HBM]
         core_representatives:
           - {symbol: SH.603986, name: 兆易创新, relation: 存储芯片/MCU链主, source_note: 存储芯片链主代表, priority: 100}
           - {symbol: SH.688008, name: 澜起科技, relation: 内存接口/HBM链主, source_note: 存储/HBM链主代表, priority: 94}
@@ -181,7 +194,7 @@ chains:
       - node_id: semiconductor_equipment
         name: 半导体设备
         layer: upstream
-        keywords: [半导体设备, 设备, 光刻机, 刻蚀, 薄膜沉积]
+        keywords: [半导体设备, 光刻机, 刻蚀, 薄膜沉积]
         core_representatives:
           - {symbol: SZ.002371, name: 北方华创, relation: 半导体设备链主, source_note: 半导体设备链主代表, priority: 100}
           - {symbol: SH.688012, name: 中微公司, relation: 刻蚀设备/半导体设备, source_note: 半导体设备链主代表, priority: 96}
@@ -189,35 +202,35 @@ chains:
       - node_id: packaging_test
         name: 封测
         layer: midstream
-        keywords: [封测, 先进封装, 封装测试]
+        keywords: [封测, 先进封装, 封装测试, 玻璃基板]
         core_representatives:
           - {symbol: SH.600584, name: 长电科技, relation: 先进封装/封测链主, source_note: 半导体封测链主代表, priority: 94}
         elastic_representatives: []
       - node_id: material_photoresist
         name: 材料/光刻胶
         layer: upstream
-        keywords: [半导体材料, 光刻胶, 电子化学品, 材料]
+        keywords: [半导体材料, 光刻胶, 电子化学品]
         core_representatives:
           - {symbol: SZ.300236, name: 上海新阳, relation: 光刻胶/电子化学品链主, source_note: 半导体材料链主代表, priority: 100}
         elastic_representatives: []
       - node_id: compound_semiconductor
         name: 第三代半导体
         layer: upstream
-        keywords: [第三代半导体, 碳化硅, 氮化镓]
+        keywords: [第三代半导体, 第四代半导体, 碳化硅, 氮化镓, IGBT, IGBT概念, 功率半导体, 分立器件]
         core_representatives:
           - {symbol: SH.600703, name: 三安光电, relation: 第三代半导体链主, source_note: 第三代半导体链主代表, priority: 96}
         elastic_representatives: []
 
   - chain_id: new_energy_vehicle
     name: 新能源汽车产业链
-    aliases: [新能源汽车, 华为汽车, 汽车热管理, 无人驾驶, 智能驾驶, 车联网, 一体化压铸, 高压快充, 特斯拉, 汽车电子]
-    industries: [汽车整车, 汽车零部件, 电池, 消费电子, 通信设备]
+    aliases: [新能源汽车, 新能源车, 新能源整车, 汽车整车, 小米汽车, 华为汽车, 汽车热管理, 无人驾驶, 智能驾驶, 车联网, 车联网(车路云), 一体化压铸, 汽车一体化压铸, 高压快充, 换电概念, 无线充电, 特斯拉, 汽车电子, 激光雷达, 电子后视镜, 电子车牌, 胎压监测, 轮毂电机, EDR概念]
+    industries: [汽车整车, 汽车零部件, 乘用车, 商用车, 商用载客车, 商用载货车, 其他汽车零部件, 电池, 消费电子, 通信设备]
     default_node_id: vehicle
     nodes:
       - node_id: vehicle
         name: 整车/智能汽车
         layer: terminal
-        keywords: [新能源汽车, 华为汽车, 智能驾驶, 无人驾驶, 车联网, 特斯拉, 汽车电子]
+        keywords: [新能源汽车, 新能源车, 新能源整车, 汽车整车, 小米汽车, 华为汽车, 智能驾驶, 无人驾驶, 车联网, 车联网(车路云), 一体化压铸, 汽车一体化压铸, 高压快充, 换电概念, 无线充电, 特斯拉, 汽车电子, 激光雷达, 电子后视镜, 电子车牌, 胎压监测, 轮毂电机, EDR概念]
         core_representatives:
           - {symbol: SZ.002594, name: 比亚迪, relation: 新能源整车链主, source_note: 汽车链主代表, priority: 100}
         elastic_representatives:
@@ -227,14 +240,14 @@ chains:
 
   - chain_id: photovoltaic
     name: 光伏产业链
-    aliases: [光伏, BC电池, HJT, TOPCon, 钙钛矿, 硅片, 组件, 逆变器, 光伏玻璃]
+    aliases: [光伏, 光伏电池组件, BC电池, HJT, TOPCon, 钙钛矿, 硅片, 组件, 逆变器, 光伏玻璃]
     industries: [光伏设备, 电网设备, 电力, 金属新材料]
     default_node_id: solar_module
     nodes:
       - node_id: solar_module
         name: 硅料/硅片/组件
         layer: midstream
-        keywords: [光伏, 硅片, 组件, BC电池, HJT, TOPCon, 钙钛矿, 光伏玻璃]
+        keywords: [光伏, 光伏电池组件, 硅片, 组件, BC电池, HJT, TOPCon, 钙钛矿, 光伏玻璃]
         core_representatives:
           - {symbol: SH.601012, name: 隆基绿能, relation: 硅片/组件链主, source_note: 光伏链主代表, priority: 100}
           - {symbol: SH.600438, name: 通威股份, relation: 硅料/电池片链主, source_note: 光伏链主代表, priority: 94}
@@ -244,14 +257,14 @@ chains:
 
   - chain_id: wind_storage_grid
     name: 风光储/电网产业链
-    aliases: [储能, 风电, 风电设备, 虚拟电厂, 智能电网, 特高压, 充电桩, 电力设备, 绿电, 氢能源, 氢燃料, 燃料电池, 核电核能, 风能, 地热能]
+    aliases: [储能, 抽水蓄能, 熔盐储能, 钒电池, 液流电池, 风电, 风电设备, 虚拟电厂, 智能电网, 电网, 电网概念, 特高压, 充电桩, 电力设备, 绿色电力, 绿电, 新能源, 氢能源, 氢燃料, 燃料电池, 核电核能, 核能核电, 可控核聚变, 核聚变, 生物质能发电, 超超临界发电, 雅下水电概念, 风能, 地热能]
     industries: [风电设备, 光伏设备, 电网设备, 电力, 其他电源设备]
     default_node_id: grid_storage
     nodes:
       - node_id: grid_storage
         name: 电网/储能/风电
         layer: downstream
-        keywords: [储能, 风电, 虚拟电厂, 智能电网, 特高压, 充电桩, 绿电, 氢能源, 氢燃料, 燃料电池, 核电核能, 风能, 地热能]
+        keywords: [储能, 抽水蓄能, 熔盐储能, 钒电池, 液流电池, 风电, 虚拟电厂, 智能电网, 电网, 电网概念, 特高压, 充电桩, 绿色电力, 绿电, 新能源, 氢能源, 氢燃料, 燃料电池, 核电核能, 核能核电, 可控核聚变, 核聚变, 生物质能发电, 超超临界发电, 雅下水电概念, 风能, 地热能]
         core_representatives:
           - {symbol: SH.600089, name: 特变电工, relation: 电网设备/特高压链主, source_note: 风光储链主代表, priority: 96}
           - {symbol: SH.600905, name: 三峡能源, relation: 风光电运营链主, source_note: 风光储链主代表, priority: 92}
@@ -261,14 +274,14 @@ chains:
 
   - chain_id: ai_compute
     name: AI算力/数据中心产业链
-    aliases: [AI, 算力, 数据中心, 服务器, 算力租赁, 智算中心, GPU云, IDC算力服务, 液冷, 东数西算, ChatGPT, DeepSeek, 多模态, 百度概念, 国产软件, 信息安全, 电子支付, 安防服务]
+    aliases: [AI, 人工智能, AIGC, AI应用, AI智能体, AI语料, 智谱AI, 智谱AI概念, Kimi, Kimi概念, MLOps, MLOps概念, 算力, 数据中心, 云计算, 腾讯云, 阿里概念, 大数据, 数据要素, 数据确权, 数据安全, 数字经济, 数字货币, 数字孪生, 数字水印, 数字阅读, 智慧城市, 智慧政务, 财税数字化, 区块链, Web3.0, 元宇宙概念, 工业互联, 国资云概念, ERP概念, 边缘计算, 量子科技, 服务器, 算力租赁, 智算中心, GPU云, IDC算力服务, 液冷, 东数西算, 英伟达概念, ChatGPT, DeepSeek, 多模态, 百度概念, 国产软件, 信创, 华为昇腾, 华为鲲鹏, 华为欧拉, 信息安全, 网络安全, 电子身份证, 生物识别, 电子支付, 安防服务, 安防概念, 虚拟数字人]
     industries: [计算机设备, 软件开发, 通信设备, 通信服务, 互联网服务]
     default_node_id: ai_server
     nodes:
       - node_id: ai_server
         name: AI服务器/数据中心
         layer: midstream
-        keywords: [AI服务器, 服务器, 数据中心硬件, 算力基础设施, 整机柜, 东数西算, ChatGPT, DeepSeek, 多模态, 国产软件, 信息安全, 电子支付, 安防服务]
+        keywords: [AI服务器, AIGC, 服务器, 数据中心硬件, 算力基础设施, 整机柜, 东数西算, 英伟达概念, 边缘计算, 量子科技, ChatGPT, DeepSeek, 多模态, 信息安全, 网络安全, 电子身份证, 生物识别, 电子支付, 安防服务]
         core_representatives:
           - {symbol: SZ.000977, name: 浪潮信息, relation: AI服务器链主, source_note: AI算力链主代表, priority: 100}
           - {symbol: SH.601138, name: 工业富联, relation: AI服务器/算力硬件链主, source_note: AI算力链主代表, priority: 98}
@@ -283,7 +296,7 @@ chains:
       - node_id: compute_service_operator
         name: 算力租赁/智算云服务
         layer: downstream
-        keywords: [算力租赁, 智算中心, 智算云, GPU云, GPU租赁, IDC算力服务, 算力服务, 算力运营, AIDC, 云算力, 推理算力服务]
+        keywords: [算力租赁, 智算中心, 智算云, GPU云, GPU租赁, IDC算力服务, 算力服务, 算力运营, AIDC, 云算力, 推理算力服务, 云计算, 腾讯云, 阿里概念]
         core_representatives:
           - {symbol: SH.603019, name: 中科曙光, relation: 智算中心/算力服务运营, source_note: 算力服务链主代表, priority: 96}
           - {symbol: SH.600050, name: 中国联通, relation: 云网融合/算力服务运营, source_note: 算力服务运营商代表, priority: 92}
@@ -292,6 +305,28 @@ chains:
           - {symbol: SZ.300442, name: 润泽科技, relation: IDC/智算中心运营弹性标的, source_note: 算力租赁弹性代表, priority: 88}
           - {symbol: SZ.300383, name: 光环新网, relation: IDC/云计算服务弹性标的, source_note: 算力服务弹性代表, priority: 84}
           - {symbol: SZ.300738, name: 奥飞数据, relation: IDC/算力基础设施弹性标的, source_note: 算力服务弹性代表, priority: 82}
+      - node_id: ai_application
+        name: AI应用/智能体
+        layer: downstream
+        keywords: [人工智能, AI应用, AI智能体, AI语料, 智谱AI, 智谱AI概念, Kimi, Kimi概念, MLOps, MLOps概念, AIGC应用, 大模型应用, 大数据, 数据要素, 数据确权, 数据安全, 数字经济, 数字货币, 数字孪生, 数字水印, 数字阅读, 智慧城市, 智慧政务, 财税数字化, 区块链, Web3.0, 元宇宙概念, 工业互联, 国资云概念, ERP概念, 安防概念, 虚拟数字人]
+        core_representatives:
+          - {symbol: SZ.002230, name: 科大讯飞, relation: AI应用/大模型链主, source_note: AI应用链主代表, priority: 100}
+          - {symbol: SZ.300418, name: 昆仑万维, relation: AI应用/大模型应用链主, source_note: AI应用链主代表, priority: 94}
+          - {symbol: SH.601360, name: 三六零, relation: 大模型应用/安全AI链主, source_note: AI应用链主代表, priority: 90}
+        elastic_representatives:
+          - {symbol: SZ.300364, name: 中文在线, relation: AI语料/内容数据弹性标的, source_note: AI语料弹性代表, priority: 86}
+          - {symbol: SZ.300229, name: 拓尔思, relation: AI语料/知识工程弹性标的, source_note: AI语料弹性代表, priority: 82}
+      - node_id: domestic_compute_ecosystem
+        name: 国产算力/华为生态
+        layer: midstream
+        keywords: [国产软件, 信创, 华为昇腾, 华为鲲鹏, 华为欧拉, 昇腾, 鲲鹏, 欧拉, 国产算力, 国产服务器, 操作系统]
+        core_representatives:
+          - {symbol: SZ.002261, name: 拓维信息, relation: 昇腾/鲲鹏/国产算力链主, source_note: 华为算力生态链主代表, priority: 96}
+          - {symbol: SZ.000158, name: 常山北明, relation: 华为鲲鹏/信创链主, source_note: 华为算力生态链主代表, priority: 92}
+          - {symbol: SZ.300339, name: 润和软件, relation: openEuler/鸿蒙/信创软件链主, source_note: 华为软件生态链主代表, priority: 88}
+        elastic_representatives:
+          - {symbol: SZ.301236, name: 软通动力, relation: 华为生态服务弹性标的, source_note: 华为生态弹性代表, priority: 84}
+          - {symbol: SH.600839, name: 四川长虹, relation: 国产服务器/算力终端弹性标的, source_note: 国产算力弹性代表, priority: 78}
 
   - chain_id: thermal_liquid_cooling
     name: 液冷/热管理产业链
@@ -314,14 +349,14 @@ chains:
 
   - chain_id: copper_interconnect
     name: 铜连接/高速连接器产业链
-    aliases: [铜连接, 高速连接器, 高速铜缆, 服务器连接器, 背板连接器]
-    industries: [通信设备, 元件, 消费电子]
+    aliases: [铜连接, 铜缆高速连接, 高速铜连接, 高速连接器, 高速铜缆, 服务器连接器, 背板连接器]
+    industries: []
     default_node_id: copper_connector_core
     nodes:
       - node_id: copper_connector_core
         name: 高速铜连接/连接器
         layer: midstream
-        keywords: [铜连接, 高速连接器, 高速铜缆, 服务器连接器, backplane, cable]
+        keywords: [铜连接, 铜缆高速连接, 高速铜连接, 高速连接器, 高速铜缆, 服务器连接器, backplane, cable]
         core_representatives:
           - {symbol: SZ.002130, name: 沃尔核材, relation: 高速铜缆/连接器链主, source_note: 铜连接链主代表, priority: 100}
           - {symbol: SZ.300563, name: 神宇股份, relation: 高速线缆/射频连接弹性链主, source_note: 铜连接链主代表, priority: 94}
@@ -333,14 +368,14 @@ chains:
 
   - chain_id: pcb_ccl
     name: PCB/CCL/服务器材料产业链
-    aliases: [PCB, CCL, 覆铜板, 服务器材料, AI服务器材料]
+    aliases: [PCB, PCB概念, 印制电路板, CCL, 覆铜板, 服务器材料, AI服务器材料]
     industries: [元件, 电子化学品, 通信设备]
     default_node_id: pcb_ccl_core
     nodes:
       - node_id: pcb_ccl_core
         name: PCB/CCL
         layer: midstream
-        keywords: [PCB, CCL, 覆铜板, 服务器材料, AI服务器材料]
+        keywords: [PCB, PCB概念, 印制电路板, CCL, 覆铜板, 服务器材料, AI服务器材料]
         core_representatives:
           - {symbol: SZ.300476, name: 胜宏科技, relation: AI服务器PCB链主, source_note: PCB/CCL链主代表, priority: 100}
           - {symbol: SZ.002463, name: 沪电股份, relation: 高速PCB/服务器PCB链主, source_note: PCB/CCL链主代表, priority: 96}
@@ -352,14 +387,14 @@ chains:
 
   - chain_id: robotics
     name: 机器人/自动化产业链
-    aliases: [机器人, 人形机器人, 减速器, 伺服, 工业母机, 智能制造, 机器视觉]
+    aliases: [机器人, 人形机器人, 减速器, 伺服, 工业母机, 智能制造, 新型工业化, 机器视觉, 机器人执行器, 虚拟机器人, 传感器, PLC概念, 发电机概念, 同步磁阻电机, 工程机械概念]
     industries: [通用设备, 专用设备, 电机, 仪器仪表, 计算机设备]
     default_node_id: automation
     nodes:
       - node_id: automation
         name: 自动化/机器人
         layer: midstream
-        keywords: [机器人, 人形机器人, 减速器, 伺服, 工业母机, 智能制造, 机器视觉]
+        keywords: [机器人, 人形机器人, 减速器, 伺服, 工业母机, 智能制造, 新型工业化, 机器视觉, 机器人执行器, 虚拟机器人, 传感器, PLC概念, 发电机概念, 同步磁阻电机, 工程机械概念]
         core_representatives:
           - {symbol: SZ.300124, name: 汇川技术, relation: 工业自动化/伺服链主, source_note: 机器人链主代表, priority: 100}
         elastic_representatives:
@@ -369,31 +404,41 @@ chains:
 
   - chain_id: consumer_electronics
     name: 消费电子/华为链
-    aliases: [消费电子, 苹果概念, 华为, 鸿蒙, 折叠屏, MR, AI眼镜, 电子纸, 无线耳机, 小米概念, 触摸屏, 智能穿戴]
+    aliases: [消费电子, 苹果概念, 华为, 鸿蒙, 折叠屏, MR, 增强现实, 混合现实, 虚拟现实, 空间计算, 全息技术, 裸眼3D, 屏下摄像, 显示技术, 智能电视, AI眼镜, AI手机, AIPC, AI PC, 电子纸, MicroLED, MiniLED, OLED, LED概念, 3D摄像头, 3D玻璃, MLCC, 被动元件, 光学元件, 无线耳机, 小米概念, 荣耀概念, 触摸屏, 智能穿戴]
     industries: [消费电子, 光学光电子, 元件, 其他电子, 软件开发]
     default_node_id: electronics
     nodes:
       - node_id: electronics
         name: 消费电子/华为链
         layer: midstream
-        keywords: [消费电子, 苹果概念, 华为, 鸿蒙, 折叠屏, MR, AI眼镜, 电子纸, 无线耳机, 小米概念, 触摸屏, 智能穿戴]
+        keywords: [消费电子, 苹果概念, 华为, 鸿蒙, 折叠屏, MR, 增强现实, 混合现实, 虚拟现实, 空间计算, 全息技术, 裸眼3D, 屏下摄像, 显示技术, 智能电视, AI眼镜, 电子纸, MicroLED, MiniLED, OLED, LED概念, 3D摄像头, 3D玻璃, MLCC, 被动元件, 光学元件, 无线耳机, 小米概念, 荣耀概念, 触摸屏, 智能穿戴]
         core_representatives:
           - {symbol: SZ.002475, name: 立讯精密, relation: 消费电子代工/连接器链主, source_note: 消费电子链主代表, priority: 100}
         elastic_representatives:
           - {symbol: SZ.000725, name: 京东方A, relation: 显示面板弹性标的, source_note: 消费电子弹性代表, priority: 90}
           - {symbol: SZ.300408, name: 三环集团, relation: 电子元件弹性标的, source_note: 消费电子弹性代表, priority: 84}
           - {symbol: SZ.300339, name: 润和软件, relation: 鸿蒙生态弹性标的, source_note: 消费电子弹性代表, priority: 76}
+      - node_id: ai_terminal
+        name: 端侧AI/AI终端
+        layer: terminal
+        keywords: [AI手机, AIPC, AI PC, AI电脑, AI终端, 端侧AI]
+        core_representatives:
+          - {symbol: SZ.002475, name: 立讯精密, relation: AI终端代工/连接器链主, source_note: AI终端链主代表, priority: 96}
+          - {symbol: SH.600745, name: 闻泰科技, relation: 手机ODM/AI终端链主, source_note: AI终端链主代表, priority: 90}
+          - {symbol: SZ.002241, name: 歌尔股份, relation: AI可穿戴/声学终端链主, source_note: AI终端链主代表, priority: 86}
+        elastic_representatives:
+          - {symbol: SZ.000725, name: 京东方A, relation: AI终端显示弹性标的, source_note: AI终端弹性代表, priority: 82}
 
   - chain_id: medicine
     name: 医药医疗产业链
-    aliases: [医药, 创新药, CRO, CXO, CXO概念, 中药, 医疗器械, 流感, 减肥药, 合成生物, 仿制药, 免疫治疗, 生物疫苗, 抗癌, 维生素, 基因测序, 民营医院, 超级细菌]
-    industries: [化学制药, 生物制药, 中药, 医疗器械, 医疗服务, 医药商业]
+    aliases: [医药, 创新药, CRO, CXO, CXO概念, 中药, 医疗器械, 流感, 减肥药, 合成生物, 仿制药, 免疫治疗, 生物疫苗, 抗癌, 维生素, 基因测序, 民营医院, 超级细菌, SPD概念, AI制药, AI制药（医疗）, CAR-T细胞疗法, DRG/DIP, 体外诊断, 体外诊断概念, 互联医疗, 医疗研发外包, 创新医疗服务, 医疗美容, 医美概念, 医美服务, 单抗概念, 幽门螺杆菌概念, 毛发医疗, 养老概念, 托育服务, 医疗耗材, 医疗设备, 原料药, 化学制剂, 特色药, 独家药品, 病原体防治, 病毒防治, 精准医疗, 精准诊断, 肝炎概念, 肝素概念, 辅助生殖, 重组蛋白, 长寿药, 阿兹海默, 青蒿素, 人脑工程]
+    industries: [化学制药, 生物制药, 中药, 医疗器械, 医疗服务, 医药商业, 体外诊断, 医院, 其他医疗服务, 其他生物制品]
     default_node_id: medicine_core
     nodes:
       - node_id: medicine_core
         name: 创新药/医疗器械
         layer: midstream
-        keywords: [医药, 创新药, CRO, CXO, CXO概念, 中药, 医疗器械, 流感, 减肥药, 合成生物, 仿制药, 免疫治疗, 生物疫苗, 抗癌, 维生素, 基因测序, 民营医院, 超级细菌]
+        keywords: [医药, 创新药, CRO, CXO, CXO概念, 中药, 医疗器械, 流感, 减肥药, 合成生物, 仿制药, 免疫治疗, 生物疫苗, 抗癌, 维生素, 基因测序, 民营医院, 超级细菌, SPD概念, AI制药, AI制药（医疗）, CAR-T细胞疗法, DRG/DIP, 体外诊断, 体外诊断概念, 互联医疗, 医疗研发外包, 创新医疗服务, 医疗美容, 医美概念, 医美服务, 单抗概念, 幽门螺杆菌概念, 毛发医疗, 养老概念, 托育服务, 医疗耗材, 医疗设备, 原料药, 化学制剂, 特色药, 独家药品, 病原体防治, 病毒防治, 精准医疗, 精准诊断, 肝炎概念, 肝素概念, 辅助生殖, 重组蛋白, 长寿药, 阿兹海默, 青蒿素, 人脑工程]
         core_representatives:
           - {symbol: SH.600276, name: 恒瑞医药, relation: 创新药/化学制药链主, source_note: 医药链主代表, priority: 100}
           - {symbol: SZ.300760, name: 迈瑞医疗, relation: 医疗器械链主, source_note: 医药链主代表, priority: 94}
@@ -403,31 +448,41 @@ chains:
 
   - chain_id: military
     name: 军工装备产业链
-    aliases: [军工, 低空经济, 卫星导航, 商业航天, 大飞机, 无人机, 船舶, 航母, 军民融合, 海工装备]
-    industries: [军工装备, 军工电子, 航空航天装备, 船舶制造, 轨道交通装备]
+    aliases: [军工, 低空经济, 卫星导航, 商业航天, 卫星互联网, 北斗导航, 航天航空, 航天装备, 航空装备, 空间站概念, 大飞机, 无人机, 飞行汽车(eVTOL), eVTOL, 船舶, 航母, 军民融合, 海工装备]
+    industries: [军工装备, 军工电子, 航空航天装备, 航天装备, 航空装备, 船舶制造]
     default_node_id: military_core
     nodes:
+      - node_id: commercial_space
+        name: 商业航天/卫星互联网
+        layer: midstream
+        keywords: [商业航天, 卫星互联网, 卫星导航, 北斗导航, 航天航空, 航天装备, 航空装备, 空间站概念, 航天, 卫星, 火箭, 测控, 地面站]
+        core_representatives:
+          - {symbol: SH.601698, name: 中国卫通, relation: 卫星通信运营/卫星互联网链主, source_note: 商业航天链主代表, priority: 100}
+          - {symbol: SZ.000547, name: 航天发展, relation: 航天电子信息/卫星应用链主, source_note: 商业航天链主代表, priority: 96}
+        elastic_representatives:
+          - {symbol: SH.600343, name: 航天动力, relation: 航天发动机/泵阀配套弹性标的, source_note: 商业航天弹性代表, priority: 92}
+          - {symbol: SH.600879, name: 航天电子, relation: 航天电子/测控配套弹性标的, source_note: 商业航天弹性代表, priority: 88}
+          - {symbol: SH.600855, name: 航天长峰, relation: 航天系统工程弹性标的, source_note: 商业航天弹性代表, priority: 82}
       - node_id: military_core
         name: 航空航天/船舶
         layer: midstream
-        keywords: [军工, 低空经济, 卫星导航, 商业航天, 大飞机, 无人机, 船舶, 航母, 军民融合, 海工装备]
+        keywords: [军工, 低空经济, 大飞机, 无人机, 飞行汽车(eVTOL), eVTOL, 船舶, 航母, 军民融合, 海工装备]
         core_representatives:
           - {symbol: SH.600893, name: 航发动力, relation: 航空发动机链主, source_note: 军工链主代表, priority: 100}
           - {symbol: SH.600760, name: 中航沈飞, relation: 军机总装链主, source_note: 军工链主代表, priority: 94}
         elastic_representatives:
           - {symbol: SH.600150, name: 中国船舶, relation: 船舶制造弹性标的, source_note: 军工弹性代表, priority: 90}
-          - {symbol: SH.601766, name: 中国中车, relation: 轨道交通装备弹性标的, source_note: 军工弹性代表, priority: 78}
 
   - chain_id: nonferrous
     name: 有色金属产业链
-    aliases: [有色, 铜, 铝, 黄金, 贵金属, 白银, 钴, 镍, 稀土, 工业金属]
+    aliases: [有色, 铜, 铝, 黄金, 贵金属, 白银, 钴, 镍, 稀土, 小金属, 小金属概念, 稀缺资源, 资源开采概念, 工业金属]
     industries: [有色金属, 工业金属, 金属新材料]
     default_node_id: industrial_metals
     nodes:
       - node_id: industrial_metals
         name: 工业金属
         layer: upstream
-        keywords: [有色, 铜, 铝, 锌, 铅, 工业金属]
+        keywords: [有色, 铜, 铝, 锌, 铅, 工业金属, 资源开采概念]
         core_representatives:
           - {symbol: SH.601899, name: 紫金矿业, relation: 铜金矿产链主, source_note: 有色链主代表, priority: 100}
           - {symbol: SH.600362, name: 江西铜业, relation: 铜产业链主, source_note: 工业金属链主代表, priority: 96}
@@ -448,7 +503,7 @@ chains:
       - node_id: rare_earth_minor
         name: 稀土/小金属
         layer: upstream
-        keywords: [稀土, 钴, 镍, 钨, 钼, 锑, 小金属]
+        keywords: [稀土, 钴, 镍, 钨, 钼, 锑, 小金属, 稀缺资源]
         core_representatives:
           - {symbol: SH.600111, name: 北方稀土, relation: 稀土链主, source_note: 稀土链主代表, priority: 96}
           - {symbol: SH.603993, name: 洛阳钼业, relation: 钼钴链主, source_note: 小金属链主代表, priority: 92}
@@ -459,14 +514,14 @@ chains:
 
   - chain_id: chemical
     name: 基础化工产业链
-    aliases: [化工, 磷化工, 氟化工, 煤化工, 纯碱, 尿素, 农药, 化肥, 钛白粉, 新材料, 碳纤维, 石墨烯, 聚氨酯, 草甘膦, 超导概念, 3D打印]
-    industries: [化学原料, 化学制品, 农化制品, 电子化学品, 塑料, 橡胶]
+    aliases: [化工, 磷化工, 氟化工, 煤化工, 纯碱, 尿素, 农药, 化肥, 钛白粉, 新材料, 碳纤维, 石墨烯, 聚氨酯, 草甘膦, 有机硅, 有机硅概念, 环氧丙烷, 碳基材料, 纳米银, 蓝宝石, 低碳冶金, 民爆概念, 降解塑料, 超导概念, 3D打印, PEEK材料, PEEK材料概念, 合成树脂, 化学纤维, 工业气体, 工业大麻, 培育钻石]
+    industries: [化学原料, 化学制品, 其他化学原料, 其他化学制品, 农化制品, 复合肥, 电子化学品, 塑料, 其他塑料制品, 橡胶, 合成树脂, 化学纤维, 工业气体, 化学工程]
     default_node_id: chemical_material
     nodes:
       - node_id: chemical_material
         name: 化工材料
         layer: midstream
-        keywords: [化工, 磷化工, 氟化工, 煤化工, 纯碱, 尿素, 农药, 化肥, 钛白粉, 新材料, 碳纤维, 石墨烯, 聚氨酯, 草甘膦, 超导概念, 3D打印]
+        keywords: [化工, 磷化工, 氟化工, 煤化工, 纯碱, 尿素, 农药, 化肥, 钛白粉, 新材料, 碳纤维, 石墨烯, 聚氨酯, 草甘膦, 有机硅, 有机硅概念, 环氧丙烷, 碳基材料, 纳米银, 蓝宝石, 低碳冶金, 民爆概念, 降解塑料, 超导概念, 3D打印, PEEK材料, PEEK材料概念, 合成树脂, 化学纤维, 工业气体, 工业大麻, 培育钻石]
         core_representatives:
           - {symbol: SH.600309, name: 万华化学, relation: 化学原料/MDI链主, source_note: 化工链主代表, priority: 100}
         elastic_representatives:
@@ -476,14 +531,14 @@ chains:
 
   - chain_id: coal_oil_gas
     name: 煤炭/油气能源产业链
-    aliases: [煤炭, 石油, 天然气, 燃气, 油气, 页岩气, 氦气]
+    aliases: [煤炭, 石油, 天然气, 燃气, 油气, 页岩气, 氦气, 可燃冰]
     industries: [煤炭, 石油石化, 燃气II, 电力]
     default_node_id: fossil_energy
     nodes:
       - node_id: fossil_energy
         name: 煤炭/油气
         layer: upstream
-        keywords: [煤炭, 石油, 天然气, 燃气, 油气, 页岩气, 氦气]
+        keywords: [煤炭, 石油, 天然气, 燃气, 油气, 页岩气, 氦气, 可燃冰]
         core_representatives:
           - {symbol: SH.601088, name: 中国神华, relation: 煤炭链主, source_note: 能源链主代表, priority: 100}
           - {symbol: SH.600028, name: 中国石化, relation: 石油石化链主, source_note: 能源链主代表, priority: 92}
@@ -493,14 +548,14 @@ chains:
 
   - chain_id: finance
     name: 大金融产业链
-    aliases: [银行, 券商, 证券, 保险, 多元金融, 互联金融, 金融科技]
+    aliases: [银行, 券商, 证券, 保险, 多元金融, 互联金融, 互联网金融, 金融科技, 移动支付, 跨境支付, 蚂蚁概念, REITs概念, 化债(AMC)概念, 创投, 参股期货]
     industries: [银行, 证券, 保险, 多元金融, 软件开发]
     default_node_id: finance_core
     nodes:
       - node_id: finance_core
         name: 银行/券商/保险
         layer: terminal
-        keywords: [银行, 券商, 证券, 保险, 多元金融, 互联金融, 金融科技]
+        keywords: [银行, 券商, 证券, 保险, 多元金融, 互联金融, 互联网金融, 金融科技, 移动支付, 跨境支付, 蚂蚁概念, REITs概念, 化债(AMC)概念, 创投, 参股期货]
         core_representatives:
           - {symbol: SH.601398, name: 工商银行, relation: 大型银行链主, source_note: 金融链主代表, priority: 100}
           - {symbol: SH.601211, name: 国泰君安, relation: 券商链主, source_note: 金融链主代表, priority: 92}
@@ -510,14 +565,14 @@ chains:
 
   - chain_id: real_estate_infra
     name: 地产基建产业链
-    aliases: [地产, 房地产, 物业, 建筑, 基建, 水泥, 装配式建筑, 城中村, 雄安新区, 水利建设, 京津冀, 上海本地, 深圳本地, 海南自贸, 自贸区]
+    aliases: [地产, 房地产, 物业, 建筑, 基建, 工程建设, 地下管网, 水泥, 装配式建筑, 装配建筑, 城中村, 新型城镇化, 房屋检测, 智慧灯杆, 海绵城市, 租售同权, 雄安新区, 水利建设, PPP模式, 京津冀, 上海本地, 深圳本地, 海南自贸, 自贸区]
     industries: [房地产开发, 房地产服务, 建筑装饰, 建筑材料, 钢铁]
     default_node_id: infra_property
     nodes:
       - node_id: infra_property
         name: 地产/基建/建材
         layer: downstream
-        keywords: [地产, 房地产, 物业, 建筑, 基建, 水泥, 装配式建筑, 城中村, 雄安新区, 水利建设, 京津冀, 上海本地, 深圳本地, 海南自贸, 自贸区]
+        keywords: [地产, 房地产, 物业, 建筑, 基建, 工程建设, 地下管网, 水泥, 装配式建筑, 装配建筑, 城中村, 新型城镇化, 房屋检测, 智慧灯杆, 海绵城市, 租售同权, 雄安新区, 水利建设, PPP模式, 京津冀, 上海本地, 深圳本地, 海南自贸, 自贸区]
         core_representatives:
           - {symbol: SZ.000002, name: 万科A, relation: 房地产开发链主, source_note: 地产基建链主代表, priority: 100}
           - {symbol: SH.601668, name: 中国建筑, relation: 建筑装饰链主, source_note: 地产基建链主代表, priority: 94}
@@ -527,14 +582,14 @@ chains:
 
   - chain_id: consumer
     name: 消费品产业链
-    aliases: [消费, 白酒, 啤酒, 食品, 饮料, 乳品, 预制菜, 零售, 免税, 奢侈品, 婴童概念, 电商概念]
-    industries: [白酒, 啤酒, 饮料乳品, 食品加工制造, 旅游景区, 酒店餐饮]
+    aliases: [消费, 白酒, 啤酒, 食品, 饮料, 乳品, 乳业, 调味品概念, 酿酒概念, 预制菜, 零售, 新零售, 免税, 退税商店, 首发经济, 奢侈品, 化妆品, 化妆品概念, 婴童概念, 电商概念, 拼多多概念, 社区团购, 谷子经济, C2M概念, 人造肉, 代糖概念, 共享经济, 内贸流通, 地摊经济, 宠物经济, 盲盒经济, 网红经济, 电子烟, 味蕾经济, 冰雪经济]
+    industries: [白酒, 啤酒, 饮料乳品, 食品加工制造, 化妆品, 品牌化妆品, 化妆品制造及其他, 旅游景区, 酒店餐饮]
     default_node_id: consumer_goods
     nodes:
       - node_id: consumer_goods
         name: 白酒/食品饮料
         layer: terminal
-        keywords: [消费, 白酒, 啤酒, 食品, 饮料, 乳品, 预制菜, 零售, 免税, 奢侈品, 婴童概念, 电商概念]
+        keywords: [消费, 白酒, 啤酒, 食品, 饮料, 乳品, 乳业, 调味品概念, 酿酒概念, 预制菜, 零售, 新零售, 免税, 退税商店, 首发经济, 奢侈品, 化妆品, 化妆品概念, 婴童概念, 电商概念, 拼多多概念, 社区团购, 谷子经济, C2M概念, 人造肉, 代糖概念, 共享经济, 内贸流通, 地摊经济, 宠物经济, 盲盒经济, 网红经济, 电子烟, 味蕾经济, 冰雪经济]
         core_representatives:
           - {symbol: SH.600519, name: 贵州茅台, relation: 高端白酒链主, source_note: 消费链主代表, priority: 100}
           - {symbol: SH.600887, name: 伊利股份, relation: 饮料乳品链主, source_note: 消费链主代表, priority: 90}
@@ -544,14 +599,14 @@ chains:
 
   - chain_id: agriculture
     name: 农业养殖产业链
-    aliases: [农业, 种业, 转基因, 养殖, 猪肉, 鸡肉, 水产, 粮食安全, 乡村振兴, 土地流转, 生物育种, 草甘膦]
-    industries: [种植业与林业, 养殖业, 水产, 农化制品]
+    aliases: [农业, 种业, 转基因, 养殖, 猪肉, 鸡肉, 水产, 粮食安全, 粮食概念, 乡村振兴, 土地流转, 生物育种, 供销社概念]
+    industries: [种植业与林业, 养殖业, 水产, 农产品加工, 其他农产品加工, 农用机械, 动物保健, 动物保健Ⅱ, 动物保健Ⅲ, 农化制品]
     default_node_id: farming
     nodes:
       - node_id: farming
         name: 种业/养殖
         layer: upstream
-        keywords: [农业, 种业, 转基因, 养殖, 猪肉, 鸡肉, 水产, 粮食安全, 乡村振兴, 土地流转, 生物育种, 草甘膦]
+        keywords: [农业, 种业, 转基因, 养殖, 猪肉, 鸡肉, 水产, 粮食安全, 粮食概念, 乡村振兴, 土地流转, 生物育种, 供销社概念]
         core_representatives:
           - {symbol: SZ.000998, name: 隆平高科, relation: 种植业/种业链主, source_note: 农业链主代表, priority: 100}
           - {symbol: SZ.002714, name: 牧原股份, relation: 猪肉/生猪养殖链主, source_note: 农业链主代表, priority: 94}
@@ -561,14 +616,14 @@ chains:
 
   - chain_id: transport
     name: 交通运输产业链
-    aliases: [航空, 航运, 港口, 物流, 铁路, 快递, 跨境物流]
-    industries: [航空运输, 航运港口, 轨道交通装备]
+    aliases: [航空, 航运, 港口, 物流, 铁路, 快递, 跨境物流, 交通运输, 公交, 公路货运, 交运设备, 磁悬浮概念, 海洋经济]
+    industries: [航空运输, 航运港口, 轨道交通装备, 交通运输, 公交, 公路货运]
     default_node_id: transport_core
     nodes:
       - node_id: transport_core
         name: 航空/航运/轨交
         layer: terminal
-        keywords: [航空, 航运, 港口, 物流, 铁路, 快递, 跨境物流]
+        keywords: [航空, 航运, 港口, 物流, 铁路, 快递, 跨境物流, 交通运输, 公交, 公路货运, 交运设备, 磁悬浮概念, 海洋经济]
         core_representatives:
           - {symbol: SH.600029, name: 南方航空, relation: 航空运输链主, source_note: 交运链主代表, priority: 100}
           - {symbol: SH.601919, name: 中远海控, relation: 航运港口链主, source_note: 交运链主代表, priority: 96}
@@ -577,14 +632,14 @@ chains:
 
   - chain_id: media_tourism
     name: 传媒旅游产业链
-    aliases: [游戏, 传媒, 影视, 短剧, 文旅, 旅游, 酒店, 教育, 广告, 文化振兴, 体育概念, 博彩概念, 迪士尼]
-    industries: [游戏, 影视院线, 广告营销, 教育, 旅游景区, 酒店餐饮]
+    aliases: [游戏, 传媒, 影视, 短剧, 文旅, 旅游, 酒店, 教育, 广告, 文化振兴, 体育概念, 博彩概念, 电子竞技, 知识产权, 超清视频, 迪士尼, 小红书概念, 快手概念, 抖音概念(字节概念), 彩票概念, 户外露营]
+    industries: [游戏, 影视院线, 广告营销, 教育, 旅游景区, 酒店餐饮, 出版, 大众出版, 图片媒体, 其他数字媒体]
     default_node_id: media_content
     nodes:
       - node_id: media_content
         name: 游戏/影视/文旅
         layer: terminal
-        keywords: [游戏, 传媒, 影视, 短剧, 文旅, 旅游, 酒店, 教育, 广告, 文化振兴, 体育概念, 博彩概念, 迪士尼]
+        keywords: [游戏, 传媒, 影视, 短剧, 文旅, 旅游, 酒店, 教育, 广告, 文化振兴, 体育概念, 博彩概念, 电子竞技, 知识产权, 超清视频, 迪士尼, 小红书概念, 快手概念, 抖音概念(字节概念), 彩票概念, 户外露营]
         core_representatives:
           - {symbol: SZ.002602, name: 世纪华通, relation: 游戏链主, source_note: 传媒链主代表, priority: 100}
           - {symbol: SZ.300251, name: 光线传媒, relation: 影视院线链主, source_note: 传媒链主代表, priority: 90}
@@ -594,14 +649,14 @@ chains:
 
   - chain_id: environmental
     name: 环保公用产业链
-    aliases: [环保, 污水处理, 固废, 水务, 碳中和, 节能环保, 核污防治, 碳交易, 垃圾分类, 低碳经济, 海水淡化, 空气治理, 循环经济]
+    aliases: [环保, 污水处理, 固废, 水务, 碳中和, 节能环保, 核污防治, 核污染防治, 碳交易, 垃圾分类, 低碳经济, 海水淡化, 空气治理, 循环经济, 汽车拆解, 医废处理, 噪声防治, 净水概念, 土壤修复, 尾气治理]
     industries: [环保设备, 环保服务, 水务, 电力]
     default_node_id: environmental_service
     nodes:
       - node_id: environmental_service
         name: 环保/水务
         layer: downstream
-        keywords: [环保, 污水处理, 固废, 水务, 碳中和, 节能环保, 核污防治, 碳交易, 垃圾分类, 低碳经济, 海水淡化, 空气治理, 循环经济]
+        keywords: [环保, 污水处理, 固废, 水务, 碳中和, 节能环保, 核污防治, 核污染防治, 碳交易, 垃圾分类, 低碳经济, 海水淡化, 空气治理, 循环经济, 汽车拆解, 医废处理, 噪声防治, 净水概念, 土壤修复, 尾气治理]
         core_representatives:
           - {symbol: SZ.300070, name: 碧水源, relation: 环保设备/水处理链主, source_note: 环保链主代表, priority: 100}
           - {symbol: SH.600323, name: 瀚蓝环境, relation: 水务/环保服务链主, source_note: 环保链主代表, priority: 90}
@@ -610,14 +665,14 @@ chains:
 
   - chain_id: textile_light
     name: 纺织轻工产业链
-    aliases: [纺织, 服装, 运动服装, 造纸, 包装, 家居, 轻工]
-    industries: [纺织制造, 运动服装, 造纸印刷, 塑料]
+    aliases: [纺织, 服装, 运动服装, 抗菌面料, 造纸, 包装, 家居, 轻工]
+    industries: [纺织制造, 运动服装, 造纸印刷, 印刷, 印染, 大宗用纸, 塑料, 其他饰品, 娱乐用品]
     default_node_id: textile_light_core
     nodes:
       - node_id: textile_light_core
         name: 纺织/轻工
         layer: downstream
-        keywords: [纺织, 服装, 运动服装, 造纸, 包装, 家居, 轻工]
+        keywords: [纺织, 服装, 运动服装, 抗菌面料, 造纸, 包装, 家居, 轻工]
         core_representatives:
           - {symbol: SH.600156, name: 华升股份, relation: 纺织制造代表, source_note: 纺织轻工链主代表, priority: 86}
           - {symbol: SZ.000488, name: 晨鸣纸业, relation: 造纸印刷代表, source_note: 纺织轻工链主代表, priority: 84}
@@ -626,14 +681,14 @@ chains:
 
   - chain_id: home_appliance
     name: 家电家居产业链
-    aliases: [家电, 家用电器, 智能家居, 照明, 小家电]
-    industries: [家用电器, 照明设备, 消费电子]
+    aliases: [家电, 家用电器, 智能家居, 照明, 小家电, 空气能热泵]
+    industries: [家用电器, 照明设备, 消费电子, 冰洗, 厨房电器, 厨卫电器, 卫浴电器, 卫浴制品, 制冷空调设备]
     default_node_id: appliance
     nodes:
       - node_id: appliance
         name: 家电/照明
         layer: terminal
-        keywords: [家电, 家用电器, 智能家居, 照明, 小家电]
+        keywords: [家电, 家用电器, 智能家居, 照明, 小家电, 空气能热泵]
         core_representatives:
           - {symbol: SZ.000333, name: 美的集团, relation: 家用电器链主, source_note: 家电链主代表, priority: 100}
           - {symbol: SZ.000651, name: 格力电器, relation: 白电链主, source_note: 家电链主代表, priority: 92}

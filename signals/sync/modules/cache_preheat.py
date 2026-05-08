@@ -32,11 +32,12 @@ def _load_json(path: Path):
 
 def _freq_from_name(freq: str) -> str:
     return {
-        "daily": "daily",
-        "weekly": "weekly",
-        "monthly": "monthly",
-        "15m": "15m",
-        "30m": "30m",
+        "daily": "日线",
+        "weekly": "周线",
+        "monthly": "月线",
+        "5m": "5分钟",
+        "15m": "15分钟",
+        "30m": "30分钟",
     }.get(freq, freq)
 
 

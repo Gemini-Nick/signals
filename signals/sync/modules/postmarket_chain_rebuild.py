@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -18,6 +19,8 @@ from typing import Any
 from pymongo import UpdateOne
 from pymongo.database import Database
 
+from signals.core.chain_ai_mapping import decide_chain_mapping
+from signals.core.chain_mapping_rules import filter_mapping_matches, matches_from_ai_decision
 from signals.core.concept_carriers import load_industry_chains, match_industry_chains, non_chain_reason
 from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import trading_day_key
@@ -360,7 +363,64 @@ def _constituent_doc(db: Database, *, kind: str, name: str) -> dict[str, Any]:
     ) or {}
 
 
-def _mapping_doc(catalog: dict[str, Any], *, trade_date: str, now: datetime) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def _ai_scope() -> str:
+    scope = _text(os.getenv("SIGNALS_CHAIN_AI_SCOPE") or "ambiguous").lower()
+    return scope if scope in {"off", "ambiguous", "all"} else "ambiguous"
+
+
+def _industry_only_evidence(match: dict[str, Any]) -> bool:
+    sources = {_text(item) for item in match.get("evidence_sources") or [] if _text(item)}
+    return sources == {"industry"}
+
+
+def _should_call_ai(
+    matches: list[dict[str, Any]],
+    rule_filtered: list[dict[str, Any]],
+    rule_reason: str,
+) -> bool:
+    scope = _ai_scope()
+    if scope == "off":
+        return False
+    if scope == "all":
+        return True
+    if rule_reason == "ambiguous_industry_only":
+        return True
+    if not rule_filtered:
+        return True
+    if len(rule_filtered) > 1:
+        return True
+    if len(matches) > 1 and any(_industry_only_evidence(match) for match in rule_filtered):
+        return True
+    if len(matches) > 1 and max(int(_float(match.get("confidence"))) for match in rule_filtered) < 90:
+        return True
+    return False
+
+
+def _resolve_mapping_matches(
+    db: Database,
+    source: dict[str, Any],
+    matches: list[dict[str, Any]],
+    *,
+    now: datetime,
+) -> tuple[list[dict[str, Any]], str]:
+    rule_filtered, rule_reason = filter_mapping_matches(matches)
+    if not _should_call_ai(matches, rule_filtered, rule_reason):
+        return rule_filtered, rule_reason
+
+    decision = decide_chain_mapping(db, source, matches, now=now)
+    status = decision.get("status")
+    if status == "mapped":
+        selected = matches_from_ai_decision(matches, decision)
+        if selected:
+            return selected, "ai_mapped"
+    if status in {"unmapped", "ambiguous"}:
+        return [], f"ai_{status}"
+    if status == "error":
+        return rule_filtered, f"ai_error_fallback_{rule_reason}"
+    return rule_filtered, rule_reason
+
+
+def _mapping_doc(db: Database, catalog: dict[str, Any], *, trade_date: str, now: datetime) -> tuple[dict[str, Any], dict[str, Any] | None]:
     name = _text(catalog.get("canonical_name") or catalog.get("raw_name"))
     base = {
         "_id": f"{trade_date}:{catalog.get('source_board_id')}",
@@ -382,9 +442,31 @@ def _mapping_doc(catalog: dict[str, Any], *, trade_date: str, now: datetime) -> 
     matches = match_industry_chains(name)
     if not matches:
         return {**base, "mapping_status": "unmapped", "confidence": 0, "evidence_sources": []}, None
-    best = matches[0]
-    confidence = int(best.get("confidence") or 0)
-    status = "mapped" if confidence >= MAPPING_CONFIDENCE_THRESHOLD else "low_confidence"
+    initial_best = matches[0]
+    initial_confidence = int(initial_best.get("confidence") or 0)
+    if initial_confidence < MAPPING_CONFIDENCE_THRESHOLD:
+        best = initial_best
+        confidence = initial_confidence
+        status = "low_confidence"
+        filter_reason = "below_threshold"
+    else:
+        source = {
+            "kind": catalog.get("kind"),
+            "name": name,
+            "code": catalog.get("source_board_id"),
+        }
+        matches, filter_reason = _resolve_mapping_matches(
+            db,
+            source,
+            [item for item in matches if int(item.get("confidence") or 0) >= MAPPING_CONFIDENCE_THRESHOLD],
+            now=now,
+        )
+        if not matches:
+            status = "ambiguous" if "ambiguous" in filter_reason else "unmapped"
+            return {**base, "mapping_status": status, "confidence": 0, "mapping_filter_reason": filter_reason, "evidence_sources": []}, None
+        best = matches[0]
+        confidence = int(best.get("confidence") or 0)
+        status = "mapped"
     doc = {
         **base,
         "mapping_status": status,
@@ -395,7 +477,10 @@ def _mapping_doc(catalog: dict[str, Any], *, trade_date: str, now: datetime) -> 
         "layer": best.get("layer"),
         "stage": best.get("stage"),
         "confidence": confidence,
-        "mapping_type": "semantic_taxonomy",
+        "ai_confidence": int(best.get("ai_confidence") or 0) if best.get("ai_confidence") is not None else None,
+        "ai_reason": _text(best.get("ai_reason")),
+        "mapping_type": "ai_rule_hybrid" if best.get("ai_confidence") is not None else "semantic_taxonomy",
+        "mapping_filter_reason": filter_reason,
         "hit_terms": best.get("hit_terms") or [],
         "evidence_sources": best.get("evidence_sources") or [],
     }
@@ -643,7 +728,7 @@ def sync_postmarket_chain_rebuild(db: Database, proxy_url: str = None) -> dict[s
     mapping_docs: list[dict[str, Any]] = []
     mapped_for_membership: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
     for item in catalog:
-        mapping, match = _mapping_doc(item, trade_date=trade_date, now=now)
+        mapping, match = _mapping_doc(db, item, trade_date=trade_date, now=now)
         mapping_docs.append(mapping)
         if match is not None:
             mapped_for_membership.append((item, mapping, match))

@@ -101,19 +101,37 @@ def _symbol_candidates(symbol: Optional[str]) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+def _bar_freq_priority(meta: object) -> int:
+    if not isinstance(meta, dict):
+        return 10
+    freq = str(meta.get("freq") or "").strip()
+    if freq in {"日线", "周线", "月线", "5分钟", "15分钟", "30分钟"}:
+        return 0
+    if freq in {"daily", "weekly", "monthly", "D", "W", "M", "1d", "1w", "1m", "5m", "15m", "30m", "5min", "15min", "30min"}:
+        return 1
+    return 5
+
+
 def _bars_df_from_docs(docs: list[dict], source: str) -> pd.DataFrame:
     if not docs:
         return pd.DataFrame()
     df = pd.DataFrame(docs)
     if "dt" not in df.columns:
         return pd.DataFrame()
-    latest_doc = max(
-        docs,
-        key=lambda item: pd.to_datetime(item.get("dt"), errors="coerce") if item.get("dt") is not None else pd.Timestamp.min,
-    )
-    latest_meta = latest_doc.get("meta") if isinstance(latest_doc.get("meta"), dict) else {}
     df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
-    df = df.dropna(subset=["dt"]).sort_values("dt").set_index("dt")
+    df = df.dropna(subset=["dt"])
+    if df.empty:
+        return pd.DataFrame()
+    df["_freq_priority"] = df["meta"].map(_bar_freq_priority) if "meta" in df.columns else 10
+    df["_row_order"] = range(len(df))
+    df = (
+        df.sort_values(["dt", "_freq_priority", "_row_order"])
+        .drop_duplicates(subset=["dt"], keep="first")
+        .sort_values("dt")
+    )
+    latest_row = df.loc[df["dt"].idxmax()]
+    latest_meta = latest_row.get("meta") if isinstance(latest_row.get("meta"), dict) else {}
+    df = df.set_index("dt")
     numeric_cols = ["open", "high", "low", "close", "vol", "amount", "prev_close", "change_pct", "pct_chg"]
     for col in numeric_cols:
         if col in df.columns:
@@ -292,6 +310,45 @@ def _read_source_snapshots(domain: str) -> tuple[pd.DataFrame, str, Optional[str
     return merged, "+".join(source_labels), max(dates) if dates else None
 
 
+def _read_heat_tick_snapshot(domain: str, target: str) -> tuple[pd.DataFrame, str, Optional[str]]:
+    kind = "concept" if domain == "concept" else "industry"
+    try:
+        from signals.data.mongo_fallback import get_db
+
+        db = get_db()
+        if db is None:
+            return pd.DataFrame(), "", None
+        base_query = {"kind": kind}
+        latest = None
+        if target:
+            latest = db["board_heat_ticks"].find_one(
+                {**base_query, "trade_date": target},
+                {"trade_minute": 1, "trade_date": 1},
+                sort=[("trade_minute", -1), ("snapshot_at", -1)],
+            )
+        if not latest:
+            latest = db["board_heat_ticks"].find_one(
+                base_query,
+                {"trade_minute": 1, "trade_date": 1},
+                sort=[("trade_minute", -1), ("snapshot_at", -1)],
+            )
+        trade_minute = (latest or {}).get("trade_minute")
+        if not trade_minute:
+            return pd.DataFrame(), "", None
+        docs = list(db["board_heat_ticks"].find(
+            {**base_query, "trade_minute": trade_minute},
+            {"_id": 0},
+        ).sort([("change_pct", -1), ("rank_idx", 1)]))
+    except Exception:
+        logger.debug("board heat tick snapshot read failed", exc_info=True)
+        return pd.DataFrame(), "", None
+    if not docs:
+        return pd.DataFrame(), "", None
+    df = _standardize_rank_df(pd.DataFrame(docs), domain)
+    as_of = str(docs[0].get("trade_date") or "")[:10] or _latest_as_of(df)
+    return df, "board_heat_ticks", as_of
+
+
 def _write_provider_health(provider: str, endpoint: str, domain: str,
                            ok: bool, latency_ms: float, error: str = ""):
     try:
@@ -407,6 +464,24 @@ def _get_rank(request: DataRequest, domain: str) -> DataResponse:
             is_stale=True,
             latency_ms=_elapsed_ms(start),
             errors=["canonical_empty"],
+        )
+
+    snapshot, source, as_of = _read_heat_tick_snapshot(domain, target)
+    if not snapshot.empty:
+        target_stale = bool(as_of and as_of < target)
+        _write_data_freshness(
+            domain, mode, source, as_of,
+            "older_than_request" if target_stale else "",
+        )
+        return DataResponse(
+            data=snapshot,
+            mode_used=mode,
+            source=source,
+            as_of=as_of,
+            freshness="stale" if target_stale else "fresh",
+            is_stale=target_stale,
+            latency_ms=_elapsed_ms(start),
+            errors=errors,
         )
 
     snapshot, source, as_of = _read_source_snapshots(domain)

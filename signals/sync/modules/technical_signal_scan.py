@@ -52,6 +52,30 @@ FREQ_ORDER = {
 }
 
 
+def _bar_freq_priority(meta: object) -> int:
+    if not isinstance(meta, dict):
+        return 10
+    freq = str(meta.get("freq") or "").strip()
+    if freq in {"周线", "日线", "30分钟", "15分钟", "5分钟"}:
+        return 0
+    if freq in {"weekly", "1w", "W", "daily", "1d", "D", "30min", "30m", "F30", "15min", "15m", "F15", "5min", "5m", "F5"}:
+        return 1
+    return 5
+
+
+def _dedupe_bar_docs_by_dt(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    best: dict[datetime, tuple[tuple[int, int], dict[str, Any]]] = {}
+    for idx, doc in enumerate(docs):
+        dt = pd.to_datetime(doc.get("dt"), errors="coerce")
+        if pd.isna(dt):
+            continue
+        key = dt.to_pydatetime()
+        score = (_bar_freq_priority(doc.get("meta")), idx)
+        if key not in best or score < best[key][0]:
+            best[key] = (score, doc)
+    return [item[1] for _, item in sorted(best.items(), key=lambda item: item[0], reverse=True)]
+
+
 def _env_text(name: str, default: str = "") -> str:
     return str(get_task_env(name, os.getenv(name, default)) or default).strip()
 
@@ -372,10 +396,12 @@ def _resampled_5m_docs(db: Database, symbol: str, label: str, *, limit: int) -> 
 
 
 def _load_bars(db: Database, symbol: str, freq_values: list[str], freq, *, limit: int, label: str = "", resample_intraday: bool = False) -> list[Any]:
+    fetch_limit = limit * 2 if len(freq_values) > 1 else limit
     docs = list(db["bars"].find(
         {"meta.symbol": {"$in": _symbol_query_values(symbol)}, "meta.freq": {"$in": freq_values}},
         {"_id": 0, "dt": 1, "meta": 1, "open": 1, "high": 1, "low": 1, "close": 1, "vol": 1, "amount": 1},
-    ).sort("dt", -1).limit(limit))
+    ).sort("dt", -1).limit(fetch_limit))
+    docs = _dedupe_bar_docs_by_dt(docs)[:limit]
     if resample_intraday and label in {"15分钟", "30分钟"}:
         resampled = _resampled_5m_docs(db, symbol, label, limit=limit)
         if resampled and (_latest_doc_dt(resampled) or datetime.min) > (_latest_doc_dt(docs) or datetime.min):
@@ -471,6 +497,98 @@ def _resonance_context(events: list[Any], *, side: str, primary_freq: str, direc
     }
 
 
+def _rolling_ma(closes: list[float], period: int) -> float | None:
+    if len(closes) < period:
+        return None
+    return sum(closes[-period:]) / period
+
+
+def _ma_direction(closes: list[float], period: int) -> str:
+    current = _rolling_ma(closes, period)
+    previous = _rolling_ma(closes[:-3], period) if len(closes) >= period + 3 else None
+    if current is None or previous in (None, 0):
+        return "未知"
+    slope_pct = (current - previous) / previous * 100
+    if abs(slope_pct) < 0.2:
+        return "走平"
+    return "向上" if slope_pct > 0 else "向下"
+
+
+def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
+    closes = [float(getattr(bar, "close", 0) or 0) for bar in bars if float(getattr(bar, "close", 0) or 0) > 0]
+    if len(closes) < 5:
+        return {}
+    latest = closes[-1]
+    previous_close = closes[-2] if len(closes) >= 2 else None
+    score = 0.0
+    above_count = 0
+    reclaim_count = 0
+    out: dict[str, Any] = {
+        "latest_close": round(latest, 3),
+    }
+    stand_weights = {5: 6.0, 10: 10.0, 20: 16.0}
+    reclaim_weights = {5: 4.0, 10: 7.0, 20: 11.0}
+    for period in (5, 10, 20):
+        ma_value = _rolling_ma(closes, period)
+        if ma_value is None:
+            continue
+        previous_ma = _rolling_ma(closes[:-1], period) if len(closes) > period else None
+        distance_pct = (latest - ma_value) / ma_value * 100 if ma_value else 0.0
+        above = latest >= ma_value
+        near = abs(distance_pct) <= 1.0
+        reclaim = bool(previous_close is not None and previous_ma is not None and previous_close < previous_ma and above)
+        out[f"ma{period}"] = round(ma_value, 3)
+        out[f"above_ma{period}"] = above
+        out[f"near_ma{period}"] = near
+        out[f"reclaim_ma{period}"] = reclaim
+        out[f"distance_ma{period}_pct"] = round(distance_pct, 3)
+        if above:
+            above_count += 1
+            score += stand_weights[period]
+        elif near:
+            score += stand_weights[period] * 0.5
+        if reclaim:
+            reclaim_count += 1
+            score += reclaim_weights[period]
+    ma5 = out.get("ma5")
+    ma10 = out.get("ma10")
+    ma20 = out.get("ma20")
+    if ma5 and ma10 and ma20:
+        if ma5 >= ma10 >= ma20:
+            out["ma_stack"] = "bullish"
+            score += 8.0
+        elif ma5 <= ma10 <= ma20:
+            out["ma_stack"] = "bearish"
+            score -= 6.0
+        else:
+            out["ma_stack"] = "mixed"
+    direction = _ma_direction(closes, 20)
+    out["ma20_direction"] = direction
+    if direction == "向上":
+        score += 4.0
+    elif direction == "走平":
+        score += 1.0
+    elif direction == "向下":
+        score -= 4.0
+    tags: list[str] = []
+    if out.get("above_ma20"):
+        tags.append("站上20日线")
+    if out.get("above_ma10"):
+        tags.append("站上10日线")
+    if out.get("above_ma5"):
+        tags.append("站上5日线")
+    if reclaim_count:
+        tags.append("重新站上均线")
+    if out.get("ma_stack") == "bullish":
+        tags.append("均线多头")
+    out["above_count"] = above_count
+    out["reclaim_count"] = reclaim_count
+    out["score"] = round(max(0.0, min(60.0, score)), 3)
+    out["summary"] = " / ".join(tags[:5]) if tags else "均线未确认"
+    out["tags"] = tags[:6]
+    return out
+
+
 def _details_dict(details: str) -> dict[str, Any]:
     if not details:
         return {}
@@ -485,8 +603,10 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
 
     market = _symbol_market(symbol)
     resample_intraday = scan_scope == INTRADAY_SCAN_SCOPE and market == "A"
+    daily_bars = _load_bars(db, symbol, DAILY_FREQS, Freq.D, limit=360, label="日线")
+    ma_alignment = _ma_alignment_from_daily_bars(daily_bars)
     bars_by_freq: list[tuple[str, Any, list[Any], int]] = [
-        ("日线", Freq.D, _load_bars(db, symbol, DAILY_FREQS, Freq.D, limit=360, label="日线"), 200),
+        ("日线", Freq.D, daily_bars, 200),
         ("周线", Freq.W, _load_bars(db, symbol, WEEKLY_FREQS, Freq.W, limit=180, label="周线"), 100),
         ("30分钟", Freq.F30, _load_bars(db, symbol, MINUTE_FREQS["30分钟"], Freq.F30, limit=260, label="30分钟", resample_intraday=resample_intraday), 80),
         ("15分钟", Freq.F15, _load_bars(db, symbol, MINUTE_FREQS["15分钟"], Freq.F15, limit=260, label="15分钟", resample_intraday=resample_intraday), 80),
@@ -543,6 +663,7 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
             "confidence": float(event.confidence or 0),
             "resonance_freqs": buy_freqs if side == "buy" else sell_freqs,
             "resonance_context": resonance_context,
+            "ma_alignment": ma_alignment,
             "technical_evidence": {
                 "signal_type": event.signal_type,
                 "freq": event.freq,
@@ -551,6 +672,7 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
                 "bi_counts": bi_counts,
                 "direction": scored.direction,
                 "resonance_context": resonance_context,
+                "ma_alignment": ma_alignment,
             },
             "invalidates_when": "跌破信号触发价或上级周期转弱" if side == "buy" else "重新站回风险触发周期并出现买点确认",
             "source": "sync.technical_signal_scan",

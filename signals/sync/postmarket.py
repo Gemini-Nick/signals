@@ -289,6 +289,22 @@ def _postmarket_trade_date(now: datetime | None = None) -> str:
             return local.date().isoformat()
 
 
+def _previous_trading_date(now: datetime | None = None) -> str:
+    local = _local_bj(now)
+    d = local.date() - timedelta(days=1)
+    try:
+        from signals.core.calendar.engine import get_calendar
+
+        cal = get_calendar()
+        while not cal.is_trading_day("SSE", d):
+            d -= timedelta(days=1)
+        return d.isoformat()
+    except Exception:
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d.isoformat()
+
+
 def _coerce_dt(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value.replace(tzinfo=None) if value.tzinfo else value
@@ -395,11 +411,15 @@ def _stock_daily_dependency_ok(task_doc: dict[str, Any]) -> bool:
     deferred = _result_number(task_doc, "deferred")
     coverage_pct = _result_number(task_doc, "coverage_pct")
     min_coverage = _env_float("SIGNALS_POSTMARKET_STOCK_DAILY_PARTIAL_MIN_COVERAGE", 40.0)
+    max_errors = _env_int("SIGNALS_POSTMARKET_STOCK_DAILY_PARTIAL_MAX_ERRORS", 25, minimum=0)
+    max_error_pct = _env_float("SIGNALS_POSTMARKET_STOCK_DAILY_PARTIAL_MAX_ERROR_PCT", 6.0)
     processed_all = bool(total > 0 and processed >= total)
     progress_done = bool(progress_pct >= 99.9)
+    error_pct = (errors / total * 100.0) if total > 0 else 0.0
+    sparse_errors_ok = bool(errors <= max_errors and error_pct <= max_error_pct)
     if status == "degraded" and (result_status != "ok" or deferred > 0):
         return False
-    return errors == 0 and (processed_all or progress_done) and coverage_pct >= min_coverage
+    return sparse_errors_ok and (processed_all or progress_done) and coverage_pct >= min_coverage
 
 
 def _dependency_status_ok(task_doc: dict[str, Any]) -> bool:
@@ -695,13 +715,85 @@ class PostmarketRunner:
     def _phase_specs(self, phase: str) -> list[PostmarketTaskSpec]:
         return [task for task in POSTMARKET_TASKS if task.phase == phase]
 
+    def _has_retryable_incomplete_tasks(self, run_id: str, *, include_optional: bool = False) -> bool:
+        blocking_task_keys = {task.task_key for task in POSTMARKET_TASKS if task.blocks_run}
+        for doc in self.db["sync_tasks"].find({"run_id": run_id}, {"task_key": 1, "status": 1}):
+            if not include_optional and str(doc.get("task_key") or "") not in blocking_task_keys:
+                continue
+            status = str(doc.get("status") or "pending")
+            if status in RETRYABLE_TASK_STATUSES and not _task_effectively_done(doc):
+                return True
+        return False
+
+    def _minute_preheat_pending_count(self, trade_date: str) -> int:
+        try:
+            rows = self.db["minute_preheat_universe"].find({"trade_date": trade_date}, {"status": 1})
+        except Exception:
+            return 0
+        return sum(1 for row in rows if str(row.get("status") or "pending") in {"pending", "error", "stale"})
+
+    def _continue_minute_preheat_universe(self, trade_date: str, run_id: str) -> int:
+        if not _env_bool("SIGNALS_POSTMARKET_CONTINUE_MINUTE_PREHEAT", True):
+            return 0
+        before = self._minute_preheat_pending_count(trade_date)
+        if before <= 0 or "stock_minute" not in self.engine.module_map:
+            return 0
+
+        spec = next(
+            (task for task in POSTMARKET_TASKS if task.module == "stock_minute" and task.shard_key == "all"),
+            None,
+        )
+        env = dict(spec.env if spec else {})
+        env.setdefault("STOCK_MINUTE_SCOPE", "postmarket_candidates")
+        env.setdefault("STOCK_MINUTE_FREQS", "5min,15min")
+        env.setdefault("STOCK_MINUTE_POSTMARKET_MAX_CODES", "240")
+        env.setdefault("STOCK_MINUTE_WORKERS", "6")
+        env.setdefault("STOCK_MINUTE_CALL_INTERVAL", "0.15")
+        continue_cap = os.getenv("SIGNALS_POSTMARKET_CONTINUE_MINUTE_MAX_CODES")
+        if continue_cap:
+            env["STOCK_MINUTE_POSTMARKET_MAX_CODES"] = continue_cap
+
+        batches = _env_int("SIGNALS_POSTMARKET_CONTINUE_MINUTE_BATCHES", 1, minimum=1)
+        fn, _schedule = self.engine.module_map["stock_minute"]
+        completed = 0
+        for batch in range(batches):
+            pending_before = self._minute_preheat_pending_count(trade_date)
+            if pending_before <= 0:
+                break
+            logger.info(
+                "postmarket continue minute preheat run=%s batch=%d pending=%d",
+                run_id,
+                batch + 1,
+                pending_before,
+            )
+            with self._with_env(env):
+                self.engine.run_module("stock_minute", fn, plan=LANE_MAINTENANCE_PLANS.get("stock_minute"))
+            pending_after = self._minute_preheat_pending_count(trade_date)
+            completed += max(0, pending_before - pending_after)
+            self.db["sync_runs"].update_one(
+                {"_id": run_id},
+                {"$set": {
+                    "minute_preheat_pending": pending_after,
+                    "minute_preheat_continued_at": _naive_bj(),
+                    "updated_at": _naive_bj(),
+                }},
+                upsert=True,
+            )
+            if pending_after <= 0 or pending_after >= pending_before:
+                break
+        return completed
+
     def run_once(self, *, resume_run_id: str | None = None, trade_date: str | None = None, force: bool = False) -> dict[str, Any]:
         trade_date = trade_date or _postmarket_trade_date()
         run_id = resume_run_id or default_run_id(trade_date)
         run_doc = self.db["sync_runs"].find_one({"_id": run_id}) or {}
         if run_doc.get("trade_date"):
             trade_date = str(run_doc["trade_date"])
-        if run_doc.get("status") in RUN_TERMINAL_STATUSES and not force:
+        continue_terminal_optional = (
+            _env_bool("SIGNALS_POSTMARKET_RUN_OPTIONAL_TASKS", False)
+            and self._has_retryable_incomplete_tasks(run_id, include_optional=True)
+        )
+        if run_doc.get("status") in RUN_TERMINAL_STATUSES and not force and not continue_terminal_optional:
             return {"run_id": run_id, "trade_date": trade_date, "status": run_doc.get("status"), "skipped": True}
 
         self._init_run(run_id, trade_date)
@@ -825,6 +917,28 @@ class PostmarketRunner:
         current = _local_bj(now).time()
         return start <= current <= end
 
+    @staticmethod
+    def should_catchup_now(now: datetime | None = None) -> bool:
+        if not _env_bool("SIGNALS_POSTMARKET_CATCHUP_ENABLED", True):
+            return False
+        start = _parse_hm(os.getenv("SIGNALS_POSTMARKET_CATCHUP_START_TIME", "00:00"), dt_time(0, 0))
+        end = _parse_hm(os.getenv("SIGNALS_POSTMARKET_CATCHUP_END_TIME", "15:00"), dt_time(15, 0))
+        current = _local_bj(now).time()
+        if start <= end:
+            return start <= current <= end
+        return current >= start or current <= end
+
+    def catchup_target(self, now: datetime | None = None) -> tuple[str, str, str] | None:
+        if not self.should_catchup_now(now):
+            return None
+        trade_date = _previous_trading_date(now)
+        run_id = default_run_id(trade_date)
+        run_doc = self.db["sync_runs"].find_one({"_id": run_id}, {"status": 1, "trade_date": 1}) or {}
+        status = str(run_doc.get("status") or "missing")
+        if status in RUN_TERMINAL_STATUSES:
+            return None
+        return run_id, trade_date, status
+
     def run_daemon(self, *, check_seconds: int | None = None) -> None:
         check_seconds = check_seconds or _env_int("SIGNALS_POSTMARKET_CHECK_SECONDS", 300, minimum=30)
         logger.info("postmarket daemon started workers=%d check_seconds=%d", self.max_workers, check_seconds)
@@ -838,4 +952,19 @@ class PostmarketRunner:
                 if status not in RUN_TERMINAL_STATUSES or _env_bool("SIGNALS_POSTMARKET_FORCE", False):
                     logger.info("postmarket trigger run=%s previous_status=%s", run_id, status or "missing")
                     self.run_once(trade_date=trade_date, force=_env_bool("SIGNALS_POSTMARKET_FORCE", False))
+                else:
+                    self._continue_minute_preheat_universe(trade_date, run_id)
+                    if (
+                        _env_bool("SIGNALS_POSTMARKET_CONTINUE_OPTIONAL_TASKS", True)
+                        and self._has_retryable_incomplete_tasks(run_id, include_optional=True)
+                    ):
+                        logger.info("postmarket continue optional tasks run=%s", run_id)
+                        with self._with_env({"SIGNALS_POSTMARKET_RUN_OPTIONAL_TASKS": "true"}):
+                            self.run_once(resume_run_id=run_id, trade_date=trade_date)
+            else:
+                target = self.catchup_target(now)
+                if target:
+                    run_id, trade_date, status = target
+                    logger.info("postmarket catchup trigger run=%s previous_status=%s", run_id, status)
+                    self.run_once(resume_run_id=run_id, trade_date=trade_date)
             time.sleep(check_seconds)

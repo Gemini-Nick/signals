@@ -58,6 +58,11 @@ async function wbApiFetch(path) {
   return data;
 }
 
+function wbSetBacktestReportButtons(enabled) {
+  document.getElementById('wb-backtest-html').disabled = !enabled;
+  document.getElementById('wb-backtest-pdf').disabled = !enabled;
+}
+
 function wbFormatNumber(value, digits = 2) {
   if (value == null || Number.isNaN(Number(value))) return '—';
   return Number(value).toFixed(digits);
@@ -126,7 +131,8 @@ function wbSetSession(session) {
   const badge = document.getElementById('wb-session-badge');
   const meta = document.getElementById('wb-session-meta');
   badge.className = 'wb-session-badge';
-  badge.classList.add(session.ready ? (session.a_live || session.hk_live || session.us_live ? 'live' : '') : 'loading');
+  const statusClass = session.ready ? (session.a_live || session.hk_live || session.us_live ? 'live' : null) : 'loading';
+  if (statusClass) badge.classList.add(statusClass);
   badge.textContent = session.label || (session.ready ? '已就绪' : '加载中');
   meta.textContent = session.error
     ? session.error
@@ -337,7 +343,7 @@ function wbRenderRisks(symbolData) {
   if (summary.style_switch) risks.push(summary.style_switch);
   if (symbolData.review?.error) risks.push(symbolData.review.error);
   if (!risks.length) {
-    el.innerHTML = wbEmpty('暂无显式风险提示');
+    el.innerHTML = wbEmpty('暂无额外失效条件');
     return;
   }
   el.innerHTML = risks.map(text => `<div class="wb-risk-item"><div class="wb-risk-text">${wbEscapeHtml(text)}</div></div>`).join('');
@@ -763,10 +769,12 @@ function wbRenderBacktestEmpty(message) {
   document.getElementById('wb-sim-kpis').innerHTML = '';
   document.getElementById('wb-backtest-config').textContent = '';
   document.getElementById('wb-backtest-signals').innerHTML = `<tr><td colspan="5">${wbEscapeHtml(message)}</td></tr>`;
+  wbSetBacktestReportButtons(false);
 }
 
 function wbRenderBacktest(backtest) {
   document.getElementById('wb-backtest-target').textContent = `${backtest.target?.symbol || ''} · ${backtest.target?.effective_freq || ''}`;
+  wbSetBacktestReportButtons(true);
   const kpiEl = document.getElementById('wb-backtest-kpis');
   const simEl = document.getElementById('wb-sim-kpis');
   const configEl = document.getElementById('wb-backtest-config');
@@ -807,6 +815,49 @@ function wbRenderBacktest(backtest) {
       <td>${wbEscapeHtml(wbFormatNumber(item.confidence, 2))}</td>
     </tr>
   `).join('') : `<tr><td colspan="5">当前选区没有信号</td></tr>`;
+}
+
+async function wbDownloadBacktestReport(format) {
+  if (!WB_STATE.backtestData) {
+    wbShowToast('请先载入回测数据');
+    return;
+  }
+  const button = document.getElementById(`wb-backtest-${format}`);
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = '生成中';
+  try {
+    const res = await fetch(`/api/backtest/report?format=${encodeURIComponent(format)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(WB_STATE.backtestData),
+    });
+    if (!res.ok) {
+      let message = `${res.status} report`;
+      try {
+        const data = await res.json();
+        message = data.error || data.detail || message;
+      } catch (_) {}
+      throw new Error(message);
+    }
+    const blob = await res.blob();
+    const disposition = res.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename="([^"]+)"/);
+    const target = WB_STATE.backtestData.target?.code || WB_STATE.backtestData.code || 'unknown';
+    const filename = match ? match[1] : `backtest_${target}.${format}`;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+    wbShowToast(`${format.toUpperCase()} 报告已生成`);
+  } catch (error) {
+    wbShowToast(error.message || '报告生成失败', 3200);
+  } finally {
+    button.textContent = original;
+    button.disabled = !WB_STATE.backtestData;
+  }
 }
 
 function wbRenderTrades(trade) {
@@ -1005,6 +1056,8 @@ function wbSwitchTab(tab) {
 function wbBindEvents() {
   document.getElementById('wb-theme-toggle').addEventListener('click', wbToggleTheme);
   document.getElementById('wb-refresh-btn').addEventListener('click', wbRefreshAll);
+  document.getElementById('wb-backtest-html').addEventListener('click', () => wbDownloadBacktestReport('html'));
+  document.getElementById('wb-backtest-pdf').addEventListener('click', () => wbDownloadBacktestReport('pdf'));
   document.getElementById('wb-search-form').addEventListener('submit', event => {
     event.preventDefault();
     const value = document.getElementById('wb-search-input').value.trim();

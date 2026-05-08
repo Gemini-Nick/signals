@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from difflib import SequenceMatcher
 import threading
 import time
@@ -70,7 +71,7 @@ SECOND_SCREEN_LANES = {
     "workbench_lane": {
         "label": "工作台重算",
         "cadence": "10m",
-        "purpose": "主观察列表、候选池、风险预警和策略快照。",
+        "purpose": "主观察列表、候选池、暂不参与池和策略快照。",
     },
     "board_lane": {
         "label": "板块异动",
@@ -139,6 +140,8 @@ _SHELL_CACHE_TTL_SECONDS = 120.0
 _SHELL_CACHE_LOCK = threading.RLock()
 _SHELL_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None, "refreshed_at": 0.0, "quote_watermark": ""}
 _SHELL_QUOTE_REFRESH_GROUPS = ("indices", "watchlist", "buy_candidates", "sell_warnings")
+_VISIBLE_QUOTE_REFRESH_LOCK = threading.Lock()
+_VISIBLE_QUOTE_REFRESH_LAST: dict[str, float] = {}
 
 
 def _invalidate_shell_cache() -> None:
@@ -147,18 +150,40 @@ def _invalidate_shell_cache() -> None:
 
 
 def _quote_snapshot_watermark() -> str:
+    parts: list[str] = []
     try:
-        doc = _mongo_db()["quote_snapshots"].find_one(
+        db = _mongo_db()
+    except Exception:
+        return ""
+    try:
+        doc = db["quote_snapshots"].find_one(
             {"snapshot_at": {"$ne": None}},
             {"_id": 0, "snapshot_at": 1},
             sort=[("snapshot_at", -1)],
         ) or {}
     except Exception:
-        return ""
+        doc = {}
     value = doc.get("snapshot_at")
     if isinstance(value, datetime):
-        return value.isoformat()
-    return str(value or "")
+        parts.append(f"quote_snapshots:{value.isoformat()}")
+    elif value:
+        parts.append(f"quote_snapshots:{value}")
+    try:
+        expected_day = _day_change_expected_day(_a_day_change_mode())
+        date_key = str(expected_day or "").replace("-", "")[:8]
+        spot_doc = db["fullmarket_spot_snapshots"].find_one(
+            {"date_key": date_key, "snapshot_at": {"$ne": None}},
+            {"_id": 0, "snapshot_at": 1},
+            sort=[("snapshot_at", -1)],
+        ) or {}
+    except Exception:
+        spot_doc = {}
+    spot_value = spot_doc.get("snapshot_at")
+    if isinstance(spot_value, datetime):
+        parts.append(f"fullmarket_spot_snapshots:{spot_value.isoformat()}")
+    elif spot_value:
+        parts.append(f"fullmarket_spot_snapshots:{spot_value}")
+    return "|".join(parts)
 
 
 def _shell_cache_usable(payload: Any, engine: Any, quote_watermark: Optional[str] = None) -> bool:
@@ -1141,7 +1166,7 @@ def _watchlist_range_columns(today: Optional[date] = None) -> list[dict[str, Any
     for _, start, key, info in relative:
         base_label = str(info.get("label") or key)
         if key == "ytd":
-            label = f"{today.year}今年以来"
+            label = f"{today.year}年以来"
         else:
             label = f"{base_label}({start.strftime('%Y-%m-%d')})"
         columns.append({
@@ -1616,16 +1641,121 @@ def _quote_age_seconds(doc: dict[str, Any]) -> Optional[float]:
         return None
 
 
+def _intraday_quote_max_age_seconds() -> float:
+    try:
+        return max(30.0, float(os.getenv("TERMINAL_WORKBENCH_INTRADAY_QUOTE_MAX_AGE_SECONDS", "180")))
+    except (TypeError, ValueError):
+        return 180.0
+
+
 def _quote_day_is_stale(quote_day: str, expected_day: str, day_change_mode: str) -> bool:
     if not quote_day or not expected_day or quote_day == expected_day:
         return False
     return True
 
 
+def _quote_intraday_open_change_pct(doc: dict[str, Any]) -> Optional[float]:
+    price = _first_numeric(doc.get("price"), doc.get("close"))
+    open_price = _float(doc.get("open"))
+    if price is None or open_price is None or open_price <= 0:
+        return None
+    return round((price - open_price) / open_price * 100, 4)
+
+
+def _fullmarket_code_candidates(candidates: list[str]) -> list[str]:
+    codes: list[str] = []
+    for candidate in candidates:
+        raw = str(candidate or "").strip().upper()
+        pure = raw.split(".", 1)[-1] if "." in raw else raw
+        if len(pure) >= 8 and pure[:2] in {"SH", "SZ", "BJ"}:
+            pure = pure[2:]
+        if pure.isdigit() and len(pure) == 6:
+            codes.append(pure)
+    return list(dict.fromkeys(codes))
+
+
+def _fullmarket_spot_quote_doc(symbol: str, candidates: list[str], expected_day: str) -> dict[str, Any]:
+    date_key = str(expected_day or "").replace("-", "")[:8]
+    if not date_key:
+        return {}
+    codes = _fullmarket_code_candidates(candidates)
+    dot_symbols = [candidate.upper() for candidate in candidates if "." in str(candidate or "")]
+    if not codes and not dot_symbols:
+        return {}
+    try:
+        row = _mongo_db()["fullmarket_spot_snapshots"].find_one(
+            {
+                "date_key": date_key,
+                "$or": [
+                    {"code": {"$in": codes}},
+                    {"symbol": {"$in": dot_symbols}},
+                ],
+            },
+            {
+                "_id": 0,
+                "code": 1,
+                "symbol": 1,
+                "trade_date": 1,
+                "snapshot_at": 1,
+                "source": 1,
+                "name": 1,
+                "latest": 1,
+                "price": 1,
+                "change": 1,
+                "change_pct": 1,
+                "turnover_pct": 1,
+                "amplitude_pct": 1,
+                "vol": 1,
+                "amount": 1,
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "prev_close": 1,
+            },
+            sort=[("snapshot_at", -1)],
+        ) or {}
+    except Exception:
+        return {}
+    trade_day = _date_text(row.get("trade_date") or expected_day)
+    if trade_day != expected_day:
+        return {}
+    price = _first_numeric(row.get("price"), row.get("latest"), row.get("close"))
+    if price is None or price <= 0:
+        return {}
+    code = _text(row.get("code")) or (codes[0] if codes else _text(symbol).split(".")[-1])
+    return {
+        "symbol": _text(row.get("symbol")) or symbol,
+        "code": code,
+        "name": row.get("name") or "",
+        "dt": trade_day,
+        "trade_date": trade_day,
+        "snapshot_at": row.get("snapshot_at"),
+        "source": "fullmarket_spot_snapshots",
+        "freshness": "fresh",
+        "is_stale": False,
+        "stale_reason": "",
+        "open": row.get("open"),
+        "high": row.get("high"),
+        "low": row.get("low"),
+        "close": price,
+        "price": price,
+        "prev_close": row.get("prev_close"),
+        "change": row.get("change"),
+        "change_pct": row.get("change_pct"),
+        "turnover_pct": row.get("turnover_pct"),
+        "amplitude_pct": row.get("amplitude_pct"),
+        "vol": row.get("vol"),
+        "amount": row.get("amount"),
+        "_day_change_source": "fullmarket_spot_snapshots",
+    }
+
+
 def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
+    day_change_mode = _a_day_change_mode()
+    expected_day = _day_change_expected_day(day_change_mode)
     candidates = _quote_symbol_candidates(symbol)
     if not candidates:
-        return {"quote_status": "missing", "quote_status_label": "无行情"}
+        return {"day_change_mode": day_change_mode, "quote_status": "missing", "quote_status_label": "无行情"}
     try:
         doc = _mongo_db()["quote_snapshots"].find_one(
             {"symbol": {"$in": candidates}},
@@ -1635,20 +1765,41 @@ def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
     except Exception:
         doc = {}
     if not doc:
-        return {"quote_status": "missing", "quote_status_label": "无行情"}
+        doc = _fullmarket_spot_quote_doc(symbol, candidates, expected_day)
+    if not doc:
+        return {"day_change_mode": day_change_mode, "quote_status": "missing", "quote_status_label": "无行情"}
 
-    day_change_mode = _a_day_change_mode()
-    expected_day = _day_change_expected_day(day_change_mode)
     quote_day = _quote_dt_text(doc)
     age_seconds = _quote_age_seconds(doc)
     stale_reason = _text(doc.get("stale_reason"))
     quote_day_stale = _quote_day_is_stale(quote_day, expected_day, day_change_mode)
-    is_stale = bool(doc.get("is_stale")) or doc.get("freshness") == "stale" or quote_day_stale
+    quote_age_stale = (
+        day_change_mode == "quote_intraday"
+        and age_seconds is not None
+        and age_seconds > _intraday_quote_max_age_seconds()
+    )
+    is_stale = bool(doc.get("is_stale")) or doc.get("freshness") == "stale" or quote_day_stale or quote_age_stale
+    if is_stale:
+        fallback_doc = _fullmarket_spot_quote_doc(symbol, candidates, expected_day)
+        if fallback_doc:
+            doc = fallback_doc
+            quote_day = _quote_dt_text(doc)
+            age_seconds = _quote_age_seconds(doc)
+            stale_reason = _text(doc.get("stale_reason"))
+            quote_day_stale = _quote_day_is_stale(quote_day, expected_day, day_change_mode)
+            quote_age_stale = (
+                day_change_mode == "quote_intraday"
+                and age_seconds is not None
+                and age_seconds > _intraday_quote_max_age_seconds()
+            )
+            is_stale = bool(doc.get("is_stale")) or doc.get("freshness") == "stale" or quote_day_stale or quote_age_stale
     if is_stale:
         status = "stale"
         label = "行情陈旧"
         if quote_day_stale:
             stale_reason = stale_reason or f"quote_day={quote_day}, expected={expected_day}"
+        elif quote_age_stale:
+            stale_reason = stale_reason or f"quote_age_seconds={round(age_seconds or 0, 1)}"
     elif day_change_mode == "daily_close":
         status = "closed"
         label = "收盘"
@@ -1671,11 +1822,22 @@ def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
     }
     quote_latest_price = _first_numeric(doc.get("price"), doc.get("close"))
     quote_change_pct = _float(doc.get("change_pct"))
+    quote_open_price = _float(doc.get("open"))
+    quote_open_change_pct = _quote_intraday_open_change_pct(doc)
+    day_change_source = _text(doc.get("_day_change_source")) or "quote_snapshots"
     if not is_stale:
         if quote_latest_price is not None:
             overlay["quote_price"] = quote_latest_price
         if quote_change_pct is not None:
             overlay["quote_change_pct"] = quote_change_pct
+            overlay["quote_prev_close_change_pct"] = quote_change_pct
+            overlay["day_change_source"] = day_change_source
+            overlay["day_change_as_of"] = quote_day
+            overlay["day_change_basis"] = "prev_close"
+        if quote_open_price is not None and quote_open_price > 0:
+            overlay["quote_open_price"] = quote_open_price
+        if quote_open_change_pct is not None:
+            overlay["quote_open_change_pct"] = quote_open_change_pct
     if day_change_mode == "quote_intraday" and status in {"realtime", "delayed"}:
         if quote_latest_price is not None:
             overlay.update({
@@ -1687,8 +1849,10 @@ def _quote_overlay_for_symbol(symbol: str) -> dict[str, Any]:
                 "day_change_pct": quote_change_pct,
                 "daily_change_pct": quote_change_pct,
                 "today_change_pct": quote_change_pct,
-                "day_change_source": "quote_snapshots",
+                "gain_pct": quote_change_pct,
+                "day_change_source": day_change_source,
                 "day_change_as_of": quote_day,
+                "day_change_basis": "prev_close",
             })
     return overlay
 
@@ -1740,8 +1904,10 @@ def _latest_daily_trading_values(symbol: str, chart: Optional[dict[str, Any]] = 
 def _apply_quote_overlay(row: dict[str, Any], symbol: str, overlay: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     overlay = overlay if isinstance(overlay, dict) else _quote_overlay_for_symbol(symbol)
     updated = dict(row)
+    overlay_mode = _text(overlay.get("day_change_mode")) or _a_day_change_mode()
+    row_kind = _text(updated.get("target_kind") or updated.get("kind")).lower()
     quote_change = _float(overlay.get("day_change_pct"))
-    if overlay.get("day_change_mode") == "quote_intraday" and overlay.get("quote_status") in {"realtime", "delayed"} and quote_change is not None:
+    if overlay_mode == "quote_intraday" and overlay.get("quote_status") in {"realtime", "delayed"} and quote_change is not None:
         updated.update(overlay)
         updated.update({
             "day_change_pct": quote_change,
@@ -1753,6 +1919,21 @@ def _apply_quote_overlay(row: dict[str, Any], symbol: str, overlay: Optional[dic
             "day_change_freq": "",
         })
         return updated
+    if overlay_mode == "quote_intraday" and overlay.get("quote_status") in {"realtime", "delayed"} and row_kind != "index":
+        quote_price = _first_numeric(overlay.get("latest_price"), overlay.get("realtime_price"), overlay.get("quote_price"))
+        if quote_price is not None:
+            updated.update(overlay)
+            updated.update({
+                "latest_price": quote_price,
+                "realtime_price": quote_price,
+                "day_change_pct": None,
+                "daily_change_pct": None,
+                "today_change_pct": None,
+                "gain_pct": None,
+                "day_change_source": "",
+                "day_change_as_of": overlay.get("quote_as_of") or "",
+            })
+            return updated
     if _has_minute_day_change(updated):
         quote_only = {
             key: value for key, value in overlay.items()
@@ -1760,31 +1941,43 @@ def _apply_quote_overlay(row: dict[str, Any], symbol: str, overlay: Optional[dic
         }
         updated.update(quote_only)
         return updated
-    if overlay.get("day_change_mode") == "quote_intraday" and overlay.get("quote_status") in {"stale", "missing"}:
+    if overlay.get("quote_status") in {"stale", "missing"} and row_kind != "index":
+        current_daily_close = (
+            overlay_mode == "daily_close"
+            and _text(updated.get("day_change_source")) == "daily_bars_close"
+            and _text(updated.get("day_change_as_of")) == _day_change_expected_day("daily_close")
+        )
+        if current_daily_close:
+            updated.update(overlay)
+            return updated
         updated.update({
+            "latest_price": None,
+            "realtime_price": None,
             "day_change_pct": None,
             "daily_change_pct": None,
             "today_change_pct": None,
+            "gain_pct": None,
             "day_change_source": "",
             "day_change_as_of": overlay.get("quote_as_of") or "",
         })
-    if overlay.get("day_change_mode") == "daily_close" and overlay.get("quote_status") == "closed":
+    if overlay_mode == "daily_close" and overlay.get("quote_status") == "closed":
         quote_price = _first_numeric(overlay.get("quote_price"), overlay.get("latest_price"), overlay.get("realtime_price"))
         quote_change = _first_numeric(overlay.get("quote_change_pct"), overlay.get("day_change_pct"))
-        if _first_numeric(updated.get("latest_price"), updated.get("price"), updated.get("close")) is None and quote_price is not None:
+        if quote_price is not None:
             updated.update({
                 "latest_price": quote_price,
                 "realtime_price": quote_price,
             })
-        if _first_numeric(updated.get("day_change_pct"), updated.get("daily_change_pct"), updated.get("today_change_pct")) is None and quote_change is not None:
+        if quote_change is not None:
             updated.update({
                 "day_change_pct": quote_change,
                 "daily_change_pct": quote_change,
                 "today_change_pct": quote_change,
                 "gain_pct": quote_change,
-                "day_change_source": "quote_snapshots",
+                "day_change_source": overlay.get("day_change_source") or "quote_snapshots",
                 "day_change_as_of": overlay.get("quote_as_of") or updated.get("day_change_as_of"),
                 "day_change_freq": "",
+                "day_change_basis": "prev_close",
             })
     updated.update(overlay)
     return updated
@@ -1921,6 +2114,7 @@ def _slim_shell_signal_reason(value: Any) -> dict[str, Any]:
         "event_latest_dt",
         "signal_age_trading_days",
         "weight",
+        "ma_alignment",
     )
     out = {key: value.get(key) for key in keys if value.get(key) not in (None, "", [], {})}
     evidence = value.get("evidence") if isinstance(value.get("evidence"), dict) else {}
@@ -1943,6 +2137,28 @@ def _slim_shell_signal_reason(value: Any) -> dict[str, Any]:
             for key in ("grade", "tags", "aligned_freqs", "conflict_freqs", "primary_freq", "direction", "latest_dt", "summary")
             if resonance.get(key) not in (None, "", [], {})
         }
+    ma_alignment = value.get("ma_alignment") if isinstance(value.get("ma_alignment"), dict) else evidence.get("ma_alignment")
+    if isinstance(ma_alignment, dict):
+        out["ma_alignment"] = {
+            key: ma_alignment.get(key)
+            for key in (
+                "above_ma5",
+                "above_ma10",
+                "above_ma20",
+                "near_ma10",
+                "near_ma20",
+                "reclaim_ma5",
+                "reclaim_ma10",
+                "reclaim_ma20",
+                "ma_stack",
+                "ma20_direction",
+                "above_count",
+                "score",
+                "summary",
+                "tags",
+            )
+            if ma_alignment.get(key) not in (None, "", [], {})
+        }
     return out
 
 
@@ -1958,10 +2174,17 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "day_change_pct",
         "daily_change_pct",
         "today_change_pct",
+        "gain_pct",
         "day_change_source",
         "day_change_mode",
         "day_change_as_of",
+        "day_change_basis",
         "realtime_price",
+        "quote_price",
+        "quote_open_price",
+        "quote_open_change_pct",
+        "quote_prev_close_change_pct",
+        "quote_change_pct",
         "latest_signal",
         "reason",
         "signal",
@@ -2015,6 +2238,8 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "current_position",
         "trade_intent",
         "trade_intent_label",
+        "setup_mode",
+        "setup_mode_label",
         "trade_role",
         "trade_role_label",
         "trade_identity",
@@ -2050,6 +2275,13 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "chain_phase",
         "theme_rank_bonus",
         "theme_alignment_level",
+        "sector_policy",
+        "sector_policy_label",
+        "sector_policy_reason",
+        "sector_policy_matched_token",
+        "broad_market_label",
+        "broad_market_context",
+        "ma_alignment",
         "event_latest_dt",
         "signal_age_trading_days",
         "stale_context",
@@ -2151,10 +2383,20 @@ def _slim_shell_sector_row(row: dict[str, Any]) -> dict[str, Any]:
         "layer",
         "stage",
         "integrated_domains",
+        "change_display_kind",
+        "change_display_label",
+        "change_explain",
+        "primary_domain",
+        "reference_domain",
+        "domain_change_stats",
+        "representative_confirmation",
+        "mismatch_flags",
         "latest_signal",
         "trader_action",
         "action_status",
         "invalidates_when",
+        "rank_reason",
+        "trace_summary",
         "explanation",
         "carrier",
         "mapping_chain",
@@ -2572,7 +2814,7 @@ def _enrich_manual_clue_decision(row: dict[str, Any], symbol: str) -> dict[str, 
         if not has_execution:
             missing_gates.append("right_side")
     missing_gates = list(dict.fromkeys(missing_gates))
-    missing_condition = " / ".join(_manual_clue_missing_label(gate) for gate in missing_gates) or "买点路径已走通，但手动探索不自动转确认买点"
+    missing_condition = " / ".join(_manual_clue_missing_label(gate) for gate in missing_gates) or "买点路径已走通，但手动探索不自动转买点池"
 
     top_buy = buy_reasons[0] if buy_reasons else {}
     top_risk = sell_reasons[0] if sell_reasons else {}
@@ -2585,21 +2827,16 @@ def _enrich_manual_clue_decision(row: dict[str, Any], symbol: str) -> dict[str, 
         evidence_bits.extend(_manual_clue_group_labels(technical_groups, side))
     chain_position = _stock_chain_position_summary(symbol)
     chain_text = " · ".join(_text(chain_position.get(key)) for key in ("chain", "node") if _text(chain_position.get(key)))
-    trade_role = "risk_review" if sell_reasons or conflict else (_trade_role_for_stock_summary(chain_position) if chain_position else "ordinary_watch")
+    trade_role = "risk_first" if sell_reasons or conflict else "clue"
     trade_role_label = {
-        "mainline_attack": "主线机会",
-        "climax_risk": "过热禁追",
-        "chain_watch": "产业链观察",
-        "defensive_weight": "防守观察",
-        "second_wave": "回踩再起",
-        "risk_review": "风险复核",
-        "ordinary_watch": "线索观察",
-    }.get(trade_role, "线索观察")
+        "risk_first": "暂不参与",
+        "clue": "线索池",
+    }.get(trade_role, "线索池")
 
     if sell_reasons or conflict:
-        trader_read = f"手动探索：{chain_text + '，' if chain_text else ''}有技术信号但存在卖点或周期冲突，先做风险复核，不自动推买点。"
+        trader_read = f"手动探索：{chain_text + '，' if chain_text else ''}有技术信号但存在卖点或周期冲突，暂不参与；非持仓不推风险动作。"
         trade_intent_label = "暂不参与"
-        recommended_action = "先排雷"
+        recommended_action = "暂不参与"
     elif buy_reasons and has_30m and not has_execution:
         trader_read = f"手动探索：{chain_text + '，' if chain_text else ''}日/周或30m已有信号，等5m/15m下单确认。"
         trade_intent_label = "试仓候选"
@@ -2640,10 +2877,12 @@ def _enrich_manual_clue_decision(row: dict[str, Any], symbol: str) -> dict[str, 
             missing_gates=missing_gates,
             source_detail="terminal_manual_clues/terminal_technical_signals" if reasons else "terminal_manual_clues",
         ),
-        "trade_stage": "clue_pool",
-        "stage_label": "线索池",
+        "trade_stage": "skip_now" if sell_reasons or conflict else "clue_pool",
+        "stage_label": "暂不参与" if sell_reasons or conflict else "线索池",
         "current_position": trade_intent_label,
-        "decision_stage": "strategy_candidate",
+        "decision_stage": "risk_first" if sell_reasons or conflict else "strategy_candidate",
+        "setup_mode": trade_role,
+        "setup_mode_label": trade_role_label,
         "trade_role": trade_role,
         "trade_role_label": trade_role_label,
         "trade_identity": "manual_exploration",
@@ -2807,7 +3046,7 @@ def _related_custom_signals_from_candidates(
     limit: int = 12,
 ) -> list[dict[str, Any]]:
     current_freq = _freq_bucket(requested_freq)
-    related: list[dict[str, Any]] = []
+    buckets: list[list[dict[str, Any]]] = []
     seen_symbols: set[str] = set()
     seen_signals: set[str] = set()
     for candidate in candidates:
@@ -2840,7 +3079,8 @@ def _related_custom_signals_from_candidates(
                 _text(item.get("dt") or item.get("signal_date") or item.get("updated_at")),
             )
         )
-        for row in preferred[:6]:
+        bucket: list[dict[str, Any]] = []
+        for row in preferred:
             signal_type = _text(row.get("signal_type") or row.get("type") or row.get("reason"))
             if not signal_type:
                 continue
@@ -2850,7 +3090,7 @@ def _related_custom_signals_from_candidates(
             if key in seen_signals:
                 continue
             seen_signals.add(key)
-            related.append({
+            bucket.append({
                 "symbol": symbol,
                 "name": _text(candidate.get("name") or candidate.get("stock_name")) or _stock_name(symbol),
                 "relation": _text(candidate.get("relation") or candidate.get("role") or candidate.get("representative_type")),
@@ -2866,8 +3106,20 @@ def _related_custom_signals_from_candidates(
                 "price": _float(row.get("price")),
                 "signal_side": _manual_clue_signal_side(row),
             })
+            if len(bucket) >= 6:
+                break
+        if bucket:
+            buckets.append(bucket)
+    related: list[dict[str, Any]] = []
+    round_index = 0
+    while len(related) < limit and any(round_index < len(bucket) for bucket in buckets):
+        for bucket in buckets:
+            if round_index >= len(bucket):
+                continue
+            related.append(bucket[round_index])
             if len(related) >= limit:
                 return related
+        round_index += 1
     return related
 
 
@@ -3679,8 +3931,8 @@ def _build_focus_stock_rows(
             trader_action = "减仓/止盈"
             invalidates_when = "重新站回关键均线且卖出信号解除"
         elif row.get("action_status") == "risk_review":
-            trader_action = "风险复核"
-            invalidates_when = "买点延续但卖出/风险信号解除"
+            trader_action = "暂不参与"
+            invalidates_when = "卖出/风险信号解除后重新进入买点池"
         elif any(item.get("badge") == "5m" for item in row.get("buy_timeframes", []) if isinstance(item, dict)):
             trader_action = "可试仓"
             invalidates_when = "5m 买点失效或跌破短线防守位"
@@ -4145,7 +4397,14 @@ def _candidate_groups(
         else:
             groups["constituents"].append(payload)
     for key, rows in groups.items():
-        rows.sort(key=lambda item: _float(item.get("attention_score"), 0) or 0, reverse=True)
+        if key == "leaders":
+            tier_order = {"龙头": 0, "龙二": 1, "龙三": 2}
+            rows.sort(key=lambda item: (
+                tier_order.get(_text(item.get("leader_tier")), 9),
+                -(_float(item.get("attention_score"), 0) or 0),
+            ))
+        else:
+            rows.sort(key=lambda item: _float(item.get("attention_score"), 0) or 0, reverse=True)
         groups[key] = rows[:8 if key != "leaders" else 3]
     return groups
 
@@ -4332,9 +4591,11 @@ def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
 
 def _merge_candidate_groups(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     groups: dict[str, list[dict[str, Any]]] = {
+        "upstream": [],
         "leaders": [],
         "weighted": [],
         "elastic": [],
+        "downstream": [],
         "source_leaders": [],
         "constituents": [],
     }
@@ -4569,22 +4830,31 @@ def _chain_risk_flags(row: dict[str, Any], data_truth: dict[str, Any]) -> list[s
 
 def _candidate_groups_from_representatives(row: dict[str, Any], *, lightweight: bool = False) -> dict[str, list[dict[str, Any]]]:
     groups: dict[str, list[dict[str, Any]]] = {
+        "upstream": [],
         "leaders": [],
         "weighted": [],
         "elastic": [],
+        "downstream": [],
         "source_leaders": [],
         "constituents": [],
     }
     heat_score = _float(row.get("heat_score"), 0) or 0
+    daily_cache: dict[str, tuple[pd.DataFrame, str]] = {}
+    core_rank = 0
     for rep in row.get("representatives") or []:
         if not isinstance(rep, dict):
             continue
+        representative_type = _text(rep.get("representative_type"))
+        leader_rank = 0
+        if representative_type == "core":
+            core_rank += 1
+            leader_rank = core_rank
         item = {
             "symbol": rep.get("symbol"),
             "name": rep.get("name"),
             "relation": rep.get("relation"),
             "source": "chain_heat_snapshots",
-            "representative_type": rep.get("representative_type"),
+            "representative_type": representative_type,
             "attention_score": heat_score + _float(rep.get("priority"), 0) * 0.1,
             "chain_id": row.get("chain_id"),
             "chain_name": row.get("chain_name"),
@@ -4593,14 +4863,33 @@ def _candidate_groups_from_representatives(row: dict[str, Any], *, lightweight: 
             "layer": row.get("layer"),
             "stage": row.get("stage"),
         }
-        payload = _scored_candidate_payload(item, heat_score=heat_score, lightweight=lightweight) or item
-        if rep.get("representative_type") == "core":
+        payload = _scored_candidate_payload(
+            item,
+            heat_score=heat_score,
+            leader_rank=leader_rank,
+            daily_cache=daily_cache,
+            lightweight=False,
+        ) or item
+        if lightweight:
+            payload = _enrich_stock_row(payload, [], lightweight=True)
+        if representative_type == "upstream":
+            groups["upstream"].append(payload)
+        elif representative_type == "downstream":
+            groups["downstream"].append(payload)
+        elif representative_type == "core":
             groups["leaders"].append(payload)
             groups["weighted"].append(payload)
         else:
             groups["elastic"].append(payload)
     for key, rows in groups.items():
-        rows.sort(key=lambda item: _float(item.get("attention_score"), 0) or 0, reverse=True)
+        if key == "leaders":
+            tier_order = {"龙头": 0, "龙二": 1, "龙三": 2}
+            rows.sort(key=lambda item: (
+                tier_order.get(_text(item.get("leader_tier")), 9),
+                -(_float(item.get("attention_score"), 0) or 0),
+            ))
+        else:
+            rows.sort(key=lambda item: _float(item.get("attention_score"), 0) or 0, reverse=True)
         groups[key] = rows[:8 if key != "leaders" else 3]
     return groups
 
@@ -4610,6 +4899,36 @@ def _chain_heat_max_nodes_per_chain() -> int:
         return max(1, int(os.getenv("WORKBENCH_CHAIN_HEAT_MAX_NODES_PER_CHAIN", "2")))
     except Exception:
         return 2
+
+
+def _chain_representative_quote_rows(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(item: dict[str, Any]) -> None:
+        symbol = _text(item.get("symbol") or item.get("code") or item.get("raw_code"))
+        if not symbol or symbol.upper() in seen:
+            return
+        seen.add(symbol.upper())
+        rows.append(item)
+
+    for doc in docs:
+        leader_symbol = _text(doc.get("leader_symbol"))
+        if leader_symbol:
+            add({"symbol": leader_symbol, "name": doc.get("leader_name")})
+        for rep in doc.get("representatives") or []:
+            if isinstance(rep, dict):
+                add(rep)
+        for domain in doc.get("integrated_domains") or []:
+            if not isinstance(domain, dict):
+                continue
+            leader_symbol = _text(domain.get("leader_symbol"))
+            if leader_symbol:
+                add({"symbol": leader_symbol, "name": domain.get("leader_name")})
+            for rep in domain.get("representatives") or []:
+                if isinstance(rep, dict):
+                    add(rep)
+    return rows
 
 
 def _diversify_chain_heat_docs(
@@ -4642,6 +4961,155 @@ def _diversify_chain_heat_docs(
     return selected[:limit]
 
 
+def _chain_domain_payload(domain: dict[str, Any]) -> dict[str, Any]:
+    keep = (
+        "kind",
+        "name",
+        "code",
+        "change_pct",
+        "up_count",
+        "down_count",
+        "leader_name",
+        "leader_symbol",
+        "leader_change_pct",
+        "rank",
+        "mapping_confidence",
+        "hit_terms",
+        "evidence_sources",
+    )
+    return {key: domain.get(key) for key in keep if domain.get(key) not in (None, "", [], {})}
+
+
+def _chain_reference_domain(doc: dict[str, Any], domains: list[dict[str, Any]]) -> dict[str, Any]:
+    if not domains:
+        return {}
+    chain_label = _text(doc.get("chain_name")).replace("产业链", "")
+    node_terms = [
+        item.strip()
+        for item in _text(doc.get("node_name")).replace("链", "").replace("产业", "").split("/")
+        if item.strip()
+    ]
+    candidates = [chain_label, *node_terms]
+    for term in candidates:
+        if not term:
+            continue
+        for domain in domains:
+            name = _text(domain.get("name"))
+            if _text(domain.get("kind")) == "industry" and name and (name == term or name in term or term in name):
+                return domain
+    for domain in domains:
+        if _text(domain.get("kind")) == "industry":
+            return domain
+    return domains[0]
+
+
+def _chain_domain_change_stats(domains: list[dict[str, Any]]) -> dict[str, Any]:
+    values = [_float(domain.get("change_pct")) for domain in domains]
+    numeric = [value for value in values if value is not None]
+    if not numeric:
+        return {"count": len(domains), "known_count": 0}
+    return {
+        "count": len(domains),
+        "known_count": len(numeric),
+        "positive_count": sum(1 for value in numeric if value > 0),
+        "negative_count": sum(1 for value in numeric if value < 0),
+        "avg_change_pct": round(sum(numeric) / len(numeric), 2),
+        "max_change_pct": round(max(numeric), 2),
+        "min_change_pct": round(min(numeric), 2),
+    }
+
+
+def _representative_confirmation(groups: dict[str, list[dict[str, Any]]], chain_change_pct: Optional[float]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for key in ("leaders", "weighted", "elastic", "source_leaders", "constituents"):
+        for row in groups.get(key) or []:
+            if isinstance(row, dict):
+                rows.append(row)
+    seen: set[str] = set()
+    changes: list[float] = []
+    missing = 0
+    for row in rows:
+        symbol = _text(row.get("symbol") or row.get("code")).upper()
+        key = symbol or _text(row.get("name"))
+        if key in seen:
+            continue
+        seen.add(key)
+        value = _first_numeric(row.get("day_change_pct"), row.get("daily_change_pct"), row.get("today_change_pct"))
+        if value is None:
+            missing += 1
+        else:
+            changes.append(value)
+    positive = sum(1 for value in changes if value > 0)
+    negative = sum(1 for value in changes if value < 0)
+    if not changes:
+        status = "unknown"
+        label = "代表股涨幅缺失"
+    elif chain_change_pct is not None and chain_change_pct > 0 and positive == 0:
+        status = "not_confirmed"
+        label = "代表股未跟随"
+    elif positive and negative:
+        status = "mixed"
+        label = "代表股分化"
+    elif positive:
+        status = "confirmed"
+        label = "代表股跟随"
+    else:
+        status = "weak"
+        label = "代表股偏弱"
+    return {
+        "status": status,
+        "label": label,
+        "known_count": len(changes),
+        "missing_count": missing,
+        "positive_count": positive,
+        "negative_count": negative,
+        "avg_change_pct": round(sum(changes) / len(changes), 2) if changes else None,
+    }
+
+
+def _chain_heat_display_context(doc: dict[str, Any], candidate_groups: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    domains = [item for item in (doc.get("integrated_domains") or []) if isinstance(item, dict)]
+    primary = domains[0] if domains else {}
+    reference = _chain_reference_domain(doc, domains)
+    primary_payload = _chain_domain_payload(primary) if primary else {}
+    reference_payload = _chain_domain_payload(reference) if reference else {}
+    primary_change = _float(primary_payload.get("change_pct"))
+    reference_change = _float(reference_payload.get("change_pct"))
+    rep_confirmation = _representative_confirmation(candidate_groups, primary_change)
+    flags: list[str] = []
+    label_text = " · ".join([_text(doc.get("chain_name")), _text(doc.get("node_name"))])
+    primary_name = _text(primary_payload.get("name"))
+    if primary_name and primary_name not in label_text:
+        flags.append("driver_not_same_as_chain_label")
+    if primary_change is not None and reference_change is not None and abs(primary_change - reference_change) >= 1.0:
+        flags.append("driver_reference_divergence")
+    if rep_confirmation.get("status") in {"not_confirmed", "weak"}:
+        flags.append("representatives_not_confirmed")
+    if _float(primary_payload.get("mapping_confidence"), 100) is not None and (_float(primary_payload.get("mapping_confidence"), 100) or 0) < 70:
+        flags.append("low_mapping_confidence")
+    primary_label = _text(primary_payload.get("name")) or "主驱动"
+    reference_label = _text(reference_payload.get("name"))
+    explain_parts = [f"主驱动 {primary_label}"]
+    if primary_change is not None:
+        explain_parts[-1] += f" {primary_change:+.2f}%"
+    if reference_label and reference_label != primary_label:
+        ref_text = f"参考行业 {reference_label}"
+        if reference_change is not None:
+            ref_text += f" {reference_change:+.2f}%"
+        explain_parts.append(ref_text)
+    explain_parts.append(rep_confirmation.get("label") or "")
+    return {
+        "change_display_kind": "chain_driver_change",
+        "change_display_label": "驱动涨幅",
+        "change_explain": "；".join([part for part in explain_parts if part]),
+        "primary_domain": primary_payload,
+        "reference_domain": reference_payload,
+        "domain_change_stats": _chain_domain_change_stats(domains),
+        "representative_confirmation": rep_confirmation,
+        "mismatch_flags": flags,
+    }
+
+
 def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
     try:
         db = _mongo_db()
@@ -4670,6 +5138,17 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             limit=limit,
             max_nodes_per_chain=_chain_heat_max_nodes_per_chain(),
         )
+        representative_quote_rows = _chain_representative_quote_rows(docs)
+        if representative_quote_rows:
+            try:
+                _refresh_realtime_quotes_for_rows(
+                    db,
+                    representative_quote_rows,
+                    refresh_key="chain_heat_representatives",
+                    limit=len(representative_quote_rows),
+                )
+            except Exception:
+                pass
     except Exception:
         return []
     rows: list[dict[str, Any]] = []
@@ -4680,6 +5159,7 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         target_label = _text(primary.get("name")) or _text(doc.get("node_name") or doc.get("chain_name"))
         label = " · ".join([item for item in [_text(doc.get("chain_name")), _text(doc.get("node_name"))] if item])
         candidate_groups = _candidate_groups_from_representatives(doc, lightweight=True)
+        display_context = _chain_heat_display_context(doc, candidate_groups)
         graph = _chain_graph_doc(doc.get("chain_id"), doc.get("node_id"))
         viewpoint_context = _viewpoint_context_from_graph(graph)
         doc_trade_day = _date_text(doc.get("trade_date") or doc.get("dt") or doc.get("trade_minute"))
@@ -4694,6 +5174,9 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
                 "chart_mode_default": "chain_heat",
                 "chain_key": _text(doc.get("chain_id")),
                 "node_key": _text(doc.get("node_id")),
+                "change_display_kind": display_context.get("change_display_kind"),
+                "primary_domain": display_context.get("primary_domain"),
+                "reference_domain": display_context.get("reference_domain"),
             },
         )
         technical_linkage = _technical_linkage_from_groups(candidate_groups)
@@ -4703,6 +5186,7 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         day_change_pct = _float(doc.get("change_pct")) if day_change_as_of == _day_change_expected_day() else None
         row = {
             **doc,
+            **display_context,
             "group": "sector_boards",
             "domain": "chain_heat",
             "kind": target_kind,
@@ -4731,6 +5215,8 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
                 f"热度 {doc.get('heat_score')}",
                 f"来源 {doc.get('integrated_count')} 个行业/概念",
             ]),
+            "rank_reason": display_context.get("change_explain"),
+            "trace_summary": display_context.get("change_explain"),
             "source": "chain_heat_snapshots",
             "latest_signal": doc.get("trading_signal"),
             "target_kind": target_kind,
@@ -4746,7 +5232,9 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             "carrier": carrier,
             "representatives": {
                 "core": candidate_groups.get("leaders", []),
+                "upstream": candidate_groups.get("upstream", []),
                 "elastic": candidate_groups.get("elastic", []),
+                "downstream": candidate_groups.get("downstream", []),
                 "source_leader": [],
             },
             "candidate_groups": candidate_groups,
@@ -4779,31 +5267,110 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
     return rows
 
 
+def _visible_quote_symbols(rows: list[dict[str, Any]], limit: int) -> list[str]:
+    symbols: list[str] = []
+    for row in rows[:limit]:
+        if not isinstance(row, dict):
+            continue
+        value = row.get("symbol") or row.get("code") or row.get("raw_code")
+        normalized, _ = _normalize_stock_symbol(str(value or ""))
+        if not normalized:
+            continue
+        if normalized.split(".", 1)[0] not in {"SH", "SZ", "BJ"}:
+            continue
+        if normalized not in symbols:
+            symbols.append(normalized)
+    return symbols
+
+
+def _refresh_realtime_quotes_for_rows(
+    db,
+    rows: list[dict[str, Any]],
+    *,
+    refresh_key: str,
+    limit: int,
+) -> dict[str, Any]:
+    if _a_day_change_mode() != "quote_intraday":
+        return {"status": "skipped", "reason": "not_intraday"}
+    try:
+        max_symbols = max(1, min(120, int(os.getenv("TERMINAL_WORKBENCH_VISIBLE_QUOTE_LIMIT", "80"))))
+    except (TypeError, ValueError):
+        max_symbols = 80
+    symbols = _visible_quote_symbols(rows, min(limit, max_symbols))
+    if not symbols:
+        return {"status": "skipped", "reason": "empty_symbols"}
+    try:
+        min_seconds = max(0.0, float(os.getenv("TERMINAL_WORKBENCH_VISIBLE_QUOTE_MIN_SECONDS", "3")))
+    except (TypeError, ValueError):
+        min_seconds = 3.0
+    now_monotonic = time.monotonic()
+    with _VISIBLE_QUOTE_REFRESH_LOCK:
+        last = float(_VISIBLE_QUOTE_REFRESH_LAST.get(refresh_key) or 0.0)
+        if last and now_monotonic - last < min_seconds:
+            return {"status": "throttled", "count": len(symbols)}
+        _VISIBLE_QUOTE_REFRESH_LAST[refresh_key] = now_monotonic
+    try:
+        from signals.sync.modules.quote_snapshots import _fetch_eastmoney_ulist_docs
+
+        now = _sync_now()
+        trading_day = _day_change_expected_day("quote_intraday") or _market_today("A").isoformat()
+        docs, observations = _fetch_eastmoney_ulist_docs(db, symbols, now, trading_day)
+        if docs:
+            collection = db["quote_snapshots"]
+            for doc in docs.values():
+                collection.replace_one({"_id": doc["_id"]}, doc, upsert=True)
+        errors = [item for item in observations if isinstance(item, dict) and item.get("error")]
+        return {"status": "ok" if docs else "empty", "count": len(symbols), "live": len(docs), "errors": len(errors)}
+    except Exception as exc:
+        return {"status": "failed", "count": len(symbols), "error": f"{exc.__class__.__name__}: {exc}"}
+
+
 def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: str = "focus_stocks", limit: Optional[int] = None) -> list[dict[str, Any]]:
+    try:
+        db = _mongo_db()
+        doc = db["terminal_stock_pool"].find_one(
+            {"pool": "terminal_stock_pool", "market": "A"},
+            {
+                "stocks": 1,
+                "focus_stocks": 1,
+                "risk_stocks": 1,
+                "watch_stocks": 1,
+                "clue_stocks": 1,
+                "stock_limit": 1,
+                "risk_limit": 1,
+                "watch_limit": 1,
+                "clue_limit": 1,
+            },
+            sort=[("updated_at", -1)],
+        ) or {}
+    except Exception:
+        return []
     if limit is None:
         env_name = {
             "focus_stocks": "TERMINAL_WORKBENCH_FOCUS_STOCK_LIMIT",
             "risk_stocks": "TERMINAL_WORKBENCH_RISK_STOCK_LIMIT",
             "watch_stocks": "TERMINAL_WORKBENCH_WATCH_STOCK_LIMIT",
+            "clue_stocks": "TERMINAL_WORKBENCH_CLUE_STOCK_LIMIT",
         }.get(group, "TERMINAL_WORKBENCH_FOCUS_STOCK_LIMIT")
-        default = "72" if group != "watch_stocks" else "36"
-        limit = max(1, int(os.getenv(env_name, default)))
-    try:
-        db = _mongo_db()
-        doc = db["terminal_stock_pool"].find_one(
-            {"pool": "terminal_stock_pool", "market": "A"},
-            {"stocks": 1, "focus_stocks": 1, "risk_stocks": 1, "watch_stocks": 1},
-            sort=[("updated_at", -1)],
-        ) or {}
-    except Exception:
-        return []
+        limit_key = {
+            "focus_stocks": "stock_limit",
+            "risk_stocks": "risk_limit",
+            "watch_stocks": "watch_limit",
+            "clue_stocks": "clue_limit",
+        }.get(group, "stock_limit")
+        fallback_default = 120 if group == "watch_stocks" else (36 if group == "clue_stocks" else 72)
+        try:
+            limit = max(1, int(os.getenv(env_name) or doc.get(limit_key) or fallback_default))
+        except (TypeError, ValueError):
+            limit = fallback_default
     rows: list[dict[str, Any]] = []
     source_rows = doc.get(group)
     if source_rows is None and group == "focus_stocks":
         source_rows = doc.get("stocks")
-    for item in source_rows or []:
-        if not isinstance(item, dict):
-            continue
+    source_rows = [item for item in source_rows or [] if isinstance(item, dict)]
+    if group in {"focus_stocks", "risk_stocks", "watch_stocks", "clue_stocks"}:
+        _refresh_realtime_quotes_for_rows(db, source_rows, refresh_key=group, limit=limit)
+    for item in source_rows:
         reasons = [reason for reason in item.get("inclusion_reasons") or [] if isinstance(reason, dict)]
         has_technical = any(
             reason.get("reason_type") in {"technical_trigger", "technical_signal"}
@@ -4905,6 +5472,65 @@ def _manual_clue_rows(range_columns: list[dict[str, Any]], limit: Optional[int] 
     return rows
 
 
+def _manual_clue_attack_focus_rows(
+    manual_clues: list[dict[str, Any]],
+    existing_focus: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    existing_symbols = {
+        _text(row.get("symbol") or row.get("code")).upper()
+        for row in existing_focus
+        if _text(row.get("symbol") or row.get("code"))
+    }
+    promoted: list[dict[str, Any]] = []
+    for row in manual_clues:
+        symbol = _text(row.get("symbol") or row.get("code")).upper()
+        if not symbol or symbol in existing_symbols:
+            continue
+        missing_gates = set(row.get("missing_gates") or row.get("blocked_by") or [])
+        if missing_gates & {"risk_clear", "period_conflict", "hard_technical", "upper_context", "right_side"}:
+            continue
+        upper_side = _text(row.get("upper_timeframe_side"))
+        execution_side = _text(row.get("execution_timeframe_side"))
+        trade_side = _text(row.get("trade_timeframe_side"))
+        if upper_side not in {"right", "mixed"} or execution_side not in {"right", "mixed"}:
+            continue
+        if trade_side == "none" and "trigger_30m" not in missing_gates:
+            continue
+        item = dict(row)
+        item.update({
+            "manual_attack_focus": True,
+            "pool_type": "focus",
+            "trade_stage": "attack_entry",
+            "stage_label": "进攻买点",
+            "current_position": "进攻买点",
+            "decision_stage": "entry_waiting_confirm",
+            "entry_gate_status": "manual_attack_entry",
+            "action_status": "manual_attack_entry",
+            "actionability": "entry_waiting_confirm",
+            "queue_lane": "entry_waiting_confirm",
+            "trader_action": "进攻买点复核",
+            "recommended_action": "进攻买点复核",
+            "next_action": "进攻买点复核",
+            "trade_intent": "attack_entry",
+            "trade_intent_label": "进攻买点",
+            "setup_mode": "right_attack",
+            "setup_mode_label": "右侧进攻",
+            "setup_side_label": "进攻买点",
+            "can_trade_now": True,
+            "missing_condition": (
+                "30m未补齐，按进攻买点小仓复核"
+                if "trigger_30m" in missing_gates
+                else "买点路径已走通，手动线索提升为进攻买点"
+            ),
+            "invalidates_when": "5m/15m转弱、30m迟迟不补或上级周期转冲突",
+            "invalidation": "5m/15m转弱、30m迟迟不补或上级周期转冲突",
+            "explanation": "手动线索已满足日/周和5m/15m右侧确认，提升到进攻买点复核。",
+        })
+        promoted.append(item)
+        existing_symbols.add(symbol)
+    return promoted
+
+
 def _merge_stock_rows_by_symbol(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -4919,6 +5545,10 @@ def _merge_stock_rows_by_symbol(rows: list[dict[str, Any]]) -> list[dict[str, An
 
 
 def _enrich_scored_stock_rows(rows: list[dict[str, Any]], range_columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    try:
+        _refresh_realtime_quotes_for_rows(_mongo_db(), rows, refresh_key="scored_stocks", limit=len(rows) or 1)
+    except Exception:
+        pass
     return [
         _enrich_stock_row(dict(item), range_columns, lightweight=True) if item.get("symbol") else dict(item)
         for item in rows
@@ -4927,7 +5557,7 @@ def _enrich_scored_stock_rows(rows: list[dict[str, Any]], range_columns: list[di
 
 def _focus_stock_pool_meta(focus_count: int) -> dict[str, Any]:
     meta: dict[str, Any] = {
-        "label": "确认买点",
+        "label": "买点池",
         "source_collection": "terminal_stock_pool",
         "count": focus_count,
         "empty_reason": "",
@@ -4978,7 +5608,7 @@ def _focus_stock_pool_meta(focus_count: int) -> dict[str, Any]:
             elif int(doc.get("candidate_count") or 0) > 0 or doc.get("watch_stocks") or doc.get("clue_stocks") or doc.get("risk_stocks"):
                 empty_reason = _text(freshness.get("stale_reason"))
                 if empty_reason in {"", "terminal_stock_pool_empty", "terminal_focus_stock_pool_empty"}:
-                    empty_reason = "当前没有通过确认买点闸门；标的已进入盯盘池/线索池等待30m与5m/15m确认。"
+                    empty_reason = "当前没有通过买点池闸门；标的已进入盯盘池/线索池等待买点质量与均线确认。"
             else:
                 empty_reason = _text(freshness.get("stale_reason")) or "terminal_stock_pool_empty"
         meta.update({
@@ -5071,10 +5701,9 @@ def _build_trader_task_queue(
     sector_boards: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     tasks: list[dict[str, Any]] = []
-    allowed_lanes = {"risk_exit_first", "entry_ready", "entry_waiting_confirm"}
+    allowed_lanes = {"entry_ready", "entry_waiting_confirm"}
     lane_titles = {
-        "risk_exit_first": "暂不参与",
-        "entry_ready": "确认买点",
+        "entry_ready": "买点池",
         "entry_waiting_confirm": "试仓候选",
     }
 
@@ -5100,7 +5729,7 @@ def _build_trader_task_queue(
             _text(row.get("trigger_reason")),
         ])
         if any(token in text for token in ("减仓", "止盈", "风险", "卖", "跌破", "阻断", "暂不参与")):
-            return "risk_exit_first"
+            return ""
         if not has_hard_technical(row):
             return ""
         if action == "可试仓" or "entry_ready" in text:
@@ -5188,71 +5817,49 @@ def _build_trader_task_queue(
 
 TRADE_ROLE_FILTERS = [
     {"key": "all", "label": "全部"},
-    {"key": "mainline_attack", "label": "主线机会"},
-    {"key": "climax_risk", "label": "过热禁追"},
-    {"key": "second_wave", "label": "回踩再起"},
-    {"key": "defensive_weight", "label": "防守观察"},
-    {"key": "chain_watch", "label": "产业链观察"},
-    {"key": "risk_review", "label": "风险复核"},
-    {"key": "ordinary_watch", "label": "线索观察"},
+    {"key": "left_attack", "label": "低吸进攻"},
+    {"key": "right_attack", "label": "右侧进攻"},
+    {"key": "watch", "label": "盯盘观察"},
+    {"key": "clue", "label": "线索池"},
 ]
 
 TRADE_ROLE_DEFINITIONS = {
-    "mainline_attack": {
-        "definition": "板块/产业链处在升温或加速，且个股不被风控和过热条件阻断。",
-        "source": "chain_heat_snapshots + terminal_stock_pool.theme_rank_bonus",
+    "left_attack": {
+        "definition": "一买、背驰买或低吸型二买叠加10/20日线承接，进入低吸进攻复核。",
+        "source": "terminal_stock_pool.setup_mode + ma_alignment + buy_point_quality",
     },
-    "climax_risk": {
-        "definition": "板块/产业链一致过热，买点被过热条件阻断，只提示风险不推追高。",
-        "source": "chain_heat_snapshots.phase + terminal_stock_pool.blocked_by",
+    "right_attack": {
+        "definition": "30m/15m/5m二买、三买、趋势或突破型信号，且至少两条关键均线确认。",
+        "source": "terminal_stock_pool.setup_mode + ma_alignment + buy_point_quality",
     },
-    "chain_watch": {
-        "definition": "股票已映射到东财/同花顺板块图谱，但还没满足主线、回踩、防守或确认买点条件。",
-        "source": "security_chain_memberships + terminal_stock_pool",
+    "watch": {
+        "definition": "有技术买点或来源，但还缺关键均线、30m、大周期或5m/15m执行确认。",
+        "source": "terminal_stock_pool.watch_stocks",
     },
-    "defensive_weight": {
-        "definition": "只接收上游数据明确标记的防守/稳仓/高股息/低波属性，不用行业词硬猜。",
-        "source": "terminal_stock_pool.exposure_bucket",
+    "clue": {
+        "definition": "只有人工/系统来源线索，还没有硬技术买点。",
+        "source": "terminal_stock_pool.clue_stocks + terminal_manual_clues",
     },
-    "second_wave": {
-        "definition": "板块退潮/分化后，或个股进入低吸/试仓阶段，等待重新放量和右侧确认。",
-        "source": "chain_heat phase=cooling/risk_off/diverging + terminal_stock_pool",
-    },
-    "risk_review": {
-        "definition": "进入 risk/skip_now 或卖点、冲突、阻断条件未解除。",
-        "source": "terminal_stock_pool risk rows",
-    },
-    "ordinary_watch": {
-        "definition": "只有线索或技术背景，没有可交易级别的产业链/买点/风控状态。",
-        "source": "terminal_stock_pool",
+    "risk_first": {
+        "definition": "卖点、冲突或过期信号，只用于从机会池排除；非持仓不推送风险动作。",
+        "source": "terminal_stock_pool.risk_stocks",
     },
 }
 
 
 def _trade_role_for_shell_stock(row: dict[str, Any]) -> str:
-    explicit = _text(row.get("trade_role") or row.get("trade_identity"))
-    if explicit:
-        return "chain_watch" if explicit == "holding_chain" else explicit
-    chain = row.get("chain_position") if isinstance(row.get("chain_position"), dict) else {}
-    context = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
-    phase = _text(row.get("chain_phase") or context.get("phase") or chain.get("phase"))
-    exposure_bucket = _text(row.get("exposure_bucket") or context.get("exposure_bucket") or chain.get("exposure_bucket"))
-    has_chain = any(_text(chain.get(key) or context.get(key)) for key in ("chain", "chain_name", "node", "node_name", "board_or_concept"))
-    if _text(row.get("pool_type")) == "risk" or _text(row.get("trade_stage")) == "skip_now":
-        return "climax_risk" if phase == "consensus_climax" else "risk_review"
-    if phase == "consensus_climax":
-        return "climax_risk"
-    if exposure_bucket in {"defensive", "防守", "稳仓", "高股息", "低波"}:
-        return "defensive_weight"
-    if phase in {"cooling", "diverging"} or _text(row.get("trade_stage")) in {"dip_watch", "probe_candidate"}:
-        return "second_wave"
-    if phase in {"accelerating", "warming"} or (_float(row.get("theme_rank_bonus")) or 0) >= 12:
-        return "mainline_attack"
-    if _text(row.get("trade_stage")) in {"confirmed_entry", "probe_candidate"}:
-        return "mainline_attack"
-    if has_chain:
-        return "chain_watch"
-    return "ordinary_watch"
+    setup_mode = _text(row.get("setup_mode"))
+    if setup_mode in {"left_attack", "right_attack", "watch", "clue", "risk_first"}:
+        return setup_mode
+    pool_type = _text(row.get("pool_type"))
+    trade_stage = _text(row.get("trade_stage"))
+    if pool_type == "risk" or trade_stage == "skip_now":
+        return "risk_first"
+    if pool_type == "focus" or trade_stage in {"left_attack", "attack_entry", "confirmed_entry"}:
+        return "left_attack" if trade_stage == "left_attack" else "right_attack"
+    if pool_type == "watch":
+        return "watch"
+    return "clue"
 
 
 def _shell_stock_chain_brief(row: dict[str, Any]) -> str:
@@ -5311,26 +5918,18 @@ def _build_trade_map(
     risk_stocks: list[dict[str, Any]],
     clue_stocks: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    stock_rows = [*focus_stocks, *watch_stocks, *clue_stocks, *risk_stocks]
-    climax = next((row for row in sector_boards if _text(row.get("phase")) == "consensus_climax"), {})
-    mainline = next((row for row in sector_boards if _text(row.get("phase")) in {"accelerating", "warming"}), {})
-    retreat = next((row for row in sector_boards if _text(row.get("phase")) in {"cooling", "risk_off", "diverging"}), {})
-    chain_watch = _first_stock_for_role(stock_rows, "chain_watch")
-    defensive = _first_stock_for_role(stock_rows, "defensive_weight")
-    second_wave = _first_stock_for_role(stock_rows, "second_wave")
+    del sector_boards, risk_stocks
+    stock_rows = [*focus_stocks, *watch_stocks, *clue_stocks]
     items: list[dict[str, Any]] = []
-    if mainline:
-        items.append(_sector_role_item(mainline, "mainline_attack", "主线机会", "升温/加速中，只看分歧承接。"))
-    if climax:
-        items.append(_sector_role_item(climax, "climax_risk", "过热风险", "一致过热，不追高，等分歧后的核心票。"))
-    if retreat:
-        items.append(_sector_role_item(retreat, "second_wave", "回踩再起", "退潮/分化后等重新放量。"))
-    if chain_watch:
-        items.append(_stock_role_item(chain_watch, "chain_watch", "产业链观察", "已入东财/同花顺图谱，等30m承接确认。"))
-    if defensive:
-        items.append(_stock_role_item(defensive, "defensive_weight", "防守观察", "偏稳仓节奏，不和进攻票混排。"))
-    if second_wave and not any(item.get("role") == "second_wave" for item in items):
-        items.append(_stock_role_item(second_wave, "second_wave", "回踩再起", "退潮后观察重新放量。"))
+    for role, label, fallback in (
+        ("left_attack", "低吸进攻", "左侧买点叠加关键均线，先复核位置和失效条件。"),
+        ("right_attack", "右侧进攻", "执行周期买点叠加均线确认，复核下单节奏。"),
+        ("watch", "盯盘观察", "买点或线索未完全共振，等缺口补齐。"),
+        ("clue", "线索池", "只有来源线索，还没有硬技术买点。"),
+    ):
+        row = _first_stock_for_role(stock_rows, role)
+        if row:
+            items.append(_stock_role_item(row, role, label, fallback))
     counts = {item["key"]: 0 for item in TRADE_ROLE_FILTERS if item["key"] != "all"}
     for row in stock_rows:
         role = _trade_role_for_shell_stock(row)
@@ -5349,6 +5948,7 @@ def _build_trade_map(
         "role_filters": TRADE_ROLE_FILTERS,
         "role_definitions": TRADE_ROLE_DEFINITIONS,
         "role_counts": counts,
+        "risk_policy": "risk_stocks_excluded_from_opportunity_map",
     }
 
 
@@ -5359,29 +5959,29 @@ def _build_ai_alerts(trade_map: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         role = _text(item.get("role"))
         name = _text(item.get("name"))
-        if role == "climax_risk":
-            alerts.append({
-                "level": "warning",
-                "role": role,
-                "text": f"{name or '主线'}已一致过热，确认买点不再推追高。",
-                "command": "排除过热票",
-            })
-        elif role == "chain_watch":
+        if role == "left_attack":
             alerts.append({
                 "level": "info",
                 "role": role,
-                "text": f"{name or '产业链观察'}只表示板块图谱归属，不代表真实持仓；只等承接确认。",
-                "command": "只看产业链观察",
+                "text": f"{name or '低吸进攻'}按左侧买点和均线承接复核，不推非持仓动作。",
+                "command": "只看低吸进攻",
+            })
+        elif role == "right_attack":
+            alerts.append({
+                "level": "info",
+                "role": role,
+                "text": f"{name or '右侧进攻'}按执行周期买点和均线确认复核。",
+                "command": "只看右侧进攻",
             })
     return alerts[:3]
 
 
 def _trade_command_suggestions() -> list[str]:
     return [
-        "只看产业链观察",
-        "排除过热票",
+        "只看低吸进攻",
+        "只看右侧进攻",
         "解释这只票为什么入池",
-        "列出主线分歧后可看的核心票",
+        "哪些还缺均线确认",
         "哪些票不符合我当前节奏",
     ]
 
@@ -5546,7 +6146,7 @@ def _plan_for_index(engine, name: str) -> Optional[Dict[str, Any]]:
 def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     status = engine.get_status()
     session = _serialize_session(status)
-    strategy_snapshot = _safe_strategy_snapshot()
+    strategy_snapshot = _normalize_strategy_snapshot_for_shell(_safe_strategy_snapshot())
     range_columns = _watchlist_range_columns()
     sync_lanes = _sync_lane_status()
     market_context = serialize_market_context(engine.get_market_context()) if engine.get_market_context() else None
@@ -5567,36 +6167,59 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         for item in strategy_candidates
         if _text(item.get("decision_stage")) == "strategy_candidate"
     ]
-    sell_warnings = [
-        _enrich_stock_row(dict(item), range_columns, lightweight=True) if isinstance(item, dict) and item.get("symbol") else dict(item)
+    warning_rows = [
+        dict(item)
         for item in strategy_snapshot.get("warnings", [])
         if isinstance(item, dict)
+    ]
+    try:
+        _refresh_realtime_quotes_for_rows(_mongo_db(), warning_rows, refresh_key="sell_warnings", limit=len(warning_rows) or 1)
+    except Exception:
+        pass
+    sell_warnings = [
+        _enrich_stock_row(dict(item), range_columns, lightweight=True) if isinstance(item, dict) and item.get("symbol") else dict(item)
+        for item in warning_rows
     ]
     decision_rows_raw = [
         dict(item)
         for item in strategy_snapshot.get("decision_queue", [])
         if isinstance(item, dict)
     ]
-    snapshot_cluster = _cluster_from_strategy_snapshot(strategy_snapshot)
-    industry_top = snapshot_cluster.get("industry_top") or _gateway_rank_rows("board", top=8)
-    concept_top = snapshot_cluster.get("concept_top") or _gateway_rank_rows("concept", top=8)
     cluster: dict[str, Any] = {}
-    if not industry_top or not concept_top:
-        try:
-            cluster = _unwrap_response(cluster_service.get_latest(top=8))
-        except Exception:
-            cluster = {}
-        industry_top = industry_top or (cluster.get("industry") or {}).get("top") or []
-        concept_top = concept_top or (cluster.get("concept") or {}).get("top") or []
+    try:
+        cluster = _unwrap_response(cluster_service.get_latest(top=8))
+    except Exception:
+        cluster = {}
+    snapshot_cluster = _cluster_from_strategy_snapshot(strategy_snapshot)
+    industry_top = (cluster.get("industry") or {}).get("top") or snapshot_cluster.get("industry_top") or _gateway_rank_rows("board", top=8)
+    concept_top = (cluster.get("concept") or {}).get("top") or snapshot_cluster.get("concept_top") or _gateway_rank_rows("concept", top=8)
     sector_boards = _chain_heat_sector_rows()
     focus_stocks = _terminal_stock_pool_rows(range_columns)
     risk_stocks = _terminal_stock_pool_group_rows(range_columns, "risk_stocks")
     watch_stocks = _terminal_stock_pool_group_rows(range_columns, "watch_stocks")
     clue_stocks = _terminal_stock_pool_group_rows(range_columns, "clue_stocks")
     manual_clues = _manual_clue_rows(range_columns)
-    scored_raw = _merge_stock_rows_by_symbol(manual_clues + (clue_stocks or strategy_clues))
+    manual_attack_focus = _manual_clue_attack_focus_rows(manual_clues, focus_stocks)
+    focus_stocks = _merge_stock_rows_by_symbol(manual_attack_focus + focus_stocks)
+    focus_symbols = {
+        _text(row.get("symbol") or row.get("code")).upper()
+        for row in focus_stocks
+        if _text(row.get("symbol") or row.get("code"))
+    }
+    manual_focus_count = sum(
+        1 for row in manual_clues
+        if _text(row.get("symbol") or row.get("code")).upper() in focus_symbols
+    )
+    remaining_manual_clues = [
+        row for row in manual_clues
+        if _text(row.get("symbol") or row.get("code")).upper() not in focus_symbols
+    ]
+    scored_raw = _merge_stock_rows_by_symbol(remaining_manual_clues + (clue_stocks or strategy_clues))
     scored = _enrich_scored_stock_rows(scored_raw, range_columns)
     focus_stocks_meta = _focus_stock_pool_meta(len(focus_stocks))
+    if manual_focus_count:
+        focus_stocks_meta["manual_attack_count"] = manual_focus_count
+        focus_stocks_meta["source_collection"] = "terminal_stock_pool + terminal_manual_clues.attack_focus"
     for rows, lane in (
         (macro_indices, "quote_lane"),
         (sector_boards, "board_lane"),
@@ -5612,7 +6235,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
 
     decision_queue = _build_trader_task_queue(
         decision_rows=decision_rows_raw,
-        focus_stocks=focus_stocks + risk_stocks,
+        focus_stocks=focus_stocks,
         sector_boards=sector_boards,
     )
     scored_shell = [_slim_shell_stock_row(row) for row in scored]
@@ -5690,8 +6313,9 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
                 "source_collection": "terminal_manual_clues + terminal_stock_pool.clue_stocks + strategy_snapshots.strategy_candidate",
                 "count": len(scored),
                 "role": "source_clue_only_not_entry",
-                "manual_clues": len(manual_clues),
-                "empty_reason": "" if scored else "当前没有纯线索；已有硬技术的标的会进入盯盘池或确认买点。",
+                "manual_clues": len(remaining_manual_clues),
+                "manual_attack_promoted": manual_focus_count,
+                "empty_reason": "" if scored else "当前没有纯线索；已有硬技术的标的会进入盯盘池或买点池。",
             },
             "focus_stocks": focus_stocks_meta,
             "risk_stocks": {
@@ -5755,6 +6379,7 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
         if _shell_cache_usable(cached_payload, engine, quote_watermark=quote_watermark) and refreshed_now < float(_SHELL_CACHE.get("expires_at") or 0):
             return _payload_from_shell_cache(cached_payload, "hit_after_lock", refreshed_now, quote_watermark)
         payload = _build_shell_payload_uncached(engine)
+        quote_watermark = _quote_snapshot_watermark()
         ttl_seconds = _shell_cache_ttl_seconds(payload)
         _SHELL_CACHE.update({
             "payload": dict(payload),
@@ -5804,6 +6429,20 @@ def _safe_strategy_snapshot() -> Dict[str, Any]:
             "strategy_kpis": {},
             "source_confidence": {"overall": 0, "sources": []},
         }
+
+
+def _normalize_strategy_snapshot_for_shell(snapshot: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(snapshot) if isinstance(snapshot, dict) else {}
+    brief = dict(normalized.get("daily_brief")) if isinstance(normalized.get("daily_brief"), dict) else {}
+    summary = _text(brief.get("summary"))
+    if summary:
+        summary = re.sub(r"，先处理\s*\d+\s*个风险预警", "", summary)
+        summary = summary.replace("确认买点复核", "买点池复核")
+        brief["summary"] = summary
+    if "risk_notes" in brief:
+        brief["risk_notes"] = []
+    normalized["daily_brief"] = brief
+    return normalized
 
 
 def _gateway_rank_rows(domain: str, top: int = 8) -> list[dict[str, Any]]:
@@ -6068,6 +6707,95 @@ def _chain_rebuild_board_candidates(name: str, kind: str, limit: int = 20) -> li
     return rows
 
 
+def _representative_rank_for_summary(value: Any) -> int:
+    return {"core": 4, "elastic": 3, "upstream": 2, "downstream": 1}.get(_text(value), 0)
+
+
+def _taxonomy_representative_position_summary(symbol: str) -> dict[str, Any]:
+    normalized, raw_code = _stock_symbol_from_code_or_name(symbol)
+    normalized = _text(normalized).upper()
+    raw_code = _text(raw_code or symbol).upper().split(".", 1)[-1]
+    if not normalized and not raw_code:
+        return {}
+
+    rows: list[dict[str, Any]] = []
+    for chain in load_industry_chains().values():
+        chain_id = _text(chain.get("chain_id"))
+        chain_name = _text(chain.get("name"))
+        for node in chain.get("nodes") or []:
+            node_id = _text(node.get("node_id"))
+            for representative_type, rep_key in (("core", "core_representatives"), ("elastic", "elastic_representatives")):
+                for rep in node.get(rep_key) or []:
+                    rep_symbol, rep_raw_code = _stock_symbol_from_code_or_name(rep.get("symbol"), rep.get("name"))
+                    rep_symbol = _text(rep_symbol).upper()
+                    rep_raw_code = _text(rep_raw_code).upper()
+                    if not rep_symbol and not rep_raw_code:
+                        continue
+                    if normalized and rep_symbol != normalized:
+                        continue
+                    if raw_code and rep_raw_code and rep_raw_code != raw_code:
+                        continue
+                    priority = int(rep.get("priority") or 0)
+                    rows.append({
+                        "chain_id": chain_id,
+                        "chain": chain_name,
+                        "chain_name": chain_name,
+                        "node_id": node_id,
+                        "node": _text(node.get("name")),
+                        "node_name": _text(node.get("name")),
+                        "role": _text(rep.get("relation")) or _text(node.get("name")),
+                        "layer": _text(node.get("layer")),
+                        "stage": _text(node.get("stage")),
+                        "source": "industry_chains.yaml",
+                        "source_note": _text(rep.get("source_note")) or "代表标的静态映射",
+                        "confidence": "taxonomy_representative",
+                        "representative_type": representative_type,
+                        "representative_priority": priority,
+                        "representative_relation": _text(rep.get("relation")),
+                        "taxonomy_representative": True,
+                        "is_primary_chain": True,
+                        "related_chains": [],
+                    })
+    if not rows:
+        return {}
+
+    rows.sort(
+        key=lambda row: (
+            _representative_rank_for_summary(row.get("representative_type")),
+            int(row.get("representative_priority") or 0),
+        ),
+        reverse=True,
+    )
+    primary = dict(rows[0])
+    primary["related_chains"] = [
+        row.get("chain_name")
+        for row in rows[1:]
+        if row.get("chain_name") and row.get("chain_name") != primary.get("chain_name")
+    ][:3]
+    return primary
+
+
+def _membership_is_stale_taxonomy_representative(membership: dict[str, Any], taxonomy: dict[str, Any]) -> bool:
+    if not membership or not taxonomy:
+        return False
+    if not membership.get("taxonomy_representative"):
+        return False
+    if (
+        _text(membership.get("chain_id")) == _text(taxonomy.get("chain_id"))
+        and _text(membership.get("node_id")) == _text(taxonomy.get("node_id"))
+    ):
+        return False
+    membership_key = (
+        _representative_rank_for_summary(membership.get("representative_type")),
+        int(membership.get("representative_priority") or 0),
+    )
+    taxonomy_key = (
+        _representative_rank_for_summary(taxonomy.get("representative_type")),
+        int(taxonomy.get("representative_priority") or 0),
+    )
+    return taxonomy_key >= membership_key
+
+
 def _stock_chain_membership_summary(symbol: str) -> dict[str, Any]:
     raw_symbol = _text(symbol).upper()
     raw_code = raw_symbol.split(".", 1)[-1] if "." in raw_symbol else raw_symbol
@@ -6098,15 +6826,19 @@ def _stock_chain_membership_summary(symbol: str) -> dict[str, Any]:
         "node_id": _text(row.get("node_id")),
         "node": _text(row.get("node_name")),
         "node_name": _text(row.get("node_name")),
-        "role": _text(row.get("role") or row.get("node_name")),
+        "role": _text(row.get("role") or row.get("representative_relation") or row.get("node_name")),
         "layer": _text(row.get("layer")),
         "stage": _text(row.get("stage")),
         "source": "security_chain_memberships",
-        "source_note": "盘后全局产业链重塑主归属",
+        "source_note": _text(row.get("source_note")) or "盘后全局产业链重塑主归属",
         "confidence": row.get("confidence"),
         "exposure_score": row.get("exposure_score"),
         "is_primary_chain": bool(row.get("is_primary_chain")),
         "trade_date": _text(row.get("trade_date")),
+        "representative_type": _text(row.get("representative_type")),
+        "representative_priority": row.get("representative_priority"),
+        "representative_relation": _text(row.get("representative_relation")),
+        "taxonomy_representative": bool(row.get("taxonomy_representative")),
         "related_chains": [],
     }
 
@@ -6757,6 +7489,7 @@ def _concept_carrier_candidates(
                     "layer": item.get("layer"),
                     "stage": item.get("stage"),
                     "representative_type": item.get("representative_type"),
+                    "chain_relation_type": item.get("chain_relation_type"),
                     "source_note": item.get("source_note"),
                     "confidence": item.get("confidence"),
                     "hit_terms": item.get("hit_terms"),
@@ -7001,17 +7734,17 @@ def _summary_from_static_index(name: str, symbol: str, chart: Dict[str, Any]) ->
             for value in [_text(chain_position.get("chain")), _text(chain_position.get("node") or chain_position.get("role"))]
             if value
         )
+        trade_role_label = {
+            "watch": "盯盘观察",
+            "clue": "线索池",
+        }.get(trade_role, "线索池")
         summary.update({
             "chain_position": chain_position,
             "chain_context": _stock_chain_context(chain_position),
+            "setup_mode": trade_role,
+            "setup_mode_label": trade_role_label,
             "trade_role": trade_role,
-            "trade_role_label": {
-                "chain_watch": "产业链观察",
-                "mainline_attack": "主线机会",
-                "climax_risk": "过热禁追",
-                "defensive_weight": "防守观察",
-                "second_wave": "回踩再起",
-            }.get(trade_role, "观察"),
+            "trade_role_label": trade_role_label,
             "trader_read": _stock_summary_trade_read(chain_position, trade_role),
             "evidence_summary": "；".join([
                 f"产业链: {chain_text}" if chain_text else "",
@@ -7054,8 +7787,20 @@ def _summary_from_industry(name: str, detail: Dict[str, Any], ranking) -> Dict[s
 
 def _stock_chain_position_summary(symbol: str) -> dict[str, Any]:
     membership = _stock_chain_membership_summary(symbol)
+    taxonomy = _taxonomy_representative_position_summary(symbol)
+    if _membership_is_stale_taxonomy_representative(membership, taxonomy):
+        return {
+            **taxonomy,
+            "source_note": _text(taxonomy.get("source_note")) or "当前静态产业链映射覆盖旧重塑结果",
+            "stale_membership_source": "security_chain_memberships",
+            "stale_membership_chain_id": membership.get("chain_id"),
+            "stale_membership_node_id": membership.get("node_id"),
+            "stale_membership_trade_date": membership.get("trade_date"),
+        }
     if membership:
         return membership
+    if taxonomy:
+        return taxonomy
     try:
         from signals.core.chain_map import get_all_chain_positions
 
@@ -7080,13 +7825,9 @@ def _stock_chain_position_summary(symbol: str) -> dict[str, Any]:
 
 def _trade_role_for_stock_summary(chain_position: dict[str, Any]) -> str:
     phase = _text(chain_position.get("phase"))
-    if phase == "consensus_climax":
-        return "climax_risk"
-    if phase in {"cooling", "diverging"}:
-        return "second_wave"
     if phase in {"accelerating", "warming"}:
-        return "mainline_attack"
-    return "chain_watch"
+        return "watch"
+    return "clue"
 
 
 def _stock_summary_trade_read(chain_position: dict[str, Any], role: str) -> str:
@@ -7095,17 +7836,9 @@ def _stock_summary_trade_read(chain_position: dict[str, Any], role: str) -> str:
         for value in [_text(chain_position.get("chain")), _text(chain_position.get("node") or chain_position.get("role"))]
         if value
     )
-    if role == "chain_watch":
-        return f"{chain or '产业链'}：不在当前买点池时只按产业链观察，不代表真实持仓；等重新进入盯盘/确认买点。"
-    if role == "mainline_attack":
-        return f"{chain or '主线'}：按主线机会观察，等分歧承接和右侧买点确认。"
-    if role == "climax_risk":
-        return f"{chain or '主线'}：一致过热，不追高，等分歧后核心票重新承接。"
-    if role == "defensive_weight":
-        return f"{chain or '防守观察'}：偏稳仓/防守，不和进攻票混排，没进池前只看图表位置。"
-    if role == "second_wave":
-        return f"{chain or '回踩再起'}：当前不在池内，先按回踩后二次启动观察，等右侧重新确认。"
-    return f"{chain or '观察标的'}：当前不在机会池，先看图表证据，不作为执行买点。"
+    if role == "watch":
+        return f"{chain or '盯盘观察'}：只有产业链/图表背景，不代表真实持仓；等买点质量和均线确认后再进入买点池。"
+    return f"{chain or '线索池'}：当前不在买点池，先看图表证据，不作为执行买点。"
 
 
 def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any]) -> Dict[str, Any]:
@@ -7176,17 +7909,17 @@ def _summary_from_stock(symbol: str, stock: Dict[str, Any], chart: Dict[str, Any
             for value in [_text(chain_position.get("chain")), _text(chain_position.get("node") or chain_position.get("role"))]
             if value
         )
+        trade_role_label = {
+            "watch": "盯盘观察",
+            "clue": "线索池",
+        }.get(trade_role, "线索池")
         summary.update({
             "chain_position": chain_position,
             "chain_context": _stock_chain_context(chain_position),
+            "setup_mode": trade_role,
+            "setup_mode_label": trade_role_label,
             "trade_role": trade_role,
-            "trade_role_label": {
-                "chain_watch": "产业链观察",
-                "mainline_attack": "主线机会",
-                "climax_risk": "过热禁追",
-                "defensive_weight": "防守观察",
-                "second_wave": "回踩再起",
-            }.get(trade_role, "观察"),
+            "trade_role_label": trade_role_label,
             "trader_read": _stock_summary_trade_read(chain_position, trade_role),
             "evidence_summary": "；".join([
                 f"产业链: {chain_text}" if chain_text else "",

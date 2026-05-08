@@ -114,6 +114,49 @@ def _latest_pool_symbols(db: Database) -> list[str]:
     return symbols
 
 
+def _latest_chain_heat_representative_symbols(db: Database) -> list[str]:
+    symbols: list[str] = []
+
+    def add(value: object) -> None:
+        symbol = _normalize_quote_symbol(value)
+        if symbol and _is_a_quote_symbol(symbol) and symbol not in symbols:
+            symbols.append(symbol)
+
+    try:
+        latest = db["chain_heat_snapshots"].find_one(
+            {"market": "A"},
+            {"trade_minute": 1},
+            sort=[("trade_minute", -1), ("updated_at", -1)],
+        ) or {}
+        trade_minute = latest.get("trade_minute")
+        if not trade_minute:
+            return []
+        limit = max(1, min(80, int(os.getenv("QUOTE_CHAIN_HEAT_NODE_LIMIT", "32"))))
+        cursor = db["chain_heat_snapshots"].find(
+            {"market": "A", "trade_minute": trade_minute},
+            {
+                "_id": 0,
+                "leader_symbol": 1,
+                "representatives": 1,
+                "integrated_domains.representatives": 1,
+            },
+        ).sort("rank", 1).limit(limit)
+        for row in cursor:
+            add(row.get("leader_symbol"))
+            for rep in row.get("representatives") or []:
+                if isinstance(rep, dict):
+                    add(rep.get("symbol") or rep.get("code") or rep.get("raw_code"))
+            for domain in row.get("integrated_domains") or []:
+                if not isinstance(domain, dict):
+                    continue
+                for rep in domain.get("representatives") or []:
+                    if isinstance(rep, dict):
+                        add(rep.get("symbol") or rep.get("code") or rep.get("raw_code"))
+    except Exception:
+        logger.debug("chain heat representative quote symbols unavailable", exc_info=True)
+    return symbols
+
+
 def _write_provider_health(
     db: Database,
     ok: bool,
@@ -476,6 +519,19 @@ def _hot_quote_symbols(db: Database) -> list[str]:
 
     for symbol in _MACRO_QUOTE_SYMBOLS:
         add(symbol)
+
+    for item in _iter_strategy_snapshot_symbols():
+        add(item)
+
+    try:
+        for item in db["terminal_manual_clues"].find(
+            {"active": {"$ne": False}},
+            {"symbol": 1, "raw_code": 1},
+        ).sort("updated_at", -1).limit(80):
+            add(item.get("symbol") or item.get("raw_code"))
+    except Exception:
+        logger.debug("manual clue quote symbols unavailable", exc_info=True)
+
     try:
         for item in macro_watchlist():
             if isinstance(item, dict):
@@ -486,25 +542,18 @@ def _hot_quote_symbols(db: Database) -> list[str]:
     try:
         doc = db["terminal_stock_pool"].find_one(
             {"pool": "terminal_stock_pool", "market": "A"},
-            {"stocks": 1, "focus_stocks": 1, "risk_stocks": 1, "watch_stocks": 1},
+            {"stocks": 1, "focus_stocks": 1, "risk_stocks": 1, "watch_stocks": 1, "clue_stocks": 1},
             sort=[("updated_at", -1)],
         ) or {}
     except Exception:
         doc = {}
-    for group in ("focus_stocks", "risk_stocks", "watch_stocks", "stocks"):
+    for group in ("focus_stocks", "risk_stocks", "watch_stocks", "clue_stocks", "stocks"):
         for item in doc.get(group) or []:
             if not isinstance(item, dict):
                 continue
             add(item.get("symbol") or item.get("code") or item.get("raw_code"))
-    try:
-        for item in db["terminal_manual_clues"].find(
-            {"active": {"$ne": False}},
-            {"symbol": 1, "raw_code": 1},
-        ).sort("updated_at", -1).limit(80):
-            add(item.get("symbol") or item.get("raw_code"))
-    except Exception:
-        logger.debug("manual clue quote symbols unavailable", exc_info=True)
-
+    for symbol in _latest_chain_heat_representative_symbols(db):
+        add(symbol)
     for symbol in _latest_pool_symbols(db):
         add(symbol)
 

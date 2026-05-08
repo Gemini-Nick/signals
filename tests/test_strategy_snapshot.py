@@ -288,5 +288,5 @@ def test_strategy_snapshot_uses_terminal_pool_before_generated_signal_pool():
     assert snapshot["candidates"][1]["decision_stage"] == "watch_preheat"
     assert snapshot["warnings"][0]["decision_stage"] == "risk_first"
     assert snapshot["daily_brief"]["top_candidate"] == "SH.688981"
-    assert "先处理 1 个风险预警" in snapshot["daily_brief"]["summary"]
-    assert "确认买点复核 SH.688981" in snapshot["daily_brief"]["summary"]
+    assert "风险预警" not in snapshot["daily_brief"]["summary"]
+    assert "买点池复核 SH.688981" in snapshot["daily_brief"]["summary"]

@@ -62,6 +62,8 @@ function _initBtEvents() {
   document.getElementById('bt-analyze')?.addEventListener('click', _runAnalyze);
   document.getElementById('bt-scan-run')?.addEventListener('click', _runScan);
   document.getElementById('bt-export')?.addEventListener('click', _exportCSV);
+  document.getElementById('bt-report-html')?.addEventListener('click', () => _downloadReport('html'));
+  document.getElementById('bt-report-pdf')?.addEventListener('click', () => _downloadReport('pdf'));
   document.getElementById('bt-push-wx')?.addEventListener('click', _pushToWeChat);
   document.getElementById('bt-code')?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') _runAnalyze();
@@ -249,6 +251,8 @@ async function _runAnalyze() {
 
     _switchBtTab('perf');
     document.getElementById('bt-export').style.display = '';
+    document.getElementById('bt-report-html').style.display = '';
+    document.getElementById('bt-report-pdf').style.display = '';
     document.getElementById('bt-push-wx').style.display = '';
 
   } catch (e) {
@@ -1215,6 +1219,40 @@ async function _exportCSV() {
     showToast('导出成功');
   } catch (e) {
     showToast('导出失败: ' + e.message);
+  }
+}
+
+
+async function _downloadReport(format) {
+  if (!_btFullData) { showToast('请先运行分析'); return; }
+  const btn = document.getElementById(`bt-report-${format}`);
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '生成中...';
+  try {
+    const resp = await fetch('/api/backtest/report?format=' + encodeURIComponent(format), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(_btFullData),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const blob = await resp.blob();
+    const disposition = resp.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename="([^"]+)"/);
+    const code = (_btFullData.code || _btFullData.symbol || 'unknown').replace('.', '_');
+    const filename = match ? match[1] : `backtest_${code}.${format}`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast(`${format.toUpperCase()} 报告已生成`);
+  } catch (e) {
+    showToast('报告生成失败: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
   }
 }
 

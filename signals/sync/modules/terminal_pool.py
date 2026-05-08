@@ -24,6 +24,14 @@ MACD_TOKENS = ("MACD", "零上绿柱扩大", "零下绿柱缩小")
 GAP_TOKENS = ("缺口", "突破缺口", "持续缺口", "衰竭缺口", "普通缺口")
 ENTRY_FACTOR_TOKENS = ("gap", "trend_breakout", "vol_contraction", "candle_run", "candle_accel")
 TECHNICAL_TOKENS = CHAN_TOKENS + PATTERN_TOKENS + MACD_TOKENS + GAP_TOKENS + ENTRY_FACTOR_TOKENS
+SIGNAL_TYPE_NORMALIZATIONS = {
+    "1买": "一买",
+    "2买": "二买",
+    "3买": "三买",
+    "1卖": "一卖",
+    "2卖": "二卖",
+    "3卖": "三卖",
+}
 LEFT_OPPORTUNITY_TOKENS = (
     "一买",
     "背驰买",
@@ -50,6 +58,71 @@ RIGHT_OPPORTUNITY_TOKENS = (
     "candle_accel",
 )
 WEAK_CONTEXT_TOKENS = ("缺口买:普通",)
+MAINLINE_LENIENT_SECTOR_TOKENS = (
+    "科技",
+    "半导体",
+    "芯片",
+    "ai硬件",
+    "ai算力",
+    "算力",
+    "数据中心",
+    "cpo",
+    "光模块",
+    "光连接",
+    "光通信",
+    "通信网络",
+    "f5g",
+    "5g",
+    "消费电子",
+    "华为链",
+    "电新",
+    "新能源",
+    "锂电",
+    "锂资源",
+    "电池",
+    "储能",
+    "光伏",
+    "风电",
+    "新能车",
+    "新能源汽车",
+    "电力设备",
+    "小金属",
+    "稀有金属",
+    "稀土",
+    "有色金属",
+    "工业金属",
+    "贵金属",
+    "金属新材料",
+    "钨",
+    "钼",
+    "锑",
+    "钴",
+    "镍",
+    "钛",
+    "镁",
+)
+DEFENSIVE_STRICT_SECTOR_TOKENS = (
+    "银行",
+    "大金融",
+    "金融",
+    "保险",
+    "消费品",
+    "消费",
+    "白酒",
+    "食品饮料",
+    "纺织",
+    "轻工",
+    "服装",
+    "家纺",
+    "家电家居",
+    "家电/照明",
+)
+BROAD_MARKET_INDEXES = (
+    ("上证指数", "sh000001"),
+    ("沪深300", "sh000300"),
+    ("创业板指", "sz399006"),
+)
+BROAD_MARKET_FALL_THRESHOLD = -0.2
 RIGHT_SIDE_FREQS = {"5分钟", "5min", "5m", "F5", "f5", "15分钟", "15min", "15m", "F15", "f15"}
 BUY_FREQ_BONUS = {"30分钟": 120, "30min": 120, "30m": 120, "15分钟": 110, "15min": 110, "15m": 110, "5分钟": 80, "5min": 80, "5m": 80}
 ENTRY_30M_FREQS = {"30分钟", "30min", "30m", "F30", "f30"}
@@ -57,12 +130,14 @@ ENTRY_UPPER_FREQS = {"日线", "daily", "1d", "D", "d", "周线", "weekly", "1w"
 ENTRY_PARTNER_FREQS = ENTRY_UPPER_FREQS | RIGHT_SIDE_FREQS
 ENTRY_QUEUE_LANES = {"entry_ready", "entry_waiting_confirm", "entry_waiting_upper_context", "entry_waiting_right_side_confirm"}
 RISK_ACTION_STATUSES = {"risk_review", "chain_risk_review", "knowledge_blocked", "knowledge_conflict"}
-POOL_RANKING_VERSION = "entry_priority_v2"
+POOL_RANKING_VERSION = "tech_ma_hot_sector_v2_sector_policy"
 TRADE_STAGE_LABELS = {
     "clue_pool": "线索池",
     "watch_pool": "盯盘池",
     "dip_watch": "低吸观察",
+    "left_attack": "低吸进攻",
     "probe_candidate": "试仓候选",
+    "attack_entry": "进攻买点",
     "confirmed_entry": "确认买点",
     "skip_now": "暂不参与",
 }
@@ -70,13 +145,17 @@ TRADE_STAGE_ACTIONS = {
     "clue_pool": "先放线索池",
     "watch_pool": "盯盘等买点",
     "dip_watch": "低吸观察",
+    "left_attack": "低吸进攻复核",
     "probe_candidate": "小仓试仓复核",
+    "attack_entry": "进攻买点复核",
     "confirmed_entry": "确认买点复核",
     "skip_now": "暂不参与",
 }
 TRADE_INTENT_LABELS = {
     "clue_only": "线索来源",
     "left_dip": "左侧低吸",
+    "left_attack": "低吸进攻",
+    "attack_entry": "进攻买点",
     "right_momentum": "右侧动量",
     "probe_candidate": "试仓候选",
     "wait_30m": "等30m买点",
@@ -96,6 +175,8 @@ TRADE_ROLE_LABELS = {
 }
 TRADE_INTENT_PRIORITY = {
     "confirmed_entry": 100,
+    "attack_entry": 92,
+    "left_attack": 88,
     "right_momentum": 86,
     "probe_candidate": 78,
     "wait_30m": 62,
@@ -104,18 +185,28 @@ TRADE_INTENT_PRIORITY = {
     "clue_only": 10,
     "skip_now": 0,
 }
+SETUP_MODE_LABELS = {
+    "left_attack": "低吸进攻",
+    "right_attack": "右侧进攻",
+    "watch": "观察",
+    "risk_first": "风险优先",
+}
 TRADE_STAGE_LEGACY_DECISION = {
     "clue_pool": "strategy_candidate",
     "watch_pool": "watch_preheat",
     "dip_watch": "watch_preheat",
+    "left_attack": "entry_waiting_confirm",
     "probe_candidate": "watch_preheat",
+    "attack_entry": "entry_waiting_confirm",
     "confirmed_entry": "entry_ready",
     "skip_now": "risk_first",
 }
 MISSING_GATE_LABELS = {
     "risk_signal_present": "有卖点或冲突，先别当机会",
     "missing_buy_technical": "还没有硬技术买点",
+    "left_attack_ma_confirmed": "左侧买点叠加10/20日线承接，按低吸进攻复核",
     "30m_missing": "等30m买点",
+    "30m_attack_missing": "30m未补齐，按进攻买点小仓复核",
     "30m_stale": "30m信号过期，等新的30m",
     "30m_right_side_missing": "30m还没走出确认买点",
     "daily_or_weekly_missing": "缺日/周大周期位置",
@@ -127,6 +218,7 @@ MISSING_GATE_LABELS = {
     "chain_consensus_climax": "产业链一致高潮，别追",
     "chain_risk_off": "产业链走弱，先不看",
     "chain_block": "产业链风险未解除",
+    "defensive_strict_requires_full_confirmation": "防守板块要等完整30m和5m/15m确认",
 }
 ENTRY_BLOCK_CHAIN_PHASES = {"consensus_climax", "risk_off"}
 FREQ_ORDER = {
@@ -173,6 +265,13 @@ REVIEW_CLUE_REASON_TYPES = {"review_sector_bullish", "review_sector_bearish"}
 
 def _text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _normalize_signal_type(value: Any) -> str:
+    text = _text(value)
+    for raw, normalized in SIGNAL_TYPE_NORMALIZATIONS.items():
+        text = text.replace(raw, normalized)
+    return text
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -308,6 +407,8 @@ def _pure_a_code(symbol: Any) -> str:
         return ""
     pure = raw.split(".", 1)[-1] if "." in raw else raw
     pure = pure.replace("SH", "").replace("SZ", "").replace("BJ", "")
+    if pure.startswith(("900", "200")):
+        return ""
     return pure if pure.isdigit() and len(pure) == 6 else ""
 
 
@@ -337,8 +438,131 @@ def _index_codes() -> set[str]:
     }
 
 
+def _date_text(value: Any) -> str:
+    parsed = _date_value(value)
+    if parsed:
+        return parsed.isoformat()
+    text = _text(value)
+    digits = text.replace("-", "")[:8]
+    if len(digits) == 8 and digits.isdigit():
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    return ""
+
+
+def _doc_date_text(doc: dict[str, Any]) -> str:
+    for key in ("trade_date", "date_key", "dt", "date", "as_of", "snapshot_at", "updated_at"):
+        value = doc.get(key)
+        if value:
+            parsed = _date_text(value)
+            if parsed:
+                return parsed
+    return ""
+
+
+def _index_quote_candidates(symbol: str) -> list[str]:
+    compact = _text(symbol).lower()
+    if len(compact) != 8 or compact[:2] not in {"sh", "sz", "bj"}:
+        return [compact] if compact else []
+    pure = compact[2:]
+    market = compact[:2].upper()
+    dotted = f"{market}.{pure}"
+    suffix = f"{pure}.{market}"
+    return list(dict.fromkeys([dotted, dotted.lower(), compact, compact.upper(), suffix, suffix.lower()]))
+
+
+def _change_pct_from_doc(doc: dict[str, Any]) -> float | None:
+    for key in ("change_pct", "pct_chg", "day_change_pct", "daily_change_pct", "today_change_pct", "gain_pct"):
+        if key in doc and doc.get(key) not in (None, ""):
+            return _float(doc.get(key))
+    close = _float(doc.get("close") or doc.get("price") or doc.get("latest"))
+    prev_close = _float(doc.get("prev_close"))
+    if close > 0 and prev_close > 0:
+        return (close / prev_close - 1.0) * 100.0
+    return None
+
+
+def _index_change_doc_from_quotes(db: Database, symbol: str, trade_date: str) -> dict[str, Any]:
+    try:
+        doc = db["quote_snapshots"].find_one(
+            {"symbol": {"$in": _index_quote_candidates(symbol)}},
+            {"_id": 0},
+            sort=[("snapshot_at", -1), ("dt", -1)],
+        ) or {}
+    except Exception:
+        return {}
+    if not doc or doc.get("is_stale") or _text(doc.get("freshness")).lower() == "stale":
+        return {}
+    if _doc_date_text(doc) != trade_date:
+        return {}
+    pct = _change_pct_from_doc(doc)
+    if pct is None:
+        return {}
+    return {"source": "quote_snapshots", "change_pct": pct, "as_of": _doc_date_text(doc)}
+
+
+def _index_change_doc_from_bars(db: Database, symbol: str, trade_date: str) -> dict[str, Any]:
+    candidates = [symbol, symbol.upper(), symbol.lower()]
+    for collection in ("index_bars", "bars"):
+        try:
+            doc = db[collection].find_one(
+                {
+                    "meta.symbol": {"$in": candidates},
+                    "meta.freq": {"$in": ["daily", "日线", "D", "1d"]},
+                },
+                {"_id": 0},
+                sort=[("dt", -1)],
+            ) or {}
+        except Exception:
+            doc = {}
+        if not doc or _doc_date_text(doc) != trade_date:
+            continue
+        pct = _change_pct_from_doc(doc)
+        if pct is None:
+            continue
+        return {"source": collection, "change_pct": pct, "as_of": _doc_date_text(doc)}
+    return {}
+
+
+def _load_broad_market_context(db: Database, trade_date: str) -> dict[str, Any]:
+    index_rows: list[dict[str, Any]] = []
+    for name, symbol in BROAD_MARKET_INDEXES:
+        doc = _index_change_doc_from_quotes(db, symbol, trade_date) or _index_change_doc_from_bars(db, symbol, trade_date)
+        if not doc:
+            continue
+        index_rows.append({
+            "name": name,
+            "symbol": symbol,
+            "change_pct": round(_float(doc.get("change_pct")), 3),
+            "source": doc.get("source"),
+            "as_of": doc.get("as_of") or trade_date,
+        })
+    if not index_rows:
+        return {"is_falling": False, "label": "大盘未知", "as_of": trade_date, "index_count": 0, "indexes": []}
+    falling = [item for item in index_rows if _float(item.get("change_pct")) <= BROAD_MARKET_FALL_THRESHOLD]
+    average = sum(_float(item.get("change_pct")) for item in index_rows) / len(index_rows)
+    required = max(1, (len(index_rows) // 2) + 1)
+    is_falling = len(falling) >= required or (average <= BROAD_MARKET_FALL_THRESHOLD and bool(falling))
+    return {
+        "is_falling": is_falling,
+        "label": "大盘下跌" if is_falling else "大盘未跌",
+        "as_of": trade_date,
+        "average_change_pct": round(average, 3),
+        "falling_count": len(falling),
+        "index_count": len(index_rows),
+        "fall_threshold": BROAD_MARKET_FALL_THRESHOLD,
+        "indexes": index_rows,
+    }
+
+
+def _attach_broad_market_context(rows: dict[str, dict[str, Any]], context: dict[str, Any]) -> None:
+    if not isinstance(context, dict) or not context:
+        return
+    for row in rows.values():
+        row["broad_market_context"] = context
+
+
 def _signal_text(row: dict[str, Any]) -> str:
-    return " ".join(_text(row.get(key)) for key in ("signal_type", "type", "reason", "summary", "details"))
+    return _normalize_signal_type(" ".join(_text(row.get(key)) for key in ("signal_type", "type", "reason", "summary", "details")))
 
 
 def _source(row: dict[str, Any]) -> str:
@@ -571,6 +795,9 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
     context_only = decision_effect in {"context_only", "history_pending"} or source_role == "context"
     weight = 0.0 if context_only else base_weight + BUY_FREQ_BONUS.get(freq, 0) + side_bonus + _float(reason.get("score")) * 0.05 + _float(reason.get("heat_score")) * 0.05
     evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+    ma_alignment = reason.get("ma_alignment") if isinstance(reason.get("ma_alignment"), dict) else {}
+    if not ma_alignment and isinstance(evidence.get("ma_alignment"), dict):
+        ma_alignment = evidence.get("ma_alignment") or {}
     event_dt = (
         _iso_dt(reason.get("event_dt"))
         or _iso_dt(reason.get("dt"))
@@ -592,7 +819,7 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
         "queue_lane": queue_lane,
         "source_collection": _text(reason.get("source_collection")),
         "source_doc_id": _text(reason.get("source_doc_id")),
-        "signal_type": _text(reason.get("signal_type")),
+        "signal_type": _normalize_signal_type(reason.get("signal_type")),
         "signal_side": signal_side,
         "signal_family": _text(reason.get("signal_family")),
         "freq": freq,
@@ -614,6 +841,7 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
         "event_date": event_dt[:10] if event_dt else "",
         "signal_age_trading_days": signal_age,
         "evidence": evidence,
+        "ma_alignment": ma_alignment,
         "resonance_context": reason.get("resonance_context") if isinstance(reason.get("resonance_context"), dict) else {},
         "knowledge_status": _text(reason.get("knowledge_status")),
         "knowledge_effect": _text(reason.get("knowledge_effect")),
@@ -627,6 +855,10 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
     top = row["inclusion_reasons"][0]
     row["sort_score"] = max(_float(row.get("sort_score")), _float(top.get("weight")))
     row["score"] = max(_float(row.get("score")), _float(reason.get("score")), _float(reason.get("heat_score")))
+    if ma_alignment:
+        existing_ma = row.get("ma_alignment") if isinstance(row.get("ma_alignment"), dict) else {}
+        if _float(ma_alignment.get("score")) >= _float(existing_ma.get("score")):
+            row["ma_alignment"] = ma_alignment
     row["signal_origin"] = top["reason_type"]
     row["signal_family"] = top.get("signal_family") or row.get("signal_family") or ""
     if top.get("signal_type"):
@@ -662,6 +894,7 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
             "signal_age_trading_days": normalized["signal_age_trading_days"],
             "evidence": normalized["evidence"],
             "resonance_context": resonance_context,
+            "ma_alignment": normalized["ma_alignment"],
             "actionability": normalized["actionability"],
             "queue_lane": normalized["queue_lane"],
         }
@@ -905,6 +1138,7 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
             "as_of": 1,
             "updated_at": 1,
             "dedupe_key": 1,
+            "ma_alignment": 1,
             "technical_evidence": 1,
             "resonance_context": 1,
             "invalidates_when": 1,
@@ -912,6 +1146,9 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
     ).sort([("total_score", -1), ("confidence", -1), ("updated_at", -1)]).limit(limit)
     for signal in cursor:
         evidence = signal.get("technical_evidence") if isinstance(signal.get("technical_evidence"), dict) else {}
+        ma_alignment = signal.get("ma_alignment") if isinstance(signal.get("ma_alignment"), dict) else {}
+        if not ma_alignment and isinstance(evidence.get("ma_alignment"), dict):
+            ma_alignment = evidence.get("ma_alignment") or {}
         resonance_context = signal.get("resonance_context") if isinstance(signal.get("resonance_context"), dict) else {}
         if not resonance_context and isinstance(evidence, dict):
             resonance_context = evidence.get("resonance_context") or {}
@@ -928,6 +1165,7 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
             "as_of": _text(signal.get("as_of") or signal.get("updated_at"))[:10],
             "event_dt": _iso_dt(signal.get("dt")),
             "source_role": "technical_trigger",
+            "ma_alignment": ma_alignment,
             "resonance_context": resonance_context,
             "evidence": evidence,
         }, index_codes=index_codes)
@@ -1754,6 +1992,142 @@ def _buy_technical_reasons(row: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _truthy_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return _text(value).lower() in {"1", "true", "yes", "on", "y", "站上", "是"}
+
+
+def _reason_ma_alignment(reason: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(reason, dict):
+        return {}
+    if isinstance(reason.get("ma_alignment"), dict):
+        return reason.get("ma_alignment") or {}
+    evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+    if isinstance(evidence.get("ma_alignment"), dict):
+        return evidence.get("ma_alignment") or {}
+    technical = reason.get("technical_evidence") if isinstance(reason.get("technical_evidence"), dict) else {}
+    if isinstance(technical.get("ma_alignment"), dict):
+        return technical.get("ma_alignment") or {}
+    return {}
+
+
+def _best_ma_alignment(row: dict[str, Any], reasons: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    if isinstance(row.get("ma_alignment"), dict):
+        candidates.append(row["ma_alignment"])
+    technical = row.get("technical_evidence") if isinstance(row.get("technical_evidence"), dict) else {}
+    if isinstance(technical.get("ma_alignment"), dict):
+        candidates.append(technical["ma_alignment"])
+    for reason in reasons or _buy_technical_reasons(row):
+        ma = _reason_ma_alignment(reason)
+        if ma:
+            candidates.append(ma)
+    return max(candidates, key=lambda item: _float(item.get("score")), default={})
+
+
+def _ma_alignment_score_from_alignment(ma: dict[str, Any]) -> float:
+    if not isinstance(ma, dict) or not ma:
+        return 0.0
+    score = 0.0
+    explicit = _float(ma.get("score"))
+    weights = {5: 6.0, 10: 11.0, 20: 18.0}
+    reclaim_weights = {5: 3.0, 10: 5.0, 20: 8.0}
+    for period, weight in weights.items():
+        if _truthy_bool(ma.get(f"above_ma{period}")):
+            score += weight
+        elif _truthy_bool(ma.get(f"near_ma{period}")):
+            score += weight * 0.45
+        if _truthy_bool(ma.get(f"reclaim_ma{period}")):
+            score += reclaim_weights[period]
+    if _text(ma.get("ma_stack")) == "bullish":
+        score += 5.0
+    elif _text(ma.get("ma_stack")) == "bearish":
+        score -= 4.0
+    direction = _text(ma.get("ma20_direction")).lower()
+    if direction in {"向上", "up", "upward", "rising"}:
+        score += 3.0
+    elif direction in {"向下", "down", "downward", "falling"}:
+        score -= 3.0
+    if score == 0.0 and explicit:
+        score = explicit
+    elif explicit:
+        score = max(score, explicit * 0.75)
+    return round(max(0.0, min(45.0, score)), 3)
+
+
+def _ma_alignment_score(row: dict[str, Any], reasons: list[dict[str, Any]] | None = None) -> float:
+    return _ma_alignment_score_from_alignment(_best_ma_alignment(row, reasons))
+
+
+def _ma_left_attack_confirmed(ma: dict[str, Any]) -> bool:
+    if not ma:
+        return False
+    return any(
+        _truthy_bool(ma.get(key))
+        for key in ("above_ma20", "near_ma20", "reclaim_ma20", "above_ma10", "near_ma10", "reclaim_ma10")
+    )
+
+
+def _ma_right_attack_confirmed(ma: dict[str, Any]) -> bool:
+    if not ma:
+        return False
+    above_count = sum(1 for period in (5, 10, 20) if _truthy_bool(ma.get(f"above_ma{period}")))
+    return above_count >= 2 or _float(ma.get("above_count")) >= 2
+
+
+def _buy_point_quality_for_reason(reason: dict[str, Any]) -> float:
+    text = _reason_signal_text(reason)
+    side = _technical_opportunity_side(reason)
+    if side not in {"left", "right"}:
+        return 0.0
+    if "二买" in text:
+        base = 28.0
+    elif "三买" in text:
+        base = 26.0
+    elif "一买" in text:
+        base = 25.0
+    elif "背驰买" in text or "底背离" in text:
+        base = 21.0
+    elif "趋势买" in text:
+        base = 19.0
+    elif "突破" in text or "trend_breakout" in text:
+        base = 18.0
+    elif "MACD绿柱扩大" in text or "零上绿柱扩大" in text:
+        base = 14.0
+    elif "MACD绿柱缩小" in text or "零下绿柱缩小" in text:
+        base = 12.0
+    elif "缺口买" in text or "缺口" in text:
+        base = 10.0
+    else:
+        base = 8.0
+    freq = _text(reason.get("freq"))
+    freq_bonus = 0.0
+    if _is_30m_freq(freq):
+        freq_bonus = 8.0
+    elif _is_right_side_freq(freq):
+        freq_bonus = 6.0
+    elif _is_upper_freq(freq):
+        freq_bonus = 4.0
+    side_bonus = 4.0 if side == "right" and (_is_30m_freq(freq) or _is_right_side_freq(freq)) else 3.0 if side == "left" else 0.0
+    freshness = _freshness_score_for_reason(reason, 5.0)
+    signal_score = min(8.0, max(0.0, _float(reason.get("score"))) * 0.04)
+    confidence = min(1.0, _float(reason.get("confidence"))) * 3.0
+    return round(min(55.0, base + freq_bonus + side_bonus + freshness + signal_score + confidence), 3)
+
+
+def _buy_point_quality(row: dict[str, Any], buy_reasons: list[dict[str, Any]] | None = None) -> float:
+    reasons = buy_reasons or _buy_technical_reasons(row)
+    values = [_buy_point_quality_for_reason(reason) for reason in reasons]
+    quality = max(values, default=0.0)
+    sides = {_technical_opportunity_side(reason) for reason in reasons}
+    if {"left", "right"} <= sides:
+        quality += 4.0
+    return round(min(60.0, quality), 3)
+
+
 def _risk_reasons(row: dict[str, Any]) -> list[dict[str, Any]]:
     reasons: list[dict[str, Any]] = []
     for reason in row.get("inclusion_reasons") or []:
@@ -1885,6 +2259,83 @@ def _has_current_reason_context_for_freq(reasons: list[dict[str, Any]], predicat
     return False
 
 
+def _current_direct_reasons_for_freq(
+    reasons: list[dict[str, Any]],
+    predicate,
+    *,
+    side: str | None = None,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for reason in reasons:
+        if not predicate(reason.get("freq")) or not _reason_is_current_for_entry(reason):
+            continue
+        if side and _technical_opportunity_side(reason) != side:
+            continue
+        out.append(reason)
+    return out
+
+
+def _is_left_attack_reason(reason: dict[str, Any]) -> bool:
+    text = _reason_signal_text(reason)
+    if _technical_opportunity_side(reason) != "left":
+        return False
+    if any(token in text for token in ("一买", "背驰买", "底背离", "MACD绿柱缩小", "零下绿柱缩小")):
+        return True
+    return "二买" in text and _is_upper_freq(reason.get("freq"))
+
+
+def _is_right_attack_reason(reason: dict[str, Any]) -> bool:
+    text = _reason_signal_text(reason)
+    if _technical_opportunity_side(reason) != "right":
+        return False
+    if not (_is_30m_freq(reason.get("freq")) or _is_right_side_freq(reason.get("freq"))):
+        return False
+    return any(token in text for token in ("二买", "三买", "趋势买", "突破", "MACD绿柱扩大", "零上绿柱扩大", "trend_breakout", "candle_run", "candle_accel"))
+
+
+def _has_left_attack_setup(row: dict[str, Any], buy_reasons: list[dict[str, Any]]) -> bool:
+    current_left = [
+        reason
+        for reason in buy_reasons
+        if _reason_is_current_for_entry(reason) and _is_left_attack_reason(reason)
+    ]
+    if not current_left:
+        return False
+    return _ma_left_attack_confirmed(_best_ma_alignment(row, buy_reasons))
+
+
+def _has_right_attack_setup(row: dict[str, Any], buy_reasons: list[dict[str, Any]]) -> bool:
+    current_right = [
+        reason
+        for reason in buy_reasons
+        if _reason_is_current_for_entry(reason) and _is_right_attack_reason(reason)
+    ]
+    if not current_right:
+        return False
+    return _ma_right_attack_confirmed(_best_ma_alignment(row, buy_reasons))
+
+
+def _has_attack_entry_setup(row: dict[str, Any], buy_reasons: list[dict[str, Any]]) -> bool:
+    """Allow hot right-side setups into focus without waiting for a 30m print."""
+    if not _has_right_attack_setup(row, buy_reasons):
+        return False
+    upper_reasons = [
+        reason
+        for reason in buy_reasons
+        if _reason_has_freq(reason, _is_upper_freq) and _reason_is_current_for_entry(reason)
+    ]
+    right_side_reasons = _current_direct_reasons_for_freq(buy_reasons, _is_right_side_freq, side="right")
+    if not upper_reasons or not right_side_reasons:
+        return False
+    right_freqs = {_text(reason.get("freq")) for reason in right_side_reasons}
+    has_5m = any(freq in {"5分钟", "5min", "5m", "F5", "f5"} for freq in right_freqs)
+    has_15m = any(freq in {"15分钟", "15min", "15m", "F15", "f15"} for freq in right_freqs)
+    strong_pair = has_5m and has_15m
+    strong_score = max((_float(reason.get("score")) for reason in right_side_reasons), default=0.0) >= 90.0
+    theme_bonus = _sector_policy(row).get("policy") in {"mainline_lenient", "defensive_lenient"}
+    return strong_pair or (strong_score and theme_bonus)
+
+
 def _chain_entry_blocker(row: dict[str, Any]) -> str:
     chain = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
     phase = _text(chain.get("phase"))
@@ -1928,7 +2379,28 @@ def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, An
     fresh_upper = _has_current_reason_for_freq(buy_reasons, _is_upper_freq)
     fresh_right_side = _has_current_direct_reason_for_freq(buy_reasons, _is_right_side_freq, side="right")
     fresh_right_side_confirmed = fresh_right_side
+    if (
+        has_30m
+        and fresh_30m
+        and fresh_30m_right
+        and has_upper
+        and fresh_upper
+        and has_partner
+        and has_right_side
+        and fresh_right_side
+        and fresh_right_side_confirmed
+    ):
+        return True, "entry_confirmed", [], top_buy, top_risk
+    defensive_strict = _sector_policy(row).get("policy") == "defensive_strict"
+    if _has_left_attack_setup(row, current_buy_reasons):
+        if defensive_strict:
+            return False, "entry_waiting_defensive_confirmation", ["defensive_strict_requires_full_confirmation"], top_buy, top_risk
+        return True, "left_attack_confirmed", ["left_attack_ma_confirmed"], top_buy, top_risk
     if not has_30m:
+        if fresh_upper and fresh_right_side and _has_attack_entry_setup(row, buy_reasons):
+            if defensive_strict:
+                return False, "entry_waiting_defensive_confirmation", ["defensive_strict_requires_full_confirmation"], top_buy, top_risk
+            return True, "entry_attack_confirmed", ["30m_attack_missing"], top_buy, top_risk
         return False, "entry_waiting_30m_confirm", ["30m_missing"], top_buy, top_risk
     if not fresh_30m:
         return False, "entry_waiting_30m_confirm", ["30m_stale"], top_buy, top_risk
@@ -1979,7 +2451,7 @@ def _context_adjust(row: dict[str, Any]) -> float:
     return adjust
 
 
-def _mainline_alignment_score(row: dict[str, Any]) -> float:
+def _chain_alignment_score(row: dict[str, Any]) -> float:
     chain = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
     if not chain:
         return 0.0
@@ -2006,6 +2478,141 @@ def _mainline_alignment_score(row: dict[str, Any]) -> float:
     return round(base + rank_bonus + role_bonus, 3)
 
 
+def _sector_policy_text(row: dict[str, Any]) -> str:
+    values: list[str] = []
+    chain = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
+    evidence = chain.get("evidence") if isinstance(chain.get("evidence"), dict) else {}
+    sources = [row, chain, evidence]
+    for reason in row.get("inclusion_reasons") or []:
+        if isinstance(reason, dict):
+            sources.append(reason)
+            nested = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+            if nested:
+                sources.append(nested)
+    keys = (
+        "chain_name",
+        "primary_chain",
+        "chain",
+        "node_name",
+        "chain_node",
+        "node",
+        "board_or_concept",
+        "sector",
+        "industry",
+        "concept",
+        "theme",
+        "domain",
+        "domain_name",
+        "rotation_line",
+        "exposure_bucket",
+    )
+    for source in sources:
+        for key in keys:
+            value = _text(source.get(key)) if isinstance(source, dict) else ""
+            if value and value not in values:
+                values.append(value)
+    return " ".join(values).lower()
+
+
+def _first_matching_token(text: str, tokens: tuple[str, ...]) -> str:
+    for token in tokens:
+        if token.lower() in text:
+            return token
+    return ""
+
+
+def _broad_market_is_falling(row: dict[str, Any]) -> bool:
+    contexts = [
+        row.get("broad_market_context"),
+        row.get("market_context"),
+        row.get("market_regime"),
+    ]
+    for context in contexts:
+        if not isinstance(context, dict):
+            continue
+        for key in ("is_falling", "broad_market_falling", "market_falling", "index_falling"):
+            if context.get(key) is True:
+                return True
+        for key in ("average_change_pct", "avg_change_pct", "day_change_pct", "change_pct"):
+            if key in context and context.get(key) not in (None, ""):
+                if _float(context.get(key), 999.0) <= BROAD_MARKET_FALL_THRESHOLD:
+                    return True
+        indexes = context.get("indexes") if isinstance(context.get("indexes"), list) else []
+        changes = [
+            _float(item.get("change_pct"), 999.0)
+            for item in indexes
+            if isinstance(item, dict) and item.get("change_pct") not in (None, "")
+        ]
+        if changes:
+            required = max(1, (len(changes) // 2) + 1)
+            if sum(1 for value in changes if value <= BROAD_MARKET_FALL_THRESHOLD) >= required:
+                return True
+        label = " ".join(
+            _text(context.get(key)).lower()
+            for key in ("label", "summary", "overall_direction", "market_line", "phase", "regime")
+        )
+        if any(token in label for token in ("大盘下跌", "下跌", "走弱", "偏空", "回撤", "risk_off", "bear")):
+            return True
+    return False
+
+
+def _sector_policy(row: dict[str, Any]) -> dict[str, Any]:
+    text = _sector_policy_text(row)
+    attack_token = _first_matching_token(text, MAINLINE_LENIENT_SECTOR_TOKENS)
+    defensive_token = _first_matching_token(text, DEFENSIVE_STRICT_SECTOR_TOKENS)
+    raw_mainline = _chain_alignment_score(row)
+    chain = row.get("chain_context") if isinstance(row.get("chain_context"), dict) else {}
+    evidence = chain.get("evidence") if isinstance(chain.get("evidence"), dict) else {}
+    phase = _text(chain.get("phase") or evidence.get("phase"))
+    effect = _text(chain.get("effect"))
+    is_current_mainline = raw_mainline >= 12.0 or phase in {"accelerating", "warming"} or effect == "confirm"
+    if attack_token and is_current_mainline:
+        return {
+            "policy": "mainline_lenient",
+            "label": "主线宽松",
+            "matched_token": attack_token,
+            "reason": f"{attack_token}处于当年/当前主线，买点和均线共振可优先",
+        }
+    if defensive_token and not attack_token:
+        if _broad_market_is_falling(row):
+            return {
+                "policy": "defensive_lenient",
+                "label": "防守放宽",
+                "matched_token": defensive_token,
+                "reason": f"{defensive_token}遇到大盘下跌，允许按避险进攻放宽",
+            }
+        return {
+            "policy": "defensive_strict",
+            "label": "防守严格",
+            "matched_token": defensive_token,
+            "reason": f"{defensive_token}按防守板块处理，必须等更完整买点确认",
+        }
+    return {"policy": "neutral", "label": "中性", "matched_token": "", "reason": ""}
+
+
+def _sector_policy_components(row: dict[str, Any]) -> dict[str, float]:
+    policy = _sector_policy(row).get("policy")
+    if policy == "mainline_lenient":
+        return {"mainline_lenient_policy": 18.0}
+    if policy == "defensive_lenient":
+        return {"defensive_lenient_policy": 12.0}
+    if policy == "defensive_strict":
+        return {"defensive_strict_policy": -24.0}
+    return {}
+
+
+def _mainline_alignment_score(row: dict[str, Any]) -> float:
+    raw = _chain_alignment_score(row)
+    policy = _sector_policy(row).get("policy")
+    if policy == "mainline_lenient" and raw > 0:
+        return round(min(36.0, raw + 6.0), 3)
+    if policy == "defensive_lenient":
+        return round(min(14.0, raw * 0.5 if raw > 0 else 6.0), 3)
+    if policy == "defensive_strict":
+        return round(min(0.0, raw) - 6.0, 3)
+    return raw
+
+
 def _mainline_alignment_level(score: float) -> str:
     if score >= 24:
         return "strong_mainline"
@@ -2024,6 +2631,7 @@ def _row_buy_freqs(row: dict[str, Any], top_buy: dict[str, Any]) -> set[str]:
 
 
 def _entry_components(row: dict[str, Any], top_buy: dict[str, Any]) -> dict[str, float]:
+    buy_reasons = _buy_technical_reasons(row)
     freqs = _row_buy_freqs(row, top_buy)
     context = top_buy.get("resonance_context") if isinstance(top_buy.get("resonance_context"), dict) else {}
     grade = _text(context.get("grade"))
@@ -2033,6 +2641,8 @@ def _entry_components(row: dict[str, Any], top_buy: dict[str, Any]) -> dict[str,
     trigger_30m = 22.0 if any(_is_30m_freq(freq) for freq in freqs) else 0.0
     components = {
         "entry_readiness": 36.0,
+        "buy_point_quality": _buy_point_quality(row, buy_reasons),
+        "ma_alignment": _ma_alignment_score(row, buy_reasons),
         "upper_timeframe_quality": upper_score,
         "trigger_30m": trigger_30m,
         "right_side_confirmation": right_side,
@@ -2043,12 +2653,15 @@ def _entry_components(row: dict[str, Any], top_buy: dict[str, Any]) -> dict[str,
         "mainline_alignment": _mainline_alignment_score(row),
         "context_adjust": _context_adjust(row),
     }
+    components.update(_sector_policy_components(row))
     return {key: round(value, 3) for key, value in components.items()}
 
 
 def _rank_reason(score_components: dict[str, float]) -> str:
     labels = {
         "entry_readiness": "买点确认",
+        "buy_point_quality": "买点质量",
+        "ma_alignment": "均线确认",
         "upper_timeframe_quality": "周/日线",
         "trigger_30m": "30m触发",
         "right_side_confirmation": "5m/15m确认",
@@ -2057,6 +2670,9 @@ def _rank_reason(score_components: dict[str, float]) -> str:
         "confidence": "置信度",
         "freshness": "新鲜度",
         "mainline_alignment": "主线",
+        "mainline_lenient_policy": "主线宽松",
+        "defensive_lenient_policy": "防守放宽",
+        "defensive_strict_policy": "防守严格",
         "context_adjust": "观点修正",
         "sell_strength": "风险强度",
         "timeframe_severity": "级别严重度",
@@ -2064,6 +2680,7 @@ def _rank_reason(score_components: dict[str, float]) -> str:
         "source_priority": "来源优先级",
         "entry_proximity": "接近买点",
         "heat_or_theme": "热度/主题",
+        "hot_sector": "热门板块",
     }
     ordered = sorted(score_components.items(), key=lambda item: abs(_float(item[1])), reverse=True)
     selected = ordered[:5]
@@ -2091,27 +2708,13 @@ def _risk_components(row: dict[str, Any], top_risk: dict[str, Any]) -> dict[str,
 
 
 def _watch_components(row: dict[str, Any], gate_status: str) -> dict[str, float]:
-    source_priority = 0.0
-    if _buy_technical_reasons(row):
-        source_priority = 40.0
-    elif "fallback_watch" in row.get("source_tags", []):
-        source_priority = 22.0
-    elif "active_pool_watch" in row.get("source_tags", []):
-        source_priority = 18.0
-    elif any(tag.startswith("chain_") for tag in row.get("source_tags", [])):
-        source_priority = 16.0
-    proximity = 30.0 if gate_status in {"entry_waiting_30m_confirm", "entry_waiting_right_side_confirm"} else 22.0 if gate_status in {"entry_waiting_resonance_confirm", "entry_waiting_upper_context"} else 10.0
-    primary = max(
-        _buy_technical_reasons(row) + _risk_reasons(row),
-        key=lambda item: (_float(item.get("weight")), abs(_float(item.get("score")))),
-        default=None,
-    )
+    del gate_status
+    buy_reasons = _buy_technical_reasons(row)
+    hot_sector = max(0.0, min(36.0, _mainline_alignment_score(row)))
     components = {
-        "source_priority": source_priority,
-        "entry_proximity": proximity,
-        "mainline_alignment": _mainline_alignment_score(row),
-        "heat_or_theme": _float(row.get("score")) * 0.05,
-        "freshness": _freshness_score_for_reason(primary, 8.0),
+        "buy_point_quality": _buy_point_quality(row, buy_reasons),
+        "ma_alignment": _ma_alignment_score(row, buy_reasons),
+        "hot_sector": hot_sector,
     }
     return {key: round(value, 3) for key, value in components.items()}
 
@@ -2119,12 +2722,12 @@ def _watch_components(row: dict[str, Any], gate_status: str) -> dict[str, float]
 def _reason_signal_text(reason: dict[str, Any]) -> str:
     evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
     details = evidence.get("details")
-    return " ".join([
+    return _normalize_signal_type(" ".join([
         _text(reason.get("signal_type")),
         _text(reason.get("reason_type")),
         _text(details if isinstance(details, str) else ""),
         " ".join(_text(value) for value in details.values()) if isinstance(details, dict) else "",
-    ])
+    ]))
 
 
 def _technical_signal_family(reason: dict[str, Any]) -> str:
@@ -2166,7 +2769,7 @@ def _technical_opportunity_side(reason: dict[str, Any]) -> str:
 
 def _technical_signal_group_item(reason: dict[str, Any]) -> dict[str, Any]:
     return {
-        "label": _text(reason.get("signal_type") or reason.get("reason_type")),
+        "label": _normalize_signal_type(reason.get("signal_type") or reason.get("reason_type")),
         "family": _technical_signal_family(reason),
         "freq": _text(reason.get("freq")),
         "event_date": _text(reason.get("event_date")) or _reason_event_dt(reason)[:10],
@@ -2276,6 +2879,10 @@ def _trade_stage_from_context(
 ) -> str:
     if entry_gate_status == "clue_pool":
         return "clue_pool"
+    if entry_gate_status == "left_attack_confirmed":
+        return "left_attack"
+    if entry_gate_status == "entry_attack_confirmed":
+        return "attack_entry"
     if pool_type == "risk" or top_risk or entry_gate_status.startswith("blocked_by"):
         return "skip_now"
     trade_side = _text(timeframe_sides.get("trade", {}).get("side"))
@@ -2395,6 +3002,10 @@ def _trade_intent_from_context(
 ) -> str:
     if pool_type == "risk" or top_risk or entry_gate_status.startswith("blocked_by"):
         return "skip_now"
+    if entry_gate_status == "left_attack_confirmed":
+        return "left_attack"
+    if entry_gate_status == "entry_attack_confirmed":
+        return "attack_entry"
     if pool_type == "focus" or entry_gate_status == "entry_confirmed":
         return "confirmed_entry"
     trade_side = _text(timeframe_sides.get("trade", {}).get("side"))
@@ -2421,9 +3032,28 @@ def _trade_intent_label(intent: str) -> str:
     return TRADE_INTENT_LABELS.get(intent, "盯盘池")
 
 
+def _setup_mode_from_context(
+    *,
+    pool_type: str,
+    entry_gate_status: str,
+    top_risk: dict[str, Any] | None,
+) -> str:
+    if pool_type == "risk" or top_risk or entry_gate_status.startswith("blocked_by"):
+        return "risk_first"
+    if entry_gate_status == "left_attack_confirmed":
+        return "left_attack"
+    if entry_gate_status in {"entry_attack_confirmed", "entry_confirmed"}:
+        return "right_attack"
+    return "watch"
+
+
 def _setup_explanation(intent: str, missing_condition: str) -> str:
     if intent == "confirmed_entry":
         return "30m买点和5m/15m下单周期都已确认，复核位置、止损和仓位。"
+    if intent == "attack_entry":
+        return "日/周背景和5m/15m右侧已经给出，30m未补齐，按进攻买点小仓复核。"
+    if intent == "left_attack":
+        return "左侧买点叠加10/20日线承接，按低吸进攻复核，不按追涨买点处理。"
     if intent == "right_momentum":
         return "已有右侧动量或大周期走强，但30m交易买点还没补齐。"
     if intent == "probe_candidate":
@@ -2495,7 +3125,7 @@ def _trade_role_from_context(
         return "climax_risk"
     if exposure_bucket in {"defensive", "防守", "稳仓", "高股息", "低波"}:
         return "defensive_weight"
-    if phase in {"cooling", "diverging"} or trade_stage in {"dip_watch", "probe_candidate"}:
+    if phase in {"cooling", "diverging"} or trade_stage in {"dip_watch", "left_attack", "probe_candidate"}:
         return "second_wave"
     if phase in {"accelerating", "warming"} or _float(row.get("theme_rank_bonus")) >= 12:
         return "mainline_attack"
@@ -2522,10 +3152,14 @@ def _trader_read_summary(
         return f"{chain or '产业链'}：只说明已进入东财/同花顺板块图谱，不代表真实持仓；等30m承接和5m/15m下单确认。"
     if trade_role == "defensive_weight":
         return f"{chain or '防守观察'}：偏稳仓/防守，不和进攻票混排，回踩爬起再看仓位。"
-    if trade_role == "second_wave":
+    if trade_role == "second_wave" and trade_stage != "left_attack":
         return f"{chain or '回踩再起'}：先当回踩后二次启动观察，等重新放量和右侧确认。"
     if trade_role == "risk_review":
         return f"{chain or prefix}：先复核风险，卖点/冲突解除前不当机会处理。"
+    if trade_stage == "attack_entry":
+        return f"{chain or prefix}：进攻买点，日/周和5m/15m已确认，30m未补齐，按小仓和快复核处理。"
+    if trade_stage == "left_attack":
+        return f"{chain or prefix}：低吸进攻，左侧买点叠加10/20日线承接，先复核关键均线和止损。"
     if trade_stage == "confirmed_entry":
         return f"{chain or prefix}：买点路径已走通，先复核位置、止损和仓位。"
     return f"{chain or prefix}：处在观察到买点之间，{missing_condition or '等新的技术确认'}。"
@@ -2656,6 +3290,12 @@ def _strategy_semantics(
     elif trade_stage == "confirmed_entry":
         intervention_side = "hybrid" if left_reasons else "right_confirmed"
         lineage = ["pangge", "system"] + (["daozhang"] if left_reasons else [])
+    elif trade_stage == "attack_entry":
+        intervention_side = "right_confirmed"
+        lineage = ["pangge", "system"]
+    elif trade_stage == "left_attack":
+        intervention_side = "left_attack"
+        lineage = ["daozhang", "system"]
     elif trade_stage in {"dip_watch", "probe_candidate"}:
         intervention_side = "left_setup"
         lineage = ["daozhang", "system"]
@@ -2714,6 +3354,9 @@ def _finalize_pool_row(
     row["left_signal_reasons"] = _technical_signal_reason_labels(technical_groups, "left")
     row["right_signal_reasons"] = _technical_signal_reason_labels(technical_groups, "right")
     row["risk_signal_reasons"] = _technical_signal_reason_labels(technical_groups, "sell")
+    best_ma = _best_ma_alignment(row, _buy_technical_reasons(row))
+    if best_ma:
+        row["ma_alignment"] = best_ma
     timeframe_sides = _timeframe_signal_sides(row)
     row["trade_timeframe"] = "30m"
     row["timeframe_signal_sides"] = timeframe_sides
@@ -2724,6 +3367,13 @@ def _finalize_pool_row(
     theme_rank_bonus = _mainline_alignment_score(row)
     row["theme_rank_bonus"] = theme_rank_bonus
     row["theme_alignment_level"] = _mainline_alignment_level(theme_rank_bonus)
+    sector_policy = _sector_policy(row)
+    row["sector_policy"] = sector_policy.get("policy")
+    row["sector_policy_label"] = sector_policy.get("label")
+    row["sector_policy_reason"] = sector_policy.get("reason")
+    row["sector_policy_matched_token"] = sector_policy.get("matched_token")
+    if isinstance(row.get("broad_market_context"), dict):
+        row["broad_market_label"] = row["broad_market_context"].get("label")
     trade_stage = _trade_stage_from_context(
         pool_type=pool_type,
         entry_gate_status=entry_gate_status,
@@ -2760,6 +3410,13 @@ def _finalize_pool_row(
     )
     row["trade_intent"] = trade_intent
     row["trade_intent_label"] = _trade_intent_label(trade_intent)
+    setup_mode = _setup_mode_from_context(
+        pool_type=pool_type,
+        entry_gate_status=entry_gate_status,
+        top_risk=top_risk,
+    )
+    row["setup_mode"] = setup_mode
+    row["setup_mode_label"] = SETUP_MODE_LABELS.get(setup_mode, "观察")
     row["setup_side_label"] = row["trade_intent_label"]
     row["watch_sort_priority"] = TRADE_INTENT_PRIORITY.get(trade_intent, 0)
     row["setup_explanation"] = _setup_explanation(trade_intent, row["missing_condition"])
@@ -2799,15 +3456,22 @@ def _finalize_pool_row(
     if stale_reasons:
         row["stale_signal_count"] = len(stale_reasons)
     if pool_type == "focus":
-        row["action_status"] = "entry_ready"
-        row["trader_action"] = "确认买点复核"
-        row["next_action"] = "确认买点复核"
-        row["queue_lane"] = "entry_ready"
-        row["actionability"] = "entry_ready"
-        row["decision_effect"] = "confirm"
+        attack_entry = entry_gate_status == "entry_attack_confirmed"
+        left_attack = entry_gate_status == "left_attack_confirmed"
+        row["action_status"] = "left_attack" if left_attack else "attack_entry" if attack_entry else "entry_ready"
+        row["trader_action"] = "低吸进攻复核" if left_attack else "进攻买点复核" if attack_entry else "确认买点复核"
+        row["next_action"] = row["trader_action"]
+        row["queue_lane"] = "entry_waiting_confirm" if (attack_entry or left_attack) else "entry_ready"
+        row["actionability"] = "entry_waiting_confirm" if (attack_entry or left_attack) else "entry_ready"
+        row["decision_effect"] = "attack_confirm" if (attack_entry or left_attack) else "confirm"
         row["signal_origin"] = _text((top_buy or {}).get("reason_type")) or row.get("signal_origin")
         row["latest_signal"] = _text((top_buy or {}).get("signal_type")) or row.get("latest_signal")
-        row["invalidates_when"] = "30m买点失效、下单周期转弱、日/周冲突或产业链高潮"
+        if left_attack:
+            row["invalidates_when"] = "跌回10/20日线、左侧买点失效或产业链风险升温"
+        elif attack_entry:
+            row["invalidates_when"] = "5m/15m转弱、30m迟迟不补、日/周转冲突或产业链高潮"
+        else:
+            row["invalidates_when"] = "30m买点失效、下单周期转弱、日/周冲突或产业链高潮"
     elif pool_type == "risk":
         row["action_status"] = "skip_now"
         row["trader_action"] = "暂不参与"
@@ -2835,6 +3499,10 @@ def _finalize_pool_row(
             row["action_status"] = "entry_waiting_right_side_confirm"
             row["trader_action"] = "等下单周期确认"
             row["queue_lane"] = "watch_preheat"
+        elif entry_gate_status == "entry_waiting_defensive_confirmation":
+            row["action_status"] = "entry_waiting_defensive_confirmation"
+            row["trader_action"] = "防守板块等完整确认"
+            row["queue_lane"] = "watch_preheat"
         elif entry_gate_status == "entry_waiting_resonance_confirm":
             row["action_status"] = "entry_waiting_resonance_confirm"
             row["trader_action"] = "盯盘等共振"
@@ -2851,6 +3519,10 @@ def _finalize_pool_row(
             row["action_status"] = "dip_watch"
             row["trader_action"] = "低吸观察"
             row["queue_lane"] = "watch_preheat"
+        elif trade_stage == "left_attack":
+            row["action_status"] = "left_attack"
+            row["trader_action"] = "低吸进攻复核"
+            row["queue_lane"] = "entry_waiting_confirm"
         elif trade_stage == "probe_candidate":
             row["action_status"] = "probe_candidate"
             row["trader_action"] = "试仓候选"
@@ -2883,7 +3555,7 @@ def _finalize_pool_row(
     row["evidence_sources"] = [item for item in chain_position.get("evidence_sources") or [] if _text(item)]
     row["can_trade_now"] = bool(
         pool_type == "focus"
-        and entry_gate_status == "entry_confirmed"
+        and entry_gate_status in {"entry_confirmed", "entry_attack_confirmed", "left_attack_confirmed"}
         and trade_role not in {"climax_risk", "risk_review"}
     )
     row["trader_read"] = _trader_read_summary(
@@ -2911,6 +3583,192 @@ def _finalize_pool_row(
 def _assign_pool_ranks(rows: list[dict[str, Any]]) -> None:
     for index, row in enumerate(rows, start=1):
         row["rank"] = index
+
+
+def _slim_ma_alignment_for_pool(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    keys = (
+        "latest_close",
+        "ma5",
+        "ma10",
+        "ma20",
+        "above_ma5",
+        "above_ma10",
+        "above_ma20",
+        "near_ma5",
+        "near_ma10",
+        "near_ma20",
+        "reclaim_ma5",
+        "reclaim_ma10",
+        "reclaim_ma20",
+        "distance_ma5_pct",
+        "distance_ma10_pct",
+        "distance_ma20_pct",
+        "ma_stack",
+        "ma20_direction",
+        "above_count",
+        "reclaim_count",
+        "score",
+        "summary",
+        "tags",
+    )
+    return {key: value.get(key) for key in keys if value.get(key) not in (None, "", [], {})}
+
+
+def _slim_resonance_for_pool(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    keys = ("direction", "primary_freq", "aligned_freqs", "conflict_freqs", "grade", "tags", "summary", "latest_dt")
+    return {key: value.get(key) for key in keys if value.get(key) not in (None, "", [], {})}
+
+
+def _slim_evidence_for_pool(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    keep_keys = (
+        "source",
+        "dedupe_key",
+        "direction",
+        "phase",
+        "rank",
+        "heat_score",
+        "range_pattern",
+        "leader_change_pct",
+        "momentum_5m",
+        "momentum_15m",
+        "momentum_30m",
+        "mapping_confidence",
+        "integrated_count",
+        "covered_security_count",
+        "primary_security_count",
+        "membership_type",
+        "confidence",
+        "exposure_score",
+        "source_policy",
+        "author",
+        "review_date",
+        "sector_keyword",
+        "snippet",
+        "sentiment",
+    )
+    out = {key: value.get(key) for key in keep_keys if value.get(key) not in (None, "", [], {})}
+    details = value.get("details")
+    if isinstance(details, str) and details:
+        out["details"] = details[:240]
+    elif isinstance(details, dict):
+        detail_keys = ("signal", "reason", "summary", "pattern", "freq", "price", "dt")
+        out["details"] = {key: details.get(key) for key in detail_keys if details.get(key) not in (None, "", [], {})}
+    if isinstance(value.get("sources"), list):
+        out["sources"] = value["sources"][:4]
+    if isinstance(value.get("catalysts"), list):
+        out["catalysts"] = value["catalysts"][:4]
+    if isinstance(value.get("evidence_sources"), list):
+        out["evidence_sources"] = value["evidence_sources"][:4]
+    resonance = _slim_resonance_for_pool(value.get("resonance_context"))
+    if resonance:
+        out["resonance_context"] = resonance
+    ma_alignment = _slim_ma_alignment_for_pool(value.get("ma_alignment"))
+    if ma_alignment:
+        out["ma_alignment"] = ma_alignment
+    return out
+
+
+def _slim_reason_for_pool(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    out = dict(value)
+    out["evidence"] = _slim_evidence_for_pool(value.get("evidence"))
+    resonance = _slim_resonance_for_pool(value.get("resonance_context"))
+    if resonance:
+        out["resonance_context"] = resonance
+    elif "resonance_context" in out:
+        out.pop("resonance_context", None)
+    ma_alignment = _slim_ma_alignment_for_pool(value.get("ma_alignment"))
+    if ma_alignment:
+        out["ma_alignment"] = ma_alignment
+    elif "ma_alignment" in out:
+        out.pop("ma_alignment", None)
+    return {key: item for key, item in out.items() if item not in (None, "", [], {})}
+
+
+def _slim_context_for_pool(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    out = dict(value)
+    if isinstance(out.get("evidence"), dict):
+        out["evidence"] = _slim_evidence_for_pool(out.get("evidence"))
+    return {key: item for key, item in out.items() if item not in (None, "", [], {})}
+
+
+def _slim_pool_row_for_storage(row: dict[str, Any]) -> dict[str, Any]:
+    out = dict(row)
+    out["inclusion_reasons"] = [
+        slim
+        for slim in (_slim_reason_for_pool(reason) for reason in row.get("inclusion_reasons") or [])
+        if slim
+    ][:12]
+    for key in ("top_buy_reason", "top_risk_reason", "technical_evidence"):
+        slim = _slim_reason_for_pool(row.get(key))
+        if slim:
+            out[key] = slim
+        else:
+            out.pop(key, None)
+    ma_alignment = _slim_ma_alignment_for_pool(row.get("ma_alignment"))
+    if ma_alignment:
+        out["ma_alignment"] = ma_alignment
+    else:
+        out.pop("ma_alignment", None)
+    resonance = _slim_resonance_for_pool(row.get("resonance_context"))
+    if resonance:
+        out["resonance_context"] = resonance
+    elif "resonance_context" in out:
+        out.pop("resonance_context", None)
+    for key in ("knowledge_confirmation", "chain_context", "chain_position"):
+        context = _slim_context_for_pool(row.get(key))
+        if context:
+            out[key] = context
+        else:
+            out.pop(key, None)
+    return out
+
+
+def _slim_skipped_row_for_storage(row: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "symbol",
+        "code",
+        "raw_code",
+        "name",
+        "rank",
+        "pool_type",
+        "rank_score",
+        "score",
+        "signal_origin",
+        "latest_signal",
+        "rank_reason",
+        "setup_mode",
+        "setup_mode_label",
+        "trade_stage",
+        "trade_intent",
+        "trade_intent_label",
+        "watch_sort_priority",
+        "source_tags",
+    )
+    out = {key: row.get(key) for key in keys if row.get(key) not in (None, "", [], {})}
+    reasons = []
+    for reason in row.get("inclusion_reasons") or []:
+        if not isinstance(reason, dict):
+            continue
+        reasons.append({
+            key: reason.get(key)
+            for key in ("reason_type", "source_collection", "signal_type", "signal_side", "freq")
+            if reason.get(key) not in (None, "", [], {})
+        })
+        if len(reasons) >= 4:
+            break
+    if reasons:
+        out["inclusion_reasons"] = reasons
+    return out
 
 
 def _prepare_pool_rows(rows: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2987,9 +3845,10 @@ def _split_pool_rows(
         _assign_pool_ranks(bucket)
     watch.sort(
         key=lambda item: (
-            _float(item.get("watch_sort_priority")),
-            _float(item.get("theme_rank_bonus")),
             _float(item.get("rank_score")),
+            _float((item.get("score_components") or {}).get("buy_point_quality")),
+            _float((item.get("score_components") or {}).get("ma_alignment")),
+            _float((item.get("score_components") or {}).get("hot_sector")),
             _float(item.get("score")),
         ),
         reverse=True,
@@ -3086,6 +3945,9 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
             now=now,
         )
 
+    broad_market_context = _load_broad_market_context(db, trade_date)
+    _attach_broad_market_context(rows, broad_market_context)
+
     split = _split_pool_rows(rows, focus_limit=stock_limit, risk_limit=risk_limit, watch_limit=watch_limit)
     focus_stocks = split["focus"]
     risk_stocks = split["risk"]
@@ -3135,6 +3997,15 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     if clue_symbols:
         watch_stocks = [row for row in watch_stocks if row.get("symbol") not in clue_symbols]
     skipped = (skipped_by_pool.get("focus") or []) + (skipped_by_pool.get("risk") or []) + (skipped_by_pool.get("watch") or [])
+    stored_focus_stocks = [_slim_pool_row_for_storage(row) for row in focus_stocks]
+    stored_risk_stocks = [_slim_pool_row_for_storage(row) for row in risk_stocks]
+    stored_watch_stocks = [_slim_pool_row_for_storage(row) for row in watch_stocks]
+    stored_clue_stocks = [_slim_pool_row_for_storage(row) for row in clue_stocks]
+    stored_skipped = [_slim_skipped_row_for_storage(row) for row in skipped[:60]]
+    stored_skipped_by_pool = {
+        key: [_slim_skipped_row_for_storage(row) for row in value[:15]]
+        for key, value in skipped_by_pool.items()
+    }
     candidate_meta = _candidate_meta(rows)
     focus_reason_counts = Counter(
         reason.get("reason_type")
@@ -3164,19 +4035,20 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "risk_limit": risk_limit,
         "watch_limit": watch_limit,
         "clue_limit": clue_limit,
-        "stocks": focus_stocks,
-        "focus_stocks": focus_stocks,
-        "risk_stocks": risk_stocks,
-        "watch_stocks": watch_stocks,
-        "clue_stocks": clue_stocks,
-        "skipped_stocks": skipped[:100],
-        "skipped_by_pool": {key: value[:50] for key, value in skipped_by_pool.items()},
+        "stocks": stored_focus_stocks,
+        "focus_stocks": stored_focus_stocks,
+        "risk_stocks": stored_risk_stocks,
+        "watch_stocks": stored_watch_stocks,
+        "clue_stocks": stored_clue_stocks,
+        "skipped_stocks": stored_skipped,
+        "skipped_by_pool": stored_skipped_by_pool,
         "skipped_count": len(skipped),
         "candidate_count": len(rows),
         "strict_candidate_count": strict_candidate_count,
         "fallback_count": fallback_count,
         "fallback_enabled": fallback_enabled,
         "pool_counts": pool_counts,
+        "broad_market_context": broad_market_context,
         "reason_counts": dict(focus_reason_counts),
         **candidate_meta,
         "coverage_by_freq": technical_freshness.get("coverage_by_freq") or {},
@@ -3187,7 +4059,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "ranking_version": POOL_RANKING_VERSION,
         "source": "whitebox_pool_builder",
         "source_policy": "postmarket_strict_with_fallback_watch" if strict_sources and fallback_enabled else ("postmarket_strict_technical_knowledge_chain" if strict_sources else "runtime_watch_and_signal_blend"),
-        "selection_policy": "confirmed_entry__watch_left_right__clue_source_only__skip_now",
+        "selection_policy": "dual_attack_ma_confirm__sector_policy__watch_left_right__clue_source_only__skip_now",
     }
     db["terminal_stock_pool"].update_one(
         {"pool": "terminal_stock_pool", "market": "A"},
@@ -3208,7 +4080,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "dt": pool_doc["dt"],
         "trade_date": trade_date,
         "updated_at": now,
-        "stocks": [row["raw_code"] for row in (focus_stocks + risk_stocks + watch_stocks + clue_stocks)[: max(stock_limit, 72)]],
+        "stocks": [row["raw_code"] for row in (stored_focus_stocks + stored_risk_stocks + stored_watch_stocks + stored_clue_stocks)[: max(stock_limit, 72)]],
         "indices": list(getattr(config, "INDEX_AK_CODES", {}).values()),
         "industries": _top_heat_names(db, "industry", 20),
         "concepts": _top_heat_names(db, "concept", 20),
@@ -3241,6 +4113,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
             "fallback_count": fallback_count,
             "skipped_count": len(skipped),
             "pool_counts": pool_counts,
+            "broad_market_context": broad_market_context,
             "reason_counts": dict(focus_reason_counts),
             **candidate_meta,
             "coverage_by_freq": pool_doc["coverage_by_freq"],
@@ -3275,6 +4148,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "industries": len(legacy_doc["industries"]),
         "concepts": len(legacy_doc["concepts"]),
         "pool_counts": pool_counts,
+        "broad_market_context": broad_market_context,
         "reason_counts": dict(focus_reason_counts),
         **candidate_meta,
         "coverage_status": pool_doc["coverage_status"],

@@ -522,7 +522,7 @@ def test_focus_stocks_attach_sell_warning_to_existing_buy_row(monkeypatch):
     assert [item["badge"] for item in rows[0]["sell_timeframes"]] == ["D"]
     assert [item["badge"] for item in rows[0]["buy_timeframes"]] == ["5m"]
     assert rows[0]["latest_signal"] == "卖D/5m"
-    assert rows[0]["trader_action"] == "风险复核"
+    assert rows[0]["trader_action"] == "暂不参与"
 
 
 def test_terminal_stock_pool_group_rows_keep_focus_risk_watch_separate(monkeypatch):
@@ -581,6 +581,118 @@ def test_terminal_stock_pool_group_rows_keep_focus_risk_watch_separate(monkeypat
     assert focus[0]["entry_gate_status"] == "entry_confirmed"
     assert risk[0]["action_status"] == "risk_review"
     assert watch[0]["action_status"] == "entry_waiting_30m_confirm"
+
+
+def test_terminal_stock_pool_group_rows_uses_watch_limit_from_pool_doc(monkeypatch):
+    from signals.web.api import workbench
+
+    watch_rows = [
+        {
+            "symbol": f"SZ.{index:06d}",
+            "name": f"观察股{index}",
+            "pool_type": "watch",
+            "action_status": "entry_waiting_30m_confirm",
+        }
+        for index in range(1, 131)
+    ]
+
+    class _Collection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "watch_limit": 114,
+                "watch_stocks": watch_rows,
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    refresh_calls = []
+    monkeypatch.delenv("TERMINAL_WORKBENCH_WATCH_STOCK_LIMIT", raising=False)
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"terminal_stock_pool": _Collection()}))
+    monkeypatch.setattr(workbench, "_enrich_stock_row", lambda row, columns, lightweight=False: dict(row))
+    monkeypatch.setattr(
+        workbench,
+        "_refresh_realtime_quotes_for_rows",
+        lambda db, rows, *, refresh_key, limit: refresh_calls.append(limit) or {"status": "skipped"},
+    )
+
+    rows = workbench._terminal_stock_pool_group_rows([], "watch_stocks")
+
+    assert len(rows) == 114
+    assert refresh_calls == [114]
+
+
+def test_terminal_stock_pool_group_rows_reads_clue_stocks_with_quote_overlay(monkeypatch):
+    from signals.web.api import workbench
+
+    class _TerminalCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            assert projection and projection.get("clue_stocks") == 1
+            return {
+                "clue_stocks": [
+                    {
+                        "symbol": "SZ.301363",
+                        "name": "美好医疗",
+                        "pool_type": "watch",
+                        "action_status": "clue_pool",
+                        "entry_gate_status": "clue_pool",
+                        "latest_price": 88.41,
+                        "day_change_pct": 5.15,
+                        "inclusion_reasons": [{"reason_type": "review_sector_bullish", "signal_type": "线索池"}],
+                    }
+                ],
+            }
+
+    class _QuoteCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "symbol": "SZ.301363",
+                "dt": "2026-05-08",
+                "snapshot_at": datetime(2026, 5, 8, 10, 0),
+                "source": "eastmoney_push2delay_ulist",
+                "price": 42.92,
+                "open": 42.0,
+                "prev_close": 41.66,
+                "change_pct": 3.02,
+                "freshness": "fresh",
+                "is_stale": False,
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({
+        "terminal_stock_pool": _TerminalCollection(),
+        "quote_snapshots": _QuoteCollection(),
+    }))
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-08")
+    monkeypatch.setattr(workbench, "_market_now", lambda market="A": datetime(2026, 5, 8, 10, 0, 5))
+    refresh_calls = []
+    monkeypatch.setattr(
+        workbench,
+        "_refresh_realtime_quotes_for_rows",
+        lambda db, rows, *, refresh_key, limit: refresh_calls.append({
+            "refresh_key": refresh_key,
+            "symbols": [row.get("symbol") for row in rows],
+            "limit": limit,
+        }) or {"status": "ok"},
+    )
+
+    rows = workbench._terminal_stock_pool_group_rows([], "clue_stocks")
+
+    assert len(rows) == 1
+    assert rows[0]["latest_price"] == 42.92
+    assert rows[0]["day_change_pct"] == 3.02
+    assert rows[0]["quote_prev_close_change_pct"] == 3.02
+    assert rows[0]["quote_open_change_pct"] == 2.1905
+    assert rows[0]["day_change_basis"] == "prev_close"
+    assert rows[0]["day_change_source"] == "quote_snapshots"
+    assert rows[0]["quote_status"] == "realtime"
+    assert refresh_calls[0]["refresh_key"] == "clue_stocks"
+    assert refresh_calls[0]["symbols"] == ["SZ.301363"]
 
 
 def test_manual_clue_rows_reuse_stock_pool_decision_fields(monkeypatch):
@@ -661,7 +773,10 @@ def test_manual_clue_rows_reuse_stock_pool_decision_fields(monkeypatch):
     assert row["timeframe_signal_sides"]["trade"]["side"] != "none"
     assert row["timeframe_signal_sides"]["execution"]["side"] == "none"
     assert {"risk_clear", "period_conflict", "right_side"} <= set(row["missing_gates"])
-    assert row["trade_stage"] == "clue_pool"
+    assert row["trade_stage"] == "skip_now"
+    assert row["decision_stage"] == "risk_first"
+    assert row["setup_mode"] == "risk_first"
+    assert row["trader_action"] == "暂不参与"
     assert row["can_trade_now"] is False
     assert "terminal_technical_signals" in row["evidence_summary"]
 
@@ -755,6 +870,320 @@ def test_quote_overlay_marks_non_current_quote_stale(monkeypatch):
     assert row["quote_status_label"] == "行情陈旧"
     assert row["today_change_pct"] is None
     assert row["day_change_pct"] is None
+
+
+def test_quote_overlay_falls_back_to_same_day_fullmarket_when_quote_stale(monkeypatch):
+    from signals.web.api import workbench
+
+    class _QuoteCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "symbol": "SZ.002780",
+                "dt": "2026-05-06",
+                "snapshot_at": datetime(2026, 5, 6, 15, 0),
+                "source": "eastmoney_push2delay_ulist",
+                "price": 15.4,
+                "change_pct": -1.2,
+                "freshness": "fresh",
+                "is_stale": False,
+            }
+
+    class _FullmarketCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "symbol": "SZ.002780",
+                "code": "002780",
+                "trade_date": "2026-05-08",
+                "date_key": "20260508",
+                "snapshot_at": datetime(2026, 5, 8, 15, 5),
+                "latest": 16.89,
+                "price": 16.89,
+                "change_pct": 3.8107,
+                "open": 16.1,
+                "prev_close": 16.27,
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({
+        "quote_snapshots": _QuoteCollection(),
+        "fullmarket_spot_snapshots": _FullmarketCollection(),
+    }))
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-08")
+
+    row = workbench._apply_quote_overlay({"latest_price": 15.4, "day_change_pct": -1.2}, "SZ.002780")
+
+    assert row["quote_status"] == "closed"
+    assert row["quote_source"] == "fullmarket_spot_snapshots"
+    assert row["latest_price"] == 16.89
+    assert row["day_change_pct"] == 3.8107
+    assert row["gain_pct"] == 3.8107
+    assert row["day_change_source"] == "fullmarket_spot_snapshots"
+    assert row["day_change_as_of"] == "2026-05-08"
+
+
+def test_quote_overlay_falls_back_to_same_day_fullmarket_when_quote_missing(monkeypatch):
+    from signals.web.api import workbench
+
+    class _QuoteCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return None
+
+    class _FullmarketCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "symbol": "SH.600857",
+                "code": "600857",
+                "trade_date": "2026-05-08",
+                "date_key": "20260508",
+                "snapshot_at": datetime(2026, 5, 8, 10, 0),
+                "latest": 12.87,
+                "price": 12.87,
+                "change_pct": 0.1556,
+                "open": 12.82,
+                "prev_close": 12.85,
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({
+        "quote_snapshots": _QuoteCollection(),
+        "fullmarket_spot_snapshots": _FullmarketCollection(),
+    }))
+    monkeypatch.setattr(workbench, "_stock_df", lambda *args, **kwargs: (_bars(), "unexpected"))
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-08")
+    monkeypatch.setattr(workbench, "_market_now", lambda market="A": datetime(2026, 5, 8, 10, 0, 5))
+
+    row = workbench._enrich_stock_row({"symbol": "SH.600857", "latest_signal": "二买"}, [], lightweight=True)
+
+    assert row["quote_status"] == "realtime"
+    assert row["latest_price"] == 12.87
+    assert row["day_change_pct"] == 0.1556
+    assert row["gain_pct"] == 0.1556
+    assert row["day_change_source"] == "fullmarket_spot_snapshots"
+
+
+def test_quote_overlay_rejects_non_current_fullmarket_fallback(monkeypatch):
+    from signals.web.api import workbench
+
+    class _QuoteCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "symbol": "SH.600249",
+                "dt": "2026-05-07",
+                "snapshot_at": datetime(2026, 5, 7, 15, 0),
+                "source": "eastmoney_push2delay_ulist",
+                "price": 5.94,
+                "change_pct": -0.5,
+                "freshness": "fresh",
+                "is_stale": False,
+            }
+
+    class _FullmarketCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "symbol": "SH.600249",
+                "code": "600249",
+                "trade_date": "2026-05-07",
+                "date_key": "20260507",
+                "snapshot_at": datetime(2026, 5, 7, 15, 5),
+                "latest": 5.94,
+                "price": 5.94,
+                "change_pct": -0.5,
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({
+        "quote_snapshots": _QuoteCollection(),
+        "fullmarket_spot_snapshots": _FullmarketCollection(),
+    }))
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-08")
+
+    row = workbench._apply_quote_overlay({"latest_price": 5.94, "day_change_pct": -0.5}, "SH.600249")
+
+    assert row["quote_status"] == "stale"
+    assert row["latest_price"] is None
+    assert row["day_change_pct"] is None
+    assert row["quote_stale_reason"] == "quote_day=2026-05-07, expected=2026-05-08"
+
+
+def test_quote_snapshot_watermark_includes_same_day_fullmarket(monkeypatch):
+    from signals.web.api import workbench
+
+    class _QuoteCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {"snapshot_at": datetime(2026, 5, 8, 9, 31)}
+
+    class _FullmarketCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {"snapshot_at": datetime(2026, 5, 8, 15, 5)}
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({
+        "quote_snapshots": _QuoteCollection(),
+        "fullmarket_spot_snapshots": _FullmarketCollection(),
+    }))
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-08")
+
+    watermark = workbench._quote_snapshot_watermark()
+
+    assert "quote_snapshots:2026-05-08T09:31:00" in watermark
+    assert "fullmarket_spot_snapshots:2026-05-08T15:05:00" in watermark
+
+
+def test_quote_overlay_marks_old_intraday_quote_stale(monkeypatch):
+    from signals.web.api import workbench
+
+    class _QuoteCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "symbol": "SZ.002759",
+                "dt": "2026-05-08",
+                "snapshot_at": datetime(2026, 5, 8, 9, 57, 10),
+                "source": "eastmoney_push2delay_ulist",
+                "price": 38.95,
+                "open": 38.89,
+                "change_pct": 0.4125,
+                "freshness": "fresh",
+                "is_stale": False,
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"quote_snapshots": _QuoteCollection()}))
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-08")
+    monkeypatch.setattr(workbench, "_market_now", lambda market="A": datetime(2026, 5, 8, 10, 35))
+
+    row = workbench._apply_quote_overlay({"day_change_pct": 9.9, "latest_price": 99.0}, "SZ.002759")
+
+    assert row["quote_status"] == "stale"
+    assert row["latest_price"] is None
+    assert row["day_change_pct"] is None
+    assert "quote_age_seconds" in row["quote_stale_reason"]
+
+
+def test_apply_quote_overlay_clears_snapshot_when_intraday_quote_missing(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+
+    row = workbench._apply_quote_overlay(
+        {
+            "latest_price": 88.41,
+            "realtime_price": 88.41,
+            "day_change_pct": 5.15,
+            "daily_change_pct": 5.15,
+            "today_change_pct": 5.15,
+            "gain_pct": 5.15,
+            "day_change_source": "row_snapshot",
+        },
+        "SZ.301363",
+        {"quote_status": "missing", "quote_status_label": "无行情"},
+    )
+
+    assert row["latest_price"] is None
+    assert row["day_change_pct"] is None
+    assert row["daily_change_pct"] is None
+    assert row["today_change_pct"] is None
+    assert row["gain_pct"] is None
+    assert row["day_change_source"] == ""
+    assert row["quote_status"] == "missing"
+
+
+def test_apply_quote_overlay_closed_quote_overrides_snapshot():
+    from signals.web.api import workbench
+
+    row = workbench._apply_quote_overlay(
+        {
+            "latest_price": 88.41,
+            "day_change_pct": 5.15,
+            "daily_change_pct": 5.15,
+            "today_change_pct": 5.15,
+            "gain_pct": 5.15,
+            "day_change_source": "row_snapshot",
+        },
+        "SZ.301363",
+        {
+            "day_change_mode": "daily_close",
+            "quote_status": "closed",
+            "quote_price": 30.16,
+            "quote_change_pct": 4.0359,
+            "quote_as_of": "2026-05-08",
+        },
+    )
+
+    assert row["latest_price"] == 30.16
+    assert row["day_change_pct"] == 4.0359
+    assert row["gain_pct"] == 4.0359
+    assert row["day_change_basis"] == "prev_close"
+    assert row["day_change_source"] == "quote_snapshots"
+
+
+def test_enrich_scored_stock_rows_refreshes_visible_quotes(monkeypatch):
+    from signals.web.api import workbench
+
+    refresh_calls = []
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: {"quote_snapshots": object()})
+    monkeypatch.setattr(
+        workbench,
+        "_refresh_realtime_quotes_for_rows",
+        lambda db, rows, *, refresh_key, limit: refresh_calls.append({
+            "refresh_key": refresh_key,
+            "symbols": [row.get("symbol") for row in rows],
+            "limit": limit,
+        }) or {"status": "ok"},
+    )
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {
+        "day_change_mode": "quote_intraday",
+        "quote_status": "realtime",
+        "latest_price": 38.06,
+        "day_change_pct": -1.882,
+        "day_change_source": "quote_snapshots",
+        "day_change_basis": "prev_close",
+    })
+
+    rows = workbench._enrich_scored_stock_rows([{"symbol": "SZ.002759", "name": "天际股份"}], [])
+
+    assert refresh_calls[0]["refresh_key"] == "scored_stocks"
+    assert refresh_calls[0]["symbols"] == ["SZ.002759"]
+    assert rows[0]["day_change_pct"] == -1.882
+    assert rows[0]["day_change_basis"] == "prev_close"
+
+
+def test_slim_shell_stock_row_preserves_quote_basis_fields():
+    from signals.web.api import workbench
+
+    row = workbench._slim_shell_stock_row({
+        "symbol": "SZ.002759",
+        "name": "天际股份",
+        "latest_price": 38.02,
+        "day_change_pct": -1.985,
+        "day_change_basis": "prev_close",
+        "quote_open_price": 38.89,
+        "quote_open_change_pct": -2.2371,
+        "quote_prev_close_change_pct": -1.985,
+    })
+
+    assert row["day_change_basis"] == "prev_close"
+    assert row["quote_open_price"] == 38.89
+    assert row["quote_prev_close_change_pct"] == -1.985
 
 
 def test_quote_overlay_prefers_realtime_quote_over_minute_change(monkeypatch):
@@ -1195,7 +1624,7 @@ def test_concept_target_returns_scored_candidate_groups(monkeypatch):
     assert payload["target"]["kind"] == "concept"
     assert payload["target"]["mapping_status"] == "mapped"
     assert payload["candidate_groups"]["leaders"]
-    assert payload["candidate_groups"]["elastic"]
+    assert payload["candidate_groups"]["upstream"]
     assert payload["candidate_stocks"]
     leader = payload["candidate_groups"]["leaders"][0]
     assert leader["leader_tier"] == "龙头"
@@ -1357,14 +1786,14 @@ def test_electrolyte_relation_groups_include_upstream_and_downstream(monkeypatch
     upstream_symbols = {item["symbol"] for item in groups["upstream"]}
     downstream_symbols = {item["symbol"] for item in groups["downstream"]}
 
-    assert {"SZ.002407", "SZ.002709", "SH.603026"} <= upstream_symbols
+    assert {"SZ.002407", "SZ.002759"} <= upstream_symbols
     assert {"SZ.300750", "SZ.300014"} <= downstream_symbols
     assert groups["upstream"][0]["chain_relation_type"] == "upstream"
     assert groups["downstream"][0]["chain_relation_type"] == "downstream"
 
     concept_candidates = workbench._concept_carrier_candidates("电解液", [], [])
     concept_groups = workbench._candidate_groups(concept_candidates, heat_value=5.0)
-    assert {"SZ.002407", "SZ.002709"} <= {item["symbol"] for item in concept_groups["upstream"]}
+    assert {"SZ.002407", "SZ.002759"} <= {item["symbol"] for item in concept_groups["upstream"]}
     assert "SZ.300750" in {item["symbol"] for item in concept_groups["downstream"]}
 
 
@@ -1390,6 +1819,206 @@ def test_chain_heat_sector_docs_keep_chain_diversity():
         "operator",
     ]
     assert sum(1 for row in rows if row["chain_id"] == "semi") == 2
+
+
+def test_chain_representative_quote_rows_collects_nested_reps():
+    from signals.web.api import workbench
+
+    rows = workbench._chain_representative_quote_rows([
+        {
+            "leader_symbol": "SZ.300308",
+            "leader_name": "中际旭创",
+            "representatives": [
+                {"symbol": "SZ.300308", "name": "中际旭创"},
+                {"symbol": "SZ.002281", "name": "光迅科技"},
+            ],
+            "integrated_domains": [
+                {
+                    "leader_symbol": "SH.688498",
+                    "leader_name": "源杰科技",
+                    "representatives": [{"symbol": "SZ.300502", "name": "新易盛"}],
+                }
+            ],
+        }
+    ])
+
+    assert [row["symbol"] for row in rows] == [
+        "SZ.300308",
+        "SZ.002281",
+        "SH.688498",
+        "SZ.300502",
+    ]
+
+
+def test_chain_heat_display_context_explains_driver_reference_and_representatives():
+    from signals.web.api import workbench
+
+    context = workbench._chain_heat_display_context({
+        "chain_name": "基础化工产业链",
+        "node_name": "化工材料",
+        "integrated_domains": [
+            {
+                "kind": "concept",
+                "name": "超导概念",
+                "change_pct": 3.48,
+                "up_count": 18,
+                "down_count": 1,
+                "mapping_confidence": 96,
+            },
+            {
+                "kind": "industry",
+                "name": "基础化工",
+                "change_pct": 0.21,
+                "up_count": 215,
+                "down_count": 219,
+                "mapping_confidence": 60,
+            },
+        ],
+    }, {
+        "leaders": [{"symbol": "SH.600309", "name": "万华化学", "day_change_pct": -5.49}],
+        "elastic": [{"symbol": "SZ.002648", "name": "卫星化学", "day_change_pct": -7.94}],
+    })
+
+    assert context["change_display_kind"] == "chain_driver_change"
+    assert context["primary_domain"]["name"] == "超导概念"
+    assert context["reference_domain"]["name"] == "基础化工"
+    assert context["representative_confirmation"]["status"] == "not_confirmed"
+    assert "driver_not_same_as_chain_label" in context["mismatch_flags"]
+    assert "driver_reference_divergence" in context["mismatch_flags"]
+    assert "主驱动 超导概念 +3.48%" in context["change_explain"]
+    assert "参考行业 基础化工 +0.21%" in context["change_explain"]
+
+
+def test_slim_sector_row_preserves_chain_change_truth_fields():
+    from signals.web.api import workbench
+
+    slim = workbench._slim_shell_sector_row({
+        "kind": "concept",
+        "label": "基础化工产业链 · 化工材料",
+        "name": "基础化工产业链 · 化工材料",
+        "day_change_pct": 3.48,
+        "change_display_kind": "chain_driver_change",
+        "change_display_label": "驱动涨幅",
+        "change_explain": "主驱动 超导概念 +3.48%；参考行业 基础化工 +0.21%；代表股未跟随",
+        "primary_domain": {"kind": "concept", "name": "超导概念", "change_pct": 3.48},
+        "reference_domain": {"kind": "industry", "name": "基础化工", "change_pct": 0.21},
+        "representative_confirmation": {"status": "not_confirmed", "label": "代表股未跟随"},
+        "mismatch_flags": ["driver_reference_divergence", "representatives_not_confirmed"],
+    })
+
+    assert slim["change_display_label"] == "驱动涨幅"
+    assert slim["primary_domain"]["name"] == "超导概念"
+    assert slim["reference_domain"]["change_pct"] == 0.21
+    assert "representatives_not_confirmed" in slim["mismatch_flags"]
+
+
+def test_lightweight_chain_representatives_apply_quote_overlay(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {
+        "day_change_mode": "daily_close",
+        "quote_status": "closed",
+        "quote_price": 38.88,
+        "quote_change_pct": 1.65,
+        "quote_as_of": "2026-05-07",
+    })
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (pd.DataFrame(), ""))
+
+    groups = workbench._candidate_groups_from_representatives({
+        "heat_score": 58.9,
+        "chain_id": "telecom_network",
+        "chain_name": "通信网络/5G产业链",
+        "node_id": "telecom_equipment",
+        "node_name": "通信设备/网络建设",
+        "representatives": [
+            {
+                "symbol": "SZ.000063",
+                "name": "中兴通讯",
+                "relation": "通信设备/5G链主",
+                "representative_type": "core",
+                "priority": 100,
+            }
+        ],
+    }, lightweight=True)
+
+    leader = groups["leaders"][0]
+    assert leader["latest_price"] == 38.88
+    assert leader["day_change_pct"] == 1.65
+    assert leader["day_change_source"] == "quote_snapshots"
+
+
+def test_chain_representatives_preserve_core_leader_rank(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (pd.DataFrame(), ""))
+
+    groups = workbench._candidate_groups_from_representatives({
+        "heat_score": 58.9,
+        "chain_id": "copper_interconnect",
+        "chain_name": "铜连接/高速连接器产业链",
+        "node_id": "copper_connector_core",
+        "node_name": "高速铜连接/连接器",
+        "representatives": [
+            {"symbol": "SZ.002130", "name": "沃尔核材", "representative_type": "core", "priority": 100},
+            {"symbol": "SZ.300563", "name": "神宇股份", "representative_type": "core", "priority": 94},
+            {"symbol": "SZ.300913", "name": "兆龙互连", "representative_type": "core", "priority": 90},
+        ],
+    }, lightweight=True)
+
+    assert [row["leader_tier"] for row in groups["leaders"]] == ["龙头", "龙二", "龙三"]
+
+
+def test_chain_heat_representatives_preserve_upstream_downstream_groups(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (pd.DataFrame(), ""))
+
+    groups = workbench._candidate_groups_from_representatives({
+        "heat_score": 58.9,
+        "chain_id": "lithium_battery",
+        "chain_name": "电新/锂电池产业链",
+        "node_id": "electrolyte",
+        "node_name": "电解液",
+        "representatives": [
+            {"symbol": "SZ.002709", "name": "天赐材料", "representative_type": "core", "priority": 100},
+            {"symbol": "SZ.002407", "name": "多氟多", "representative_type": "upstream", "priority": 94},
+            {"symbol": "SZ.300750", "name": "宁德时代", "representative_type": "downstream", "priority": 100},
+            {"symbol": "SZ.002759", "name": "天际股份", "representative_type": "elastic", "priority": 84},
+        ],
+    }, lightweight=True)
+
+    assert [row["symbol"] for row in groups["leaders"]] == ["SZ.002709"]
+    assert [row["symbol"] for row in groups["upstream"]] == ["SZ.002407"]
+    assert [row["symbol"] for row in groups["downstream"]] == ["SZ.300750"]
+    assert [row["symbol"] for row in groups["elastic"]] == ["SZ.002759"]
+
+
+def test_related_custom_signals_round_robin_symbols(monkeypatch):
+    from signals.web.api import workbench
+
+    rows_by_symbol = {
+        "SZ.000001": [
+            {"signal_type": f"信号A{i}", "freq": "30min", "signal_date": f"2026-05-07T10:0{i}:00"}
+            for i in range(4)
+        ],
+        "SZ.000002": [
+            {"signal_type": f"信号B{i}", "freq": "30min", "signal_date": f"2026-05-07T10:1{i}:00"}
+            for i in range(3)
+        ],
+        "SZ.000003": [
+            {"signal_type": "信号C0", "freq": "30min", "signal_date": "2026-05-07T10:20:00"}
+        ],
+    }
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=80: rows_by_symbol.get(symbol, []))
+    monkeypatch.setattr(workbench, "_custom_signal_rows", lambda symbol, limit=200: [])
+
+    related = workbench._related_custom_signals_from_candidates([
+        {"symbol": "SZ.000001", "name": "一号"},
+        {"symbol": "SZ.000002", "name": "二号"},
+        {"symbol": "SZ.000003", "name": "三号"},
+    ], "30min", limit=5)
+
+    assert [row["symbol"] for row in related] == ["SZ.000001", "SZ.000002", "SZ.000003", "SZ.000001", "SZ.000002"]
 
 
 def test_chain_backed_concept_skips_generic_industry_leaders(monkeypatch):
@@ -1459,6 +2088,45 @@ def test_stock_chain_summary_prefers_security_membership(monkeypatch):
     assert summary["chain"] == "电新/锂电池产业链"
     assert summary["node"] == "锂资源"
     assert summary["is_primary_chain"] is True
+
+
+def test_stock_chain_summary_overrides_stale_taxonomy_membership(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Collection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "trade_date": "2026-05-08",
+                "symbol": "SZ.002759",
+                "raw_code": "002759",
+                "chain_id": "lithium_battery",
+                "chain_name": "电新/锂电池产业链",
+                "node_id": "electrolyte",
+                "node_name": "电解液",
+                "layer": "midstream",
+                "stage": "中游",
+                "role": "六氟磷酸锂弹性标的",
+                "confidence": 92,
+                "exposure_score": 96,
+                "is_primary_chain": True,
+                "taxonomy_representative": True,
+                "representative_type": "elastic",
+                "representative_priority": 84,
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"security_chain_memberships": _Collection()}))
+
+    summary = workbench._stock_chain_position_summary("SZ.002759")
+
+    assert summary["source"] == "industry_chains.yaml"
+    assert summary["chain_id"] == "lithium_battery"
+    assert summary["node_id"] == "lipf6_lithium_salt"
+    assert summary["node"] == "六氟磷酸锂/锂盐"
+    assert summary["stale_membership_node_id"] == "electrolyte"
 
 
 def test_stock_chain_context_exposes_same_node_candidate_groups(monkeypatch):
@@ -1565,6 +2233,37 @@ def test_trader_task_queue_is_action_oriented():
     assert tasks[0]["invalidates_when"]
 
 
+def test_manual_clue_attack_focus_promotes_right_side_setup():
+    from signals.web.api import workbench
+
+    promoted = workbench._manual_clue_attack_focus_rows([
+        {
+            "symbol": "SZ.002050",
+            "name": "三花智控",
+            "missing_gates": ["trigger_30m"],
+            "upper_timeframe_side": "right",
+            "trade_timeframe_side": "none",
+            "execution_timeframe_side": "right",
+            "technical_evidence": {"signal_type": "15分钟 MACD绿柱扩大_零上"},
+        },
+        {
+            "symbol": "SH.688802",
+            "name": "沐曦股份",
+            "missing_gates": ["risk_clear", "trigger_30m"],
+            "upper_timeframe_side": "right",
+            "trade_timeframe_side": "none",
+            "execution_timeframe_side": "right",
+            "technical_evidence": {"signal_type": "5分钟 趋势买"},
+        },
+    ], existing_focus=[])
+
+    assert [row["symbol"] for row in promoted] == ["SZ.002050"]
+    assert promoted[0]["stage_label"] == "进攻买点"
+    assert promoted[0]["queue_lane"] == "entry_waiting_confirm"
+    assert promoted[0]["trader_action"] == "进攻买点复核"
+    assert promoted[0]["can_trade_now"] is True
+
+
 def test_trader_task_queue_excludes_observation_context():
     from signals.web.api import workbench
 
@@ -1593,17 +2292,17 @@ def test_trader_task_queue_excludes_observation_context():
     assert tasks == []
 
 
-def test_trader_task_queue_excludes_legacy_buy_review_without_hard_technical():
+def test_trader_task_queue_excludes_risk_rows_and_legacy_buy_without_hard_technical():
     from signals.web.api import workbench
 
     tasks = workbench._build_trader_task_queue(
         decision_rows=[
             {
-                "title": "确认买点 · 测试股",
+                "title": "买点池 · 测试股",
                 "symbol": "SZ.000001",
                 "action_label": "复合买点",
                 "queue_lane": "risk_exit_first",
-                "summary": "打开图表确认买点、关键均线方向和止损位。",
+                "summary": "打开图表复合买点池、关键均线方向和止损位。",
                 "reason": "背驰买",
             },
             {
@@ -1618,9 +2317,57 @@ def test_trader_task_queue_excludes_legacy_buy_review_without_hard_technical():
         sector_boards=[],
     )
 
-    assert len(tasks) == 1
-    assert tasks[0]["queue_lane"] == "risk_exit_first"
-    assert tasks[0]["symbol"] == "SZ.000002"
+    assert tasks == []
+
+
+def test_trade_map_uses_setup_modes_and_excludes_risk_rows():
+    from signals.web.api import workbench
+
+    trade_map = workbench._build_trade_map(
+        sector_boards=[],
+        focus_stocks=[
+            {
+                "symbol": "SZ.000001",
+                "name": "左侧股",
+                "setup_mode": "left_attack",
+                "trader_read": "一买叠加10/20日线承接。",
+            },
+            {
+                "symbol": "SZ.000002",
+                "name": "右侧股",
+                "setup_mode": "right_attack",
+                "trader_read": "30m二买叠加5/10/20日线。",
+            },
+        ],
+        watch_stocks=[
+            {
+                "symbol": "SZ.000003",
+                "name": "观察股",
+                "setup_mode": "watch",
+                "trader_read": "还缺均线确认。",
+            }
+        ],
+        risk_stocks=[
+            {
+                "symbol": "SZ.000004",
+                "name": "风险股",
+                "setup_mode": "risk_first",
+                "trader_read": "非持仓不推风险动作。",
+            }
+        ],
+        clue_stocks=[
+            {
+                "symbol": "SZ.000005",
+                "name": "线索股",
+                "setup_mode": "clue",
+            }
+        ],
+    )
+
+    assert [item["label"] for item in trade_map["role_filters"]] == ["全部", "低吸进攻", "右侧进攻", "盯盘观察", "线索池"]
+    assert trade_map["role_counts"] == {"left_attack": 1, "right_attack": 1, "watch": 1, "clue": 1}
+    assert [item["role"] for item in trade_map["items"]] == ["left_attack", "right_attack", "watch", "clue"]
+    assert trade_map["risk_policy"] == "risk_stocks_excluded_from_opportunity_map"
 
 
 def test_static_index_minute_request_does_not_fallback_to_daily(monkeypatch):

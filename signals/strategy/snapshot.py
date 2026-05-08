@@ -1291,11 +1291,9 @@ def _build_daily_brief(
     top_candidate = candidates[0]["symbol"] if candidates else ""
     top_stage = str((candidates[0] if candidates else {}).get("decision_stage") or "")
     summary = f"{market_regime.get('label', '均衡观察')}，主线关注 {primary}"
-    if warnings:
-        summary += f"，先处理 {len(warnings)} 个风险预警"
     if top_candidate:
         if top_stage == "entry_ready":
-            summary += f"，确认买点复核 {top_candidate}"
+            summary += f"，买点池复核 {top_candidate}"
         else:
             summary += f"，线索池观察 {top_candidate}"
     next_actions = [str(item.get("metadata", {}).get("next_action") or "") for item in candidates[:3]]

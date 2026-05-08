@@ -4,7 +4,7 @@
 #
 # 规则:
 #   - 节假日期间: 所有品种 (equity/futures/option) 全部休市
-#   - 调休工作日: 周末变为工作日, 市场正常开市
+#   - 行政调休工作日: 交易所公告仍按周末休市处理, 不自动开市
 #   - 无半日市, 无提前收盘
 #   - applies_to 为空表示影响所有品种
 
@@ -22,9 +22,7 @@ holidays:
   - {date: "2025-02-03", exchange: ALL_CN, holiday_type: full_close, description: "春节初六"}
   - {date: "2025-02-04", exchange: ALL_CN, holiday_type: full_close, description: "春节初七"}
 
-  # 春节调休: 1月26日(周日)上班→市场开市
-  # 注意: 调休工作日不在此列出, 因为周末+非节假日默认检查即可
-  # 但为显式清晰, 这里通过注释标注
+  # 春节调休: 1月26日(周日)、2月8日(周六)为行政补班日, 交易所仍周末休市
 
   - {date: "2025-04-04", exchange: ALL_CN, holiday_type: full_close, description: "清明节"}
 
@@ -54,7 +52,7 @@ holidays:
   - {date: "2026-01-02", exchange: ALL_CN, holiday_type: full_close, description: "元旦假期"}
 
   # 春节: 2月16日(除夕周一)-2月23日休市
-  # 调休: 2月14日(周六)、2月28日(周六)上班→市场开市
+  # 行政调休: 2月14日(周六)、2月28日(周六)补班, 交易所仍周末休市
   - {date: "2026-02-16", exchange: ALL_CN, holiday_type: full_close, description: "春节除夕"}
   - {date: "2026-02-17", exchange: ALL_CN, holiday_type: full_close, description: "春节初一"}
   - {date: "2026-02-18", exchange: ALL_CN, holiday_type: full_close, description: "春节初二"}

@@ -22,9 +22,10 @@ def test_schedule_window_is_only_due_inside_window():
     assert SyncEngine._schedule_due("16:00-17:30 weekday", datetime(2026, 4, 24, 17, 31)) is False
 
 
-def test_weekday_schedule_skips_cn_labor_day_holiday():
+def test_weekday_schedule_skips_cn_labor_day_holiday_and_weekend_close():
     assert SyncEngine._schedule_due("16:00-17:30 weekday", datetime(2026, 5, 1, 16, 1)) is False
-    assert SyncEngine._schedule_due("16:00-17:30 weekday", datetime(2026, 5, 9, 16, 1)) is True
+    assert SyncEngine._schedule_due("16:00-17:30 weekday", datetime(2026, 5, 6, 16, 1)) is True
+    assert SyncEngine._schedule_due("16:00-17:30 weekday", datetime(2026, 5, 9, 16, 1)) is False
 
 
 def test_a_quote_preopen_window_is_trading_day_only():

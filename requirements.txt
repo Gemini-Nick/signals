@@ -1,6 +1,9 @@
 czsc
 pandas
 akshare
+reportlab
+plotly
+kaleido
 lark-oapi
 pdfplumber
 pytesseract

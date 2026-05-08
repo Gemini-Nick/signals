@@ -55,6 +55,38 @@ def test_weekly_docs_label_unfinished_week_by_data_as_of():
     assert weekly[0]["meta"]["is_partial_period"] is True
 
 
+def test_weekly_docs_dedupes_legacy_daily_alias_before_rollup():
+    docs = [
+        {
+            "dt": pd.Timestamp("2026-04-20"),
+            "meta": {"symbol": "002759", "freq": "daily", "source": "legacy"},
+            "open": 9,
+            "high": 11,
+            "low": 8,
+            "close": 10,
+            "vol": 100,
+            "amount": 1000,
+        },
+        {
+            "dt": pd.Timestamp("2026-04-20"),
+            "meta": {"symbol": "002759", "freq": "日线", "source": "canonical"},
+            "open": 19,
+            "high": 21,
+            "low": 18,
+            "close": 20,
+            "vol": 200,
+            "amount": 2000,
+        },
+    ]
+
+    weekly = _weekly_docs("002759", docs, collection="bars")
+
+    assert len(weekly) == 1
+    assert weekly[0]["open"] == 19
+    assert weekly[0]["close"] == 20
+    assert weekly[0]["vol"] == 200
+
+
 def test_weekly_docs_preserve_hk_market_metadata():
     docs = []
     for dt, close in zip(pd.date_range("2026-04-20", periods=5, freq="D"), [300, 302, 304, 306, 308]):

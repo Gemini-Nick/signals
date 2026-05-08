@@ -17,6 +17,17 @@ DAILY_FREQS = ["日线", "daily", "D", "1d"]
 WEEKLY_FREQ = "周线"
 
 
+def _daily_freq_priority(meta: object) -> int:
+    if not isinstance(meta, dict):
+        return 10
+    freq = str(meta.get("freq") or "").strip()
+    if freq == "日线":
+        return 0
+    if freq in {"daily", "D", "1d"}:
+        return 1
+    return 5
+
+
 def _symbols_with_daily(db: Database, collection: str) -> list[str]:
     try:
         return [
@@ -43,7 +54,17 @@ def _weekly_docs(symbol: str, docs: list[dict[str, Any]], *, collection: str) ->
     if df.empty or "dt" not in df.columns:
         return []
     df["dt"] = pd.to_datetime(df["dt"], errors="coerce")
-    df = df.dropna(subset=["dt"]).sort_values("dt").set_index("dt")
+    df = df.dropna(subset=["dt"])
+    if df.empty:
+        return []
+    df["_freq_priority"] = df["meta"].map(_daily_freq_priority) if "meta" in df.columns else 10
+    df["_row_order"] = range(len(df))
+    df = (
+        df.sort_values(["dt", "_freq_priority", "_row_order"])
+        .drop_duplicates(subset=["dt"], keep="first")
+        .sort_values("dt")
+        .set_index("dt")
+    )
     for column in ("open", "high", "low", "close", "vol", "amount"):
         if column in df.columns:
             df[column] = pd.to_numeric(df[column], errors="coerce")

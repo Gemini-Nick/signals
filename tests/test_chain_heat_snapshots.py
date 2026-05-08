@@ -3,7 +3,111 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from signals.sync.modules.chain_heat import _aggregate
+from signals.sync.modules.chain_heat import _aggregate, _filter_mapping_matches
+
+
+def test_chain_heat_drops_ambiguous_industry_only_matches():
+    matches = [
+        {"chain_id": "optical_module", "score": 76, "evidence_sources": ["industry"]},
+        {"chain_id": "semiconductor", "score": 76, "evidence_sources": ["industry"]},
+        {"chain_id": "pcb_ccl", "score": 76, "evidence_sources": ["industry"]},
+    ]
+
+    filtered, reason = _filter_mapping_matches(matches)
+
+    assert filtered == []
+    assert reason == "ambiguous_industry_only"
+
+
+def test_chain_heat_prefers_specific_evidence_over_industry_fallback():
+    matches = [
+        {"chain_id": "photovoltaic", "score": 64, "evidence_sources": ["alias", "node_keyword"]},
+        {"chain_id": "lithium_battery", "score": 60, "evidence_sources": ["industry", "node_keyword"]},
+    ]
+
+    filtered, reason = _filter_mapping_matches(matches)
+
+    assert [row["chain_id"] for row in filtered] == ["photovoltaic"]
+    assert reason == "specific_only"
+
+
+def test_chain_heat_keeps_single_chain_industry_only_match():
+    matches = [
+        {"chain_id": "medicine", "score": 76, "evidence_sources": ["industry"]},
+    ]
+
+    filtered, reason = _filter_mapping_matches(matches)
+
+    assert filtered == matches
+    assert reason == "industry_only"
+
+
+def test_postmarket_chain_rebuild_ai_can_adjudicate_rule_candidates(monkeypatch):
+    from signals.sync.modules import postmarket_chain_rebuild
+
+    matches = [
+        {"chain_id": "optical_module", "node_id": "optical_module_core", "score": 76, "confidence": 76, "evidence_sources": ["industry"], "hit_terms": ["元件"]},
+        {"chain_id": "semiconductor", "node_id": "wafer_foundry", "score": 76, "confidence": 76, "evidence_sources": ["industry"], "hit_terms": ["元件"]},
+    ]
+    monkeypatch.setattr(postmarket_chain_rebuild, "decide_chain_mapping", lambda db, source, matches, now: {
+        "status": "mapped",
+        "decisions": [{
+            "candidate_id": "optical_module:optical_module_core",
+            "confidence": 91,
+            "reason": "元件板块今日由光通信链带动",
+            "matched_terms": ["光通信"],
+        }],
+    })
+
+    filtered, reason = postmarket_chain_rebuild._resolve_mapping_matches(
+        None,
+        {"kind": "industry", "name": "元件"},
+        matches,
+        now=datetime(2026, 5, 7, 15, 0),
+    )
+
+    assert reason == "ai_mapped"
+    assert [row["chain_id"] for row in filtered] == ["optical_module"]
+    assert filtered[0]["ai_confidence"] == 91
+    assert "ai_semantic_mapper" in filtered[0]["evidence_sources"]
+
+
+def test_postmarket_chain_rebuild_skips_ai_for_specific_rule_match(monkeypatch):
+    from signals.sync.modules import postmarket_chain_rebuild
+
+    matches = [
+        {
+            "chain_id": "copper_interconnect",
+            "node_id": "copper_connector_core",
+            "score": 92,
+            "confidence": 92,
+            "evidence_sources": ["alias", "node_keyword"],
+            "hit_terms": ["铜缆高速连接"],
+        },
+    ]
+
+    def fail_decision(*args, **kwargs):
+        raise AssertionError("AI should not run for a specific one-candidate rule match")
+
+    monkeypatch.setattr(postmarket_chain_rebuild, "decide_chain_mapping", fail_decision)
+
+    filtered, reason = postmarket_chain_rebuild._resolve_mapping_matches(
+        None,
+        {"kind": "concept", "name": "铜缆高速连接"},
+        matches,
+        now=datetime(2026, 5, 7, 15, 0),
+    )
+
+    assert reason == "specific_only"
+    assert filtered == matches
+
+
+def test_ai_mapping_parser_accepts_json_fences():
+    from signals.core.chain_ai_mapping import _parse_json_content
+
+    parsed = _parse_json_content("""```json\n{"status":"ambiguous","decisions":[],"reason":"宽行业"}\n```""")
+
+    assert parsed["status"] == "ambiguous"
 
 
 def test_chain_heat_aggregate_builds_realtime_node_fields():

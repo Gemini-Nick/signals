@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>LONG CLAW Terminal</title>
   <link rel="stylesheet" href="/static/css/themes.css">
-  <link rel="stylesheet" href="/static/css/workbench.css">
+  <link rel="stylesheet" href="/static/css/workbench.css?v=2">
 </head>
 <body class="workbench-body">
   <div class="wb-grid-bg"></div>
@@ -132,7 +132,11 @@
         <div class="wb-tab-panel active" data-tab="backtest">
           <div class="wb-tab-toolbar">
             <div class="wb-tab-title">增强回测</div>
-            <div class="wb-tab-meta" id="wb-backtest-target"></div>
+            <div class="wb-report-actions">
+              <button class="wb-report-btn" id="wb-backtest-html" type="button" disabled>HTML</button>
+              <button class="wb-report-btn" id="wb-backtest-pdf" type="button" disabled>PDF</button>
+              <div class="wb-tab-meta" id="wb-backtest-target"></div>
+            </div>
           </div>
           <div class="wb-kpi-grid" id="wb-backtest-kpis"></div>
           <div class="wb-subgrid">
@@ -251,8 +255,8 @@
 
       <section class="wb-panel">
         <div class="wb-panel-header">
-          <span>风险提示</span>
-          <span class="wb-panel-meta">risk</span>
+          <span>失效条件</span>
+          <span class="wb-panel-meta">rules</span>
         </div>
         <div class="wb-risk-list" id="wb-risk-list"></div>
       </section>
@@ -262,6 +266,6 @@
   <div class="wb-toast" id="wb-toast"></div>
 
   <script src="/static/vendor/echarts.min.js"></script>
-  <script src="/static/js/workbench.js"></script>
+  <script src="/static/js/workbench.js?v=2"></script>
 </body>
 </html>

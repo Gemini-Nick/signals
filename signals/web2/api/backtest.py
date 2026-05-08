@@ -7,12 +7,13 @@
 import logging
 import traceback
 from datetime import datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 import config
 from signals.core.market_time import to_unix_seconds
@@ -1255,31 +1256,36 @@ def _annotate_signals_ma_vol(df: pd.DataFrame, signals: list):
             df.drop(columns=[col], inplace=True, errors="ignore")
 
 
-@router.get("/analyze")
-async def backtest_analyze(
-    code: str = Query(..., description="股票代码 (如 002759, 09988)"),
-    freq: str = Query("daily", description="daily / weekly / monthly"),
-    signal_group: str = Query("all", description="macd / czsc / all"),
-    lookback: int = Query(999, description="信号回看窗口"),
-    # 入场因子
-    factor: str = Query("", description="入场因子: gap / trend_breakout / vol_contraction / candle_run / candle_accel"),
-    gap_pct_min: float = Query(2.0), volume_ratio_min: float = Query(1.5),
-    trend_lookback: int = Query(20), bb_period: int = Query(20), squeeze_threshold: float = Query(0.05),
-    run_count: int = Query(3), body_ratio: float = Query(0.5), accel_count: int = Query(3),
-    # 基础风控
-    stop_loss: float = Query(5.0), trail_stop: float = Query(50.0),
-    max_hold: int = Query(20), slippage: float = Query(0.1),
-    # 高级出场
-    take_profit: float = Query(0), ma_exit_period: int = Query(0),
-    profit_drawdown: float = Query(0),
-    batch_exit: str = Query("0"), batch1_ratio: float = Query(50),
-    batch1_target: float = Query(5), batch2_target: float = Query(10),
-    # ATR 追踪止损
-    atr_exit_period: int = Query(0), atr_exit_mult: float = Query(2.0),
-):
-    """
-    一体化分析 — 信号检测 + 交易模拟，一次请求返回全部数据。
-    """
+async def analyze_backtest_payload(
+    *,
+    code: str,
+    freq: str = "daily",
+    signal_group: str = "all",
+    lookback: int = 999,
+    factor: str = "",
+    gap_pct_min: float = 2.0,
+    volume_ratio_min: float = 1.5,
+    trend_lookback: int = 20,
+    bb_period: int = 20,
+    squeeze_threshold: float = 0.05,
+    run_count: int = 3,
+    body_ratio: float = 0.5,
+    accel_count: int = 3,
+    stop_loss: float = 5.0,
+    trail_stop: float = 50.0,
+    max_hold: int = 20,
+    slippage: float = 0.1,
+    take_profit: float = 0,
+    ma_exit_period: int = 0,
+    profit_drawdown: float = 0,
+    batch_exit: str = "0",
+    batch1_ratio: float = 50,
+    batch1_target: float = 5,
+    batch2_target: float = 10,
+    atr_exit_period: int = 0,
+    atr_exit_mult: float = 2.0,
+) -> dict[str, Any] | JSONResponse:
+    """Pure Python backtest analysis entrypoint shared by API and services."""
     from signals.core.trade_simulator import SimConfig, simulate_trades
     import dataclasses
 
@@ -1295,7 +1301,6 @@ async def backtest_analyze(
         symbol = _build_symbol(code, market)
         freq_label = _freq_label(freq)
 
-        # 1. 拉取K线
         df = _fetch_kline(code, market, freq)
         if df.empty:
             return JSONResponse(status_code=404, content={
@@ -1307,23 +1312,19 @@ async def backtest_analyze(
         data_source = meta["data_source"]
         data_source_detail = meta["data_source_detail"]
 
-        # 2. 信号检测
         all_signals, bi_list, zhongshu, warnings = _detect_all_signals(
             df, symbol, freq_label, signal_group, lookback, factor,
             gap_pct_min, volume_ratio_min, trend_lookback, bb_period, squeeze_threshold,
             run_count=run_count, body_ratio=body_ratio, accel_count=accel_count,
         )
 
-        # 2.5 MA/量能标注 — 给每个信号补充 ma_status 和 volume_status
         _annotate_signals_ma_vol(df, all_signals)
 
-        # 3. 序列化图表数据
         ohlcv = _serialize_ohlcv(df)
         macd_data = _compute_macd_data(df)
         ma_lines = _compute_ma_lines(df)
         kpi = _compute_kpi(all_signals)
 
-        # 4. 交易模拟
         sim_kwargs = dict(
             stop_loss_pct=stop_loss, trail_stop_pct=trail_stop,
             max_hold_days=max_hold, slippage=slippage / 100.0,
@@ -1353,6 +1354,7 @@ async def backtest_analyze(
             "sim_trades": sim.trades, "sim_equity": sim.equity_curve,
             "sim_kpi": sim.kpi, "sim_config": sim.config,
             "sim_skip_reasons": sim.skip_reasons,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
         }
         if data_source in {
             "disk_cache",
@@ -1379,6 +1381,61 @@ async def backtest_analyze(
             "last_upstream_error": str(e),
             "detail": traceback.format_exc(),
         })
+
+
+@router.get("/analyze")
+async def backtest_analyze(
+    code: str = Query(..., description="股票代码 (如 002759, 09988)"),
+    freq: str = Query("daily", description="daily / weekly / monthly"),
+    signal_group: str = Query("all", description="macd / czsc / all"),
+    lookback: int = Query(999, description="信号回看窗口"),
+    # 入场因子
+    factor: str = Query("", description="入场因子: gap / trend_breakout / vol_contraction / candle_run / candle_accel"),
+    gap_pct_min: float = Query(2.0), volume_ratio_min: float = Query(1.5),
+    trend_lookback: int = Query(20), bb_period: int = Query(20), squeeze_threshold: float = Query(0.05),
+    run_count: int = Query(3), body_ratio: float = Query(0.5), accel_count: int = Query(3),
+    # 基础风控
+    stop_loss: float = Query(5.0), trail_stop: float = Query(50.0),
+    max_hold: int = Query(20), slippage: float = Query(0.1),
+    # 高级出场
+    take_profit: float = Query(0), ma_exit_period: int = Query(0),
+    profit_drawdown: float = Query(0),
+    batch_exit: str = Query("0"), batch1_ratio: float = Query(50),
+    batch1_target: float = Query(5), batch2_target: float = Query(10),
+    # ATR 追踪止损
+    atr_exit_period: int = Query(0), atr_exit_mult: float = Query(2.0),
+):
+    """
+    一体化分析 — 信号检测 + 交易模拟，一次请求返回全部数据。
+    """
+    return await analyze_backtest_payload(
+        code=code,
+        freq=freq,
+        signal_group=signal_group,
+        lookback=lookback,
+        factor=factor,
+        gap_pct_min=gap_pct_min,
+        volume_ratio_min=volume_ratio_min,
+        trend_lookback=trend_lookback,
+        bb_period=bb_period,
+        squeeze_threshold=squeeze_threshold,
+        run_count=run_count,
+        body_ratio=body_ratio,
+        accel_count=accel_count,
+        stop_loss=stop_loss,
+        trail_stop=trail_stop,
+        max_hold=max_hold,
+        slippage=slippage,
+        take_profit=take_profit,
+        ma_exit_period=ma_exit_period,
+        profit_drawdown=profit_drawdown,
+        batch_exit=batch_exit,
+        batch1_ratio=batch1_ratio,
+        batch1_target=batch1_target,
+        batch2_target=batch2_target,
+        atr_exit_period=atr_exit_period,
+        atr_exit_mult=atr_exit_mult,
+    )
 
 
 @router.get("/health/push2his")
@@ -1858,6 +1915,29 @@ async def backtest_push(request: Request):
         return {"ok": ok}
     except Exception as e:
         logger.warning("回测推送失败: %s", e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@router.post("/report")
+async def backtest_report(request: Request, format: str = Query("html", description="html / pdf")):
+    """将当前回测结果生成 HTML/PDF 报告附件。"""
+    try:
+        data = await request.json()
+        fmt = format.lower().lstrip(".")
+        from signals.core.backtest_report import render_backtest_report, report_filename
+
+        content = render_backtest_report(data, fmt)
+        media_type = "application/pdf" if fmt == "pdf" else "text/html; charset=utf-8"
+        filename = report_filename(data, fmt)
+        return StreamingResponse(
+            BytesIO(content),
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:
+        logger.exception("回测报告生成失败")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 

@@ -11,6 +11,8 @@ from signals.sync.modules.technical_signal_scan import (
     POSTMARKET_SCAN_SCOPE,
     _coverage_by_freq,
     _doc_to_rawbar,
+    _load_bars,
+    _ma_alignment_from_daily_bars,
     _resampled_5m_docs,
     _resonance_context,
     _symbols_for_scope,
@@ -23,6 +25,11 @@ class _Event:
     signal_type: str
     confidence: float = 1.0
     dt: datetime = datetime(2026, 4, 28, 15, 0, 0)
+
+
+@dataclass
+class _Bar:
+    close: float
 
 
 WEIGHTS = {
@@ -79,6 +86,22 @@ def test_resonance_context_marks_period_conflict():
     assert "周期冲突" in context["tags"]
 
 
+def test_ma_alignment_marks_reclaim_and_above_key_daily_averages():
+    closes = [10, 10.2, 10.1, 10.3, 10.2, 10.4, 10.5, 10.6, 10.7, 10.8]
+    closes += [11, 11.1, 11.2, 11.3, 11.4, 11.5, 11.6, 11.7, 11.8]
+    closes += [10.5, 12.1]
+
+    alignment = _ma_alignment_from_daily_bars([_Bar(close=value) for value in closes])
+
+    assert alignment["above_ma5"] is True
+    assert alignment["above_ma10"] is True
+    assert alignment["above_ma20"] is True
+    assert alignment["reclaim_ma20"] is True
+    assert alignment["above_count"] == 3
+    assert alignment["score"] > 0
+    assert "站上20日线" in alignment["tags"]
+
+
 def test_doc_to_rawbar_preserves_market_naive_datetime():
     raw_dt = datetime(2026, 4, 30, 13, 30)
 
@@ -99,6 +122,39 @@ def test_doc_to_rawbar_preserves_market_naive_datetime():
     )
 
     assert bar.dt.to_pydatetime() == raw_dt
+
+
+def test_load_bars_prefers_canonical_freq_on_duplicate_dt():
+    db = _Db({
+        "bars": _Collection(docs=[
+            {
+                "dt": datetime(2026, 4, 23),
+                "meta": {"symbol": "002759", "freq": "daily"},
+                "open": 1,
+                "high": 2,
+                "low": 1,
+                "close": 2,
+                "vol": 100,
+                "amount": 1000,
+            },
+            {
+                "dt": datetime(2026, 4, 23),
+                "meta": {"symbol": "002759", "freq": "日线"},
+                "open": 3,
+                "high": 4,
+                "low": 3,
+                "close": 4,
+                "vol": 200,
+                "amount": 2000,
+            },
+        ]),
+    })
+
+    bars = _load_bars(db, "002759", ["日线", "daily"], Freq.D, limit=10, label="日线")
+
+    assert len(bars) == 1
+    assert bars[0].close == 4
+    assert bars[0].vol == 200
 
 
 class _Bars:

@@ -580,21 +580,20 @@ def _select_postmarket_minute_symbols(
             return float("-inf")
 
     def status_rank(code: str) -> int:
-        if code in pinned:
-            return 0
         status = str((universe_states.get(code) or {}).get("status") or "pending")
         if status in {"pending", "error", "stale"}:
-            return 1
+            return 0
         if status == "running":
-            return 2
+            return 1
         if status == "cached":
-            return 4
-        return 3
+            return 3
+        return 2
 
     sorted_codes = sorted(
         ordered,
         key=lambda code: (
             status_rank(code),
+            0 if code in pinned else 1,
             0 if code in priority else 1,
             stale_rank(code),
             original_idx.get(code, 0),

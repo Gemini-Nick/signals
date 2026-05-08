@@ -5,6 +5,7 @@ from datetime import datetime
 
 from signals.sync.modules.quote_snapshots import (
     _a_quote_symbols,
+    _hot_quote_symbols,
     _quote_doc_from_em,
     _quote_doc_from_ulist_row,
     _read_fullmarket_no_price_symbols,
@@ -190,6 +191,170 @@ class _Collection:
 class _Db(dict):
     def __getitem__(self, key):
         return dict.__getitem__(self, key)
+
+
+def test_hot_quote_symbols_include_terminal_clue_stocks():
+    class _Cursor(list):
+        def sort(self, *args, **kwargs):
+            return self
+
+        def limit(self, *args, **kwargs):
+            return self
+
+    class _SimpleCollection:
+        def __init__(self, doc=None, rows=None):
+            self.doc = doc
+            self.rows = rows or []
+
+        def find_one(self, query=None, projection=None, sort=None):
+            return self.doc
+
+        def find(self, query=None, projection=None):
+            return _Cursor(self.rows)
+
+        def aggregate(self, pipeline):
+            return _Cursor([])
+
+    db = _Db({
+        "terminal_stock_pool": _SimpleCollection({
+            "clue_stocks": [{"symbol": "SZ.301363"}],
+        }),
+        "market_pools": _SimpleCollection({"symbols": []}),
+        "signals": _SimpleCollection(rows=[]),
+        "bars": _SimpleCollection(rows=[]),
+    })
+
+    symbols = _hot_quote_symbols(db)
+
+    assert "SZ.301363" in symbols
+
+
+def test_hot_quote_symbols_include_chain_heat_representatives(monkeypatch):
+    from signals.sync.modules import quote_snapshots
+
+    class _Cursor(list):
+        def sort(self, *args, **kwargs):
+            return self
+
+        def limit(self, *args, **kwargs):
+            return self
+
+    class _SimpleCollection:
+        def __init__(self, doc=None, rows=None):
+            self.doc = doc
+            self.rows = rows or []
+
+        def find_one(self, query=None, projection=None, sort=None):
+            return self.doc
+
+        def find(self, query=None, projection=None):
+            return _Cursor(self.rows)
+
+        def aggregate(self, pipeline):
+            return _Cursor([])
+
+    db = _Db({
+        "terminal_stock_pool": _SimpleCollection({}),
+        "terminal_manual_clues": _SimpleCollection(rows=[]),
+        "market_pools": _SimpleCollection({"symbols": []}),
+        "signals": _SimpleCollection(rows=[]),
+        "bars": _SimpleCollection(rows=[]),
+        "chain_heat_snapshots": _SimpleCollection(
+            {"trade_minute": datetime(2026, 5, 8, 10, 30)},
+            rows=[{
+                "representatives": [
+                    {"symbol": "SZ.002281", "representative_type": "elastic"},
+                    {"symbol": "SH.688498", "representative_type": "elastic"},
+                ]
+            }],
+        ),
+    })
+    monkeypatch.setattr(quote_snapshots, "_iter_strategy_snapshot_symbols", lambda: [])
+
+    symbols = quote_snapshots._hot_quote_symbols(db)
+
+    assert "SZ.002281" in symbols
+    assert "SH.688498" in symbols
+
+
+def test_hot_quote_symbols_prioritize_strategy_snapshot_before_limit(monkeypatch):
+    from signals.sync.modules import quote_snapshots
+
+    class _Cursor(list):
+        def sort(self, *args, **kwargs):
+            return self
+
+        def limit(self, *args, **kwargs):
+            return self
+
+    class _SimpleCollection:
+        def __init__(self, doc=None, rows=None):
+            self.doc = doc
+            self.rows = rows or []
+
+        def find_one(self, query=None, projection=None, sort=None):
+            return self.doc
+
+        def find(self, query=None, projection=None):
+            return _Cursor(self.rows)
+
+        def aggregate(self, pipeline):
+            return _Cursor([])
+
+    terminal_rows = [{"symbol": f"SZ.{idx:06d}"} for idx in range(1, 20)]
+    db = _Db({
+        "terminal_stock_pool": _SimpleCollection({"watch_stocks": terminal_rows}),
+        "terminal_manual_clues": _SimpleCollection(rows=[]),
+        "market_pools": _SimpleCollection({"symbols": []}),
+        "signals": _SimpleCollection(rows=[]),
+        "bars": _SimpleCollection(rows=[]),
+    })
+    monkeypatch.setenv("EASTMONEY_ULIST_MAX_SYMBOLS", "6")
+    monkeypatch.setattr(quote_snapshots, "_iter_strategy_snapshot_symbols", lambda: ["SZ.002759"])
+
+    symbols = quote_snapshots._hot_quote_symbols(db)
+
+    assert "SZ.002759" in symbols
+
+
+def test_hot_quote_symbols_prioritize_manual_clues_before_limit(monkeypatch):
+    from signals.sync.modules import quote_snapshots
+
+    class _Cursor(list):
+        def sort(self, *args, **kwargs):
+            return self
+
+        def limit(self, *args, **kwargs):
+            return self
+
+    class _SimpleCollection:
+        def __init__(self, doc=None, rows=None):
+            self.doc = doc
+            self.rows = rows or []
+
+        def find_one(self, query=None, projection=None, sort=None):
+            return self.doc
+
+        def find(self, query=None, projection=None):
+            return _Cursor(self.rows)
+
+        def aggregate(self, pipeline):
+            return _Cursor([])
+
+    terminal_rows = [{"symbol": f"SZ.{idx:06d}"} for idx in range(1, 20)]
+    db = _Db({
+        "terminal_stock_pool": _SimpleCollection({"watch_stocks": terminal_rows}),
+        "terminal_manual_clues": _SimpleCollection(rows=[{"symbol": "SZ.002759"}]),
+        "market_pools": _SimpleCollection({"symbols": []}),
+        "signals": _SimpleCollection(rows=[]),
+        "bars": _SimpleCollection(rows=[]),
+    })
+    monkeypatch.setenv("EASTMONEY_ULIST_MAX_SYMBOLS", "6")
+    monkeypatch.setattr(quote_snapshots, "_iter_strategy_snapshot_symbols", lambda: [])
+
+    symbols = quote_snapshots._hot_quote_symbols(db)
+
+    assert "SZ.002759" in symbols
 
 
 def test_quote_snapshots_reads_fullmarket_spot_snapshot():

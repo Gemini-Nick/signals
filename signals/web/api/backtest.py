@@ -7,10 +7,11 @@
 import logging
 import traceback
 from datetime import datetime, timedelta
+from io import BytesIO
 
 import pandas as pd
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 import config
 from signals.core.market_time import market_now, to_unix_seconds
@@ -683,6 +684,29 @@ async def backtest_analyze(
         atr_exit_period=atr_exit_period,
         atr_exit_mult=atr_exit_mult,
     )
+
+
+@router.post("/report")
+async def backtest_report(request: Request, format: str = Query("html", description="html / pdf")):
+    """将当前回测结果生成 HTML/PDF 报告附件。"""
+    try:
+        data = await request.json()
+        fmt = format.lower().lstrip(".")
+        from signals.core.backtest_report import render_backtest_report, report_filename
+
+        content = render_backtest_report(data, fmt)
+        media_type = "application/pdf" if fmt == "pdf" else "text/html; charset=utf-8"
+        filename = report_filename(data, fmt)
+        return StreamingResponse(
+            BytesIO(content),
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:
+        logger.exception("回测报告生成失败")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @router.get("/scan")

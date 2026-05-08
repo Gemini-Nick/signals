@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+import re
 from typing import Any, Iterable
 
 import yaml
@@ -44,6 +45,17 @@ _BROAD_TERMS_NO_CARRIER_BOOST = {
     "电新",
 }
 
+_REVERSE_MATCH_DENY_TERMS = {
+    "设备",
+    "材料",
+    "租赁",
+    "航空",
+    "电池",
+    "储能",
+    "电力",
+    "元件",
+}
+
 NON_CHAIN_THEME_TERMS = {
     "本月解禁": "事件/时间维度主题，不对应稳定产业链。",
     "昨日涨停": "交易行为主题，不对应稳定产业链。",
@@ -58,8 +70,94 @@ NON_CHAIN_THEME_KEYWORDS = {
     "沪深300": "指数样本主题，不对应单一产业链。",
     "中证500": "指数样本主题，不对应单一产业链。",
     "上证50": "指数样本主题，不对应单一产业链。",
+    "上证180": "指数样本主题，不对应单一产业链。",
+    "上证380": "指数样本主题，不对应单一产业链。",
+    "HS300": "指数样本主题，不对应单一产业链。",
+    "MSCI": "指数/持仓主题，不对应单一产业链。",
+    "QFII": "持仓主题，不对应单一产业链。",
+    "AB股": "市场结构主题，不对应单一产业链。",
+    "AH股": "市场结构主题，不对应单一产业链。",
+    "B股": "市场结构主题，不对应单一产业链。",
+    "GDR": "融资/市场结构主题，不对应单一产业链。",
+    "IPO": "融资事件主题，不对应单一产业链。",
+    "举牌": "交易事件主题，不对应稳定产业链。",
+    "热股": "交易热度主题，不对应稳定产业链。",
+    "预增": "财报预告主题，不对应单一产业链。",
+    "预减": "财报预告主题，不对应单一产业链。",
+    "扭亏": "财报预告主题，不对应单一产业链。",
+    "年报": "财报时间主题，不对应单一产业链。",
+    "季报": "财报时间主题，不对应单一产业链。",
+    "低价股": "交易风格主题，不对应单一产业链。",
+    "价值股": "交易风格主题，不对应单一产业链。",
+    "成长股": "交易风格主题，不对应单一产业链。",
+    "大盘股": "交易风格主题，不对应单一产业链。",
+    "中盘股": "交易风格主题，不对应单一产业链。",
+    "小盘股": "交易风格主题，不对应单一产业链。",
+    "北交所": "交易场所主题，不对应单一产业链。",
+    "基金重仓": "持仓主题，不对应单一产业链。",
+    "养老金": "持仓主题，不对应单一产业链。",
+    "富时罗素": "指数/持仓主题，不对应单一产业链。",
+    "一带一路": "政策/区域主题，不对应单一产业链。",
+    "上海自贸": "政策/区域主题，不对应单一产业链。",
+    "东北振兴": "政策/区域主题，不对应单一产业链。",
+    "中俄贸易": "政策/区域主题，不对应单一产业链。",
+    "中字头": "央企风格主题，不对应单一产业链。",
+    "中特估": "估值风格主题，不对应单一产业链。",
+    "央国企改革": "产权/政策主题，不对应单一产业链。",
+    "专精特新": "企业属性主题，不对应单一产业链。",
+    "并购重组": "交易事件主题，不对应单一产业链。",
+    "历史新高": "交易行为主题，不对应单一产业链。",
+    "昨日": "交易行为主题，不对应稳定产业链。",
+    "最近多板": "交易行为主题，不对应稳定产业链。",
+    "次新股": "上市时间主题，不对应单一产业链。",
+    "微盘": "交易风格主题，不对应单一产业链。",
+    "权重股": "交易风格主题，不对应单一产业链。",
+    "标准普尔": "指数/持仓主题，不对应单一产业链。",
+    "央视50": "指数样本主题，不对应单一产业链。",
+    "宁组合": "持仓风格主题，不对应单一产业链。",
+    "反内卷": "政策/事件主题，不对应单一产业链。",
     "解禁": "事件/时间维度主题，不对应稳定产业链。",
     "ST": "风险状态主题，不对应稳定产业链。",
+    "中盘": "交易风格主题，不对应单一产业链。",
+    "大盘": "交易风格主题，不对应单一产业链。",
+    "小盘": "交易风格主题，不对应单一产业链。",
+    "周期股": "交易风格主题，不对应单一产业链。",
+    "微利股": "交易风格主题，不对应单一产业链。",
+    "百元股": "交易风格主题，不对应单一产业链。",
+    "百日新高": "交易行为主题，不对应稳定产业链。",
+    "破净": "交易风格主题，不对应单一产业链。",
+    "破发": "交易事件主题，不对应单一产业链。",
+    "红利": "分红/风格主题，不对应单一产业链。",
+    "茅指数": "持仓风格主题，不对应单一产业链。",
+    "行业龙头": "企业属性主题，不对应单一产业链。",
+    "创业成份": "指数样本主题，不对应单一产业链。",
+    "创业板综": "指数样本主题，不对应单一产业链。",
+    "深成": "指数样本主题，不对应单一产业链。",
+    "深证": "指数样本主题，不对应单一产业链。",
+    "沪股通": "资金通道/持仓主题，不对应单一产业链。",
+    "深股通": "资金通道/持仓主题，不对应单一产业链。",
+    "机构重仓": "持仓主题，不对应单一产业链。",
+    "社保重仓": "持仓主题，不对应单一产业链。",
+    "证金持股": "持仓主题，不对应单一产业链。",
+    "科创板做市": "交易制度主题，不对应单一产业链。",
+    "股权激励": "公司治理/事件主题，不对应单一产业链。",
+    "股权转让": "交易事件主题，不对应单一产业链。",
+    "破增发价": "交易事件主题，不对应单一产业链。",
+    "贬值受益": "汇率因子主题，不对应单一产业链。",
+    "超级品牌": "品牌风格主题，不对应单一产业链。",
+    "超跌股": "交易行为主题，不对应稳定产业链。",
+    "近期新高": "交易行为主题，不对应稳定产业链。",
+    "参股新三板": "市场结构主题，不对应单一产业链。",
+    "独角兽": "企业属性主题，不对应单一产业链。",
+    "成渝特区": "区域政策主题，不对应单一产业链。",
+    "沪企改革": "区域国企改革主题，不对应单一产业链。",
+    "深圳特区": "区域政策主题，不对应单一产业链。",
+    "湖北自贸": "区域政策主题，不对应单一产业链。",
+    "滨海新区": "区域政策主题，不对应单一产业链。",
+    "粤港自贸": "区域政策主题，不对应单一产业链。",
+    "西部大开发": "区域政策主题，不对应单一产业链。",
+    "长江三角": "区域政策主题，不对应单一产业链。",
+    "统一大市场": "政策主题，不对应单一产业链。",
 }
 
 
@@ -82,17 +180,19 @@ def _text(value: Any) -> str:
 
 
 def _norm(value: Any) -> str:
-    return (
+    normalized = (
         _text(value)
         .replace("概念", "")
         .replace("板块", "")
         .replace("产业链", "")
         .replace("行业", "")
-        .replace("II", "")
+        .replace("Ⅲ", "")
         .replace("Ⅱ", "")
+        .replace("Ⅰ", "")
         .strip()
         .upper()
     )
+    return re.sub(r"(?<=[\u4e00-\u9fff])(?:IV|III|II|I)$", "", normalized)
 
 
 def _matches(text: str, token: str) -> bool:
@@ -100,9 +200,33 @@ def _matches(text: str, token: str) -> bool:
         return False
     if text == token:
         return True
+    if _is_ascii_token(token):
+        return _ascii_token_in_text(text, token) or _ascii_token_in_text(token, text)
     if len(token) == 1:
         return token in text
-    return token in text or text in token
+    if token in text:
+        return True
+    if text in _REVERSE_MATCH_DENY_TERMS:
+        return False
+    return text in token
+
+
+def _is_ascii_token(value: str) -> bool:
+    return bool(value) and bool(re.fullmatch(r"[A-Z0-9]+", value))
+
+
+def _ascii_token_in_text(text: str, token: str) -> bool:
+    """Avoid matching short acronyms inside unrelated English words, e.g. CRO in MICROLED."""
+    if not text or not token:
+        return False
+    for hit in re.finditer(re.escape(token), text):
+        before = text[hit.start() - 1] if hit.start() > 0 else ""
+        after = text[hit.end()] if hit.end() < len(text) else ""
+        if (not before or not before.isascii() or not before.isalnum()) and (
+            not after or not after.isascii() or not after.isalnum()
+        ):
+            return True
+    return False
 
 
 def _score_match(key: str, token: str, *, exact: int, partial: int) -> int:
@@ -119,6 +243,8 @@ def _score_keyword_match(key: str, token: str, *, exact: int, partial: int) -> i
         return 0
     if key == token:
         return exact
+    if _is_ascii_token(token):
+        return partial + min(len(token), 12) if _ascii_token_in_text(key, token) else 0
     if token in key or (len(token) == 1 and token in key):
         return partial + min(len(token), 12)
     return 0
@@ -298,6 +424,8 @@ def match_industry_chains(
                 "representatives": [
                     *(node.get("core_representatives") or []),
                     *(node.get("elastic_representatives") or []),
+                    *(node.get("upstream_representatives") or []),
+                    *(node.get("downstream_representatives") or []),
                 ],
                 "chain": chain,
                 "node": node,
@@ -344,7 +472,7 @@ def preferred_concept_carriers(
     aliases: Iterable[str] = (),
     related_industries: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
-    rows_by_symbol: dict[str, dict[str, Any]] = {}
+    rows_by_key: dict[str, dict[str, Any]] = {}
     boost_terms = [_norm(concept_name)] + [_norm(item) for item in aliases]
     boost_terms = [item for item in boost_terms if item]
 
@@ -362,11 +490,12 @@ def preferred_concept_carriers(
             symbol = _normalize_symbol(rep.get("symbol"))
             if not symbol:
                 continue
+            representative_type = _text(rep.get("representative_type"))
             priority = (
                 int(rep.get("priority") or 0)
                 + int(match.get("score") or 0)
                 + _carrier_boost(rep, boost_terms, _text(match.get("node_name")))
-                + (20 if rep.get("representative_type") == "core" else 0)
+                + (20 if representative_type == "core" else 0)
             )
             row = {
                 **rep,
@@ -378,20 +507,23 @@ def preferred_concept_carriers(
                 "node_name": match.get("node_name"),
                 "layer": match.get("layer"),
                 "stage": match.get("stage"),
+                "chain_relation_type": representative_type if representative_type in {"upstream", "downstream"} else "",
                 "priority": priority,
                 "base_priority": int(rep.get("priority") or 0),
                 "confidence": match.get("confidence", 0),
                 "hit_terms": match.get("hit_terms", []),
                 "evidence_sources": match.get("evidence_sources", []),
             }
-            existing = rows_by_symbol.get(symbol)
+            key = f"{symbol}:{representative_type}" if representative_type in {"upstream", "downstream"} else symbol
+            existing = rows_by_key.get(key)
             if not existing or int(row["priority"]) > int(existing.get("priority") or 0):
-                rows_by_symbol[symbol] = row
+                rows_by_key[key] = row
 
-    rows = list(rows_by_symbol.values())
+    rows = list(rows_by_key.values())
+    tier = {"core": 4, "elastic": 3, "upstream": 2, "downstream": 1}
     rows.sort(
         key=lambda item: (
-            1 if item.get("representative_type") == "core" else 0,
+            tier.get(_text(item.get("representative_type")), 0),
             int(item.get("priority") or 0),
         ),
         reverse=True,

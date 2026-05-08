@@ -3,6 +3,16 @@ from datetime import datetime
 from signals.sync.modules import postmarket_chain_rebuild as rebuild
 
 
+def test_tianji_taxonomy_representative_lives_under_lipf6_not_electrolyte():
+    reps = rebuild._taxonomy_representatives_by_node()
+
+    assert "002759" not in reps.get(("lithium_battery", "electrolyte"), {})
+    tianji = reps[("lithium_battery", "lipf6_lithium_salt")]["002759"]
+    assert tianji["symbol"] == "SZ.002759"
+    assert tianji["representative_type"] == "core"
+    assert "六氟磷酸锂" in tianji["representative_relation"]
+
+
 def test_rollup_prefers_chain_role_before_heat_exposure():
     rows = [
         {

@@ -72,6 +72,7 @@ def test_realtime_concept_reads_snapshot_without_provider(monkeypatch):
         raise AssertionError("realtime gateway must not call providers")
 
     monkeypatch.setattr(gateway, "_latest_df", fake_latest)
+    monkeypatch.setattr(gateway, "_read_heat_tick_snapshot", lambda domain, target: (pd.DataFrame(), "", None))
     monkeypatch.setattr(gateway, "_fetch_realtime_sources", fake_realtime)
     monkeypatch.setattr(gateway, "_write_data_freshness", lambda *a, **k: None)
 
@@ -86,6 +87,33 @@ def test_realtime_concept_reads_snapshot_without_provider(monkeypatch):
     assert response.source == "concept_sina"
     assert response.data.iloc[0]["board_name"] == "AI算力"
     assert calls["realtime"] == 0
+
+
+def test_realtime_board_prefers_heat_ticks(monkeypatch):
+    from signals.data import gateway
+
+    heat_df = pd.DataFrame([
+        {"dt": "2026-05-08", "board_name": "通信设备", "change_pct": 3.6, "source": "eastmoney_push2delay"}
+    ])
+
+    monkeypatch.setattr(gateway, "_read_heat_tick_snapshot", lambda domain, target: (heat_df, "board_heat_ticks", "2026-05-08"))
+    monkeypatch.setattr(
+        gateway,
+        "_read_source_snapshots",
+        lambda domain: (_ for _ in ()).throw(AssertionError("source snapshots should not be read")),
+    )
+    monkeypatch.setattr(gateway, "_write_data_freshness", lambda *a, **k: None)
+
+    response = gateway.get_board_rank(DataRequest(
+        domain="board",
+        mode="realtime",
+        as_of="2026-05-08",
+    ))
+
+    assert response.mode_used == "realtime"
+    assert response.source == "board_heat_ticks"
+    assert response.freshness == "fresh"
+    assert response.data.iloc[0]["board_name"] == "通信设备"
 
 
 def test_realtime_empty_falls_back_to_canonical_without_provider(monkeypatch):
@@ -104,6 +132,7 @@ def test_realtime_empty_falls_back_to_canonical_without_provider(monkeypatch):
         "_fetch_realtime_sources",
         lambda domain: (_ for _ in ()).throw(AssertionError("provider called")),
     )
+    monkeypatch.setattr(gateway, "_read_heat_tick_snapshot", lambda domain, target: (pd.DataFrame(), "", None))
 
     response = gateway.get_board_rank(DataRequest(domain="board", mode="realtime"))
 
@@ -163,6 +192,35 @@ def test_bars_df_from_docs_preserves_cached_change_fields():
     assert list(df.columns) == ["open", "high", "low", "close", "vol", "amount", "prev_close", "change_pct", "pct_chg"]
     assert df.iloc[0]["prev_close"] == 10.0
     assert df.iloc[0]["change_pct"] == 4.0
+
+
+def test_bars_df_from_docs_prefers_canonical_freq_on_duplicate_dt():
+    from signals.data import gateway
+
+    df = gateway._bars_df_from_docs([
+        {
+            "dt": "2026-04-23",
+            "open": 1,
+            "high": 2,
+            "low": 1,
+            "close": 2,
+            "vol": 100,
+            "meta": {"symbol": "002759", "freq": "daily"},
+        },
+        {
+            "dt": "2026-04-23",
+            "open": 3,
+            "high": 4,
+            "low": 3,
+            "close": 4,
+            "vol": 200,
+            "meta": {"symbol": "002759", "freq": "日线"},
+        },
+    ], "bars")
+
+    assert len(df) == 1
+    assert df.iloc[0]["close"] == 4
+    assert df.iloc[0]["vol"] == 200
 
 
 def test_index_bars_prefers_index_collection(monkeypatch):

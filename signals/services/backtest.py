@@ -14,7 +14,7 @@ async def backtest_run(**kwargs: Any) -> Any:
 
 async def backtest_analyze(**kwargs: Any) -> Any:
     """Run full historical signal analysis through the current implementation."""
-    from signals.web2.api.backtest import backtest_analyze as _impl
+    from signals.web2.api.backtest import analyze_backtest_payload as _impl
 
     return await _impl(**kwargs)
 
