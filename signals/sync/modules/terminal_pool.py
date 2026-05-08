@@ -3194,6 +3194,13 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         {"$set": pool_doc},
         upsert=True,
     )
+    try:
+        from signals.notify.intraday_pool_alerts import process_terminal_stock_pool_alerts
+
+        alert_result = process_terminal_stock_pool_alerts(db, pool_doc)
+    except Exception as exc:
+        logger.debug("terminal stock pool alert skipped: %s", exc)
+        alert_result = {"status": "error", "reason": str(exc), "sent": 0}
 
     legacy_doc = {
         "pool": "terminal_realtime",
@@ -3273,4 +3280,5 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "coverage_status": pool_doc["coverage_status"],
         "is_full_market_complete": pool_doc["is_full_market_complete"],
         "ranking_version": POOL_RANKING_VERSION,
+        "alerts": alert_result,
     }
