@@ -8,12 +8,20 @@ from signals.sync import provider_limits
 from signals.sync.modules import stock_daily
 
 
+class _Cursor(list):
+    def sort(self, *args, **kwargs):
+        return self
+
+    def limit(self, *args, **kwargs):
+        return self
+
+
 class _Collection:
     def __init__(self, docs=None):
         self.docs = docs or []
 
     def find(self, query=None, projection=None):
-        return list(self.docs)
+        return _Cursor(self.docs)
 
     def find_one(self, query, projection=None, sort=None):
         for doc in self.docs:
@@ -85,6 +93,38 @@ def test_stock_daily_tencent_empty_returns_without_akshare(monkeypatch):
 def test_stock_daily_provider_prefix_maps_bj_920_codes():
     assert stock_daily._daily_provider_prefix("920118") == "bj"
     assert stock_daily._daily_provider_prefix("900901") == "sh"
+
+
+def test_stock_daily_active_repair_lookback_defaults_to_two_years(monkeypatch):
+    monkeypatch.delenv("STOCK_DAILY_REPAIR_LOOKBACK_DAYS", raising=False)
+    monkeypatch.delenv("STOCK_DAILY_ACTIVE_REPAIR_LOOKBACK_DAYS", raising=False)
+
+    assert stock_daily._repair_lookback_days_for_scope("active") == 730
+    assert stock_daily._repair_lookback_days_for_scope("manual_only_codes") == 730
+    assert stock_daily._repair_lookback_days_for_scope("all") == 0
+
+    monkeypatch.setenv("STOCK_DAILY_REPAIR_LOOKBACK_DAYS", "30")
+    assert stock_daily._repair_lookback_days_for_scope("all") == 30
+
+
+def test_active_stock_codes_include_all_terminal_stock_pool_groups():
+    db = _DB({
+        "terminal_stock_pool": _Collection([{
+            "pool": "terminal_stock_pool",
+            "market": "A",
+            "stocks": [{"raw_code": "600001"}],
+            "risk_stocks": [{"symbol": "SH.600002"}],
+            "watch_stocks": [{"raw_code": "300003"}],
+            "clue_stocks": [{"symbol": "SZ.300004"}],
+        }]),
+    })
+
+    codes = stock_daily._get_active_stock_codes(db)
+
+    assert "600001" in codes
+    assert "600002" in codes
+    assert "300003" in codes
+    assert "300004" in codes
 
 
 def test_get_all_stock_codes_falls_back_to_cached_universe(monkeypatch):

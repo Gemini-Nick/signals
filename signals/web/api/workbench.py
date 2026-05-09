@@ -7311,7 +7311,7 @@ def _ensure_daily_bars(symbol: str, raw_code: str) -> bool:
     if not code or not code.isdigit():
         return False
     try:
-        from signals.sync.modules.stock_daily import _sync_one_stock
+        from signals.sync.modules.stock_daily import _replace_daily_docs_batch, _sync_one_stock
 
         now = _sync_now()
         docs = _sync_one_stock(
@@ -7322,35 +7322,13 @@ def _ensure_daily_bars(symbol: str, raw_code: str) -> bool:
         if not docs:
             return False
         db = _mongo_db()
-        existing_dts = {
-            item.get("dt")
-            for item in db["bars"].find(
-                {
-                    "meta.symbol": code,
-                    "meta.freq": "日线",
-                    "dt": {"$in": [doc["dt"] for doc in docs]},
-                },
-                {"dt": 1},
-            )
-        }
-        new_docs = [doc for doc in docs if doc["dt"] not in existing_dts]
-        if new_docs:
-            db["bars"].insert_many(new_docs, ordered=False)
-        db["sync_log"].update_one(
-            {"_id": f"stock_daily:{code}"},
-            {"$set": {
-                "module": "stock_daily",
-                "symbol": code,
-                "last_dt": docs[-1]["dt"],
-                "last_run": _sync_now(),
-                "status": "ok",
-                "bar_count": len(docs),
-                "written": len(new_docs),
-                "source": "concept_carrier_preheat",
-            }},
-            upsert=True,
+        written = _replace_daily_docs_batch(
+            db["bars"],
+            db["sync_log"],
+            {code: docs},
+            source="concept_carrier_preheat",
         )
-        return True
+        return bool(written.get(code))
     except Exception:
         return False
 

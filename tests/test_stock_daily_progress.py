@@ -17,6 +17,7 @@ class _Collection:
     def __init__(self):
         self.docs = {}
         self.inserted = []
+        self.deleted = []
 
     def find(self, query=None, projection=None):
         return []
@@ -32,6 +33,9 @@ class _Collection:
     def insert_many(self, docs, ordered=False):
         self.inserted.extend(docs)
         return _InsertResult(len(docs))
+
+    def delete_many(self, query):
+        self.deleted.append(query)
 
 
 class _DB(dict):
@@ -69,6 +73,35 @@ def test_stock_daily_filters_holiday_rows_before_cursor_update():
     assert written == {}
     assert bars.inserted == []
     assert sync.docs == {}
+
+
+def test_stock_daily_replace_daily_docs_uses_meta_only_delete():
+    bars = _Collection()
+    sync = _Collection()
+    docs = [{
+        "dt": datetime(2026, 4, 28),
+        "meta": {"symbol": "600001", "freq": "日线", "source": "tencent"},
+        "open": 10,
+        "high": 11,
+        "low": 9,
+        "close": 10.5,
+        "vol": 100,
+        "amount": 1000,
+    }]
+
+    written = stock_daily._replace_daily_docs_batch(
+        bars,
+        sync,
+        {"600001": docs},
+        source="unit_test_repair",
+    )
+
+    assert written == {"600001": 1}
+    assert bars.deleted == [{"meta.symbol": "600001", "meta.freq": "日线"}]
+    assert bars.inserted[0]["close"] == 10.5
+    cursor = sync.docs["stock_daily:600001"]
+    assert cursor["source"] == "unit_test_repair"
+    assert cursor["repair_mode"] == "replace_daily_symbol"
 
 
 def test_stock_daily_batch_today_candidates_skip_cn_labor_day_gap():

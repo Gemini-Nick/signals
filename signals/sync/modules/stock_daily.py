@@ -139,6 +139,15 @@ def _write_batch_symbols() -> int:
     return max(1, int(os.getenv("STOCK_DAILY_WRITE_BATCH_SYMBOLS", "20")))
 
 
+def _repair_lookback_days_for_scope(scope: str) -> int:
+    raw = get_task_env("STOCK_DAILY_REPAIR_LOOKBACK_DAYS", "")
+    if raw not in (None, ""):
+        return max(0, int(raw or 0))
+    if scope in {"active", "manual_only_codes"}:
+        return max(0, int(get_task_env("STOCK_DAILY_ACTIVE_REPAIR_LOOKBACK_DAYS", "730") or 0))
+    return 0
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -319,6 +328,55 @@ def _write_daily_docs_batch(bars_col, sync_col, docs_by_code: dict[str, list]) -
                 "status": "ok",
                 "bar_count": len(docs),
                 "written": written_by_code.get(code, 0),
+            }},
+            upsert=True,
+        )
+    return written_by_code
+
+
+def _replace_daily_docs_batch(
+    bars_col,
+    sync_col,
+    docs_by_code: dict[str, list],
+    *,
+    source: str = "stock_daily_repair",
+) -> dict[str, int]:
+    """Replace daily bars per symbol using a time-series-safe meta-only delete."""
+    filtered_by_code = {
+        code: sorted(
+            [
+                {key: value for key, value in doc.items() if key != "_id"}
+                for doc in docs
+                if _valid_daily_doc(doc)
+            ],
+            key=lambda doc: doc["dt"],
+        )
+        for code, docs in docs_by_code.items()
+        if docs
+    }
+    filtered_by_code = {code: docs for code, docs in filtered_by_code.items() if docs}
+    if not filtered_by_code:
+        return {}
+
+    now = naive_market_now("A")
+    written_by_code: dict[str, int] = {}
+    for code, docs in filtered_by_code.items():
+        bars_col.delete_many({"meta.symbol": code, "meta.freq": "日线"})
+        result = bars_col.insert_many(docs, ordered=False)
+        inserted = len(getattr(result, "inserted_ids", []) or docs)
+        written_by_code[code] = inserted
+        sync_col.update_one(
+            {"_id": f"stock_daily:{code}"},
+            {"$set": {
+                "module": "stock_daily",
+                "symbol": code,
+                "last_dt": docs[-1]["dt"],
+                "last_run": now,
+                "status": "ok",
+                "bar_count": len(docs),
+                "written": inserted,
+                "source": source,
+                "repair_mode": "replace_daily_symbol",
             }},
             upsert=True,
         )
@@ -716,12 +774,13 @@ def _get_active_stock_codes(db: Database) -> list[str]:
 
     terminal_pool = db["terminal_stock_pool"].find_one(
         {"pool": "terminal_stock_pool", "market": "A"},
-        {"stocks": 1},
+        {"stocks": 1, "focus_stocks": 1, "risk_stocks": 1, "watch_stocks": 1, "clue_stocks": 1},
         sort=[("updated_at", -1)],
     ) or {}
-    for item in terminal_pool.get("stocks") or []:
-        symbol = item.get("raw_code") or item.get("symbol") if isinstance(item, dict) else item
-        add(symbol, priority=True)
+    for key in ("stocks", "focus_stocks", "risk_stocks", "watch_stocks", "clue_stocks"):
+        for item in terminal_pool.get(key) or []:
+            symbol = item.get("raw_code") or item.get("symbol") if isinstance(item, dict) else item
+            add(symbol, priority=True)
 
     for symbol in getattr(config, "WHITELIST", []):
         add(symbol, priority=True)
@@ -1336,13 +1395,14 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
     # 默认只补活跃池；全市场补仓库需要显式设置 STOCK_DAILY_SCOPE=all。
     all_codes, scope = _get_stock_codes(db)
     codes, shard_meta = _apply_code_shard(all_codes)
+    repair_lookback_days = _repair_lookback_days_for_scope(scope)
     shard_key = str(shard_meta["shard_key"])
     shard_index = int(shard_meta["shard_index"])
     shard_count = int(shard_meta["shard_count"])
     global_total = int(shard_meta["global_total"])
     logger.info(
-        "A股日线同步: %d/%d 只股票, scope=%s shard=%s",
-        len(codes), global_total, scope, shard_key,
+        "A股日线同步: %d/%d 只股票, scope=%s shard=%s repair_lookback_days=%d",
+        len(codes), global_total, scope, shard_key, repair_lookback_days,
     )
 
     # 批量查询 sync_log，并以 bars 最新合法交易日为准，避免节假日 cursor 污染。
@@ -1390,7 +1450,8 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         written_by_code = _write_daily_docs_batch(bars_col, sync_col, batch_docs_by_code)
         batch_inserted = sum(int(value or 0) for value in written_by_code.values())
         total_inserted += batch_inserted
-        processed_count += len(batch_codes)
+        if repair_lookback_days <= 0:
+            processed_count += len(batch_codes)
         _write_progress(
             sync_col,
             status="running" if processed_count < len(codes) else "ok",
@@ -1425,10 +1486,16 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
             # 增量：从 last_dt 下一天开始
             inc_start = (last_dt + timedelta(days=1)).strftime("%Y%m%d")
             if inc_start > end_date:
-                return code, [], "skip"
+                if repair_lookback_days <= 0:
+                    return code, [], "skip"
+                inc_start = (now - timedelta(days=repair_lookback_days)).strftime("%Y%m%d")
         else:
             # 全量：近 2 年
             inc_start = (now - timedelta(days=730)).strftime("%Y%m%d")
+        if repair_lookback_days > 0:
+            repair_start = (now - timedelta(days=repair_lookback_days)).strftime("%Y%m%d")
+            if inc_start > repair_start:
+                inc_start = repair_start
 
         if _stock_daily_providers_all_cooling(db):
             return code, [], "deferred/cooling_down:all_stock_daily_providers"
@@ -1456,11 +1523,19 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
             return 0
         batch = pending_docs
         pending_docs = {}
-        written_by_code = _write_daily_docs_batch(bars_col, sync_col, batch)
+        if repair_lookback_days > 0:
+            written_by_code = _replace_daily_docs_batch(
+                bars_col,
+                sync_col,
+                batch,
+                source=f"stock_daily_repair_{repair_lookback_days}d",
+            )
+        else:
+            written_by_code = _write_daily_docs_batch(bars_col, sync_col, batch)
         return sum(int(value or 0) for value in written_by_code.values())
 
     # 并行拉取
-    remaining_codes = [code for code in codes if code not in batch_codes]
+    remaining_codes = codes if repair_lookback_days > 0 else [code for code in codes if code not in batch_codes]
     with ThreadPoolExecutor(max_workers=_BATCH_WORKERS) as executor:
         futures = {executor.submit(_process, c): c for c in remaining_codes}
         for future in as_completed(futures):
@@ -1569,4 +1644,5 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         "batch_today": len(batch_codes),
         "batch_today_inserted": batch_inserted,
         "batch_today_reason": batch_reason,
+        "repair_lookback_days": repair_lookback_days,
     }
