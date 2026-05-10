@@ -2247,6 +2247,25 @@ def _slim_shell_signal_reason(value: Any) -> dict[str, Any]:
             for key in ("grade", "tags", "aligned_freqs", "conflict_freqs", "primary_freq", "direction", "latest_dt", "summary")
             if resonance.get(key) not in (None, "", [], {})
         }
+    entry_factor = evidence.get("entry_factor") if isinstance(evidence.get("entry_factor"), dict) else value.get("entry_factor")
+    if isinstance(entry_factor, dict):
+        entry_factor_keys = (
+            "group",
+            "type",
+            "price",
+            "today_high",
+            "previous_high",
+            "breakout_pct",
+            "five_day_gain_pct",
+            "volume_ratio",
+            "date",
+            "date_str",
+        )
+        out["entry_factor"] = {
+            key: entry_factor.get(key)
+            for key in entry_factor_keys
+            if entry_factor.get(key) not in (None, "", [], {})
+        }
     ma_alignment = value.get("ma_alignment") if isinstance(value.get("ma_alignment"), dict) else evidence.get("ma_alignment")
     if isinstance(ma_alignment, dict):
         out["ma_alignment"] = {
@@ -2270,6 +2289,233 @@ def _slim_shell_signal_reason(value: Any) -> dict[str, Any]:
             if ma_alignment.get(key) not in (None, "", [], {})
         }
     return out
+
+
+def _shell_signal_label_from_reason(reason: Any) -> str:
+    if not isinstance(reason, dict):
+        return ""
+    signal = _text(reason.get("signal_type") or reason.get("reason_type"))
+    freq = _text(reason.get("freq"))
+    if signal and freq and not signal.startswith(freq):
+        return f"{freq} {signal}"
+    return signal or freq
+
+
+def _shell_dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        text = _text(value)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        output.append(text)
+    return output
+
+
+def _shell_stock_reason_labels(row: dict[str, Any], *, side: str = "buy", limit: int = 3) -> list[str]:
+    direct_key = "right_signal_reasons" if side == "buy" else "risk_signal_reasons" if side == "risk" else "left_signal_reasons"
+    direct = [
+        _text(item)
+        for item in row.get(direct_key) or []
+        if _text(item)
+    ]
+    if direct:
+        return _shell_dedupe_preserve_order(direct)[:limit]
+    reasons = []
+    for reason in row.get("inclusion_reasons") or []:
+        if not isinstance(reason, dict):
+            continue
+        reason_side = _text(reason.get("signal_side")).lower()
+        if side == "buy" and reason_side == "sell":
+            continue
+        if side == "risk" and reason_side not in {"sell", "risk"}:
+            continue
+        if side == "left" and "left" not in _text(reason.get("decision_effect")).lower() and _text(reason.get("signal_side")).lower() != "left":
+            continue
+        label = _shell_signal_label_from_reason(reason)
+        if label:
+            reasons.append(label)
+    return _shell_dedupe_preserve_order(reasons)[:limit]
+
+
+def _shell_stock_entry_factor(row: dict[str, Any]) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    for key in ("top_buy_reason", "technical_evidence"):
+        value = row.get(key)
+        if isinstance(value, dict):
+            candidates.append(value)
+    candidates.extend(reason for reason in row.get("inclusion_reasons") or [] if isinstance(reason, dict))
+    for reason in candidates:
+        evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+        entry_factor = evidence.get("entry_factor") if isinstance(evidence.get("entry_factor"), dict) else reason.get("entry_factor")
+        signal = _text(reason.get("signal_type") or evidence.get("signal_type"))
+        if isinstance(entry_factor, dict) and (_text(entry_factor.get("group")) == "200d_new_high_breakout" or "200日新高" in signal):
+            return entry_factor
+        if "200日新高" in signal:
+            return {"group": "200d_new_high_breakout"}
+    return {}
+
+
+def _shell_stock_pct_text(value: Any, *, digits: int = 1) -> str:
+    numeric = _float(value)
+    if numeric is None:
+        return ""
+    return f"{numeric:+.{digits}f}%"
+
+
+def _shell_stock_metric_text(label: str, value: Any, *, suffix: str = "", digits: int = 1) -> str:
+    numeric = _float(value)
+    if numeric is None:
+        return ""
+    return f"{label}{numeric:.{digits}f}{suffix}"
+
+
+def _shell_stock_breakout_summary(entry_factor: dict[str, Any]) -> str:
+    if not entry_factor:
+        return ""
+    parts = []
+    breakout = _shell_stock_pct_text(entry_factor.get("breakout_pct"), digits=1)
+    if breakout:
+        parts.append(f"突破{breakout}")
+    five_day = _shell_stock_pct_text(entry_factor.get("five_day_gain_pct"), digits=1)
+    if five_day:
+        parts.append(f"5日{five_day}")
+    volume = _shell_stock_metric_text("量比", entry_factor.get("volume_ratio"), digits=2)
+    if volume:
+        parts.append(volume)
+    return "200日新高" + (f"({ ' / '.join(parts) })" if parts else "")
+
+
+def _shell_stock_trade_summary(row: dict[str, Any], *, entry_factor: dict[str, Any]) -> str:
+    pool_type = _text(row.get("pool_type"))
+    gate = _text(row.get("entry_gate_status"))
+    trade_stage = _text(row.get("trade_stage"))
+    chain = _shell_stock_chain_brief(row)
+    primary_signal = _shell_stock_reason_labels(row, side="buy", limit=2)
+    left_signal = _shell_stock_reason_labels(row, side="left", limit=1)
+    risk_signal = _shell_stock_reason_labels(row, side="risk", limit=2)
+    breakout = _shell_stock_breakout_summary(entry_factor)
+    ma = row.get("ma_alignment") if isinstance(row.get("ma_alignment"), dict) else {}
+    ma_tags = [
+        _text(item)
+        for item in ma.get("tags") or []
+        if _text(item)
+    ][:2]
+    detail = ""
+    top_buy = row.get("top_buy_reason") if isinstance(row.get("top_buy_reason"), dict) else {}
+    if isinstance(top_buy, dict):
+        detail = _text(top_buy.get("details"))
+    missing = _text(row.get("missing_condition") or row.get("primary_blocker"))
+
+    if pool_type == "focus" and gate == "entry_confirmed":
+        lead = "买点路径已走通"
+    elif pool_type == "focus" and (gate == "entry_attack_confirmed" or trade_stage == "attack_entry"):
+        lead = "进攻买点，先按小仓/节奏复核"
+    elif pool_type == "focus" and trade_stage == "left_attack":
+        lead = "低吸进攻，先复核承接位"
+    elif gate == "entry_waiting_right_side_confirm":
+        lead = "还差5m/15m下单确认"
+    elif gate == "entry_waiting_30m_confirm":
+        lead = "还差30m买点"
+    elif gate == "entry_waiting_upper_context":
+        lead = "先等日/周大周期补强"
+    elif pool_type == "watch":
+        lead = "盯盘观察，等缺口补齐"
+    elif pool_type in {"clue", "clue_pool"} or trade_stage == "clue_pool":
+        lead = "线索池观察，还不是买点"
+    elif pool_type == "risk" or trade_stage == "skip_now":
+        lead = "暂不参与"
+    else:
+        lead = _text(row.get("stage_label") or row.get("trader_action")) or "观察"
+
+    evidence = []
+    if primary_signal:
+        evidence.append("买点 " + " / ".join(primary_signal[:2]))
+    if left_signal and not primary_signal:
+        evidence.append("左侧 " + " / ".join(left_signal[:1]))
+    if breakout:
+        evidence.append(breakout)
+    if ma_tags:
+        evidence.append("均线 " + " / ".join(ma_tags))
+    if detail:
+        evidence.append(detail)
+
+    context = []
+    if chain:
+        context.append(chain)
+    if risk_signal:
+        context.append("风险标记 " + " / ".join(risk_signal[:2]))
+    elif row.get("risk_marked"):
+        context.append("风险已标记")
+    if missing and missing not in lead:
+        context.append(missing)
+
+    text = "；".join([lead, *evidence[:3], *context[:2]])
+    return text[:180]
+
+
+def _shell_stock_display_action(row: dict[str, Any]) -> str:
+    gate = _text(row.get("entry_gate_status"))
+    trade_stage = _text(row.get("trade_stage"))
+    pool_type = _text(row.get("pool_type"))
+    risk_marked = bool(row.get("risk_marked"))
+    if pool_type == "risk" or trade_stage == "skip_now":
+        return "暂不参与"
+    if gate == "entry_confirmed" or trade_stage == "confirmed_entry":
+        return "复核仓位/止损"
+    if gate == "entry_attack_confirmed" or trade_stage == "attack_entry":
+        return "进攻买点复核"
+    if trade_stage == "left_attack" or gate == "left_attack_confirmed":
+        return "低吸承接复核"
+    if gate == "entry_waiting_right_side_confirm":
+        return "等5m/15m确认"
+    if gate == "entry_waiting_30m_confirm":
+        return "等30m买点"
+    if gate == "entry_waiting_upper_context":
+        return "等大周期补强"
+    if pool_type == "watch":
+        return "盯盘等买点"
+    if pool_type in {"clue", "clue_pool"} or trade_stage == "clue_pool":
+        return "线索先观察"
+    action = _text(row.get("trader_action") or row.get("recommended_action") or row.get("next_action"))
+    if action:
+        return f"{action}/风险标记" if risk_marked and "风险" not in action else action
+    return "复核"
+
+
+def _shell_stock_display_badges(row: dict[str, Any], *, entry_factor: dict[str, Any]) -> list[dict[str, str]]:
+    badges: list[dict[str, str]] = []
+
+    def add(label: str, tone: str = "neutral") -> None:
+        text = _text(label)
+        if text and text not in {item["label"] for item in badges}:
+            badges.append({"label": text[:14], "tone": tone})
+
+    pool_type = _text(row.get("pool_type"))
+    gate = _text(row.get("entry_gate_status"))
+    stage = _text(row.get("stage_label") or row.get("trade_stage"))
+    setup = _text(row.get("setup_mode_label"))
+    if stage:
+        add(stage, "buy" if pool_type == "focus" else "watch" if pool_type == "watch" else "neutral")
+    if setup and setup != stage:
+        add(setup, "info")
+    if _text(row.get("sector_policy_label")):
+        add(_text(row.get("sector_policy_label")), "info")
+    breakout = _shell_stock_breakout_summary(entry_factor)
+    if breakout:
+        add("200日新高", "hot")
+    elif any("200日新高" in item for item in _shell_stock_reason_labels(row, side="buy", limit=4)):
+        add("200日新高", "hot")
+    if row.get("risk_marked"):
+        marker = _text(row.get("risk_marker")) or (_shell_stock_reason_labels(row, side="risk", limit=1) or ["风险"])[0]
+        add(marker, "risk")
+    if gate.startswith("entry_waiting"):
+        add(_shell_stock_display_action(row), "wait")
+    chain = _shell_stock_chain_brief(row)
+    if chain:
+        add(chain.split(" · ")[0], "neutral")
+    return badges[:5]
 
 
 def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -2358,9 +2604,18 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "ai_trade_summary",
         "evidence_summary",
         "setup_side_label",
+        "setup_rank_tier",
+        "market_setup_bias",
+        "mainline_status",
+        "mainline_confirmation_reason",
+        "mainline_rank_tier",
+        "left_allowed_reason",
         "setup_explanation",
         "entry_logic_summary",
         "watch_sort_priority",
+        "watch_backfill_source",
+        "clue_quality_score",
+        "promotion_gates",
         "timeframe_reads",
         "entry_reason",
         "missing_condition",
@@ -2376,6 +2631,10 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "left_signal_reasons",
         "right_signal_reasons",
         "risk_signal_reasons",
+        "risk_marked",
+        "risk_marker",
+        "risk_marker_reason_type",
+        "risk_level",
         "technical_signal_groups",
         "timeframe_signal_sides",
         "upper_timeframe_side",
@@ -2423,6 +2682,19 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         slim = _slim_shell_signal_reason(row.get(key))
         if slim:
             out[key] = slim
+    entry_factor = _shell_stock_entry_factor(row)
+    display_summary = _shell_stock_trade_summary(row, entry_factor=entry_factor)
+    display_action = _shell_stock_display_action(row)
+    display_badges = _shell_stock_display_badges(row, entry_factor=entry_factor)
+    if display_summary:
+        out["display_summary"] = display_summary
+    if display_action:
+        out["display_action"] = display_action
+    if display_badges:
+        out["display_badges"] = display_badges
+    breakout = _shell_stock_breakout_summary(entry_factor)
+    if breakout:
+        out["display_breakout"] = breakout
     return out
 
 
@@ -2494,6 +2766,14 @@ def _slim_shell_sector_row(row: dict[str, Any]) -> dict[str, Any]:
         "layer",
         "stage",
         "integrated_domains",
+        "source_driver",
+        "source_events",
+        "source_concept_overlays",
+        "source_event_concept_overlays",
+        "source_theme_overlays",
+        "source_event_theme_overlays",
+        "source_kind_mix",
+        "route_explain",
         "change_display_kind",
         "change_display_label",
         "change_explain",
@@ -2501,7 +2781,10 @@ def _slim_shell_sector_row(row: dict[str, Any]) -> dict[str, Any]:
         "reference_domain",
         "domain_change_stats",
         "representative_confirmation",
+        "chain_confirmation",
         "mismatch_flags",
+        "display_rank_score",
+        "non_chain_reason",
         "latest_signal",
         "trader_action",
         "action_status",
@@ -5091,6 +5374,233 @@ def _chain_domain_payload(domain: dict[str, Any]) -> dict[str, Any]:
     return {key: domain.get(key) for key in keep if domain.get(key) not in (None, "", [], {})}
 
 
+_CHAIN_SOURCE_KIND_LABELS = {
+    "industry": "行业",
+    "concept": "概念",
+    "theme": "主题",
+}
+
+
+def _chain_source_kind_label(kind: Any) -> str:
+    text = _text(kind)
+    return _CHAIN_SOURCE_KIND_LABELS.get(text, text or "来源")
+
+
+def _chain_source_driver_payload(primary: dict[str, Any], fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+    source = dict(fallback or {})
+    for key in (
+        "kind",
+        "name",
+        "code",
+        "change_pct",
+        "up_count",
+        "down_count",
+        "leader_name",
+        "leader_symbol",
+        "leader_change_pct",
+        "rank",
+        "mapping_confidence",
+        "hit_terms",
+        "evidence_sources",
+    ):
+        if primary.get(key) not in (None, "", [], {}):
+            source[key] = primary.get(key)
+    kind_label = _chain_source_kind_label(source.get("kind"))
+    source["kind_label"] = kind_label
+    if source.get("name"):
+        source["label"] = f"{kind_label}:{source.get('name')}"
+    return {key: value for key, value in source.items() if value not in (None, "", [], {})}
+
+
+def _constituent_symbols_for_source(db: Any, source: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
+    name = _text(source.get("name"))
+    if not name:
+        return [], {}
+    collection_name = "concept_constituents" if _text(source.get("kind")) == "concept" else "board_constituents"
+    doc = db[collection_name].find_one(
+        {"$or": [{"board_name": name}, {"concept_name": name}, {"name": name}]},
+        {"_id": 0, "symbols": 1, "stock_names": 1},
+        sort=[("updated_at", -1)],
+    ) or {}
+    symbols: list[str] = []
+    stock_names: dict[str, str] = {}
+    for raw_symbol in doc.get("symbols") or []:
+        normalized, raw_code = _normalize_stock_symbol(_text(raw_symbol))
+        code = raw_code or _text(raw_symbol)
+        if code and code not in symbols:
+            symbols.append(code)
+        if normalized:
+            stock_names[normalized] = _text((doc.get("stock_names") or {}).get(code))
+        if code:
+            stock_names[code] = _text((doc.get("stock_names") or {}).get(code))
+    return symbols, {key: value for key, value in stock_names.items() if value}
+
+
+def _latest_concept_heat(db: Any, name: str) -> dict[str, Any]:
+    expected_day = _day_change_expected_day()
+    query = {"kind": "concept", "name": name}
+    if expected_day:
+        day_start = datetime.fromisoformat(expected_day)
+        day_end = day_start + timedelta(days=1)
+        query = {
+            **query,
+            "$or": [
+                {"trade_date": expected_day},
+                {"dt": {"$gte": day_start, "$lt": day_end}},
+                {"trade_minute": {"$gte": day_start, "$lt": day_end}},
+            ],
+        }
+    return db["board_heat_ticks"].find_one(
+        query,
+        {
+            "_id": 0,
+            "kind": 1,
+            "name": 1,
+            "code": 1,
+            "change_pct": 1,
+            "up_count": 1,
+            "down_count": 1,
+            "leader_name": 1,
+            "leader_change_pct": 1,
+            "rank_idx": 1,
+            "trade_date": 1,
+            "trade_minute": 1,
+        },
+        sort=[("trade_minute", -1)],
+    ) or {}
+
+
+def _source_market_overlays(
+    db: Any,
+    source_events: list[dict[str, Any]],
+    *,
+    limit: int = 8,
+    only_non_chain: bool = False,
+) -> list[dict[str, Any]]:
+    overlays_by_name: dict[str, dict[str, Any]] = {}
+    for source_order, source in enumerate(source_events[:5]):
+        source_name = _text(source.get("name"))
+        symbols, stock_names = _constituent_symbols_for_source(db, source)
+        if not source_name or not symbols:
+            continue
+        cursor = db["concept_constituents"].find(
+            {"symbols": {"$in": symbols}},
+            {"_id": 0, "concept_name": 1, "board_name": 1, "symbols": 1, "stock_names": 1},
+        )
+        for doc in cursor:
+            concept_name = _text(doc.get("concept_name") or doc.get("board_name") or doc.get("name"))
+            non_chain = non_chain_reason(concept_name)
+            if not concept_name or concept_name == source_name:
+                continue
+            if only_non_chain:
+                if not non_chain:
+                    continue
+            elif non_chain:
+                continue
+            heat = _latest_concept_heat(db, concept_name)
+            change_pct = _float(heat.get("change_pct"))
+            if change_pct is None or change_pct <= 0:
+                continue
+            matched_codes = [code for code in symbols if code in (doc.get("symbols") or [])]
+            if not matched_codes:
+                continue
+            matched_names = [
+                _text((doc.get("stock_names") or {}).get(code))
+                or stock_names.get(code)
+                or stock_names.get((_normalize_stock_symbol(code)[0] or ""))
+                or code
+                for code in matched_codes
+            ]
+            current = overlays_by_name.get(concept_name) or {
+                "kind": "theme" if non_chain else "concept",
+                "kind_label": "主题" if non_chain else "概念",
+                "name": concept_name,
+                "change_pct": change_pct,
+                "leader_name": _text(heat.get("leader_name")),
+                "leader_change_pct": _float(heat.get("leader_change_pct")),
+                "up_count": _float(heat.get("up_count"), 0),
+                "down_count": _float(heat.get("down_count"), 0),
+                "rank": _float(heat.get("rank_idx")),
+                "non_chain_reason": non_chain,
+                "matched_symbols": [],
+                "matched_names": [],
+                "source_boards": [],
+                "source_order": source_order,
+                "primary_source": source_order == 0,
+            }
+            current["source_order"] = min(int(current.get("source_order") or source_order), source_order)
+            current["primary_source"] = bool(current.get("primary_source")) or source_order == 0
+            current["change_pct"] = max(_float(current.get("change_pct"), 0) or 0, change_pct)
+            current["source_boards"] = list(dict.fromkeys([*current.get("source_boards", []), source_name]))
+            current["matched_symbols"] = list(dict.fromkeys([*current.get("matched_symbols", []), *matched_codes]))[:8]
+            current["matched_names"] = list(dict.fromkeys([*current.get("matched_names", []), *matched_names]))[:8]
+            current["matched_count"] = len(current["matched_symbols"])
+            overlays_by_name[concept_name] = current
+    overlays = list(overlays_by_name.values())
+    overlays.sort(
+        key=lambda item: (
+            1 if item.get("primary_source") else 0,
+            _standalone_theme_rank_bonus(_text(item.get("name")), _text(item.get("non_chain_reason"))),
+            _float(item.get("change_pct"), 0) or 0,
+            _float(item.get("leader_change_pct"), 0) or 0,
+            _float(item.get("matched_count"), 0) or 0,
+        ),
+        reverse=True,
+    )
+    return overlays[:limit]
+
+
+def _source_concept_overlays(db: Any, source_events: list[dict[str, Any]], *, limit: int = 8) -> list[dict[str, Any]]:
+    return _source_market_overlays(db, source_events, limit=limit, only_non_chain=False)
+
+
+def _source_theme_overlays(db: Any, source_events: list[dict[str, Any]], *, limit: int = 6) -> list[dict[str, Any]]:
+    return _source_market_overlays(db, source_events, limit=limit, only_non_chain=True)
+
+
+def _source_event_concept_overlays(db: Any, source_events: list[dict[str, Any]], *, concepts_per_source: int = 3) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    for source in source_events[:6]:
+        source_payload = _chain_source_driver_payload(source)
+        concepts = _source_concept_overlays(db, [source_payload], limit=concepts_per_source)
+        if not concepts:
+            continue
+        groups.append({
+            "source": source_payload,
+            "concepts": concepts,
+        })
+    return groups
+
+
+def _source_event_theme_overlays(db: Any, source_events: list[dict[str, Any]], *, themes_per_source: int = 2) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    for source in source_events[:6]:
+        source_payload = _chain_source_driver_payload(source)
+        themes = _source_theme_overlays(db, [source_payload], limit=themes_per_source)
+        if not themes:
+            continue
+        groups.append({
+            "source": source_payload,
+            "themes": themes,
+        })
+    return groups
+
+
+def _standalone_theme_rank_bonus(name: str, reason: str) -> float:
+    text = _text(name)
+    reason_text = _text(reason)
+    if "次新" in text:
+        return 1.0
+    if "破发" in text or "上市时间" in reason_text:
+        return 1.0
+    return 0.0
+
+
+def _format_signed_pct(value: Any) -> str:
+    numeric = _float(value)
+    return f"{numeric:+.2f}%" if numeric is not None else ""
+
+
 def _chain_reference_domain(doc: dict[str, Any], domains: list[dict[str, Any]]) -> dict[str, Any]:
     if not domains:
         return {}
@@ -5131,15 +5641,16 @@ def _chain_domain_change_stats(domains: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _representative_confirmation(groups: dict[str, list[dict[str, Any]]], chain_change_pct: Optional[float]) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
+    rows: list[tuple[str, dict[str, Any]]] = []
     for key in ("leaders", "weighted", "elastic", "source_leaders", "constituents"):
         for row in groups.get(key) or []:
             if isinstance(row, dict):
-                rows.append(row)
+                rows.append((key, row))
     seen: set[str] = set()
     changes: list[float] = []
+    role_changes: dict[str, list[float]] = {}
     missing = 0
-    for row in rows:
+    for role, row in rows:
         symbol = _text(row.get("symbol") or row.get("code")).upper()
         key = symbol or _text(row.get("name"))
         if key in seen:
@@ -5150,14 +5661,35 @@ def _representative_confirmation(groups: dict[str, list[dict[str, Any]]], chain_
             missing += 1
         else:
             changes.append(value)
+            role_changes.setdefault(role, []).append(value)
     positive = sum(1 for value in changes if value > 0)
     negative = sum(1 for value in changes if value < 0)
+    avg_change_pct = round(sum(changes) / len(changes), 2) if changes else None
+    role_stats = {
+        role: {
+            "known_count": len(values),
+            "positive_count": sum(1 for value in values if value > 0),
+            "negative_count": sum(1 for value in values if value < 0),
+            "avg_change_pct": round(sum(values) / len(values), 2) if values else None,
+            "max_change_pct": round(max(values), 2) if values else None,
+            "min_change_pct": round(min(values), 2) if values else None,
+        }
+        for role, values in role_changes.items()
+    }
     if not changes:
         status = "unknown"
         label = "代表股涨幅缺失"
     elif chain_change_pct is not None and chain_change_pct > 0 and positive == 0:
         status = "not_confirmed"
         label = "代表股未跟随"
+    elif (
+        chain_change_pct is not None
+        and chain_change_pct >= 2.0
+        and avg_change_pct is not None
+        and avg_change_pct < max(0.8, chain_change_pct * 0.35)
+    ):
+        status = "source_only"
+        label = "源强链弱"
     elif positive and negative:
         status = "mixed"
         label = "代表股分化"
@@ -5174,8 +5706,97 @@ def _representative_confirmation(groups: dict[str, list[dict[str, Any]]], chain_
         "missing_count": missing,
         "positive_count": positive,
         "negative_count": negative,
-        "avg_change_pct": round(sum(changes) / len(changes), 2) if changes else None,
+        "avg_change_pct": avg_change_pct,
+        "role_stats": role_stats,
     }
+
+
+def _chain_confirmation_payload(rep_confirmation: dict[str, Any]) -> dict[str, Any]:
+    status = _text(rep_confirmation.get("status"))
+    mapping = {
+        "confirmed": ("confirmed", "产业链确认"),
+        "mixed": ("mixed", "链内分化"),
+        "source_only": ("source_only", "源强链弱"),
+        "not_confirmed": ("not_confirmed", "链主未确认"),
+        "weak": ("weak", "链主偏弱"),
+        "unknown": ("unknown", "待确认"),
+    }
+    normalized, label = mapping.get(status, (status or "unknown", _text(rep_confirmation.get("label")) or "待确认"))
+    role_stats = rep_confirmation.get("role_stats") if isinstance(rep_confirmation.get("role_stats"), dict) else {}
+    leader_stats = role_stats.get("leaders") if isinstance(role_stats.get("leaders"), dict) else {}
+    weighted_stats = role_stats.get("weighted") if isinstance(role_stats.get("weighted"), dict) else {}
+    elastic_stats = role_stats.get("elastic") if isinstance(role_stats.get("elastic"), dict) else {}
+    core_values = [
+        _float(leader_stats.get("avg_change_pct")),
+        _float(weighted_stats.get("avg_change_pct")),
+    ]
+    core_values = [value for value in core_values if value is not None]
+    core_avg = round(sum(core_values) / len(core_values), 2) if core_values else None
+    elastic_avg = _float(elastic_stats.get("avg_change_pct"))
+    elastic_max = _float(elastic_stats.get("max_change_pct"))
+    if (
+        status == "mixed"
+        and elastic_avg is not None
+        and elastic_avg >= 2.0
+        and (elastic_max is not None and elastic_max >= 5.0)
+        and (core_avg is None or core_avg < 1.0)
+    ):
+        normalized = "elastic_rebound"
+        label = "弹性补涨"
+    return {
+        "status": normalized,
+        "label": label,
+        "representative_status": status,
+        "representative_label": _text(rep_confirmation.get("label")),
+        "representative_avg_change_pct": rep_confirmation.get("avg_change_pct"),
+        "core_avg_change_pct": core_avg,
+        "elastic_avg_change_pct": elastic_avg,
+        "elastic_max_change_pct": elastic_max,
+        "positive_count": rep_confirmation.get("positive_count"),
+        "negative_count": rep_confirmation.get("negative_count"),
+        "known_count": rep_confirmation.get("known_count"),
+        "role_stats": role_stats,
+    }
+
+
+def _chain_heat_display_rank_score(doc: dict[str, Any], context: dict[str, Any]) -> float:
+    score = _float(doc.get("heat_score"), 0) or 0.0
+    confirmation_status = _text((context.get("chain_confirmation") or {}).get("status"))
+    if confirmation_status == "confirmed":
+        score += 8.0
+    elif confirmation_status in {"mixed", "elastic_rebound"}:
+        score -= 4.0
+    elif confirmation_status == "source_only":
+        score -= 14.0
+    elif confirmation_status in {"not_confirmed", "weak"}:
+        score -= 18.0
+    flags = set(context.get("mismatch_flags") or [])
+    if "low_mapping_confidence" in flags:
+        score -= 6.0
+    if "driver_not_same_as_chain_label" in flags:
+        score -= 3.0
+    return round(score, 3)
+
+
+def _chain_heat_trader_action(context: dict[str, Any]) -> str:
+    confirmation = context.get("chain_confirmation") if isinstance(context.get("chain_confirmation"), dict) else {}
+    source_driver = context.get("source_driver") if isinstance(context.get("source_driver"), dict) else {}
+    status = _text(confirmation.get("status"))
+    label = _text(confirmation.get("label")) or "待确认"
+    source_kind = _chain_source_kind_label(source_driver.get("kind"))
+    source_name = _text(source_driver.get("name")) or "源板块"
+    source_text = f"{source_kind}{source_name}"
+    if status == "confirmed":
+        return f"{label}：链主/弹性跟随，复核扩散延续"
+    if status == "elastic_rebound":
+        return f"{label}：链主不强，先看弹性标的和三线扩散"
+    if status == "source_only":
+        return f"{label}：{source_text}在涨，等链主确认后再当主线"
+    if status == "mixed":
+        return f"{label}：只看强分支，不当整链共振"
+    if status in {"not_confirmed", "weak"}:
+        return f"{label}：{source_text}不代表整条产业链"
+    return label
 
 
 def _chain_heat_display_context(doc: dict[str, Any], candidate_groups: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
@@ -5184,9 +5805,11 @@ def _chain_heat_display_context(doc: dict[str, Any], candidate_groups: dict[str,
     reference = _chain_reference_domain(doc, domains)
     primary_payload = _chain_domain_payload(primary) if primary else {}
     reference_payload = _chain_domain_payload(reference) if reference else {}
+    source_driver = _chain_source_driver_payload(primary_payload, doc.get("source_driver") if isinstance(doc.get("source_driver"), dict) else None)
     primary_change = _float(primary_payload.get("change_pct"))
     reference_change = _float(reference_payload.get("change_pct"))
     rep_confirmation = _representative_confirmation(candidate_groups, primary_change)
+    chain_confirmation = _chain_confirmation_payload(rep_confirmation)
     flags: list[str] = []
     label_text = " · ".join([_text(doc.get("chain_name")), _text(doc.get("node_name"))])
     primary_name = _text(primary_payload.get("name"))
@@ -5196,29 +5819,287 @@ def _chain_heat_display_context(doc: dict[str, Any], candidate_groups: dict[str,
         flags.append("driver_reference_divergence")
     if rep_confirmation.get("status") in {"not_confirmed", "weak"}:
         flags.append("representatives_not_confirmed")
+    if rep_confirmation.get("status") == "source_only":
+        flags.append("representatives_weak_confirmation")
     if _float(primary_payload.get("mapping_confidence"), 100) is not None and (_float(primary_payload.get("mapping_confidence"), 100) or 0) < 70:
         flags.append("low_mapping_confidence")
-    primary_label = _text(primary_payload.get("name")) or "主驱动"
+    primary_label = _text(source_driver.get("name")) or _text(primary_payload.get("name")) or "源板块"
+    primary_kind_label = _chain_source_kind_label(source_driver.get("kind") or primary_payload.get("kind"))
     reference_label = _text(reference_payload.get("name"))
-    explain_parts = [f"主驱动 {primary_label}"]
+    explain_parts = [f"源[{primary_kind_label}] {primary_label}"]
     if primary_change is not None:
-        explain_parts[-1] += f" {primary_change:+.2f}%"
+        explain_parts[-1] += f" {_format_signed_pct(primary_change)}"
     if reference_label and reference_label != primary_label:
         ref_text = f"参考行业 {reference_label}"
         if reference_change is not None:
-            ref_text += f" {reference_change:+.2f}%"
+            ref_text += f" {_format_signed_pct(reference_change)}"
         explain_parts.append(ref_text)
-    explain_parts.append(rep_confirmation.get("label") or "")
+    explain_parts.append(chain_confirmation.get("label") or rep_confirmation.get("label") or "")
+    route_explain = _text(doc.get("route_explain"))
+    if not route_explain:
+        route_target = "/".join([part for part in (_text(doc.get("chain_name")), _text(doc.get("node_name"))) if part])
+        route_explain = f"源[{primary_kind_label}] {primary_label} -> {route_target}" if route_target else ""
+    source_events = doc.get("source_events") or [
+        _chain_source_driver_payload(_chain_domain_payload(domain))
+        for domain in domains[:10]
+        if isinstance(domain, dict)
+    ]
     return {
         "change_display_kind": "chain_driver_change",
         "change_display_label": "驱动涨幅",
         "change_explain": "；".join([part for part in explain_parts if part]),
+        "source_driver": source_driver,
+        "source_events": source_events,
+        "source_kind_mix": doc.get("source_kind_mix") or {},
+        "route_explain": route_explain,
         "primary_domain": primary_payload,
         "reference_domain": reference_payload,
         "domain_change_stats": _chain_domain_change_stats(domains),
         "representative_confirmation": rep_confirmation,
+        "chain_confirmation": chain_confirmation,
         "mismatch_flags": flags,
     }
+
+
+def _theme_focus_stocks_preview(db: Any, theme_name: str, *, limit: int = 6) -> list[dict[str, Any]]:
+    symbols, stock_names = _constituent_symbols_for_source(db, {"kind": "concept", "name": theme_name})
+    if not symbols:
+        return []
+    codes: list[str] = []
+    dot_symbols: list[str] = []
+    for raw_symbol in symbols:
+        normalized, raw_code = _normalize_stock_symbol(_text(raw_symbol))
+        code = raw_code or _text(raw_symbol).split(".", 1)[-1]
+        if code and code not in codes:
+            codes.append(code)
+        if normalized and normalized not in dot_symbols:
+            dot_symbols.append(normalized)
+    if not codes and not dot_symbols:
+        return []
+    symbol_query = {"$or": [{"code": {"$in": codes}}, {"symbol": {"$in": dot_symbols}}]}
+    expected_day = _day_change_expected_day()
+    if expected_day:
+        symbol_query = {
+            "$and": [
+                symbol_query,
+                {"$or": [{"trade_date": expected_day}, {"dt": expected_day}]},
+            ]
+        }
+    try:
+        docs = list(db["quote_snapshots"].find(
+            symbol_query,
+            {
+                "_id": 0,
+                "symbol": 1,
+                "code": 1,
+                "name": 1,
+                "price": 1,
+                "close": 1,
+                "change_pct": 1,
+                "turnover_pct": 1,
+                "amount": 1,
+                "trade_date": 1,
+                "dt": 1,
+            },
+        ).sort([("change_pct", -1), ("amount", -1)]).limit(limit * 3))
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for doc in docs:
+        normalized, raw_code = _normalize_stock_symbol(_text(doc.get("symbol") or doc.get("code")))
+        raw_code = raw_code or _text(doc.get("code"))
+        key = normalized or raw_code
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        name = _text(doc.get("name")) or stock_names.get(raw_code) or stock_names.get(normalized or "") or key
+        change_pct = _float(doc.get("change_pct"))
+        rows.append({
+            "kind": "stock",
+            "symbol": normalized,
+            "raw_code": raw_code,
+            "code": normalized or raw_code,
+            "name": name,
+            "leader_tier": "theme_hot",
+            "chain_role": f"{theme_name}热股",
+            "attention_score": change_pct,
+            "day_change_pct": change_pct,
+            "latest_signal": f"{theme_name}叠加",
+            "why_watch": f"{theme_name}主题内涨幅靠前",
+            "target_kind": "stock",
+            "target_label": normalized or raw_code,
+            "target_symbol": normalized or raw_code,
+            "target_freq": DEFAULT_TERMINAL_FREQ,
+        })
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _non_chain_theme_sector_rows(db: Any, *, limit: int = 4) -> list[dict[str, Any]]:
+    expected_day = _day_change_expected_day()
+    query: dict[str, Any] = {"kind": "concept"}
+    if expected_day:
+        day_start = datetime.fromisoformat(expected_day)
+        day_end = day_start + timedelta(days=1)
+        query["$or"] = [
+            {"trade_date": expected_day},
+            {"dt": {"$gte": day_start, "$lt": day_end}},
+            {"trade_minute": {"$gte": day_start, "$lt": day_end}},
+        ]
+    latest = db["board_heat_ticks"].find_one(query, {"trade_minute": 1}, sort=[("trade_minute", -1)]) or {}
+    latest_minute = latest.get("trade_minute")
+    if latest_minute is not None:
+        query = {"kind": "concept", "trade_minute": latest_minute}
+    try:
+        docs = list(db["board_heat_ticks"].find(
+            query,
+            {
+                "_id": 0,
+                "name": 1,
+                "board_name": 1,
+                "code": 1,
+                "change_pct": 1,
+                "up_count": 1,
+                "down_count": 1,
+                "leader_name": 1,
+                "leader_symbol": 1,
+                "leader_change_pct": 1,
+                "rank_idx": 1,
+                "trade_date": 1,
+                "trade_minute": 1,
+                "snapshot_at": 1,
+            },
+        ).sort([("change_pct", -1), ("leader_change_pct", -1)]).limit(800))
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for doc in docs:
+        name = _text(doc.get("name") or doc.get("board_name"))
+        reason = non_chain_reason(name)
+        change_pct = _float(doc.get("change_pct"))
+        standalone_bonus = _standalone_theme_rank_bonus(name, reason)
+        if not name or not reason or standalone_bonus <= 0 or change_pct is None or change_pct < 1.5:
+            continue
+        up_count = _float(doc.get("up_count"), 0) or 0
+        leader_change = _float(doc.get("leader_change_pct"), 0) or 0
+        display_rank_score = round(change_pct * 10 + min(up_count / 4, 28) + min(leader_change, 20) + standalone_bonus, 3)
+        source_driver = {
+            "kind": "theme",
+            "kind_label": "主题",
+            "name": name,
+            "code": _text(doc.get("code")),
+            "change_pct": change_pct,
+            "up_count": up_count,
+            "down_count": _float(doc.get("down_count"), 0),
+            "leader_name": _text(doc.get("leader_name")),
+            "leader_symbol": _text(doc.get("leader_symbol")),
+            "leader_change_pct": _float(doc.get("leader_change_pct")),
+            "rank": _float(doc.get("rank_idx")),
+            "non_chain_reason": reason,
+        }
+        focus_preview = _theme_focus_stocks_preview(db, name, limit=6)
+        matched_names = [_text(item.get("name")) for item in focus_preview if _text(item.get("name"))]
+        matched_symbols = [_text(item.get("symbol") or item.get("code") or item.get("raw_code")) for item in focus_preview]
+        overlay = {
+            **source_driver,
+            "matched_names": matched_names[:6],
+            "matched_symbols": matched_symbols[:6],
+            "matched_count": len(matched_symbols),
+            "source_boards": [name],
+        }
+        doc_trade_day = _date_text(doc.get("trade_date") or doc.get("trade_minute") or doc.get("snapshot_at"))
+        leader_label = _text(doc.get("leader_name"))
+        hot_stock_label = " / ".join(matched_names[:2])
+        rank_reason = "；".join([
+            f"主题[{name}] {_format_signed_pct(change_pct)}",
+            reason,
+            f"热股 {hot_stock_label}" if hot_stock_label else (f"领涨 {leader_label}" if leader_label else ""),
+        ])
+        rows.append({
+            "group": "sector_boards",
+            "domain": "theme_heat",
+            "kind": "theme",
+            "label": f"主题热度 · {name}",
+            "name": f"主题热度 · {name}",
+            "code": name,
+            "latest_price": display_rank_score,
+            "day_change_pct": change_pct,
+            "daily_change_pct": change_pct,
+            "day_change_source": "board_heat_ticks",
+            "day_change_mode": _a_day_change_mode(),
+            "day_change_as_of": doc_trade_day,
+            "range_returns": {},
+            "range_return_source": "board_heat_ticks",
+            "lane": "board_lane",
+            "second_screen_role": "event_theme_heat",
+            "source": "board_heat_ticks",
+            "heat_source": "board_heat_ticks",
+            "rank": _float(doc.get("rank_idx")),
+            "phase": "warming",
+            "trading_signal": "theme_heat",
+            "heat_score": display_rank_score,
+            "display_rank_score": display_rank_score,
+            "chain_id": "",
+            "chain_name": "主题热度",
+            "node_id": name,
+            "node_name": name,
+            "layer": "theme",
+            "stage": "event_or_style",
+            "integrated_domains": [source_driver],
+            "source_driver": source_driver,
+            "source_events": [source_driver],
+            "source_concept_overlays": [],
+            "source_event_concept_overlays": [],
+            "source_theme_overlays": [overlay],
+            "source_event_theme_overlays": [{"source": source_driver, "themes": [overlay]}],
+            "source_kind_mix": {"theme": 1},
+            "route_explain": f"主题[{name}] 独立观察，不强制映射产业链",
+            "change_display_kind": "theme_change",
+            "change_display_label": "主题涨幅",
+            "change_explain": rank_reason,
+            "primary_domain": source_driver,
+            "reference_domain": {},
+            "domain_change_stats": {"count": 1, "known_count": 1, "positive_count": 1, "negative_count": 0, "avg_change_pct": change_pct},
+            "representative_confirmation": {"status": "theme_heat", "label": "主题独立观察", "known_count": len(focus_preview)},
+            "chain_confirmation": {"status": "theme_heat", "label": "主题热度", "representative_status": "theme_heat", "representative_label": "主题独立观察", "known_count": len(focus_preview)},
+            "non_chain_reason": reason,
+            "mismatch_flags": ["non_chain_theme"],
+            "latest_signal": "主题热度",
+            "trader_action": "观察事件/风格扩散，不当成行业主线",
+            "action_status": "主题热度",
+            "invalidates_when": "主题涨幅回落或热股退潮",
+            "rank_reason": rank_reason,
+            "trace_summary": rank_reason,
+            "explanation": rank_reason,
+            "carrier": focus_preview[0] if focus_preview else {"name": leader_label, "day_change_pct": _float(doc.get("leader_change_pct"))},
+            "representatives": {"core": [], "upstream": [], "elastic": focus_preview[:3], "downstream": [], "source_leader": []},
+            "candidate_groups": {"leaders": [], "weighted": [], "elastic": focus_preview[:6], "source_leaders": [], "constituents": []},
+            "focus_stocks_preview": focus_preview,
+            "target_kind": "concept",
+            "target_label": name,
+            "target_symbol": name,
+            "target_freq": DEFAULT_TERMINAL_FREQ,
+            "display_label": f"主题热度 · {name}",
+            "heat_target_label": name,
+            "heat_resolution_status": "non_chain_theme",
+            "data_truth": _data_truth_payload(
+                collection="board_heat_ticks",
+                domain="theme_heat",
+                source="board_heat_ticks",
+                extra={
+                    "as_of": doc_trade_day,
+                    "latest_bar_time": _iso_dt(doc.get("trade_minute")),
+                    "mapping_status": "non_chain_theme",
+                    "unmapped_reason": reason,
+                    "chart_mode_default": "board_heat",
+                },
+            ),
+        })
+        if len(rows) >= limit:
+            break
+    return rows
 
 
 def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
@@ -5271,6 +6152,21 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         label = " · ".join([item for item in [_text(doc.get("chain_name")), _text(doc.get("node_name"))] if item])
         candidate_groups = _candidate_groups_from_representatives(doc, lightweight=True)
         display_context = _chain_heat_display_context(doc, candidate_groups)
+        try:
+            concept_overlays = _source_concept_overlays(db, display_context.get("source_events") or [], limit=8)
+            source_event_overlays = _source_event_concept_overlays(db, display_context.get("source_events") or [], concepts_per_source=3)
+            theme_overlays = _source_theme_overlays(db, display_context.get("source_events") or [], limit=4)
+            source_event_theme_overlays = _source_event_theme_overlays(db, display_context.get("source_events") or [], themes_per_source=2)
+        except Exception:
+            concept_overlays = []
+            source_event_overlays = []
+            theme_overlays = []
+            source_event_theme_overlays = []
+        display_context["source_concept_overlays"] = concept_overlays
+        display_context["source_event_concept_overlays"] = source_event_overlays
+        display_context["source_theme_overlays"] = theme_overlays
+        display_context["source_event_theme_overlays"] = source_event_theme_overlays
+        display_rank_score = _chain_heat_display_rank_score(doc, display_context)
         graph = _chain_graph_doc(doc.get("chain_id"), doc.get("node_id"))
         viewpoint_context = _viewpoint_context_from_graph(graph)
         doc_trade_day = _date_text(doc.get("trade_date") or doc.get("dt") or doc.get("trade_minute"))
@@ -5319,7 +6215,7 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             "lane": "board_lane",
             "second_screen_role": "chain_heat_map",
             "action_status": doc.get("phase"),
-            "trader_action": doc.get("trader_action"),
+            "trader_action": _chain_heat_trader_action(display_context) or doc.get("trader_action"),
             "invalidates_when": doc.get("invalidates_when"),
             "explanation": " · ".join([
                 _text(doc.get("range_pattern")),
@@ -5328,6 +6224,7 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             ]),
             "rank_reason": display_context.get("change_explain"),
             "trace_summary": display_context.get("change_explain"),
+            "display_rank_score": display_rank_score,
             "source": "chain_heat_snapshots",
             "latest_signal": doc.get("trading_signal"),
             "target_kind": target_kind,
@@ -5375,7 +6272,12 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             },
         }
         rows.append(row)
-    return rows
+    try:
+        rows.extend(_non_chain_theme_sector_rows(db, limit=4))
+    except Exception:
+        pass
+    rows.sort(key=lambda item: (_float(item.get("display_rank_score"), 0) or 0, _float(item.get("heat_score"), 0) or 0), reverse=True)
+    return rows[:limit]
 
 
 def _visible_quote_symbols(rows: list[dict[str, Any]], limit: int) -> list[str]:

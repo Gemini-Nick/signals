@@ -630,7 +630,7 @@ async def backtest_analyze(
     freq: str = Query("daily", description="daily / weekly / monthly"),
     signal_group: str = Query("all", description="macd / czsc / all"),
     lookback: int = Query(999, description="信号回看窗口"),
-    factor: str = Query("", description="入场因子: gap / trend_breakout / vol_contraction / candle_run / candle_accel"),
+    factor: str = Query("", description="入场因子: gap / trend_breakout / 200d_new_high_breakout / vol_contraction / candle_run / candle_accel"),
     gap_pct_min: float = Query(2.0),
     volume_ratio_min: float = Query(1.5),
     trend_lookback: int = Query(20),

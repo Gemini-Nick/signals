@@ -1026,6 +1026,7 @@ def _detect_entry_factors(
     from signals.core.entry_factors import (
         detect_gap_entries,
         detect_trend_breakout_entries,
+        detect_200d_new_high_entries,
         detect_volatility_contraction_entries,
         detect_candle_run_entries,
         detect_candle_accel_entries,
@@ -1063,6 +1064,21 @@ def _detect_entry_factors(
             except Exception:
                 sig["eval"] = {}
         signals.extend(trend_sigs)
+
+    if factor in ("200d_new_high_breakout", "all_factors"):
+        new_high_sigs = detect_200d_new_high_entries(
+            df,
+            lookback_days=int(kwargs.get("new_high_lookback_days", 199)),
+            volume_ratio_min=float(kwargs.get("new_high_volume_ratio_min", 0.0)),
+            lookback=lookback,
+        )
+        for sig in new_high_sigs:
+            try:
+                sig_idx = df.index.get_indexer([pd.Timestamp(sig["date_str"])], method="nearest")[0]
+                sig["eval"] = _compute_forward_eval(df, sig_idx)
+            except Exception:
+                sig["eval"] = {}
+        signals.extend(new_high_sigs)
 
     if factor in ("vol_contraction", "all_factors"):
         vol_sigs = detect_volatility_contraction_entries(
@@ -1390,7 +1406,7 @@ async def backtest_analyze(
     signal_group: str = Query("all", description="macd / czsc / all"),
     lookback: int = Query(999, description="信号回看窗口"),
     # 入场因子
-    factor: str = Query("", description="入场因子: gap / trend_breakout / vol_contraction / candle_run / candle_accel"),
+    factor: str = Query("", description="入场因子: gap / trend_breakout / 200d_new_high_breakout / vol_contraction / candle_run / candle_accel"),
     gap_pct_min: float = Query(2.0), volume_ratio_min: float = Query(1.5),
     trend_lookback: int = Query(20), bb_period: int = Query(20), squeeze_threshold: float = Query(0.05),
     run_count: int = Query(3), body_ratio: float = Query(0.5), accel_count: int = Query(3),
@@ -1606,7 +1622,7 @@ async def backtest_run(
     signal_group: str = Query("all", description="macd / czsc / all"),
     lookback: int = Query(999, description="信号回看窗口"),
     # Phase 2: 入场因子
-    factor: str = Query("", description="入场因子: gap / trend_breakout / vol_contraction"),
+    factor: str = Query("", description="入场因子: gap / trend_breakout / 200d_new_high_breakout / vol_contraction"),
     gap_pct_min: float = Query(2.0, description="跳空幅度阈值%"),
     volume_ratio_min: float = Query(1.5, description="量比阈值"),
     trend_lookback: int = Query(20, description="趋势突破回看天数"),

@@ -171,6 +171,45 @@ def _trading_signal(phase: str) -> dict[str, str]:
     return {"signal": signal, "trader_action": action, "invalidates_when": invalidates}
 
 
+_SOURCE_KIND_LABELS = {
+    "industry": "行业",
+    "concept": "概念",
+}
+
+
+def _source_event_payload(item: dict[str, Any]) -> dict[str, Any]:
+    kind = _text(item.get("kind"))
+    kind_label = _SOURCE_KIND_LABELS.get(kind, kind or "来源")
+    name = _text(item.get("name"))
+    return {
+        "kind": kind,
+        "kind_label": kind_label,
+        "name": name,
+        "label": f"{kind_label}:{name}" if name else kind_label,
+        "code": _text(item.get("code")),
+        "change_pct": _float(item.get("change_pct")),
+        "up_count": _int(item.get("up_count")),
+        "down_count": _int(item.get("down_count")),
+        "leader_name": _text(item.get("leader_name")),
+        "leader_symbol": _text(item.get("leader_symbol")),
+        "leader_change_pct": _float(item.get("leader_change_pct")),
+        "rank": _int(item.get("rank")),
+        "heat_score": _float(item.get("heat_score")),
+        "mapping_confidence": _int(item.get("mapping_confidence")),
+        "hit_terms": item.get("hit_terms") or [],
+        "evidence_sources": item.get("evidence_sources") or [],
+    }
+
+
+def _route_explain(item: dict[str, Any]) -> str:
+    source = _source_event_payload(item)
+    source_name = source.get("name") or "未知来源"
+    chain_name = _text(item.get("chain_name")) or "未映射产业链"
+    node_name = _text(item.get("node_name"))
+    target = "/".join([part for part in (chain_name, node_name) if part])
+    return f"源[{source.get('kind_label')}] {source_name} -> {target}"
+
+
 def _representatives(match: dict[str, Any]) -> list[dict[str, Any]]:
     reps: list[dict[str, Any]] = []
     for rep in match.get("representatives") or []:
@@ -313,6 +352,11 @@ def _aggregate(mapped: list[dict[str, Any]], latest_minute: Any) -> list[dict[st
             ),
             reverse=True,
         )[:12]
+        source_events = [_source_event_payload(item) for item in items[:10]]
+        source_kind_mix = {
+            kind: sum(1 for item in items if _text(item.get("kind")) == kind)
+            for kind in ("industry", "concept")
+        }
         snapshots.append({
             "market": "A",
             "dt": _day_start(trade_date),
@@ -350,6 +394,15 @@ def _aggregate(mapped: list[dict[str, Any]], latest_minute: Any) -> list[dict[st
             "mapping_confidence": mapping_confidence,
             "integrated_count": len(items),
             "integrated_domains": items[:10],
+            "source_driver": source_events[0] if source_events else {},
+            "source_events": source_events,
+            "source_kind_mix": source_kind_mix,
+            "route_explain": _route_explain(top),
+            "route_confidence": _int(top.get("mapping_confidence")),
+            "route_basis": {
+                "hit_terms": top.get("hit_terms") or [],
+                "evidence_sources": top.get("evidence_sources") or [],
+            },
             "representatives": representatives,
             "evidence_sources": ["board_heat_ticks", "industry_chains.yaml"],
         })

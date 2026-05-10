@@ -135,13 +135,13 @@ def test_semiconductor_related_concepts_map_to_semiconductor_chain():
 
 
 def test_commercial_space_concepts_outrank_transport_airline_aliases():
-    for concept in ["商业航天", "卫星互联网", "航天航空", "航天装备Ⅲ", "航天装备Ⅱ", "航空装备Ⅲ", "航空装备III"]:
+    for concept in ["商业航天", "卫星互联网", "航天航空", "通用航空", "低空经济", "航天装备Ⅲ", "航天装备Ⅱ", "航空装备Ⅲ", "航空装备III"]:
         matches = match_industry_chains(concept)
         assert matches
         assert matches[0]["chain_id"] == "military"
         assert matches[0]["node_id"] == "commercial_space"
 
-    for concept in ["商业航天", "航空装备III"]:
+    for concept in ["商业航天", "通用航空", "航空装备III"]:
         carriers = preferred_concept_carriers(concept)
         assert [row["symbol"] for row in carriers[:3]] == ["SH.601698", "SZ.000547", "SH.600343"]
         assert not any(row["chain_id"] == "transport" for row in carriers[:5])

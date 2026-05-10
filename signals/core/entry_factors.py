@@ -16,6 +16,24 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+def _robust_volume_ratio(vols: np.ndarray, index: int, period: int) -> float:
+    current = float(vols[index]) if index < len(vols) else 0.0
+    if current <= 0:
+        return 0.0
+    start = max(0, index - period)
+    baseline_values = [float(value) for value in vols[start:index] if float(value) > 0]
+    if not baseline_values:
+        return 0.0
+    comparable = [
+        value for value in baseline_values
+        if 0.05 <= value / current <= 20.0
+    ]
+    if len(comparable) >= min(3, len(baseline_values)):
+        baseline_values = comparable
+    baseline = float(np.mean(baseline_values)) if baseline_values else 0.0
+    return current / baseline if baseline > 0 else 0.0
+
+
 def detect_gap_entries(
     df: pd.DataFrame,
     gap_pct_min: float = 2.0,
@@ -120,6 +138,75 @@ def detect_trend_breakout_entries(
             "price": round(float(closes[i]), 4),
             "confidence": round(confidence, 2),
             "details": f"突破{lookback_days}日高{period_high:.2f}, +{breakout_pct:.1f}%",
+        })
+
+    return signals
+
+
+def detect_200d_new_high_entries(
+    df: pd.DataFrame,
+    lookback_days: int = 199,
+    volume_ratio_min: float = 0.0,
+    volume_ma_days: int = 20,
+    five_day_window: int = 5,
+    lookback: int = 999,
+) -> list[dict]:
+    """
+    200 日新高突破入场因子:
+    - 当日最高价严格突破此前 lookback_days 个交易日最高价
+    - 记录过去 five_day_window 日涨幅与量比，默认不强制过滤量比
+    """
+    min_len = max(lookback_days + 1, volume_ma_days + 1, five_day_window + 1)
+    if len(df) < min_len:
+        return []
+
+    signals = []
+    vol_col = "vol" if "vol" in df.columns else "volume"
+    closes = df["close"].values.astype(float)
+    highs = df["high"].values.astype(float)
+    vols = df[vol_col].values.astype(float) if vol_col in df.columns else np.zeros(len(df), dtype=float)
+    start = max(lookback_days, len(df) - lookback)
+    for i in range(start, len(df)):
+        previous_high = np.max(highs[i - lookback_days:i])
+        today_high = highs[i]
+        if previous_high <= 0 or today_high <= previous_high:
+            continue
+
+        volume_ratio = _robust_volume_ratio(vols, i, volume_ma_days)
+        if volume_ratio_min > 0 and volume_ratio < volume_ratio_min:
+            continue
+
+        close_n_days_ago = closes[i - five_day_window] if i >= five_day_window else 0.0
+        five_day_gain_pct = (
+            (closes[i] - close_n_days_ago) / close_n_days_ago * 100
+            if close_n_days_ago > 0 else 0.0
+        )
+        breakout_pct = (today_high - previous_high) / previous_high * 100
+        confidence = 0.45
+        confidence += min(max(breakout_pct, 0.0) / 10.0, 0.25)
+        confidence += min(max(five_day_gain_pct, 0.0) / 50.0, 0.20)
+        confidence += min(max(volume_ratio - 1.0, 0.0) / 5.0, 0.10)
+
+        dt_idx = df.index[i]
+        signals.append({
+            "dt": int(pd.Timestamp(dt_idx).timestamp()),
+            "date_str": dt_idx.strftime("%Y-%m-%d") if hasattr(dt_idx, "strftime") else str(dt_idx)[:10],
+            "type": "200日新高突破",
+            "group": "200d_new_high_breakout",
+            "price": round(float(closes[i]), 4),
+            "confidence": round(min(confidence, 1.0), 2),
+            "details": (
+                f"200日新高, 最高{today_high:.2f} > 前高{previous_high:.2f}, "
+                f"突破{breakout_pct:.1f}%, 5日涨幅{five_day_gain_pct:.1f}%, "
+                f"量比{volume_ratio:.2f}"
+            ),
+            "today_high": round(float(today_high), 4),
+            "previous_high": round(float(previous_high), 4),
+            "breakout_pct": round(float(breakout_pct), 4),
+            "five_day_gain_pct": round(float(five_day_gain_pct), 4),
+            "volume_ratio": round(float(volume_ratio), 4),
+            "lookback_days": int(lookback_days + 1),
+            "volume_ma_days": int(volume_ma_days),
         })
 
     return signals

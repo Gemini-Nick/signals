@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
+import pandas as pd
 from czsc import Freq
 
 from signals.sync.modules.technical_signal_scan import (
@@ -11,12 +12,15 @@ from signals.sync.modules.technical_signal_scan import (
     POSTMARKET_SCAN_SCOPE,
     _coverage_by_freq,
     _doc_to_rawbar,
+    _entry_factor_docs,
+    _entry_factor_score,
     _load_bars,
     _ma_alignment_from_daily_bars,
     _resampled_5m_docs,
     _resonance_context,
     _symbols_for_scope,
 )
+from signals.core.entry_factors import detect_200d_new_high_entries
 
 
 @dataclass
@@ -32,12 +36,91 @@ class _Bar:
     close: float
 
 
+@dataclass
+class _OhlcvBar:
+    dt: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    vol: int = 1000
+    amount: int = 10000
+
+
 WEIGHTS = {
     "三买": 100,
     "趋势买": 80,
     "背驰买": 70,
     "一卖": -100,
 }
+
+
+def test_detect_200d_new_high_entries_reports_breakout_metrics():
+    rows = []
+    dates = pd.date_range("2025-07-01", periods=205, freq="B")
+    for idx, dt in enumerate(dates):
+        close = 10 + idx * 0.01
+        rows.append({
+            "dt": dt,
+            "open": close - 0.1,
+            "high": close + 0.2,
+            "low": close - 0.2,
+            "close": close,
+            "vol": 1000,
+        })
+    rows[-1].update({"open": 13.8, "high": 15.8, "low": 13.7, "close": 15.5, "vol": 3000})
+    df = pd.DataFrame(rows).set_index("dt")
+
+    signals = detect_200d_new_high_entries(df, lookback=1)
+
+    assert len(signals) == 1
+    signal = signals[0]
+    assert signal["group"] == "200d_new_high_breakout"
+    assert signal["type"] == "200日新高突破"
+    assert signal["lookback_days"] == 200
+    assert signal["breakout_pct"] > 0
+    assert signal["five_day_gain_pct"] > 0
+    assert signal["volume_ratio"] > 1
+
+
+def test_entry_factor_docs_publish_200d_new_high_as_terminal_signal():
+    bars = []
+    dates = pd.date_range("2025-07-01", periods=205, freq="B")
+    for idx, dt in enumerate(dates):
+        close = 10 + idx * 0.01
+        bars.append(_OhlcvBar(
+            dt=dt.to_pydatetime(),
+            open=close - 0.1,
+            high=close + 0.2,
+            low=close - 0.2,
+            close=close,
+            vol=1000,
+        ))
+    bars[-1] = _OhlcvBar(
+        dt=dates[-1].to_pydatetime(),
+        open=13.8,
+        high=15.8,
+        low=13.7,
+        close=15.5,
+        vol=3000,
+    )
+
+    docs = _entry_factor_docs(
+        "300001",
+        bars,
+        ma_alignment={"score": 12, "above_ma20": True},
+        now=datetime(2026, 5, 8, 16, 0),
+        scan_scope=POSTMARKET_SCAN_SCOPE,
+    )
+
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc["signal_type"] == "200日新高突破"
+    assert doc["signal_family"] == "entry_factor"
+    assert doc["signal_side"] == "buy"
+    assert doc["freq"] == "日线"
+    assert doc["technical_evidence"]["entry_factor"]["group"] == "200d_new_high_breakout"
+    assert _entry_factor_score(doc["technical_evidence"]["entry_factor"]) == doc["total_score"]
 
 
 def test_resonance_context_marks_single_period_signal():

@@ -152,6 +152,10 @@ def test_chain_heat_aggregate_builds_realtime_node_fields():
     assert node["taxonomy_source"] == "industry_chains.yaml"
     assert node["trade_date"] == "2026-04-28"
     assert node["momentum_5m"] == 0.4
+    assert node["source_driver"]["kind"] == "industry"
+    assert node["source_driver"]["name"] == "半导体"
+    assert node["source_driver"]["change_pct"] == 2.4
+    assert node["route_explain"] == "源[行业] 半导体 -> 半导体产业链/晶圆制造"
     assert node["representatives"][0]["symbol"] == "SH.688981"
 
 

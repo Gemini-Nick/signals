@@ -457,14 +457,14 @@ chains:
 
   - chain_id: military
     name: 军工装备产业链
-    aliases: [军工, 低空经济, 卫星导航, 商业航天, 卫星互联网, 北斗导航, 航天航空, 航天装备, 航空装备, 空间站概念, 大飞机, 无人机, 飞行汽车(eVTOL), eVTOL, 船舶, 航母, 军民融合, 海工装备]
+    aliases: [军工, 低空经济, 通用航空, 卫星导航, 商业航天, 卫星互联网, 北斗导航, 航天航空, 航天装备, 航空装备, 空间站概念, 大飞机, 无人机, 飞行汽车(eVTOL), eVTOL, 船舶, 航母, 军民融合, 海工装备]
     industries: [军工装备, 军工电子, 航空航天装备, 航天装备, 航空装备, 船舶制造]
     default_node_id: military_core
     nodes:
       - node_id: commercial_space
         name: 商业航天/卫星互联网
         layer: midstream
-        keywords: [商业航天, 卫星互联网, 卫星导航, 北斗导航, 航天航空, 航天装备, 航空装备, 空间站概念, 航天, 卫星, 火箭, 测控, 地面站]
+        keywords: [商业航天, 低空经济, 通用航空, 卫星互联网, 卫星导航, 北斗导航, 航天航空, 航天装备, 航空装备, 空间站概念, 航天, 卫星, 火箭, 测控, 地面站]
         core_representatives:
           - {symbol: SH.601698, name: 中国卫通, relation: 卫星通信运营/卫星互联网链主, source_note: 商业航天链主代表, priority: 100}
           - {symbol: SZ.000547, name: 航天发展, relation: 航天电子信息/卫星应用链主, source_note: 商业航天链主代表, priority: 96}

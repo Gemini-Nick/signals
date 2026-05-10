@@ -611,6 +611,132 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
     return out
 
 
+def _bars_to_ohlcv_frame(bars: list[Any]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for bar in bars:
+        dt_value = getattr(bar, "dt", None)
+        if dt_value is None:
+            continue
+        rows.append({
+            "dt": pd.Timestamp(dt_value),
+            "open": float(getattr(bar, "open", 0) or 0),
+            "high": float(getattr(bar, "high", 0) or 0),
+            "low": float(getattr(bar, "low", 0) or 0),
+            "close": float(getattr(bar, "close", 0) or 0),
+            "vol": float(getattr(bar, "vol", 0) or 0),
+            "amount": float(getattr(bar, "amount", 0) or 0),
+        })
+    if not rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "vol", "amount"])
+    df = pd.DataFrame(rows).dropna(subset=["dt", "open", "high", "low", "close"])
+    return df.sort_values("dt").set_index("dt")
+
+
+def _latest_volume_ratio(df: pd.DataFrame, *, period: int = 20) -> float:
+    if df.empty or "vol" not in df.columns or len(df) < period + 1:
+        return 0.0
+    vols = pd.to_numeric(df["vol"], errors="coerce").fillna(0.0)
+    baseline = vols.shift(1).rolling(period).mean().iloc[-1]
+    latest = vols.iloc[-1]
+    if not baseline or baseline <= 0:
+        return 0.0
+    return round(float(latest / baseline), 4)
+
+
+def _entry_factor_score(signal: dict[str, Any]) -> float:
+    breakout_pct = max(0.0, float(signal.get("breakout_pct") or 0.0))
+    five_day_gain_pct = max(0.0, float(signal.get("five_day_gain_pct") or 0.0))
+    volume_ratio = max(0.0, float(signal.get("volume_ratio") or 0.0))
+    score = 45.0
+    score += min(22.0, breakout_pct * 1.8)
+    score += min(22.0, five_day_gain_pct * 0.45)
+    score += min(11.0, max(0.0, volume_ratio - 1.0) * 5.0)
+    return round(min(100.0, score), 3)
+
+
+def _entry_factor_resonance_context(signal: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "direction": "buy",
+        "primary_freq": "日线",
+        "aligned_freqs": ["日线"],
+        "conflict_freqs": [],
+        "grade": "single_period",
+        "tags": ["200日新高", "新高突破", "硬技术"],
+        "summary": str(signal.get("details") or "200日新高突破")[:240],
+        "latest_dt": str(signal.get("date_str") or ""),
+    }
+
+
+def _entry_factor_docs(
+    symbol: str,
+    daily_bars: list[Any],
+    *,
+    ma_alignment: dict[str, Any],
+    now: datetime,
+    scan_scope: str,
+) -> list[dict[str, Any]]:
+    if not daily_bars:
+        return []
+    try:
+        from signals.core.entry_factors import detect_200d_new_high_entries
+    except Exception as exc:
+        logger.debug("entry factor import failed %s: %s", symbol, exc)
+        return []
+
+    df = _bars_to_ohlcv_frame(daily_bars)
+    if df.empty:
+        return []
+    signals = detect_200d_new_high_entries(df, lookback=1)
+    docs: list[dict[str, Any]] = []
+    market = _symbol_market(symbol)
+    prefixed = _prefixed_symbol(symbol)
+    for signal in signals:
+        dt = pd.to_datetime(signal.get("date_str"), errors="coerce")
+        if pd.isna(dt):
+            continue
+        dt_value = dt.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0)
+        score = _entry_factor_score(signal)
+        resonance_context = _entry_factor_resonance_context(signal)
+        signal_type = str(signal.get("type") or "200日新高突破")
+        dedupe_key = f"{prefixed}|日线|200d_new_high_breakout|{dt_value.date().isoformat()}"
+        technical_evidence = {
+            "signal_type": signal_type,
+            "freq": "日线",
+            "details": str(signal.get("details") or ""),
+            "entry_factor": signal,
+            "score_details": str(signal.get("details") or ""),
+            "direction": "偏多",
+            "resonance_context": resonance_context,
+            "ma_alignment": ma_alignment,
+        }
+        docs.append({
+            "dedupe_key": dedupe_key,
+            "symbol": prefixed,
+            "raw_code": _raw_symbol_code(symbol),
+            "market": market,
+            "freq": "日线",
+            "dt": dt_value,
+            "as_of": now.date().isoformat(),
+            "updated_at": now,
+            "signal_type": signal_type,
+            "signal_side": "buy",
+            "signal_family": "entry_factor",
+            "price": float(signal.get("price") or 0),
+            "score": score,
+            "total_score": score,
+            "direction": "偏多",
+            "confidence": float(signal.get("confidence") or 0),
+            "resonance_freqs": ["日线"],
+            "resonance_context": resonance_context,
+            "ma_alignment": ma_alignment,
+            "technical_evidence": technical_evidence,
+            "invalidates_when": "跌回前199日高点下方，或突破后放量回落无法维持",
+            "source": "sync.technical_signal_scan.entry_factors",
+            "scan_scope": scan_scope,
+        })
+    return docs
+
+
 def _details_dict(details: str) -> dict[str, Any]:
     if not details:
         return {}
@@ -627,6 +753,16 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
     resample_intraday = scan_scope == INTRADAY_SCAN_SCOPE and market == "A"
     daily_bars = _load_bars(db, symbol, DAILY_FREQS, Freq.D, limit=360, label="日线")
     ma_alignment = _ma_alignment_from_daily_bars(daily_bars)
+    daily_frame = _bars_to_ohlcv_frame(daily_bars)
+    volume_ratio = _latest_volume_ratio(daily_frame)
+    now = naive_market_now(market)
+    entry_factor_docs = _entry_factor_docs(
+        symbol,
+        daily_bars,
+        ma_alignment=ma_alignment,
+        now=now,
+        scan_scope=scan_scope,
+    )
     bars_by_freq: list[tuple[str, Any, list[Any], int]] = [
         ("日线", Freq.D, daily_bars, 200),
         ("周线", Freq.W, _load_bars(db, symbol, WEEKLY_FREQS, Freq.W, limit=180, label="周线"), 100),
@@ -647,13 +783,12 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
         except Exception as exc:
             logger.debug("technical scan failed %s/%s: %s", symbol, label, exc)
     if not events:
-        return []
+        return entry_factor_docs
 
-    scored = score_signals(_prefixed_symbol(symbol), events)
-    now = naive_market_now(market)
+    scored = score_signals(_prefixed_symbol(symbol), events, volume_ratio=volume_ratio)
     buy_freqs = sorted({event.freq for event in events if _event_side(event, SIGNAL_WEIGHTS) == "buy"}, key=_freq_sort_key)
     sell_freqs = sorted({event.freq for event in events if _event_side(event, SIGNAL_WEIGHTS) == "sell"}, key=_freq_sort_key)
-    docs: list[dict[str, Any]] = []
+    docs: list[dict[str, Any]] = list(entry_factor_docs)
     for event in events:
         base_score = float(SIGNAL_WEIGHTS.get(event.signal_type, 0)) * float(event.confidence or 0)
         side = _signal_side(event.signal_type, base_score)

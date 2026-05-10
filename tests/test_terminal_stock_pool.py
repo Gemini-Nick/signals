@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from signals.sync.modules.terminal_pool import _add_fallback_watch_rows, _add_reason, _add_signal_rows, _add_user_pinned, _default_opportunity_candidate_rows, _entry_age_limit, _fib_ma_support_score_from_alignment, _reason_is_current_for_entry, _reason_type_for_signal, _selected_rows, _split_pool_rows
+from signals.sync.modules.terminal_pool import _add_fallback_watch_rows, _add_reason, _add_signal_rows, _add_user_pinned, _backfill_watch_from_clue_candidates, _default_opportunity_candidate_rows, _entry_age_limit, _fib_ma_support_score_from_alignment, _reason_is_current_for_entry, _reason_type_for_signal, _selected_rows, _split_pool_rows
 
 
 class _Cursor(list):
@@ -574,6 +574,54 @@ def test_terminal_stock_pool_daily_30m_without_right_side_waits_for_confirmation
     assert split["watch"][0]["trader_action"] == "等下单周期确认"
 
 
+def test_terminal_stock_pool_mainline_30m_right_review_enters_focus_without_full_confirmation():
+    rows = {}
+    _add_reason(rows, "300106", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "mainline-30m-right",
+        "signal_type": "趋势买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 96,
+        "confidence": 0.85,
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="主线右侧复核股")
+    _add_chain_context(
+        rows,
+        "300106",
+        chain_name="AI算力产业链",
+        node_name="AI硬件/CPO",
+        phase="warming",
+        rank=2,
+        name="主线右侧复核股",
+    )
+    _add_reason(rows, "300107", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "neutral-30m-right",
+        "signal_type": "趋势买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 96,
+        "confidence": 0.85,
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="中性右侧复核股")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert [row["raw_code"] for row in split["focus"]] == ["300106"]
+    row = split["focus"][0]
+    assert row["entry_gate_status"] == "entry_waiting_upper_context"
+    assert row["market_setup_bias"] == "right_review"
+    assert row["setup_rank_tier"] == 150
+    assert row["mainline_rank_tier"] == 240
+    assert row["queue_lane"] == "entry_waiting_confirm"
+    assert row["trader_action"] == "右侧买点复核"
+    assert row["can_trade_now"] is False
+    assert split["watch"][0]["raw_code"] == "300107"
+
+
 def test_terminal_stock_pool_attack_entry_does_not_wait_for_30m():
     rows = {}
     _add_reason(rows, "002050", {
@@ -609,6 +657,15 @@ def test_terminal_stock_pool_attack_entry_does_not_wait_for_30m():
         "confidence": 0.8,
         "ma_alignment": _ma_alignment(),
     }, index_codes=set(), name="三花智控")
+    _add_chain_context(
+        rows,
+        "002050",
+        chain_name="机器人产业链",
+        node_name="人形机器人/执行器",
+        phase="warming",
+        rank=2,
+        name="三花智控",
+    )
 
     split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
 
@@ -621,7 +678,155 @@ def test_terminal_stock_pool_attack_entry_does_not_wait_for_30m():
     assert "30m未补齐" in split["focus"][0]["missing_condition"]
 
 
-def test_terminal_stock_pool_one_buy_ma_confirmed_enters_left_attack_focus():
+def test_terminal_stock_pool_buy_shape_with_resistance_text_stays_right_attack():
+    rows = {}
+    _add_reason(rows, "600007", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "daily-right",
+        "signal_type": "MACD绿柱扩大_零上",
+        "signal_side": "buy",
+        "freq": "日线",
+        "score": 62,
+        "confidence": 0.8,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="中国国贸")
+    _add_reason(rows, "600007", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "f15-right",
+        "signal_type": "MACD绿柱扩大_零上",
+        "signal_side": "buy",
+        "freq": "15分钟",
+        "score": 62,
+        "confidence": 0.8,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="中国国贸")
+    _add_reason(rows, "600007", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "f5-shape",
+        "signal_type": "形态:上升三角",
+        "signal_side": "buy",
+        "freq": "5分钟",
+        "score": 62,
+        "confidence": 0.6,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "evidence": {"details": "阻力位形成平顶，低点递升"},
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="中国国贸")
+    _add_chain_context(
+        rows,
+        "600007",
+        chain_name="AI算力产业链",
+        node_name="AI硬件/CPO",
+        phase="warming",
+        rank=2,
+        name="中国国贸",
+    )
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["focus"][0]["raw_code"] == "600007"
+    assert split["focus"][0]["entry_gate_status"] == "entry_attack_confirmed"
+    assert split["focus"][0]["market_setup_bias"] == "right_attack"
+    assert split["focus"][0]["can_trade_now"] is True
+
+
+def test_terminal_stock_pool_neutral_attack_entry_stays_watch_without_mainline():
+    rows = {}
+    for freq, signal_type in (("日线", "MACD绿柱扩大_零上"), ("15分钟", "MACD绿柱扩大_零上"), ("5分钟", "趋势买")):
+        _add_reason(rows, "600008", {
+            "reason_type": "technical_trigger",
+            "source_collection": "terminal_technical_signals",
+            "source_doc_id": f"neutral-attack-{freq}",
+            "signal_type": signal_type,
+            "signal_side": "buy",
+            "freq": freq,
+            "score": 90,
+            "confidence": 0.8,
+            "ma_alignment": _ma_alignment(),
+        }, index_codes=set(), name="中性右侧进攻")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["focus"] == []
+    assert split["watch"][0]["raw_code"] == "600008"
+    assert split["watch"][0]["entry_gate_status"] == "entry_attack_confirmed"
+    assert split["watch"][0]["market_setup_bias"] == "right_attack"
+    assert split["watch"][0]["can_trade_now"] is False
+
+
+def test_terminal_stock_pool_focus_sorts_right_setups_above_left_review():
+    rows = {}
+    for freq, signal_type in (("日线", "趋势买"), ("30分钟", "三买"), ("15分钟", "趋势买")):
+        _add_reason(rows, "300901", {
+            "reason_type": "technical_trigger",
+            "source_collection": "terminal_technical_signals",
+            "source_doc_id": f"right-exec-{freq}",
+            "signal_type": signal_type,
+            "signal_side": "buy",
+            "freq": freq,
+            "score": 40,
+            "confidence": 0.5,
+            "ma_alignment": _ma_alignment(score=20),
+        }, index_codes=set(), name="低分右侧确认")
+    for freq, signal_type in (("日线", "趋势买"), ("15分钟", "趋势买"), ("5分钟", "趋势买")):
+        _add_reason(rows, "300902", {
+            "reason_type": "technical_trigger",
+            "source_collection": "terminal_technical_signals",
+            "source_doc_id": f"right-attack-{freq}",
+            "signal_type": signal_type,
+            "signal_side": "buy",
+            "freq": freq,
+            "score": 45,
+            "confidence": 0.5,
+            "ma_alignment": _ma_alignment(score=20),
+        }, index_codes=set(), name="低分进攻买点")
+    _add_chain_context(
+        rows,
+        "300902",
+        chain_name="AI算力产业链",
+        node_name="AI硬件/CPO",
+        phase="warming",
+        rank=2,
+        name="低分进攻买点",
+    )
+    _add_reason(rows, "300903", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "left-high-score",
+        "signal_type": "一买",
+        "signal_side": "buy",
+        "freq": "日线",
+        "score": 300,
+        "confidence": 0.95,
+        "ma_alignment": _ma_alignment(score=44),
+    }, index_codes=set(), name="高分主线低吸")
+    _add_chain_context(
+        rows,
+        "300903",
+        chain_name="AI算力产业链",
+        node_name="AI硬件/CPO",
+        phase="warming",
+        rank=1,
+        name="高分主线低吸",
+    )
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert [row["raw_code"] for row in split["focus"][:3]] == ["300901", "300902", "300903"]
+    assert [row["market_setup_bias"] for row in split["focus"][:3]] == ["right_executable", "right_attack", "left_review"]
+    assert [row["setup_rank_tier"] for row in split["focus"][:3]] == [300, 200, 100]
+    assert [row["can_trade_now"] for row in split["focus"][:3]] == [True, True, False]
+
+
+def test_terminal_stock_pool_one_buy_ma_confirmed_enters_left_review_watch_by_default():
     rows = {}
     _add_reason(rows, "300001", {
         "reason_type": "technical_trigger",
@@ -637,12 +842,18 @@ def test_terminal_stock_pool_one_buy_ma_confirmed_enters_left_attack_focus():
 
     split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
 
-    assert split["focus"][0]["raw_code"] == "300001"
-    assert split["focus"][0]["entry_gate_status"] == "left_attack_confirmed"
-    assert split["focus"][0]["setup_mode"] == "left_attack"
-    assert split["focus"][0]["stage_label"] == "低吸进攻"
-    assert "买点质量" in split["focus"][0]["rank_reason"]
-    assert "均线确认" in split["focus"][0]["rank_reason"]
+    assert split["focus"] == []
+    row = split["watch"][0]
+    assert row["raw_code"] == "300001"
+    assert row["entry_gate_status"] == "left_attack_confirmed"
+    assert row["setup_mode"] == "left_attack"
+    assert row["stage_label"] == "低吸进攻"
+    assert row["queue_lane"] == "left_review"
+    assert row["market_setup_bias"] == "left_review"
+    assert row["setup_rank_tier"] == 100
+    assert row["left_allowed_reason"] == ""
+    assert "买点质量" in row["rank_reason"]
+    assert "均线确认" in row["rank_reason"]
 
 
 def test_terminal_stock_pool_one_buy_without_key_ma_stays_watch_above_plain_clue():
@@ -760,7 +971,8 @@ def test_terminal_stock_pool_daily_two_buy_is_upper_context_not_right_attack_sig
     }, index_codes=set(), name="日线二买股")
 
     split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
-    row = split["focus"][0]
+    assert split["focus"] == []
+    row = split["watch"][0]
 
     assert row["top_buy_reason"]["signal_type"] == "二买"
     assert row["setup_mode"] == "left_attack"
@@ -826,12 +1038,14 @@ def test_terminal_stock_pool_mainline_tech_gets_lenient_attack_focus_without_30m
 
     split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
 
-    assert [row["raw_code"] for row in split["focus"][:2]] == ["300101", "300102"]
+    assert [row["raw_code"] for row in split["focus"]] == ["300101"]
+    assert split["watch"][0]["raw_code"] == "300102"
     assert split["focus"][0]["entry_gate_status"] == "left_attack_confirmed"
     assert split["focus"][0]["sector_policy"] == "mainline_lenient"
     assert split["focus"][0]["score_components"]["mainline_lenient_policy"] == 18.0
-    assert split["focus"][1]["sector_policy"] == "neutral"
-    assert split["focus"][0]["rank_score"] > split["focus"][1]["rank_score"]
+    assert split["focus"][0]["left_allowed_reason"] == "mainline_lenient"
+    assert split["focus"][0]["can_trade_now"] is False
+    assert split["watch"][0]["sector_policy"] == "neutral"
 
 
 def test_terminal_stock_pool_defensive_sector_requires_full_confirmation():
@@ -922,6 +1136,9 @@ def test_terminal_stock_pool_defensive_sector_relaxes_when_broad_market_falls():
     assert row["sector_policy"] == "defensive_lenient"
     assert row["broad_market_label"] == "大盘下跌"
     assert row["score_components"]["defensive_lenient_policy"] == 12.0
+    assert row["left_allowed_reason"] == "defensive_lenient_broad_market_falling"
+    assert row["queue_lane"] == "left_review"
+    assert row["can_trade_now"] is False
 
 
 def test_terminal_stock_pool_mainline_concept_overrides_defensive_industry():
@@ -1214,7 +1431,7 @@ def test_terminal_stock_pool_scores_fibonacci_ma_support_separately():
 
     split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
 
-    by_code = {row["raw_code"]: row for row in split["focus"]}
+    by_code = {row["raw_code"]: row for row in split["watch"]}
     assert by_code["300421"]["score_components"]["fib_ma_support"] > 0
     assert by_code["300422"]["score_components"]["fib_ma_support"] == 0
     assert "Fibonacci均线" in by_code["300421"]["rank_reason"]
@@ -1269,6 +1486,167 @@ def test_terminal_stock_pool_watch_rank_rewards_multi_period_and_indicator_bread
     assert split["watch"][0]["score_components"]["indicator_breadth"] == 8.0
     assert split["watch"][1]["score_components"]["multi_period_bonus"] == 0.0
     assert split["watch"][1]["score_components"]["indicator_breadth"] == 4.0
+
+
+def test_terminal_stock_pool_watch_rank_rewards_200d_new_high_breakout():
+    rows = {}
+    _add_reason(rows, "300501", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "new-high-breakout",
+        "signal_type": "200日新高突破",
+        "signal_side": "buy",
+        "signal_family": "entry_factor",
+        "freq": "日线",
+        "score": 88,
+        "confidence": 0.9,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+        "evidence": {
+            "details": "200日新高, 突破5.0%, 5日涨幅20.0%, 量比2.0",
+            "entry_factor": {
+                "group": "200d_new_high_breakout",
+                "breakout_pct": 5.0,
+                "five_day_gain_pct": 20.0,
+                "volume_ratio": 2.0,
+            },
+        },
+    }, index_codes=set(), name="新高突破股")
+    _add_reason(rows, "300502", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "daily-two-buy",
+        "signal_type": "二买",
+        "signal_side": "buy",
+        "freq": "日线",
+        "score": 60,
+        "confidence": 0.7,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="日线二买股")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["focus"] == []
+    assert [row["raw_code"] for row in split["watch"][:2]] == ["300502", "300501"]
+    row = next(item for item in split["watch"] if item["raw_code"] == "300501")
+    assert row["raw_code"] == "300501"
+    assert row["latest_signal"] == "200日新高突破"
+    assert row["score_components"]["breakout_momentum"] > 0
+    assert row["score_components"]["buy_point_quality"] > 0
+    assert row["score_components"]["breakout_momentum"] < split["watch"][0]["score_components"]["buy_point_quality"]
+    assert "新高动量" in row["rank_reason"]
+
+
+def test_terminal_stock_pool_buy_with_risk_still_enters_focus_with_risk_marker():
+    rows = {}
+    for freq, signal_type in (("日线", "趋势买"), ("30分钟", "三买"), ("15分钟", "趋势买")):
+        _add_reason(rows, "300701", {
+            "reason_type": "technical_trigger",
+            "source_collection": "terminal_technical_signals",
+            "source_doc_id": f"buy-risk-{freq}",
+            "signal_type": signal_type,
+            "signal_side": "buy",
+            "freq": freq,
+            "score": 82,
+            "confidence": 0.82,
+            "event_dt": "2026-05-08",
+            "as_of": "2026-05-08",
+            "ma_alignment": _ma_alignment(),
+        }, index_codes=set(), name="买点带风险股")
+    _add_reason(rows, "300701", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "buy-risk-sell",
+        "signal_type": "日线卖点风险",
+        "signal_side": "sell",
+        "freq": "日线",
+        "score": -92,
+        "confidence": 0.8,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+    }, index_codes=set(), name="买点带风险股")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["risk"] == []
+    row = split["focus"][0]
+    assert row["raw_code"] == "300701"
+    assert row["entry_gate_status"] == "entry_confirmed"
+    assert row["market_setup_bias"] == "right_executable"
+    assert row["trade_stage"] == "confirmed_entry"
+    assert row["setup_mode"] == "right_attack"
+    assert row["top_risk_reason"]["signal_type"] == "日线卖点风险"
+    assert row["risk_marked"] is True
+    assert row["risk_marker"] == "日线卖点风险"
+    assert row["risk_level"] == "high"
+    assert "日线卖点风险" in row["risk_signal_reasons"]
+
+
+def test_terminal_stock_pool_period_conflict_marks_risk_without_blocking_buy():
+    rows = {}
+    for freq, signal_type in (("日线", "趋势买"), ("30分钟", "三买"), ("15分钟", "趋势买")):
+        _add_reason(rows, "300703", {
+            "reason_type": "technical_trigger",
+            "source_collection": "terminal_technical_signals",
+            "source_doc_id": f"buy-conflict-{freq}",
+            "signal_type": signal_type,
+            "signal_side": "buy",
+            "freq": freq,
+            "score": 82,
+            "confidence": 0.82,
+            "event_dt": "2026-05-08",
+            "as_of": "2026-05-08",
+            "ma_alignment": _ma_alignment(),
+            "resonance_context": {
+                "direction": "buy",
+                "aligned_freqs": ["日线", "30分钟", "15分钟"],
+                "conflict_freqs": ["5分钟"] if freq == "30分钟" else [],
+                "grade": "conflict" if freq == "30分钟" else "multi_period",
+            },
+        }, index_codes=set(), name="买点冲突标记股")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["risk"] == []
+    row = split["focus"][0]
+    assert row["raw_code"] == "300703"
+    assert row["entry_gate_status"] == "entry_confirmed"
+    assert row["trade_stage"] == "confirmed_entry"
+    assert row["risk_marked"] is True
+    assert row["risk_marker"] == "周期冲突"
+    assert row["risk_level"] == "medium"
+    assert "周期冲突" in row["risk_signal_reasons"]
+
+
+def test_terminal_stock_pool_pure_risk_still_enters_risk_pool():
+    rows = {}
+    _add_reason(rows, "300702", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "pure-risk-sell",
+        "signal_type": "日线卖点风险",
+        "signal_side": "sell",
+        "freq": "日线",
+        "score": -90,
+        "confidence": 0.8,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+    }, index_codes=set(), name="纯风险股")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["focus"] == []
+    assert split["watch"] == []
+    row = split["risk"][0]
+    assert row["raw_code"] == "300702"
+    assert row["entry_gate_status"] == "blocked_by_risk"
+    assert row["top_buy_reason"] == {}
+    assert row["top_risk_reason"]["signal_type"] == "日线卖点风险"
+    assert row["risk_marked"] is True
+    assert row["pool_type"] == "risk"
 
 
 def test_terminal_stock_pool_stale_resonance_context_does_not_count_as_fresh_periods():
@@ -1704,6 +2082,43 @@ def test_has_clue_source_detects_review_and_legacy_sources():
         "score": 120,
     }, index_codes=set(), name="中旗新材")
     assert not _has_clue_source(rows_tech["300575"])
+
+
+def test_terminal_stock_pool_clue_overflow_backfills_watch_pool():
+    rows = {}
+    for index in range(6):
+        code = f"30060{index}"
+        _add_reason(rows, code, {
+            "reason_type": "review_sector_bullish",
+            "source_collection": "review_sector_clues",
+            "source_doc_id": f"clue-{index}",
+            "signal_type": "复盘线索",
+            "signal_side": "buy",
+            "source_role": "review_clue",
+            "decision_effect": "context_only",
+            "can_create_candidate": True,
+            "board_or_concept": "机器人",
+            "evidence": {"author": "daozhang"},
+        }, index_codes=set(), name=f"线索股{index}")
+
+    clue_candidates = list(rows.values())
+    clue_symbols = {row["symbol"] for row in clue_candidates[:2]}
+    watch_stocks = []
+
+    added = _backfill_watch_from_clue_candidates(
+        watch_stocks,
+        clue_candidates,
+        clue_symbols=clue_symbols,
+        watch_limit=3,
+    )
+
+    assert added == 3
+    assert [row["raw_code"] for row in watch_stocks] == ["300602", "300603", "300604"]
+    assert all(row["pool_type"] == "watch" for row in watch_stocks)
+    assert all(row["watch_backfill_source"] == "clue_overflow" for row in watch_stocks)
+    assert all(row["entry_gate_status"] == "watch_only_not_hard_buy" for row in watch_stocks)
+    assert all(row["market_setup_bias"] == "watch_only" for row in watch_stocks)
+    assert all(row["can_trade_now"] is False for row in watch_stocks)
 
 
 def test_gate_progress_returns_zero_for_no_technical_reasons():

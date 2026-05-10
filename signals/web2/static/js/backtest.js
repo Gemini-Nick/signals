@@ -104,7 +104,7 @@ function _switchBtTab(tabName) {
 }
 
 // ── 信号类型联动 ────────────────────────────────────
-const _FACTOR_TYPES = ['gap', 'trend_breakout', 'vol_contraction', 'candle_run', 'candle_accel'];
+const _FACTOR_TYPES = ['gap', 'trend_breakout', '200d_new_high_breakout', 'vol_contraction', 'candle_run', 'candle_accel'];
 const _CLASSIC_TYPES = ['all', 'macd', 'czsc'];
 
 function _getSignalType() {
@@ -139,6 +139,9 @@ function _collectSignalParams() {
     } else if (st === 'trend_breakout') {
       params.trend_lookback = document.getElementById('bt-trend-lookback').value;
       params.volume_ratio_min = document.getElementById('bt-trend-vol-ratio').value;
+    } else if (st === '200d_new_high_breakout') {
+      params.new_high_lookback_days = document.getElementById('bt-new-high-lookback').value;
+      params.new_high_volume_ratio_min = document.getElementById('bt-new-high-vol-ratio').value;
     } else if (st === 'vol_contraction') {
       params.bb_period = document.getElementById('bt-bb-period').value;
       params.squeeze_threshold = document.getElementById('bt-squeeze-thresh').value;
@@ -691,6 +694,7 @@ const _SIGNAL_TYPE_TO_GROUPS = {
   czsc: ['czsc'],
   gap: ['gap'],
   trend_breakout: ['trend'],
+  '200d_new_high_breakout': ['200d_new_high_breakout'],
   vol_contraction: ['vol'],
   candle_run: ['candle_run'],
   candle_accel: ['candle_accel'],
@@ -720,6 +724,8 @@ function _drawBtSignalMarkers(signals) {
         color = '#26a69a'; shape = 'arrowUp'; position = 'belowBar';
       } else if (s.group === 'vol') {
         color = '#e040fb'; shape = 'arrowUp'; position = 'belowBar';
+      } else if (s.group === '200d_new_high_breakout') {
+        color = '#00acc1'; shape = 'arrowUp'; position = 'belowBar';
       } else if (s.group === 'candle_run') {
         color = '#ff5722'; shape = 'arrowUp'; position = 'belowBar';
       } else if (s.group === 'candle_accel') {
@@ -1303,6 +1309,7 @@ function _groupBadge(group) {
     'czsc': '<span class="bt-pattern-badge czsc">缠论</span>',
     'gap': '<span class="bt-pattern-badge gap">跳空</span>',
     'trend': '<span class="bt-pattern-badge trend">突破</span>',
+    '200d_new_high_breakout': '<span class="bt-pattern-badge trend">新高</span>',
     'vol': '<span class="bt-pattern-badge vol">收缩</span>',
     'candle_run': '<span class="bt-pattern-badge candle-run">连续K</span>',
     'candle_accel': '<span class="bt-pattern-badge candle-accel">加速K</span>',

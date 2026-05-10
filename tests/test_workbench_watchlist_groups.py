@@ -1261,11 +1261,23 @@ def test_slim_shell_stock_row_preserves_quote_basis_fields():
         "quote_open_price": 38.89,
         "quote_open_change_pct": -2.2371,
         "quote_prev_close_change_pct": -1.985,
+        "setup_rank_tier": 0,
+        "market_setup_bias": "watch_only",
+        "left_allowed_reason": "mainline_lenient",
+        "watch_backfill_source": "clue_overflow",
+        "clue_quality_score": 68.0,
+        "promotion_gates": ["missing_buy_technical"],
     })
 
     assert row["day_change_basis"] == "prev_close"
     assert row["quote_open_price"] == 38.89
     assert row["quote_prev_close_change_pct"] == -1.985
+    assert row["setup_rank_tier"] == 0
+    assert row["market_setup_bias"] == "watch_only"
+    assert row["left_allowed_reason"] == "mainline_lenient"
+    assert row["watch_backfill_source"] == "clue_overflow"
+    assert row["clue_quality_score"] == 68.0
+    assert row["promotion_gates"] == ["missing_buy_technical"]
 
 
 def test_quote_overlay_prefers_realtime_quote_over_minute_change(monkeypatch):
@@ -1967,8 +1979,140 @@ def test_chain_heat_display_context_explains_driver_reference_and_representative
     assert context["representative_confirmation"]["status"] == "not_confirmed"
     assert "driver_not_same_as_chain_label" in context["mismatch_flags"]
     assert "driver_reference_divergence" in context["mismatch_flags"]
-    assert "主驱动 超导概念 +3.48%" in context["change_explain"]
+    assert "源[概念] 超导概念 +3.48%" in context["change_explain"]
     assert "参考行业 基础化工 +0.21%" in context["change_explain"]
+    assert context["source_driver"]["kind"] == "concept"
+    assert context["chain_confirmation"]["status"] == "not_confirmed"
+
+
+def test_chain_heat_display_context_marks_source_only_when_reps_lag():
+    from signals.web.api import workbench
+
+    context = workbench._chain_heat_display_context({
+        "chain_name": "家电家居产业链",
+        "node_name": "家电/照明",
+        "integrated_domains": [
+            {
+                "kind": "industry",
+                "name": "其他家电Ⅲ",
+                "change_pct": 5.64,
+                "up_count": 3,
+                "down_count": 0,
+                "mapping_confidence": 60,
+            },
+            {
+                "kind": "industry",
+                "name": "家用电器",
+                "change_pct": 1.57,
+                "up_count": 85,
+                "down_count": 22,
+                "mapping_confidence": 96,
+            },
+        ],
+    }, {
+        "leaders": [
+            {"symbol": "SZ.000333", "name": "美的集团", "day_change_pct": 0.78},
+            {"symbol": "SZ.000651", "name": "格力电器", "day_change_pct": 0.05},
+        ],
+        "elastic": [{"symbol": "SZ.300625", "name": "三雄极光", "day_change_pct": 0.33}],
+    })
+
+    assert context["representative_confirmation"]["status"] == "source_only"
+    assert context["chain_confirmation"]["label"] == "源强链弱"
+    assert "representatives_weak_confirmation" in context["mismatch_flags"]
+    assert "源[行业] 其他家电Ⅲ +5.64%" in context["change_explain"]
+    assert "等链主确认后再当主线" in workbench._chain_heat_trader_action(context)
+
+
+def test_source_concept_overlays_explain_hot_theme_inside_industry():
+    from signals.web.api import workbench
+
+    class _Cursor(list):
+        pass
+
+    class _ConstituentCollection:
+        def __init__(self, docs):
+            self.docs = docs
+
+        def find_one(self, query=None, projection=None, sort=None):
+            names = {
+                clause.get("board_name") or clause.get("concept_name") or clause.get("name")
+                for clause in (query or {}).get("$or", [])
+            }
+            for doc in self.docs:
+                if doc.get("board_name") in names or doc.get("concept_name") in names:
+                    return doc
+            return {}
+
+        def find(self, query=None, projection=None):
+            symbols = set(((query or {}).get("symbols") or {}).get("$in") or [])
+            return _Cursor([
+                doc for doc in self.docs
+                if symbols.intersection(set(doc.get("symbols") or []))
+            ])
+
+    class _HeatCollection:
+        def __init__(self, docs):
+            self.docs = docs
+
+        def find_one(self, query=None, projection=None, sort=None):
+            for doc in self.docs:
+                if doc.get("kind") == (query or {}).get("kind") and doc.get("name") == (query or {}).get("name"):
+                    return doc
+            return {}
+
+    db = {
+        "board_constituents": _ConstituentCollection([
+            {"board_name": "印染", "symbols": ["605055", "605189"], "stock_names": {"605055": "迎丰股份", "605189": "富春染织"}},
+        ]),
+        "concept_constituents": _ConstituentCollection([
+            {"concept_name": "机器人执行器", "symbols": ["605189"], "stock_names": {"605189": "富春染织"}},
+            {"concept_name": "昨日高振幅", "symbols": ["605189"], "stock_names": {"605189": "富春染织"}},
+        ]),
+        "board_heat_ticks": _HeatCollection([
+            {"kind": "concept", "name": "机器人执行器", "change_pct": 5.28, "leader_name": "五洲新春", "leader_change_pct": 10.01},
+            {"kind": "concept", "name": "昨日高振幅", "change_pct": 1.36, "leader_name": "南威软件", "leader_change_pct": 10.0},
+        ]),
+    }
+
+    overlays = workbench._source_concept_overlays(db, [{"kind": "industry", "name": "印染"}])
+    grouped = workbench._source_event_concept_overlays(db, [{"kind": "industry", "name": "印染"}])
+    themes = workbench._source_theme_overlays(db, [{"kind": "industry", "name": "印染"}])
+    theme_grouped = workbench._source_event_theme_overlays(db, [{"kind": "industry", "name": "印染"}])
+
+    assert overlays[0]["name"] == "机器人执行器"
+    assert overlays[0]["matched_names"] == ["富春染织"]
+    assert not any(item["name"] == "昨日高振幅" for item in overlays)
+    assert grouped[0]["source"]["name"] == "印染"
+    assert grouped[0]["concepts"][0]["name"] == "机器人执行器"
+    assert themes[0]["name"] == "昨日高振幅"
+    assert themes[0]["kind_label"] == "主题"
+    assert themes[0]["non_chain_reason"]
+    assert theme_grouped[0]["source"]["name"] == "印染"
+    assert theme_grouped[0]["themes"][0]["name"] == "昨日高振幅"
+
+
+def test_chain_confirmation_labels_elastic_rebound_when_core_is_weak():
+    from signals.web.api import workbench
+
+    confirmation = workbench._representative_confirmation({
+        "leaders": [
+            {"symbol": "SZ.300308", "name": "中际旭创", "day_change_pct": 0.95},
+            {"symbol": "SZ.300502", "name": "新易盛", "day_change_pct": -2.1},
+        ],
+        "elastic": [
+            {"symbol": "SZ.002281", "name": "光迅科技", "day_change_pct": 10.0},
+            {"symbol": "SH.688498", "name": "源杰科技", "day_change_pct": -3.31},
+        ],
+    }, 2.69)
+    payload = workbench._chain_confirmation_payload(confirmation)
+
+    assert confirmation["status"] == "mixed"
+    assert payload["status"] == "elastic_rebound"
+    assert payload["label"] == "弹性补涨"
+    assert payload["core_avg_change_pct"] < 1.0
+    assert payload["elastic_max_change_pct"] >= 5.0
+    assert "链主不强" in workbench._chain_heat_trader_action({"chain_confirmation": payload})
 
 
 def test_slim_sector_row_preserves_chain_change_truth_fields():
@@ -1985,12 +2129,27 @@ def test_slim_sector_row_preserves_chain_change_truth_fields():
         "primary_domain": {"kind": "concept", "name": "超导概念", "change_pct": 3.48},
         "reference_domain": {"kind": "industry", "name": "基础化工", "change_pct": 0.21},
         "representative_confirmation": {"status": "not_confirmed", "label": "代表股未跟随"},
+        "source_driver": {"kind": "concept", "kind_label": "概念", "name": "超导概念", "change_pct": 3.48},
+        "chain_confirmation": {"status": "not_confirmed", "label": "链主未确认"},
+        "source_concept_overlays": [{"kind": "concept", "name": "机器人执行器", "change_pct": 5.28}],
+        "source_event_concept_overlays": [{"source": {"name": "印染"}, "concepts": [{"name": "机器人执行器"}]}],
+        "source_theme_overlays": [{"kind": "theme", "name": "次新股", "change_pct": 2.88}],
+        "source_event_theme_overlays": [{"source": {"name": "存储芯片"}, "themes": [{"name": "次新股"}]}],
+        "route_explain": "源[概念] 超导概念 -> 基础化工产业链/化工材料",
+        "display_rank_score": 42.5,
         "mismatch_flags": ["driver_reference_divergence", "representatives_not_confirmed"],
     })
 
     assert slim["change_display_label"] == "驱动涨幅"
     assert slim["primary_domain"]["name"] == "超导概念"
     assert slim["reference_domain"]["change_pct"] == 0.21
+    assert slim["source_driver"]["kind_label"] == "概念"
+    assert slim["chain_confirmation"]["label"] == "链主未确认"
+    assert slim["source_concept_overlays"][0]["name"] == "机器人执行器"
+    assert slim["source_event_concept_overlays"][0]["source"]["name"] == "印染"
+    assert slim["source_theme_overlays"][0]["name"] == "次新股"
+    assert slim["source_event_theme_overlays"][0]["source"]["name"] == "存储芯片"
+    assert slim["display_rank_score"] == 42.5
     assert "representatives_not_confirmed" in slim["mismatch_flags"]
 
 
