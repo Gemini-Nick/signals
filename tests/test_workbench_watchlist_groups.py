@@ -64,6 +64,48 @@ def test_watchlist_range_columns_include_all_key_presets():
     assert len(columns) > 4
 
 
+def test_board_heat_range_returns_use_watchlist_column_keys(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Cursor(list):
+        def sort(self, *args, **kwargs):
+            return self
+
+    class _Collection:
+        def find(self, query=None, projection=None):
+            assert query == {"kind": "concept", "name": "高带宽内存"}
+            return _Cursor([
+                {"trade_minute": datetime(2026, 4, 28, 11, 16), "price": 100.0},
+                {"trade_minute": datetime(2026, 5, 8, 14, 59), "price": 110.0},
+                {"trade_minute": datetime(2026, 5, 11, 14, 59), "price": 120.0},
+            ])
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"board_heat_ticks": _Collection()}))
+    monkeypatch.setattr(
+        workbench,
+        "resolve_board_heat_name",
+        lambda kind, label: {"query": label, "heat_name": label, "status": "exact"},
+    )
+
+    returns, source, meta = workbench._board_heat_range_returns(
+        "concept",
+        "高带宽内存",
+        [
+            {"key": "ytd", "label": "2026年以来", "start_date": "2026-01-01"},
+            {"key": "1w", "label": "最近一周", "start_date": "2026-05-04"},
+        ],
+    )
+
+    assert returns == {"ytd": 20.0, "1w": 9.09}
+    assert source == "board_heat_ticks_price"
+    assert meta["status"] == "partial_history"
+    assert meta["partial_keys"] == ["ytd"]
+
+
 def test_lightweight_stock_row_requires_fresh_range_returns(monkeypatch):
     from signals.web.api import workbench
 

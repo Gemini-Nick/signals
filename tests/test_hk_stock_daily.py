@@ -55,11 +55,11 @@ def test_hk_universe_sources_allows_akshare_alias(monkeypatch):
     assert _hk_universe_sources() == ["akshare"]
 
 
-def test_hk_history_sources_defaults_to_daily_first(monkeypatch):
+def test_hk_history_sources_defaults_to_bounded_hist_first(monkeypatch):
     monkeypatch.delenv("HK_STOCK_DAILY_HISTORY_SOURCE", raising=False)
     monkeypatch.delenv("HK_STOCK_DAILY_HISTORY_SOURCES", raising=False)
 
-    assert _hk_history_sources() == ["daily", "hist"]
+    assert _hk_history_sources() == ["hist", "daily"]
 
 
 def test_docs_from_hk_daily_df_writes_canonical_bar_docs():

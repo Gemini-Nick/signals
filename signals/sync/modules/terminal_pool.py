@@ -31,6 +31,9 @@ ENTRY_FACTOR_TOKENS = (
     "200d_new_high_breakout",
     "200日新高",
     "新高突破",
+    "relative_resilience_refusal_pullback",
+    "拒绝回调",
+    "相对强度",
 )
 TECHNICAL_TOKENS = CHAN_TOKENS + PATTERN_TOKENS + MACD_TOKENS + GAP_TOKENS + ENTRY_FACTOR_TOKENS
 SIGNAL_TYPE_NORMALIZATIONS = {
@@ -68,6 +71,8 @@ RIGHT_OPPORTUNITY_TOKENS = (
     "200d_new_high_breakout",
     "200日新高",
     "新高突破",
+    "relative_resilience_refusal_pullback",
+    "拒绝回调",
 )
 WEAK_CONTEXT_TOKENS = ("缺口买:普通",)
 MAINLINE_LENIENT_SECTOR_TOKENS = (
@@ -2418,6 +2423,36 @@ def _new_high_breakout_score(row: dict[str, Any], buy_reasons: list[dict[str, An
     return max((_new_high_breakout_score_for_reason(reason) for reason in reasons), default=0.0)
 
 
+def _refusal_pullback_score_for_reason(reason: dict[str, Any]) -> float:
+    text = _reason_signal_text(reason)
+    if not any(token in text for token in ("relative_resilience_refusal_pullback", "拒绝回调", "相对强度")):
+        return 0.0
+    evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+    entry_factor = evidence.get("entry_factor") if isinstance(evidence.get("entry_factor"), dict) else {}
+    if not entry_factor:
+        return 4.0
+    max_drawdown_pct = max(0.0, _float(entry_factor.get("max_drawdown_pct")))
+    max_close_drawdown_pct = max(0.0, _float(entry_factor.get("max_close_drawdown_pct")))
+    high_proximity_pct = max(0.0, _float(entry_factor.get("high_proximity_pct")))
+    strong_close_days = max(0.0, _float(entry_factor.get("strong_close_days")))
+    twenty_day_gain_pct = max(0.0, _float(entry_factor.get("twenty_day_gain_pct")))
+    recent_volume_ratio = max(0.0, _float(entry_factor.get("recent_volume_ratio")))
+    score = 4.0
+    score += max(0.0, 3.5 - max_drawdown_pct) * 1.2
+    score += max(0.0, 2.0 - max_close_drawdown_pct)
+    score += min(4.0, max(0.0, high_proximity_pct - 97.0) * 0.8)
+    score += min(4.0, strong_close_days * 1.2)
+    score += min(3.0, twenty_day_gain_pct * 0.12)
+    if 0 < recent_volume_ratio <= 1.35:
+        score += 2.0
+    return round(min(18.0, score), 3)
+
+
+def _refusal_pullback_score(row: dict[str, Any], buy_reasons: list[dict[str, Any]] | None = None) -> float:
+    reasons = _buy_technical_reasons(row) if buy_reasons is None else buy_reasons
+    return max((_refusal_pullback_score_for_reason(reason) for reason in reasons), default=0.0)
+
+
 def _risk_reasons(row: dict[str, Any]) -> list[dict[str, Any]]:
     reasons: list[dict[str, Any]] = []
     for reason in row.get("inclusion_reasons") or []:
@@ -3155,6 +3190,7 @@ def _entry_components(row: dict[str, Any], top_buy: dict[str, Any]) -> dict[str,
         "indicator_breadth": _indicator_breadth_score(buy_reasons),
         "buy_point_quality": _buy_point_quality(row, buy_reasons),
         "breakout_momentum": _new_high_breakout_score(row, buy_reasons),
+        "relative_resilience": _refusal_pullback_score(row, buy_reasons),
         "ma_alignment": _ma_alignment_score(row, buy_reasons, include_row_level=False),
         "fib_ma_support": _fib_ma_support_score(row, buy_reasons, include_row_level=False),
         "upper_timeframe_quality": upper_score,
@@ -3184,6 +3220,7 @@ def _rank_reason(score_components: dict[str, float]) -> str:
         "focus_review": "买点复核",
         "buy_point_quality": "买点质量",
         "breakout_momentum": "新高动量",
+        "relative_resilience": "拒绝回调",
         "ma_alignment": "均线确认",
         "fib_ma_support": "Fibonacci均线",
         "upper_timeframe_quality": "周/日线",
@@ -3214,6 +3251,8 @@ def _rank_reason(score_components: dict[str, float]) -> str:
     selected = ordered[:5]
     if "upper_timeframe_quality" in score_components and not any(key == "upper_timeframe_quality" for key, _ in selected):
         selected.append(("upper_timeframe_quality", score_components["upper_timeframe_quality"]))
+    if _float(score_components.get("relative_resilience")) and not any(key == "relative_resilience" for key, _ in selected):
+        selected.append(("relative_resilience", score_components["relative_resilience"]))
     if _float(score_components.get("fib_ma_support")) and not any(key == "fib_ma_support" for key, _ in selected):
         selected.append(("fib_ma_support", score_components["fib_ma_support"]))
     parts = []
@@ -3247,6 +3286,7 @@ def _watch_components(row: dict[str, Any], gate_status: str) -> dict[str, float]
         "indicator_breadth": _indicator_breadth_score(buy_reasons),
         "buy_point_quality": _buy_point_quality(row, buy_reasons),
         "breakout_momentum": _new_high_breakout_score(row, buy_reasons),
+        "relative_resilience": _refusal_pullback_score(row, buy_reasons),
         "ma_alignment": _ma_alignment_score(row, buy_reasons, include_row_level=False),
         "fib_ma_support": _fib_ma_support_score(row, buy_reasons, include_row_level=False),
         "hot_sector": hot_sector,
@@ -4294,6 +4334,16 @@ def _slim_evidence_for_pool(value: Any) -> dict[str, Any]:
             "breakout_pct",
             "five_day_gain_pct",
             "volume_ratio",
+            "max_drawdown_pct",
+            "max_close_drawdown_pct",
+            "three_day_change_pct",
+            "twenty_day_gain_pct",
+            "high_proximity_pct",
+            "close_position_avg",
+            "strong_close_days",
+            "recent_volume_ratio",
+            "score",
+            "confidence",
             "date",
             "date_str",
         )

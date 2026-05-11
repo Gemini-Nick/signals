@@ -1233,6 +1233,119 @@ def _compute_range_returns(df: pd.DataFrame, columns: list[dict[str, Any]]) -> d
     return result
 
 
+def _normalize_board_heat_kind(kind: str) -> str:
+    if kind in {"concept", "theme"}:
+        return "concept"
+    if kind == "industry":
+        return "industry"
+    return ""
+
+
+def _board_heat_range_result_from_docs(
+    heat_name: str,
+    resolution: dict[str, Any],
+    docs: list[dict[str, Any]],
+    range_columns: list[dict[str, Any]],
+) -> tuple[dict[str, Optional[float]], str, dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for doc in docs:
+        timestamp = pd.to_datetime(doc.get("trade_minute") or doc.get("dt") or doc.get("trade_date"), errors="coerce")
+        close = _first_numeric(doc.get("price"), doc.get("close"))
+        if pd.isna(timestamp) or close is None:
+            continue
+        records.append({"dt": timestamp, "close": close})
+    if not records:
+        return {}, "", {"status": "missing_price_history", "heat_name": heat_name, "resolution_status": resolution.get("status", "")}
+    df = pd.DataFrame(records).sort_values("dt").drop_duplicates(subset=["dt"], keep="last").set_index("dt")
+    returns = _compute_range_returns(df, range_columns)
+    first_date = _date_text(df.index.min())
+    latest_date = _date_text(df.index.max())
+    partial_keys: list[str] = []
+    if first_date:
+        first_ts = pd.Timestamp(first_date)
+        for column in range_columns:
+            key = _text(column.get("key"))
+            start_date = _text(column.get("start_date"))
+            if not key or not start_date:
+                continue
+            try:
+                if pd.Timestamp(start_date) < first_ts:
+                    partial_keys.append(key)
+            except Exception:
+                continue
+    status = "partial_history" if partial_keys else "ok"
+    return returns, "board_heat_ticks_price", {
+        "status": status,
+        "heat_name": heat_name,
+        "resolution_status": resolution.get("status", ""),
+        "first_date": first_date,
+        "latest_date": latest_date,
+        "partial_keys": partial_keys,
+    }
+
+
+def _board_heat_range_returns(
+    kind: str,
+    name: str,
+    range_columns: list[dict[str, Any]],
+) -> tuple[dict[str, Optional[float]], str, dict[str, Any]]:
+    normalized_kind = _normalize_board_heat_kind(kind)
+    heat_name = _text(name)
+    if not normalized_kind or not heat_name:
+        return {}, "", {"status": "missing_target"}
+    resolution = resolve_board_heat_name(normalized_kind, heat_name)
+    heat_name = _text(resolution.get("heat_name")) or heat_name
+    try:
+        docs = list(_mongo_db()["board_heat_ticks"].find(
+            {"kind": normalized_kind, "name": heat_name},
+            {"_id": 0, "trade_minute": 1, "trade_date": 1, "dt": 1, "price": 1, "close": 1},
+        ).sort("trade_minute", 1))
+    except Exception:
+        return {}, "", {"status": "query_failed", "heat_name": heat_name}
+    return _board_heat_range_result_from_docs(heat_name, resolution, docs, range_columns)
+
+
+def _board_heat_range_returns_batch(
+    targets: list[tuple[str, str]],
+    range_columns: list[dict[str, Any]],
+) -> dict[tuple[str, str], tuple[dict[str, Optional[float]], str, dict[str, Any]]]:
+    normalized: list[tuple[str, str]] = []
+    for kind, name in targets:
+        normalized_kind = _normalize_board_heat_kind(_text(kind))
+        heat_name = _text(name)
+        if normalized_kind and heat_name and (normalized_kind, heat_name) not in normalized:
+            normalized.append((normalized_kind, heat_name))
+    output: dict[tuple[str, str], tuple[dict[str, Optional[float]], str, dict[str, Any]]] = {}
+    if not normalized:
+        return output
+    query_parts: list[dict[str, Any]] = []
+    for kind in sorted({kind for kind, _ in normalized}):
+        names = sorted({name for item_kind, name in normalized if item_kind == kind})
+        query_parts.append({"kind": kind, "name": {"$in": names}})
+    try:
+        docs = list(_mongo_db()["board_heat_ticks"].find(
+            {"$or": query_parts},
+            {"_id": 0, "kind": 1, "name": 1, "trade_minute": 1, "trade_date": 1, "dt": 1, "price": 1, "close": 1},
+        ).sort([("kind", 1), ("name", 1), ("trade_minute", 1)]))
+    except Exception:
+        for key in normalized:
+            output[key] = ({}, "", {"status": "query_failed", "heat_name": key[1]})
+        return output
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for doc in docs:
+        key = (_text(doc.get("kind")), _text(doc.get("name")))
+        if key in normalized:
+            grouped.setdefault(key, []).append(doc)
+    for key in normalized:
+        output[key] = _board_heat_range_result_from_docs(
+            key[1],
+            {"query": key[1], "heat_name": key[1], "status": "exact"},
+            grouped.get(key, []),
+            range_columns,
+        )
+    return output
+
+
 def _range_return_column_keys(columns: list[dict[str, Any]]) -> list[str]:
     keys: list[str] = []
     for column in columns:
@@ -2090,7 +2203,13 @@ def _apply_quote_overlay(row: dict[str, Any], symbol: str, overlay: Optional[dic
     return updated
 
 
-def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]], *, lightweight: bool = False) -> dict[str, Any]:
+def _enrich_stock_row(
+    row: dict[str, Any],
+    range_columns: list[dict[str, Any]],
+    *,
+    lightweight: bool = False,
+    require_range_returns: bool = True,
+) -> dict[str, Any]:
     symbol = str(row.get("symbol") or row.get("code") or row.get("label") or "").strip()
     normalized, raw_code = _normalize_stock_symbol(symbol)
     normalized = normalized or symbol
@@ -2112,10 +2231,20 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]], 
             metadata.get("price"),
             metadata.get("close"),
         )
-        range_returns, range_return_source = _compute_stock_range_returns_required(
-            normalized,
-            range_columns,
-        )
+        range_returns: dict[str, Any]
+        range_return_source: str
+        range_return_status = _text(row.get("range_return_status"))
+        if require_range_returns:
+            range_returns, range_return_source = _compute_stock_range_returns_required(
+                normalized,
+                range_columns,
+            )
+            range_return_status = range_return_status or ("ok" if range_returns else "")
+        else:
+            range_returns = dict(row.get("range_returns") or {}) if isinstance(row.get("range_returns"), dict) else {}
+            range_return_source = _text(row.get("range_return_source"))
+            if not range_returns and _range_return_column_keys(range_columns):
+                range_return_status = range_return_status or "lazy"
         enriched = dict(row)
         enriched.update({
             "kind": "stock",
@@ -2136,6 +2265,7 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]], 
             "latest_signal": latest_signal or "待观察",
             "range_returns": range_returns,
             "range_return_source": range_return_source,
+            "range_return_status": range_return_status,
             "available_freqs": UI_FREQS,
             "target_kind": "stock",
             "target_label": normalized,
@@ -2200,6 +2330,25 @@ def _enrich_stock_row(row: dict[str, Any], range_columns: list[dict[str, Any]], 
         "target_freq": DEFAULT_TERMINAL_FREQ,
     })
     return _apply_quote_overlay(enriched, normalized)
+
+
+def _enrich_shell_stock_row(
+    row: dict[str, Any],
+    range_columns: list[dict[str, Any]],
+    *,
+    require_range_returns: bool,
+) -> dict[str, Any]:
+    try:
+        return _enrich_stock_row(
+            row,
+            range_columns,
+            lightweight=True,
+            require_range_returns=require_range_returns,
+        )
+    except TypeError as exc:
+        if "require_range_returns" not in str(exc):
+            raise
+        return _enrich_stock_row(row, range_columns, lightweight=True)
 
 
 def _slim_shell_signal_reason(value: Any) -> dict[str, Any]:
@@ -2289,6 +2438,104 @@ def _slim_shell_signal_reason(value: Any) -> dict[str, Any]:
             if ma_alignment.get(key) not in (None, "", [], {})
         }
     return out
+
+
+def _slim_shell_chain_position(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    keep = (
+        "chain",
+        "node",
+        "role",
+        "board_or_concept",
+        "chain_name",
+        "node_name",
+        "phase",
+        "source",
+        "mapping_status",
+        "chain_id",
+        "node_id",
+        "exposure_score",
+        "rank",
+    )
+    return {key: value.get(key) for key in keep if value.get(key) not in (None, "", [], {})}
+
+
+def _slim_shell_chain_context(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    keep = (
+        "board_or_concept",
+        "chain_name",
+        "node_name",
+        "phase",
+        "source",
+        "mapping_status",
+        "chain_id",
+        "node_id",
+        "confidence",
+        "summary",
+    )
+    out = {key: value.get(key) for key in keep if value.get(key) not in (None, "", [], {})}
+    evidence = _slim_shell_chain_position(value.get("evidence"))
+    if evidence:
+        out["evidence"] = evidence
+    return out
+
+
+def _slim_shell_domain(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    keep = (
+        "kind",
+        "kind_label",
+        "name",
+        "code",
+        "symbol",
+        "change_pct",
+        "day_change_pct",
+        "rank",
+        "source",
+        "status",
+        "label",
+    )
+    return {key: value.get(key) for key in keep if value.get(key) not in (None, "", [], {})}
+
+
+def _slim_shell_domain_list(values: Any, limit: int = 3) -> list[dict[str, Any]]:
+    if not isinstance(values, list):
+        return []
+    return [row for row in (_slim_shell_domain(item) for item in values[:limit]) if row]
+
+
+def _slim_shell_overlay_list(values: Any, limit: int = 2) -> list[dict[str, Any]]:
+    if not isinstance(values, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in values[:limit]:
+        if not isinstance(item, dict):
+            continue
+        row = _slim_shell_domain(item)
+        matched = item.get("matched_names")
+        if isinstance(matched, list):
+            row["matched_names"] = [_text(value) for value in matched[:2] if _text(value)]
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _slim_shell_event_overlay_list(values: Any, child_key: str, limit: int = 4) -> list[dict[str, Any]]:
+    if not isinstance(values, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in values[:limit]:
+        if not isinstance(item, dict):
+            continue
+        source = _slim_shell_domain(item.get("source"))
+        children = _slim_shell_overlay_list(item.get(child_key), 3)
+        if source or children:
+            rows.append({"source": source, child_key: children})
+    return rows
 
 
 def _shell_signal_label_from_reason(reason: Any) -> str:
@@ -2547,6 +2794,7 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "direction",
         "range_returns",
         "range_return_source",
+        "range_return_status",
         "available_freqs",
         "target_kind",
         "target_label",
@@ -2564,9 +2812,7 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "trace_summary",
         "signal_origin",
         "signal_family",
-        "knowledge_confirmation",
         "resonance_context",
-        "chain_context",
         "exit_condition",
         "invalidates_when",
         "action_status",
@@ -2580,7 +2826,6 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "sort_score",
         "score",
         "rank_reason",
-        "score_components",
         "coverage_status",
         "decision_effect",
         "blocked_by",
@@ -2588,7 +2833,6 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "recommended_action",
         "missing_gates",
         "promotion_path",
-        "strategy_semantics",
         "trade_stage",
         "stage_label",
         "current_position",
@@ -2616,11 +2860,9 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "watch_backfill_source",
         "clue_quality_score",
         "promotion_gates",
-        "timeframe_reads",
         "entry_reason",
         "missing_condition",
         "invalidation",
-        "chain_position",
         "intervention_side",
         "intervention_label",
         "opportunity_side",
@@ -2650,8 +2892,6 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "sector_policy_matched_token",
         "sector_policy_source",
         "broad_market_label",
-        "broad_market_context",
-        "ma_alignment",
         "event_latest_dt",
         "signal_age_trading_days",
         "stale_context",
@@ -2671,6 +2911,12 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "can_trade_now",
     )
     out = {key: row.get(key) for key in keys if row.get(key) not in (None, "", [], {})}
+    chain_context = _slim_shell_chain_context(row.get("chain_context"))
+    if chain_context:
+        out["chain_context"] = chain_context
+    chain_position = _slim_shell_chain_position(row.get("chain_position"))
+    if chain_position:
+        out["chain_position"] = chain_position
     reasons = [
         _slim_shell_signal_reason(reason)
         for reason in row.get("inclusion_reasons") or []
@@ -2739,6 +2985,9 @@ def _slim_shell_sector_row(row: dict[str, Any]) -> dict[str, Any]:
         "day_change_as_of",
         "range_returns",
         "range_return_source",
+        "range_return_status",
+        "range_return_meta",
+        "intraday_momentum_returns",
         "target_kind",
         "target_label",
         "target_symbol",
@@ -2765,13 +3014,7 @@ def _slim_shell_sector_row(row: dict[str, Any]) -> dict[str, Any]:
         "node_name",
         "layer",
         "stage",
-        "integrated_domains",
         "source_driver",
-        "source_events",
-        "source_concept_overlays",
-        "source_event_concept_overlays",
-        "source_theme_overlays",
-        "source_event_theme_overlays",
         "source_kind_mix",
         "route_explain",
         "change_display_kind",
@@ -2797,6 +3040,27 @@ def _slim_shell_sector_row(row: dict[str, Any]) -> dict[str, Any]:
         "data_truth",
     )
     out = {key: row.get(key) for key in keep if row.get(key) not in (None, "", [], {})}
+    for key in ("source_driver", "primary_domain", "reference_domain", "carrier", "representative_confirmation", "chain_confirmation"):
+        slim = _slim_shell_domain(row.get(key))
+        if slim:
+            out[key] = slim
+        else:
+            out.pop(key, None)
+    integrated = _slim_shell_domain_list(row.get("integrated_domains"), 3)
+    if integrated:
+        out["integrated_domains"] = integrated
+    concept_overlays = _slim_shell_overlay_list(row.get("source_concept_overlays"), 2)
+    if concept_overlays:
+        out["source_concept_overlays"] = concept_overlays
+    theme_overlays = _slim_shell_overlay_list(row.get("source_theme_overlays"), 1)
+    if theme_overlays:
+        out["source_theme_overlays"] = theme_overlays
+    event_concepts = _slim_shell_event_overlay_list(row.get("source_event_concept_overlays"), "concepts", 4)
+    if event_concepts:
+        out["source_event_concept_overlays"] = event_concepts
+    event_themes = _slim_shell_event_overlay_list(row.get("source_event_theme_overlays"), "themes", 4)
+    if event_themes:
+        out["source_event_theme_overlays"] = event_themes
     groups = row.get("candidate_groups")
     if isinstance(groups, dict):
         out["candidate_groups"] = {
@@ -5939,6 +6203,7 @@ def _theme_focus_stocks_preview(db: Any, theme_name: str, *, limit: int = 6) -> 
 
 def _non_chain_theme_sector_rows(db: Any, *, limit: int = 4) -> list[dict[str, Any]]:
     expected_day = _day_change_expected_day()
+    range_columns = _watchlist_range_columns()
     query: dict[str, Any] = {"kind": "concept"}
     if expected_day:
         day_start = datetime.fromisoformat(expected_day)
@@ -5974,6 +6239,17 @@ def _non_chain_theme_sector_rows(db: Any, *, limit: int = 4) -> list[dict[str, A
         ).sort([("change_pct", -1), ("leader_change_pct", -1)]).limit(800))
     except Exception:
         return []
+    range_targets: list[tuple[str, str]] = []
+    for doc in docs:
+        name = _text(doc.get("name") or doc.get("board_name"))
+        reason = non_chain_reason(name)
+        change_pct = _float(doc.get("change_pct"))
+        standalone_bonus = _standalone_theme_rank_bonus(name, reason)
+        if name and reason and standalone_bonus > 0 and change_pct is not None and change_pct >= 1.5:
+            range_targets.append(("concept", name))
+            if len(range_targets) >= limit:
+                break
+    range_lookup = _board_heat_range_returns_batch(range_targets, range_columns)
     rows: list[dict[str, Any]] = []
     for doc in docs:
         name = _text(doc.get("name") or doc.get("board_name"))
@@ -6002,6 +6278,7 @@ def _non_chain_theme_sector_rows(db: Any, *, limit: int = 4) -> list[dict[str, A
         focus_preview = _theme_focus_stocks_preview(db, name, limit=6)
         matched_names = [_text(item.get("name")) for item in focus_preview if _text(item.get("name"))]
         matched_symbols = [_text(item.get("symbol") or item.get("code") or item.get("raw_code")) for item in focus_preview]
+        range_returns, range_source, range_meta = range_lookup.get(("concept", name), ({}, "", {"status": "missing_target"}))
         overlay = {
             **source_driver,
             "matched_names": matched_names[:6],
@@ -6030,8 +6307,10 @@ def _non_chain_theme_sector_rows(db: Any, *, limit: int = 4) -> list[dict[str, A
             "day_change_source": "board_heat_ticks",
             "day_change_mode": _a_day_change_mode(),
             "day_change_as_of": doc_trade_day,
-            "range_returns": {},
-            "range_return_source": "board_heat_ticks",
+            "range_returns": range_returns,
+            "range_return_source": range_source or "board_heat_ticks",
+            "range_return_status": range_meta.get("status") or ("board_heat_price" if range_returns else "board_heat_kline_missing"),
+            "range_return_meta": range_meta,
             "lane": "board_lane",
             "second_screen_role": "event_theme_heat",
             "source": "board_heat_ticks",
@@ -6144,6 +6423,15 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
     except Exception:
         return []
     rows: list[dict[str, Any]] = []
+    range_columns = _watchlist_range_columns()
+    range_targets: list[tuple[str, str]] = []
+    for doc in docs:
+        integrated = doc.get("integrated_domains") if isinstance(doc.get("integrated_domains"), list) else []
+        primary = integrated[0] if integrated and isinstance(integrated[0], dict) else {}
+        target_kind = _text(primary.get("kind")) or "industry"
+        target_label = _text(primary.get("name")) or _text(doc.get("node_name") or doc.get("chain_name"))
+        range_targets.append((target_kind, target_label))
+    range_lookup = _board_heat_range_returns_batch(range_targets, range_columns)
     for doc in docs:
         integrated = doc.get("integrated_domains") if isinstance(doc.get("integrated_domains"), list) else []
         primary = integrated[0] if integrated and isinstance(integrated[0], dict) else {}
@@ -6152,16 +6440,12 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         label = " · ".join([item for item in [_text(doc.get("chain_name")), _text(doc.get("node_name"))] if item])
         candidate_groups = _candidate_groups_from_representatives(doc, lightweight=True)
         display_context = _chain_heat_display_context(doc, candidate_groups)
-        try:
-            concept_overlays = _source_concept_overlays(db, display_context.get("source_events") or [], limit=8)
-            source_event_overlays = _source_event_concept_overlays(db, display_context.get("source_events") or [], concepts_per_source=3)
-            theme_overlays = _source_theme_overlays(db, display_context.get("source_events") or [], limit=4)
-            source_event_theme_overlays = _source_event_theme_overlays(db, display_context.get("source_events") or [], themes_per_source=2)
-        except Exception:
-            concept_overlays = []
-            source_event_overlays = []
-            theme_overlays = []
-            source_event_theme_overlays = []
+        # Detail-only source overlays are expensive per-board Mongo lookups; keep
+        # the shell rebuild on the critical path and let richer views load them separately.
+        concept_overlays: list[dict[str, Any]] = []
+        source_event_overlays: list[dict[str, Any]] = []
+        theme_overlays: list[dict[str, Any]] = []
+        source_event_theme_overlays: list[dict[str, Any]] = []
         display_context["source_concept_overlays"] = concept_overlays
         display_context["source_event_concept_overlays"] = source_event_overlays
         display_context["source_theme_overlays"] = theme_overlays
@@ -6191,6 +6475,8 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         carrier = (candidate_groups.get("leaders") or candidate_groups.get("elastic") or [{}])[0]
         day_change_as_of = doc_trade_day
         day_change_pct = _float(doc.get("change_pct")) if day_change_as_of == _day_change_expected_day() else None
+        range_key = (_normalize_board_heat_kind(target_kind), target_label)
+        range_returns, range_source, range_meta = range_lookup.get(range_key, ({}, "", {"status": "missing_target"}))
         row = {
             **doc,
             **display_context,
@@ -6206,12 +6492,15 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             "day_change_source": "chain_heat_snapshots" if day_change_pct is not None else "",
             "day_change_mode": _a_day_change_mode(),
             "day_change_as_of": day_change_as_of,
-            "range_returns": {
+            "range_returns": range_returns,
+            "intraday_momentum_returns": {
                 "momentum_5m": doc.get("momentum_5m"),
                 "momentum_15m": doc.get("momentum_15m"),
                 "momentum_30m": doc.get("momentum_30m"),
             },
-            "range_return_source": "chain_heat_snapshots",
+            "range_return_source": range_source or "chain_heat_snapshots",
+            "range_return_status": range_meta.get("status") or ("board_heat_price" if range_returns else "board_heat_kline_missing"),
+            "range_return_meta": range_meta,
             "lane": "board_lane",
             "second_screen_role": "chain_heat_map",
             "action_status": doc.get("phase"),
@@ -6338,6 +6627,22 @@ def _refresh_realtime_quotes_for_rows(
         return {"status": "failed", "count": len(symbols), "error": f"{exc.__class__.__name__}: {exc}"}
 
 
+def _shell_stock_range_return_limit(group: str) -> int:
+    defaults = {
+        "focus_stocks": 24,
+        "risk_stocks": 8,
+        "watch_stocks": 16,
+        "clue_stocks": 12,
+        "manual_clues": 3,
+        "scored_stocks": 12,
+    }
+    env_name = f"TERMINAL_WORKBENCH_{group.upper()}_RANGE_RETURN_LIMIT"
+    try:
+        return max(0, int(os.getenv(env_name, str(defaults.get(group, 12)))))
+    except (TypeError, ValueError):
+        return defaults.get(group, 12)
+
+
 def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: str = "focus_stocks", limit: Optional[int] = None) -> list[dict[str, Any]]:
     try:
         db = _mongo_db()
@@ -6383,6 +6688,7 @@ def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: 
     source_rows = [item for item in source_rows or [] if isinstance(item, dict)]
     if group in {"focus_stocks", "risk_stocks", "watch_stocks", "clue_stocks"}:
         _refresh_realtime_quotes_for_rows(db, source_rows, refresh_key=group, limit=limit)
+    range_return_limit = _shell_stock_range_return_limit(group)
     for item in source_rows:
         reasons = [reason for reason in item.get("inclusion_reasons") or [] if isinstance(reason, dict)]
         has_technical = any(
@@ -6393,7 +6699,11 @@ def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: 
         fallback_only = bool(reasons) and all(reason.get("reason_type") == "fallback_watch" for reason in reasons)
         if group == "focus_stocks" and (fallback_only or (item.get("signal_origin") == "fallback_watch" and not has_technical)):
             continue
-        row = _enrich_stock_row(dict(item), range_columns, lightweight=True)
+        row = _enrich_shell_stock_row(
+            dict(item),
+            range_columns,
+            require_range_returns=len(rows) < range_return_limit,
+        )
         row["lane"] = "signal_lane"
         row["second_screen_role"] = "actionable_focus_stock" if group == "focus_stocks" else group
         row["focus_reasons"] = [
@@ -6440,19 +6750,24 @@ def _manual_clue_rows(range_columns: list[dict[str, Any]], limit: Optional[int] 
     except Exception:
         return []
     rows: list[dict[str, Any]] = []
+    range_return_limit = _shell_stock_range_return_limit("manual_clues")
     for doc in docs:
         symbol = _text(doc.get("symbol"))
         normalized, raw_code = _normalize_stock_symbol(symbol)
         if not normalized:
             continue
-        row = _enrich_stock_row({
-            "symbol": normalized,
-            "raw_code": raw_code,
-            "name": doc.get("name") or _stock_name(normalized),
-            "reason": "用户临时探索，不影响自动入池",
-            "latest_signal": "手动线索",
-            "source": "terminal_manual_clues",
-        }, range_columns, lightweight=True)
+        row = _enrich_shell_stock_row(
+            {
+                "symbol": normalized,
+                "raw_code": raw_code,
+                "name": doc.get("name") or _stock_name(normalized),
+                "reason": "用户临时探索，不影响自动入池",
+                "latest_signal": "手动线索",
+                "source": "terminal_manual_clues",
+            },
+            range_columns,
+            require_range_returns=len(rows) < range_return_limit,
+        )
         row.update({
             "source_collection": "terminal_manual_clues",
             "source_tags": ["用户探索", "临时线索"],
@@ -6562,9 +6877,14 @@ def _enrich_scored_stock_rows(rows: list[dict[str, Any]], range_columns: list[di
         _refresh_realtime_quotes_for_rows(_mongo_db(), rows, refresh_key="scored_stocks", limit=len(rows) or 1)
     except Exception:
         pass
+    range_return_limit = _shell_stock_range_return_limit("scored_stocks")
     return [
-        _enrich_stock_row(dict(item), range_columns, lightweight=True) if item.get("symbol") else dict(item)
-        for item in rows
+        _enrich_shell_stock_row(
+            dict(item),
+            range_columns,
+            require_range_returns=index < range_return_limit,
+        ) if item.get("symbol") else dict(item)
+        for index, item in enumerate(rows)
     ]
 
 
@@ -7198,14 +7518,10 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         for item in strategy_snapshot.get("decision_queue", [])
         if isinstance(item, dict)
     ]
-    cluster: dict[str, Any] = {}
-    try:
-        cluster = _unwrap_response(cluster_service.get_latest(top=8))
-    except Exception:
-        cluster = {}
     snapshot_cluster = _cluster_from_strategy_snapshot(strategy_snapshot)
-    industry_top = (cluster.get("industry") or {}).get("top") or snapshot_cluster.get("industry_top") or _gateway_rank_rows("board", top=8)
-    concept_top = (cluster.get("concept") or {}).get("top") or snapshot_cluster.get("concept_top") or _gateway_rank_rows("concept", top=8)
+    cluster: dict[str, Any] = {"market_status": {}, "data_warning": ""}
+    industry_top = snapshot_cluster.get("industry_top") or _gateway_rank_rows("board", top=8)
+    concept_top = snapshot_cluster.get("concept_top") or _gateway_rank_rows("concept", top=8)
     sector_boards = _chain_heat_sector_rows()
     focus_stocks = _terminal_stock_pool_rows(range_columns)
     risk_stocks = _terminal_stock_pool_group_rows(range_columns, "risk_stocks")
@@ -7273,16 +7589,6 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         label = item.get("label")
         if label and label not in watchlist_directions:
             watchlist_directions.append(label)
-    watchlist = _build_watchlist_rows(
-        reports=reports,
-        buy_rows=scored_shell,
-        sell_rows=sell_warnings_shell,
-        decision_rows=decision_queue,
-        industry_top=industry_top,
-        concept_top=concept_top,
-        range_columns=range_columns,
-    )
-
     notices = []
     if not session["ready"]:
         notices.append("分析引擎正在启动，首屏数据会逐步填充。")
@@ -7346,7 +7652,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
                 **{key: value for key, value in focus_stocks_meta.items() if key in {"pool_counts", "candidate_counts_by_source", "candidate_counts_by_side", "candidate_counts_by_freq", "coverage_by_freq", "coverage_status", "selection_policy", "ranking_version"}},
             },
         },
-        "watchlist": watchlist,
+        "watchlist": [],
         "watchlist_range_columns": range_columns,
         "kline_cache_coverage": _kline_cache_coverage_shell_summary(),
         "sync_lanes": sync_lanes,

@@ -16,6 +16,7 @@ from signals.sync.modules.technical_signal_scan import (
     _entry_factor_score,
     _load_bars,
     _ma_alignment_from_daily_bars,
+    _refusal_pullback_factor,
     _resampled_5m_docs,
     _resonance_context,
     _symbols_for_scope,
@@ -121,6 +122,50 @@ def test_entry_factor_docs_publish_200d_new_high_as_terminal_signal():
     assert doc["freq"] == "日线"
     assert doc["technical_evidence"]["entry_factor"]["group"] == "200d_new_high_breakout"
     assert _entry_factor_score(doc["technical_evidence"]["entry_factor"]) == doc["total_score"]
+
+
+def test_refusal_pullback_factor_detects_tight_high_level_consolidation():
+    dates = pd.date_range("2026-03-01", periods=35, freq="B")
+    bars = []
+    for idx, dt in enumerate(dates[:-3]):
+        close = 10 + idx * 0.1
+        bars.append(_OhlcvBar(
+            dt=dt.to_pydatetime(),
+            open=close - 0.05,
+            high=close + 0.1,
+            low=close - 0.15,
+            close=close,
+            vol=1000,
+        ))
+    for dt, close, low in zip(dates[-3:], [13.35, 13.42, 13.5], [13.18, 13.25, 13.36]):
+        bars.append(_OhlcvBar(
+            dt=dt.to_pydatetime(),
+            open=close - 0.08,
+            high=close + 0.03,
+            low=low,
+            close=close,
+            vol=900,
+        ))
+    ma_alignment = _ma_alignment_from_daily_bars(bars)
+
+    factor = _refusal_pullback_factor(bars, ma_alignment)
+    docs = _entry_factor_docs(
+        "300001",
+        bars,
+        ma_alignment=ma_alignment,
+        now=datetime(2026, 5, 11, 16, 0),
+        scan_scope=POSTMARKET_SCAN_SCOPE,
+    )
+
+    assert factor["group"] == "relative_resilience_refusal_pullback"
+    assert factor["type"] == "拒绝回调相对强度"
+    assert factor["max_drawdown_pct"] < 2
+    assert factor["strong_close_days"] == 3
+    doc = next(item for item in docs if item["signal_type"] == "拒绝回调相对强度")
+    assert doc["signal_family"] == "entry_factor"
+    assert doc["signal_side"] == "buy"
+    assert doc["technical_evidence"]["entry_factor"]["group"] == "relative_resilience_refusal_pullback"
+    assert "拒绝回调" in doc["resonance_context"]["tags"]
 
 
 def test_resonance_context_marks_single_period_signal():

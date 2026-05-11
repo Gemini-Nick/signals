@@ -26,7 +26,12 @@ from ..proxy import em_proxy
 from ..provider_limits import ProviderCoolingDown, provider_call, providers_all_cooling_down
 from ..retry import sync_retry
 from ..task_context import get_task_env
-from ..volume_units import CANONICAL_STOCK_VOLUME_UNIT, normalize_stock_volume
+from ..volume_units import (
+    CANONICAL_STOCK_VOLUME_UNIT,
+    normalize_stock_volume,
+    normalize_volume_unit,
+    tencent_daily_volume_unit,
+)
 from .daily_sources import fetch_tencent_daily
 
 logger = logging.getLogger("signals.sync.stock_daily")
@@ -858,7 +863,8 @@ def _docs_from_daily_df(
     for _, row in df.iterrows():
         dt = row[column_map["dt"]]
         source_vol = row[column_map["vol"]] if pd.notna(row[column_map["vol"]]) else 0
-        vol, source_volume_unit = normalize_stock_volume(source_vol, source=source)
+        source_unit = tencent_daily_volume_unit(code) if source == "tencent" else ""
+        vol, source_volume_unit = normalize_stock_volume(source_vol, source=source, source_unit=source_unit)
         doc = {
             "dt": pd.to_datetime(dt),
             "meta": {
@@ -1081,6 +1087,7 @@ def _snapshot_daily_doc(
         source_unit=row.get("_volume_unit"),
         default_source_unit="hands",
     )
+    raw_source_volume_unit = normalize_volume_unit(row.get("_source_volume_unit")) or source_volume_unit
     amount = _safe_number(row.get("成交额"), 0.0)
     if not all(value is not None and value > 0 for value in (open_price, high, low, close)):
         return None
@@ -1106,7 +1113,7 @@ def _snapshot_daily_doc(
             "batch_semantics": "today_spot_ohlcv",
             "prev_close": snapshot_prev_close,
             "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
-            "source_volume_unit": source_volume_unit,
+            "source_volume_unit": raw_source_volume_unit,
             "source_vol": source_vol,
         },
         "open": float(open_price),

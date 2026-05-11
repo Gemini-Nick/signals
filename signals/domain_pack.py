@@ -225,6 +225,7 @@ class SignalsPack:
         *,
         recent_limit: int = 20,
         backlog_limit: int = 10,
+        include_ai_factor_factory: bool = False,
     ) -> Dict[str, Any]:
         strategy_snapshot = self._strategy_snapshot()
         self._record_strategy_snapshot_run(strategy_snapshot)
@@ -239,7 +240,6 @@ class SignalsPack:
         status = self._dashboard_status(connector_health)
         overview = self._overview(backtest_summary, strategy_snapshot)
         cache_status = self._cache_status()
-        ai_factor_factory = self._ai_factor_factory()
         return {
             "pack_id": "signals",
             "title": "Signals",
@@ -263,7 +263,7 @@ class SignalsPack:
             "strategy_kpis": strategy_snapshot.get("strategy_kpis", {}),
             "source_confidence": strategy_snapshot.get("source_confidence", {}),
             "cache_status": cache_status,
-            "ai_factor_factory": ai_factor_factory,
+            "ai_factor_factory": self._ai_factor_factory() if include_ai_factor_factory else self._ai_factor_factory_stub(strategy_snapshot),
         }
 
     def _operator_actions(self) -> List[Dict[str, Any]]:
@@ -493,11 +493,20 @@ class SignalsPack:
         rows: List[Dict[str, Any]] = []
         status_counts: Dict[str, int] = {}
         completed = 0
+        critical_task_count = 0
+        critical_completed = 0
+        optional_task_count = 0
+        optional_completed = 0
         progress_values: List[float] = []
+        critical_progress_values: List[float] = []
+        optional_progress_values: List[float] = []
+        critical_status_counts: Dict[str, int] = {}
+        optional_status_counts: Dict[str, int] = {}
         sample_errors: List[Any] = []
         for task in tasks:
             module = str(task.get("module") or "")
             status = str(task.get("status") or "pending")
+            blocks_run = bool(task.get("blocks_run", True))
             status_counts[status] = status_counts.get(status, 0) + 1
             if status == "ok":
                 completed += 1
@@ -530,6 +539,23 @@ class SignalsPack:
             eta_seconds = self._task_eta_seconds(task, progress_pct)
             if progress_pct is not None:
                 progress_values.append(progress_pct)
+                if blocks_run:
+                    critical_progress_values.append(progress_pct)
+                else:
+                    optional_progress_values.append(progress_pct)
+            task_done = status == "ok" or (
+                status in {"partial", "degraded"} and progress_pct is not None and progress_pct >= 99.9
+            )
+            if blocks_run:
+                critical_task_count += 1
+                critical_status_counts[status] = critical_status_counts.get(status, 0) + 1
+                if task_done:
+                    critical_completed += 1
+            else:
+                optional_task_count += 1
+                optional_status_counts[status] = optional_status_counts.get(status, 0) + 1
+                if task_done:
+                    optional_completed += 1
             errors = summary.get("sample_errors")
             if isinstance(errors, list):
                 sample_errors.extend(errors[:3])
@@ -539,6 +565,7 @@ class SignalsPack:
                 "phase": task.get("phase") or "",
                 "shard_key": task.get("shard_key") or "all",
                 "status": status,
+                "blocks_run": blocks_run,
                 "attempts": int(task.get("attempts") or 0),
                 "depends_on": task.get("depends_on") or [],
                 "cursor": _json_safe(cursor),
@@ -564,6 +591,21 @@ class SignalsPack:
                 round(completed / task_count * 100, 2) if task_count else 0
             )
             eta_seconds = self._postmarket_eta_seconds(rows, progress_pct, run.get("started_at"))
+        if critical_task_count and critical_completed == critical_task_count:
+            critical_progress_pct = 100.0
+            critical_status = "ok"
+        else:
+            critical_progress_pct = (
+                round(sum(critical_progress_values) / critical_task_count, 2)
+                if critical_task_count and critical_progress_values
+                else (round(critical_completed / critical_task_count * 100, 2) if critical_task_count else 100.0)
+            )
+            critical_status = run_status or "pending"
+        optional_progress_pct = (
+            round(sum(optional_progress_values) / optional_task_count, 2)
+            if optional_task_count and optional_progress_values
+            else (round(optional_completed / optional_task_count * 100, 2) if optional_task_count else 100.0)
+        )
         return {
             "run": {
                 "run_id": run_id,
@@ -582,6 +624,15 @@ class SignalsPack:
                 "completed": completed,
                 "status_counts": status_counts,
                 "progress_pct": progress_pct,
+                "critical_task_count": critical_task_count,
+                "critical_completed": critical_completed,
+                "critical_status": critical_status,
+                "critical_progress_pct": critical_progress_pct,
+                "critical_status_counts": critical_status_counts,
+                "optional_task_count": optional_task_count,
+                "optional_completed": optional_completed,
+                "optional_progress_pct": optional_progress_pct,
+                "optional_status_counts": optional_status_counts,
                 "eta_seconds": eta_seconds,
                 "sample_errors": _json_safe(sample_errors[:10]),
                 "stock_daily_landing_rate": stock_daily_progress.get("landing_rate", 0),
@@ -1292,6 +1343,22 @@ class SignalsPack:
 
     def _strategy_snapshot(self) -> Dict[str, Any]:
         try:
+            from signals.data.mongo_fallback import get_db
+
+            db = get_db()
+            if db is not None:
+                doc = db["strategy_snapshots"].find_one(
+                    {"snapshot": {"$exists": True}},
+                    {"_id": 0, "snapshot": 1},
+                    sort=[("updated_at", -1), ("as_of", -1)],
+                )
+                if doc and isinstance(doc.get("snapshot"), Mapping):
+                    snapshot = dict(doc["snapshot"])
+                    snapshot.setdefault("read_model_source", "mongodb.strategy_snapshots")
+                    return snapshot
+        except Exception:
+            pass
+        try:
             from signals.strategy.snapshot import get_strategy_snapshot
 
             snapshot = get_strategy_snapshot()
@@ -1324,6 +1391,25 @@ class SignalsPack:
                 "active_factor_id": "",
                 "error": f"ai_factor_factory_error:{exc.__class__.__name__}",
             }
+
+    def _ai_factor_factory_stub(self, strategy_snapshot: Mapping[str, Any]) -> Dict[str, Any]:
+        return {
+            "factory_id": "ai_factor_factory",
+            "as_of": str(strategy_snapshot.get("as_of") or ""),
+            "generated_at": str(strategy_snapshot.get("generated_at") or ""),
+            "title": "AI因子工厂",
+            "summary": {"load_mode": "lazy"},
+            "active_factor_id": "",
+            "phases": [],
+            "research_modes": {},
+            "factor_registry": {},
+            "candidate_factor_ideas": [],
+            "factor_idea_queue": [],
+            "ideas": [],
+            "factors": [],
+            "data_lineage": {"source": "/api/strategy/ai-factor-factory"},
+            "error": "",
+        }
 
     def _snapshot_source_freshness(self, snapshot: Mapping[str, Any], source_name: str) -> str:
         confidence = snapshot.get("source_confidence") or {}

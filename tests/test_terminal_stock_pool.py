@@ -1540,6 +1540,59 @@ def test_terminal_stock_pool_watch_rank_rewards_200d_new_high_breakout():
     assert "新高动量" in row["rank_reason"]
 
 
+def test_terminal_stock_pool_watch_rank_rewards_refusal_pullback_factor():
+    rows = {}
+    _add_reason(rows, "300601", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "refusal-pullback",
+        "signal_type": "拒绝回调相对强度",
+        "signal_side": "buy",
+        "signal_family": "entry_factor",
+        "freq": "日线",
+        "score": 82,
+        "confidence": 0.84,
+        "event_dt": "2026-05-11",
+        "as_of": "2026-05-11",
+        "ma_alignment": _ma_alignment(),
+        "evidence": {
+            "details": "近3日拒绝回调，最大回撤0.8%，强收盘3/3日",
+            "entry_factor": {
+                "group": "relative_resilience_refusal_pullback",
+                "max_drawdown_pct": 0.8,
+                "max_close_drawdown_pct": 0.0,
+                "three_day_change_pct": 2.5,
+                "twenty_day_gain_pct": 16.0,
+                "high_proximity_pct": 101.2,
+                "strong_close_days": 3,
+                "recent_volume_ratio": 0.9,
+            },
+        },
+    }, index_codes=set(), name="拒绝回调股")
+    _add_reason(rows, "300602", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "daily-trend-buy",
+        "signal_type": "趋势买",
+        "signal_side": "buy",
+        "signal_family": "hard_technical",
+        "freq": "日线",
+        "score": 82,
+        "confidence": 0.84,
+        "event_dt": "2026-05-11",
+        "as_of": "2026-05-11",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="普通趋势股")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["focus"] == []
+    assert [row["raw_code"] for row in split["watch"][:2]] == ["300601", "300602"]
+    row = split["watch"][0]
+    assert row["score_components"]["relative_resilience"] > 0
+    assert "拒绝回调" in row["rank_reason"]
+
+
 def test_terminal_stock_pool_buy_with_risk_still_enters_focus_with_risk_marker():
     rows = {}
     for freq, signal_type in (("日线", "趋势买"), ("30分钟", "三买"), ("15分钟", "趋势买")):

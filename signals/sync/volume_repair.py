@@ -15,10 +15,11 @@ from typing import Any, Iterable
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
-from signals.sync.volume_units import CANONICAL_STOCK_VOLUME_UNIT, normalize_volume_unit
+from signals.sync.volume_units import CANONICAL_STOCK_VOLUME_UNIT, normalize_volume_unit, pure_stock_code
 
 DAILY_FREQ = "日线"
 REPAIR_VERSION = "daily_volume_unit_v1"
+TENCENT_STAR_REPAIR_VERSION = "tencent_star_daily_volume_unit_v1"
 
 _HAND_SOURCES = {
     "eastmoney",
@@ -58,6 +59,28 @@ def _source_unit_hint(source: Any) -> str:
     if raw in _SHARE_SOURCES:
         return "shares"
     return ""
+
+
+def _is_tencent_star_daily_doc(doc: dict[str, Any]) -> bool:
+    meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+    symbol = pure_stock_code(meta.get("symbol") or doc.get("symbol"))
+    return (
+        symbol.startswith(("688", "689"))
+        and str(meta.get("source") or doc.get("source") or "").strip().lower() == "tencent"
+        and str(meta.get("freq") or "").strip() == DAILY_FREQ
+    )
+
+
+def _tencent_star_daily_repair(doc: dict[str, Any]) -> tuple[int, float, bool]:
+    """Return ``(canonical_vol, source_vol, changed)`` for legacy STAR Tencent rows."""
+    meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+    raw_vol = _number(doc.get("vol"))
+    source_vol = _number(meta.get("source_vol"), 0.0)
+    if source_vol <= 0 and raw_vol > 0:
+        source_vol = raw_vol / 100.0
+    repaired = int(round(source_vol))
+    changed = raw_vol > 0 and repaired > 0 and int(round(raw_vol)) != repaired
+    return repaired, source_vol, changed
 
 
 def _amount_unit_hint(doc: dict[str, Any]) -> tuple[str, str]:
@@ -144,6 +167,11 @@ def _symbols_for_daily_repair(db: Database, symbols: Iterable[str] | None = None
                     {"meta.volume_unit": {"$exists": False}},
                     {"meta.volume_unit": None},
                     {"meta.volume_unit": ""},
+                    {
+                        "meta.source": "tencent",
+                        "meta.symbol": {"$regex": r"^(688|689)\d{3}$"},
+                        "meta.source_volume_unit": "hands",
+                    },
                 ],
             },
         )
@@ -185,6 +213,7 @@ def repair_daily_volume_units(
         "scanned": 0,
         "updates": 0,
         "multiplied": 0,
+        "divided": 0,
         "annotated_only": 0,
         "rewritten_symbols": 0,
         "reasons": {},
@@ -204,10 +233,39 @@ def repair_daily_volume_units(
             rewritten_doc["meta"] = dict(doc.get("meta") or {})
             meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
             if normalize_volume_unit(meta.get("volume_unit")):
+                if _is_tencent_star_daily_doc(doc) and normalize_volume_unit(meta.get("source_volume_unit")) == "hands":
+                    stats["scanned"] += 1
+                    repaired_vol, source_vol, changed = _tencent_star_daily_repair(doc)
+                    if repaired_vol <= 0:
+                        rewritten_docs.append(rewritten_doc)
+                        continue
+                    rewritten_doc["meta"].update({
+                        "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
+                        "source_volume_unit": "shares",
+                        "source_vol": source_vol,
+                        "volume_unit_repaired_at": now,
+                        "volume_unit_repair": TENCENT_STAR_REPAIR_VERSION,
+                        "volume_unit_repair_reason": "tencent_star_daily_source_shares",
+                    })
+                    if changed:
+                        rewritten_doc["vol"] = repaired_vol
+                        stats["divided"] += 1
+                    else:
+                        stats["annotated_only"] += 1
+                    stats["updates"] += 1
+                    symbol_updates += 1
+                    stats["reasons"]["tencent_star_daily_source_shares"] = int(
+                        stats["reasons"].get("tencent_star_daily_source_shares", 0)
+                    ) + 1
+                    rewritten_docs.append(rewritten_doc)
+                    continue
                 rewritten_docs.append(rewritten_doc)
                 continue
             stats["scanned"] += 1
-            unit, reason = infer_legacy_daily_volume_unit(doc, reference_shares_volume=reference)
+            if _is_tencent_star_daily_doc(doc):
+                unit, reason = "shares", "tencent_star_daily_source_shares"
+            else:
+                unit, reason = infer_legacy_daily_volume_unit(doc, reference_shares_volume=reference)
             raw_vol = _number(doc.get("vol"))
             repaired_vol = canonical_stock_volume(raw_vol, unit)
             if repaired_vol <= 0:

@@ -644,6 +644,9 @@ def _latest_volume_ratio(df: pd.DataFrame, *, period: int = 20) -> float:
 
 
 def _entry_factor_score(signal: dict[str, Any]) -> float:
+    explicit = _safe_float(signal.get("score"))
+    if explicit > 0:
+        return round(min(100.0, explicit), 3)
     breakout_pct = max(0.0, float(signal.get("breakout_pct") or 0.0))
     five_day_gain_pct = max(0.0, float(signal.get("five_day_gain_pct") or 0.0))
     volume_ratio = max(0.0, float(signal.get("volume_ratio") or 0.0))
@@ -655,15 +658,144 @@ def _entry_factor_score(signal: dict[str, Any]) -> float:
 
 
 def _entry_factor_resonance_context(signal: dict[str, Any]) -> dict[str, Any]:
+    group = str(signal.get("group") or "")
+    if group == "relative_resilience_refusal_pullback":
+        tags = ["拒绝回调", "相对强度", "硬技术"]
+        summary = str(signal.get("details") or "上升趋势中近3日拒绝回调")[:240]
+    else:
+        tags = ["200日新高", "新高突破", "硬技术"]
+        summary = str(signal.get("details") or "200日新高突破")[:240]
     return {
         "direction": "buy",
         "primary_freq": "日线",
         "aligned_freqs": ["日线"],
         "conflict_freqs": [],
         "grade": "single_period",
-        "tags": ["200日新高", "新高突破", "硬技术"],
-        "summary": str(signal.get("details") or "200日新高突破")[:240],
+        "tags": tags,
+        "summary": summary,
         "latest_dt": str(signal.get("date_str") or ""),
+    }
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _refusal_pullback_factor(daily_bars: list[Any], ma_alignment: dict[str, Any]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for bar in daily_bars:
+        close = _safe_float(getattr(bar, "close", 0))
+        if close <= 0:
+            continue
+        high = max(close, _safe_float(getattr(bar, "high", close), close))
+        low = min(close, _safe_float(getattr(bar, "low", close), close))
+        rows.append({
+            "dt": getattr(bar, "dt", None),
+            "open": _safe_float(getattr(bar, "open", close), close),
+            "high": high,
+            "low": low,
+            "close": close,
+            "vol": max(0.0, _safe_float(getattr(bar, "vol", 0))),
+        })
+    if len(rows) < 30:
+        return {}
+
+    anchor = rows[-4]
+    recent = rows[-3:]
+    latest = rows[-1]
+    anchor_close = anchor["close"]
+    latest_close = latest["close"]
+    if anchor_close <= 0 or latest_close <= 0:
+        return {}
+
+    recent_low = min(row["low"] for row in recent)
+    recent_close_low = min(row["close"] for row in recent)
+    max_drawdown_pct = max(0.0, (anchor_close - recent_low) / anchor_close * 100)
+    max_close_drawdown_pct = max(0.0, (anchor_close - recent_close_low) / anchor_close * 100)
+    three_day_change_pct = (latest_close - anchor_close) / anchor_close * 100
+
+    prior_20 = rows[-23:-3]
+    if len(prior_20) < 10:
+        return {}
+    prior_high = max(row["high"] for row in prior_20)
+    high_proximity_pct = latest_close / prior_high * 100 if prior_high > 0 else 0.0
+    base_20 = rows[-21]["close"]
+    twenty_day_gain_pct = (latest_close - base_20) / base_20 * 100 if base_20 > 0 else 0.0
+
+    close_positions: list[float] = []
+    for row in recent:
+        width = row["high"] - row["low"]
+        if width > 0:
+            close_positions.append(max(0.0, min(1.0, (row["close"] - row["low"]) / width)))
+        else:
+            close_positions.append(1.0 if row["close"] >= row["open"] else 0.5)
+    close_position_avg = sum(close_positions) / len(close_positions)
+    strong_close_days = sum(1 for value in close_positions if value >= 0.62)
+
+    recent_avg_vol = sum(row["vol"] for row in recent) / len(recent)
+    prior_vols = [row["vol"] for row in prior_20 if row["vol"] > 0]
+    prior_avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 0.0
+    recent_volume_ratio = recent_avg_vol / prior_avg_vol if prior_avg_vol > 0 else 0.0
+
+    trend_ok = (
+        _safe_float(ma_alignment.get("above_count")) >= 2
+        and bool(ma_alignment.get("above_ma20"))
+        and str(ma_alignment.get("ma20_direction") or "") in {"向上", "走平"}
+    ) or twenty_day_gain_pct >= 5.0
+    if not trend_ok:
+        return {}
+    if max_drawdown_pct > 3.5 or max_close_drawdown_pct > 2.0:
+        return {}
+    if three_day_change_pct < -0.6 or high_proximity_pct < 97.0 or strong_close_days < 2:
+        return {}
+
+    score = 52.0
+    score += max(0.0, 3.5 - max_drawdown_pct) * 3.0
+    score += max(0.0, 2.0 - max_close_drawdown_pct) * 2.0
+    score += min(10.0, max(0.0, high_proximity_pct - 97.0) * 2.0)
+    score += min(12.0, max(0.0, twenty_day_gain_pct) * 0.45)
+    score += close_position_avg * 8.0
+    score += strong_close_days * 2.0
+    if 0 < recent_volume_ratio <= 1.25:
+        score += 6.0
+    elif 0 < recent_volume_ratio <= 1.6:
+        score += 3.0
+    if str(ma_alignment.get("ma_stack") or "") == "bullish":
+        score += 5.0
+    score += min(2.0, _safe_float(ma_alignment.get("fib_support_score")) * 0.15)
+    score = round(min(90.0, score), 3)
+
+    dt_value = latest["dt"]
+    date_str = ""
+    if dt_value is not None:
+        parsed = pd.to_datetime(dt_value, errors="coerce")
+        if not pd.isna(parsed):
+            date_str = parsed.date().isoformat()
+    details = (
+        "近3日拒绝回调，"
+        f"最大回撤{max_drawdown_pct:.1f}%，收盘回撤{max_close_drawdown_pct:.1f}%，"
+        f"3日涨跌{three_day_change_pct:.1f}%，距20日高点{high_proximity_pct:.1f}%，"
+        f"强收盘{strong_close_days}/3日"
+    )
+    return {
+        "group": "relative_resilience_refusal_pullback",
+        "type": "拒绝回调相对强度",
+        "price": latest_close,
+        "date_str": date_str,
+        "max_drawdown_pct": round(max_drawdown_pct, 3),
+        "max_close_drawdown_pct": round(max_close_drawdown_pct, 3),
+        "three_day_change_pct": round(three_day_change_pct, 3),
+        "twenty_day_gain_pct": round(twenty_day_gain_pct, 3),
+        "high_proximity_pct": round(high_proximity_pct, 3),
+        "close_position_avg": round(close_position_avg, 3),
+        "strong_close_days": strong_close_days,
+        "recent_volume_ratio": round(recent_volume_ratio, 3),
+        "score": score,
+        "confidence": round(min(0.9, 0.58 + score / 300.0), 3),
+        "details": details,
     }
 
 
@@ -687,6 +819,9 @@ def _entry_factor_docs(
     if df.empty:
         return []
     signals = detect_200d_new_high_entries(df, lookback=1)
+    refusal_signal = _refusal_pullback_factor(daily_bars, ma_alignment)
+    if refusal_signal:
+        signals.append(refusal_signal)
     docs: list[dict[str, Any]] = []
     market = _symbol_market(symbol)
     prefixed = _prefixed_symbol(symbol)
@@ -698,7 +833,8 @@ def _entry_factor_docs(
         score = _entry_factor_score(signal)
         resonance_context = _entry_factor_resonance_context(signal)
         signal_type = str(signal.get("type") or "200日新高突破")
-        dedupe_key = f"{prefixed}|日线|200d_new_high_breakout|{dt_value.date().isoformat()}"
+        group = str(signal.get("group") or "200d_new_high_breakout")
+        dedupe_key = f"{prefixed}|日线|{group}|{dt_value.date().isoformat()}"
         technical_evidence = {
             "signal_type": signal_type,
             "freq": "日线",
@@ -709,6 +845,11 @@ def _entry_factor_docs(
             "resonance_context": resonance_context,
             "ma_alignment": ma_alignment,
         }
+        invalidates_when = (
+            "跌破近3日整理低点，或同细分回调时不再保持相对抗跌"
+            if group == "relative_resilience_refusal_pullback"
+            else "跌回前199日高点下方，或突破后放量回落无法维持"
+        )
         docs.append({
             "dedupe_key": dedupe_key,
             "symbol": prefixed,
@@ -730,8 +871,8 @@ def _entry_factor_docs(
             "resonance_context": resonance_context,
             "ma_alignment": ma_alignment,
             "technical_evidence": technical_evidence,
-            "invalidates_when": "跌回前199日高点下方，或突破后放量回落无法维持",
-            "source": "sync.technical_signal_scan.entry_factors",
+            "invalidates_when": invalidates_when,
+            "source": f"sync.technical_signal_scan.entry_factors.{group}",
             "scan_scope": scan_scope,
         })
     return docs

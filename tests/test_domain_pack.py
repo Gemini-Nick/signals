@@ -407,4 +407,57 @@ def test_completed_postmarket_progress_is_done_even_with_stale_task_progress():
 
     assert postmarket["summary"]["completed"] == 1
     assert postmarket["summary"]["progress_pct"] == 100.0
+    assert postmarket["summary"]["critical_progress_pct"] == 100.0
+    assert postmarket["summary"]["critical_status"] == "ok"
     assert postmarket["summary"]["eta_seconds"] == 0
+
+
+def test_postmarket_critical_progress_ignores_optional_hk_tail():
+    from signals.domain_pack import SignalsPack
+
+    db = _Db({
+        "sync_runs": _Collection([
+            {
+                "_id": "postmarket:2026-05-11",
+                "run_id": "postmarket:2026-05-11",
+                "trade_date": "2026-05-11",
+                "status": "running",
+                "phase": "hk_market_data",
+                "started_at": datetime(2026, 5, 11, 16, 10),
+            }
+        ]),
+        "sync_tasks": _Collection([
+            {
+                "_id": "postmarket:2026-05-11:terminal_realtime_pool:all",
+                "run_id": "postmarket:2026-05-11",
+                "module": "terminal_realtime_pool",
+                "phase": "terminal",
+                "task_key": "terminal_realtime_pool:all",
+                "shard_key": "all",
+                "blocks_run": True,
+                "status": "ok",
+                "order": 1,
+            },
+            {
+                "_id": "postmarket:2026-05-11:hk_stock_daily:shard_00",
+                "run_id": "postmarket:2026-05-11",
+                "module": "hk_stock_daily",
+                "phase": "hk_market_data",
+                "task_key": "hk_stock_daily:shard_00",
+                "shard_key": "shard_00",
+                "blocks_run": False,
+                "status": "running",
+                "order": 2,
+                "cursor": {"processed": 100, "total": 400},
+            },
+        ]),
+    })
+    pack = SignalsPack()
+
+    postmarket = pack._cache_postmarket_backfill(db)
+
+    assert postmarket["summary"]["progress_pct"] == 62.5
+    assert postmarket["summary"]["critical_progress_pct"] == 100.0
+    assert postmarket["summary"]["critical_status"] == "ok"
+    assert postmarket["summary"]["optional_progress_pct"] == 25.0
+    assert postmarket["summary"]["optional_status_counts"] == {"running": 1}

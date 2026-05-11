@@ -30,6 +30,7 @@ _SHARE_VOLUME_SOURCES = {
     "bars_latest",
     "fullmarket_spot_snapshot",
 }
+_TENCENT_DAILY_SHARE_PREFIXES = ("688", "689")
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -53,6 +54,23 @@ def stock_source_volume_unit(source: Any, *, default: str = "shares") -> str:
     if raw in _SHARE_VOLUME_SOURCES:
         return "shares"
     return normalize_volume_unit(default) or "shares"
+
+
+def pure_stock_code(symbol: Any) -> str:
+    raw = str(symbol or "").strip().upper()
+    if "." in raw:
+        raw = raw.split(".", 1)[-1]
+    if len(raw) >= 8 and raw[:2] in {"SH", "SZ", "BJ"}:
+        raw = raw[2:]
+    return raw if raw.isdigit() and len(raw) == 6 else ""
+
+
+def tencent_daily_volume_unit(symbol: Any) -> str:
+    """Tencent qfq daily returns STAR-market volume in shares, others in hands."""
+    code = pure_stock_code(symbol)
+    if code.startswith(_TENCENT_DAILY_SHARE_PREFIXES):
+        return "shares"
+    return "hands"
 
 
 def normalize_stock_volume(

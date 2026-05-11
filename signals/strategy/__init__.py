@@ -7,6 +7,8 @@ from .ai_factor_factory import (
     create_factor_draft,
     disable_factor,
     publish_factor,
+    run_signal_first_environment_validation,
+    build_signal_first_rl_environments,
     run_factor_rhythm_demo,
     run_factor_validation,
 )
@@ -18,6 +20,8 @@ __all__ = [
     "create_factor_draft",
     "disable_factor",
     "publish_factor",
+    "run_signal_first_environment_validation",
+    "build_signal_first_rl_environments",
     "run_factor_rhythm_demo",
     "run_factor_validation",
     "build_strategy_snapshot",

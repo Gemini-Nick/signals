@@ -415,6 +415,60 @@ def test_stock_daily_normalizes_provider_daily_volume_units():
     assert docs[0]["meta"]["source_volume_unit"] == "hands"
 
 
+def test_stock_daily_keeps_tencent_star_daily_volume_as_shares():
+    df = pd.DataFrame([
+        {
+            "日期": "2026-05-11",
+            "开盘": 799,
+            "最高": 803,
+            "最低": 760.2,
+            "收盘": 787.5,
+            "成交量": 3326290,
+            "成交额": 0,
+        }
+    ])
+    docs = stock_daily._docs_from_daily_df(
+        "688802",
+        df,
+        {
+            "dt": "日期",
+            "open": "开盘",
+            "high": "最高",
+            "low": "最低",
+            "close": "收盘",
+            "vol": "成交量",
+            "amount": "成交额",
+        },
+        "tencent",
+        end_date="20260511",
+    )
+
+    assert docs[0]["vol"] == 3326290
+    assert docs[0]["meta"]["volume_unit"] == "shares"
+    assert docs[0]["meta"]["source_volume_unit"] == "shares"
+
+
+def test_snapshot_daily_doc_preserves_raw_source_volume_unit():
+    row = pd.Series({
+        "今开": 333.33,
+        "最高": 335.0,
+        "最低": 318.1,
+        "最新价": 331.92,
+        "成交量": 46423200,
+        "_volume_unit": "shares",
+        "_source_vol": 464232,
+        "_source_volume_unit": "hands",
+        "成交额": 15270518541,
+        "昨收": 326.3,
+    })
+
+    doc = stock_daily._snapshot_daily_doc("300394", row, "20260511")
+
+    assert doc["vol"] == 46423200
+    assert doc["meta"]["source_vol"] == 464232
+    assert doc["meta"]["source_volume_unit"] == "hands"
+
+
 def test_stock_daily_defers_shard_when_all_providers_cooling(monkeypatch):
     db = _DB()
     monkeypatch.setattr(stock_daily, "_get_stock_codes", lambda _db: (["600001", "600002"], "all"))

@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import io
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time as dt_time, timedelta
 from typing import Any
@@ -26,6 +27,7 @@ logger = logging.getLogger("signals.sync.hk_stock_daily")
 DAILY_FREQ = "日线"
 _PROGRESS_META_ID = "hk_stock_daily:progress:_meta"
 _HKEX_SECURITIES_XLSX_URL = "https://www.hkex.com.hk/eng/services/trading/securities/securitieslists/ListOfSecurities.xlsx"
+_SINA_DAILY_LOCK = threading.Lock()
 
 
 def _env_int(name: str, default: int, *, minimum: int = 0, maximum: int | None = None) -> int:
@@ -328,7 +330,7 @@ def _hk_history_sources() -> list[str]:
     if single:
         raw = single
     if not raw or str(raw).strip().lower() == "auto":
-        raw = "daily,hist"
+        raw = "hist,daily"
     sources: list[str] = []
     seen: set[str] = set()
     aliases = {
@@ -396,8 +398,11 @@ def _fetch_one_hk_daily(code: str, start_date: str, end_date: str) -> list[dict[
                 source_errors.append(f"stock_hk_hist: {exc}")
         elif source == "daily":
             try:
-                with no_proxy():
-                    df = ak.stock_hk_daily(symbol=_pure_hk_code(code), adjust=adjust)
+                # AKShare's Sina HK daily path uses py_mini_racer internally; running
+                # several MiniRacer contexts in parallel can abort the whole process.
+                with _SINA_DAILY_LOCK:
+                    with no_proxy():
+                        df = ak.stock_hk_daily(symbol=_pure_hk_code(code), adjust=adjust)
                 docs = _docs_from_hk_daily_df(code, df, "akshare_stock_hk_daily", end_date=end_date)
                 if docs:
                     return filter_start(docs)
@@ -558,9 +563,9 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
     errors: list[tuple[str, str]] = []
     deferred: list[tuple[str, str]] = []
     progress_interval = _env_int("HK_STOCK_DAILY_PROGRESS_INTERVAL", 25, minimum=1)
-    workers = _env_int("HK_STOCK_DAILY_WORKERS", 1, minimum=1, maximum=8)
-    call_interval = _env_float("HK_STOCK_DAILY_CALL_INTERVAL", 0.35, minimum=0.0)
-    write_batch_symbols = _env_int("HK_STOCK_DAILY_WRITE_BATCH_SYMBOLS", 20, minimum=1)
+    workers = _env_int("HK_STOCK_DAILY_WORKERS", 3, minimum=1, maximum=8)
+    call_interval = _env_float("HK_STOCK_DAILY_CALL_INTERVAL", 0.12, minimum=0.0)
+    write_batch_symbols = _env_int("HK_STOCK_DAILY_WRITE_BATCH_SYMBOLS", 40, minimum=1)
     lookback_days = _env_int("HK_STOCK_DAILY_LOOKBACK_DAYS", 730, minimum=30)
     pending_docs: dict[str, list[dict[str, Any]]] = {}
 

@@ -9,6 +9,7 @@ from signals.strategy.ai_factor_factory import (
     create_factor_draft,
     disable_factor,
     publish_factor,
+    run_signal_first_environment_validation,
     run_factor_rhythm_demo,
     run_factor_validation,
 )
@@ -47,8 +48,16 @@ async def ai_factor_factory_validate(
     observations = payload.get("observations")
     if not isinstance(observations, list):
         observations = None
+    mode = str(payload.get("mode") or "").lower()
+    environment_id = str(payload.get("environment_id") or "")
+    if mode == "signal_first" or environment_id:
+        return run_signal_first_environment_validation(
+            environment_id=environment_id or str(payload.get("factor_id") or ""),
+            observations=observations,
+            persist=bool(payload.get("persist", True)),
+        )
     demo_mode = _payload_bool(payload.get("demo_mode"), default=observations is None)
-    if str(payload.get("mode") or "").lower() == "demo":
+    if mode == "demo":
         demo_mode = True
     return run_factor_validation(
         factor_id=str(payload.get("factor_id") or ""),
