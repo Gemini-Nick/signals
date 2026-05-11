@@ -132,6 +132,7 @@ EMPTY_OK_MODULES = {
 SYNC_TZ = ZoneInfo(os.getenv("SIGNALS_SYNC_TIMEZONE", "Asia/Shanghai"))
 QUOTE_PREOPEN_START = dt_time(9, 15)
 QUOTE_PREOPEN_END = dt_time(9, 30)
+PREOPEN_LIVE_LANES = {"quote_lane", "workbench_lane", "board_lane"}
 
 
 def _env_seconds(name: str, default: int, *, minimum: int = 60) -> int:
@@ -861,7 +862,7 @@ class SyncEngine:
         return 24 * 60 * 60
 
     def _quote_preopen_enabled(self) -> bool:
-        return self.enabled_lanes is not None and self.enabled_lanes <= {"quote_lane"}
+        return self.enabled_lanes is not None and self.enabled_lanes <= PREOPEN_LIVE_LANES
 
     def bootstrap_preheat(self) -> list[dict]:
         """Run conservative startup preheat for empty critical collections."""

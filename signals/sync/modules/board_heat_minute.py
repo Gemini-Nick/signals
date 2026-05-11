@@ -15,7 +15,7 @@ from pymongo import UpdateOne
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
-from signals.core.trading_dates import normalized_trade_minute, trading_day_key
+from signals.core.trading_dates import a_share_realtime_day_key, normalized_a_share_realtime_minute
 
 from ..provider_limits import provider_call
 from ..retry import sync_retry
@@ -85,8 +85,8 @@ def _tick_docs(
 
 def _sync_heat_kind(db: Database, *, kind: str, proxy_url: str | None = None) -> dict:
     now = naive_market_now("A")
-    trade_date = trading_day_key("A", now=now)
-    trade_minute = normalized_trade_minute("A", now=now)
+    trade_date = a_share_realtime_day_key(now=now)
+    trade_minute = normalized_a_share_realtime_minute(now=now)
     source_kind = "concept" if kind == "concept" else "industry"
     domain = "concept" if kind == "concept" else "board"
     endpoint = f"push2delay_clist_{source_kind}"

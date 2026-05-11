@@ -12,7 +12,7 @@ from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
 from signals.core.scorer import FREQ_MULTIPLIER
-from signals.core.trading_dates import trading_day, trading_day_key
+from signals.core.trading_dates import a_share_realtime_day_key, trading_day
 from signals.sync.task_context import get_task_env
 
 logger = logging.getLogger("signals.sync.terminal_pool")
@@ -1083,7 +1083,7 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
 def _add_user_pinned(rows: dict[str, dict[str, Any]], index_codes: set[str], now) -> None:
     raw_values = os.getenv("TERMINAL_REALTIME_PRIORITY_CODES", "")
     values = raw_values.replace(";", ",").split(",") if raw_values.strip() else []
-    trade_date = trading_day_key("A", now=now)
+    trade_date = a_share_realtime_day_key(now=now)
     for value in values:
         code = _pure_a_code(value)
         _add_reason(rows, code, {
@@ -1927,7 +1927,7 @@ def _add_fallback_watch_rows(rows: dict[str, dict[str, Any]], db: Database, inde
     if limit <= 0:
         return 0
     before = len(rows)
-    trade_date = trading_day_key("A", now=now)
+    trade_date = a_share_realtime_day_key(now=now)
     snapshot = _latest_strategy_snapshot(db)
     source_doc_id = _text(snapshot.get("_source_doc_id")) or "latest"
     as_of = _text(snapshot.get("_as_of")) or trade_date
@@ -4620,7 +4620,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     import config
 
     now = naive_market_now("A")
-    trade_date = trading_day_key("A", now=now)
+    trade_date = a_share_realtime_day_key(now=now)
     trade_dt = datetime.strptime(trade_date, "%Y-%m-%d")
     stock_limit = int(os.getenv("TERMINAL_REALTIME_STOCK_LIMIT", "24"))
     risk_limit = int(os.getenv("TERMINAL_RISK_STOCK_LIMIT", "72"))

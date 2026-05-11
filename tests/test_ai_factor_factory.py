@@ -162,6 +162,21 @@ def test_factor_draft_writes_qlib_style_ledger_without_fake_metrics():
     )
 
     assert draft["status"] == "specified"
+    assert draft["research_mode"] == "research_first"
+    assert draft["factor_origin"] == "industry_research"
+    assert draft["factor_family"]["family_id"] == "industry_factor.ai_hardware"
+    assert draft["industry_beta"]["name"] == "ai_hardware_industry_chain"
+    assert draft["expectation_alpha"]["name"] == "ai_expectation_revision"
+    assert draft["strategy_integration"]["outputs"] == [
+        "factor_exposure",
+        "factor_origin",
+        "validation_status",
+        "industry_beta_score",
+        "expectation_alpha_score",
+        "technical_confirmation_score",
+        "risk_overlay_flags",
+    ]
+    assert draft["risk_overlay_flags"]
     assert draft["metrics"] == {}
     assert draft["validation"]["verified"] is False
     assert draft["ledger"]["experiment_id"]
@@ -177,6 +192,13 @@ def test_factor_draft_writes_qlib_style_ledger_without_fake_metrics():
     assert draft["portfolio_construction"]["us_driver_nodes"][0]["role"] == "primary_driver"
     assert draft["rhythm"]["status"] == "pending_kline_fusion"
     assert "T+1" in draft["portfolio_construction"]["mapping_rule"]
+    assert draft["development"]["factor_definition"]["components"] == [
+        "industry_beta",
+        "expectation_alpha",
+        "cross_market_lead_lag",
+        "a_share_acceptance_confirmation",
+    ]
+    assert "macd" in draft["development"]["factor_definition"]["a_share_acceptance_confirmation"]
     workflow = draft["research_workflow"]
     assert workflow["czsc_signal_event_trade"]["event"]["signals_all"] == [
         "us_ai_hardware_strength",
@@ -188,7 +210,9 @@ def test_factor_draft_writes_qlib_style_ledger_without_fake_metrics():
     factory = build_ai_factor_factory(db=db, include_sample=False)
 
     assert factory["summary"]["requires_validation"] == 1
+    assert factory["summary"]["research_modes"]["research_first"] == 1
     assert factory["summary"]["live_enabled"] == 0
+    assert factory["factor_registry"]["industry_factor.ai_hardware"]["alpha"] == "ai_expectation_revision"
     assert factory["data_lineage"]["no_auto_order"] is True
 
 
@@ -283,6 +307,83 @@ def test_single_factor_validation_computes_alphalens_metrics_and_rejects_future_
     assert result["paper_account"]["no_auto_order"] is True
 
 
+def test_signal_first_technical_scan_builds_candidate_factor_ideas_without_live_pollution():
+    from signals.strategy.ai_factor_factory import (
+        build_ai_factor_factory,
+        build_ai_factor_strategy_candidates,
+    )
+
+    db = _Db()
+    db["terminal_technical_signals"] = _Collection(docs=[
+        {
+            "market": "A",
+            "as_of": "2026-05-08",
+            "symbol": "SZ.300024",
+            "name": "机器人A",
+            "concept": "机器人执行器",
+            "signal_side": "buy",
+            "signal_type": "三买",
+            "freq": "日线",
+            "total_score": 82,
+            "confidence": 0.84,
+        },
+        {
+            "market": "A",
+            "as_of": "2026-05-08",
+            "symbol": "SH.688017",
+            "name": "机器人B",
+            "concept": "机器人执行器",
+            "signal_side": "buy",
+            "signal_type": "中枢突破",
+            "freq": "30分钟",
+            "total_score": 76,
+            "confidence": 0.78,
+        },
+        {
+            "market": "A",
+            "as_of": "2026-05-08",
+            "symbol": "SZ.002472",
+            "name": "机器人C",
+            "concept": "机器人执行器",
+            "signal_side": "buy",
+            "signal_type": "MACD面积收缩",
+            "freq": "周线",
+            "total_score": 71,
+            "confidence": 0.72,
+        },
+        {
+            "market": "A",
+            "as_of": "2026-05-08",
+            "symbol": "SZ.000001",
+            "concept": "银行",
+            "signal_side": "sell",
+            "signal_type": "顶背驰卖点",
+            "freq": "日线",
+            "total_score": 90,
+            "confidence": 0.9,
+        },
+    ])
+
+    factory = build_ai_factor_factory(db=db, include_sample=False)
+    ideas = factory["candidate_factor_ideas"]
+
+    assert ideas
+    idea = ideas[0]
+    assert idea["research_mode"] == "signal_first"
+    assert idea["factor_origin"] == "technical_discovery"
+    assert idea["status"] == "idea"
+    assert idea["live_enabled"] is False
+    assert idea["validation"]["verified"] is False
+    assert idea["beta_alpha_assessment"]["classification"] == "industry_beta"
+    assert idea["industry_beta"]["symbol_count"] == 3
+    assert idea["technical_confirmation"]["unique_symbol_count"] == 3
+    assert "unvalidated_factor_idea" in idea["risk_overlay_flags"]
+    assert "机器人执行器" in idea["title"]
+    assert factory["summary"]["candidate_factor_ideas"] == 1
+    assert factory["summary"]["research_modes"]["signal_first"] == 1
+    assert build_ai_factor_strategy_candidates(db=db) == []
+
+
 def test_publish_gate_controls_strategy_snapshot_pollution():
     from signals.strategy.ai_factor_factory import publish_factor, run_factor_validation
     from signals.strategy.snapshot import _merge_ai_factor_candidates, build_strategy_snapshot
@@ -328,6 +429,14 @@ def test_publish_gate_controls_strategy_snapshot_pollution():
     ]
     assert ai_candidates
     assert ai_candidates[0]["metadata"]["next_action"] == "等待盘中触发，不自动下单"
+    assert ai_candidates[0]["factor_origin"] == "industry_research"
+    assert ai_candidates[0]["factor_research_mode"] == "research_first"
+    assert ai_candidates[0]["factor_exposures"]["primary"] == "industry_factor.ai_hardware"
+    assert ai_candidates[0]["validation_status"] == "validated"
+    assert ai_candidates[0]["industry_beta_score"] >= 0
+    assert ai_candidates[0]["expectation_alpha_score"] >= 0
+    assert ai_candidates[0]["technical_confirmation_score"] >= 0
+    assert "future_leak_guard" in ai_candidates[0]["risk_overlay_flags"]
 
     crowded_candidates = [
         {
@@ -352,6 +461,9 @@ def test_publish_gate_controls_strategy_snapshot_pollution():
     assert overlay["metadata"]["source"] == "terminal_stock_pool.focus_stocks"
     assert overlay["metadata"]["ai_factor_factory"]["source"] == "ai_factor_factory"
     assert overlay["ai_factor_score"] > 0
+    assert overlay["factor_exposures"]["primary"] == "industry_factor.ai_hardware"
+    assert overlay["metadata"]["ai_factor_factory"]["validation_status"] == "validated"
+    assert overlay["metadata"]["ai_factor_factory"]["factor_score_breakdown"]["industry_beta_score"] >= 0
 
 
 def test_strategy_ai_factor_factory_api_smoke():

@@ -5,6 +5,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from signals.core.market_time import infer_market, timestamp_range_to_dates, to_market_naive, to_unix_seconds
+from signals.core.trading_dates import a_share_realtime_day_key, normalized_a_share_realtime_minute
 
 
 UTC = ZoneInfo("UTC")
@@ -51,3 +52,9 @@ def test_backtest_dt_to_unix_uses_a_share_market_timezone():
     value = datetime(2026, 4, 30, 15, 0)
 
     assert backtest._dt_to_unix(value) == to_unix_seconds(value, market="A")
+
+
+def test_a_share_realtime_day_switches_at_call_auction():
+    assert a_share_realtime_day_key(now=datetime(2026, 4, 27, 9, 14)) == "2026-04-24"
+    assert a_share_realtime_day_key(now=datetime(2026, 4, 27, 9, 15)) == "2026-04-27"
+    assert normalized_a_share_realtime_minute(now=datetime(2026, 4, 27, 9, 20)) == datetime(2026, 4, 27, 9, 20)

@@ -12,7 +12,10 @@ from pymongo.database import Database
 from signals.core.chain_mapping_rules import filter_mapping_matches as _filter_mapping_matches
 from signals.core.concept_carriers import match_industry_chains, non_chain_reason
 from signals.core.market_time import naive_market_now
-from signals.core.trading_dates import normalized_trade_minute, trading_day_key
+from signals.core.trading_dates import (
+    a_share_realtime_day_key,
+    normalized_a_share_realtime_minute,
+)
 
 from ..retry import sync_retry
 
@@ -60,7 +63,7 @@ def _doc_trade_date(doc: dict[str, Any], fallback: Any = None) -> str:
 
 
 def _latest_heat_docs(db: Database, kind: str) -> list[dict[str, Any]]:
-    expected_day = trading_day_key("A")
+    expected_day = a_share_realtime_day_key()
     day_start = _day_start(expected_day)
     day_end = day_start + timedelta(days=1)
     query = {
@@ -335,7 +338,7 @@ def _aggregate(mapped: list[dict[str, Any]], latest_minute: Any) -> list[dict[st
         m15 = round(sum(_float(item.get("momentum_15m")) for item in items[:5]) / min(len(items), 5), 3)
         m30 = round(sum(_float(item.get("momentum_30m")) for item in items[:5]) / min(len(items), 5), 3)
         mapping_confidence = round(sum(_float(item.get("mapping_confidence")) for item in items[:5]) / min(len(items), 5), 1)
-        trade_date = _doc_trade_date(top, latest_minute) or trading_day_key("A", now=now)
+        trade_date = _doc_trade_date(top, latest_minute) or a_share_realtime_day_key(now=now)
         phase = _phase(_float(top.get("change_pct")), up_count, down_count, m5, m15, m30)
         signal = _trading_signal(phase)
         reps: dict[str, dict[str, Any]] = {}
@@ -361,7 +364,7 @@ def _aggregate(mapped: list[dict[str, Any]], latest_minute: Any) -> list[dict[st
             "market": "A",
             "dt": _day_start(trade_date),
             "trade_date": trade_date,
-            "trade_minute": latest_minute or normalized_trade_minute("A", now=now),
+            "trade_minute": latest_minute or normalized_a_share_realtime_minute(now=now),
             "updated_at": now,
             "chain_id": chain_id,
             "chain_name": top.get("chain_name"),
@@ -419,8 +422,8 @@ def sync_chain_heat_snapshots(db: Database, proxy_url: str = None) -> dict:
     snapshots = _aggregate(mapped, latest_minute)
     if not snapshots:
         now = naive_market_now("A")
-        trade_date = trading_day_key("A", now=now)
-        trade_minute = normalized_trade_minute("A", now=now)
+        trade_date = a_share_realtime_day_key(now=now)
+        trade_minute = normalized_a_share_realtime_minute(now=now)
         db["data_freshness"].update_one(
             {"domain": "chain_heat", "market": "A", "mode": "realtime", "collection": "chain_heat_snapshots"},
             {"$set": {
@@ -469,7 +472,7 @@ def sync_chain_heat_snapshots(db: Database, proxy_url: str = None) -> dict:
     result = db["chain_heat_snapshots"].bulk_write(ops, ordered=False)
     now = naive_market_now("A")
     written = int(result.upserted_count + result.modified_count)
-    trade_date = _doc_trade_date(snapshots[0], latest_minute) if snapshots else trading_day_key("A", now=now)
+    trade_date = _doc_trade_date(snapshots[0], latest_minute) if snapshots else a_share_realtime_day_key(now=now)
     db["data_freshness"].update_one(
         {"domain": "chain_heat", "market": "A", "mode": "realtime", "collection": "chain_heat_snapshots"},
         {"$set": {

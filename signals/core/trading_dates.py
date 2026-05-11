@@ -12,6 +12,9 @@ from typing import Any
 from signals.core import market_time
 
 
+A_SHARE_AUCTION_OPEN = time(9, 15)
+
+
 def exchange_for_market(market: Any = "A") -> str:
     raw = str(market or "A").strip().upper()
     return {
@@ -76,6 +79,15 @@ def trading_day_key(
     return trading_day(market, now=now, open_time=open_time).strftime(fmt)
 
 
+def a_share_realtime_day_key(
+    *,
+    now: datetime | None = None,
+    compact: bool = False,
+) -> str:
+    """A-share realtime feeds switch to the current trading day at call auction."""
+    return trading_day_key("A", now=now, compact=compact, open_time=A_SHARE_AUCTION_OPEN)
+
+
 def normalized_trade_minute(
     market: Any = "A",
     *,
@@ -88,6 +100,11 @@ def normalized_trade_minute(
     if day == local.date():
         return local.replace(second=0, microsecond=0)
     return datetime.combine(day, close_time)
+
+
+def normalized_a_share_realtime_minute(*, now: datetime | None = None) -> datetime:
+    """Normalize realtime A-share ticks, including the 09:15 call-auction window."""
+    return normalized_trade_minute("A", now=now, open_time=A_SHARE_AUCTION_OPEN)
 
 
 def _coerce_date(value: date | datetime | str | None) -> date | None:

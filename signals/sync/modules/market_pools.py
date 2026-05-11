@@ -9,7 +9,7 @@ from typing import Iterable
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
-from signals.core.trading_dates import trading_day_key
+from signals.core.trading_dates import a_share_realtime_day_key
 
 logger = logging.getLogger("signals.sync.market_pools")
 
@@ -87,7 +87,7 @@ def _collect_pool_symbols(db: Database) -> dict[str, set[str]]:
 
 def _write_data_freshness(db: Database, count: int, status: str) -> None:
     now = naive_market_now("A")
-    trade_date = trading_day_key("A", now=now)
+    trade_date = a_share_realtime_day_key(now=now)
     freshness = "fresh" if count else "empty"
     db["data_freshness"].update_one(
         {"domain": "market_pool", "market": "A", "mode": "realtime", "collection": "market_pools"},
@@ -111,7 +111,7 @@ def sync_market_pools(db: Database, proxy_url: str = None) -> dict:
     """Create active market pool from configured, held, signaled, and sector symbols."""
     del proxy_url
     now = naive_market_now("A")
-    trade_date = trading_day_key("A", now=now)
+    trade_date = a_share_realtime_day_key(now=now)
     sources_by_symbol = _collect_pool_symbols(db)
     source_priority = {
         "whitelist": 0,

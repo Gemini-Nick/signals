@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any, Mapping, Optional
 
 from signals.core.market_time import naive_market_now
-from signals.core.trading_dates import trading_day_key
+from signals.core.trading_dates import a_share_realtime_day_key
 
 
 WARNING_TOKENS = ("卖", "顶", "风险", "死叉", "减仓", "跌破", "预警")
@@ -42,7 +42,7 @@ def build_strategy_snapshot(
     without a live MongoDB or external data provider.
     """
     now = _now_bj()
-    trade_date = trading_day_key("A", now=now)
+    trade_date = a_share_realtime_day_key(now=now)
     responses_provided = responses is not None
     db_provided = db is not None
     responses = dict(responses or _fetch_gateway_responses())
@@ -229,6 +229,27 @@ def _merge_ai_factor_overlay(existing: Mapping[str, Any], ai_item: Mapping[str, 
         ai_item.get("recommended_action") or merged.get("recommended_action") or ""
     )
     merged["ai_factor_score"] = _float(ai_item.get("score"), 0.0)
+    for key in (
+        "factor_exposures",
+        "factor_origin",
+        "factor_research_mode",
+        "validation_status",
+        "factor_score_breakdown",
+        "industry_beta_score",
+        "expectation_alpha_score",
+        "technical_confirmation_score",
+        "risk_overlay_flags",
+    ):
+        if key in ai_item:
+            merged[key] = ai_item[key]
+    if ai_metadata:
+        merged["metadata"]["ai_factor_factory"] = {
+            **ai_metadata,
+            "factor_exposures": ai_item.get("factor_exposures") or ai_metadata.get("factor_exposures", {}),
+            "factor_score_breakdown": ai_item.get("factor_score_breakdown") or ai_metadata.get("factor_score_breakdown", {}),
+            "validation_status": ai_item.get("validation_status") or ai_metadata.get("validation_status", ""),
+            "risk_overlay_flags": ai_item.get("risk_overlay_flags") or ai_metadata.get("risk_overlay_flags", []),
+        }
     return merged
 
 

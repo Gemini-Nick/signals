@@ -3,7 +3,7 @@
 
 This module keeps AI factor research separate from ``autoresearch``.  AI may
 turn a trader's idea into a structured factor and feedback loop, but every
-number shown to Agent OS must come from a validation artifact.
+number shown to Agent OS must come from a sample replay artifact.
 """
 from __future__ import annotations
 
@@ -21,6 +21,54 @@ DEFAULT_FACTOR_ID = "us_ai_hardware_to_cn_optical_cpo_memory_v1"
 DEFAULT_FACTOR_TITLE = "美股 AI 硬件 -> A股光模块/CPO/液冷/存储联动因子"
 REPRO_BOUNDARY = "US T close is allowed to affect A-share T+1 and later only."
 LIFECYCLE_STATES = ["idea", "draft", "specified", "validated", "observable", "published", "disabled"]
+FACTOR_FACTORY_PHASES = [
+    {
+        "phase": "phase_1",
+        "mode": "research_first",
+        "title": "投研因子 -> 技术验证",
+        "goal": "以 AI 硬件行业因子跑通假设、定义、样本复盘、观察账户和策略赋能。",
+        "strategy_gate": "样本复盘、人工确认、观察启用后才进入 strategy_snapshot。",
+    },
+    {
+        "phase": "phase_2",
+        "mode": "signal_first",
+        "title": "技术因子 -> 行业归因",
+        "goal": "从全市场技术信号聚类发现候选行业 beta 或预期 alpha，再回到研究验证链路。",
+        "strategy_gate": "只进入 factor_idea_queue，不直接进入 live 候选池。",
+    },
+]
+RESEARCH_MODES = {
+    "research_first": {
+        "label": "投研发现因子",
+        "definition": "先有行业/产业链假设，再用技术结构和单因子验证确认市场是否承接。",
+    },
+    "signal_first": {
+        "label": "技术发现因子",
+        "definition": "先有全市场技术异动，再按行业、概念、产业链聚类归因。",
+    },
+}
+AI_HARDWARE_FACTOR_FAMILY = {
+    "family_id": "industry_factor.ai_hardware",
+    "label": "AI硬件行业因子",
+    "mode": "research_first",
+    "primary_style": "industry_beta_with_expectation_alpha",
+    "beta": "ai_hardware_industry_chain",
+    "alpha": "ai_expectation_revision",
+}
+VALIDATION_METRICS_PROFILE = [
+    "forward_return",
+    "rank_ic",
+    "quantile_return",
+    "mfe_mae",
+    "failure_samples",
+    "industry_diffusion_rate",
+    "technical_confirmation_rate",
+]
+SIGNAL_FIRST_COLLECTION = "terminal_technical_signals"
+SIGNAL_FIRST_BULLISH_TOKENS = (
+    "一买", "二买", "三买", "中枢突破", "突破", "背驰", "macd", "面积收缩",
+    "均线多头", "放量", "缩量回踩", "趋势", "买点",
+)
 
 
 def build_ai_factor_factory(*, db: Any = None, include_sample: bool = True) -> dict[str, Any]:
@@ -31,6 +79,7 @@ def build_ai_factor_factory(*, db: Any = None, include_sample: bool = True) -> d
     factors = _load_factor_docs(db)
     if not factors and include_sample:
         factors = [_sample_factor(now)]
+    candidate_factor_ideas = build_signal_first_candidate_factor_ideas(db=db)
 
     active_factor_id = str(factors[0].get("factor_id") or "") if factors else ""
     return _json_safe({
@@ -38,8 +87,15 @@ def build_ai_factor_factory(*, db: Any = None, include_sample: bool = True) -> d
         "as_of": trade_date,
         "generated_at": now.isoformat(timespec="seconds"),
         "title": "AI因子工厂",
-        "summary": _summary(factors),
+        "summary": _summary(factors, candidate_factor_ideas),
         "active_factor_id": active_factor_id,
+        "phases": FACTOR_FACTORY_PHASES,
+        "research_modes": RESEARCH_MODES,
+        "factor_registry": {
+            "industry_factor.ai_hardware": AI_HARDWARE_FACTOR_FAMILY,
+        },
+        "candidate_factor_ideas": candidate_factor_ideas,
+        "factor_idea_queue": candidate_factor_ideas,
         "ideas": factors,
         "factors": factors,
         "experiments": _load_experiment_ledger(db),
@@ -50,12 +106,17 @@ def build_ai_factor_factory(*, db: Any = None, include_sample: bool = True) -> d
                 "ai_factor_experiments",
                 "ai_factor_publications",
                 "ai_factor_validation_samples",
+                SIGNAL_FIRST_COLLECTION,
             ],
             "research_loop": "RD-Agent style Research -> Development -> Feedback",
+            "phase_1_loop": "research_first idea -> factor spec -> technical confirmation -> sample replay -> paper account -> observation",
+            "phase_2_loop": "signal_first atomic signals -> industry/concept clustering -> candidate_factor_ideas -> manual research review",
             "experiment_ledger": "Qlib-style experiment/recorder run ledger",
             "single_factor_validation": "Alphalens-style IC, quantiles, group returns, turnover",
+            "validation_profile": VALIDATION_METRICS_PROFILE,
             "repro_boundary": REPRO_BOUNDARY,
-            "live_gate": "Only published + approved + live_enabled + verified factors can enter strategy_snapshot.",
+            "live_gate": "Only replayed + approved + live_enabled factors can enter strategy_snapshot.",
+            "signal_first_gate": "Candidate factor ideas stay in review until research evidence and sample replay are complete.",
             "no_auto_order": True,
         },
     })
@@ -83,12 +144,29 @@ def create_factor_draft(
     research = _draft_research_from_idea(idea_text)
     portfolio_construction = _portfolio_construction_for_idea(idea_text)
     research_workflow = _research_workflow_for_idea(idea_text)
+    identity = _factor_identity_for_idea(idea_text)
+    technical_confirmation = _technical_confirmation_profile()
+    strategy_integration = _strategy_integration_profile()
+    risk_overlay_flags = _risk_overlay_flags_for_factor(identity)
     doc = {
         "_id": factor_id,
         "factor_id": factor_id,
         "version": version,
         "title": _factor_title_from_idea(idea_text, factor_id),
         "hypothesis": idea_text,
+        "research_mode": identity["research_mode"],
+        "factor_origin": identity["factor_origin"],
+        "factor_family": identity["factor_family"],
+        "industry_beta": identity["industry_beta"],
+        "expectation_alpha": identity["expectation_alpha"],
+        "technical_confirmation": technical_confirmation,
+        "strategy_integration": strategy_integration,
+        "factor_exposures": _factor_exposures_for_factor({
+            **identity,
+            "portfolio_construction": portfolio_construction,
+        }),
+        "validation_profile": _validation_profile(),
+        "risk_overlay_flags": risk_overlay_flags,
         "status": "specified",
         "approval_status": "not_requested",
         "live_enabled": False,
@@ -98,6 +176,22 @@ def create_factor_draft(
         "research": research,
         "development": {
             "factor_definition": {
+                "mode": identity["research_mode"],
+                "origin": identity["factor_origin"],
+                "components": [
+                    "industry_beta",
+                    "expectation_alpha",
+                    "cross_market_lead_lag",
+                    "a_share_acceptance_confirmation",
+                ],
+                "industry_beta": identity["industry_beta"],
+                "expectation_alpha": identity["expectation_alpha"],
+                "cross_market_lead_lag": {
+                    "rule": REPRO_BOUNDARY,
+                    "source": "US trigger basket",
+                    "target": "A-share reaction basket",
+                },
+                "a_share_acceptance_confirmation": technical_confirmation,
                 "inputs": _basket_symbols(portfolio_construction.get("us_trigger_basket")),
                 "mapped_universe": _basket_groups(portfolio_construction.get("cn_reaction_basket")),
                 "signal_layer": "US AI hardware overnight strength",
@@ -128,7 +222,7 @@ def create_factor_draft(
             "state": "specified",
             "states": LIFECYCLE_STATES,
             "next_allowed": ["validated", "disabled"],
-            "live_gate": "published + approved + live_enabled + metrics.verified",
+            "live_gate": "sample_replayed + approved + live_enabled",
         },
         "paper_account": {
             "enabled": False,
@@ -139,6 +233,7 @@ def create_factor_draft(
         "metrics": {},
         "validation": {"status": "not_run", "verified": False},
         "ai_explanation": [
+            _ai_factor_positioning_explanation(identity),
             "AI 只负责把想法拆成可复现定义、验证边界和反馈建议。",
             "该因子未验证、未批准前不会进入策略页盘前池。",
         ],
@@ -395,10 +490,14 @@ def build_ai_factor_strategy_candidates(*, db: Any = None) -> list[dict[str, Any
             name = str(symbol_item.get("name") or symbol).strip()
             metrics = _as_dict(factor.get("metrics"))
             draft = _as_dict(factor.get("draft") or factor.get("research"))
+            score_breakdown = _strategy_score_breakdown(factor, symbol_item)
+            factor_exposures = _factor_exposures_for_factor(factor)
+            risk_overlay_flags = _risk_overlay_flags_for_factor(factor)
+            validation_status = str(_as_dict(factor.get("validation")).get("status") or factor.get("status") or "")
             candidates.append({
                 "symbol": symbol,
                 "name": name,
-                "display_name": f"{name} · AI因子",
+                "display_name": f"{name} · {str(_as_dict(factor.get('factor_family')).get('label') or 'AI因子')}",
                 "score": _float(symbol_item.get("score"), _float(metrics.get("fitness"), 0.0)),
                 "status": "watch",
                 "decision_stage": "strategy_candidate",
@@ -407,10 +506,33 @@ def build_ai_factor_strategy_candidates(*, db: Any = None) -> list[dict[str, Any
                 "missing_gates": ["intraday_trigger_confirmation", "manual_risk_review"],
                 "primary_blocker": "",
                 "promotion_path": ["AI因子验证", "盘前池观察", "盘中触发复核"],
+                "factor_exposures": factor_exposures,
+                "factor_origin": str(factor.get("factor_origin") or ""),
+                "factor_research_mode": str(factor.get("research_mode") or ""),
+                "validation_status": validation_status,
+                "factor_score_breakdown": score_breakdown,
+                "industry_beta_score": score_breakdown["industry_beta_score"],
+                "expectation_alpha_score": score_breakdown["expectation_alpha_score"],
+                "technical_confirmation_score": score_breakdown["technical_confirmation_score"],
+                "risk_overlay_flags": risk_overlay_flags,
                 "metadata": {
                     "source": "ai_factor_factory",
                     "factor_id": factor.get("factor_id", ""),
                     "factor_version": factor.get("version", ""),
+                    "factor_origin": factor.get("factor_origin", ""),
+                    "research_mode": factor.get("research_mode", ""),
+                    "factor_family": factor.get("factor_family", {}),
+                    "industry_beta": factor.get("industry_beta", {}),
+                    "expectation_alpha": factor.get("expectation_alpha", {}),
+                    "technical_confirmation": factor.get("technical_confirmation", {}),
+                    "strategy_integration": factor.get("strategy_integration", {}),
+                    "factor_exposures": factor_exposures,
+                    "factor_score_breakdown": score_breakdown,
+                    "validation_status": validation_status,
+                    "industry_beta_score": score_breakdown["industry_beta_score"],
+                    "expectation_alpha_score": score_breakdown["expectation_alpha_score"],
+                    "technical_confirmation_score": score_breakdown["technical_confirmation_score"],
+                    "risk_overlay_flags": risk_overlay_flags,
                     "trigger_condition": draft.get("trigger_condition", ""),
                     "invalidation_condition": draft.get("invalidation_condition", ""),
                     "risk_tags": factor.get("risk_tags", []),
@@ -427,6 +549,331 @@ def build_ai_factor_strategy_candidates(*, db: Any = None) -> list[dict[str, Any
                 }],
             })
     return candidates
+
+
+def build_signal_first_candidate_factor_ideas(*, db: Any = None, limit: int = 12) -> list[dict[str, Any]]:
+    """Discover candidate industry factors from technical signals.
+
+    These ideas are intentionally not live factors.  They must go through
+    research review and sample replay before affecting strategy candidates.
+    """
+    rows = _load_recent_technical_signal_rows(db)
+    if not rows:
+        return []
+    clusters: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not _is_constructive_technical_signal(row):
+            continue
+        theme = _technical_signal_theme(row)
+        symbol = str(row.get("symbol") or row.get("raw_code") or row.get("code") or "").strip()
+        signal_type = str(row.get("signal_type") or row.get("type") or row.get("reason") or "").strip()
+        cluster = clusters.setdefault(theme, {
+            "theme": theme,
+            "symbols": [],
+            "signal_types": [],
+            "source_signals": [],
+            "score_total": 0.0,
+            "confidence_total": 0.0,
+            "count": 0,
+        })
+        if symbol and symbol not in cluster["symbols"]:
+            cluster["symbols"].append(symbol)
+        if signal_type and signal_type not in cluster["signal_types"]:
+            cluster["signal_types"].append(signal_type)
+        cluster["source_signals"].append(_technical_signal_preview(row))
+        cluster["score_total"] += _float(row.get("total_score") or row.get("score"), 0.0) or 0.0
+        cluster["confidence_total"] += _float(row.get("confidence"), 0.0) or 0.0
+        cluster["count"] += 1
+
+    ideas: list[dict[str, Any]] = []
+    for cluster in clusters.values():
+        if cluster["count"] <= 0:
+            continue
+        symbol_count = len(cluster["symbols"])
+        classification = "industry_beta" if symbol_count >= 3 else "potential_expectation_alpha"
+        theme = str(cluster["theme"])
+        factor_id = _safe_factor_id(f"signal_first:{theme}:{classification}")
+        avg_score = cluster["score_total"] / max(1, cluster["count"])
+        avg_confidence = cluster["confidence_total"] / max(1, cluster["count"])
+        technical_score = _round(min(100.0, max(0.0, avg_score + avg_confidence * 20 + symbol_count * 6)), 2)
+        family_id = f"candidate_industry_factor.{_safe_factor_id(theme)}"
+        title_suffix = "技术扩散因子" if classification == "industry_beta" else "预期差技术因子"
+        idea = {
+            "factor_id": factor_id,
+            "version": "idea",
+            "title": f"{theme}{title_suffix}",
+            "hypothesis": f"全市场技术信号在「{theme}」聚集，可能指向新的行业 beta 或预期 alpha。",
+            "research_mode": "signal_first",
+            "factor_origin": "technical_discovery",
+            "factor_family": {
+                "family_id": family_id,
+                "label": f"{theme}候选行业因子",
+                "mode": "signal_first",
+                "primary_style": classification,
+            },
+            "industry_beta": {
+                "name": f"{_safe_factor_id(theme)}_technical_diffusion",
+                "classification": classification,
+                "evidence": "同产业链/概念内技术信号同步聚集" if classification == "industry_beta" else "少数高暴露标的技术结构先走强",
+                "symbol_count": symbol_count,
+            },
+            "expectation_alpha": {
+                "name": f"{_safe_factor_id(theme)}_expectation_gap",
+                "classification": classification,
+                "evidence": "需要投研补充事件、订单、政策、产业链或资金扩散证据。",
+            },
+            "technical_confirmation": {
+                **_technical_confirmation_profile(),
+                "source_signal_types": cluster["signal_types"][:8],
+                "source_signal_count": cluster["count"],
+                "unique_symbol_count": symbol_count,
+                "technical_confirmation_score": technical_score,
+            },
+            "strategy_integration": {
+                **_strategy_integration_profile(),
+                "live_gate": "signal_first 候选只进入 factor_idea_queue；完成投研复核和样本复盘前不能进入 live 候选池。",
+            },
+            "factor_exposures": {
+                "primary": family_id,
+                "mode": "signal_first",
+                "origin": "technical_discovery",
+                "theme": theme,
+                "symbols": cluster["symbols"][:20],
+                "groups": [theme],
+            },
+            "validation_profile": _validation_profile(),
+            "risk_overlay_flags": _risk_overlay_flags_for_factor({"research_mode": "signal_first"}),
+            "status": "idea",
+            "approval_status": "not_requested",
+            "live_enabled": False,
+            "metrics": {"verified": False, "sample_count": 0},
+            "validation": {
+                "status": "not_run",
+                "verified": False,
+                "required_before_live": True,
+            },
+            "source_signals": cluster["source_signals"][:10],
+            "beta_alpha_assessment": {
+                "classification": classification,
+                "industry_beta_score": _round(min(100.0, symbol_count * 18 + avg_confidence * 20), 2),
+                "expectation_alpha_score": _round(min(100.0, max(20.0, avg_score + (4 - min(symbol_count, 4)) * 8)), 2),
+                "technical_confirmation_score": technical_score,
+            },
+            "next_action": "进入 Agent OS 复核：补产业链/事件证据，再创建 research_first 因子草稿和复盘样本。",
+            "ai_explanation": [
+                "这是技术发现因子候选，不是可直接使用的策略因子。",
+                "必须先完成投研归因、样本复盘和人工观察确认，才能影响 live 候选池。",
+            ],
+        }
+        ideas.append(idea)
+
+    return sorted(
+        ideas,
+        key=lambda item: _float(_as_dict(item.get("technical_confirmation")).get("technical_confirmation_score"), 0.0),
+        reverse=True,
+    )[:limit]
+
+
+def _factor_identity_for_idea(idea_text: str) -> dict[str, Any]:
+    if _is_ai_hardware_idea(idea_text):
+        return {
+            "research_mode": "research_first",
+            "factor_origin": "industry_research",
+            "factor_family": dict(AI_HARDWARE_FACTOR_FAMILY),
+            "industry_beta": {
+                "name": "ai_hardware_industry_chain",
+                "label": "AI硬件产业链行业 beta",
+                "definition": "海外订单、资本开支、GB200、光模块、液冷、铜连接、PCB、服务器和存储链的同步景气扩散。",
+                "evidence_required": ["chain_breadth", "cross_market_lead_lag", "a_share_acceptance"],
+            },
+            "expectation_alpha": {
+                "name": "ai_expectation_revision",
+                "label": "AI 产业预期修正 alpha",
+                "definition": "AI 产业预期上修、分支订单/价格/供需变化或预期差先于全链条扩散被市场定价。",
+                "evidence_required": ["expectation_change", "leader_confirmation", "failure_sample_boundary"],
+            },
+        }
+    terms = _idea_terms(idea_text)
+    theme = terms[0] if terms else "dynamic_industry"
+    slug = _safe_factor_id(theme)
+    return {
+        "research_mode": "research_first",
+        "factor_origin": "industry_research",
+        "factor_family": {
+            "family_id": f"industry_factor.{slug}",
+            "label": f"{theme}行业因子",
+            "mode": "research_first",
+            "primary_style": "industry_research_hypothesis",
+        },
+        "industry_beta": {
+            "name": f"{slug}_industry_chain",
+            "label": f"{theme}行业 beta",
+            "definition": "投研假设中的同产业链股票同步承接。",
+            "evidence_required": ["theme_breadth", "chain_breadth", "a_share_acceptance"],
+        },
+        "expectation_alpha": {
+            "name": f"{slug}_expectation_revision",
+            "label": f"{theme}预期修正 alpha",
+            "definition": "少数高暴露标的先于行业扩散定价预期变化。",
+            "evidence_required": ["expectation_change", "leader_confirmation", "failure_sample_boundary"],
+        },
+    }
+
+
+def _technical_confirmation_profile() -> dict[str, Any]:
+    return {
+        "chan": "一买/二买/三买、中枢突破、分型和背驰用于判断趋势还是震荡内反弹。",
+        "ma": "均线多头、关键均线不破或破后收回，用于确认趋势承接。",
+        "macd": "MACD 红绿柱面积、零轴状态、背驰和面积收缩用于判断趋势会不会破。",
+        "volume": "放量突破、缩量回踩和组内扩散确认市场是否承接行业故事。",
+        "multi_timeframe": "日线/周线/30分钟/15分钟/5分钟共振优先，防止单周期噪音。",
+        "control_warning": "高控盘标的可能故意击穿关键位，需结合收回、量能和组内扩散复核。",
+    }
+
+
+def _strategy_integration_profile() -> dict[str, Any]:
+    return {
+        "outputs": [
+            "factor_exposure",
+            "factor_origin",
+            "validation_status",
+            "industry_beta_score",
+            "expectation_alpha_score",
+            "technical_confirmation_score",
+            "risk_overlay_flags",
+        ],
+        "candidate_sorting": "提高同因子族中已验证且技术承接更强标的排序。",
+        "watch_pool": "只在样本复盘和人工复核通过后进入观察池。",
+        "risk_gate": "高开过热、关键位破坏、组内分化和未来函数边界失败时降权或阻断。",
+        "agent_os_review": "复核理由必须同时说明行业 beta、预期 alpha、技术确认和风险覆盖。",
+    }
+
+
+def _validation_profile() -> dict[str, Any]:
+    return {
+        "metrics": list(VALIDATION_METRICS_PROFILE),
+        "forward_windows": ["T+1", "T+5", "T+10", "T+20"],
+        "engines": ["Alphalens-style single factor validation", "paper factor account"],
+        "must_not": ["future_leak", "unverified_live_publish", "auto_order"],
+    }
+
+
+def _ai_factor_positioning_explanation(identity: Mapping[str, Any]) -> str:
+    family = _as_dict(identity.get("factor_family"))
+    if family.get("family_id") == "industry_factor.ai_hardware":
+        return "AI 硬件是第一条被产品化的行业因子，定位为行业 beta + AI 产业预期 alpha，不是一套通用方法论。"
+    return "该因子走 research_first 路径：先明确投研假设，再用技术结构和样本复盘证明市场承接。"
+
+
+def _risk_overlay_flags_for_factor(factor: Mapping[str, Any]) -> list[str]:
+    flags = _string_list(factor.get("risk_overlay_flags"))
+    if flags:
+        return flags
+    base = ["gap_overheat", "chain_divergence", "support_break_without_reclaim", "future_leak_guard"]
+    if str(factor.get("research_mode") or "") == "signal_first":
+        return base + ["unvalidated_factor_idea", "event_evidence_missing"]
+    return base
+
+
+def _factor_exposures_for_factor(factor: Mapping[str, Any]) -> dict[str, Any]:
+    family = _as_dict(factor.get("factor_family"))
+    portfolio = _as_dict(factor.get("portfolio_construction"))
+    return {
+        "primary": str(family.get("family_id") or ""),
+        "mode": str(factor.get("research_mode") or ""),
+        "origin": str(factor.get("factor_origin") or ""),
+        "industry_beta": str(_as_dict(factor.get("industry_beta")).get("name") or ""),
+        "expectation_alpha": str(_as_dict(factor.get("expectation_alpha")).get("name") or ""),
+        "groups": _basket_groups(portfolio.get("cn_reaction_basket") or portfolio.get("reaction_basket")),
+    }
+
+
+def _strategy_score_breakdown(factor: Mapping[str, Any], symbol_item: Mapping[str, Any]) -> dict[str, float]:
+    metrics = _as_dict(factor.get("metrics"))
+    symbol_score = _float(symbol_item.get("score"), _float(metrics.get("fitness"), 0.0)) or 0.0
+    rank_ic = max(0.0, _float(metrics.get("rank_ic"), 0.0) or 0.0)
+    long_short = max(0.0, _float(metrics.get("long_short_return"), 0.0) or 0.0)
+    win_rate = max(0.0, _float(metrics.get("win_rate"), 0.0) or 0.0)
+    beta_score = min(100.0, symbol_score * 0.45 + win_rate * 35 + rank_ic * 20)
+    alpha_score = min(100.0, symbol_score * 0.35 + long_short * 600 + rank_ic * 25)
+    technical_score = min(100.0, symbol_score * 0.55 + max(0.0, _float(symbol_item.get("return_t5"), 0.0) or 0.0) * 450)
+    validation_score = min(100.0, (_float(metrics.get("fitness"), 0.0) or 0.0) + rank_ic * 15)
+    return {
+        "industry_beta_score": _round(beta_score, 2),
+        "expectation_alpha_score": _round(alpha_score, 2),
+        "technical_confirmation_score": _round(technical_score, 2),
+        "validation_score": _round(validation_score, 2),
+        "risk_adjustment": 0.0,
+    }
+
+
+def _load_recent_technical_signal_rows(db: Any, limit: int = 500) -> list[dict[str, Any]]:
+    if db is None:
+        return []
+    try:
+        latest = db[SIGNAL_FIRST_COLLECTION].find_one(
+            {"market": "A", "as_of": {"$exists": True}},
+            {"as_of": 1},
+            sort=[("as_of", -1), ("updated_at", -1)],
+        ) or {}
+    except Exception:
+        latest = {}
+    query: dict[str, Any] = {"market": "A"}
+    if latest.get("as_of"):
+        query["as_of"] = latest.get("as_of")
+    try:
+        cursor = db[SIGNAL_FIRST_COLLECTION].find(query).sort(
+            [("total_score", -1), ("score", -1), ("confidence", -1), ("updated_at", -1)]
+        ).limit(limit)
+        return [dict(item) for item in cursor]
+    except Exception:
+        return []
+
+
+def _is_constructive_technical_signal(row: Mapping[str, Any]) -> bool:
+    side = str(row.get("signal_side") or row.get("side") or "").lower()
+    text = " ".join(str(row.get(key) or "") for key in ("signal_type", "signal_family", "reason", "summary"))
+    if side == "sell" or any(token in text for token in ("卖", "顶", "死叉", "跌破", "减仓")):
+        return False
+    if side == "buy":
+        return True
+    lowered = text.lower()
+    return any(token.lower() in lowered for token in SIGNAL_FIRST_BULLISH_TOKENS)
+
+
+def _technical_signal_theme(row: Mapping[str, Any]) -> str:
+    evidence = _as_dict(row.get("technical_evidence"))
+    candidates = [
+        row.get("industry_chain"),
+        row.get("chain"),
+        row.get("concept"),
+        row.get("board"),
+        row.get("industry"),
+        row.get("theme"),
+        evidence.get("industry_chain"),
+        evidence.get("concept"),
+        evidence.get("theme"),
+        row.get("signal_family"),
+    ]
+    for value in candidates:
+        text = str(value or "").strip()
+        if text and text not in {"hard_technical", "technical", "buy"}:
+            return text[:24]
+    return "技术结构共振"
+
+
+def _technical_signal_preview(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "symbol": str(row.get("symbol") or row.get("raw_code") or row.get("code") or ""),
+        "name": str(row.get("name") or row.get("symbol_name") or ""),
+        "freq": str(row.get("freq") or ""),
+        "signal_type": str(row.get("signal_type") or row.get("type") or ""),
+        "signal_side": str(row.get("signal_side") or row.get("side") or ""),
+        "score": _round(_float(row.get("total_score") or row.get("score"), 0.0), 4),
+        "confidence": _round(_float(row.get("confidence"), 0.0), 4),
+        "as_of": str(row.get("as_of") or row.get("updated_at") or "")[:10],
+        "source": SIGNAL_FIRST_COLLECTION,
+    }
 
 
 def _load_factor_docs(db: Any) -> list[dict[str, Any]]:
@@ -482,11 +929,26 @@ def _normalize_factor_doc(doc: Mapping[str, Any]) -> dict[str, Any]:
         )
     ):
         portfolio = _portfolio_construction_for_idea(idea_text)
+    identity = _factor_identity_for_idea(idea_text)
+    technical_confirmation = _as_dict(doc.get("technical_confirmation")) or _technical_confirmation_profile()
     return {
         "factor_id": factor_id or title,
         "version": str(doc.get("version") or doc.get("factor_version") or "v1"),
         "title": title,
         "hypothesis": idea_text,
+        "research_mode": str(doc.get("research_mode") or doc.get("mode") or identity["research_mode"]),
+        "factor_origin": str(doc.get("factor_origin") or doc.get("origin") or identity["factor_origin"]),
+        "factor_family": _as_dict(doc.get("factor_family")) or identity["factor_family"],
+        "industry_beta": _as_dict(doc.get("industry_beta")) or identity["industry_beta"],
+        "expectation_alpha": _as_dict(doc.get("expectation_alpha")) or identity["expectation_alpha"],
+        "technical_confirmation": technical_confirmation,
+        "strategy_integration": _as_dict(doc.get("strategy_integration")) or _strategy_integration_profile(),
+        "factor_exposures": _as_dict(doc.get("factor_exposures")) or _factor_exposures_for_factor({
+            **identity,
+            "portfolio_construction": portfolio,
+        }),
+        "validation_profile": _as_dict(doc.get("validation_profile")) or _validation_profile(),
+        "risk_overlay_flags": _string_list(doc.get("risk_overlay_flags")) or _risk_overlay_flags_for_factor(doc or identity),
         "status": str(doc.get("status") or doc.get("publication_status") or "idea"),
         "approval_status": str(doc.get("approval_status") or ""),
         "live_enabled": bool(doc.get("live_enabled") or doc.get("enabled")),
@@ -514,18 +976,29 @@ def _normalize_factor_doc(doc: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _sample_factor(now: datetime) -> dict[str, Any]:
+    draft = create_factor_draft(db=None, persist=False)
     return {
         "factor_id": DEFAULT_FACTOR_ID,
         "version": "v1",
         "title": DEFAULT_FACTOR_TITLE,
         "hypothesis": "美股 AI 硬件链强势时，A股光模块、CPO、存储等高暴露标的存在次日或盘中联动机会。",
+        "research_mode": draft["research_mode"],
+        "factor_origin": draft["factor_origin"],
+        "factor_family": draft["factor_family"],
+        "industry_beta": draft["industry_beta"],
+        "expectation_alpha": draft["expectation_alpha"],
+        "technical_confirmation": draft["technical_confirmation"],
+        "strategy_integration": draft["strategy_integration"],
+        "factor_exposures": draft["factor_exposures"],
+        "validation_profile": draft["validation_profile"],
+        "risk_overlay_flags": draft["risk_overlay_flags"],
         "status": "idea",
         "approval_status": "not_requested",
         "live_enabled": False,
         "updated_at": now.isoformat(timespec="seconds"),
         "last_verified_at": "",
-        "draft": _normalize_draft(create_factor_draft(db=None, persist=False)["research"]),
-        "development": create_factor_draft(db=None, persist=False)["development"],
+        "draft": _normalize_draft(draft["research"]),
+        "development": draft["development"],
         "research_workflow": _default_research_workflow(),
         "portfolio_construction": _default_portfolio_construction(),
         "rhythm": {
@@ -542,7 +1015,8 @@ def _sample_factor(now: datetime) -> dict[str, Any]:
         "metrics": {"verified": False},
         "validation": {"status": "not_run", "verified": False},
         "ai_explanation": [
-            "这是样板因子想法，尚未产生验证 artifact。",
+            "AI 硬件是第一条行业因子研发链路，定位为行业 beta + AI 产业预期 alpha。",
+            "当前尚未产生样本复盘结果。",
             "只有运行验证并人工批准后，才会进入策略页盘前池。",
         ],
         "failure_samples": [],
@@ -585,7 +1059,7 @@ def _draft_research_from_idea(idea_text: str) -> dict[str, Any]:
                 "trigger_condition": f"{trigger_groups} T 日强势后，A股 {('、'.join(cn_groups) or 'AI硬件映射')} 反应池 T+1 开盘不过热，并出现回踩承接或放量扩散。",
                 "avoid_condition": "高开过热、一字涨停、单票孤立拉升、板块内部分化、指数宽度恶化、海外链反转或数据源过期。",
                 "invalidation_condition": "美股 AI server 映射反转、A股映射支链组内退潮、个股跌破开盘承接位、失败样本集中出现高开低走。",
-                "proof": "demo 模式生成可复现验证 artifact；接入真实 observations 后复算 T+1/T+5/T+10/T+20、Rank IC、分位差、MFE/MAE 和失败样本。",
+                "proof": "demo 模式生成可复盘样本结果；接入真实 observations 后复算 T+1/T+5/T+10/T+20、Rank IC、分位差、MFE/MAE 和失败样本。",
             }
         return {
             "idea": idea_text,
@@ -605,7 +1079,7 @@ def _draft_research_from_idea(idea_text: str) -> dict[str, Any]:
         "trigger_condition": f"触发源在 T 日出现政策、订单、价格、海外映射或资金强度后，A股 {theme} 篮子 T+1 不高开过热，并出现量价承接。",
         "avoid_condition": "一字涨停、缩量冲高、同组扩散失败、指数宽度恶化、流动性不足或数据源过期。",
         "invalidation_condition": f"{theme} 主线回落、触发源反转、个股跌破承接位、分位收益转负或失败样本集中出现。",
-        "proof": "demo 模式先生成可见验证 artifact；接入真实 observations 后复算 T+1/T+5/T+10/T+20、Rank IC、分位差、MAE 和失败样本。",
+        "proof": "demo 模式先生成可见样本复盘结果；接入真实 observations 后复算 T+1/T+5/T+10/T+20、Rank IC、分位差、MAE 和失败样本。",
     }
 
 
@@ -661,7 +1135,7 @@ def _research_workflow_for_idea(idea_text: str) -> dict[str, Any]:
                     "data": "Signals 本地数据快照；demo 模式使用确定性 GB200 映射样本，不替代真实回测。",
                     "account": "paper factor account；记录模拟持仓、收益、回撤、暴露和换手。",
                     "portfolio": "美股 AI 硬件篮子只做触发源，A股光互联/液冷/铜连接/PCB/服务器/存储反应池才做观察组合。",
-                    "storage": "实验账本写入 ai_factor_experiment_ledger，发布门禁写入 strategy_snapshot 前。",
+                    "storage": "研究账本写入 ai_factor_experiment_ledger，进入观察池前同步 strategy_snapshot。",
                 },
             }
         return _default_research_workflow()
@@ -713,7 +1187,7 @@ def _research_workflow_for_idea(idea_text: str) -> dict[str, Any]:
             "data": "Signals 本地 Mongo/缓存数据快照；demo 模式使用确定性样本，不替代真实回测。",
             "account": "paper factor account；记录模拟持仓、收益、回撤、暴露和换手。",
             "portfolio": "触发篮子只做信号源，A股反应篮子才做观察组合。",
-            "storage": "实验账本写入 ai_factor_experiment_ledger，发布门禁写入 strategy_snapshot 前。",
+            "storage": "研究账本写入 ai_factor_experiment_ledger，进入观察池前同步 strategy_snapshot。",
         },
     }
 
@@ -894,7 +1368,7 @@ def _default_research_workflow() -> dict[str, Any]:
             "data": "Signals 本地 Mongo/缓存数据快照；美股/A股日历按 as-of 固定。",
             "account": "paper factor account；记录模拟持仓、收益、回撤、暴露和换手。",
             "portfolio": "美股篮子只做触发源，A股反应池才做观察组合。",
-            "storage": "实验账本写入 ai_factor_experiment_ledger，发布门禁写入 strategy_snapshot 前。",
+            "storage": "研究账本写入 ai_factor_experiment_ledger，进入观察池前同步 strategy_snapshot。",
         },
     }
 
@@ -929,9 +1403,17 @@ def _normalize_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _summary(factors: list[dict[str, Any]]) -> dict[str, Any]:
+def _summary(
+    factors: list[dict[str, Any]],
+    candidate_factor_ideas: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    candidate_factor_ideas = candidate_factor_ideas or []
     live = [item for item in factors if _is_live_factor(item)]
     verified = [item for item in factors if _as_dict(item.get("metrics")).get("verified")]
+    mode_counts: dict[str, int] = {}
+    for item in factors + candidate_factor_ideas:
+        mode = str(item.get("research_mode") or item.get("mode") or "unknown")
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
     return {
         "total": len(factors),
         "verified": len(verified),
@@ -939,6 +1421,8 @@ def _summary(factors: list[dict[str, Any]]) -> dict[str, Any]:
         "draft": sum(1 for item in factors if item.get("status") in {"idea", "draft", "specified"}),
         "published": sum(1 for item in factors if item.get("status") == "published"),
         "requires_validation": sum(1 for item in factors if not _as_dict(item.get("metrics")).get("verified")),
+        "candidate_factor_ideas": len(candidate_factor_ideas),
+        "research_modes": mode_counts,
     }
 
 

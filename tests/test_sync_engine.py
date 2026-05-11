@@ -39,6 +39,17 @@ def test_quote_preopen_sleep_wakes_at_auction_start():
     assert SyncEngine._seconds_until_a_quote_preopen(datetime(2026, 5, 6, 9, 1)) == 14 * 60
 
 
+def test_preopen_enables_realtime_board_and_workbench_lanes():
+    engine = object.__new__(SyncEngine)
+
+    for lanes in ({"quote_lane"}, {"board_lane"}, {"workbench_lane"}, {"board_lane", "workbench_lane"}):
+        engine.enabled_lanes = lanes
+        assert engine._quote_preopen_enabled() is True
+
+    engine.enabled_lanes = {"signal_lane"}
+    assert engine._quote_preopen_enabled() is False
+
+
 def test_sunday_schedule_only_on_sunday():
     sunday = datetime(2026, 4, 26, 10, 1)
     friday = datetime(2026, 4, 24, 10, 1)
