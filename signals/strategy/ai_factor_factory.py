@@ -69,6 +69,39 @@ SIGNAL_FIRST_BULLISH_TOKENS = (
     "一买", "二买", "三买", "中枢突破", "突破", "背驰", "macd", "面积收缩",
     "均线多头", "放量", "缩量回踩", "趋势", "买点",
 )
+SIGNAL_FIRST_FALLBACK_THEME = "技术结构共振"
+SIGNAL_FIRST_MIN_EVALUABLE_SAMPLES = 10
+SIGNAL_FIRST_MIN_VALIDATED_SAMPLES = 30
+SIGNAL_FIRST_MAX_CLEAN_SYMBOLS = 50
+SIGNAL_FIRST_MAX_CLEAN_SIGNALS = 200
+SIGNAL_FIRST_REWARD_SPEC = {
+    "mode": "layered_gate",
+    "factor_score_weights": {
+        "rank_ic_score": 0.30,
+        "quantile_spread_score": 0.25,
+        "forward_return_score": 0.20,
+        "mfe_mae_score": 0.10,
+        "cluster_cleanliness_score": 0.10,
+        "sample_robustness_score": 0.05,
+    },
+    "portfolio_score_weights": {
+        "cost_adjusted_return_score": 0.30,
+        "sharpe_or_ir_score": 0.25,
+        "max_drawdown_score": 0.25,
+        "turnover_score": 0.10,
+        "hit_rate_stability_score": 0.10,
+    },
+    "gates": {
+        "min_evaluable_samples": SIGNAL_FIRST_MIN_EVALUABLE_SAMPLES,
+        "min_validated_samples": SIGNAL_FIRST_MIN_VALIDATED_SAMPLES,
+        "rank_ic_must_be_positive": True,
+        "quantile_spread_must_be_positive": True,
+        "cost_adjusted_return_must_be_positive": True,
+        "max_drawdown_floor": -0.15,
+        "turnover_ceiling": 1.5,
+        "intraday_status": "observation_only",
+    },
+}
 
 
 def build_ai_factor_factory(*, db: Any = None, include_sample: bool = True) -> dict[str, Any]:
@@ -79,7 +112,8 @@ def build_ai_factor_factory(*, db: Any = None, include_sample: bool = True) -> d
     factors = _load_factor_docs(db)
     if not factors and include_sample:
         factors = [_sample_factor(now)]
-    candidate_factor_ideas = build_signal_first_candidate_factor_ideas(db=db)
+    rl_environments = build_signal_first_rl_environments(db=db)
+    candidate_factor_ideas = build_signal_first_candidate_factor_ideas(db=db, environments=rl_environments)
 
     active_factor_id = str(factors[0].get("factor_id") or "") if factors else ""
     return _json_safe({
@@ -94,6 +128,9 @@ def build_ai_factor_factory(*, db: Any = None, include_sample: bool = True) -> d
         "factor_registry": {
             "industry_factor.ai_hardware": AI_HARDWARE_FACTOR_FAMILY,
         },
+        "rl_environments": rl_environments,
+        "reward_spec": SIGNAL_FIRST_REWARD_SPEC,
+        "evaluation_summary": _signal_first_evaluation_summary(rl_environments),
         "candidate_factor_ideas": candidate_factor_ideas,
         "factor_idea_queue": candidate_factor_ideas,
         "ideas": factors,
@@ -301,6 +338,7 @@ def run_factor_validation(
     valid_rows, rejected_rows = _enforce_repro_boundary(rows)
     metrics = _compute_single_factor_metrics(valid_rows)
     validation_artifact = _validation_artifact(metrics, valid_rows, rejected_rows)
+    evaluation = _layered_reward_evaluation(metrics, valid_rows, rejected_rows)
     validation_status = "validated" if metrics.get("verified") else "not_enough_samples"
     experiment_id = _experiment_id(factor_id, "validation", str(len(rows)))
     recorder_id = _recorder_id(experiment_id, "alphalens")
@@ -331,6 +369,7 @@ def run_factor_validation(
                 "signals.core.backtest.BacktestReport",
             ],
         },
+        "evaluation": evaluation,
         "failure_samples": validation_artifact["failure_samples"],
         "watchlist_symbols": _watchlist_from_rows(valid_rows),
         "feedback": _feedback(metrics, len(rejected_rows)),
@@ -358,6 +397,100 @@ def run_factor_validation(
             "feedback": report["feedback"],
         },
         "repro_boundary": REPRO_BOUNDARY,
+    })
+    if persist and db is not None:
+        _upsert(db, "ai_factor_experiments", {"factor_id": factor_id}, report)
+        _upsert(db, "ai_factor_experiment_ledger", {"recorder_id": recorder_id}, ledger)
+    return _json_safe({**report, "ledger": ledger})
+
+
+def run_signal_first_environment_validation(
+    *,
+    environment_id: str,
+    observations: Sequence[Mapping[str, Any]] | None = None,
+    db: Any = None,
+    persist: bool = True,
+) -> dict[str, Any]:
+    """Validate a signal-first RL environment from historical signal rows."""
+    now = naive_market_now("A")
+    db = db if db is not None else _get_db_or_none()
+    environments = build_signal_first_rl_environments(db=db)
+    environment = next(
+        (item for item in environments if str(item.get("environment_id") or "") == str(environment_id or "")),
+        None,
+    )
+    if environment is None:
+        environment = _empty_signal_first_environment(environment_id)
+
+    rows = list(observations) if observations is not None else _signal_first_observations_for_environment(
+        db,
+        environment,
+    )
+    valid_rows, rejected_rows = _enforce_repro_boundary(rows)
+    metrics = _compute_single_factor_metrics(valid_rows)
+    validation_artifact = _validation_artifact(metrics, valid_rows, rejected_rows)
+    evaluation = _layered_reward_evaluation(metrics, valid_rows, rejected_rows, environment=environment)
+    reward = _as_dict(evaluation.get("reward"))
+    status = str(reward.get("status") or "not_evaluable")
+    factor_id = _safe_factor_id(str(environment.get("factor_id") or environment.get("environment_id") or environment_id or ""))
+    experiment_id = _experiment_id(factor_id, "signal_first_validation", str(len(rows)))
+    recorder_id = _recorder_id(experiment_id, "signal_first")
+    report = {
+        "_id": factor_id,
+        "factor_id": factor_id,
+        "version": "signal_first",
+        "title": str(environment.get("title") or "Signal-first RL environment"),
+        "hypothesis": str(environment.get("hypothesis") or ""),
+        "research_mode": "signal_first",
+        "factor_origin": "technical_discovery",
+        "factor_family": environment.get("factor_family", {}),
+        "factor_exposures": environment.get("factor_exposures", {}),
+        "environment": environment,
+        "environment_id": str(environment.get("environment_id") or environment_id),
+        "status": status,
+        "approval_status": "not_requested",
+        "live_enabled": False,
+        "updated_at": now,
+        "last_verified_at": now.isoformat(timespec="seconds") if status == "validated" else "",
+        "metrics": metrics,
+        "validation": {
+            "status": status,
+            "verified": status == "validated",
+            "mode": "signal_first",
+            "sample_source": "observations" if observations is not None else SIGNAL_FIRST_COLLECTION,
+            "sample_count": int(metrics.get("sample_count") or 0),
+            "rejected_sample_count": len(rejected_rows),
+            "rejected_reason": "future_leak_boundary" if rejected_rows else "",
+            "rejected_future_leak": validation_artifact["rejected_future_leak"],
+            "artifact": validation_artifact,
+        },
+        "evaluation": evaluation,
+        "failure_samples": validation_artifact["failure_samples"],
+        "watchlist_symbols": _watchlist_from_rows(valid_rows),
+        "feedback": _feedback(metrics, len(rejected_rows)),
+        "paper_account": {
+            **validation_artifact["paper_account"],
+            "enabled": status in {"validated", "observation_only"},
+            "mode": "paper_observation",
+            "no_auto_order": True,
+        },
+        "reproducibility": {
+            **_default_reproducibility(now),
+            "as_of_boundary": "Signal rows generated on T can only be scored against T+1 and later bars.",
+            "data_snapshot": _data_snapshot(valid_rows, now),
+            "rejected_future_leak_rows": len(rejected_rows),
+        },
+        "experiment_id": experiment_id,
+        "recorder_id": recorder_id,
+    }
+    ledger = _ledger_doc(report, stage="signal_first_feedback_validation", status="FINISHED", metrics=metrics, artifacts={
+        "environment": environment,
+        "evaluation": evaluation,
+        "validation_report": {
+            "metrics": metrics,
+            "artifact": validation_artifact,
+            "failure_samples": report["failure_samples"],
+        },
     })
     if persist and db is not None:
         _upsert(db, "ai_factor_experiments", {"factor_id": factor_id}, report)
@@ -430,6 +563,19 @@ def publish_factor(
             "status": "rejected",
             "live_enabled": False,
             "error": "factor_requires_verified_validation_before_publish",
+        })
+    reward = _as_dict(_as_dict(factor.get("evaluation")).get("reward"))
+    if (
+        str(factor.get("research_mode") or "") == "signal_first"
+        and reward
+        and str(reward.get("status") or "") != "validated"
+    ):
+        return _json_safe({
+            "factor_id": factor_id,
+            "status": "rejected",
+            "live_enabled": False,
+            "error": "factor_reward_gate_not_validated",
+            "blocking_gates": reward.get("blocking_gates", []),
         })
     now = naive_market_now("A")
     publication = {
@@ -551,24 +697,25 @@ def build_ai_factor_strategy_candidates(*, db: Any = None) -> list[dict[str, Any
     return candidates
 
 
-def build_signal_first_candidate_factor_ideas(*, db: Any = None, limit: int = 12) -> list[dict[str, Any]]:
-    """Discover candidate industry factors from technical signals.
-
-    These ideas are intentionally not live factors.  They must go through
-    research review and sample replay before affecting strategy candidates.
-    """
-    rows = _load_recent_technical_signal_rows(db)
+def build_signal_first_rl_environments(*, db: Any = None, limit: int = 24) -> list[dict[str, Any]]:
+    """Build clean signal-first RL environments from technical signal rows."""
+    rows = _load_recent_technical_signal_rows(db, limit=1500)
     if not rows:
         return []
+    attribution_index = _load_signal_first_attribution_index(db)
     clusters: dict[str, dict[str, Any]] = {}
     for row in rows:
         if not _is_constructive_technical_signal(row):
             continue
-        theme = _technical_signal_theme(row)
-        symbol = str(row.get("symbol") or row.get("raw_code") or row.get("code") or "").strip()
-        signal_type = str(row.get("signal_type") or row.get("type") or row.get("reason") or "").strip()
-        cluster = clusters.setdefault(theme, {
-            "theme": theme,
+        key = _signal_first_environment_key(row)
+        cluster = clusters.setdefault(key, {
+            "environment_id": key,
+            "theme": _technical_signal_theme(row),
+            "signal_family": str(row.get("signal_family") or "unknown"),
+            "signal_type_family": _signal_type_family(row),
+            "freq_bucket": _freq_bucket(row),
+            "resonance_grade": _resonance_grade_from_row(row),
+            "scan_scope": str(row.get("scan_scope") or "unknown"),
             "symbols": [],
             "signal_types": [],
             "source_signals": [],
@@ -576,6 +723,8 @@ def build_signal_first_candidate_factor_ideas(*, db: Any = None, limit: int = 12
             "confidence_total": 0.0,
             "count": 0,
         })
+        symbol = str(row.get("symbol") or row.get("raw_code") or row.get("code") or "").strip()
+        signal_type = str(row.get("signal_type") or row.get("type") or row.get("reason") or "").strip()
         if symbol and symbol not in cluster["symbols"]:
             cluster["symbols"].append(symbol)
         if signal_type and signal_type not in cluster["signal_types"]:
@@ -585,26 +734,129 @@ def build_signal_first_candidate_factor_ideas(*, db: Any = None, limit: int = 12
         cluster["confidence_total"] += _float(row.get("confidence"), 0.0) or 0.0
         cluster["count"] += 1
 
-    ideas: list[dict[str, Any]] = []
+    environments: list[dict[str, Any]] = []
     for cluster in clusters.values():
-        if cluster["count"] <= 0:
+        count = int(cluster["count"])
+        if count <= 0:
             continue
         symbol_count = len(cluster["symbols"])
+        avg_score = cluster["score_total"] / max(1, count)
+        avg_confidence = cluster["confidence_total"] / max(1, count)
+        raw_theme = str(cluster["theme"])
+        attribution = _infer_signal_first_attribution(
+            attribution_index,
+            cluster["symbols"],
+            fallback_theme=raw_theme,
+        )
+        theme = str(attribution.get("primary_theme") or raw_theme)
+        family_id = f"candidate_industry_factor.{_safe_factor_id(theme)}"
+        cleanliness = _cluster_cleanliness(
+            theme=theme,
+            symbol_count=symbol_count,
+            signal_count=count,
+            signal_type_count=len(cluster["signal_types"]),
+        )
+        status = "pending_validation"
+        blocking_gates: list[str] = []
+        if str(cluster["scan_scope"]).lower().startswith("intraday"):
+            status = "observation_only"
+            blocking_gates.append("intraday_signal_first_observation_only")
+        if _is_overbroad_signal_first_cluster(theme, symbol_count, count):
+            status = "not_evaluable"
+            blocking_gates.append("overbroad_cluster")
+        technical_score = _round(min(100.0, max(0.0, avg_score + avg_confidence * 20 + symbol_count * 4)), 2)
+        environments.append({
+            "environment_id": str(cluster["environment_id"]),
+            "factor_id": _safe_factor_id(str(cluster["environment_id"])),
+            "version": "signal_first_env_v1",
+            "title": _signal_first_environment_title({**cluster, "theme": theme}),
+            "hypothesis": f"全市场技术信号在「{theme}」的 {cluster['signal_type_family']} / {cluster['freq_bucket']} / {cluster['resonance_grade']} 环境中聚集，可能形成可验证因子。",
+            "research_mode": "signal_first",
+            "factor_origin": "technical_discovery",
+            "status": status,
+            "live_enabled": False,
+            "blocking_gates": blocking_gates,
+            "split_keys": {
+                "signal_family": cluster["signal_family"],
+                "signal_type_family": cluster["signal_type_family"],
+                "freq_bucket": cluster["freq_bucket"],
+                "resonance_grade": cluster["resonance_grade"],
+                "scan_scope": cluster["scan_scope"],
+                "theme": theme,
+                "raw_theme": raw_theme,
+            },
+            "attribution": attribution,
+            "factor_family": {
+                "family_id": family_id,
+                "label": f"{theme}候选技术环境",
+                "mode": "signal_first",
+                "primary_style": "industry_beta" if symbol_count >= 3 else "potential_expectation_alpha",
+            },
+            "factor_exposures": {
+                "primary": family_id,
+                "mode": "signal_first",
+                "origin": "technical_discovery",
+                "theme": theme,
+                "symbols": cluster["symbols"][:20],
+                "groups": [theme],
+            },
+            "environment_metrics": {
+                "source_signal_count": count,
+                "unique_symbol_count": symbol_count,
+                "signal_type_count": len(cluster["signal_types"]),
+                "avg_source_score": _round(avg_score, 4),
+                "avg_confidence": _round(avg_confidence, 4),
+                "cluster_cleanliness": cleanliness,
+                "technical_confirmation_score": technical_score,
+            },
+            "validation_profile": _validation_profile(),
+            "risk_overlay_flags": _risk_overlay_flags_for_factor({"research_mode": "signal_first"}),
+            "source_signal_types": cluster["signal_types"][:8],
+            "source_signals": cluster["source_signals"][:12],
+            "next_action": "自动生成 forward-return observations；通过分层 reward 后再进入人工复核。",
+        })
+    return sorted(
+        environments,
+        key=lambda item: (
+            _float(_as_dict(item.get("environment_metrics")).get("cluster_cleanliness"), 0.0),
+            _float(_as_dict(item.get("environment_metrics")).get("technical_confirmation_score"), 0.0),
+            _float(_as_dict(item.get("environment_metrics")).get("source_signal_count"), 0.0),
+        ),
+        reverse=True,
+    )[:limit]
+
+
+def build_signal_first_candidate_factor_ideas(
+    *,
+    db: Any = None,
+    environments: list[dict[str, Any]] | None = None,
+    limit: int = 12,
+) -> list[dict[str, Any]]:
+    """Discover candidate industry factors from technical signals.
+
+    These ideas are intentionally not live factors.  They must go through
+    research review and sample replay before affecting strategy candidates.
+    """
+    environments = environments if environments is not None else build_signal_first_rl_environments(db=db)
+    ideas: list[dict[str, Any]] = []
+    for environment in _candidate_idea_sources(environments):
+        metrics = _as_dict(environment.get("environment_metrics"))
+        split_keys = _as_dict(environment.get("split_keys"))
+        symbol_count = int(metrics.get("unique_symbol_count") or 0)
         classification = "industry_beta" if symbol_count >= 3 else "potential_expectation_alpha"
-        theme = str(cluster["theme"])
-        factor_id = _safe_factor_id(f"signal_first:{theme}:{classification}")
-        avg_score = cluster["score_total"] / max(1, cluster["count"])
-        avg_confidence = cluster["confidence_total"] / max(1, cluster["count"])
-        technical_score = _round(min(100.0, max(0.0, avg_score + avg_confidence * 20 + symbol_count * 6)), 2)
+        theme = str(split_keys.get("theme") or environment.get("title") or SIGNAL_FIRST_FALLBACK_THEME)
+        factor_id = str(environment.get("factor_id") or _safe_factor_id(f"signal_first:{theme}:{classification}"))
         family_id = f"candidate_industry_factor.{_safe_factor_id(theme)}"
         title_suffix = "技术扩散因子" if classification == "industry_beta" else "预期差技术因子"
         idea = {
             "factor_id": factor_id,
             "version": "idea",
             "title": f"{theme}{title_suffix}",
-            "hypothesis": f"全市场技术信号在「{theme}」聚集，可能指向新的行业 beta 或预期 alpha。",
+            "hypothesis": str(environment.get("hypothesis") or f"全市场技术信号在「{theme}」聚集，可能指向新的行业 beta 或预期 alpha。"),
             "research_mode": "signal_first",
             "factor_origin": "technical_discovery",
+            "environment_id": environment.get("environment_id", ""),
+            "rl_environment": environment,
             "factor_family": {
                 "family_id": family_id,
                 "label": f"{theme}候选行业因子",
@@ -624,10 +876,10 @@ def build_signal_first_candidate_factor_ideas(*, db: Any = None, limit: int = 12
             },
             "technical_confirmation": {
                 **_technical_confirmation_profile(),
-                "source_signal_types": cluster["signal_types"][:8],
-                "source_signal_count": cluster["count"],
+                "source_signal_types": environment.get("source_signal_types", []),
+                "source_signal_count": int(metrics.get("source_signal_count") or 0),
                 "unique_symbol_count": symbol_count,
-                "technical_confirmation_score": technical_score,
+                "technical_confirmation_score": _round(metrics.get("technical_confirmation_score"), 2),
             },
             "strategy_integration": {
                 **_strategy_integration_profile(),
@@ -638,7 +890,7 @@ def build_signal_first_candidate_factor_ideas(*, db: Any = None, limit: int = 12
                 "mode": "signal_first",
                 "origin": "technical_discovery",
                 "theme": theme,
-                "symbols": cluster["symbols"][:20],
+                "symbols": _string_list(_as_dict(environment.get("factor_exposures")).get("symbols"))[:20],
                 "groups": [theme],
             },
             "validation_profile": _validation_profile(),
@@ -652,12 +904,12 @@ def build_signal_first_candidate_factor_ideas(*, db: Any = None, limit: int = 12
                 "verified": False,
                 "required_before_live": True,
             },
-            "source_signals": cluster["source_signals"][:10],
+            "source_signals": environment.get("source_signals", [])[:10],
             "beta_alpha_assessment": {
                 "classification": classification,
-                "industry_beta_score": _round(min(100.0, symbol_count * 18 + avg_confidence * 20), 2),
-                "expectation_alpha_score": _round(min(100.0, max(20.0, avg_score + (4 - min(symbol_count, 4)) * 8)), 2),
-                "technical_confirmation_score": technical_score,
+                "industry_beta_score": _round(min(100.0, symbol_count * 18 + _float(metrics.get("avg_confidence"), 0.0) * 20), 2),
+                "expectation_alpha_score": _round(min(100.0, max(20.0, _float(metrics.get("avg_source_score"), 0.0) + (4 - min(symbol_count, 4)) * 8)), 2),
+                "technical_confirmation_score": _round(metrics.get("technical_confirmation_score"), 2),
             },
             "next_action": "进入 Agent OS 复核：补产业链/事件证据，再创建 research_first 因子草稿和复盘样本。",
             "ai_explanation": [
@@ -672,6 +924,508 @@ def build_signal_first_candidate_factor_ideas(*, db: Any = None, limit: int = 12
         key=lambda item: _float(_as_dict(item.get("technical_confirmation")).get("technical_confirmation_score"), 0.0),
         reverse=True,
     )[:limit]
+
+
+def _signal_first_environment_key(row: Mapping[str, Any]) -> str:
+    parts = [
+        "signal_first",
+        _safe_factor_id(_technical_signal_theme(row)),
+        _safe_factor_id(str(row.get("signal_family") or "unknown")),
+        _signal_type_family(row),
+        _freq_bucket(row),
+        _resonance_grade_from_row(row),
+        _safe_factor_id(str(row.get("scan_scope") or "unknown")),
+    ]
+    return ":".join(parts)
+
+
+def _candidate_idea_sources(environments: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    passthrough: list[dict[str, Any]] = []
+    for environment in environments:
+        split_keys = _as_dict(environment.get("split_keys"))
+        theme = str(split_keys.get("theme") or SIGNAL_FIRST_FALLBACK_THEME)
+        if theme == SIGNAL_FIRST_FALLBACK_THEME:
+            passthrough.append(dict(environment))
+            continue
+        group = grouped.setdefault(theme, {
+            "environment_id": f"signal_first:{_safe_factor_id(theme)}:aggregate",
+            "factor_id": _safe_factor_id(f"signal_first:{_safe_factor_id(theme)}:aggregate"),
+            "title": f"{theme}技术扩散环境",
+            "hypothesis": f"全市场技术信号在「{theme}」聚集，可能指向新的行业 beta 或预期 alpha。",
+            "research_mode": "signal_first",
+            "factor_origin": "technical_discovery",
+            "status": "pending_validation",
+            "split_keys": {"theme": theme, "signal_family": "aggregate", "signal_type_family": "aggregate", "freq_bucket": "aggregate", "resonance_grade": "aggregate", "scan_scope": "aggregate"},
+            "factor_exposures": {"primary": f"candidate_industry_factor.{_safe_factor_id(theme)}", "symbols": [], "groups": [theme]},
+            "source_signal_types": [],
+            "source_signals": [],
+            "environment_metrics": {
+                "source_signal_count": 0,
+                "unique_symbol_count": 0,
+                "signal_type_count": 0,
+                "avg_source_score": 0.0,
+                "avg_confidence": 0.0,
+                "cluster_cleanliness": 1.0,
+                "technical_confirmation_score": 0.0,
+            },
+        })
+        group_metrics = group.get("environment_metrics")
+        if not isinstance(group_metrics, dict):
+            group_metrics = {
+                "source_signal_count": 0,
+                "unique_symbol_count": 0,
+                "signal_type_count": 0,
+                "avg_source_score": 0.0,
+                "avg_confidence": 0.0,
+                "cluster_cleanliness": 1.0,
+                "technical_confirmation_score": 0.0,
+            }
+            group["environment_metrics"] = group_metrics
+        env_metrics = _as_dict(environment.get("environment_metrics"))
+        factor_exposures = group.get("factor_exposures")
+        if not isinstance(factor_exposures, dict):
+            factor_exposures = {"primary": f"candidate_industry_factor.{_safe_factor_id(theme)}", "symbols": [], "groups": [theme]}
+            group["factor_exposures"] = factor_exposures
+        group_symbols = factor_exposures.setdefault("symbols", [])
+        for symbol in _string_list(_as_dict(environment.get("factor_exposures")).get("symbols")):
+            if symbol not in group_symbols:
+                group_symbols.append(symbol)
+        for signal_type in _string_list(environment.get("source_signal_types")):
+            if signal_type not in group["source_signal_types"]:
+                group["source_signal_types"].append(signal_type)
+        group["source_signals"].extend(_as_list(environment.get("source_signals"))[:8])
+        group_metrics["source_signal_count"] += int(env_metrics.get("source_signal_count") or 0)
+        group_metrics["unique_symbol_count"] = len(group_symbols)
+        group_metrics["signal_type_count"] = len(group["source_signal_types"])
+        group_metrics["avg_source_score"] = max(
+            _float(group_metrics.get("avg_source_score"), 0.0) or 0.0,
+            _float(env_metrics.get("avg_source_score"), 0.0) or 0.0,
+        )
+        group_metrics["avg_confidence"] = max(
+            _float(group_metrics.get("avg_confidence"), 0.0) or 0.0,
+            _float(env_metrics.get("avg_confidence"), 0.0) or 0.0,
+        )
+        group_metrics["cluster_cleanliness"] = min(
+            _float(group_metrics.get("cluster_cleanliness"), 1.0) or 1.0,
+            _float(env_metrics.get("cluster_cleanliness"), 1.0) or 1.0,
+        )
+        group_metrics["technical_confirmation_score"] = max(
+            _float(group_metrics.get("technical_confirmation_score"), 0.0) or 0.0,
+            _float(env_metrics.get("technical_confirmation_score"), 0.0) or 0.0,
+        )
+    return list(grouped.values()) + passthrough
+
+
+def _signal_type_family(row: Mapping[str, Any]) -> str:
+    text = str(row.get("signal_type") or row.get("type") or row.get("reason") or "").lower()
+    if "macd" in text:
+        return "macd"
+    if "背驰" in text:
+        return "divergence"
+    if "一买" in text or "二买" in text or "三买" in text:
+        return "chan_buy"
+    if "一卖" in text or "二卖" in text or "三卖" in text or "卖" in text:
+        return "chan_sell"
+    if "缺口" in text or "gap" in text:
+        return "gap"
+    if "形态" in text:
+        return "pattern"
+    if "趋势" in text or "突破" in text:
+        return "trend_breakout"
+    return _safe_factor_id(text or "other")[:32]
+
+
+def _freq_bucket(row: Mapping[str, Any]) -> str:
+    text = str(row.get("freq") or "").strip().lower()
+    if text in {"周线", "weekly", "w", "1w"}:
+        return "weekly"
+    if text in {"日线", "daily", "d", "1d"}:
+        return "daily"
+    if text in {"30分钟", "30min", "30m", "f30"}:
+        return "intraday_30m"
+    if text in {"15分钟", "15min", "15m", "f15"}:
+        return "intraday_15m"
+    if text in {"5分钟", "5min", "5m", "f5"}:
+        return "intraday_5m"
+    return _safe_factor_id(text or "unknown")
+
+
+def _resonance_grade_from_row(row: Mapping[str, Any]) -> str:
+    context = _as_dict(row.get("resonance_context"))
+    grade = str(context.get("grade") or "").strip()
+    return _safe_factor_id(grade or "unknown")
+
+
+def _signal_first_environment_title(cluster: Mapping[str, Any]) -> str:
+    return (
+        f"{cluster.get('theme') or SIGNAL_FIRST_FALLBACK_THEME} / "
+        f"{cluster.get('signal_type_family') or 'technical'} / "
+        f"{cluster.get('freq_bucket') or 'freq'} / "
+        f"{cluster.get('resonance_grade') or 'resonance'}"
+    )
+
+
+def _cluster_cleanliness(*, theme: str, symbol_count: int, signal_count: int, signal_type_count: int) -> float:
+    base = 0.95 if theme != SIGNAL_FIRST_FALLBACK_THEME else 0.62
+    symbol_penalty = max(0.0, symbol_count - 25) / 120
+    signal_penalty = max(0.0, signal_count - 80) / 500
+    type_penalty = max(0.0, signal_type_count - 4) * 0.035
+    return _round(max(0.05, min(1.0, base - symbol_penalty - signal_penalty - type_penalty)), 4)
+
+
+def _is_overbroad_signal_first_cluster(theme: str, symbol_count: int, signal_count: int) -> bool:
+    if theme != SIGNAL_FIRST_FALLBACK_THEME:
+        return False
+    return symbol_count > SIGNAL_FIRST_MAX_CLEAN_SYMBOLS or signal_count > SIGNAL_FIRST_MAX_CLEAN_SIGNALS
+
+
+def _empty_signal_first_environment(environment_id: str) -> dict[str, Any]:
+    return {
+        "environment_id": str(environment_id or ""),
+        "factor_id": _safe_factor_id(str(environment_id or "")),
+        "title": "Unknown signal-first environment",
+        "research_mode": "signal_first",
+        "factor_origin": "technical_discovery",
+        "status": "not_evaluable",
+        "blocking_gates": ["environment_not_found"],
+        "split_keys": {},
+        "environment_metrics": {"cluster_cleanliness": 0.0, "source_signal_count": 0, "unique_symbol_count": 0},
+        "source_signals": [],
+    }
+
+
+def _signal_first_evaluation_summary(environments: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    for item in environments:
+        status = str(item.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    clean_scores = [
+        _float(_as_dict(item.get("environment_metrics")).get("cluster_cleanliness"), 0.0) or 0.0
+        for item in environments
+    ]
+    return {
+        "environment_count": len(environments),
+        "status_counts": status_counts,
+        "avg_cluster_cleanliness": _round(sum(clean_scores) / len(clean_scores), 4) if clean_scores else 0.0,
+        "overbroad_count": status_counts.get("not_evaluable", 0),
+        "reward_mode": SIGNAL_FIRST_REWARD_SPEC["mode"],
+    }
+
+
+def _signal_first_observations_for_environment(db: Any, environment: Mapping[str, Any]) -> list[dict[str, Any]]:
+    if db is None:
+        return []
+    environment_id = str(environment.get("environment_id") or "")
+    rows = [
+        row for row in _load_recent_technical_signal_rows(db, limit=2500)
+        if _signal_first_environment_key(row) == environment_id
+    ]
+    observations: list[dict[str, Any]] = []
+    group = str(_as_dict(environment.get("split_keys")).get("theme") or SIGNAL_FIRST_FALLBACK_THEME)
+    for row in rows:
+        if str(row.get("scan_scope") or "").lower().startswith("intraday"):
+            continue
+        symbol = str(row.get("symbol") or row.get("raw_code") or row.get("code") or "").strip()
+        source_date = _parse_date(row.get("as_of") or row.get("dt") or row.get("updated_at"))
+        if not symbol or source_date is None:
+            continue
+        returns = _forward_returns_from_bars(db, symbol, source_date)
+        if not returns:
+            continue
+        observations.append({
+            "factor_id": environment_id,
+            "source_date": source_date.isoformat(),
+            "cn_trade_date": returns["trade_date"],
+            "symbol": symbol,
+            "name": str(row.get("name") or row.get("symbol_name") or symbol),
+            "group": group,
+            "factor_value": _row_signal_strength(row),
+            "return_t1": returns.get("return_t1"),
+            "return_t5": returns.get("return_t5"),
+            "return_t10": returns.get("return_t10"),
+            "return_t20": returns.get("return_t20"),
+            "mfe": returns.get("mfe"),
+            "mae": returns.get("mae"),
+            "sample_mode": "signal_first_auto",
+        })
+    return observations
+
+
+def _row_signal_strength(row: Mapping[str, Any]) -> float:
+    score = _float(row.get("total_score") or row.get("score"), 0.0) or 0.0
+    confidence = _float(row.get("confidence"), 0.0) or 0.0
+    if score:
+        return _round(max(0.0, min(1.0, score / 300.0)), 4)
+    return _round(max(0.0, min(1.0, confidence)), 4)
+
+
+def _forward_returns_from_bars(db: Any, symbol: str, source_date: date) -> dict[str, Any]:
+    docs = _daily_bar_docs(db, symbol)
+    if not docs:
+        return {}
+    dated = []
+    for doc in docs:
+        dt = _parse_date(doc.get("dt") or doc.get("date"))
+        close = _float(doc.get("close"))
+        high = _float(doc.get("high"), close)
+        low = _float(doc.get("low"), close)
+        if dt is None or close is None:
+            continue
+        dated.append({"dt": dt, "close": close, "high": high, "low": low})
+    dated.sort(key=lambda item: item["dt"])
+    trade_index = next((idx for idx, item in enumerate(dated) if item["dt"] > source_date), None)
+    if trade_index is None:
+        return {}
+    base = _float(dated[trade_index]["close"])
+    if not base:
+        return {}
+    out: dict[str, Any] = {"trade_date": dated[trade_index]["dt"].isoformat()}
+    for window in (1, 5, 10, 20):
+        target = min(trade_index + window, len(dated) - 1)
+        if target <= trade_index:
+            continue
+        out[f"return_t{window}"] = _round(dated[target]["close"] / base - 1.0, 4)
+    path = dated[trade_index:min(len(dated), trade_index + 6)]
+    if path:
+        highs = [_float(item.get("high"), item.get("close")) for item in path]
+        lows = [_float(item.get("low"), item.get("close")) for item in path]
+        out["mfe"] = _round(max(value for value in highs if value is not None) / base - 1.0, 4)
+        out["mae"] = _round(min(value for value in lows if value is not None) / base - 1.0, 4)
+    return out
+
+
+def _daily_bar_docs(db: Any, symbol: str) -> list[dict[str, Any]]:
+    query_values = _symbol_query_values_for_factor(symbol)
+    try:
+        cursor = db["bars"].find({
+            "meta.symbol": {"$in": query_values},
+            "meta.freq": {"$in": ["日线", "daily", "D", "1d"]},
+        }).sort([("dt", 1)])
+        docs = [dict(item) for item in cursor]
+    except Exception:
+        docs = []
+    if docs:
+        return docs
+    try:
+        return [dict(item) for item in db["bars"].find({"symbol": {"$in": query_values}}).sort([("dt", 1)])]
+    except Exception:
+        return []
+
+
+def _symbol_query_values_for_factor(symbol: str) -> list[str]:
+    raw = str(symbol or "").strip()
+    upper = raw.upper()
+    values = [raw]
+    if "." in raw:
+        values.append(raw.split(".", 1)[-1])
+    digits = "".join(ch for ch in upper if ch.isdigit())
+    if len(digits) == 6:
+        values.extend([digits, f"SH.{digits}" if digits.startswith(("6", "9")) else f"SZ.{digits}"])
+    return _unique_strings(values)
+
+
+def _layered_reward_evaluation(
+    metrics: Mapping[str, Any],
+    valid_rows: Sequence[Mapping[str, Any]],
+    rejected_rows: Sequence[Mapping[str, Any]],
+    *,
+    environment: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    environment = environment or {}
+    factor_eval = _factor_evaluation(metrics, environment)
+    portfolio_eval = _portfolio_evaluation(metrics, valid_rows)
+    reward = _layered_reward(metrics, factor_eval, portfolio_eval, valid_rows, rejected_rows, environment)
+    return {
+        "methodology": "Alphalens-style factor predictive evaluation first; Qlib-style portfolio risk gate second.",
+        "factor_evaluation": factor_eval,
+        "portfolio_evaluation": portfolio_eval,
+        "reward": reward,
+    }
+
+
+def _factor_evaluation(metrics: Mapping[str, Any], environment: Mapping[str, Any]) -> dict[str, Any]:
+    env_metrics = _as_dict(environment.get("environment_metrics"))
+    rank_ic = _float(metrics.get("rank_ic"), 0.0) or 0.0
+    spread = _float(metrics.get("long_short_quantile_spread") or metrics.get("long_short_return"), 0.0) or 0.0
+    t5 = _float(metrics.get("avg_return_t5"), 0.0) or 0.0
+    t20 = _float(metrics.get("avg_return_t20"), t5) or t5
+    mfe = _float(metrics.get("mfe"), 0.0) or 0.0
+    mae = _float(metrics.get("mae"), 0.0) or 0.0
+    sample_count = int(_float(metrics.get("sample_count"), 0) or 0)
+    cleanliness = _float(env_metrics.get("cluster_cleanliness"), 0.7)
+    rank_ic_score = _positive_score(rank_ic, 0.12)
+    spread_score = _positive_score(spread, 0.05)
+    forward_score = _round((_positive_score(t5, 0.03) + _positive_score(t20, 0.06)) / 2, 2)
+    mfe_score = _round(min(100.0, max(0.0, _positive_score(mfe, 0.08) * 0.7 + max(0.0, 1 - abs(mae) / 0.15) * 30)), 2)
+    cleanliness_score = _round(max(0.0, min(100.0, (cleanliness or 0.0) * 100)), 2)
+    robustness_score = _round(min(100.0, sample_count / SIGNAL_FIRST_MIN_VALIDATED_SAMPLES * 100), 2)
+    factor_score = _round(
+        rank_ic_score * 0.30
+        + spread_score * 0.25
+        + forward_score * 0.20
+        + mfe_score * 0.10
+        + cleanliness_score * 0.10
+        + robustness_score * 0.05,
+        2,
+    )
+    return {
+        "rank_ic": _round(rank_ic, 4),
+        "quantile_spread": _round(spread, 4),
+        "avg_return_t5": _round(t5, 4),
+        "avg_return_t20": _round(t20, 4),
+        "mfe": _round(mfe, 4),
+        "mae": _round(mae, 4),
+        "cluster_cleanliness": _round(cleanliness, 4),
+        "sample_count": sample_count,
+        "component_scores": {
+            "rank_ic_score": rank_ic_score,
+            "quantile_spread_score": spread_score,
+            "forward_return_score": forward_score,
+            "mfe_mae_score": mfe_score,
+            "cluster_cleanliness_score": cleanliness_score,
+            "sample_robustness_score": robustness_score,
+        },
+        "factor_score": factor_score,
+    }
+
+
+def _portfolio_evaluation(metrics: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    paper = _paper_account_from_rows(rows, {**dict(metrics), "verified": bool(rows)})
+    turnover = _float(metrics.get("turnover"), 0.0) or 0.0
+    total_return = _float(paper.get("total_return"), 0.0) or 0.0
+    cost_adjusted_return = _round(total_return - turnover * 0.002, 4)
+    returns = [_row_float(row, "return_t5", "forward_return_t5") for row in rows]
+    returns = [value for value in returns if value is not None]
+    sharpe = _sharpe_like(returns)
+    information_ratio = sharpe
+    max_drawdown = _float(paper.get("max_drawdown"), 0.0) or 0.0
+    hit_rate = _float(metrics.get("win_rate"), 0.0) or 0.0
+    portfolio_score = _round(
+        _positive_score(cost_adjusted_return, 0.06) * 0.30
+        + _positive_score(max(sharpe, information_ratio), 1.5) * 0.25
+        + _drawdown_score(max_drawdown) * 0.25
+        + _turnover_score(turnover) * 0.10
+        + max(0.0, min(100.0, hit_rate * 100)) * 0.10,
+        2,
+    )
+    return {
+        "cost_adjusted_return": cost_adjusted_return,
+        "sharpe": _round(sharpe, 4),
+        "information_ratio": _round(information_ratio, 4),
+        "max_drawdown": _round(max_drawdown, 4),
+        "turnover": _round(turnover, 4),
+        "hit_rate": _round(hit_rate, 4),
+        "component_scores": {
+            "cost_adjusted_return_score": _positive_score(cost_adjusted_return, 0.06),
+            "sharpe_or_ir_score": _positive_score(max(sharpe, information_ratio), 1.5),
+            "max_drawdown_score": _drawdown_score(max_drawdown),
+            "turnover_score": _turnover_score(turnover),
+            "hit_rate_stability_score": max(0.0, min(100.0, hit_rate * 100)),
+        },
+        "portfolio_score": portfolio_score,
+    }
+
+
+def _layered_reward(
+    metrics: Mapping[str, Any],
+    factor_eval: Mapping[str, Any],
+    portfolio_eval: Mapping[str, Any],
+    valid_rows: Sequence[Mapping[str, Any]],
+    rejected_rows: Sequence[Mapping[str, Any]],
+    environment: Mapping[str, Any],
+) -> dict[str, Any]:
+    sample_count = int(_float(metrics.get("sample_count"), 0) or 0)
+    factor_score = _float(factor_eval.get("factor_score"), 0.0) or 0.0
+    portfolio_score = _float(portfolio_eval.get("portfolio_score"), 0.0) or 0.0
+    blocking_gates = list(environment.get("blocking_gates") or [])
+    if rejected_rows and not valid_rows:
+        blocking_gates.append("future_leak")
+    if sample_count < SIGNAL_FIRST_MIN_EVALUABLE_SAMPLES:
+        blocking_gates.append("insufficient_samples")
+    if _float(factor_eval.get("rank_ic"), 0.0) <= 0:
+        blocking_gates.append("rank_ic_not_positive")
+    if _float(factor_eval.get("quantile_spread"), 0.0) <= 0:
+        blocking_gates.append("quantile_spread_not_positive")
+    if _float(portfolio_eval.get("cost_adjusted_return"), 0.0) <= 0:
+        blocking_gates.append("cost_adjusted_return_not_positive")
+    if _float(portfolio_eval.get("max_drawdown"), 0.0) < -0.15:
+        blocking_gates.append("max_drawdown_gate_failed")
+    if _float(portfolio_eval.get("turnover"), 0.0) > 1.5:
+        blocking_gates.append("turnover_gate_failed")
+    blocking_gates = _unique_strings(blocking_gates)
+
+    if "future_leak" in blocking_gates or "overbroad_cluster" in blocking_gates or "insufficient_samples" in blocking_gates:
+        status = "not_evaluable"
+        final_reward = min(40.0, factor_score * 0.4)
+    elif str(environment.get("status") or "") == "observation_only" or sample_count < SIGNAL_FIRST_MIN_VALIDATED_SAMPLES:
+        status = "observation_only"
+        final_reward = min(60.0, factor_score * 0.75 + portfolio_score * 0.25)
+    elif any(gate in blocking_gates for gate in ("rank_ic_not_positive", "quantile_spread_not_positive")):
+        status = "rejected"
+        final_reward = min(50.0, factor_score * 0.4)
+    elif any(gate in blocking_gates for gate in ("cost_adjusted_return_not_positive", "max_drawdown_gate_failed", "turnover_gate_failed")):
+        status = "observation_only"
+        final_reward = min(60.0, factor_score * 0.75 + portfolio_score * 0.25)
+    else:
+        status = "validated"
+        final_reward = factor_score * 0.70 + portfolio_score * 0.30
+
+    return {
+        "factor_score": _round(factor_score, 2),
+        "portfolio_score": _round(portfolio_score, 2),
+        "final_reward": _round(max(-100.0, min(100.0, final_reward)), 2),
+        "status": status,
+        "blocking_gates": blocking_gates,
+        "primary_reason": _reward_primary_reason(status, blocking_gates),
+    }
+
+
+def _reward_primary_reason(status: str, gates: Sequence[str]) -> str:
+    if gates:
+        return str(gates[0])
+    if status == "validated":
+        return "factor_predictive_power_and_portfolio_gate_passed"
+    if status == "observation_only":
+        return "factor_requires_more_samples_or_portfolio_confirmation"
+    return status
+
+
+def _positive_score(value: Any, target: float) -> float:
+    numeric = _float(value, 0.0) or 0.0
+    if numeric <= 0 or target <= 0:
+        return 0.0
+    return _round(min(100.0, numeric / target * 100), 2)
+
+
+def _drawdown_score(max_drawdown: Any) -> float:
+    drawdown = _float(max_drawdown, 0.0) or 0.0
+    if drawdown >= -0.05:
+        return 100.0
+    if drawdown <= -0.25:
+        return 0.0
+    return _round((0.25 + drawdown) / 0.20 * 100, 2)
+
+
+def _turnover_score(turnover: Any) -> float:
+    value = _float(turnover, 0.0) or 0.0
+    if value <= 0.3:
+        return 100.0
+    if value >= 1.5:
+        return 0.0
+    return _round((1.5 - value) / 1.2 * 100, 2)
+
+
+def _sharpe_like(values: Sequence[float]) -> float:
+    filtered = [value for value in values if value is not None and math.isfinite(value)]
+    if len(filtered) < 2:
+        return 0.0
+    mean = sum(filtered) / len(filtered)
+    variance = sum((value - mean) ** 2 for value in filtered) / (len(filtered) - 1)
+    std = math.sqrt(variance)
+    if std <= 0:
+        return 0.0
+    return _round(mean / std * math.sqrt(len(filtered)), 4)
 
 
 def _factor_identity_for_idea(idea_text: str) -> dict[str, Any]:
@@ -860,6 +1614,144 @@ def _technical_signal_theme(row: Mapping[str, Any]) -> str:
         if text and text not in {"hard_technical", "technical", "buy"}:
             return text[:24]
     return "技术结构共振"
+
+
+def _symbol_match_keys(symbol: Any) -> set[str]:
+    text = str(symbol or "").strip().upper()
+    if not text:
+        return set()
+    compact = text.replace(".", "").replace("-", "")
+    digits = "".join(ch for ch in compact if ch.isdigit())
+    keys = {text, compact}
+    if len(digits) >= 6:
+        code = digits[-6:]
+        keys.update({code, f"SZ.{code}", f"SH.{code}"})
+    return {item for item in keys if item}
+
+
+def _normalized_symbol_code(symbol: Any) -> str:
+    keys = _symbol_match_keys(symbol)
+    code = next((item for item in keys if item.isdigit() and len(item) == 6), "")
+    return code or str(symbol or "").strip().upper()
+
+
+def _load_signal_first_attribution_index(db: Any) -> dict[str, list[dict[str, Any]]]:
+    index: dict[str, list[dict[str, Any]]] = {}
+    if db is None:
+        return index
+    for collection_name, domain in (
+        ("concept_constituents", "concept"),
+        ("board_constituents", "board"),
+    ):
+        try:
+            rows = list(db[collection_name].find({}))
+        except Exception:
+            rows = []
+        for row in rows:
+            theme = str(
+                row.get("concept_name")
+                or row.get("board_name")
+                or row.get("name")
+                or ""
+            ).strip()
+            if not theme:
+                continue
+            row_symbols = set()
+            for item in _string_list(row.get("symbols")):
+                row_symbols.update(_symbol_match_keys(item))
+            if not row_symbols:
+                continue
+            stock_count = int(_float(row.get("stock_count"), len(row_symbols)) or len(row_symbols) or 1)
+            record = {
+                "theme": theme[:24],
+                "domain": domain,
+                "stock_count": stock_count,
+                "row_key": f"{domain}:{theme}:{stock_count}",
+            }
+            for key in row_symbols:
+                index.setdefault(key, []).append(record)
+    return index
+
+
+def _infer_signal_first_attribution(
+    attribution_index: Mapping[str, Sequence[Mapping[str, Any]]],
+    symbols: Sequence[Any],
+    *,
+    fallback_theme: str,
+) -> dict[str, Any]:
+    normalized_symbols = [_normalized_symbol_code(symbol) for symbol in symbols]
+    normalized_symbols = _unique_strings([symbol for symbol in normalized_symbols if symbol])
+    if not normalized_symbols:
+        return {
+            "status": "insufficient_symbols",
+            "primary_theme": fallback_theme,
+            "domain": "technical",
+            "confidence": 0.0,
+            "support_count": 0,
+            "matched_symbols": [],
+            "candidates": [],
+        }
+
+    candidate_map: dict[str, dict[str, Any]] = {}
+    for symbol in normalized_symbols:
+        for key in _symbol_match_keys(symbol):
+            for record in attribution_index.get(key, []):
+                row_key = str(record.get("row_key") or f"{record.get('domain')}:{record.get('theme')}")
+                item = candidate_map.setdefault(row_key, {
+                    "theme": str(record.get("theme") or "")[:24],
+                    "domain": str(record.get("domain") or ""),
+                    "stock_count": int(record.get("stock_count") or 1),
+                    "matched_symbols": [],
+                })
+                if symbol not in item["matched_symbols"]:
+                    item["matched_symbols"].append(symbol)
+
+    candidates: list[dict[str, Any]] = []
+    for item in candidate_map.values():
+        matched = _unique_strings(item.get("matched_symbols") or [])
+        stock_count = int(item.get("stock_count") or 1)
+        coverage = len(matched) / max(1, len(normalized_symbols))
+        breadth_penalty = min(0.18, max(0, stock_count - 80) / 600)
+        score = coverage * 0.82 + min(0.16, len(matched) * 0.04) - breadth_penalty
+        candidates.append({
+            "theme": str(item.get("theme") or "")[:24],
+            "domain": str(item.get("domain") or ""),
+            "score": _round(max(0.0, min(1.0, score)), 4),
+            "support_count": len(matched),
+            "stock_count": stock_count,
+            "matched_symbols": matched[:12],
+        })
+
+    candidates = sorted(
+        candidates,
+        key=lambda item: (
+            _float(item.get("score"), 0.0),
+            int(item.get("support_count") or 0),
+            -int(item.get("stock_count") or 0),
+        ),
+        reverse=True,
+    )
+    top = candidates[0] if candidates else {}
+    if top:
+        return {
+            "status": "auto_attributed",
+            "primary_theme": top["theme"],
+            "domain": top["domain"],
+            "confidence": top["score"],
+            "support_count": top["support_count"],
+            "matched_symbols": top["matched_symbols"],
+            "candidates": candidates[:5],
+            "fallback_theme": fallback_theme,
+        }
+    return {
+        "status": "technical_only",
+        "primary_theme": fallback_theme,
+        "domain": "technical",
+        "confidence": 0.0,
+        "support_count": 0,
+        "matched_symbols": [],
+        "candidates": [],
+    }
 
 
 def _technical_signal_preview(row: Mapping[str, Any]) -> dict[str, Any]:

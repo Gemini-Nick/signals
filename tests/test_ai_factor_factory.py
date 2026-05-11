@@ -8,8 +8,10 @@ from typing import Any
 class _Cursor(list):
     def sort(self, sort_spec=None, *args, **kwargs):
         rows = list(self)
+        if isinstance(sort_spec, str):
+            sort_spec = [(sort_spec, args[0] if args else 1)]
         for key, direction in reversed(sort_spec or []):
-            rows.sort(key=lambda item: str(item.get(key) or ""), reverse=direction < 0)
+            rows.sort(key=lambda item: str(_doc_get(item, key) or ""), reverse=direction < 0)
         return _Cursor(rows)
 
     def limit(self, n):
@@ -28,7 +30,14 @@ class _Collection:
 
     def _match(self, doc, query):
         for key, value in (query or {}).items():
-            if doc.get(key) != value:
+            actual = _doc_get(doc, key)
+            if isinstance(value, dict):
+                if "$exists" in value and bool(actual is not None) is not bool(value["$exists"]):
+                    return False
+                if "$in" in value and actual not in set(value["$in"]):
+                    return False
+                continue
+            if actual != value:
                 return False
         return True
 
@@ -59,6 +68,15 @@ class _Db(dict):
     def __missing__(self, key):
         self[key] = _Collection()
         return self[key]
+
+
+def _doc_get(doc, key):
+    current = doc
+    for part in str(key).split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
 
 
 def _samples() -> list[dict[str, Any]]:
@@ -382,6 +400,253 @@ def test_signal_first_technical_scan_builds_candidate_factor_ideas_without_live_
     assert factory["summary"]["candidate_factor_ideas"] == 1
     assert factory["summary"]["research_modes"]["signal_first"] == 1
     assert build_ai_factor_strategy_candidates(db=db) == []
+
+
+def test_signal_first_rl_environments_split_fallback_technical_bucket():
+    from signals.strategy.ai_factor_factory import build_ai_factor_factory
+
+    db = _Db()
+    db["terminal_technical_signals"] = _Collection(docs=[
+        {
+            "market": "A",
+            "as_of": "2026-05-08",
+            "symbol": "SZ.300001",
+            "signal_side": "buy",
+            "signal_type": "MACD绿柱缩小_零下",
+            "signal_family": "hard_technical",
+            "freq": "周线",
+            "scan_scope": "postmarket",
+            "total_score": 80,
+            "confidence": 0.8,
+            "resonance_context": {"grade": "strong_resonance"},
+        },
+        {
+            "market": "A",
+            "as_of": "2026-05-08",
+            "symbol": "SZ.300002",
+            "signal_side": "buy",
+            "signal_type": "三买",
+            "signal_family": "hard_technical",
+            "freq": "日线",
+            "scan_scope": "postmarket",
+            "total_score": 78,
+            "confidence": 0.76,
+            "resonance_context": {"grade": "single_period"},
+        },
+        {
+            "market": "A",
+            "as_of": "2026-05-08",
+            "symbol": "SZ.300003",
+            "signal_side": "buy",
+            "signal_type": "三买",
+            "signal_family": "hard_technical",
+            "freq": "30分钟",
+            "scan_scope": "postmarket",
+            "total_score": 74,
+            "confidence": 0.73,
+            "resonance_context": {"grade": "multi_period"},
+        },
+    ])
+
+    factory = build_ai_factor_factory(db=db, include_sample=False)
+    environments = factory["rl_environments"]
+
+    assert len(environments) == 3
+    assert {item["split_keys"]["signal_type_family"] for item in environments} == {"macd", "chan_buy"}
+    assert {item["split_keys"]["freq_bucket"] for item in environments} == {"weekly", "daily", "intraday_30m"}
+    assert factory["reward_spec"]["mode"] == "layered_gate"
+    assert "evaluation_summary" in factory
+
+
+def test_signal_first_auto_attributes_technical_cluster_from_concept_constituents():
+    from signals.strategy.ai_factor_factory import build_ai_factor_factory
+
+    db = _Db()
+    db["terminal_technical_signals"] = _Collection(docs=[
+        {
+            "market": "A",
+            "as_of": "2026-05-08",
+            "symbol": "SZ.300001",
+            "signal_side": "buy",
+            "signal_type": "趋势突破",
+            "signal_family": "hard_technical",
+            "freq": "日线",
+            "scan_scope": "postmarket",
+            "total_score": 90,
+            "confidence": 0.82,
+            "resonance_context": {"grade": "strong_resonance"},
+        },
+        {
+            "market": "A",
+            "as_of": "2026-05-08",
+            "symbol": "SH.600002",
+            "signal_side": "buy",
+            "signal_type": "趋势突破",
+            "signal_family": "hard_technical",
+            "freq": "日线",
+            "scan_scope": "postmarket",
+            "total_score": 86,
+            "confidence": 0.8,
+            "resonance_context": {"grade": "strong_resonance"},
+        },
+    ])
+    db["concept_constituents"] = _Collection(docs=[
+        {
+            "concept_name": "机器人",
+            "symbols": ["300001", "600002", "300003"],
+            "stock_count": 3,
+        },
+        {
+            "concept_name": "宽基样本",
+            "symbols": ["300001"],
+            "stock_count": 100,
+        },
+    ])
+
+    env = build_ai_factor_factory(db=db, include_sample=False)["rl_environments"][0]
+
+    assert env["attribution"]["status"] == "auto_attributed"
+    assert env["attribution"]["primary_theme"] == "机器人"
+    assert env["attribution"]["support_count"] == 2
+    assert env["split_keys"]["theme"] == "机器人"
+    assert env["split_keys"]["raw_theme"] == "技术结构共振"
+    assert env["factor_exposures"]["groups"] == ["机器人"]
+
+
+def test_signal_first_overbroad_fallback_cluster_is_not_evaluable():
+    from signals.strategy.ai_factor_factory import build_ai_factor_factory
+
+    db = _Db()
+    db["terminal_technical_signals"] = _Collection(docs=[
+        {
+            "market": "A",
+            "as_of": "2026-05-08",
+            "symbol": f"SZ.{idx:06d}",
+            "signal_side": "buy",
+            "signal_type": "MACD绿柱扩大_零上",
+            "signal_family": "hard_technical",
+            "freq": "周线",
+            "scan_scope": "postmarket",
+            "total_score": 70 + idx % 20,
+            "confidence": 0.75,
+            "resonance_context": {"grade": "strong_resonance"},
+        }
+        for idx in range(1, 62)
+    ])
+
+    env = build_ai_factor_factory(db=db, include_sample=False)["rl_environments"][0]
+
+    assert env["status"] == "not_evaluable"
+    assert "overbroad_cluster" in env["blocking_gates"]
+    assert env["environment_metrics"]["unique_symbol_count"] > 50
+
+
+def test_signal_first_environment_validation_auto_generates_clean_observations():
+    from signals.strategy.ai_factor_factory import (
+        build_ai_factor_factory,
+        run_signal_first_environment_validation,
+    )
+
+    db = _Db()
+    signal_docs = []
+    bar_docs = []
+    for idx in range(32):
+        code = f"SZ.{300000 + idx:06d}"
+        score = 50 + idx * 5
+        signal_docs.append({
+            "market": "A",
+            "as_of": "2026-05-01",
+            "symbol": code,
+            "signal_side": "buy",
+            "signal_type": "三买",
+            "signal_family": "hard_technical",
+            "freq": "日线",
+            "scan_scope": "postmarket",
+            "total_score": score,
+            "confidence": 0.7 + idx / 200,
+            "resonance_context": {"grade": "multi_period"},
+        })
+        daily_step = 0.004 + idx * 0.0005
+        for day in range(24):
+            close = 10 * (1 + daily_step * day)
+            bar_docs.append({
+                "dt": f"2026-05-{day + 1:02d}",
+                "meta": {"symbol": code, "freq": "日线"},
+                "open": close * 0.99,
+                "high": close * 1.01,
+                "low": close * 0.98,
+                "close": close,
+                "vol": 1000,
+            })
+    db["terminal_technical_signals"] = _Collection(docs=signal_docs)
+    db["bars"] = _Collection(docs=bar_docs)
+
+    environment_id = build_ai_factor_factory(db=db, include_sample=False)["rl_environments"][0]["environment_id"]
+    result = run_signal_first_environment_validation(
+        environment_id=environment_id,
+        db=db,
+        persist=False,
+    )
+
+    assert result["validation"]["sample_count"] == 32
+    assert result["validation"]["rejected_sample_count"] == 0
+    assert result["evaluation"]["factor_evaluation"]["rank_ic"] > 0
+    assert result["evaluation"]["reward"]["status"] == "validated"
+    assert result["evaluation"]["reward"]["final_reward"] > 0
+
+
+def test_signal_first_high_ic_can_still_fail_portfolio_gate_and_publish():
+    from signals.strategy.ai_factor_factory import (
+        build_ai_factor_factory,
+        publish_factor,
+        run_signal_first_environment_validation,
+    )
+
+    db = _Db()
+    db["terminal_technical_signals"] = _Collection(docs=[{
+        "market": "A",
+        "as_of": "2026-05-01",
+        "symbol": "SZ.300001",
+        "signal_side": "buy",
+        "signal_type": "三买",
+        "signal_family": "hard_technical",
+        "freq": "日线",
+        "scan_scope": "postmarket",
+        "total_score": 80,
+        "confidence": 0.8,
+        "resonance_context": {"grade": "multi_period"},
+    }])
+    environment_id = build_ai_factor_factory(db=db, include_sample=False)["rl_environments"][0]["environment_id"]
+    observations = []
+    for idx in range(30):
+        factor_value = 0.1 + idx * 0.03
+        return_t5 = -1.0 if idx < 5 else 0.25
+        observations.append({
+            "factor_id": environment_id,
+            "source_date": f"2026-04-{idx + 1:02d}",
+            "cn_trade_date": f"2026-05-{idx + 1:02d}",
+            "symbol": f"SZ.{300000 + idx:06d}",
+            "factor_value": factor_value,
+            "return_t1": return_t5 / 5,
+            "return_t5": return_t5,
+            "return_t10": return_t5,
+            "return_t20": return_t5,
+            "mfe": 0.3,
+            "mae": -1.0 if idx < 5 else -0.02,
+        })
+
+    result = run_signal_first_environment_validation(
+        environment_id=environment_id,
+        observations=observations,
+        db=db,
+    )
+    rejected = publish_factor(factor_id=environment_id, db=db)
+
+    assert result["evaluation"]["factor_evaluation"]["rank_ic"] > 0
+    assert result["evaluation"]["reward"]["status"] == "observation_only"
+    assert "max_drawdown_gate_failed" in result["evaluation"]["reward"]["blocking_gates"]
+    assert rejected["status"] == "rejected"
+    assert rejected["error"] == "factor_reward_gate_not_validated"
 
 
 def test_publish_gate_controls_strategy_snapshot_pollution():
