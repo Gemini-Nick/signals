@@ -1635,7 +1635,7 @@ def test_terminal_stock_pool_market_right_buy_rewards_confirmed_stock_right_buy(
     assert "市场共振" in row["rank_reason"]
 
 
-def test_terminal_stock_pool_market_right_sell_blocks_stock_right_buy_from_focus():
+def test_terminal_stock_pool_market_right_sell_marks_stock_right_buy_without_filtering():
     rows = {}
     for freq, signal_type in (("日线", "趋势买"), ("30分钟", "三买"), ("15分钟", "趋势买")):
         _add_reason(rows, "300612", {
@@ -1655,13 +1655,13 @@ def test_terminal_stock_pool_market_right_sell_blocks_stock_right_buy_from_focus
 
     split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
 
-    assert split["focus"] == []
-    row = split["watch"][0]
+    assert [row["raw_code"] for row in split["focus"]] == ["300612"]
+    row = split["focus"][0]
     assert row["raw_code"] == "300612"
     assert row["entry_gate_status"] == "entry_confirmed"
     assert row["index_setup_side"] == "right_sell"
     assert row["stock_setup_side"] == "right_buy"
-    assert row["alignment_policy"] == "block_focus"
+    assert row["alignment_policy"] == "mark_index_risk"
     assert row["score_components"]["market_alignment"] == -28.0
 
 

@@ -3244,17 +3244,17 @@ def _market_setup_alignment(row: dict[str, Any], entry_gate_status: str, top_buy
     if stock_side == "sell":
         alignment, policy, score = "stock_sell", "risk_first", -40.0
     elif index_side == "right_sell" and stock_side.endswith("_buy"):
-        alignment, policy, score = "index_right_sell_stock_buy", "block_focus", -28.0
+        alignment, policy, score = "index_right_sell_stock_buy", "mark_index_risk", -28.0
     elif index_side == "left_sell" and stock_side == "right_buy":
         if entry_gate_status == "entry_confirmed":
             alignment, policy, score = "index_left_sell_stock_right_buy", "allow_focus_cautious", -8.0
         else:
-            alignment, policy, score = "index_left_sell_stock_right_buy", "downgrade_watch", -14.0
+            alignment, policy, score = "index_left_sell_stock_right_buy", "mark_index_caution", -14.0
     elif index_side == "left_sell" and stock_side == "left_buy":
         if _sector_policy(row).get("policy") == "defensive_lenient":
             alignment, policy, score = "index_left_sell_defensive_left_buy", "allow_focus_cautious", 2.0
         else:
-            alignment, policy, score = "index_left_sell_stock_left_buy", "downgrade_watch", -18.0
+            alignment, policy, score = "index_left_sell_stock_left_buy", "mark_index_caution", -18.0
     elif index_side == "right_buy" and stock_side == "right_buy":
         alignment, policy, score = "aligned_right_buy", "allow_focus", 20.0
     elif index_side == "right_buy" and stock_side == "left_buy":
@@ -3262,7 +3262,7 @@ def _market_setup_alignment(row: dict[str, Any], entry_gate_status: str, top_buy
     elif index_side == "left_buy" and stock_side == "right_buy":
         alignment, policy, score = "index_left_buy_stock_right_buy", "allow_focus", 10.0
     elif index_side == "left_buy" and stock_side == "left_buy":
-        alignment, policy, score = "aligned_left_buy", "downgrade_watch", 4.0
+        alignment, policy, score = "aligned_left_buy", "mark_index_caution", 4.0
     else:
         alignment, policy, score = "mixed", "neutral", 0.0
     volume_state = _text(context.get("volume_state")) or "unknown"
@@ -3290,7 +3290,7 @@ def _market_alignment_components(row: dict[str, Any], entry_gate_status: str, to
 
 def _alignment_allows_focus(row: dict[str, Any], entry_gate_status: str, top_buy: dict[str, Any] | None, top_risk: dict[str, Any] | None) -> bool:
     policy = _market_setup_alignment(row, entry_gate_status, top_buy, top_risk).get("alignment_policy")
-    return policy not in {"block_focus", "downgrade_watch", "risk_first"}
+    return policy != "risk_first"
 
 
 def _sector_policy(row: dict[str, Any]) -> dict[str, Any]:

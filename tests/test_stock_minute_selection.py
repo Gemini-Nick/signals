@@ -29,6 +29,18 @@ class _Collection:
         return _Cursor(self.docs)
 
 
+class _ProjectingCollection(_Collection):
+    def find_one(self, *args, **kwargs):
+        projection = None
+        if len(args) >= 2 and isinstance(args[1], dict):
+            projection = args[1]
+        if projection is None:
+            projection = kwargs.get("projection")
+        if not projection:
+            return self.doc
+        return {key: value for key, value in self.doc.items() if projection.get(key)}
+
+
 class _Db(dict):
     def __missing__(self, key):
         self[key] = _Collection()
@@ -392,6 +404,31 @@ def test_pinned_candidate_source_promotes_existing_terminal_symbol(monkeypatch):
 
     assert selected == ["600941", "600050"]
     assert set(meta["pinned_symbols"]) == {"600941", "600050"}
+
+
+def test_stock_minute_selection_includes_terminal_clue_stocks(monkeypatch):
+    monkeypatch.delenv("STOCK_MINUTE_SCOPE", raising=False)
+    monkeypatch.setattr(stock_minute, "_iter_static_chain_representative_symbols", lambda: [])
+
+    db = _Db({
+        "terminal_stock_pool": _ProjectingCollection(doc={
+            "candidate_count": 3,
+            "watch_stocks": [{"raw_code": "300001"}],
+            "clue_stocks": [
+                {
+                    "raw_code": "300010",
+                    "inclusion_reasons": [{"reason_type": "technical_trigger"}],
+                }
+            ],
+        }),
+        "sync_log": _Collection(),
+    })
+
+    selected, meta = stock_minute._get_active_symbols_with_meta(db)
+
+    assert selected == ["300001", "300010"]
+    assert meta["source_counts"]["terminal_stock_pool"] == 2
+    assert meta["source_counts"]["technical_trigger"] == 1
 
 
 def test_split_current_minute_tasks_skips_already_closed_bars():
