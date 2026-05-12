@@ -523,13 +523,9 @@ def _normalize_chart_df(df: pd.DataFrame, freq: str, *, live_render: bool = Fals
     canonical = _canonical_freq(freq)
     if live_render and canonical in MINUTE_FREQS and _a_day_change_mode() == "quote_intraday" and not working.empty:
         expected_day = _day_change_expected_day("quote_intraday")
-        index_dates = pd.to_datetime(working.index, errors="coerce").date
-        same_day_mask = [str(item) == expected_day for item in index_dates]
-        if any(same_day_mask):
-            working = working.loc[same_day_mask]
-        else:
+        latest_day = _date_text(working.index.max())
+        if expected_day and latest_day and latest_day < expected_day:
             attrs = dict(working.attrs)
-            latest_day = _date_text(working.index.max())
             working = working.iloc[0:0].copy()
             working.attrs.update(attrs)
             working.attrs["gateway_is_stale"] = True

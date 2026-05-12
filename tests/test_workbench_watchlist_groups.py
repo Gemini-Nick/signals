@@ -289,6 +289,38 @@ def test_intraday_chart_does_not_render_previous_day_after_call_auction(monkeypa
     assert "minute_cache_older_than_realtime_day" in chart["meta"]["stale_reason"]
 
 
+def test_intraday_chart_preserves_history_when_today_cache_is_ready(monkeypatch):
+    from signals.web.api import workbench
+
+    df = pd.DataFrame(
+        [
+            {"open": 10.0, "high": 10.5, "low": 9.8, "close": 10.2, "vol": 1000, "amount": 10000},
+            {"open": 10.2, "high": 10.9, "low": 10.1, "close": 10.7, "vol": 1200, "amount": 13000},
+        ],
+        index=[pd.Timestamp("2026-05-11 15:00"), pd.Timestamp("2026-05-12 09:35")],
+    )
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-12")
+
+    chart = workbench._chart_from_df(df, symbol="SZ.000001", freq="5min", source="bars", live_render=True)
+
+    assert chart["meta"]["cache_status"] == "ready"
+    assert chart["meta"]["bars"] == 2
+    assert len(chart["ohlcv"]) == 2
+    assert chart["ohlcv"][0]["time"] == workbench._dt_to_unix(
+        pd.Timestamp("2026-05-11 15:00"),
+        market="A",
+        symbol="SZ.000001",
+        source="bars",
+    )
+    assert chart["ohlcv"][-1]["time"] == workbench._dt_to_unix(
+        pd.Timestamp("2026-05-12 09:35"),
+        market="A",
+        symbol="SZ.000001",
+        source="bars",
+    )
+
+
 def test_macro_indices_have_day_and_range_returns(monkeypatch):
     from signals.web.api import workbench
 
