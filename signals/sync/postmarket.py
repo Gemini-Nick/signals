@@ -141,16 +141,26 @@ _STOCK_30M_DEPS = tuple(task.task_key for task in _STOCK_30M_TASKS)
 POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     PostmarketTaskSpec("fullmarket_spot_snapshot", "market_data"),
     PostmarketTaskSpec("market_pools", "market_data"),
-    PostmarketTaskSpec("quote_snapshots", "market_data"),
+    PostmarketTaskSpec("quote_snapshots", "market_data", depends_on=("fullmarket_spot_snapshot:all",)),
     PostmarketTaskSpec("index_daily", "market_data", depends_on=("quote_snapshots:all",)),
     *_STOCK_DAILY_TASKS,
     PostmarketTaskSpec("board_ranking", "market_data"),
     *_BOARD_CONS_TASKS,
     PostmarketTaskSpec("chain_heat_snapshots", "chain_context", depends_on=("board_ranking:all",)),
     PostmarketTaskSpec(
+        "security_business_facts",
+        "chain_context",
+        depends_on=("fullmarket_spot_snapshot:all", "board_ranking:all", *_BOARD_CONS_DEPS),
+        env={
+            "SECURITY_BUSINESS_FACT_MAX_CODES": "80",
+            "SECURITY_BUSINESS_FACT_CALL_INTERVAL": "0.8",
+        },
+        blocks_run=False,
+    ),
+    PostmarketTaskSpec(
         "postmarket_chain_rebuild",
         "chain_context",
-        depends_on=("fullmarket_spot_snapshot:all", *_STOCK_DAILY_DEPS, "board_ranking:all", *_BOARD_CONS_DEPS, "chain_heat_snapshots:all"),
+        depends_on=("fullmarket_spot_snapshot:all", *_STOCK_DAILY_DEPS, "board_ranking:all", *_BOARD_CONS_DEPS, "chain_heat_snapshots:all", "security_business_facts:all"),
     ),
     PostmarketTaskSpec(
         "stock_minute",

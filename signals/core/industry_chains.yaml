@@ -168,21 +168,21 @@ chains:
 
   - chain_id: semiconductor
     name: 半导体产业链
-    aliases: [半导体, 芯片, 集成电路, 华为海思, 中芯概念, 高带宽内存, HBM, AI芯片, 国产芯片, EDA, EDA概念, IGBT, IGBT概念, 功率半导体, 分立器件, 玻璃基板]
+    aliases: [半导体, 芯片, 集成电路, 华为海思, 中芯概念, 高带宽内存, HBM, AI芯片, 汽车芯片, 国产芯片, EDA, EDA概念, IGBT, IGBT概念, 功率半导体, 分立器件, 玻璃基板]
     industries: [半导体, 元件, 电子化学品, 消费电子, 其他电子]
     default_node_id: wafer_foundry
     nodes:
       - node_id: wafer_foundry
         name: 晶圆制造
         layer: midstream
-        keywords: [半导体, 芯片, 集成电路, 晶圆制造, 晶圆代工, 中芯概念]
+        keywords: [半导体, 芯片, 集成电路, 集成电路制造, 晶圆制造, 晶圆代工, 中芯概念]
         core_representatives:
           - {symbol: SH.688981, name: 中芯国际, relation: 晶圆代工链主, source_note: 半导体默认链主代表, priority: 100}
         elastic_representatives: []
       - node_id: chip_design
         name: 芯片设计
         layer: downstream
-        keywords: [设计, 芯片设计, CIS, MCU, 华为海思, AI芯片, 国产芯片, EDA, EDA概念]
+        keywords: [设计, 芯片设计, 数字芯片设计, 模拟芯片设计, 汽车芯片, CIS, MCU, 华为海思, AI芯片, 国产芯片, EDA, EDA概念]
         core_representatives:
           - {symbol: SH.603501, name: 韦尔股份, relation: 芯片设计/CIS, source_note: 半导体设计链主代表, priority: 92}
           - {symbol: SH.603986, name: 兆易创新, relation: 存储芯片/MCU, source_note: 半导体设计链主代表, priority: 90}
@@ -202,7 +202,7 @@ chains:
       - node_id: semiconductor_equipment
         name: 半导体设备
         layer: upstream
-        keywords: [半导体设备, 光刻机, 刻蚀, 薄膜沉积]
+        keywords: [半导体设备, 光刻机, 光刻机(胶), 刻蚀, 薄膜沉积]
         core_representatives:
           - {symbol: SZ.002371, name: 北方华创, relation: 半导体设备链主, source_note: 半导体设备链主代表, priority: 100}
           - {symbol: SH.688012, name: 中微公司, relation: 刻蚀设备/半导体设备, source_note: 半导体设备链主代表, priority: 96}
@@ -248,14 +248,14 @@ chains:
 
   - chain_id: photovoltaic
     name: 光伏产业链
-    aliases: [光伏, 光伏电池组件, BC电池, HJT, TOPCon, 钙钛矿, 硅片, 组件, 逆变器, 光伏玻璃]
+    aliases: [光伏, 光伏电池组件, 光伏发电, 光伏主材, 光伏辅材, 光伏加工设备, BC电池, HJT, HJT电池, TOPCon, TOPCon电池, 钙钛矿, 钙钛矿电池, 硅片, 硅料硅片, 组件, 逆变器, 光伏玻璃]
     industries: [光伏设备, 电网设备, 电力, 金属新材料]
     default_node_id: solar_module
     nodes:
       - node_id: solar_module
         name: 硅料/硅片/组件
         layer: midstream
-        keywords: [光伏, 光伏电池组件, 硅片, 组件, BC电池, HJT, TOPCon, 钙钛矿, 光伏玻璃]
+        keywords: [光伏, 光伏电池组件, 光伏发电, 光伏主材, 光伏辅材, 光伏加工设备, 硅片, 硅料硅片, 组件, BC电池, HJT, HJT电池, TOPCon, TOPCon电池, 钙钛矿, 钙钛矿电池, 光伏玻璃]
         core_representatives:
           - {symbol: SH.601012, name: 隆基绿能, relation: 硅片/组件链主, source_note: 光伏链主代表, priority: 100}
           - {symbol: SH.600438, name: 通威股份, relation: 硅料/电池片链主, source_note: 光伏链主代表, priority: 94}
@@ -283,7 +283,7 @@ chains:
   - chain_id: ai_compute
     name: AI算力/数据中心产业链
     aliases: [AI, 人工智能, AIGC, AI应用, AI智能体, AI语料, 智谱AI, 智谱AI概念, Kimi, Kimi概念, MLOps, MLOps概念, 算力, 数据中心, 云计算, 腾讯云, 阿里概念, 大数据, 数据要素, 数据确权, 数据安全, 数字经济, 数字货币, 数字孪生, 数字水印, 数字阅读, 智慧城市, 智慧政务, 财税数字化, 区块链, Web3.0, 元宇宙概念, 工业互联, 国资云概念, ERP概念, 边缘计算, 量子科技, 服务器, 算力租赁, 智算中心, GPU云, IDC算力服务, 液冷, 东数西算, 英伟达概念, ChatGPT, DeepSeek, 多模态, 百度概念, 国产软件, 信创, 华为昇腾, 华为鲲鹏, 华为欧拉, 信息安全, 网络安全, 电子身份证, 生物识别, 电子支付, 安防服务, 安防概念, 虚拟数字人]
-    industries: [计算机设备, 软件开发, 通信设备, 通信服务, 互联网服务]
+    industries: [计算机设备, 软件开发, 垂直应用软件, 通信设备, 通信服务, 互联网服务]
     default_node_id: ai_server
     nodes:
       - node_id: ai_server
@@ -316,7 +316,7 @@ chains:
       - node_id: ai_application
         name: AI应用/智能体
         layer: downstream
-        keywords: [人工智能, AI应用, AI智能体, AI语料, 智谱AI, 智谱AI概念, Kimi, Kimi概念, MLOps, MLOps概念, AIGC应用, 大模型应用, 大数据, 数据要素, 数据确权, 数据安全, 数字经济, 数字货币, 数字孪生, 数字水印, 数字阅读, 智慧城市, 智慧政务, 财税数字化, 区块链, Web3.0, 元宇宙概念, 工业互联, 国资云概念, ERP概念, 安防概念, 虚拟数字人]
+        keywords: [人工智能, AI应用, AI智能体, AI语料, 智谱AI, 智谱AI概念, Kimi, Kimi概念, MLOps, MLOps概念, AIGC应用, 大模型应用, 垂直应用软件, 大数据, 数据要素, 数据确权, 数据安全, 数字经济, 数字货币, 数字孪生, 数字水印, 数字阅读, 智慧城市, 智慧政务, 财税数字化, 区块链, Web3.0, 元宇宙概念, 工业互联, 国资云概念, ERP概念, 安防概念, 虚拟数字人]
         core_representatives:
           - {symbol: SZ.002230, name: 科大讯飞, relation: AI应用/大模型链主, source_note: AI应用链主代表, priority: 100}
           - {symbol: SZ.300418, name: 昆仑万维, relation: AI应用/大模型应用链主, source_note: AI应用链主代表, priority: 94}
@@ -512,7 +512,7 @@ chains:
       - node_id: rare_earth_minor
         name: 稀土/小金属
         layer: upstream
-        keywords: [稀土, 钴, 镍, 钨, 钼, 锑, 小金属, 稀缺资源]
+        keywords: [稀土, 稀土永磁, 钴, 镍, 钨, 钼, 锑, 小金属, 稀缺资源]
         core_representatives:
           - {symbol: SH.600111, name: 北方稀土, relation: 稀土链主, source_note: 稀土链主代表, priority: 96}
           - {symbol: SH.603993, name: 洛阳钼业, relation: 钼钴链主, source_note: 小金属链主代表, priority: 92}
@@ -540,14 +540,14 @@ chains:
 
   - chain_id: coal_oil_gas
     name: 煤炭/油气能源产业链
-    aliases: [煤炭, 石油, 天然气, 燃气, 油气, 页岩气, 氦气, 可燃冰]
+    aliases: [煤炭, 石油, 天然气, 燃气, 油气, 油气资源, 油气设服, 页岩气, 氦气, 可燃冰]
     industries: [煤炭, 石油石化, 燃气II, 电力]
     default_node_id: fossil_energy
     nodes:
       - node_id: fossil_energy
         name: 煤炭/油气
         layer: upstream
-        keywords: [煤炭, 石油, 天然气, 燃气, 油气, 页岩气, 氦气, 可燃冰]
+        keywords: [煤炭, 石油, 天然气, 燃气, 油气, 油气资源, 油气设服, 页岩气, 氦气, 可燃冰]
         core_representatives:
           - {symbol: SH.601088, name: 中国神华, relation: 煤炭链主, source_note: 能源链主代表, priority: 100}
           - {symbol: SH.600028, name: 中国石化, relation: 石油石化链主, source_note: 能源链主代表, priority: 92}
@@ -574,14 +574,14 @@ chains:
 
   - chain_id: real_estate_infra
     name: 地产基建产业链
-    aliases: [地产, 房地产, 物业, 建筑, 基建, 工程建设, 地下管网, 水泥, 装配式建筑, 装配建筑, 城中村, 新型城镇化, 房屋检测, 智慧灯杆, 海绵城市, 租售同权, 雄安新区, 水利建设, PPP模式, 京津冀, 上海本地, 深圳本地, 海南自贸, 自贸区]
+    aliases: [地产, 房地产, 物业, 建筑, 基建, 铁路基建, 工程建设, 地下管网, 水泥, 建筑节能, 装配式建筑, 装配建筑, 城中村, 新型城镇化, 房屋检测, 智慧灯杆, 海绵城市, 租售同权, 雄安新区, 水利建设, PPP模式, 京津冀, 上海本地, 深圳本地, 海南自贸, 自贸区]
     industries: [房地产开发, 房地产服务, 建筑装饰, 建筑材料, 钢铁]
     default_node_id: infra_property
     nodes:
       - node_id: infra_property
         name: 地产/基建/建材
         layer: downstream
-        keywords: [地产, 房地产, 物业, 建筑, 基建, 工程建设, 地下管网, 水泥, 装配式建筑, 装配建筑, 城中村, 新型城镇化, 房屋检测, 智慧灯杆, 海绵城市, 租售同权, 雄安新区, 水利建设, PPP模式, 京津冀, 上海本地, 深圳本地, 海南自贸, 自贸区]
+        keywords: [地产, 房地产, 物业, 建筑, 基建, 铁路基建, 工程建设, 地下管网, 水泥, 建筑节能, 装配式建筑, 装配建筑, 城中村, 新型城镇化, 房屋检测, 智慧灯杆, 海绵城市, 租售同权, 雄安新区, 水利建设, PPP模式, 京津冀, 上海本地, 深圳本地, 海南自贸, 自贸区]
         core_representatives:
           - {symbol: SZ.000002, name: 万科A, relation: 房地产开发链主, source_note: 地产基建链主代表, priority: 100}
           - {symbol: SH.601668, name: 中国建筑, relation: 建筑装饰链主, source_note: 地产基建链主代表, priority: 94}
@@ -591,14 +591,14 @@ chains:
 
   - chain_id: consumer
     name: 消费品产业链
-    aliases: [消费, 白酒, 啤酒, 食品, 饮料, 乳品, 乳业, 调味品概念, 酿酒概念, 预制菜, 零售, 新零售, 免税, 退税商店, 首发经济, 奢侈品, 化妆品, 化妆品概念, 婴童概念, 电商概念, 拼多多概念, 社区团购, 谷子经济, C2M概念, 人造肉, 代糖概念, 共享经济, 内贸流通, 地摊经济, 宠物经济, 盲盒经济, 网红经济, 电子烟, 味蕾经济, 冰雪经济]
+    aliases: [消费, 白酒, 啤酒, 食品, 食品饮料, 食品加工, 食品加工制造, 休闲食品, 烘焙食品, 软饮料, 饮料, 乳品, 乳业, 调味品概念, 酿酒概念, 预制菜, 零售, 商贸零售, 一般零售, 多业态零售, 新零售, 免税, 退税商店, 奢侈品, 化妆品, 化妆品概念, 婴童概念, 电商概念, 跨境电商, 互联网电商, 综合电商, 电商服务, 拼多多概念, 社区团购, 谷子经济, C2M概念, 人造肉, 代糖概念, 地摊经济, 宠物经济, 宠物食品, 盲盒经济, 网红经济, 电子烟, 味蕾经济]
     industries: [白酒, 啤酒, 饮料乳品, 食品加工制造, 化妆品, 品牌化妆品, 化妆品制造及其他, 旅游景区, 酒店餐饮]
     default_node_id: consumer_goods
     nodes:
       - node_id: consumer_goods
-        name: 白酒/食品饮料
+        name: 食品饮料/零售消费
         layer: terminal
-        keywords: [消费, 白酒, 啤酒, 食品, 饮料, 乳品, 乳业, 调味品概念, 酿酒概念, 预制菜, 零售, 新零售, 免税, 退税商店, 首发经济, 奢侈品, 化妆品, 化妆品概念, 婴童概念, 电商概念, 拼多多概念, 社区团购, 谷子经济, C2M概念, 人造肉, 代糖概念, 共享经济, 内贸流通, 地摊经济, 宠物经济, 盲盒经济, 网红经济, 电子烟, 味蕾经济, 冰雪经济]
+        keywords: [消费, 白酒, 啤酒, 食品, 食品饮料, 食品加工, 食品加工制造, 休闲食品, 烘焙食品, 软饮料, 饮料, 乳品, 乳业, 调味品概念, 酿酒概念, 预制菜, 零售, 商贸零售, 一般零售, 多业态零售, 新零售, 免税, 退税商店, 奢侈品, 化妆品, 化妆品概念, 婴童概念, 电商概念, 跨境电商, 互联网电商, 综合电商, 电商服务, 拼多多概念, 社区团购, 谷子经济, C2M概念, 人造肉, 代糖概念, 地摊经济, 宠物经济, 宠物食品, 盲盒经济, 网红经济, 电子烟, 味蕾经济]
         core_representatives:
           - {symbol: SH.600519, name: 贵州茅台, relation: 高端白酒链主, source_note: 消费链主代表, priority: 100}
           - {symbol: SH.600887, name: 伊利股份, relation: 饮料乳品链主, source_note: 消费链主代表, priority: 90}
@@ -608,14 +608,14 @@ chains:
 
   - chain_id: agriculture
     name: 农业养殖产业链
-    aliases: [农业, 种业, 转基因, 养殖, 猪肉, 鸡肉, 水产, 粮食安全, 粮食概念, 乡村振兴, 土地流转, 生物育种, 供销社概念]
+    aliases: [农业, 农业种植, 种业, 转基因, 养殖, 猪肉, 鸡肉, 水产, 粮食安全, 粮食概念, 乡村振兴, 土地流转, 生物育种, 供销社概念]
     industries: [种植业与林业, 养殖业, 水产, 农产品加工, 其他农产品加工, 农用机械, 动物保健, 动物保健Ⅱ, 动物保健Ⅲ, 农化制品]
     default_node_id: farming
     nodes:
       - node_id: farming
         name: 种业/养殖
         layer: upstream
-        keywords: [农业, 种业, 转基因, 养殖, 猪肉, 鸡肉, 水产, 粮食安全, 粮食概念, 乡村振兴, 土地流转, 生物育种, 供销社概念]
+        keywords: [农业, 农业种植, 种业, 转基因, 养殖, 猪肉, 鸡肉, 水产, 粮食安全, 粮食概念, 乡村振兴, 土地流转, 生物育种, 供销社概念]
         core_representatives:
           - {symbol: SZ.000998, name: 隆平高科, relation: 种植业/种业链主, source_note: 农业链主代表, priority: 100}
           - {symbol: SZ.002714, name: 牧原股份, relation: 猪肉/生猪养殖链主, source_note: 农业链主代表, priority: 94}
@@ -625,14 +625,14 @@ chains:
 
   - chain_id: transport
     name: 交通运输产业链
-    aliases: [航空, 航运, 港口, 物流, 铁路, 快递, 跨境物流, 交通运输, 公交, 公路货运, 交运设备, 磁悬浮概念, 海洋经济]
+    aliases: [航空, 航运, 港口, 物流, 冷链物流, 铁路, 快递, 跨境物流, 交通运输, 公交, 公路货运, 交运设备, 磁悬浮概念, 海洋经济]
     industries: [航空运输, 航运港口, 轨道交通装备, 交通运输, 公交, 公路货运]
     default_node_id: transport_core
     nodes:
       - node_id: transport_core
         name: 航空/航运/轨交
         layer: terminal
-        keywords: [航空, 航运, 港口, 物流, 铁路, 快递, 跨境物流, 交通运输, 公交, 公路货运, 交运设备, 磁悬浮概念, 海洋经济]
+        keywords: [航空, 航运, 港口, 物流, 冷链物流, 铁路, 快递, 跨境物流, 交通运输, 公交, 公路货运, 交运设备, 磁悬浮概念, 海洋经济]
         core_representatives:
           - {symbol: SH.600029, name: 南方航空, relation: 航空运输链主, source_note: 交运链主代表, priority: 100}
           - {symbol: SH.601919, name: 中远海控, relation: 航运港口链主, source_note: 交运链主代表, priority: 96}
@@ -641,14 +641,14 @@ chains:
 
   - chain_id: media_tourism
     name: 传媒旅游产业链
-    aliases: [游戏, 传媒, 影视, 短剧, 文旅, 旅游, 酒店, 教育, 广告, 文化振兴, 体育概念, 博彩概念, 电子竞技, 知识产权, 超清视频, 迪士尼, 小红书概念, 快手概念, 抖音概念(字节概念), 彩票概念, 户外露营]
+    aliases: [游戏, 网络游戏, 传媒, 影视, 短剧, 文旅, 旅游, 酒店, 教育, 职业教育, 广告, 文化振兴, 体育概念, 体育产业, 博彩概念, 电子竞技, 知识产权, 超清视频, 迪士尼, 小红书概念, 快手概念, 抖音概念(字节概念), 彩票概念, 户外露营]
     industries: [游戏, 影视院线, 广告营销, 教育, 旅游景区, 酒店餐饮, 出版, 大众出版, 图片媒体, 其他数字媒体]
     default_node_id: media_content
     nodes:
       - node_id: media_content
         name: 游戏/影视/文旅
         layer: terminal
-        keywords: [游戏, 传媒, 影视, 短剧, 文旅, 旅游, 酒店, 教育, 广告, 文化振兴, 体育概念, 博彩概念, 电子竞技, 知识产权, 超清视频, 迪士尼, 小红书概念, 快手概念, 抖音概念(字节概念), 彩票概念, 户外露营]
+        keywords: [游戏, 网络游戏, 传媒, 影视, 短剧, 文旅, 旅游, 酒店, 教育, 职业教育, 广告, 文化振兴, 体育概念, 体育产业, 博彩概念, 电子竞技, 知识产权, 超清视频, 迪士尼, 小红书概念, 快手概念, 抖音概念(字节概念), 彩票概念, 户外露营]
         core_representatives:
           - {symbol: SZ.002602, name: 世纪华通, relation: 游戏链主, source_note: 传媒链主代表, priority: 100}
           - {symbol: SZ.300251, name: 光线传媒, relation: 影视院线链主, source_note: 传媒链主代表, priority: 90}
@@ -687,6 +687,34 @@ chains:
           - {symbol: SZ.000488, name: 晨鸣纸业, relation: 造纸印刷代表, source_note: 纺织轻工链主代表, priority: 84}
         elastic_representatives:
           - {symbol: SZ.000973, name: 佛塑科技, relation: 塑料弹性标的, source_note: 纺织轻工弹性代表, priority: 74}
+
+  - chain_id: home_building_materials
+    name: 家居建材产业链
+    aliases: [家居用品, 家居建材, 装修建材, 装饰建材, 瓷砖, 瓷砖地板, 陶瓷, 建筑陶瓷, 陶瓷砖, 卫浴, 卫浴制品, 定制家居, 地板, 门窗]
+    industries: [家居用品, 装修建材, 卫浴制品, 定制家居, 地板, 门窗]
+    default_node_id: home_decoration_materials
+    nodes:
+      - node_id: ceramic_tile_sanitary
+        name: 瓷砖/卫浴/建筑陶瓷
+        layer: downstream
+        keywords: [瓷砖, 瓷砖地板, 陶瓷, 建筑陶瓷, 陶瓷砖, 卫浴, 卫浴制品, 箭牌家居, 蒙娜丽莎, 东鹏控股, 马可波罗]
+        core_representatives:
+          - {symbol: SZ.002918, name: 蒙娜丽莎, relation: 瓷砖/建筑陶瓷核心标的, source_note: 家居建材链主代表, priority: 96}
+          - {symbol: SZ.003012, name: 东鹏控股, relation: 瓷砖/卫浴核心标的, source_note: 家居建材链主代表, priority: 94}
+          - {symbol: SZ.001386, name: 马可波罗, relation: 建筑陶瓷核心标的, source_note: 家居建材链主代表, priority: 92}
+        elastic_representatives:
+          - {symbol: SZ.001322, name: 箭牌家居, relation: 卫浴制品弹性标的, source_note: 家居建材弹性代表, priority: 86}
+          - {symbol: SZ.002798, name: 帝欧家居, relation: 建筑陶瓷/卫浴弹性标的, source_note: 家居建材弹性代表, priority: 82}
+      - node_id: home_decoration_materials
+        name: 家居用品/装饰建材
+        layer: downstream
+        keywords: [家居用品, 家居建材, 装修建材, 装饰建材, 定制家居, 地板, 门窗, 家具, 软体家居]
+        core_representatives:
+          - {symbol: SH.603833, name: 欧派家居, relation: 定制家居核心标的, source_note: 家居建材链主代表, priority: 92}
+          - {symbol: SH.603816, name: 顾家家居, relation: 软体家居核心标的, source_note: 家居建材链主代表, priority: 90}
+        elastic_representatives:
+          - {symbol: SZ.002489, name: 浙江永强, relation: 户外家居弹性标的, source_note: 家居建材弹性代表, priority: 78}
+          - {symbol: SZ.000910, name: 大亚圣象, relation: 地板/人造板弹性标的, source_note: 家居建材弹性代表, priority: 76}
 
   - chain_id: home_appliance
     name: 家电家居产业链

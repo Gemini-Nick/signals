@@ -91,19 +91,17 @@ def _worker_count() -> int:
 
 def _opening_phase() -> bool:
     now = naive_market_now("A")
-    return now.hour == 9 and 30 <= now.minute < 45
+    return now.hour == 9 and 15 <= now.minute < 45
 
 
 def _active_minute_freqs() -> list[str]:
     lane = _env_value("SIGNALS_CURRENT_SYNC_LANE")
     market = _env_value("SIGNALS_CURRENT_SYNC_MARKET")
     if lane == "signal_lane" and market == "A" and not _postmarket_minute_scope():
-        all_freqs = _env_value("STOCK_MINUTE_SIGNAL_ALL_FREQS", "false").strip().lower() in {"1", "true", "yes", "on"}
-        if not all_freqs:
-            return ["5分钟"]
         values = _parse_freqs(_env_value("STOCK_MINUTE_SIGNAL_FREQS"))
         if values:
             return values
+        return list(_MINUTE_FREQS)
 
     configured = _env_value("STOCK_MINUTE_FREQS").strip()
     if configured:
@@ -234,7 +232,7 @@ def _selection_cap() -> int:
         if market == "A":
             configured = int(os.getenv("STOCK_MINUTE_SIGNAL_MAX_CODES", "72"))
             if _opening_phase():
-                return min(configured, int(os.getenv("STOCK_MINUTE_OPENING_MAX_CODES", "24")))
+                return min(configured, int(os.getenv("STOCK_MINUTE_OPENING_MAX_CODES", str(configured))))
             return configured
         close_default = os.getenv("TERMINAL_REALTIME_STOCK_LIMIT", "72")
         return int(os.getenv("STOCK_MINUTE_CLOSE_MAX_CODES", close_default))

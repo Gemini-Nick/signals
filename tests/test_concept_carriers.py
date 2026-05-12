@@ -310,7 +310,6 @@ def test_hot_terminal_chip_medical_and_material_concepts_map_explicitly():
         "调味品概念": ("consumer", "consumer_goods"),
         "谷子经济": ("consumer", "consumer_goods"),
         "退税商店": ("consumer", "consumer_goods"),
-        "首发经济": ("consumer", "consumer_goods"),
         "超清视频": ("media_tourism", "media_content"),
         "新能源汽车": ("new_energy_vehicle", "vehicle"),
         "新能源整车": ("new_energy_vehicle", "vehicle"),
@@ -325,6 +324,29 @@ def test_hot_terminal_chip_medical_and_material_concepts_map_explicitly():
         assert matches
         assert (matches[0]["chain_id"], matches[0]["node_id"]) == (chain_id, node_id)
         assert matches[0]["confidence"] >= 90
+
+
+def test_home_building_materials_do_not_fall_into_liquor_or_textile():
+    expected = {
+        "家居用品": ("home_building_materials", "home_decoration_materials"),
+        "装修建材": ("home_building_materials", "home_decoration_materials"),
+        "装饰建材": ("home_building_materials", "home_decoration_materials"),
+        "瓷砖": ("home_building_materials", "ceramic_tile_sanitary"),
+        "建筑陶瓷": ("home_building_materials", "ceramic_tile_sanitary"),
+        "卫浴制品": ("home_building_materials", "ceramic_tile_sanitary"),
+    }
+
+    for concept, (chain_id, node_id) in expected.items():
+        matches = match_industry_chains(concept)
+        assert matches
+        assert (matches[0]["chain_id"], matches[0]["node_id"]) == (chain_id, node_id)
+        assert matches[0]["confidence"] >= 90
+
+    carriers = preferred_concept_carriers("瓷砖")
+    assert carriers
+    assert carriers[0]["symbol"] == "SZ.002918"
+    assert not any(row["chain_id"] == "consumer" for row in carriers[:5])
+    assert not any(row["chain_id"] == "textile_light" for row in carriers[:5])
 
 
 def test_specific_keywords_do_not_pull_adjacent_chain_representatives():
@@ -370,6 +392,32 @@ def test_new_energy_segment_concepts_map_to_chain_nodes():
     assert perovskite[0]["node_id"] == "solar_module"
 
 
+def test_market_board_exact_terms_do_not_remain_low_confidence():
+    expected = {
+        "HJT电池": ("photovoltaic", "solar_module"),
+        "光伏发电": ("photovoltaic", "solar_module"),
+        "油气设服": ("coal_oil_gas", "fossil_energy"),
+        "油气资源": ("coal_oil_gas", "fossil_energy"),
+        "稀土永磁": ("nonferrous", "rare_earth_minor"),
+        "光刻机(胶)": ("semiconductor", "semiconductor_equipment"),
+        "汽车芯片": ("semiconductor", "chip_design"),
+        "农业种植": ("agriculture", "farming"),
+        "铁路基建": ("real_estate_infra", "infra_property"),
+        "建筑节能": ("real_estate_infra", "infra_property"),
+        "冷链物流": ("transport", "transport_core"),
+        "网络游戏": ("media_tourism", "media_content"),
+        "体育产业": ("media_tourism", "media_content"),
+        "职业教育": ("media_tourism", "media_content"),
+        "跨境电商": ("consumer", "consumer_goods"),
+    }
+
+    for concept, (chain_id, node_id) in expected.items():
+        matches = match_industry_chains(concept)
+        assert matches
+        assert (matches[0]["chain_id"], matches[0]["node_id"]) == (chain_id, node_id)
+        assert matches[0]["confidence"] >= 90
+
+
 def test_non_chain_theme_is_accounted_without_forced_mapping():
     assert non_chain_reason("本月解禁")
     assert non_chain_reason("科创50")
@@ -390,6 +438,10 @@ def test_non_chain_theme_is_accounted_without_forced_mapping():
     assert non_chain_reason("贬值受益")
     assert non_chain_reason("超级品牌")
     assert non_chain_reason("近期新高")
+    assert non_chain_reason("首发经济")
+    assert non_chain_reason("内贸流通")
+    assert non_chain_reason("共享经济")
+    assert non_chain_reason("冰雪经济")
 
     report = build_mapping_coverage([
         "本月解禁",
@@ -399,10 +451,14 @@ def test_non_chain_theme_is_accounted_without_forced_mapping():
         "中特估",
         "中盘成长",
         "沪股通",
+        "首发经济",
+        "内贸流通",
+        "共享经济",
+        "冰雪经济",
         "半导体设备",
     ])
     counts = report["counts"]
-    assert counts["non_chain"] == 7
+    assert counts["non_chain"] == 11
     assert counts["mapped"] == 1
     assert counts["accounted"] == counts["total"]
 

@@ -52,9 +52,11 @@ MODULE_TARGETS = {
     "board_ranking": ("board_ranking", "concept_ranking"),
     "board_heat_minute": ("board_heat_ticks",),
     "concept_heat_minute": ("board_heat_ticks",),
+    "security_business_facts": ("security_business_facts",),
     "postmarket_chain_rebuild": (
         "source_board_catalog",
         "source_board_chain_mappings",
+        "security_concept_evidence",
         "security_master",
         "security_chain_memberships",
         "chain_node_security_rollups",
@@ -78,8 +80,10 @@ COLLECTION_DOMAINS = {
     "board_ranking": "board",
     "concept_ranking": "concept",
     "board_heat_ticks": "board_heat",
+    "security_business_facts": "business_facts",
     "source_board_catalog": "chain_rebuild",
     "source_board_chain_mappings": "chain_rebuild",
+    "security_concept_evidence": "chain_rebuild",
     "security_master": "security_master",
     "security_chain_memberships": "chain_rebuild",
     "chain_node_security_rollups": "chain_rebuild",
@@ -132,7 +136,7 @@ EMPTY_OK_MODULES = {
 SYNC_TZ = ZoneInfo(os.getenv("SIGNALS_SYNC_TIMEZONE", "Asia/Shanghai"))
 QUOTE_PREOPEN_START = dt_time(9, 15)
 QUOTE_PREOPEN_END = dt_time(9, 30)
-PREOPEN_LIVE_LANES = {"quote_lane", "workbench_lane", "board_lane"}
+PREOPEN_LIVE_LANES = {"quote_lane", "signal_lane", "workbench_lane", "board_lane"}
 
 
 def _env_seconds(name: str, default: int, *, minimum: int = 60) -> int:
@@ -218,6 +222,7 @@ LANE_MAINTENANCE_PLANS = {
     "weekly_rollup": LiveSyncPlan("weekly_rollup", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 600, 45),
     "board_ranking": LiveSyncPlan("board_ranking", "board_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 60),
     "board_cons": LiveSyncPlan("board_cons", "board_lane", 24 * 60 * 60, 6 * 60 * 60, 900, 70),
+    "security_business_facts": LiveSyncPlan("security_business_facts", "workbench_lane", 24 * 60 * 60, 12 * 60 * 60, 1200, 76),
     "postmarket_chain_rebuild": LiveSyncPlan("postmarket_chain_rebuild", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 900, 78),
     "signal_pool": LiveSyncPlan("signal_pool", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 80),
     "technical_signal_scan": LiveSyncPlan("technical_signal_scan", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 1800, 82),
@@ -251,6 +256,7 @@ BOOTSTRAP_LANE_MODULES = {
     "chain_heat_snapshots": {"board_lane"},
     "minute_readiness_probe": {"signal_lane"},
     "board_cons": {"board_lane"},
+    "security_business_facts": {"workbench_lane"},
     "postmarket_chain_rebuild": {"workbench_lane"},
 }
 

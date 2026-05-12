@@ -47,6 +47,19 @@ def _elapsed_ms(start: float) -> float:
     return (time.monotonic() - start) * 1000
 
 
+def _request_target_day(request: DataRequest, mode: str) -> str:
+    if request.as_of and str(request.as_of).lower() != "today":
+        return normalize_as_of(request.as_of, request.market)
+    if mode == "realtime" and str(request.market or "A").upper() == "A":
+        try:
+            from signals.core.trading_dates import a_share_realtime_day_key
+
+            return a_share_realtime_day_key(now=naive_market_now("A"))
+        except Exception:
+            pass
+    return normalize_as_of(request.as_of, request.market)
+
+
 def _latest_df(collection: str, query: Optional[dict] = None) -> Optional[pd.DataFrame]:
     from signals.data.mongo_fallback import get_latest_df
 
@@ -421,7 +434,7 @@ def _get_rank(request: DataRequest, domain: str) -> DataResponse:
     start = time.monotonic()
     mode = resolve_mode(request)
     errors: list[str] = []
-    target = normalize_as_of(request.as_of, request.market)
+    target = _request_target_day(request, mode)
 
     if mode == "historical":
         collection = CANONICAL_COLLECTIONS[domain]

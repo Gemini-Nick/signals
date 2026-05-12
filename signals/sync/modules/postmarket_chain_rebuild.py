@@ -14,13 +14,15 @@ import os
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from pymongo import UpdateOne
 from pymongo.database import Database
+import yaml
 
 from signals.core.chain_ai_mapping import decide_chain_mapping
-from signals.core.chain_mapping_rules import filter_mapping_matches, matches_from_ai_decision
+from signals.core.chain_mapping_rules import filter_mapping_matches, mapping_specificity, matches_from_ai_decision
 from signals.core.concept_carriers import load_industry_chains, match_industry_chains, non_chain_reason
 from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import trading_day_key
@@ -37,6 +39,8 @@ REQUIRED_BOARD_SOURCES = {"ths", "em"}
 MAPPING_CONFIDENCE_THRESHOLD = 60
 ROLLUP_TOP_SECURITY_LIMIT = 30
 REPRESENTATIVE_TYPE_RANK = {"core": 2, "elastic": 1}
+SECURITY_CHAIN_OVERRIDES_PATH = Path(__file__).resolve().parents[2] / "core" / "security_chain_overrides.yaml"
+SECURITY_CONCEPT_EVIDENCE_COLLECTION = "security_concept_evidence"
 
 
 def _text(value: Any) -> str:
@@ -104,11 +108,36 @@ def _representative_rank(value: Any) -> int:
     return REPRESENTATIVE_TYPE_RANK.get(_text(value), 0)
 
 
-def _membership_sort_key(row: dict[str, Any]) -> tuple[float, float, float, float, float]:
+def _membership_type_rank(value: Any) -> int:
+    return {
+        "reviewed_primary": 4,
+        "core": 3,
+        "theme": 2,
+        "weak_related": 1,
+    }.get(_text(value), 0)
+
+
+def _membership_sort_key(row: dict[str, Any]) -> tuple[float, ...]:
     return (
+        1.0 if row.get("reviewed_override") else 0.0,
         float(_representative_rank(row.get("representative_type"))),
         _float(row.get("representative_priority")),
+        _float(row.get("chain_specificity_score")),
+        float(_membership_type_rank(row.get("membership_type"))),
         1.0 if row.get("is_primary_chain") else 0.0,
+        _float(row.get("exposure_score")),
+        _float(row.get("confidence")),
+    )
+
+
+def _primary_membership_sort_key(row: dict[str, Any]) -> tuple[float, ...]:
+    return (
+        1.0 if row.get("reviewed_override") else 0.0,
+        float(_membership_type_rank(row.get("membership_type"))),
+        _float(row.get("chain_specificity_score")),
+        1.0 if row.get("taxonomy_representative") else 0.0,
+        float(_representative_rank(row.get("representative_type"))),
+        _float(row.get("representative_priority")),
         _float(row.get("exposure_score")),
         _float(row.get("confidence")),
     )
@@ -163,6 +192,123 @@ def _apply_taxonomy_representative(row: dict[str, Any], rep: dict[str, Any] | No
         row["membership_type"] = "core"
     row.setdefault("evidence_sources", [])
     row["evidence_sources"].extend(["industry_chains.yaml", "semantic_industry_chain"])
+
+
+def _load_security_chain_overrides(config_path: str | None = None) -> list[dict[str, Any]]:
+    path = Path(config_path) if config_path else SECURITY_CHAIN_OVERRIDES_PATH
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as fh:
+        raw = yaml.safe_load(fh) or {}
+    chains = load_industry_chains()
+    rows: list[dict[str, Any]] = []
+    for item in raw.get("overrides") or []:
+        if not isinstance(item, dict):
+            continue
+        code = _pure_a_code(item.get("symbol") or item.get("raw_code") or item.get("code"))
+        chain_id = _text(item.get("chain_id"))
+        node_id = _text(item.get("node_id"))
+        chain = chains.get(chain_id) or {}
+        node = (chain.get("nodes_by_id") or {}).get(node_id) or {}
+        if not code or not chain or not node:
+            continue
+        rows.append({
+            "symbol": _prefixed_a_symbol(code),
+            "raw_code": code,
+            "name": _text(item.get("name")),
+            "chain_id": chain_id,
+            "chain_name": chain.get("name"),
+            "node_id": node_id,
+            "node_name": node.get("name"),
+            "layer": node.get("layer"),
+            "stage": node.get("stage"),
+            "role": _text(item.get("role") or node.get("stage") or node.get("layer")),
+            "confidence": int(item.get("confidence") or 98),
+            "source_note": _text(item.get("source_note") or item.get("reason") or "人工确认产业链归属"),
+            "concept_name": _text(item.get("concept_name")),
+            "reviewed_by": _text(item.get("reviewed_by")),
+            "effective_from": _text(item.get("effective_from")),
+        })
+    return rows
+
+
+def _apply_security_chain_overrides(
+    grouped: dict[tuple[str, str, str], dict[str, Any]],
+    *,
+    trade_date: str,
+    now: datetime,
+    security_master: dict[str, dict[str, Any]],
+    security_names: dict[str, str],
+) -> None:
+    for override in _load_security_chain_overrides():
+        code = _pure_a_code(override.get("raw_code") or override.get("symbol"))
+        if not code:
+            continue
+        master = security_master.get(code)
+        symbol = _text((master or {}).get("symbol")) or _text(override.get("symbol")) or _prefixed_a_symbol(code)
+        sid = _text((master or {}).get("security_id")) or _security_id(symbol)
+        stock_name = _text((master or {}).get("name") or security_names.get(code) or override.get("name"))
+        issuer = _text((master or {}).get("issuer_id")) or _issuer_id(market="A", symbol=symbol, code=code, name=stock_name)
+        chain_id = _text(override.get("chain_id"))
+        node_id = _text(override.get("node_id"))
+        key = (sid, chain_id, node_id)
+        row = grouped.get(key)
+        if row is None:
+            row = {
+                "_id": f"{trade_date}:{sid}:{chain_id}:{node_id}",
+                "trade_date": trade_date,
+                "security_id": sid,
+                "issuer_id": issuer,
+                "market": "A",
+                "symbol": symbol,
+                "raw_code": code,
+                "name": stock_name,
+                "chain_id": chain_id,
+                "chain_name": override.get("chain_name"),
+                "node_id": node_id,
+                "node_name": override.get("node_name"),
+                "layer": override.get("layer"),
+                "stage": override.get("stage"),
+                "role": override.get("role"),
+                "membership_type": "reviewed_primary",
+                "confidence": override.get("confidence"),
+                "exposure_score": _exposure_score(kind="industry", confidence=int(override.get("confidence") or 98), source_count=1),
+                "is_primary_chain": False,
+                "source_boards": [],
+                "evidence_sources": [],
+                "evidence_docs": [],
+                "as_of": trade_date,
+                "stale_level": "fresh",
+                "updated_at": now,
+            }
+            grouped[key] = row
+        row["reviewed_override"] = True
+        row["membership_type"] = "reviewed_primary"
+        row["confidence"] = max(int(row.get("confidence") or 0), int(override.get("confidence") or 98))
+        row["exposure_score"] = max(
+            _float(row.get("exposure_score")),
+            _exposure_score(kind="industry", confidence=int(row["confidence"]), source_count=1),
+        )
+        row["source_note"] = override.get("source_note")
+        row["role"] = override.get("role") or row.get("role")
+        row["chain_specificity_score"] = max(_float(row.get("chain_specificity_score")), 5.0)
+        concept_name = _text(override.get("concept_name"))
+        if concept_name:
+            row.setdefault("source_boards", []).append({
+                "source_board_id": f"reviewed:concept:{concept_name}:{code}",
+                "name": concept_name,
+                "kind": "reviewed_concept",
+                "source": "reviewed_override",
+                "confidence": row["confidence"],
+            })
+        row.setdefault("evidence_sources", []).extend(["reviewed_override", "security_chain_overrides.yaml"])
+        row.setdefault("evidence_docs", []).append({
+            "collection": "security_chain_overrides.yaml",
+            "concept_name": concept_name,
+            "reviewed_by": override.get("reviewed_by"),
+            "effective_from": override.get("effective_from"),
+            "mapping_confidence": row["confidence"],
+        })
 
 
 def _seed_taxonomy_memberships(
@@ -363,6 +509,423 @@ def _constituent_doc(db: Database, *, kind: str, name: str) -> dict[str, Any]:
     ) or {}
 
 
+def _latest_board_heat_context(db: Database) -> dict[tuple[str, str], dict[str, Any]]:
+    latest = db["board_heat_ticks"].find_one(
+        {"trade_minute": {"$exists": True}},
+        {"trade_minute": 1},
+        sort=[("trade_minute", -1)],
+    ) or {}
+    trade_minute = latest.get("trade_minute")
+    if trade_minute is None:
+        return {}
+    rows = db["board_heat_ticks"].find(
+        {"trade_minute": trade_minute},
+        {
+            "_id": 0,
+            "kind": 1,
+            "name": 1,
+            "board_name": 1,
+            "concept_name": 1,
+            "change_pct": 1,
+            "turnover_pct": 1,
+            "rank_idx": 1,
+            "up_count": 1,
+            "down_count": 1,
+            "leader_name": 1,
+            "leader_symbol": 1,
+            "leader_change_pct": 1,
+            "source": 1,
+            "trade_date": 1,
+            "trade_minute": 1,
+        },
+    )
+    output: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        kind = _text(row.get("kind"))
+        name = _text(row.get("name") or row.get("board_name") or row.get("concept_name"))
+        if not kind or not name:
+            continue
+        output[(kind, name)] = {
+            "source": _text(row.get("source")),
+            "change_pct": _float(row.get("change_pct")),
+            "turnover_pct": _float(row.get("turnover_pct")),
+            "rank": row.get("rank_idx"),
+            "up_count": row.get("up_count"),
+            "down_count": row.get("down_count"),
+            "leader_name": _text(row.get("leader_name")),
+            "leader_symbol": _text(row.get("leader_symbol")),
+            "leader_change_pct": _float(row.get("leader_change_pct")),
+            "trade_date": _date_text(row.get("trade_date") or row.get("trade_minute")),
+            "trade_minute": row.get("trade_minute"),
+        }
+    return output
+
+
+def _latest_quote_context_by_code(db: Database) -> dict[str, dict[str, Any]]:
+    latest = db["quote_snapshots"].find_one(
+        {"trade_date": {"$exists": True}},
+        {"trade_date": 1},
+        sort=[("trade_date", -1), ("snapshot_at", -1)],
+    ) or {}
+    trade_date = _text(latest.get("trade_date"))
+    if not trade_date:
+        return {}
+    rows = db["quote_snapshots"].find(
+        {"trade_date": trade_date},
+        {
+            "_id": 1,
+            "code": 1,
+            "symbol": 1,
+            "name": 1,
+            "change_pct": 1,
+            "turnover_pct": 1,
+            "vol": 1,
+            "amount": 1,
+            "price": 1,
+            "snapshot_at": 1,
+            "freshness": 1,
+            "is_stale": 1,
+        },
+    )
+    output: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        code = _pure_a_code(row.get("code") or row.get("symbol"))
+        if not code:
+            continue
+        existing = output.get(code)
+        snapshot_at = row.get("snapshot_at")
+        if existing and existing.get("snapshot_at") and snapshot_at and snapshot_at < existing["snapshot_at"]:
+            continue
+        output[code] = {
+            "symbol": _text(row.get("symbol")) or _prefixed_a_symbol(code),
+            "name": _text(row.get("name")),
+            "change_pct": _float(row.get("change_pct")),
+            "turnover_pct": _float(row.get("turnover_pct")),
+            "vol": _float(row.get("vol")),
+            "amount": _float(row.get("amount")),
+            "price": _float(row.get("price")),
+            "trade_date": trade_date,
+            "snapshot_at": snapshot_at,
+            "freshness": _text(row.get("freshness")),
+            "is_stale": bool(row.get("is_stale")),
+        }
+    return output
+
+
+def _evidence_type_for_mapping(*, kind: str, mapping_status: str) -> str:
+    if mapping_status == "mapped":
+        return "vendor_industry_membership" if kind == "industry" else "vendor_concept_membership"
+    if mapping_status == "non_chain":
+        return "non_chain_theme_membership"
+    return "unmapped_source_membership"
+
+
+def _evidence_layer_for_mapping(*, kind: str, mapping_status: str) -> str:
+    if mapping_status == "mapped":
+        return "stable_industry" if kind == "industry" else "candidate_theme"
+    if mapping_status == "non_chain":
+        return "market_theme"
+    return "weak_source"
+
+
+def _primary_policy_for_mapping(*, kind: str, mapping_status: str) -> str:
+    if mapping_status != "mapped":
+        return "blocked"
+    return "direct" if kind == "industry" else "fallback"
+
+
+def _volume_driver_score(board_heat: dict[str, Any], quote_context: dict[str, Any]) -> float:
+    board_change = max(0.0, _float(board_heat.get("change_pct")))
+    board_turnover = max(0.0, _float(board_heat.get("turnover_pct")))
+    stock_change = max(0.0, _float(quote_context.get("change_pct")))
+    stock_turnover = max(0.0, _float(quote_context.get("turnover_pct")))
+    return round(min(20.0, board_change * 1.2 + board_turnover * 2.0 + stock_change + stock_turnover * 2.0), 3)
+
+
+def _market_context(board_heat: dict[str, Any], quote_context: dict[str, Any]) -> dict[str, Any]:
+    context: dict[str, Any] = {}
+    if board_heat:
+        context["source_board"] = {
+            "change_pct": board_heat.get("change_pct"),
+            "turnover_pct": board_heat.get("turnover_pct"),
+            "rank": board_heat.get("rank"),
+            "up_count": board_heat.get("up_count"),
+            "down_count": board_heat.get("down_count"),
+            "leader_name": board_heat.get("leader_name"),
+            "leader_symbol": board_heat.get("leader_symbol"),
+            "leader_change_pct": board_heat.get("leader_change_pct"),
+            "trade_date": board_heat.get("trade_date"),
+            "trade_minute": board_heat.get("trade_minute"),
+            "source": board_heat.get("source"),
+        }
+    if quote_context:
+        context["security_quote"] = {
+            "change_pct": quote_context.get("change_pct"),
+            "turnover_pct": quote_context.get("turnover_pct"),
+            "vol": quote_context.get("vol"),
+            "amount": quote_context.get("amount"),
+            "price": quote_context.get("price"),
+            "trade_date": quote_context.get("trade_date"),
+            "snapshot_at": quote_context.get("snapshot_at"),
+            "freshness": quote_context.get("freshness"),
+            "is_stale": quote_context.get("is_stale"),
+        }
+    return context
+
+
+def _build_security_concept_evidence(
+    db: Database,
+    *,
+    trade_date: str,
+    now: datetime,
+    catalog: list[dict[str, Any]],
+    mapping_docs: list[dict[str, Any]],
+    security_master: dict[str, dict[str, Any]],
+    security_names: dict[str, str],
+    include_market_context: bool = True,
+) -> list[dict[str, Any]]:
+    mappings_by_source = {
+        _text(item.get("source_board_id")): item
+        for item in mapping_docs
+        if _text(item.get("source_board_id"))
+    }
+    heat_by_board = _latest_board_heat_context(db) if include_market_context else {}
+    quote_by_code = _latest_quote_context_by_code(db) if include_market_context else {}
+    docs: list[dict[str, Any]] = []
+    for source in catalog:
+        name = _text(source.get("canonical_name") or source.get("raw_name"))
+        kind = _text(source.get("kind"))
+        if not name or kind not in {"industry", "concept"}:
+            continue
+        constituent = _constituent_doc(db, kind=kind, name=name)
+        symbols = list(constituent.get("symbols") or [])
+        if not symbols:
+            continue
+        stock_names = dict(constituent.get("stock_names") or {})
+        source_board_id = _text(source.get("source_board_id"))
+        mapping = mappings_by_source.get(source_board_id) or {}
+        mapping_status = _text(mapping.get("mapping_status")) or ("mapped" if mapping.get("chain_id") else "unmapped")
+        confidence = int(_float(mapping.get("confidence")))
+        specificity = _float(mapping.get("mapping_specificity"))
+        evidence_type = _evidence_type_for_mapping(kind=kind, mapping_status=mapping_status)
+        evidence_layer = _evidence_layer_for_mapping(kind=kind, mapping_status=mapping_status)
+        primary_policy = _primary_policy_for_mapping(kind=kind, mapping_status=mapping_status)
+        board_heat = heat_by_board.get((kind, name), {})
+        source_collection = "concept_constituents" if kind == "concept" else "board_constituents"
+        for symbol_value in symbols:
+            code = _pure_a_code(symbol_value)
+            if not code:
+                continue
+            master = security_master.get(code)
+            symbol = _text((master or {}).get("symbol")) or _prefixed_a_symbol(code)
+            sid = _text((master or {}).get("security_id")) or _security_id(symbol)
+            stock_name = _text(stock_names.get(code) or stock_names.get(symbol) or security_names.get(code) or (master or {}).get("name"))
+            issuer = _text((master or {}).get("issuer_id")) or _issuer_id(market="A", symbol=symbol, code=code, name=stock_name)
+            quote_context = quote_by_code.get(code, {})
+            volume_score = _volume_driver_score(board_heat, quote_context)
+            row: dict[str, Any] = {
+                "_id": f"{trade_date}:{sid}:{_stable_id(source_board_id)}",
+                "trade_date": trade_date,
+                "market": "A",
+                "security_id": sid,
+                "issuer_id": issuer,
+                "symbol": symbol,
+                "raw_code": code,
+                "name": stock_name,
+                "source_board_id": source_board_id,
+                "source_board_name": name,
+                "source_board_kind": kind,
+                "source": source.get("source"),
+                "source_collection": source_collection,
+                "source_doc_id": str(constituent.get("_id") or name),
+                "source_status": constituent.get("status"),
+                "evidence_type": evidence_type,
+                "evidence_layer": evidence_layer,
+                "primary_policy": primary_policy,
+                "chain_mapping_status": mapping_status,
+                "mapping_filter_reason": mapping.get("mapping_filter_reason") or mapping.get("reason") or "",
+                "confidence": confidence,
+                "mapping_confidence": confidence,
+                "chain_specificity_score": specificity,
+                "hit_terms": mapping.get("hit_terms") or [],
+                "evidence_sources": mapping.get("evidence_sources") or [],
+                "market_context": _market_context(board_heat, quote_context),
+                "volume_driver_score": volume_score,
+                "evidence_strength": round(float(confidence) + min(12.0, volume_score), 3),
+                "promotable": mapping_status == "mapped",
+                "as_of": source.get("as_of") or trade_date,
+                "updated_at": now,
+            }
+            if mapping_status == "mapped":
+                row.update({
+                    "chain_id": mapping.get("chain_id"),
+                    "chain_name": mapping.get("chain_name"),
+                    "node_id": mapping.get("node_id"),
+                    "node_name": mapping.get("node_name"),
+                    "layer": mapping.get("layer"),
+                    "stage": mapping.get("stage"),
+                    "membership_type_candidate": _membership_type(
+                        kind=kind,
+                        confidence=confidence,
+                        specificity=specificity,
+                    ),
+                })
+            docs.append(row)
+    if include_market_context:
+        docs.extend(_build_company_business_fact_evidence(
+            db,
+            trade_date=trade_date,
+            now=now,
+            security_master=security_master,
+            security_names=security_names,
+            quote_by_code=quote_by_code,
+        ))
+    return docs
+
+
+def _business_fact_rows(fact: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in fact.get("business_rows") or []:
+        if not isinstance(item, dict):
+            continue
+        term = _text(item.get("term"))
+        if not term:
+            continue
+        rows.append({
+            "term": term,
+            "category": _text(item.get("category")),
+            "report_date": _text(item.get("report_date")),
+            "revenue_ratio": _float(item.get("revenue_ratio")),
+            "gross_margin": _float(item.get("gross_margin")),
+        })
+    industry = _text(fact.get("industry"))
+    if industry:
+        rows.insert(0, {
+            "term": industry,
+            "category": "东财行业",
+            "report_date": _text(fact.get("as_of")),
+            "revenue_ratio": 0.0,
+            "gross_margin": 0.0,
+        })
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        term = row["term"]
+        if term in seen:
+            continue
+        seen.add(term)
+        deduped.append(row)
+    return deduped[:8]
+
+
+def _latest_business_fact_docs(db: Database) -> list[dict[str, Any]]:
+    return list(db["security_business_facts"].find(
+        {"status": "ok", "business_terms": {"$exists": True}},
+        {
+            "_id": 1,
+            "security_id": 1,
+            "issuer_id": 1,
+            "symbol": 1,
+            "raw_code": 1,
+            "name": 1,
+            "industry": 1,
+            "business_terms": 1,
+            "business_rows": 1,
+            "source": 1,
+            "as_of": 1,
+            "updated_at": 1,
+        },
+    ).limit(20000))
+
+
+def _build_company_business_fact_evidence(
+    db: Database,
+    *,
+    trade_date: str,
+    now: datetime,
+    security_master: dict[str, dict[str, Any]],
+    security_names: dict[str, str],
+    quote_by_code: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    docs: list[dict[str, Any]] = []
+    for fact in _latest_business_fact_docs(db):
+        code = _pure_a_code(fact.get("raw_code") or fact.get("symbol"))
+        if not code:
+            continue
+        master = security_master.get(code)
+        symbol = _text((master or {}).get("symbol") or fact.get("symbol")) or _prefixed_a_symbol(code)
+        sid = _text((master or {}).get("security_id") or fact.get("security_id")) or _security_id(symbol)
+        stock_name = _text((master or {}).get("name") or fact.get("name") or security_names.get(code))
+        issuer = _text((master or {}).get("issuer_id") or fact.get("issuer_id")) or _issuer_id(
+            market="A",
+            symbol=symbol,
+            code=code,
+            name=stock_name,
+        )
+        quote_context = quote_by_code.get(code, {})
+        for fact_row in _business_fact_rows(fact):
+            term = fact_row["term"]
+            if non_chain_reason(term):
+                continue
+            matches = match_industry_chains(term)
+            if not matches:
+                continue
+            best = matches[0]
+            confidence = int(best.get("confidence") or 0)
+            if confidence < MAPPING_CONFIDENCE_THRESHOLD:
+                continue
+            specificity = mapping_specificity(best)
+            volume_score = _volume_driver_score({}, quote_context)
+            docs.append({
+                "_id": f"{trade_date}:{sid}:business_fact:{_stable_id(term)}",
+                "trade_date": trade_date,
+                "market": "A",
+                "security_id": sid,
+                "issuer_id": issuer,
+                "symbol": symbol,
+                "raw_code": code,
+                "name": stock_name,
+                "source_board_id": f"business_fact:{code}:{_stable_id(term)}",
+                "source_board_name": term,
+                "source_board_kind": "company_fact",
+                "source": fact.get("source") or "eastmoney_f10",
+                "source_collection": "security_business_facts",
+                "source_doc_id": str(fact.get("_id") or code),
+                "source_status": "ok",
+                "evidence_type": "company_business_fact",
+                "evidence_layer": "company_fact",
+                "primary_policy": "fallback",
+                "chain_mapping_status": "mapped",
+                "mapping_filter_reason": "",
+                "confidence": confidence,
+                "mapping_confidence": confidence,
+                "chain_specificity_score": specificity,
+                "hit_terms": best.get("hit_terms") or [],
+                "evidence_sources": ["company_business_fact", *(best.get("evidence_sources") or [])],
+                "market_context": _market_context({}, quote_context),
+                "business_context": {
+                    "term": term,
+                    "category": fact_row.get("category"),
+                    "report_date": fact_row.get("report_date"),
+                    "revenue_ratio": fact_row.get("revenue_ratio"),
+                    "gross_margin": fact_row.get("gross_margin"),
+                },
+                "volume_driver_score": volume_score,
+                "evidence_strength": round(float(confidence) + min(8.0, volume_score), 3),
+                "promotable": True,
+                "chain_id": best.get("chain_id"),
+                "chain_name": best.get("chain_name"),
+                "node_id": best.get("node_id"),
+                "node_name": best.get("node_name"),
+                "layer": best.get("layer"),
+                "stage": best.get("stage"),
+                "membership_type_candidate": "theme",
+                "as_of": _text(fact.get("as_of")) or trade_date,
+                "updated_at": now,
+            })
+    return docs
+
+
 def _ai_scope() -> str:
     scope = _text(os.getenv("SIGNALS_CHAIN_AI_SCOPE") or "ambiguous").lower()
     return scope if scope in {"off", "ambiguous", "all"} else "ambiguous"
@@ -481,16 +1044,23 @@ def _mapping_doc(db: Database, catalog: dict[str, Any], *, trade_date: str, now:
         "ai_reason": _text(best.get("ai_reason")),
         "mapping_type": "ai_rule_hybrid" if best.get("ai_confidence") is not None else "semantic_taxonomy",
         "mapping_filter_reason": filter_reason,
+        "mapping_specificity": mapping_specificity(best),
         "hit_terms": best.get("hit_terms") or [],
         "evidence_sources": best.get("evidence_sources") or [],
     }
     return doc, best if status == "mapped" else None
 
 
-def _membership_type(*, kind: str, confidence: int) -> str:
+def _membership_type(*, kind: str, confidence: int, specificity: float = 0.0) -> str:
+    if kind == "industry" and specificity >= 3:
+        return "core"
     if confidence < 65:
         return "weak_related"
     return "core" if kind == "industry" else "theme"
+
+
+def _stronger_membership_type(current: Any, candidate: str) -> str:
+    return candidate if _membership_type_rank(candidate) > _membership_type_rank(current) else _text(current)
 
 
 def _exposure_score(*, kind: str, confidence: int, source_count: int) -> float:
@@ -506,88 +1076,132 @@ def _build_memberships(
     mappings: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]],
     security_master: dict[str, dict[str, Any]],
     security_names: dict[str, str],
+    evidence_docs: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
     reps_by_node = _taxonomy_representatives_by_node()
-    for catalog, mapping, match in mappings:
-        name = _text(catalog.get("canonical_name"))
-        kind = _text(catalog.get("kind"))
-        constituent = _constituent_doc(db, kind=kind, name=name)
-        symbols = list(constituent.get("symbols") or [])
-        stock_names = dict(constituent.get("stock_names") or {})
-        if not symbols:
+    if evidence_docs is None:
+        synthesized_mapping_docs = []
+        for catalog, mapping, _ in mappings:
+            synthesized_mapping_docs.append({
+                **mapping,
+                "source_board_id": mapping.get("source_board_id") or catalog.get("source_board_id"),
+                "mapping_status": mapping.get("mapping_status") or "mapped",
+            })
+        evidence_docs = _build_security_concept_evidence(
+            db,
+            trade_date=trade_date,
+            now=now,
+            catalog=[catalog for catalog, _, _ in mappings],
+            mapping_docs=synthesized_mapping_docs,
+            security_master=security_master,
+            security_names=security_names,
+            include_market_context=False,
+        )
+    for evidence in evidence_docs:
+        if _text(evidence.get("chain_mapping_status")) != "mapped":
             continue
-        confidence = int(mapping.get("confidence") or 0)
-        for symbol_value in symbols:
-            code = _pure_a_code(symbol_value)
-            if not code:
-                continue
-            symbol = _prefixed_a_symbol(code)
-            sid = _security_id(symbol)
-            master = security_master.get(code)
-            stock_name = _text(stock_names.get(code) or stock_names.get(symbol) or security_names.get(code) or (master or {}).get("name"))
-            issuer = (master or {}).get("issuer_id") or _issuer_id(market="A", symbol=symbol, code=code, name=stock_name)
-            chain_id = _text(mapping.get("chain_id"))
-            node_id = _text(mapping.get("node_id"))
-            node_key = (chain_id, node_id)
-            key = (sid, chain_id, node_id)
-            row = grouped.get(key)
-            if row is None:
-                row = {
-                    "_id": f"{trade_date}:{sid}:{mapping.get('chain_id')}:{mapping.get('node_id')}",
-                    "trade_date": trade_date,
-                    "security_id": sid,
-                    "issuer_id": issuer,
-                    "market": "A",
-                    "symbol": symbol,
-                    "raw_code": code,
-                    "name": stock_name,
-                    "chain_id": mapping.get("chain_id"),
-                    "chain_name": mapping.get("chain_name"),
-                    "node_id": mapping.get("node_id"),
-                    "node_name": mapping.get("node_name"),
-                    "layer": mapping.get("layer"),
-                    "stage": mapping.get("stage"),
-                    "role": mapping.get("stage") or mapping.get("layer") or "",
-                    "membership_type": _membership_type(kind=kind, confidence=confidence),
-                    "confidence": confidence,
-                    "exposure_score": _exposure_score(kind=kind, confidence=confidence, source_count=1),
-                    "is_primary_chain": False,
-                    "source_boards": [],
-                    "evidence_sources": [],
-                    "evidence_docs": [],
-                    "as_of": trade_date,
-                    "stale_level": "fresh",
-                    "updated_at": now,
-                }
-                grouped[key] = row
-            row["confidence"] = max(int(row.get("confidence") or 0), confidence)
-            row["source_boards"].append({
-                "source_board_id": catalog.get("source_board_id"),
-                "name": name,
-                "kind": kind,
-                "source": catalog.get("source"),
+        code = _pure_a_code(evidence.get("raw_code") or evidence.get("symbol"))
+        chain_id = _text(evidence.get("chain_id"))
+        node_id = _text(evidence.get("node_id"))
+        if not code or not chain_id or not node_id:
+            continue
+        kind = _text(evidence.get("source_board_kind"))
+        confidence = int(_float(evidence.get("confidence") or evidence.get("mapping_confidence")))
+        specificity = _float(evidence.get("chain_specificity_score"))
+        symbol = _text(evidence.get("symbol")) or _prefixed_a_symbol(code)
+        sid = _text(evidence.get("security_id")) or _security_id(symbol)
+        master = security_master.get(code)
+        stock_name = _text(evidence.get("name") or security_names.get(code) or (master or {}).get("name"))
+        issuer = _text(evidence.get("issuer_id") or (master or {}).get("issuer_id")) or _issuer_id(
+            market="A",
+            symbol=symbol,
+            code=code,
+            name=stock_name,
+        )
+        node_key = (chain_id, node_id)
+        key = (sid, chain_id, node_id)
+        row = grouped.get(key)
+        if row is None:
+            row = {
+                "_id": f"{trade_date}:{sid}:{chain_id}:{node_id}",
+                "trade_date": trade_date,
+                "security_id": sid,
+                "issuer_id": issuer,
+                "market": "A",
+                "symbol": symbol,
+                "raw_code": code,
+                "name": stock_name,
+                "chain_id": chain_id,
+                "chain_name": evidence.get("chain_name"),
+                "node_id": node_id,
+                "node_name": evidence.get("node_name"),
+                "layer": evidence.get("layer"),
+                "stage": evidence.get("stage"),
+                "role": evidence.get("stage") or evidence.get("layer") or "",
+                "membership_type": evidence.get("membership_type_candidate")
+                or _membership_type(kind=kind, confidence=confidence, specificity=specificity),
                 "confidence": confidence,
-            })
-            row["evidence_sources"].extend([
-                _text(catalog.get("source")),
-                f"{kind}_constituent",
-                "source_board_chain_mapping",
-            ])
-            row["evidence_docs"].append({
-                "collection": "concept_constituents" if kind == "concept" else "board_constituents",
-                "board_name": name,
-                "source": constituent.get("source"),
-                "status": constituent.get("status"),
-                "mapping_confidence": confidence,
-            })
-            source_count = len({item.get("source_board_id") for item in row["source_boards"]})
-            row["membership_type"] = "core" if any(item.get("kind") == "industry" for item in row["source_boards"]) and row["confidence"] >= 65 else row["membership_type"]
-            row["exposure_score"] = max(
-                _float(row.get("exposure_score")),
-                _exposure_score(kind=kind, confidence=int(row["confidence"]), source_count=source_count),
-            )
-            _apply_taxonomy_representative(row, reps_by_node.get(node_key, {}).get(code))
+                "chain_specificity_score": specificity,
+                "exposure_score": _exposure_score(kind=kind, confidence=confidence, source_count=1),
+                "is_primary_chain": False,
+                "source_boards": [],
+                "evidence_sources": [],
+                "evidence_layers": [],
+                "primary_policies": [],
+                "evidence_docs": [],
+                "as_of": trade_date,
+                "stale_level": "fresh",
+                "updated_at": now,
+            }
+            grouped[key] = row
+        row["confidence"] = max(int(row.get("confidence") or 0), confidence)
+        row["chain_specificity_score"] = max(
+            _float(row.get("chain_specificity_score")),
+            specificity,
+        )
+        row["source_boards"].append({
+            "source_board_id": evidence.get("source_board_id"),
+            "name": evidence.get("source_board_name"),
+            "kind": kind,
+            "source": evidence.get("source"),
+            "confidence": confidence,
+            "evidence_layer": evidence.get("evidence_layer"),
+            "primary_policy": evidence.get("primary_policy"),
+            "volume_driver_score": evidence.get("volume_driver_score"),
+            "market_context": evidence.get("market_context") or {},
+        })
+        row["evidence_sources"].extend([
+            _text(evidence.get("source")),
+            _text(evidence.get("evidence_type")),
+            "source_board_chain_mapping",
+            SECURITY_CONCEPT_EVIDENCE_COLLECTION,
+        ])
+        row.setdefault("evidence_layers", []).append(_text(evidence.get("evidence_layer")))
+        row.setdefault("primary_policies", []).append(_text(evidence.get("primary_policy")))
+        row["evidence_docs"].append({
+            "collection": SECURITY_CONCEPT_EVIDENCE_COLLECTION,
+            "evidence_id": evidence.get("_id"),
+            "evidence_type": evidence.get("evidence_type"),
+            "evidence_layer": evidence.get("evidence_layer"),
+            "primary_policy": evidence.get("primary_policy"),
+            "board_name": evidence.get("source_board_name"),
+            "source": evidence.get("source"),
+            "source_collection": evidence.get("source_collection"),
+            "mapping_confidence": confidence,
+            "volume_driver_score": evidence.get("volume_driver_score"),
+        })
+        source_count = len({item.get("source_board_id") for item in row["source_boards"]})
+        row["membership_type"] = _stronger_membership_type(
+            row.get("membership_type"),
+            _text(evidence.get("membership_type_candidate"))
+            or _membership_type(kind=kind, confidence=confidence, specificity=specificity),
+        )
+        row["exposure_score"] = max(
+            _float(row.get("exposure_score")),
+            _exposure_score(kind=kind, confidence=int(row["confidence"]), source_count=source_count),
+        )
+        _apply_taxonomy_representative(row, reps_by_node.get(node_key, {}).get(code))
 
     _seed_taxonomy_memberships(
         grouped,
@@ -597,15 +1211,24 @@ def _build_memberships(
         security_names=security_names,
         reps_by_node=reps_by_node,
     )
+    _apply_security_chain_overrides(
+        grouped,
+        trade_date=trade_date,
+        now=now,
+        security_master=security_master,
+        security_names=security_names,
+    )
 
     by_security: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in grouped.values():
         row["source_boards"] = list({item["source_board_id"]: item for item in row["source_boards"]}.values())[:12]
         row["evidence_sources"] = [item for item in dict.fromkeys(row["evidence_sources"]) if item]
+        row["evidence_layers"] = [item for item in dict.fromkeys(row.get("evidence_layers") or []) if item]
+        row["primary_policies"] = [item for item in dict.fromkeys(row.get("primary_policies") or []) if item]
         row["evidence_docs"] = row["evidence_docs"][:10]
         by_security[row["security_id"]].append(row)
     for rows in by_security.values():
-        primary = max(rows, key=_membership_sort_key, default=None)
+        primary = max(rows, key=_primary_membership_sort_key, default=None)
         if primary:
             primary["is_primary_chain"] = True
     return list(grouped.values())
@@ -672,6 +1295,8 @@ def _rollup_docs(
                     "exposure_score": row.get("exposure_score"),
                     "is_primary_chain": row.get("is_primary_chain"),
                     "evidence_sources": row.get("evidence_sources") or [],
+                    "evidence_layers": row.get("evidence_layers") or [],
+                    "primary_policies": row.get("primary_policies") or [],
                 }
                 for row in top
             ],
@@ -734,6 +1359,22 @@ def sync_postmarket_chain_rebuild(db: Database, proxy_url: str = None) -> dict[s
             mapped_for_membership.append((item, mapping, match))
     mapping_inserted, mapping_modified = _write_many_replace(db, "source_board_chain_mappings", mapping_docs, trade_date=trade_date)
 
+    concept_evidence = _build_security_concept_evidence(
+        db,
+        trade_date=trade_date,
+        now=now,
+        catalog=catalog,
+        mapping_docs=mapping_docs,
+        security_master=security_master,
+        security_names=security_names,
+    )
+    evidence_inserted, evidence_modified = _write_many_replace(
+        db,
+        SECURITY_CONCEPT_EVIDENCE_COLLECTION,
+        concept_evidence,
+        trade_date=trade_date,
+    )
+
     memberships = _build_memberships(
         db,
         trade_date=trade_date,
@@ -741,6 +1382,7 @@ def sync_postmarket_chain_rebuild(db: Database, proxy_url: str = None) -> dict[s
         mappings=mapped_for_membership,
         security_master=security_master,
         security_names=security_names,
+        evidence_docs=concept_evidence,
     )
     membership_inserted, membership_modified = _write_many_replace(db, "security_chain_memberships", memberships, trade_date=trade_date)
 
@@ -768,6 +1410,9 @@ def sync_postmarket_chain_rebuild(db: Database, proxy_url: str = None) -> dict[s
         "source_board_count": len(catalog),
         "source_board_status_counts": dict(Counter(doc.get("normalization_status") for doc in catalog)),
         "mapping_status_counts": dict(mapping_counts),
+        "security_concept_evidence_count": len(concept_evidence),
+        "evidence_layer_counts": dict(Counter(row.get("evidence_layer") for row in concept_evidence)),
+        "primary_policy_counts": dict(Counter(row.get("primary_policy") for row in concept_evidence)),
         "coverage_by_chain": dict(coverage_by_chain),
         "coverage_by_market": dict(Counter(row.get("market") for row in memberships)),
         "relationship_edges_status": "deferred_v1",
@@ -791,6 +1436,7 @@ def sync_postmarket_chain_rebuild(db: Database, proxy_url: str = None) -> dict[s
                 "security_master": len(security_master),
                 "source_board_catalog": len(catalog),
                 "source_board_chain_mappings": len(mapping_docs),
+                SECURITY_CONCEPT_EVIDENCE_COLLECTION: len(concept_evidence),
                 "security_chain_memberships": len(memberships),
                 "chain_node_security_rollups": len(rollups),
             },
@@ -810,6 +1456,7 @@ def sync_postmarket_chain_rebuild(db: Database, proxy_url: str = None) -> dict[s
             "updated_at": now,
             "stale_reason": "" if memberships else "security_chain_memberships_empty",
             "count": len(memberships),
+            "security_concept_evidence_count": len(concept_evidence),
             "security_universe_count": len(security_master),
             "covered_security_count": report["covered_security_count"],
             "mapping_status_counts": dict(mapping_counts),
@@ -822,11 +1469,12 @@ def sync_postmarket_chain_rebuild(db: Database, proxy_url: str = None) -> dict[s
         security_inserted
         + catalog_inserted
         + mapping_inserted
+        + evidence_inserted
         + membership_inserted
         + rollup_inserted
         + 2
     )
-    modified = security_modified + catalog_modified + mapping_modified + membership_modified + rollup_modified
+    modified = security_modified + catalog_modified + mapping_modified + evidence_modified + membership_modified + rollup_modified
     return {
         "module": "postmarket_chain_rebuild",
         "status": "ok" if memberships else "degraded",
@@ -836,6 +1484,7 @@ def sync_postmarket_chain_rebuild(db: Database, proxy_url: str = None) -> dict[s
         "security_universe_count": len(security_master),
         "covered_security_count": report["covered_security_count"],
         "membership_count": len(memberships),
+        "security_concept_evidence_count": len(concept_evidence),
         "rollup_count": len(rollups),
         "mapping_status_counts": dict(mapping_counts),
         "elapsed": round(time.monotonic() - started, 3),

@@ -42,11 +42,17 @@ def test_quote_preopen_sleep_wakes_at_auction_start():
 def test_preopen_enables_realtime_board_and_workbench_lanes():
     engine = object.__new__(SyncEngine)
 
-    for lanes in ({"quote_lane"}, {"board_lane"}, {"workbench_lane"}, {"board_lane", "workbench_lane"}):
+    for lanes in (
+        {"quote_lane"},
+        {"signal_lane"},
+        {"board_lane"},
+        {"workbench_lane"},
+        {"quote_lane", "signal_lane", "board_lane", "workbench_lane"},
+    ):
         engine.enabled_lanes = lanes
         assert engine._quote_preopen_enabled() is True
 
-    engine.enabled_lanes = {"signal_lane"}
+    engine.enabled_lanes = {"custom_lane"}
     assert engine._quote_preopen_enabled() is False
 
 

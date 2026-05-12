@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 
 from signals.data.models import DataRequest, resolve_mode
@@ -114,6 +116,29 @@ def test_realtime_board_prefers_heat_ticks(monkeypatch):
     assert response.source == "board_heat_ticks"
     assert response.freshness == "fresh"
     assert response.data.iloc[0]["board_name"] == "通信设备"
+
+
+def test_realtime_board_default_target_switches_at_call_auction(monkeypatch):
+    from signals.data import gateway
+
+    captured = {}
+    heat_df = pd.DataFrame([
+        {"dt": "2026-05-12", "board_name": "通信设备", "change_pct": 3.6, "source": "eastmoney_push2delay"}
+    ])
+
+    def fake_heat_snapshot(domain, target):
+        captured["target"] = target
+        return heat_df, "board_heat_ticks", "2026-05-12"
+
+    monkeypatch.setattr(gateway, "naive_market_now", lambda market: datetime(2026, 5, 12, 9, 15))
+    monkeypatch.setattr(gateway, "_read_heat_tick_snapshot", fake_heat_snapshot)
+    monkeypatch.setattr(gateway, "_write_data_freshness", lambda *a, **k: None)
+
+    response = gateway.get_board_rank(DataRequest(domain="board", mode="realtime"))
+
+    assert captured["target"] == "2026-05-12"
+    assert response.as_of == "2026-05-12"
+    assert response.freshness == "fresh"
 
 
 def test_realtime_empty_falls_back_to_canonical_without_provider(monkeypatch):

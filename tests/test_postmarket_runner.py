@@ -12,6 +12,7 @@ from signals.sync import postmarket as pm
 
 def test_default_postmarket_tasks_split_long_market_data_tasks():
     spot = next(task for task in pm.POSTMARKET_TASKS if task.module == "fullmarket_spot_snapshot")
+    quote = next(task for task in pm.POSTMARKET_TASKS if task.module == "quote_snapshots")
     stock_daily = [task for task in pm.POSTMARKET_TASKS if task.module == "stock_daily"]
     hk_stock_daily = [task for task in pm.POSTMARKET_TASKS if task.module == "hk_stock_daily"]
     stock_30m = [task for task in pm.POSTMARKET_TASKS if task.module == "stock_30m_fullmarket"]
@@ -34,6 +35,7 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert all(task.phase == "hk_market_data" for task in hk_stock_daily)
     assert all(task.blocks_run is False for task in hk_stock_daily)
     assert all(task.blocks_run is False for task in stock_30m)
+    assert quote.depends_on == ("fullmarket_spot_snapshot:all",)
     assert all(task.depends_on == ("fullmarket_spot_snapshot:all",) for task in stock_daily)
     assert index_daily.depends_on == ("quote_snapshots:all",)
     assert all(task.task_key not in technical_scan.depends_on for task in stock_30m)

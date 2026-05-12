@@ -215,6 +215,80 @@ def test_shell_cache_refreshes_quote_overlay_when_quote_watermark_changes(monkey
         workbench._invalidate_shell_cache()
 
 
+def test_shell_cache_rebuilds_when_board_watermark_changes():
+    from signals.web.api import workbench
+
+    class _Engine:
+        def is_ready(self):
+            return True
+
+    try:
+        cached_payload = {"session": {"ready": True}, "buy_candidates": []}
+        workbench._SHELL_CACHE.update({
+            "expires_at": 999999.0,
+            "payload": cached_payload,
+            "refreshed_at": 1.0,
+            "quote_watermark": "quote_snapshots:old|board_heat_ticks:old",
+        })
+
+        assert workbench._shell_cache_usable(
+            cached_payload,
+            _Engine(),
+            quote_watermark="quote_snapshots:new|board_heat_ticks:old",
+        ) is True
+        assert workbench._shell_cache_usable(
+            cached_payload,
+            _Engine(),
+            quote_watermark="quote_snapshots:old|board_heat_ticks:new",
+        ) is False
+    finally:
+        workbench._invalidate_shell_cache()
+
+
+def test_daily_chart_appends_live_quote_bar_after_call_auction(monkeypatch):
+    from signals.web.api import workbench
+
+    df = pd.DataFrame(
+        [{"open": 10.0, "high": 10.5, "low": 9.8, "close": 10.2, "vol": 1000, "amount": 10000}],
+        index=[pd.Timestamp("2026-05-11")],
+    )
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-12")
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {
+        "quote_status": "realtime",
+        "latest_price": 10.8,
+        "quote_open_price": 10.3,
+    })
+
+    chart = workbench._chart_from_df(df, symbol="SZ.000001", freq="daily", source="bars", live_render=True)
+
+    assert chart["meta"]["as_of"] == "2026-05-12"
+    assert chart["meta"]["cache_status"] == "ready"
+    assert chart["meta"]["freshness"] == "fresh"
+    assert chart["meta"]["time_semantics"] == "realtime_daily_partial"
+    assert "live_quote_daily_overlay" in chart["meta"]["source"]
+    assert chart["ohlcv"][-1]["close"] == 10.8
+
+
+def test_intraday_chart_does_not_render_previous_day_after_call_auction(monkeypatch):
+    from signals.web.api import workbench
+
+    df = pd.DataFrame(
+        [{"open": 10.0, "high": 10.5, "low": 9.8, "close": 10.2, "vol": 1000, "amount": 10000}],
+        index=[pd.Timestamp("2026-05-11 15:00")],
+    )
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-12")
+
+    chart = workbench._chart_from_df(df, symbol="SZ.000001", freq="5min", source="bars", live_render=True)
+    chart = workbench._mark_chart_readiness(chart, kind="stock", requested_freq="5min")
+
+    assert chart["ohlcv"] == []
+    assert chart["meta"]["cache_status"] == "not_ready"
+    assert chart["meta"]["not_ready_reason"] == "stock_minute_not_ready"
+    assert "minute_cache_older_than_realtime_day" in chart["meta"]["stale_reason"]
+
+
 def test_macro_indices_have_day_and_range_returns(monkeypatch):
     from signals.web.api import workbench
 
@@ -705,6 +779,59 @@ def test_terminal_stock_pool_group_rows_keep_focus_risk_watch_separate(monkeypat
     assert focus[0]["entry_gate_status"] == "entry_confirmed"
     assert risk[0]["action_status"] == "risk_review"
     assert watch[0]["action_status"] == "entry_waiting_30m_confirm"
+
+
+def test_terminal_stock_pool_group_rows_refreshes_stale_chain_assignment(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Collection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "watch_stocks": [
+                    {
+                        "symbol": "SZ.002918",
+                        "name": "蒙娜丽莎",
+                        "pool_type": "watch",
+                        "action_status": "entry_waiting_30m_confirm",
+                        "chain_position": {
+                            "chain": "消费品产业链",
+                            "node": "白酒/食品饮料",
+                            "chain_id": "consumer",
+                            "node_id": "consumer_goods",
+                        },
+                    }
+                ]
+            }
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"terminal_stock_pool": _Collection()}))
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (_bars_current(), "test_bars"))
+    monkeypatch.setattr(
+        workbench,
+        "_refresh_realtime_quotes_for_rows",
+        lambda db, rows, *, refresh_key, limit: {"status": "skipped"},
+    )
+    monkeypatch.setattr(workbench, "_terminal_stock_chain_position_map", lambda rows: {
+        "SZ.002918": {
+            "chain": "家居建材产业链",
+            "chain_name": "家居建材产业链",
+            "node": "瓷砖/卫浴/建筑陶瓷",
+            "node_name": "瓷砖/卫浴/建筑陶瓷",
+            "chain_id": "home_building_materials",
+            "node_id": "ceramic_tile_sanitary",
+            "source": "security_chain_memberships",
+        }
+    })
+
+    rows = workbench._terminal_stock_pool_group_rows([], "watch_stocks")
+
+    assert rows[0]["chain_position"]["chain_id"] == "home_building_materials"
+    assert rows[0]["chain_position"]["node_id"] == "ceramic_tile_sanitary"
+    assert rows[0]["chain_position"]["board_or_concept"] == "瓷砖/卫浴/建筑陶瓷"
+    assert rows[0]["chain_context"]["mapping_status"] == "security_chain_memberships"
 
 
 def test_terminal_stock_pool_group_rows_uses_watch_limit_from_pool_doc(monkeypatch):
@@ -1305,6 +1432,16 @@ def test_slim_shell_stock_row_preserves_quote_basis_fields():
         "quote_prev_close_change_pct": -1.985,
         "setup_rank_tier": 0,
         "market_setup_bias": "watch_only",
+        "index_setup_side": "right_buy",
+        "index_setup_label": "指数右侧买",
+        "stock_setup_side": "right_buy",
+        "stock_setup_label": "个股右侧买",
+        "setup_alignment": "aligned_right_buy",
+        "alignment_policy": "allow_focus",
+        "alignment_score": 20.0,
+        "market_volume_state": "expanding",
+        "market_volume_label": "放量",
+        "market_volume_ratio": 1.2,
         "left_allowed_reason": "mainline_lenient",
         "watch_backfill_source": "clue_overflow",
         "clue_quality_score": 68.0,
@@ -1316,6 +1453,10 @@ def test_slim_shell_stock_row_preserves_quote_basis_fields():
     assert row["quote_prev_close_change_pct"] == -1.985
     assert row["setup_rank_tier"] == 0
     assert row["market_setup_bias"] == "watch_only"
+    assert row["index_setup_label"] == "指数右侧买"
+    assert row["stock_setup_label"] == "个股右侧买"
+    assert row["alignment_policy"] == "allow_focus"
+    assert row["market_volume_label"] == "放量"
     assert row["left_allowed_reason"] == "mainline_lenient"
     assert row["watch_backfill_source"] == "clue_overflow"
     assert row["clue_quality_score"] == 68.0
@@ -2934,6 +3075,7 @@ def test_stock_30min_uses_bars_chart_not_backtest_override(monkeypatch):
     monkeypatch.setattr(workbench, "_ensure_engine", lambda: FakeEngine())
     monkeypatch.setattr(workbench, "_review_context", lambda *args, **kwargs: {})
     monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "ready"}})
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
 
     payload = asyncio.run(workbench._build_stock_target("SH.600000", "600000", "30min"))
 
@@ -2964,6 +3106,7 @@ def test_stock_daily_uses_bars_chart_before_backtest(monkeypatch):
     monkeypatch.setattr(workbench, "_ensure_engine", lambda: FakeEngine())
     monkeypatch.setattr(workbench, "_review_context", lambda *args, **kwargs: {})
     monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "ready"}})
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
 
     payload = asyncio.run(workbench._build_stock_target("SH.600000", "600000", "daily"))
 
@@ -3000,6 +3143,7 @@ def test_stock_daily_missing_bars_triggers_loader_without_backtest(monkeypatch):
     monkeypatch.setattr(workbench, "_ensure_engine", lambda: FakeEngine())
     monkeypatch.setattr(workbench, "_review_context", lambda *args, **kwargs: {})
     monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "miss"}})
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
 
     payload = asyncio.run(workbench._build_stock_target("SH.600000", "600000", "daily"))
 
@@ -3086,3 +3230,18 @@ def test_quote_future_holiday_date_is_stale_against_expected_daily_close():
     from signals.web.api import workbench
 
     assert workbench._quote_day_is_stale("2026-05-01", "2026-04-30", "daily_close") is True
+
+
+def test_a_day_change_mode_switches_at_call_auction(monkeypatch):
+    from signals.core import market_hours
+    from signals.web.api import workbench
+
+    class _Session:
+        a_live = False
+
+    monkeypatch.setattr(market_hours, "get_session_mode", lambda: _Session())
+    monkeypatch.setattr(workbench, "_market_now", lambda market: datetime(2026, 5, 12, 9, 14))
+    assert workbench._a_day_change_mode() == "daily_close"
+
+    monkeypatch.setattr(workbench, "_market_now", lambda market: datetime(2026, 5, 12, 9, 15))
+    assert workbench._a_day_change_mode() == "quote_intraday"

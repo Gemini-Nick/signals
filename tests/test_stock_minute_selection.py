@@ -137,13 +137,23 @@ def test_stock_minute_opening_phase_caps_symbols_and_freqs(monkeypatch):
     monkeypatch.delenv("STOCK_MINUTE_OPENING_ALL_FREQS", raising=False)
 
     assert stock_minute._selection_cap() == 24
-    assert stock_minute._active_minute_freqs() == ["5分钟"]
+    assert stock_minute._active_minute_freqs() == ["5分钟", "15分钟", "30分钟"]
 
     monkeypatch.setenv("STOCK_MINUTE_OPENING_ALL_FREQS", "true")
-    assert stock_minute._active_minute_freqs() == ["5分钟"]
+    assert stock_minute._active_minute_freqs() == ["5分钟", "15分钟", "30分钟"]
 
 
-def test_stock_minute_signal_lane_defaults_to_5m_low_latency(monkeypatch):
+def test_stock_minute_opening_phase_defaults_to_signal_cap(monkeypatch):
+    monkeypatch.setattr(stock_minute, "naive_market_now", lambda _market: datetime(2026, 4, 29, 9, 15))
+    monkeypatch.setenv("SIGNALS_CURRENT_SYNC_LANE", "signal_lane")
+    monkeypatch.setenv("SIGNALS_CURRENT_SYNC_MARKET", "A")
+    monkeypatch.setenv("STOCK_MINUTE_SIGNAL_MAX_CODES", "72")
+    monkeypatch.delenv("STOCK_MINUTE_OPENING_MAX_CODES", raising=False)
+
+    assert stock_minute._selection_cap() == 72
+
+
+def test_stock_minute_signal_lane_defaults_to_all_realtime_freqs(monkeypatch):
     monkeypatch.setattr(stock_minute, "naive_market_now", lambda _market: datetime(2026, 4, 29, 10, 5))
     monkeypatch.setenv("SIGNALS_CURRENT_SYNC_LANE", "signal_lane")
     monkeypatch.setenv("SIGNALS_CURRENT_SYNC_MARKET", "A")
@@ -152,12 +162,12 @@ def test_stock_minute_signal_lane_defaults_to_5m_low_latency(monkeypatch):
     monkeypatch.delenv("STOCK_MINUTE_SIGNAL_TAIL_COUNT_5", raising=False)
     monkeypatch.delenv("STOCK_MINUTE_SIGNAL_ALL_FREQS", raising=False)
 
-    assert stock_minute._active_minute_freqs() == ["5分钟"]
+    assert stock_minute._active_minute_freqs() == ["5分钟", "15分钟", "30分钟"]
     assert stock_minute._tail_count_for_freq("5分钟") == 80
 
     monkeypatch.setenv("STOCK_MINUTE_SIGNAL_FREQS", "5min,15min")
     monkeypatch.setenv("STOCK_MINUTE_SIGNAL_TAIL_COUNT_5", "120")
-    assert stock_minute._active_minute_freqs() == ["5分钟"]
+    assert stock_minute._active_minute_freqs() == ["5分钟", "15分钟"]
     assert stock_minute._tail_count_for_freq("5分钟") == 120
 
     monkeypatch.setenv("STOCK_MINUTE_SIGNAL_ALL_FREQS", "true")

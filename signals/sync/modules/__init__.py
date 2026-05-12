@@ -25,6 +25,7 @@ from .knowledge_market_views import sync_knowledge_market_views
 from .concept_relationship_graph import sync_concept_relationship_graph
 from .calendar_validate import sync_calendar_validate
 from .postmarket_chain_rebuild import sync_postmarket_chain_rebuild
+from .security_business_facts import sync_security_business_facts
 
 ALL_MODULES = [
     ("calendar_validate", sync_calendar_validate, "08:30 weekday"),
@@ -46,6 +47,7 @@ ALL_MODULES = [
     ("weekly_rollup", sync_weekly_rollup, "17:30-18:00 weekday"),
     ("board_ranking", sync_board_ranking, "18:00-21:00 weekday"),
     ("board_cons",    sync_board_cons,    "18:00-21:00 weekday"),
+    ("security_business_facts", sync_security_business_facts, "20:00-22:00 weekday"),
     ("postmarket_chain_rebuild", sync_postmarket_chain_rebuild, "20:15-22:15 weekday"),
     ("technical_signal_scan", sync_technical_signal_scan, "20:30-22:30 weekday"),
     ("knowledge_market_views", sync_knowledge_market_views, "20:30-22:30 weekday"),

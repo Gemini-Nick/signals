@@ -34,6 +34,7 @@ from signals.core.stock_names import get_resolver
 from signals.data.gateway import get_index_bars, get_kline
 from signals.data.models import DataRequest
 from signals.core.trade_log import get_trade_log
+from signals.core.trading_dates import A_SHARE_AUCTION_OPEN
 from signals.services import backtest as backtest_service
 from signals.services import cluster as cluster_service
 from signals.strategy.snapshot import get_strategy_snapshot
@@ -140,6 +141,13 @@ _SHELL_CACHE_TTL_SECONDS = 120.0
 _SHELL_CACHE_LOCK = threading.RLock()
 _SHELL_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None, "refreshed_at": 0.0, "quote_watermark": ""}
 _SHELL_QUOTE_REFRESH_GROUPS = ("indices", "watchlist", "buy_candidates", "sell_warnings")
+_SHELL_REBUILD_WATERMARK_KEYS = {
+    "terminal_stock_pool",
+    "market_pools",
+    "strategy_snapshots",
+    "board_heat_ticks",
+    "chain_heat_snapshots",
+}
 _VISIBLE_QUOTE_REFRESH_LOCK = threading.Lock()
 _VISIBLE_QUOTE_REFRESH_LAST: dict[str, float] = {}
 
@@ -197,7 +205,46 @@ def _quote_snapshot_watermark() -> str:
         parts.append(f"terminal_stock_pool:{pool_value.isoformat()}:{pool_version}")
     elif pool_value:
         parts.append(f"terminal_stock_pool:{pool_value}:{pool_version}")
+    for collection, field, query in (
+        ("market_pools", "updated_at", {"market": "A"}),
+        ("strategy_snapshots", "updated_at", {}),
+        ("board_heat_ticks", "trade_minute", {}),
+        ("chain_heat_snapshots", "trade_minute", {}),
+    ):
+        try:
+            latest_doc = db[collection].find_one(
+                query,
+                {"_id": 0, field: 1, "updated_at": 1, "snapshot_at": 1},
+                sort=[(field, -1), ("updated_at", -1), ("snapshot_at", -1)],
+            ) or {}
+        except Exception:
+            latest_doc = {}
+        latest_value = latest_doc.get(field) or latest_doc.get("updated_at") or latest_doc.get("snapshot_at")
+        if isinstance(latest_value, datetime):
+            parts.append(f"{collection}:{latest_value.isoformat()}")
+        elif latest_value:
+            parts.append(f"{collection}:{latest_value}")
     return "|".join(parts)
+
+
+def _watermark_parts(value: Any) -> dict[str, str]:
+    parts: dict[str, str] = {}
+    for item in str(value or "").split("|"):
+        if ":" not in item:
+            continue
+        key, rest = item.split(":", 1)
+        if key:
+            parts[key] = rest
+    return parts
+
+
+def _shell_watermark_requires_rebuild(current: Any, cached: Any) -> bool:
+    current_parts = _watermark_parts(current)
+    cached_parts = _watermark_parts(cached)
+    for key in _SHELL_REBUILD_WATERMARK_KEYS:
+        if current_parts.get(key) != cached_parts.get(key):
+            return True
+    return False
 
 
 def _shell_cache_usable(payload: Any, engine: Any, quote_watermark: Optional[str] = None) -> bool:
@@ -205,6 +252,8 @@ def _shell_cache_usable(payload: Any, engine: Any, quote_watermark: Optional[str
         return False
     session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
     if session and not session.get("ready") and engine.is_ready():
+        return False
+    if quote_watermark is not None and _shell_watermark_requires_rebuild(quote_watermark, _SHELL_CACHE.get("quote_watermark")):
         return False
     return True
 
@@ -396,7 +445,11 @@ def _a_day_change_mode() -> str:
         session = None
     if bool(getattr(session, "a_live", False)):
         return "quote_intraday"
-    if now.weekday() < 5 and (now.hour, now.minute) >= (9, 30) and (now.hour, now.minute) < (15, 0):
+    if (
+        now.weekday() < 5
+        and (now.hour, now.minute) >= (A_SHARE_AUCTION_OPEN.hour, A_SHARE_AUCTION_OPEN.minute)
+        and (now.hour, now.minute) < (15, 0)
+    ):
         return "quote_intraday"
     return "daily_close"
 
@@ -459,7 +512,7 @@ def _date_text(value: Any) -> str:
         return _text(value)[:10]
 
 
-def _normalize_chart_df(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+def _normalize_chart_df(df: pd.DataFrame, freq: str, *, live_render: bool = False) -> pd.DataFrame:
     if df is None or df.empty:
         out = pd.DataFrame()
         if df is not None:
@@ -467,7 +520,25 @@ def _normalize_chart_df(df: pd.DataFrame, freq: str) -> pd.DataFrame:
         return out
     working = df.copy().sort_index()
     working.attrs.update(getattr(df, "attrs", {}) or {})
-    if _canonical_freq(freq) == "weekly" and not working.empty:
+    canonical = _canonical_freq(freq)
+    if live_render and canonical in MINUTE_FREQS and _a_day_change_mode() == "quote_intraday" and not working.empty:
+        expected_day = _day_change_expected_day("quote_intraday")
+        index_dates = pd.to_datetime(working.index, errors="coerce").date
+        same_day_mask = [str(item) == expected_day for item in index_dates]
+        if any(same_day_mask):
+            working = working.loc[same_day_mask]
+        else:
+            attrs = dict(working.attrs)
+            latest_day = _date_text(working.index.max())
+            working = working.iloc[0:0].copy()
+            working.attrs.update(attrs)
+            working.attrs["gateway_is_stale"] = True
+            working.attrs["freshness"] = "stale"
+            working.attrs["stale_reason"] = f"minute_cache_older_than_realtime_day:{latest_day}->{expected_day}"
+            working.attrs["as_of"] = latest_day
+            working.attrs["data_as_of"] = latest_day
+        return working
+    if canonical == "weekly" and not working.empty:
         latest_idx = pd.to_datetime(working.index.max())
         today = _market_today("A")
         if latest_idx.date() > today:
@@ -481,6 +552,68 @@ def _normalize_chart_df(df: pd.DataFrame, freq: str) -> pd.DataFrame:
             working.attrs["is_partial_period"] = True
             working.attrs["time_semantics"] = "period_data_as_of"
     return working
+
+
+def _append_live_daily_quote_bar(df: pd.DataFrame, *, symbol: str, freq: str) -> tuple[pd.DataFrame, str]:
+    if _canonical_freq(freq) != "daily" or _a_day_change_mode() != "quote_intraday":
+        return df, ""
+    try:
+        overlay = _quote_overlay_for_symbol(symbol)
+    except Exception:
+        return df, ""
+    if overlay.get("quote_status") not in {"realtime", "delayed"}:
+        return df, ""
+    latest_price = _first_numeric(overlay.get("latest_price"), overlay.get("realtime_price"), overlay.get("quote_price"))
+    if latest_price is None:
+        return df, ""
+    expected_day = _day_change_expected_day("quote_intraday")
+    if not expected_day:
+        return df, ""
+    working = df.copy().sort_index() if df is not None else pd.DataFrame()
+    working.attrs.update(getattr(df, "attrs", {}) or {})
+    today_idx = pd.Timestamp(expected_day)
+    previous_close = _float(working["close"].iloc[-1]) if working is not None and not working.empty and "close" in working.columns else latest_price
+    open_price = _first_numeric(overlay.get("quote_open_price"), previous_close, latest_price) or latest_price
+    row = {
+        "open": open_price,
+        "high": max(open_price, latest_price),
+        "low": min(open_price, latest_price),
+        "close": latest_price,
+        "vol": 0,
+        "amount": 0,
+    }
+    if working.empty:
+        working = pd.DataFrame([row], index=[today_idx])
+    else:
+        same_day = pd.to_datetime(working.index, errors="coerce").date == today_idx.date()
+        if any(same_day):
+            idx = working.loc[same_day].index[-1]
+            existing = working.loc[idx].to_dict()
+            row["open"] = _first_numeric(existing.get("open"), row["open"]) or row["open"]
+            row["high"] = max(_first_numeric(existing.get("high"), row["high"]) or row["high"], row["high"])
+            row["low"] = min(_first_numeric(existing.get("low"), row["low"]) or row["low"], row["low"])
+            working.loc[idx, ["open", "high", "low", "close", "vol", "amount"]] = [
+                row["open"],
+                row["high"],
+                row["low"],
+                row["close"],
+                _first_numeric(existing.get("vol"), row["vol"]) or row["vol"],
+                _first_numeric(existing.get("amount"), row["amount"]) or row["amount"],
+            ]
+        else:
+            working.loc[today_idx, list(row)] = list(row.values())
+            working = working.sort_index()
+    working.attrs["as_of"] = expected_day
+    working.attrs["data_as_of"] = expected_day
+    working.attrs["latest_bar_time"] = today_idx.isoformat()
+    working.attrs["freshness"] = "fresh"
+    working.attrs["gateway_freshness"] = "fresh"
+    working.attrs["gateway_is_stale"] = False
+    working.attrs["is_stale"] = False
+    working.attrs["stale_reason"] = ""
+    working.attrs["live_quote_overlay"] = True
+    working.attrs["time_semantics"] = "realtime_daily_partial"
+    return working, "live_quote_daily_overlay"
 
 
 def _chart_cache_meta(df: pd.DataFrame, *, source: str, freq: str) -> dict[str, Any]:
@@ -562,17 +695,28 @@ def _serialize_ohlcv_df(
     return rows
 
 
-def _chart_from_df(df: pd.DataFrame, *, symbol: str, freq: str, source: str = "gateway") -> dict[str, Any]:
+def _chart_from_df(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    freq: str,
+    source: str = "gateway",
+    live_render: bool = False,
+) -> dict[str, Any]:
     market = infer_market(symbol=symbol, source=source)
     limit = 900 if _canonical_freq(freq) in {"5min", "15min", "30min"} else 720
-    working = _normalize_chart_df(df, freq)
-    cache_meta = _chart_cache_meta(working, source=source, freq=freq)
+    working = _normalize_chart_df(df, freq, live_render=live_render)
+    live_overlay_source = ""
+    if live_render:
+        working, live_overlay_source = _append_live_daily_quote_bar(working, symbol=symbol, freq=freq)
+    effective_source = f"{source};{live_overlay_source}" if live_overlay_source else source
+    cache_meta = _chart_cache_meta(working, source=effective_source, freq=freq)
     return {
         "symbol": symbol,
         "freq": _freq_label(freq),
         "meta": {
             "freq": _canonical_freq(freq),
-            "source": source,
+            "source": effective_source,
             **cache_meta,
             "market": market,
             "market_timezone": market_timezone_name(market, symbol=symbol, source=source),
@@ -1109,7 +1253,7 @@ def _board_heat_chart(name: str, kind: str, freq: str) -> tuple[dict[str, Any], 
         "heat_resolution_status": resolution.get("status", ""),
         **latest,
     }
-    chart = _chart_from_df(df, symbol=heat_name, freq=freq, source=source)
+    chart = _chart_from_df(df, symbol=heat_name, freq=freq, source=source, live_render=True)
     chart["meta"] = {
         **chart.get("meta", {}),
         "kind": kind,
@@ -1900,6 +2044,8 @@ def _fullmarket_spot_quote_doc(symbol: str, candidates: list[str], expected_day:
         return {}
     codes = _fullmarket_code_candidates(candidates)
     dot_symbols = [candidate.upper() for candidate in candidates if "." in str(candidate or "")]
+    if supports_a_index_minute_cache(symbol):
+        codes = []
     if not codes and not dot_symbols:
         return {}
     try:
@@ -2351,6 +2497,122 @@ def _enrich_shell_stock_row(
         return _enrich_stock_row(row, range_columns, lightweight=True)
 
 
+def _chain_position_from_membership_row(row: dict[str, Any]) -> dict[str, Any]:
+    if not row:
+        return {}
+    return {
+        "chain_id": _text(row.get("chain_id")),
+        "chain": _text(row.get("chain_name")),
+        "chain_name": _text(row.get("chain_name")),
+        "node_id": _text(row.get("node_id")),
+        "node": _text(row.get("node_name")),
+        "node_name": _text(row.get("node_name")),
+        "role": _text(row.get("role") or row.get("representative_relation") or row.get("node_name")),
+        "layer": _text(row.get("layer")),
+        "stage": _text(row.get("stage")),
+        "source": "security_chain_memberships",
+        "source_note": _text(row.get("source_note")) or "盘后全局产业链重塑主归属",
+        "confidence": row.get("confidence"),
+        "exposure_score": row.get("exposure_score"),
+        "is_primary_chain": bool(row.get("is_primary_chain")),
+        "trade_date": _text(row.get("trade_date")),
+        "membership_type": _text(row.get("membership_type")),
+        "reviewed_override": bool(row.get("reviewed_override")),
+        "source_board_names": _source_board_names(row),
+    }
+
+
+def _terminal_stock_chain_position_map(source_rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    codes: set[str] = set()
+    symbol_by_code: dict[str, str] = {}
+    for row in source_rows:
+        symbol = _text(row.get("symbol") or row.get("code") or row.get("label"))
+        normalized, raw_code = _normalize_stock_symbol(symbol)
+        raw_code = _text(raw_code or (normalized.split(".", 1)[-1] if "." in normalized else ""))
+        if raw_code:
+            codes.add(raw_code)
+            symbol_by_code[raw_code] = normalized or symbol
+    if not codes:
+        return {}
+    try:
+        db = _mongo_db()
+        latest = db["security_chain_memberships"].find_one(
+            {"market": "A", "trade_date": {"$exists": True}},
+            {"trade_date": 1},
+            sort=[("trade_date", -1)],
+        ) or {}
+        trade_date = _text(latest.get("trade_date"))
+        if not trade_date:
+            return {}
+        rows = list(db["security_chain_memberships"].find(
+            {
+                "market": "A",
+                "trade_date": trade_date,
+                "raw_code": {"$in": sorted(codes)},
+                "is_primary_chain": True,
+            },
+            {"_id": 0},
+        ))
+    except Exception:
+        return {}
+    output: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        position = _chain_position_from_membership_row(row)
+        raw_code = _text(row.get("raw_code"))
+        symbol = _text(row.get("symbol") or symbol_by_code.get(raw_code))
+        if symbol and position:
+            output[symbol.upper()] = position
+        if raw_code and position:
+            output[raw_code] = position
+    return output
+
+
+def _light_shell_chain_context(chain_position: dict[str, Any]) -> dict[str, Any]:
+    if not chain_position:
+        return {}
+    chain_name = _text(chain_position.get("chain_name") or chain_position.get("chain"))
+    node_name = _text(chain_position.get("node_name") or chain_position.get("node") or chain_position.get("role"))
+    return {
+        **chain_position,
+        "chain_name": chain_name,
+        "node_name": node_name,
+        "mapping_status": _text(chain_position.get("source")) or "security_chain_memberships",
+        "mapping_chain": {
+            "chain_id": _text(chain_position.get("chain_id")),
+            "chain_name": chain_name,
+            "node_id": _text(chain_position.get("node_id")),
+            "node_name": node_name,
+            "layer": _text(chain_position.get("layer")),
+            "stage": _text(chain_position.get("stage")),
+            "confidence": chain_position.get("confidence"),
+            "source_note": chain_position.get("source_note"),
+        },
+        "data_truth": {
+            "collection": "security_chain_memberships",
+            "as_of": _text(chain_position.get("trade_date")),
+            "mapping_status": _text(chain_position.get("source")) or "security_chain_memberships",
+        },
+    }
+
+
+def _refresh_shell_stock_chain_assignment(row: dict[str, Any], chain_positions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    symbol = _text(row.get("symbol") or row.get("code") or row.get("label"))
+    if not symbol:
+        return row
+    normalized, raw_code = _normalize_stock_symbol(symbol)
+    chain_position = chain_positions.get((normalized or symbol).upper()) or chain_positions.get(_text(raw_code))
+    if not chain_position:
+        return row
+    previous = row.get("chain_position") if isinstance(row.get("chain_position"), dict) else {}
+    merged = {**previous, **chain_position}
+    node_label = _text(chain_position.get("node") or chain_position.get("node_name") or chain_position.get("role"))
+    if node_label:
+        merged["board_or_concept"] = node_label
+    row["chain_position"] = merged
+    row["chain_context"] = _light_shell_chain_context(merged)
+    return row
+
+
 def _slim_shell_signal_reason(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -2455,7 +2717,12 @@ def _slim_shell_chain_position(value: Any) -> dict[str, Any]:
         "mapping_status",
         "chain_id",
         "node_id",
+        "confidence",
         "exposure_score",
+        "membership_type",
+        "reviewed_override",
+        "source_board_names",
+        "trade_date",
         "rank",
     )
     return {key: value.get(key) for key in keep if value.get(key) not in (None, "", [], {})}
@@ -2749,6 +3016,10 @@ def _shell_stock_display_badges(row: dict[str, Any], *, entry_factor: dict[str, 
         add(setup, "info")
     if _text(row.get("sector_policy_label")):
         add(_text(row.get("sector_policy_label")), "info")
+    if _text(row.get("index_setup_label")):
+        add(_text(row.get("index_setup_label")), "info")
+    if _text(row.get("market_volume_label")) and _text(row.get("market_volume_state")) != "unknown":
+        add(_text(row.get("market_volume_label")), "neutral")
     breakout = _shell_stock_breakout_summary(entry_factor)
     if breakout:
         add("200日新高", "hot")
@@ -2850,6 +3121,16 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "setup_side_label",
         "setup_rank_tier",
         "market_setup_bias",
+        "index_setup_side",
+        "index_setup_label",
+        "stock_setup_side",
+        "stock_setup_label",
+        "setup_alignment",
+        "alignment_policy",
+        "alignment_score",
+        "market_volume_state",
+        "market_volume_label",
+        "market_volume_ratio",
         "mainline_status",
         "mainline_confirmation_reason",
         "mainline_rank_tier",
@@ -6689,6 +6970,7 @@ def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: 
     if group in {"focus_stocks", "risk_stocks", "watch_stocks", "clue_stocks"}:
         _refresh_realtime_quotes_for_rows(db, source_rows, refresh_key=group, limit=limit)
     range_return_limit = _shell_stock_range_return_limit(group)
+    chain_positions = _terminal_stock_chain_position_map(source_rows)
     for item in source_rows:
         reasons = [reason for reason in item.get("inclusion_reasons") or [] if isinstance(reason, dict)]
         has_technical = any(
@@ -6724,6 +7006,7 @@ def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: 
         row["signal_origin"] = item.get("signal_origin", "")
         row["signal_family"] = item.get("signal_family", "")
         row["chain_context"] = item.get("chain_context") if isinstance(item.get("chain_context"), dict) else {}
+        row = _refresh_shell_stock_chain_assignment(row, chain_positions)
         row["exit_condition"] = item.get("exit_condition") or item.get("invalidates_when") or row.get("invalidates_when")
         row["invalidates_when"] = row["exit_condition"]
         row["reason"] = item.get("reason") or " · ".join(row["focus_reasons"][:2])
@@ -8261,8 +8544,8 @@ def _stock_chain_board_driver_candidates(rows: list[dict[str, Any]]) -> list[dic
         chain_penalty = -0.4 if item.get("is_non_chain_theme") else 0.0
         return (
             has_change,
-            _float(change) + concept_bonus + chain_penalty,
-            _float(item.get("mapping_confidence")),
+            _float(change, 0.0) + concept_bonus + chain_penalty,
+            _float(item.get("mapping_confidence"), 0.0),
             1.0 if _text(item.get("kind")) == "concept" else 0.0,
         )
 
@@ -8321,6 +8604,8 @@ def _stock_chain_membership_summary(symbol: str) -> dict[str, Any]:
         "source_note": _text(row.get("source_note")) or "盘后全局产业链重塑主归属",
         "confidence": row.get("confidence"),
         "exposure_score": row.get("exposure_score"),
+        "membership_type": _text(row.get("membership_type")),
+        "reviewed_override": bool(row.get("reviewed_override")),
         "is_primary_chain": bool(row.get("is_primary_chain")),
         "trade_date": _text(row.get("trade_date")),
         "representative_type": _text(row.get("representative_type")),
@@ -9436,7 +9721,7 @@ async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
 
     report = serialize_index_report(report_obj)
     df, source = _index_df(str(report.get("symbol") or name), requested_freq)
-    chart = _chart_from_df(df, symbol=str(report.get("symbol") or name), freq=requested_freq, source=source)
+    chart = _chart_from_df(df, symbol=str(report.get("symbol") or name), freq=requested_freq, source=source, live_render=True)
     chart = _mark_chart_readiness(chart, kind="index", requested_freq=requested_freq)
     plan = _plan_for_index(engine, name)
 
@@ -9474,7 +9759,7 @@ async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
 async def _build_static_index_target(name: str, symbol: str, freq: str) -> Dict[str, Any]:
     requested_freq = _canonical_freq(freq)
     df, source = _index_df(symbol, requested_freq)
-    chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)
+    chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source, live_render=True)
     chart = _mark_chart_readiness(chart, kind="index", requested_freq=requested_freq)
     summary = _summary_from_static_index(name, symbol, chart)
     summary["latest_signal"] = summary.get("latest_signal") or _ma_signal_from_df(df)
@@ -9936,7 +10221,7 @@ async def _build_concept_target(engine, name: str, freq: str) -> Dict[str, Any]:
         payload = await _build_stock_target(carrier["symbol"], carrier["raw_code"], requested_freq)
         if not _chart_has_ohlcv(payload.get("chart", {})):
             df, source = _stock_df(carrier["symbol"], requested_freq)
-            payload["chart"] = _chart_from_df(df, symbol=carrier["symbol"], freq=requested_freq, source=source)
+            payload["chart"] = _chart_from_df(df, symbol=carrier["symbol"], freq=requested_freq, source=source, live_render=True)
         relation = _text(carrier.get("relation")) or name
         stock_title = payload.get("summary", {}).get("title") or carrier.get("name") or carrier["symbol"]
         concept_chain = [_text(item.get("name")) for item in theme_candidates]
@@ -10092,13 +10377,13 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
     requested_freq = _canonical_freq(freq)
     if requested_freq in {"daily", "weekly", "monthly"}:
         df, source = _stock_df(symbol, requested_freq)
-        chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)
+        chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source, live_render=True)
     elif requested_freq == "30min":
         df, source = _stock_df(symbol, requested_freq)
-        chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)
+        chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source, live_render=True)
     else:
         df, source = _stock_df(symbol, requested_freq)
-        chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source)
+        chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source, live_render=True)
     chart_meta = dict(chart.get("meta") or {})
     should_load = not _chart_has_ohlcv(chart) or (
         requested_freq in {"5min", "15min", "30min"} and bool(chart_meta.get("is_stale"))

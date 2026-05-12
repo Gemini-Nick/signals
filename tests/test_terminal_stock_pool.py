@@ -97,10 +97,23 @@ def _add_chain_context(
     }, index_codes=set(), name=name)
 
 
-def _set_broad_market(rows, *, falling=True, change_pct=-0.8):
+def _set_broad_market(rows, *, falling=True, change_pct=-0.8, index_setup_side=None, volume_state="normal", volume_ratio=1.0):
+    setup_side = index_setup_side or ("left_sell" if falling else "left_buy")
+    setup_label = {
+        "right_buy": "指数右侧买",
+        "left_buy": "指数左侧买",
+        "left_sell": "指数左侧卖",
+        "right_sell": "指数右侧卖",
+        "unknown": "指数未知",
+    }.get(setup_side, "指数未知")
     context = {
         "is_falling": falling,
-        "label": "大盘下跌" if falling else "大盘未跌",
+        "label": setup_label,
+        "index_setup_side": setup_side,
+        "index_setup_label": setup_label,
+        "volume_state": volume_state,
+        "volume_label": {"expanding": "放量", "shrinking": "缩量", "normal": "量能正常", "unknown": "量能未知"}.get(volume_state, "量能未知"),
+        "volume_ratio_5d": volume_ratio,
         "average_change_pct": change_pct,
         "indexes": [
             {"name": "上证指数", "change_pct": change_pct},
@@ -1134,7 +1147,7 @@ def test_terminal_stock_pool_defensive_sector_relaxes_when_broad_market_falls():
     row = split["focus"][0]
     assert row["entry_gate_status"] == "left_attack_confirmed"
     assert row["sector_policy"] == "defensive_lenient"
-    assert row["broad_market_label"] == "大盘下跌"
+    assert row["broad_market_label"] == "指数左侧卖"
     assert row["score_components"]["defensive_lenient_policy"] == 12.0
     assert row["left_allowed_reason"] == "defensive_lenient_broad_market_falling"
     assert row["queue_lane"] == "left_review"
@@ -1591,6 +1604,65 @@ def test_terminal_stock_pool_watch_rank_rewards_refusal_pullback_factor():
     row = split["watch"][0]
     assert row["score_components"]["relative_resilience"] > 0
     assert "拒绝回调" in row["rank_reason"]
+
+
+def test_terminal_stock_pool_market_right_buy_rewards_confirmed_stock_right_buy():
+    rows = {}
+    for freq, signal_type in (("日线", "趋势买"), ("30分钟", "三买"), ("15分钟", "趋势买")):
+        _add_reason(rows, "300611", {
+            "reason_type": "technical_trigger",
+            "source_collection": "terminal_technical_signals",
+            "source_doc_id": f"aligned-right-{freq}",
+            "signal_type": signal_type,
+            "signal_side": "buy",
+            "freq": freq,
+            "score": 86,
+            "confidence": 0.86,
+            "event_dt": "2026-05-11",
+            "as_of": "2026-05-11",
+            "ma_alignment": _ma_alignment(),
+        }, index_codes=set(), name="市场右买共振股")
+    _set_broad_market(rows, falling=False, change_pct=0.9, index_setup_side="right_buy", volume_state="expanding", volume_ratio=1.2)
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert [row["raw_code"] for row in split["focus"]] == ["300611"]
+    row = split["focus"][0]
+    assert row["index_setup_side"] == "right_buy"
+    assert row["stock_setup_side"] == "right_buy"
+    assert row["alignment_policy"] == "allow_focus"
+    assert row["score_components"]["market_alignment"] == 20.0
+    assert "市场共振" in row["rank_reason"]
+
+
+def test_terminal_stock_pool_market_right_sell_blocks_stock_right_buy_from_focus():
+    rows = {}
+    for freq, signal_type in (("日线", "趋势买"), ("30分钟", "三买"), ("15分钟", "趋势买")):
+        _add_reason(rows, "300612", {
+            "reason_type": "technical_trigger",
+            "source_collection": "terminal_technical_signals",
+            "source_doc_id": f"blocked-right-{freq}",
+            "signal_type": signal_type,
+            "signal_side": "buy",
+            "freq": freq,
+            "score": 86,
+            "confidence": 0.86,
+            "event_dt": "2026-05-11",
+            "as_of": "2026-05-11",
+            "ma_alignment": _ma_alignment(),
+        }, index_codes=set(), name="指数卖侧逆势股")
+    _set_broad_market(rows, falling=True, change_pct=-0.9, index_setup_side="right_sell", volume_state="expanding", volume_ratio=1.2)
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["focus"] == []
+    row = split["watch"][0]
+    assert row["raw_code"] == "300612"
+    assert row["entry_gate_status"] == "entry_confirmed"
+    assert row["index_setup_side"] == "right_sell"
+    assert row["stock_setup_side"] == "right_buy"
+    assert row["alignment_policy"] == "block_focus"
+    assert row["score_components"]["market_alignment"] == -28.0
 
 
 def test_terminal_stock_pool_buy_with_risk_still_enters_focus_with_risk_marker():

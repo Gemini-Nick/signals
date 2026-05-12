@@ -144,7 +144,11 @@ BROAD_MARKET_INDEXES = (
     ("沪深300", "sh000300"),
     ("创业板指", "sz399006"),
 )
+BROAD_MARKET_RISE_THRESHOLD = 0.2
 BROAD_MARKET_FALL_THRESHOLD = -0.2
+BROAD_MARKET_NEUTRAL_THRESHOLD = 0.08
+BROAD_MARKET_VOLUME_EXPAND_THRESHOLD = 1.08
+BROAD_MARKET_VOLUME_SHRINK_THRESHOLD = 0.85
 RIGHT_SIDE_FREQS = {"5分钟", "5min", "5m", "F5", "f5", "15分钟", "15min", "15m", "F15", "f15"}
 BUY_FREQ_BONUS = {"30分钟": 120, "30min": 120, "30m": 120, "15分钟": 110, "15min": 110, "15m": 110, "5分钟": 80, "5min": 80, "5m": 80}
 ENTRY_30M_FREQS = {"30分钟", "30min", "30m", "F30", "f30"}
@@ -565,32 +569,142 @@ def _index_change_doc_from_bars(db: Database, symbol: str, trade_date: str) -> d
     return {}
 
 
+def _bar_liquidity_value(doc: dict[str, Any], metric: str) -> float:
+    if metric == "amount":
+        return _float(doc.get("amount"))
+    if metric == "volume":
+        return _float(doc.get("vol") or doc.get("volume"))
+    return 0.0
+
+
+def _index_volume_doc_from_bars(db: Database, symbol: str, trade_date: str) -> dict[str, Any]:
+    candidates = [symbol, symbol.upper(), symbol.lower()]
+    for collection in ("index_bars", "bars"):
+        try:
+            docs = list(db[collection].find(
+                {
+                    "meta.symbol": {"$in": candidates},
+                    "meta.freq": {"$in": ["daily", "日线", "D", "1d"]},
+                },
+                {"_id": 0, "dt": 1, "amount": 1, "vol": 1, "volume": 1},
+            ).sort([("dt", -1)]).limit(25))
+        except Exception:
+            docs = []
+        if not docs:
+            continue
+        latest = next((doc for doc in docs if _doc_date_text(doc) == trade_date), docs[0])
+        latest_date = _doc_date_text(latest)
+        for metric in ("amount", "volume"):
+            latest_value = _bar_liquidity_value(latest, metric)
+            history = [
+                _bar_liquidity_value(doc, metric)
+                for doc in docs
+                if _doc_date_text(doc) < latest_date and _bar_liquidity_value(doc, metric) > 0
+            ][:5]
+            if latest_value <= 0 or len(history) < 3:
+                continue
+            avg_value = sum(history) / len(history)
+            if avg_value <= 0:
+                continue
+            return {
+                "source": collection,
+                "liquidity_metric": metric,
+                "liquidity_value": latest_value,
+                "liquidity_ratio_5d": round(latest_value / avg_value, 3),
+                "liquidity_baseline_days": len(history),
+            }
+    return {}
+
+
+def _market_volume_state(value: float) -> str:
+    if value >= BROAD_MARKET_VOLUME_EXPAND_THRESHOLD:
+        return "expanding"
+    if 0 < value <= BROAD_MARKET_VOLUME_SHRINK_THRESHOLD:
+        return "shrinking"
+    if value > 0:
+        return "normal"
+    return "unknown"
+
+
+def _market_volume_label(state: str) -> str:
+    return {
+        "expanding": "放量",
+        "normal": "量能正常",
+        "shrinking": "缩量",
+        "unknown": "量能未知",
+    }.get(state, "量能未知")
+
+
+def _index_setup_side_from_market(average_change: float, rising_count: int, falling_count: int, index_count: int, volume_state: str) -> str:
+    required = max(1, (index_count // 2) + 1)
+    if falling_count >= required or average_change <= BROAD_MARKET_FALL_THRESHOLD:
+        return "right_sell" if volume_state == "expanding" else "left_sell"
+    if rising_count >= required or average_change >= BROAD_MARKET_RISE_THRESHOLD:
+        return "right_buy" if volume_state == "expanding" else "left_buy"
+    if abs(average_change) < BROAD_MARKET_NEUTRAL_THRESHOLD:
+        return "unknown"
+    if average_change > 0:
+        return "left_buy"
+    if average_change < 0:
+        return "left_sell"
+    return "unknown"
+
+
+def _index_setup_label(side: str) -> str:
+    return {
+        "right_buy": "指数右侧买",
+        "left_buy": "指数左侧买",
+        "left_sell": "指数左侧卖",
+        "right_sell": "指数右侧卖",
+        "unknown": "指数未知",
+    }.get(side, "指数未知")
+
+
 def _load_broad_market_context(db: Database, trade_date: str) -> dict[str, Any]:
     index_rows: list[dict[str, Any]] = []
     for name, symbol in BROAD_MARKET_INDEXES:
         doc = _index_change_doc_from_quotes(db, symbol, trade_date) or _index_change_doc_from_bars(db, symbol, trade_date)
         if not doc:
             continue
+        volume_doc = _index_volume_doc_from_bars(db, symbol, trade_date)
         index_rows.append({
             "name": name,
             "symbol": symbol,
             "change_pct": round(_float(doc.get("change_pct")), 3),
             "source": doc.get("source"),
             "as_of": doc.get("as_of") or trade_date,
+            **({key: value for key, value in volume_doc.items() if key != "source"} if volume_doc else {}),
+            **({"volume_source": volume_doc.get("source")} if volume_doc else {}),
         })
     if not index_rows:
-        return {"is_falling": False, "label": "大盘未知", "as_of": trade_date, "index_count": 0, "indexes": []}
+        return {"is_falling": False, "label": "大盘未知", "index_setup_side": "unknown", "index_setup_label": "指数未知", "volume_state": "unknown", "volume_label": "量能未知", "as_of": trade_date, "index_count": 0, "indexes": []}
     falling = [item for item in index_rows if _float(item.get("change_pct")) <= BROAD_MARKET_FALL_THRESHOLD]
+    rising = [item for item in index_rows if _float(item.get("change_pct")) >= BROAD_MARKET_RISE_THRESHOLD]
     average = sum(_float(item.get("change_pct")) for item in index_rows) / len(index_rows)
+    volume_ratios = [
+        _float(item.get("liquidity_ratio_5d"))
+        for item in index_rows
+        if _float(item.get("liquidity_ratio_5d")) > 0
+    ]
+    volume_ratio = sum(volume_ratios) / len(volume_ratios) if volume_ratios else 0.0
+    volume_state = _market_volume_state(volume_ratio)
+    index_setup_side = _index_setup_side_from_market(average, len(rising), len(falling), len(index_rows), volume_state)
     required = max(1, (len(index_rows) // 2) + 1)
     is_falling = len(falling) >= required or (average <= BROAD_MARKET_FALL_THRESHOLD and bool(falling))
     return {
         "is_falling": is_falling,
-        "label": "大盘下跌" if is_falling else "大盘未跌",
+        "label": _index_setup_label(index_setup_side),
+        "index_setup_side": index_setup_side,
+        "index_setup_label": _index_setup_label(index_setup_side),
+        "volume_state": volume_state,
+        "volume_label": _market_volume_label(volume_state),
+        "volume_ratio_5d": round(volume_ratio, 3) if volume_ratio > 0 else 0.0,
         "as_of": trade_date,
         "average_change_pct": round(average, 3),
+        "rising_count": len(rising),
         "falling_count": len(falling),
         "index_count": len(index_rows),
+        "rise_threshold": BROAD_MARKET_RISE_THRESHOLD,
         "fall_threshold": BROAD_MARKET_FALL_THRESHOLD,
         "indexes": index_rows,
     }
@@ -3082,6 +3196,103 @@ def _broad_market_is_falling(row: dict[str, Any]) -> bool:
     return False
 
 
+def _index_setup_side(row: dict[str, Any]) -> str:
+    context = row.get("broad_market_context") if isinstance(row.get("broad_market_context"), dict) else {}
+    side = _text(context.get("index_setup_side"))
+    if side in {"left_buy", "right_buy", "left_sell", "right_sell"}:
+        return side
+    if _broad_market_is_falling(row):
+        return "left_sell"
+    return "unknown"
+
+
+def _stock_setup_side(entry_gate_status: str, top_buy: dict[str, Any] | None, top_risk: dict[str, Any] | None) -> str:
+    if top_risk and not top_buy:
+        return "sell"
+    if entry_gate_status.startswith("blocked_by"):
+        return "sell" if top_risk else "context"
+    if entry_gate_status in {"entry_confirmed", "entry_attack_confirmed"}:
+        return "right_buy"
+    if entry_gate_status == "left_attack_confirmed":
+        return "left_buy"
+    if top_buy:
+        side = _technical_opportunity_side(top_buy)
+        if side == "right":
+            return "right_buy"
+        if side == "left":
+            return "left_buy"
+        if side == "sell":
+            return "sell"
+    if top_risk:
+        return "sell"
+    return "context"
+
+
+def _stock_setup_label(side: str) -> str:
+    return {
+        "right_buy": "个股右侧买",
+        "left_buy": "个股左侧买",
+        "sell": "个股卖侧",
+        "context": "个股观察",
+    }.get(side, "个股观察")
+
+
+def _market_setup_alignment(row: dict[str, Any], entry_gate_status: str, top_buy: dict[str, Any] | None, top_risk: dict[str, Any] | None) -> dict[str, Any]:
+    index_side = _index_setup_side(row)
+    stock_side = _stock_setup_side(entry_gate_status, top_buy, top_risk)
+    context = row.get("broad_market_context") if isinstance(row.get("broad_market_context"), dict) else {}
+    if stock_side == "sell":
+        alignment, policy, score = "stock_sell", "risk_first", -40.0
+    elif index_side == "right_sell" and stock_side.endswith("_buy"):
+        alignment, policy, score = "index_right_sell_stock_buy", "block_focus", -28.0
+    elif index_side == "left_sell" and stock_side == "right_buy":
+        if entry_gate_status == "entry_confirmed":
+            alignment, policy, score = "index_left_sell_stock_right_buy", "allow_focus_cautious", -8.0
+        else:
+            alignment, policy, score = "index_left_sell_stock_right_buy", "downgrade_watch", -14.0
+    elif index_side == "left_sell" and stock_side == "left_buy":
+        if _sector_policy(row).get("policy") == "defensive_lenient":
+            alignment, policy, score = "index_left_sell_defensive_left_buy", "allow_focus_cautious", 2.0
+        else:
+            alignment, policy, score = "index_left_sell_stock_left_buy", "downgrade_watch", -18.0
+    elif index_side == "right_buy" and stock_side == "right_buy":
+        alignment, policy, score = "aligned_right_buy", "allow_focus", 20.0
+    elif index_side == "right_buy" and stock_side == "left_buy":
+        alignment, policy, score = "index_right_buy_stock_left_buy", "allow_focus", 8.0
+    elif index_side == "left_buy" and stock_side == "right_buy":
+        alignment, policy, score = "index_left_buy_stock_right_buy", "allow_focus", 10.0
+    elif index_side == "left_buy" and stock_side == "left_buy":
+        alignment, policy, score = "aligned_left_buy", "downgrade_watch", 4.0
+    else:
+        alignment, policy, score = "mixed", "neutral", 0.0
+    volume_state = _text(context.get("volume_state")) or "unknown"
+    volume_ratio = _float(context.get("volume_ratio_5d"))
+    if policy in {"allow_focus", "allow_focus_cautious"} and volume_state == "shrinking":
+        score -= 4.0
+    return {
+        "index_setup_side": index_side,
+        "index_setup_label": _index_setup_label(index_side),
+        "stock_setup_side": stock_side,
+        "stock_setup_label": _stock_setup_label(stock_side),
+        "setup_alignment": alignment,
+        "alignment_policy": policy,
+        "alignment_score": round(score, 3),
+        "market_volume_state": volume_state,
+        "market_volume_label": _market_volume_label(volume_state),
+        "market_volume_ratio": round(volume_ratio, 3) if volume_ratio > 0 else 0.0,
+    }
+
+
+def _market_alignment_components(row: dict[str, Any], entry_gate_status: str, top_buy: dict[str, Any] | None, top_risk: dict[str, Any] | None) -> dict[str, float]:
+    score = _float(_market_setup_alignment(row, entry_gate_status, top_buy, top_risk).get("alignment_score"))
+    return {"market_alignment": score} if score else {}
+
+
+def _alignment_allows_focus(row: dict[str, Any], entry_gate_status: str, top_buy: dict[str, Any] | None, top_risk: dict[str, Any] | None) -> bool:
+    policy = _market_setup_alignment(row, entry_gate_status, top_buy, top_risk).get("alignment_policy")
+    return policy not in {"block_focus", "downgrade_watch", "risk_first"}
+
+
 def _sector_policy(row: dict[str, Any]) -> dict[str, Any]:
     texts = _sector_policy_texts(row)
     concept_attack_token = _first_matching_token(texts["concept"], MAINLINE_LENIENT_SECTOR_TOKENS)
@@ -3231,6 +3442,7 @@ def _rank_reason(score_components: dict[str, float]) -> str:
         "confidence": "置信度",
         "freshness": "新鲜度",
         "mainline_alignment": "主线",
+        "market_alignment": "市场共振",
         "mainline_lenient_policy": "主线宽松",
         "defensive_lenient_policy": "防守放宽",
         "defensive_strict_policy": "防守严格",
@@ -3251,6 +3463,8 @@ def _rank_reason(score_components: dict[str, float]) -> str:
     selected = ordered[:5]
     if "upper_timeframe_quality" in score_components and not any(key == "upper_timeframe_quality" for key, _ in selected):
         selected.append(("upper_timeframe_quality", score_components["upper_timeframe_quality"]))
+    if _float(score_components.get("market_alignment")) and not any(key == "market_alignment" for key, _ in selected):
+        selected.append(("market_alignment", score_components["market_alignment"]))
     if _float(score_components.get("relative_resilience")) and not any(key == "relative_resilience" for key, _ in selected):
         selected.append(("relative_resilience", score_components["relative_resilience"]))
     if _float(score_components.get("fib_ma_support")) and not any(key == "fib_ma_support" for key, _ in selected):
@@ -3992,6 +4206,10 @@ def _finalize_pool_row(
     row["mainline_rank_tier"] = _focus_mainline_rank_tier(row)
     if isinstance(row.get("broad_market_context"), dict):
         row["broad_market_label"] = row["broad_market_context"].get("label")
+        row["market_volume_label"] = row["broad_market_context"].get("volume_label")
+        row["market_volume_state"] = row["broad_market_context"].get("volume_state")
+        row["market_volume_ratio"] = row["broad_market_context"].get("volume_ratio_5d")
+    row.update(_market_setup_alignment(row, entry_gate_status, top_buy, top_risk))
     setup_bias = _market_setup_bias(pool_type, entry_gate_status, top_risk)
     row["market_setup_bias"] = setup_bias
     row["setup_rank_tier"] = SETUP_RANK_TIERS.get(setup_bias, 0)
@@ -4503,11 +4721,12 @@ def _split_pool_rows(
                 top_buy=top_buy,
                 top_risk=top_risk,
             ))
-        elif entry_ok and top_buy and _entry_allowed_in_focus(row, gate_status) and not (
+        elif entry_ok and top_buy and _entry_allowed_in_focus(row, gate_status) and _alignment_allows_focus(row, gate_status, top_buy, top_risk) and not (
             gate_status == "left_attack_confirmed"
             and not _left_attack_allowed_in_focus(row, gate_status)
         ):
             components = _entry_components(row, top_buy)
+            components.update(_market_alignment_components(row, gate_status, top_buy, top_risk))
             focus.append(_finalize_pool_row(
                 row,
                 pool_type="focus",
@@ -4518,8 +4737,9 @@ def _split_pool_rows(
                 top_buy=top_buy,
                 top_risk=top_risk,
             ))
-        elif top_buy and _right_review_allowed_in_focus(row, gate_status, top_buy):
+        elif top_buy and _right_review_allowed_in_focus(row, gate_status, top_buy) and _alignment_allows_focus(row, gate_status, top_buy, top_risk):
             components = _focus_review_components(row, top_buy)
+            components.update(_market_alignment_components(row, gate_status, top_buy, top_risk))
             focus.append(_finalize_pool_row(
                 row,
                 pool_type="focus",
@@ -4532,6 +4752,7 @@ def _split_pool_rows(
             ))
         else:
             components = _watch_components(row, gate_status)
+            components.update(_market_alignment_components(row, gate_status, top_buy, top_risk))
             watch.append(_finalize_pool_row(
                 row,
                 pool_type="watch",
