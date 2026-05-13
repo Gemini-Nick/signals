@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, time
 from typing import Any
 
 import pandas as pd
@@ -30,6 +30,9 @@ INTRADAY_SCAN_SCOPE = "intraday_active"
 POSTMARKET_SCAN_SCOPE = "postmarket"
 PRIMARY_MA_PERIODS = (5, 10, 20)
 FIBONACCI_MA_PERIODS = (8, 13, 21, 34, 55, 89)
+FIB_MA_TOUCH_UNDERSHOOT_PCT = 1.5
+FIB_MA_TOUCH_OVERSHOOT_PCT = 0.8
+FIB_MA_NEAR_PCT = 1.0
 FREQ_ORDER = {
     "周线": 0,
     "weekly": 0,
@@ -419,6 +422,111 @@ def _load_bars(db: Database, symbol: str, freq_values: list[str], freq, *, limit
     return out
 
 
+def _use_intraday_daily_acceptance(scan_scope: str, market: str, now: datetime) -> bool:
+    if scan_scope != INTRADAY_SCAN_SCOPE or market != "A":
+        return False
+    try:
+        from signals.core.trading_dates import is_trading_day
+
+        if not is_trading_day("A", now.date()):
+            return False
+    except Exception:
+        if now.weekday() >= 5:
+            return False
+    return time(9, 15) <= now.time() < time(15, 0)
+
+
+def _latest_quote_daily_doc(db: Database, symbol: str) -> dict[str, Any] | None:
+    if _symbol_market(symbol) != "A":
+        return None
+    raw_code = _raw_symbol_code(symbol)
+    prefixed = _prefixed_symbol(symbol)
+    if not raw_code:
+        return None
+    try:
+        doc = db["quote_snapshots"].find_one(
+            {
+                "$or": [
+                    {"symbol": {"$in": [prefixed, raw_code]}},
+                    {"code": raw_code},
+                    {"raw_code": raw_code},
+                ]
+            },
+            {
+                "_id": 0,
+                "dt": 1,
+                "symbol": 1,
+                "code": 1,
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "close": 1,
+                "price": 1,
+                "latest": 1,
+                "vol": 1,
+                "amount": 1,
+                "updated_at": 1,
+            },
+            sort=[("dt", -1), ("updated_at", -1)],
+        )
+    except Exception:
+        return None
+    if not doc:
+        return None
+    close = _safe_float(doc.get("close") or doc.get("price") or doc.get("latest"))
+    if close <= 0:
+        return None
+    parsed_dt = pd.to_datetime(doc.get("dt"), errors="coerce")
+    if pd.isna(parsed_dt):
+        return None
+    open_price = _safe_float(doc.get("open"), close)
+    high = max(close, open_price, _safe_float(doc.get("high"), close))
+    low = min(close, open_price, _safe_float(doc.get("low"), close))
+    return {
+        "dt": parsed_dt.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0),
+        "meta": {
+            "symbol": raw_code,
+            "freq": "日线",
+            "market": "A",
+            "source": "quote_snapshots_intraday_daily",
+            "quality": "provisional_intraday",
+        },
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close,
+        "vol": int(_safe_float(doc.get("vol"))),
+        "amount": int(_safe_float(doc.get("amount"))),
+    }
+
+
+def _append_quote_snapshot_daily_bar(db: Database, symbol: str, daily_bars: list[Any], freq, *, enabled: bool) -> list[Any]:
+    if not enabled:
+        return daily_bars
+    doc = _latest_quote_daily_doc(db, symbol)
+    if not doc:
+        return daily_bars
+    quote_dt = pd.to_datetime(doc.get("dt"), errors="coerce")
+    if pd.isna(quote_dt):
+        return daily_bars
+    quote_day = quote_dt.date()
+    out = list(daily_bars)
+    latest_day = None
+    if out:
+        latest_dt = pd.to_datetime(getattr(out[-1], "dt", None), errors="coerce")
+        if not pd.isna(latest_dt):
+            latest_day = latest_dt.date()
+    try:
+        quote_bar = _doc_to_rawbar(doc, _prefixed_symbol(symbol), freq, len(out))
+    except Exception:
+        return daily_bars
+    if latest_day is None or quote_day > latest_day:
+        out.append(quote_bar)
+    elif quote_day == latest_day:
+        out[-1] = quote_bar
+    return out
+
+
 def _signal_side(signal_type: str, score: float) -> str:
     if "卖" in signal_type or "顶" in signal_type or "风险" in signal_type or score < 0:
         return "sell"
@@ -517,16 +625,35 @@ def _ma_direction(closes: list[float], period: int) -> str:
 
 
 def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
-    closes = [float(getattr(bar, "close", 0) or 0) for bar in bars if float(getattr(bar, "close", 0) or 0) > 0]
+    rows: list[dict[str, float]] = []
+    for bar in bars:
+        close = _safe_float(getattr(bar, "close", 0))
+        if close <= 0:
+            continue
+        high = max(close, _safe_float(getattr(bar, "high", close), close))
+        low = min(close, _safe_float(getattr(bar, "low", close), close))
+        rows.append({
+            "open": _safe_float(getattr(bar, "open", close), close),
+            "high": high,
+            "low": low,
+            "close": close,
+        })
+    closes = [row["close"] for row in rows]
     if len(closes) < 5:
         return {}
+    latest_row = rows[-1]
     latest = closes[-1]
+    latest_low = latest_row["low"]
+    latest_high = latest_row["high"]
+    latest_range = latest_high - latest_low
+    latest_close_position = (latest - latest_low) / latest_range if latest_range > 0 else 1.0
     previous_close = closes[-2] if len(closes) >= 2 else None
     score = 0.0
     above_count = 0
     reclaim_count = 0
     out: dict[str, Any] = {
         "latest_close": round(latest, 3),
+        "latest_low": round(latest_low, 3),
     }
     stand_weights = {5: 6.0, 10: 10.0, 20: 16.0}
     reclaim_weights = {5: 4.0, 10: 7.0, 20: 11.0}
@@ -534,20 +661,29 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
     fib_support_score = 0.0
     fib_above_count = 0
     fib_reclaim_count = 0
+    fib_touch_count = 0
+    fib_accept_count = 0
+    fib_ma_array: list[dict[str, Any]] = []
     for period in PRIMARY_MA_PERIODS + FIBONACCI_MA_PERIODS:
         ma_value = _rolling_ma(closes, period)
         if ma_value is None:
             continue
         previous_ma = _rolling_ma(closes[:-1], period) if len(closes) > period else None
         distance_pct = (latest - ma_value) / ma_value * 100 if ma_value else 0.0
+        low_distance_pct = (latest_low - ma_value) / ma_value * 100 if ma_value else 0.0
+        touch_reference = previous_ma or ma_value
+        touch_distance_pct = (latest_low - touch_reference) / touch_reference * 100 if touch_reference else low_distance_pct
         above = latest >= ma_value
-        near = abs(distance_pct) <= 1.0
+        near = abs(distance_pct) <= FIB_MA_NEAR_PCT
         reclaim = bool(previous_close is not None and previous_ma is not None and previous_close < previous_ma and above)
         out[f"ma{period}"] = round(ma_value, 3)
+        if previous_ma is not None:
+            out[f"previous_ma{period}"] = round(previous_ma, 3)
         out[f"above_ma{period}"] = above
         out[f"near_ma{period}"] = near
         out[f"reclaim_ma{period}"] = reclaim
         out[f"distance_ma{period}_pct"] = round(distance_pct, 3)
+        out[f"low_distance_ma{period}_pct"] = round(low_distance_pct, 3)
         if period in stand_weights:
             if above:
                 above_count += 1
@@ -559,14 +695,41 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
                 score += reclaim_weights[period]
         elif period in fib_weights:
             weight = fib_weights[period]
+            touched = (
+                -FIB_MA_TOUCH_UNDERSHOOT_PCT <= touch_distance_pct <= FIB_MA_TOUCH_OVERSHOOT_PCT
+                or -FIB_MA_TOUCH_UNDERSHOOT_PCT <= low_distance_pct <= FIB_MA_TOUCH_OVERSHOOT_PCT
+            )
+            accepted = bool(touched and latest >= touch_reference and latest_close_position >= 0.45)
             if above:
                 fib_above_count += 1
-                fib_support_score += weight
             elif near:
-                fib_support_score += weight * 0.55
+                pass
             if reclaim:
                 fib_reclaim_count += 1
+            if touched:
+                fib_touch_count += 1
+            if accepted:
+                fib_accept_count += 1
+                fib_support_score += weight
+            elif reclaim:
                 fib_support_score += min(4.0, weight)
+            elif near:
+                fib_support_score += weight * 0.45
+            fib_ma_array.append({
+                "period": period,
+                "name": f"MA{period}",
+                "value": round(ma_value, 3),
+                "previous_value": round(previous_ma, 3) if previous_ma is not None else None,
+                "above": above,
+                "near": near,
+                "reclaim": reclaim,
+                "pullback_touch": touched,
+                "pullback_acceptance": accepted,
+                "distance_pct": round(distance_pct, 3),
+                "low_distance_pct": round(low_distance_pct, 3),
+                "touch_distance_pct": round(touch_distance_pct, 3),
+                "acceptance_score": round(weight if accepted else min(4.0, weight) if reclaim else weight * 0.45 if near else 0.0, 3),
+            })
     ma5 = out.get("ma5")
     ma10 = out.get("ma10")
     ma20 = out.get("ma20")
@@ -598,12 +761,30 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
         tags.append("重新站上均线")
     if out.get("ma_stack") == "bullish":
         tags.append("均线多头")
-    if fib_support_score > 0:
-        tags.append("Fibonacci均线支撑")
+    fib_ma_values = [out.get(f"ma{period}") for period in FIBONACCI_MA_PERIODS if out.get(f"ma{period}")]
+    if len(fib_ma_values) >= 2:
+        if all(left >= right for left, right in zip(fib_ma_values, fib_ma_values[1:])):
+            out["fib_ma_array_state"] = "bullish"
+        elif all(left <= right for left, right in zip(fib_ma_values, fib_ma_values[1:])):
+            out["fib_ma_array_state"] = "bearish"
+        else:
+            out["fib_ma_array_state"] = "mixed"
+    accepted_periods = [item["period"] for item in fib_ma_array if item.get("pullback_acceptance")]
+    touched_periods = [item["period"] for item in fib_ma_array if item.get("pullback_touch")]
+    if accepted_periods:
+        tags.append("斐波那切均线回踩承接")
+    elif touched_periods:
+        tags.append("斐波那切均线回踩待确认")
     out["above_count"] = above_count
     out["reclaim_count"] = reclaim_count
     out["fib_above_count"] = fib_above_count
     out["fib_reclaim_count"] = fib_reclaim_count
+    out["fib_touch_count"] = fib_touch_count
+    out["fib_accept_count"] = fib_accept_count
+    out["fib_accept_periods"] = accepted_periods[:6]
+    out["fib_touch_periods"] = touched_periods[:6]
+    out["fib_ma_array"] = fib_ma_array
+    out["fib_array_summary"] = " / ".join(f"MA{period}回踩承接" for period in accepted_periods[:3]) or " / ".join(f"MA{period}触碰待确认" for period in touched_periods[:3])
     out["fib_support_score"] = round(min(16.0, fib_support_score), 3)
     out["score"] = round(max(0.0, min(60.0, score + out["fib_support_score"])), 3)
     out["summary"] = " / ".join(tags[:5]) if tags else "均线未确认"
@@ -893,10 +1074,17 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
     market = _symbol_market(symbol)
     resample_intraday = scan_scope == INTRADAY_SCAN_SCOPE and market == "A"
     daily_bars = _load_bars(db, symbol, DAILY_FREQS, Freq.D, limit=360, label="日线")
+    now = naive_market_now(market)
+    daily_bars = _append_quote_snapshot_daily_bar(
+        db,
+        symbol,
+        daily_bars,
+        Freq.D,
+        enabled=_use_intraday_daily_acceptance(scan_scope, market, now),
+    )
     ma_alignment = _ma_alignment_from_daily_bars(daily_bars)
     daily_frame = _bars_to_ohlcv_frame(daily_bars)
     volume_ratio = _latest_volume_ratio(daily_frame)
-    now = naive_market_now(market)
     entry_factor_docs = _entry_factor_docs(
         symbol,
         daily_bars,

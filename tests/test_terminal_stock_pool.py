@@ -51,9 +51,39 @@ def _ma_alignment(*, above5=True, above10=True, above20=True, near10=False, near
             "reclaim_ma21": False,
             "reclaim_ma34": False,
             "reclaim_ma55": False,
+            "fib_ma_array": [
+                {
+                    "period": 13,
+                    "name": "MA13",
+                    "value": 10.0,
+                    "pullback_touch": True,
+                    "pullback_acceptance": True,
+                    "acceptance_score": 2.5,
+                },
+                {
+                    "period": 21,
+                    "name": "MA21",
+                    "value": 10.0,
+                    "pullback_touch": True,
+                    "pullback_acceptance": True,
+                    "acceptance_score": 3.5,
+                },
+                {
+                    "period": 34,
+                    "name": "MA34",
+                    "value": 9.8,
+                    "pullback_touch": False,
+                    "pullback_acceptance": False,
+                    "acceptance_score": 0.0,
+                },
+            ],
+            "fib_accept_count": 2,
+            "fib_accept_periods": [13, 21],
+            "fib_touch_count": 2,
+            "fib_touch_periods": [13, 21],
             "fib_above_count": 3,
             "fib_reclaim_count": 0,
-            "fib_support_score": 8.0,
+            "fib_support_score": 6.0,
         } if fib else {}),
         "ma_stack": "bullish" if above5 and above10 and above20 else "mixed",
         "ma20_direction": "向上",
@@ -1411,7 +1441,7 @@ def test_terminal_stock_pool_watch_rank_prefers_daily_then_30m_weekly_execution(
     assert [row["score_components"]["timeframe_priority"] for row in split["watch"][:4]] == [34.0, 28.0, 20.0, 12.0]
 
 
-def test_terminal_stock_pool_scores_fibonacci_ma_support_separately():
+def test_terminal_stock_pool_scores_fibonacci_ma_acceptance_separately():
     assert _fib_ma_support_score_from_alignment(_ma_alignment(fib=True)) > 0
 
     rows = {}
@@ -1445,9 +1475,9 @@ def test_terminal_stock_pool_scores_fibonacci_ma_support_separately():
     split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
 
     by_code = {row["raw_code"]: row for row in split["watch"]}
-    assert by_code["300421"]["score_components"]["fib_ma_support"] > 0
-    assert by_code["300422"]["score_components"]["fib_ma_support"] == 0
-    assert "Fibonacci均线" in by_code["300421"]["rank_reason"]
+    assert by_code["300421"]["score_components"]["fib_ma_acceptance"] > 0
+    assert by_code["300422"]["score_components"]["fib_ma_acceptance"] == 0
+    assert "斐波那切均线承接" in by_code["300421"]["rank_reason"]
 
 
 def test_terminal_stock_pool_watch_rank_rewards_multi_period_and_indicator_breadth():

@@ -246,6 +246,7 @@ function wbRenderSignals(signals) {
   const recent = [...signals].slice(-8).reverse();
   el.innerHTML = recent.map(item => {
     const isBuy = String(item.type || '').includes('买');
+    const detail = item.ma_acceptance?.summary || item.details || '';
     return `
       <div class="wb-list-item">
         <div class="wb-list-row">
@@ -253,10 +254,225 @@ function wbRenderSignals(signals) {
           <span class="wb-list-title">${wbEscapeHtml(item.freq || '')}</span>
           <span class="wb-list-side">${wbEscapeHtml(wbFormatNumber(item.price, 2))}</span>
         </div>
-        <div class="wb-list-subtitle">${wbEscapeHtml(item.dt ? wbUnixToLabel(item.dt, true) : '')} · 置信度 ${wbEscapeHtml(wbFormatNumber(item.confidence ?? 0, 2))}</div>
+        <div class="wb-list-subtitle">${wbEscapeHtml(item.dt ? wbUnixToLabel(item.dt, true) : '')} · 置信度 ${wbEscapeHtml(wbFormatNumber(item.confidence ?? 0, 2))}${detail ? ` · ${wbEscapeHtml(detail)}` : ''}</div>
       </div>
     `;
   }).join('');
+}
+
+function wbShortFreq(freq) {
+  const raw = String(freq || '');
+  if (!raw) return '';
+  if (raw.includes('周') || raw === 'weekly') return '周';
+  if (raw.includes('日') || raw === 'daily') return '日';
+  if (raw.includes('30')) return '30m';
+  if (raw.includes('15')) return '15m';
+  if (raw.includes('5')) return '5m';
+  return raw.replace('分钟', 'm');
+}
+
+function wbNormalizeFreq(freq) {
+  const raw = String(freq || '').trim().toLowerCase();
+  if (['5m', '5min', '5分钟'].includes(raw)) return '5min';
+  if (['15m', '15min', '15分钟'].includes(raw)) return '15min';
+  if (['30m', '30min', '30分钟'].includes(raw)) return '30min';
+  if (['daily', 'day', '1d', '日线', '日'].includes(raw)) return 'daily';
+  if (['weekly', 'week', '1w', '周线', '周'].includes(raw)) return 'weekly';
+  return raw;
+}
+
+function wbIsMaAcceptanceMarker(item) {
+  return item?.signal_family === 'ma_acceptance' && Boolean(item?.ma_acceptance);
+}
+
+function wbMaAcceptanceLabel(acceptance) {
+  const summary = String(acceptance?.summary || '');
+  if (!summary) return '';
+  return summary.replace(/回踩承接/g, '承接').slice(0, 10);
+}
+
+function wbSignalPriority(item) {
+  const typeName = String(item?.type || '');
+  let score = 0;
+  if (wbIsMaAcceptanceMarker(item)) score += 160;
+  if (item?.display_scope === 'current_timeframe') score += 28;
+  if (item?.display_scope === 'higher_timeframe_context') score += 18;
+  if (String(item?.signal_side || '').toLowerCase() === 'sell' || /卖|跌破|风险|背离/.test(typeName)) score += 55;
+  if (/一买|二买|三买|背驰买|缺口买|趋势|突破/.test(typeName)) score += 45;
+  if (/MACD|量价|缩量|放量/.test(typeName)) score += 24;
+  score += Math.min(20, Number(item?.confidence || 0) * 20);
+  return score;
+}
+
+function wbSignalDisplayLabel(item, count = 1) {
+  const maLabel = wbIsMaAcceptanceMarker(item) ? wbMaAcceptanceLabel(item?.ma_acceptance) : '';
+  const typeName = String(item?.type || item?.signal_type || '');
+  const freq = wbShortFreq(item?.freq);
+  let label = maLabel || [freq, typeName].filter(Boolean).join(' ');
+  if (label.length > 10) label = label.slice(0, 10);
+  if (count > 1) label = `${label}+${count - 1}`;
+  return label || (count > 1 ? `信号+${count - 1}` : '信号');
+}
+
+function wbBuildSignalMarkPoints(signals, colors) {
+  const groups = new Map();
+  (signals || []).forEach(item => {
+    const dt = Number(item?.dt || 0);
+    const price = Number(item?.price);
+    if (!dt || Number.isNaN(price)) return;
+    const key = `${dt}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  });
+  const ordered = Array.from(groups.entries())
+    .map(([dt, items]) => {
+      const sorted = [...items].sort((a, b) => wbSignalPriority(b) - wbSignalPriority(a));
+      return { dt: Number(dt), items: sorted, top: sorted[0] };
+    })
+    .sort((a, b) => b.dt - a.dt);
+
+  let labelCount = 0;
+  return ordered.map(group => {
+    const top = group.top || {};
+    const typeName = String(top.type || '');
+    const maMarker = wbIsMaAcceptanceMarker(top);
+    const isSell = String(top.signal_side || '').toLowerCase() === 'sell' || /卖|跌破|风险|背离/.test(typeName);
+    const isBuy = !isSell && (String(top.signal_side || '').toLowerCase() === 'buy' || /买|突破|承接/.test(typeName) || maMarker);
+    const forcedLabel = maMarker;
+    const showLabel = forcedLabel || labelCount < 8;
+    if (showLabel) labelCount += 1;
+    const color = maMarker ? colors.ma5 : isBuy ? colors.up : colors.down;
+    return {
+      name: typeName,
+      coord: [group.dt * 1000, Number(top.price)],
+      value: wbSignalDisplayLabel(top, group.items.length),
+      symbol: showLabel ? 'pin' : 'circle',
+      symbolRotate: isSell ? 180 : 0,
+      symbolSize: showLabel ? 30 : 8,
+      itemStyle: { color },
+      label: {
+        show: showLabel,
+        color,
+        formatter: params => params.value || '',
+        fontSize: 11,
+        fontWeight: 700,
+        position: isSell ? 'bottom' : 'top',
+        distance: 6,
+        textShadowBlur: 6,
+        textShadowColor: 'rgba(0,0,0,0.8)',
+      },
+    };
+  }).reverse();
+}
+
+function wbFindMaAcceptance(symbolData) {
+  const summaryAcceptance = symbolData?.summary?.ma_acceptance;
+  if (summaryAcceptance?.summary) return summaryAcceptance;
+  const chartSignals = symbolData?.chart?.signals || [];
+  for (let idx = chartSignals.length - 1; idx >= 0; idx -= 1) {
+    if (chartSignals[idx]?.ma_acceptance?.summary) return chartSignals[idx].ma_acceptance;
+  }
+  const signals = symbolData?.signals || [];
+  for (let idx = signals.length - 1; idx >= 0; idx -= 1) {
+    if (signals[idx]?.ma_acceptance?.summary) return signals[idx].ma_acceptance;
+  }
+  return null;
+}
+
+function wbDailyMaAcceptanceSignal(data) {
+  const currentFreq = wbNormalizeFreq(data?.target?.effective_freq || data?.target?.requested_freq || WB_STATE.target.freq);
+  if (currentFreq !== 'daily') return null;
+  const maAcceptance = wbFindMaAcceptance(data);
+  const bars = data?.chart?.ohlcv || [];
+  const latest = bars[bars.length - 1];
+  if (!maAcceptance?.summary || !latest?.time) return null;
+  const primary = maAcceptance.primary || {};
+  return {
+    dt: latest.time,
+    date_str: wbUnixToLabel(latest.time, false),
+    type: 'MA承接',
+    signal_type: maAcceptance.summary,
+    price: Number(primary.value || latest.low || latest.close),
+    freq: 'daily',
+    details: maAcceptance.detail || '',
+    source: maAcceptance.source_collection || 'terminal_ma_acceptance',
+    display_scope: 'current_timeframe',
+    signal_side: 'buy',
+    signal_family: 'ma_acceptance',
+    ma_acceptance: { ...maAcceptance, freq: 'daily' },
+  };
+}
+
+function wbRenderEvidenceLanes(symbolData) {
+  const el = document.getElementById('wb-evidence-lanes');
+  if (!el) return;
+  if (!symbolData) {
+    el.innerHTML = wbEmpty('等待目标载入');
+    return;
+  }
+  const signals = symbolData.chart?.signals || symbolData.signals || [];
+  const rows = [];
+  const maAcceptance = wbFindMaAcceptance(symbolData);
+  if (maAcceptance) {
+    const primary = maAcceptance.primary || {};
+    rows.push({
+      tone: 'buy',
+      lane: '均线承接',
+      title: maAcceptance.summary || '回踩承接',
+      detail: maAcceptance.detail || '',
+      metrics: [
+        ['周期', (maAcceptance.periods || []).map(period => `MA${period}`).join('/')],
+        ['均线', wbFormatNumber(primary.value, 2)],
+        ['触线', wbFormatPct(primary.touch_distance_pct, 3)],
+        ['现距', wbFormatPct(primary.distance_pct, 2)],
+      ],
+    });
+  }
+  const recentBuys = [...signals].reverse()
+    .filter(item => /买|突破|承接/.test(String(item.type || '')))
+    .slice(0, 4);
+  if (recentBuys.length) {
+    rows.push({
+      tone: 'buy',
+      lane: '结构买点',
+      title: recentBuys.map(item => [wbShortFreq(item.freq), item.type].filter(Boolean).join(' ')).join(' / '),
+      detail: recentBuys[0]?.details || '',
+      metrics: [['数量', recentBuys.length], ['最近', recentBuys[0]?.dt ? wbUnixToLabel(recentBuys[0].dt, true) : '']],
+    });
+  }
+  const recentMomentum = [...signals].reverse()
+    .filter(item => /MACD|量价|缩量|放量/.test(String(item.type || item.details || '')))
+    .slice(0, 3);
+  if (recentMomentum.length) {
+    rows.push({
+      tone: 'info',
+      lane: '量价动能',
+      title: recentMomentum.map(item => [wbShortFreq(item.freq), item.type].filter(Boolean).join(' ')).join(' / '),
+      detail: recentMomentum[0]?.details || '',
+      metrics: [['数量', recentMomentum.length]],
+    });
+  }
+  if (!rows.length) {
+    el.innerHTML = wbEmpty('暂无可用证据');
+    return;
+  }
+  el.innerHTML = rows.map(row => `
+    <div class="wb-evidence-card ${wbEscapeHtml(row.tone || 'neutral')}">
+      <div class="wb-evidence-head">
+        <span class="wb-evidence-pill">${wbEscapeHtml(row.lane)}</span>
+        <strong>${wbEscapeHtml(row.title)}</strong>
+      </div>
+      ${row.detail ? `<div class="wb-evidence-detail">${wbEscapeHtml(row.detail)}</div>` : ''}
+      <div class="wb-evidence-grid">
+        ${(row.metrics || []).filter(item => item[1] !== '' && item[1] != null).map(([label, value]) => `
+          <div class="wb-evidence-metric">
+            <span>${wbEscapeHtml(label)}</span>
+            <b>${wbEscapeHtml(value)}</b>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `).join('');
 }
 
 function wbRenderBootState(session, message = '分析引擎正在构建首轮快照，图表就绪后会自动切入当前目标。') {
@@ -279,6 +495,7 @@ function wbRenderBootState(session, message = '分析引擎正在构建首轮快
     conclusion: '正在建立图表终端上下文',
     daily_trend: message,
   });
+  wbRenderEvidenceLanes(null);
   wbRenderKeyLevels({ key_levels: [] });
   wbRenderSignals([]);
   wbRenderPlan(null, { candidate_stocks: [] });
@@ -418,32 +635,8 @@ function wbChartOption(data) {
     { xAxis: item.end_dt * 1000, yAxis: item.zg },
   ]);
 
-  const signalMarkPoints = signals.map(item => {
-    const typeName = String(item.type || '');
-    const isBuy = typeName.includes('买');
-    return {
-      name: typeName,
-      coord: [item.dt * 1000, item.price],
-      value: typeName,
-      symbol: 'pin',
-      symbolRotate: isBuy ? 0 : 180,
-      symbolSize: 32,
-      itemStyle: {
-        color: isBuy ? colors.up : colors.down,
-      },
-      label: {
-        show: true,
-        color: isBuy ? colors.up : colors.down,
-        formatter: () => typeName.length > 6 ? typeName.slice(0, 6) : typeName,
-        fontSize: 11,
-        fontWeight: 700,
-        position: isBuy ? 'top' : 'bottom',
-        distance: 6,
-        textShadowBlur: 6,
-        textShadowColor: 'rgba(0,0,0,0.8)',
-      },
-    };
-  });
+  const dailyMaSignal = wbDailyMaAcceptanceSignal(data);
+  const signalMarkPoints = wbBuildSignalMarkPoints(dailyMaSignal ? [...signals, dailyMaSignal] : signals, colors);
 
   const maColorMap = {
     MA5: colors.ma5,
@@ -959,6 +1152,7 @@ async function wbLoadSymbol(label, kind = 'auto', silent = false) {
     document.getElementById('wb-chart-range-label').textContent = '未选择区间';
     wbRenderTargetMeta(data);
     wbRenderSummaryCard(data.summary || {});
+    wbRenderEvidenceLanes(data);
     wbRenderKeyLevels(data.summary || {});
     wbRenderSignals(data.signals || []);
     wbRenderPlan(data.plan, data);

@@ -1755,6 +1755,44 @@ def _signal_or_fallback(row: dict[str, Any], df: pd.DataFrame) -> str:
     return _ma_signal_from_df(df)
 
 
+def _timeframe_signal_value(row: dict[str, Any], key: str) -> str:
+    value = _text(row.get(key))
+    if not value or value.lower() in {"none", "n/a"} or value == "无":
+        return ""
+    return value
+
+
+def _index_timeframe_signal_entries(row: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    buy_entries: list[dict[str, Any]] = []
+    sell_entries: list[dict[str, Any]] = []
+    for freq, key in (
+        ("daily", "daily_latest_signal"),
+        ("30min", "f30_latest_signal"),
+        ("15min", "f15_latest_signal"),
+    ):
+        signal = _timeframe_signal_value(row, key)
+        if not signal:
+            continue
+        side = _manual_clue_signal_side({"signal_type": signal})
+        if side not in {"buy", "sell"}:
+            continue
+        payload = {
+            "freq": freq,
+            "badge": _freq_badge(freq),
+            "side": side,
+            "signal_type": signal,
+            "score": _float(row.get("score") or row.get("composite_score"), 0) or 0,
+            "confidence": _float(row.get("confidence")),
+            "signal_date": _text(row.get(f"{key}_date") or row.get("daily_last_dt") or row.get("snapshot_dt")),
+            "price": _float(row.get("latest_price") or row.get("snapshot_price")),
+        }
+        if side == "sell":
+            sell_entries.append(payload)
+        else:
+            buy_entries.append(payload)
+    return buy_entries, sell_entries
+
+
 def _unwrap_response(value: Any) -> Any:
     if isinstance(value, JSONResponse):
         return json.loads(value.body.decode("utf-8"))
@@ -2609,6 +2647,133 @@ def _refresh_shell_stock_chain_assignment(row: dict[str, Any], chain_positions: 
     return row
 
 
+def _slim_shell_fib_ma_item(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    keep = (
+        "period",
+        "name",
+        "value",
+        "previous_value",
+        "above",
+        "near",
+        "reclaim",
+        "pullback_touch",
+        "pullback_acceptance",
+        "distance_pct",
+        "low_distance_pct",
+        "touch_distance_pct",
+        "acceptance_score",
+    )
+    return {key: item.get(key) for key in keep if item.get(key) not in (None, "", [], {})}
+
+
+def _slim_shell_ma_alignment(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    keep = {
+        "latest_close",
+        "latest_low",
+        "ma_stack",
+        "ma20_direction",
+        "fib_ma_array_state",
+        "above_count",
+        "reclaim_count",
+        "fib_above_count",
+        "fib_reclaim_count",
+        "fib_touch_count",
+        "fib_accept_count",
+        "fib_accept_periods",
+        "fib_touch_periods",
+        "fib_array_summary",
+        "fib_support_score",
+        "score",
+        "summary",
+        "tags",
+    }
+    for period in (5, 8, 10, 13, 20, 21, 34, 55, 60, 89):
+        keep.update({
+            f"ma{period}",
+            f"previous_ma{period}",
+            f"above_ma{period}",
+            f"near_ma{period}",
+            f"reclaim_ma{period}",
+            f"distance_ma{period}_pct",
+            f"low_distance_ma{period}_pct",
+        })
+    out = {key: value.get(key) for key in sorted(keep) if value.get(key) not in (None, "", [], {})}
+    fib_items = [
+        item
+        for item in (_slim_shell_fib_ma_item(raw) for raw in value.get("fib_ma_array") or [])
+        if item
+    ]
+    if fib_items:
+        out["fib_ma_array"] = fib_items[:8]
+    return out
+
+
+def _shell_ma_acceptance_summary(ma_alignment: Any) -> dict[str, Any]:
+    ma = _slim_shell_ma_alignment(ma_alignment)
+    if not ma:
+        return {}
+    fib_items = [item for item in ma.get("fib_ma_array") or [] if isinstance(item, dict)]
+    accept_items = [item for item in fib_items if item.get("pullback_acceptance")]
+    if not accept_items:
+        periods = [int(period) for period in ma.get("fib_accept_periods") or [] if _text(period)]
+        for period in periods:
+            item = {
+                "period": period,
+                "name": f"MA{period}",
+                "value": ma.get(f"ma{period}"),
+                "previous_value": ma.get(f"previous_ma{period}"),
+                "above": ma.get(f"above_ma{period}"),
+                "distance_pct": ma.get(f"distance_ma{period}_pct"),
+                "low_distance_pct": ma.get(f"low_distance_ma{period}_pct"),
+                "pullback_acceptance": True,
+            }
+            accept_items.append({key: val for key, val in item.items() if val not in (None, "", [], {})})
+    if not accept_items:
+        return {}
+    def touch_sort(item: dict[str, Any]) -> float:
+        value = _float(item.get("touch_distance_pct"))
+        return abs(value) if value is not None else 9999.0
+
+    accept_items.sort(key=touch_sort)
+    primary = accept_items[0]
+    periods = [
+        int(period)
+        for period in ma.get("fib_accept_periods") or [item.get("period") for item in accept_items]
+        if _text(period)
+    ]
+    summary = _text(ma.get("fib_array_summary")) or " / ".join(f"MA{period}回踩承接" for period in periods)
+    detail_parts = []
+    value = _float(primary.get("value"))
+    latest_low = _float(ma.get("latest_low"))
+    latest_close = _float(ma.get("latest_close"))
+    touch_distance = _float(primary.get("touch_distance_pct"))
+    distance = _float(primary.get("distance_pct"))
+    primary_label = _text(primary.get("name")) or f"MA{primary.get('period')}"
+    if value is not None:
+        detail_parts.append(f"{primary_label} {value:.2f}")
+    if latest_low is not None:
+        detail_parts.append(f"低点 {latest_low:.2f}")
+    if latest_close is not None:
+        detail_parts.append(f"收/现 {latest_close:.2f}")
+    if touch_distance is not None:
+        detail_parts.append(f"触线 {touch_distance:+.3f}%")
+    if distance is not None:
+        detail_parts.append(f"现价距线 {distance:+.2f}%")
+    return {
+        "summary": summary,
+        "periods": periods,
+        "primary": primary,
+        "items": accept_items[:4],
+        "state": _text(ma.get("fib_ma_array_state")),
+        "score": _float(ma.get("fib_support_score"), _float(ma.get("score"))),
+        "detail": " / ".join(part for part in detail_parts if part),
+    }
+
+
 def _slim_shell_signal_reason(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -2631,7 +2796,6 @@ def _slim_shell_signal_reason(value: Any) -> dict[str, Any]:
         "event_latest_dt",
         "signal_age_trading_days",
         "weight",
-        "ma_alignment",
     )
     out = {key: value.get(key) for key in keys if value.get(key) not in (None, "", [], {})}
     evidence = value.get("evidence") if isinstance(value.get("evidence"), dict) else {}
@@ -2675,26 +2839,12 @@ def _slim_shell_signal_reason(value: Any) -> dict[str, Any]:
         }
     ma_alignment = value.get("ma_alignment") if isinstance(value.get("ma_alignment"), dict) else evidence.get("ma_alignment")
     if isinstance(ma_alignment, dict):
-        out["ma_alignment"] = {
-            key: ma_alignment.get(key)
-            for key in (
-                "above_ma5",
-                "above_ma10",
-                "above_ma20",
-                "near_ma10",
-                "near_ma20",
-                "reclaim_ma5",
-                "reclaim_ma10",
-                "reclaim_ma20",
-                "ma_stack",
-                "ma20_direction",
-                "above_count",
-                "score",
-                "summary",
-                "tags",
-            )
-            if ma_alignment.get(key) not in (None, "", [], {})
-        }
+        slim_ma = _slim_shell_ma_alignment(ma_alignment)
+        if slim_ma:
+            out["ma_alignment"] = slim_ma
+        ma_acceptance = _shell_ma_acceptance_summary(ma_alignment)
+        if ma_acceptance:
+            out["ma_acceptance"] = ma_acceptance
     return out
 
 
@@ -2912,6 +3062,7 @@ def _shell_stock_trade_summary(row: dict[str, Any], *, entry_factor: dict[str, A
         for item in ma.get("tags") or []
         if _text(item)
     ][:2]
+    fib_summary = _text(ma.get("fib_array_summary"))
     detail = ""
     top_buy = row.get("top_buy_reason") if isinstance(row.get("top_buy_reason"), dict) else {}
     if isinstance(top_buy, dict):
@@ -2946,7 +3097,9 @@ def _shell_stock_trade_summary(row: dict[str, Any], *, entry_factor: dict[str, A
         evidence.append("左侧 " + " / ".join(left_signal[:1]))
     if breakout:
         evidence.append(breakout)
-    if ma_tags:
+    if fib_summary:
+        evidence.append("均线 " + fib_summary)
+    elif ma_tags:
         evidence.append("均线 " + " / ".join(ma_tags))
     if detail:
         evidence.append(detail)
@@ -3024,6 +3177,10 @@ def _shell_stock_display_badges(row: dict[str, Any], *, entry_factor: dict[str, 
     if row.get("risk_marked"):
         marker = _text(row.get("risk_marker")) or (_shell_stock_reason_labels(row, side="risk", limit=1) or ["风险"])[0]
         add(marker, "risk")
+    ma = row.get("ma_alignment") if isinstance(row.get("ma_alignment"), dict) else {}
+    fib_summary = _text(ma.get("fib_array_summary"))
+    if fib_summary:
+        add(fib_summary.replace("回踩承接", "承接"), "buy")
     if gate.startswith("entry_waiting"):
         add(_shell_stock_display_action(row), "wait")
     chain = _shell_stock_chain_brief(row)
@@ -3188,6 +3345,12 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "can_trade_now",
     )
     out = {key: row.get(key) for key in keys if row.get(key) not in (None, "", [], {})}
+    ma_alignment = _slim_shell_ma_alignment(row.get("ma_alignment"))
+    if ma_alignment:
+        out["ma_alignment"] = ma_alignment
+    ma_acceptance = _shell_ma_acceptance_summary(row.get("ma_alignment"))
+    if ma_acceptance:
+        out["ma_acceptance"] = ma_acceptance
     chain_context = _slim_shell_chain_context(row.get("chain_context"))
     if chain_context:
         out["chain_context"] = chain_context
@@ -3361,6 +3524,7 @@ def _slim_shell_sector_row(row: dict[str, Any]) -> dict[str, Any]:
 def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) -> dict[str, Any]:
     symbol = str(row.get("symbol") or row.get("code") or row.get("label") or row.get("name") or "").strip()
     df, source = _index_df(symbol, "daily") if symbol else (pd.DataFrame(), "")
+    buy_timeframes, sell_timeframes = _index_timeframe_signal_entries(row)
     day_change_mode = _a_day_change_mode()
     daily_day_change, daily_day_source, daily_as_of = _daily_close_day_change_pct(df)
     daily_close_price = (
@@ -3398,6 +3562,8 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "day_change_as_of": day_change_as_of,
         "day_change_freq": minute_change.get("day_change_freq") if minute_change else "",
         "latest_signal": _signal_or_fallback(row, df),
+        "buy_timeframes": buy_timeframes,
+        "sell_timeframes": sell_timeframes,
         "range_returns": _compute_range_returns(df, range_columns),
         "range_return_source": source,
         "available_freqs": UI_FREQS,
@@ -3478,12 +3644,16 @@ def _load_signal_pool_rows(limit: int = 200, symbol: Optional[str] = None) -> li
         return []
 
 
-def _load_terminal_technical_signal_rows(symbol: str, *, limit: int = 300) -> list[dict[str, Any]]:
+def _load_terminal_technical_signal_rows(symbol: str, *, limit: int = 300, kind: str = "stock") -> list[dict[str, Any]]:
     if not symbol:
         return []
     try:
         db = _mongo_db()
-        candidates = _probe_symbol_candidates(symbol, kind="stock")
+        candidates = _probe_symbol_candidates(symbol, kind=kind)
+        if kind == "index":
+            for candidate in _probe_symbol_candidates(symbol, kind="stock"):
+                if candidate and candidate not in candidates:
+                    candidates.append(candidate)
         latest = db["terminal_technical_signals"].find_one(
             {"symbol": {"$in": candidates}, "market": "A", "as_of": {"$exists": True}},
             {"_id": 0, "as_of": 1},
@@ -3515,6 +3685,7 @@ def _manual_clue_signal_side(signal: dict[str, Any]) -> str:
 
 def _manual_clue_signal_reason(signal: dict[str, Any]) -> dict[str, Any]:
     evidence = signal.get("technical_evidence") if isinstance(signal.get("technical_evidence"), dict) else {}
+    ma_alignment = signal.get("ma_alignment") if isinstance(signal.get("ma_alignment"), dict) else evidence.get("ma_alignment")
     signal_type = _text(signal.get("signal_type") or signal.get("type") or signal.get("reason"))
     freq = _text(signal.get("freq") or signal.get("timeframe")) or _freq_label(DEFAULT_TERMINAL_FREQ)
     side = _manual_clue_signal_side(signal)
@@ -3522,7 +3693,7 @@ def _manual_clue_signal_reason(signal: dict[str, Any]) -> dict[str, Any]:
     score = _float(signal.get("score"), _float(signal.get("total_score"), 0) or 0) or 0
     decision_effect = "exit_priority" if side == "sell" else "confirm" if side == "buy" else "context_only"
     queue_lane = "risk_exit_first" if side == "sell" else "manual_signal_review"
-    return {
+    reason = {
         "reason_type": "technical_trigger" if side in {"buy", "sell"} else "technical_signal",
         "weight": round(100 + abs(score), 3),
         "source_role": "technical_trigger" if side in {"buy", "sell"} else "context",
@@ -3547,6 +3718,9 @@ def _manual_clue_signal_reason(signal: dict[str, Any]) -> dict[str, Any]:
         "resonance_context": signal.get("resonance_context") if isinstance(signal.get("resonance_context"), dict) else {},
         "invalidates_when": _text(signal.get("invalidates_when")),
     }
+    if isinstance(ma_alignment, dict):
+        reason["ma_alignment"] = ma_alignment
+    return reason
 
 
 def _manual_clue_bucket_side(left_items: list[dict[str, Any]], right_items: list[dict[str, Any]]) -> str:
@@ -4182,10 +4356,16 @@ def _signal_details(signal: dict[str, Any]) -> str:
 
 def _technical_signal_details(signal: dict[str, Any]) -> str:
     evidence = signal.get("technical_evidence") if isinstance(signal.get("technical_evidence"), dict) else {}
-    return _text(evidence.get("details") or evidence.get("score_details") or signal.get("details") or signal.get("summary"))[:240]
+    base = _text(evidence.get("details") or evidence.get("score_details") or signal.get("details") or signal.get("summary"))
+    ma_alignment = signal.get("ma_alignment") if isinstance(signal.get("ma_alignment"), dict) else evidence.get("ma_alignment")
+    ma_acceptance = _shell_ma_acceptance_summary(ma_alignment)
+    if ma_acceptance:
+        ma_detail = _text(ma_acceptance.get("detail"))
+        base = " · ".join(part for part in [base, ma_acceptance.get("summary"), ma_detail] if _text(part))
+    return base[:240]
 
 
-def _terminal_technical_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) -> list[dict[str, Any]]:
+def _terminal_technical_chart_signals(symbol: str, freq: str, chart: dict[str, Any], *, kind: str = "stock") -> list[dict[str, Any]]:
     chart_meta = chart.get("meta") if isinstance(chart.get("meta"), dict) else {}
     effective_freq = _freq_bucket(chart_meta.get("freq") or freq)
     market = _text(chart_meta.get("market")) or infer_market(symbol=symbol, source=_text(chart_meta.get("source")))
@@ -4194,7 +4374,7 @@ def _terminal_technical_chart_signals(symbol: str, freq: str, chart: dict[str, A
     start_ts = int(ohlcv[0]["time"]) if ohlcv and isinstance(ohlcv[0], dict) and ohlcv[0].get("time") else None
     end_ts = int(ohlcv[-1]["time"]) if ohlcv and isinstance(ohlcv[-1], dict) and ohlcv[-1].get("time") else None
     output: list[dict[str, Any]] = []
-    for signal in _load_terminal_technical_signal_rows(symbol):
+    for signal in _load_terminal_technical_signal_rows(symbol, kind=kind):
         signal_freq = _freq_bucket(signal.get("freq") or signal.get("timeframe"))
         display_scope = _chart_signal_display_scope(_text(signal.get("freq") or signal.get("timeframe")), effective_freq)
         if display_scope == "other_timeframe":
@@ -4218,7 +4398,14 @@ def _terminal_technical_chart_signals(symbol: str, freq: str, chart: dict[str, A
             continue
         if end_ts and aligned_ts > end_ts + 86400:
             continue
-        output.append({
+        ma_alignment = signal.get("ma_alignment") if isinstance(signal.get("ma_alignment"), dict) else (
+            signal.get("technical_evidence", {}).get("ma_alignment")
+            if isinstance(signal.get("technical_evidence"), dict)
+            else {}
+        )
+        slim_ma = _slim_shell_ma_alignment(ma_alignment)
+        ma_acceptance = _shell_ma_acceptance_summary(ma_alignment)
+        row = {
             "dt": aligned_ts,
             "date_str": _date_text(signal_dt),
             "type": signal_type,
@@ -4231,7 +4418,12 @@ def _terminal_technical_chart_signals(symbol: str, freq: str, chart: dict[str, A
             "chart_aligned": aligned,
             "display_scope": display_scope,
             "signal_side": signal.get("signal_side"),
-        })
+        }
+        if slim_ma:
+            row["ma_alignment"] = slim_ma
+        if ma_acceptance:
+            row["ma_acceptance"] = ma_acceptance
+        output.append(row)
     return output
 
 
@@ -4595,6 +4787,116 @@ def _volume_signal_chart_signals(symbol: str, freq: str, chart: dict[str, Any]) 
     return output[-12:]
 
 
+def _index_report_chart_signals(report: dict[str, Any], chart: dict[str, Any], freq: str) -> list[dict[str, Any]]:
+    chart_meta = chart.get("meta") if isinstance(chart.get("meta"), dict) else {}
+    effective_freq = _freq_bucket(chart_meta.get("freq") or freq)
+    symbol = _text(report.get("symbol") or chart.get("symbol"))
+    market = _text(chart_meta.get("market")) or infer_market(symbol=symbol, source=_text(chart_meta.get("source")))
+    source = _text(chart_meta.get("source")) or "index_bars"
+    ohlcv = chart.get("ohlcv") if isinstance(chart.get("ohlcv"), list) else []
+    if not ohlcv:
+        return []
+    latest_bar = next((row for row in reversed(ohlcv) if isinstance(row, dict) and row.get("time")), None)
+    if not latest_bar:
+        return []
+    latest_ts = int(latest_bar.get("time") or 0)
+    if not latest_ts:
+        return []
+    output: list[dict[str, Any]] = []
+    for signal_freq, signal_key, trend_key in (
+        ("daily", "daily_latest_signal", "daily_trend"),
+        ("30min", "f30_latest_signal", "f30_trend"),
+        ("15min", "f15_latest_signal", "f15_trend"),
+    ):
+        signal_type = _timeframe_signal_value(report, signal_key)
+        if not signal_type:
+            continue
+        side = _manual_clue_signal_side({"signal_type": signal_type})
+        price = (
+            _float(latest_bar.get("high") or latest_bar.get("close"))
+            if side == "sell"
+            else _float(latest_bar.get("low") or latest_bar.get("close"))
+            if side == "buy"
+            else _float(latest_bar.get("close"))
+        )
+        output.append({
+            "dt": latest_ts,
+            "date_str": _timestamp_date(latest_ts, market=market, symbol=symbol, source=source),
+            "type": signal_type,
+            "price": price,
+            "confidence": 0.72,
+            "freq": signal_freq,
+            "details": " · ".join(
+                item for item in [_freq_badge(signal_freq), _text(report.get(trend_key)), "index_report"] if item
+            ),
+            "source": "signals.index_report",
+            "pool_status": "index_timeframe_signal",
+            "chart_aligned": True,
+            "display_scope": _chart_signal_display_scope(signal_freq, effective_freq),
+            "signal_side": side,
+            "signal_family": "index_report",
+        })
+    return output
+
+
+def _index_signal_context_from_row(row: dict[str, Any], *, name: str, symbol: str) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {}
+    stack = row.get("signal_stack") if isinstance(row.get("signal_stack"), dict) else {}
+    context = {
+        "name": _text(row.get("name") or row.get("label") or name),
+        "symbol": _text(row.get("symbol") or row.get("target_symbol") or symbol),
+        "latest_signal": _timeframe_signal_value(row, "latest_signal"),
+        "daily_trend": _text(row.get("daily_trend")),
+        "f30_trend": _text(row.get("f30_trend")),
+        "f15_trend": _text(row.get("f15_trend")),
+        "daily_latest_signal": _timeframe_signal_value(row, "daily_latest_signal")
+        or _timeframe_signal_value(stack, "daily"),
+        "f30_latest_signal": _timeframe_signal_value(row, "f30_latest_signal")
+        or _timeframe_signal_value(stack, "30min")
+        or _timeframe_signal_value(stack, "30m"),
+        "f15_latest_signal": _timeframe_signal_value(row, "f15_latest_signal")
+        or _timeframe_signal_value(stack, "15min")
+        or _timeframe_signal_value(stack, "15m"),
+    }
+    if any(_timeframe_signal_value(context, key) for key in (
+        "daily_latest_signal",
+        "f30_latest_signal",
+        "f15_latest_signal",
+        "latest_signal",
+    )):
+        return context
+    return {}
+
+
+def _cached_static_index_signal_context(name: str, symbol: str) -> dict[str, Any]:
+    payload = _SHELL_CACHE.get("payload")
+    if not isinstance(payload, dict):
+        return {}
+    expected = {item.lower() for item in (name, symbol) if _text(item)}
+    groups = payload.get("watchlist_groups") if isinstance(payload.get("watchlist_groups"), dict) else {}
+    candidates: list[Any] = []
+    for key in ("indices", "macro_indices"):
+        if isinstance(payload.get(key), list):
+            candidates.extend(payload[key])
+        if isinstance(groups.get(key), list):
+            candidates.extend(groups[key])
+    for row in candidates:
+        if not isinstance(row, dict):
+            continue
+        row_keys = {
+            _text(row.get(key)).lower()
+            for key in ("name", "label", "symbol", "code", "target_label", "target_symbol")
+            if _text(row.get(key))
+        }
+        if expected and row_keys.isdisjoint(expected):
+            continue
+        context = _index_signal_context_from_row(row, name=name, symbol=symbol)
+        if context:
+            return context
+    return {}
+
+
 def _aligned_signal_bar(
     signal: dict[str, Any],
     *,
@@ -4664,8 +4966,8 @@ def _aligned_signal_bar(
     return int(row.get("time") or ts), price_for_row(row), True
 
 
-def _merge_signal_pool_into_chart(chart: dict[str, Any], symbol: str, freq: str) -> dict[str, Any]:
-    technical_signals = _terminal_technical_chart_signals(symbol, freq, chart)
+def _merge_signal_pool_into_chart(chart: dict[str, Any], symbol: str, freq: str, *, kind: str = "stock") -> dict[str, Any]:
+    technical_signals = _terminal_technical_chart_signals(symbol, freq, chart, kind=kind)
     pool_signals = _signal_pool_chart_signals(symbol, freq, chart)
     volume_signals = _volume_signal_chart_signals(symbol, freq, chart)
     if not technical_signals and not pool_signals and not volume_signals:
@@ -4694,6 +4996,26 @@ def _merge_signal_pool_into_chart(chart: dict[str, Any], symbol: str, freq: str)
     updated = dict(chart)
     updated["signals"] = merged[-300:]
     return updated
+
+
+def _latest_terminal_ma_acceptance(symbol: str) -> dict[str, Any]:
+    for signal in _load_terminal_technical_signal_rows(symbol, limit=40):
+        if not isinstance(signal, dict):
+            continue
+        evidence = signal.get("technical_evidence") if isinstance(signal.get("technical_evidence"), dict) else {}
+        ma_alignment = signal.get("ma_alignment") if isinstance(signal.get("ma_alignment"), dict) else evidence.get("ma_alignment")
+        ma_acceptance = _shell_ma_acceptance_summary(ma_alignment)
+        if not ma_acceptance:
+            continue
+        ma_acceptance.update({
+            "source_collection": "terminal_technical_signals",
+            "signal_type": _text(signal.get("signal_type") or signal.get("type") or signal.get("reason")),
+            "freq": _text(signal.get("freq") or signal.get("timeframe")),
+            "as_of": _text(signal.get("as_of")),
+            "event_dt": _iso_dt(signal.get("dt") or signal.get("signal_date") or signal.get("updated_at")),
+        })
+        return ma_acceptance
+    return {}
 
 
 def _add_timeframe_signal(target: dict[str, Any], signal: dict[str, Any], *, side: str = "buy") -> None:
@@ -7151,6 +7473,23 @@ def _merge_stock_rows_by_symbol(rows: list[dict[str, Any]]) -> list[dict[str, An
     return merged
 
 
+def _remaining_manual_clues_after_attack_focus(
+    manual_clues: list[dict[str, Any]],
+    manual_attack_focus: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    attack_symbols = {
+        _text(row.get("symbol") or row.get("code")).upper()
+        for row in manual_attack_focus
+        if _text(row.get("symbol") or row.get("code"))
+    }
+    if not attack_symbols:
+        return list(manual_clues)
+    return [
+        row for row in manual_clues
+        if _text(row.get("symbol") or row.get("code")).upper() not in attack_symbols
+    ]
+
+
 def _enrich_scored_stock_rows(rows: list[dict[str, Any]], range_columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
     try:
         _refresh_realtime_quotes_for_rows(_mongo_db(), rows, refresh_key="scored_stocks", limit=len(rows) or 1)
@@ -7809,19 +8148,8 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     manual_clues = _manual_clue_rows(range_columns)
     manual_attack_focus = _manual_clue_attack_focus_rows(manual_clues, focus_stocks)
     focus_stocks = _merge_stock_rows_by_symbol(manual_attack_focus + focus_stocks)
-    focus_symbols = {
-        _text(row.get("symbol") or row.get("code")).upper()
-        for row in focus_stocks
-        if _text(row.get("symbol") or row.get("code"))
-    }
-    manual_focus_count = sum(
-        1 for row in manual_clues
-        if _text(row.get("symbol") or row.get("code")).upper() in focus_symbols
-    )
-    remaining_manual_clues = [
-        row for row in manual_clues
-        if _text(row.get("symbol") or row.get("code")).upper() not in focus_symbols
-    ]
+    manual_focus_count = len(manual_attack_focus)
+    remaining_manual_clues = _remaining_manual_clues_after_attack_focus(manual_clues, manual_attack_focus)
     scored_raw = _merge_stock_rows_by_symbol(remaining_manual_clues + (clue_stocks or strategy_clues))
     scored = _enrich_scored_stock_rows(scored_raw, range_columns)
     focus_stocks_meta = _focus_stock_pool_meta(len(focus_stocks))
@@ -9390,7 +9718,7 @@ def _summary_from_index(report: Dict[str, Any], chart: Dict[str, Any]) -> Dict[s
         "daily_trend": report.get("daily_trend", ""),
         "f30_trend": report.get("f30_trend", ""),
         "f15_trend": report.get("f15_trend", ""),
-        "latest_signal": chart_report.get("daily_latest_signal") or report.get("daily_latest_signal", ""),
+        "latest_signal": _signal_or_fallback({**report, **chart_report}, pd.DataFrame()),
         "key_levels": chart_report.get("key_levels") or ma_context.get("key_levels") or [],
         "style_switch": style_switch.suggestion if style_switch else "",
     }
@@ -9719,6 +10047,11 @@ async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
     df, source = _index_df(str(report.get("symbol") or name), requested_freq)
     chart = _chart_from_df(df, symbol=str(report.get("symbol") or name), freq=requested_freq, source=source, live_render=True)
     chart = _mark_chart_readiness(chart, kind="index", requested_freq=requested_freq)
+    chart["signals"] = [
+        *(chart.get("signals") if isinstance(chart.get("signals"), list) else []),
+        *_index_report_chart_signals(report, chart, requested_freq),
+    ]
+    chart = _merge_signal_pool_into_chart(chart, str(report.get("symbol") or name), requested_freq, kind="index")
     plan = _plan_for_index(engine, name)
 
     return {
@@ -9757,8 +10090,34 @@ async def _build_static_index_target(name: str, symbol: str, freq: str) -> Dict[
     df, source = _index_df(symbol, requested_freq)
     chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source, live_render=True)
     chart = _mark_chart_readiness(chart, kind="index", requested_freq=requested_freq)
+    signal_context = _cached_static_index_signal_context(name, symbol)
+    if signal_context:
+        chart["signals"] = [
+            *(chart.get("signals") if isinstance(chart.get("signals"), list) else []),
+            *_index_report_chart_signals(signal_context, chart, requested_freq),
+        ]
+    chart = _merge_signal_pool_into_chart(chart, symbol, requested_freq, kind="index")
     summary = _summary_from_static_index(name, symbol, chart)
-    summary["latest_signal"] = summary.get("latest_signal") or _ma_signal_from_df(df)
+    chart_signals = chart.get("signals") if isinstance(chart.get("signals"), list) else []
+    context_signal = _signal_or_fallback(signal_context, df) if signal_context else ""
+    chart_report_signal = next(
+        (
+            _text(item.get("type") or item.get("signal_type"))
+            for item in reversed(chart_signals)
+            if isinstance(item, dict) and _text(item.get("source")) == "signals.index_report"
+        ),
+        "",
+    )
+    if signal_context:
+        for key in ("daily_trend", "f30_trend", "f15_trend"):
+            if _text(signal_context.get(key)):
+                summary[key] = signal_context[key]
+    summary["latest_signal"] = (
+        context_signal
+        or summary.get("latest_signal")
+        or chart_report_signal
+        or _ma_signal_from_df(df)
+    )
     try:
         engine = _ensure_engine()
     except Exception:
@@ -10407,6 +10766,10 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
             "layered_position": {},
         }
     engine = _ensure_engine()
+    summary = _summary_from_stock(symbol, stock, chart)
+    ma_acceptance = _latest_terminal_ma_acceptance(symbol)
+    if ma_acceptance:
+        summary["ma_acceptance"] = ma_acceptance
     return {
         "target": {
             "kind": "stock",
@@ -10421,7 +10784,7 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
             **_target_diagnostics("stock", symbol, requested_freq),
         },
         "chart": chart,
-        "summary": _summary_from_stock(symbol, stock, chart),
+        "summary": summary,
         "signals": chart.get("signals", []),
         "plan": {
             "scenarios": stock.get("scenarios", []),

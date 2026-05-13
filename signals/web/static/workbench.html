@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>LONG CLAW Terminal</title>
   <link rel="stylesheet" href="/static/css/themes.css">
-  <link rel="stylesheet" href="/static/css/workbench.css?v=2">
+  <link rel="stylesheet" href="/static/css/workbench.css?v=4">
 </head>
 <body class="workbench-body">
   <div class="wb-grid-bg"></div>
@@ -231,6 +231,14 @@
 
       <section class="wb-panel">
         <div class="wb-panel-header">
+          <span>交易证据</span>
+          <span class="wb-panel-meta">lanes</span>
+        </div>
+        <div class="wb-evidence-list" id="wb-evidence-lanes"></div>
+      </section>
+
+      <section class="wb-panel">
+        <div class="wb-panel-header">
           <span>关键位</span>
           <span class="wb-panel-meta">levels</span>
         </div>
@@ -266,6 +274,6 @@
   <div class="wb-toast" id="wb-toast"></div>
 
   <script src="/static/vendor/echarts.min.js"></script>
-  <script src="/static/js/workbench.js?v=2"></script>
+  <script src="/static/js/workbench.js?v=4"></script>
 </body>
 </html>

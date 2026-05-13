@@ -386,6 +386,7 @@ body.workbench-body {
 .wb-level-list,
 .wb-plan-list,
 .wb-risk-list,
+.wb-evidence-list,
 .wb-timeline {
   display: flex;
   flex-direction: column;
@@ -397,10 +398,11 @@ body.workbench-body {
 .wb-level-item,
 .wb-plan-card,
 .wb-risk-item,
+.wb-evidence-card,
 .wb-review-card,
 .wb-timeline-row {
   padding: 12px;
-  border-radius: 14px;
+  border-radius: 8px;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid rgba(255, 255, 255, 0.06);
 }
@@ -483,6 +485,82 @@ body.workbench-body {
 .wb-level-pill {
   background: rgba(247, 147, 26, 0.16);
   color: #ffc46b;
+}
+
+.wb-evidence-card.buy {
+  border-color: rgba(242, 54, 69, 0.28);
+  background: rgba(242, 54, 69, 0.07);
+}
+
+.wb-evidence-card.info {
+  border-color: rgba(41, 98, 255, 0.26);
+  background: rgba(41, 98, 255, 0.07);
+}
+
+.wb-evidence-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.wb-evidence-head strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wb-evidence-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 58px;
+  padding: 4px 7px;
+  border-radius: 999px;
+  color: #ffc46b;
+  background: rgba(247, 147, 26, 0.16);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.wb-evidence-detail {
+  margin-top: 7px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.wb-evidence-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.wb-evidence-metric {
+  min-width: 0;
+  padding: 7px 8px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.16);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.wb-evidence-metric span {
+  display: block;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.wb-evidence-metric b {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--text-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
 }
 
 .wb-watch-form {

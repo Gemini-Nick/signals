@@ -159,7 +159,7 @@ FIBONACCI_MA_PERIODS = (8, 13, 21, 34, 55, 89)
 ENTRY_PARTNER_FREQS = ENTRY_UPPER_FREQS | RIGHT_SIDE_FREQS
 ENTRY_QUEUE_LANES = {"entry_ready", "entry_waiting_confirm", "entry_waiting_upper_context", "entry_waiting_right_side_confirm"}
 RISK_ACTION_STATUSES = {"risk_review", "chain_risk_review", "knowledge_blocked", "knowledge_conflict"}
-POOL_RANKING_VERSION = "tech_ma_hot_sector_v10_right_first_left_review"
+POOL_RANKING_VERSION = "tech_ma_hot_sector_v11_fib_ma_acceptance"
 SETUP_RANK_TIERS = {
     "right_executable": 300,
     "right_attack": 200,
@@ -2398,23 +2398,17 @@ def _ma_alignment_score_from_alignment(ma: dict[str, Any]) -> float:
 def _fib_ma_support_score_from_alignment(ma: dict[str, Any]) -> float:
     if not isinstance(ma, dict) or not ma:
         return 0.0
-    explicit = _float(ma.get("fib_support_score"))
     weights = {8: 2.0, 13: 2.5, 21: 3.5, 34: 4.0, 55: 5.0, 89: 6.0}
     score = 0.0
-    has_field = False
-    for period, weight in weights.items():
-        has_field = has_field or any(key in ma for key in (f"above_ma{period}", f"near_ma{period}", f"reclaim_ma{period}"))
-        if _truthy_bool(ma.get(f"near_ma{period}")):
-            score += weight
-        elif _truthy_bool(ma.get(f"above_ma{period}")):
-            score += weight * 0.55
-        if _truthy_bool(ma.get(f"reclaim_ma{period}")):
-            score += min(4.0, weight)
-    if explicit:
-        score = max(score, explicit)
-    if not has_field and not explicit:
-        return 0.0
-    return round(min(18.0, score), 3)
+    array = ma.get("fib_ma_array")
+    if isinstance(array, list):
+        for item in array:
+            if not isinstance(item, dict):
+                continue
+            if _truthy_bool(item.get("pullback_acceptance")):
+                score += _float(item.get("acceptance_score")) or weights.get(int(_float(item.get("period"))), 0.0)
+        return round(min(18.0, score), 3)
+    return 0.0
 
 
 def _ma_alignment_score(
@@ -3403,7 +3397,7 @@ def _entry_components(row: dict[str, Any], top_buy: dict[str, Any]) -> dict[str,
         "breakout_momentum": _new_high_breakout_score(row, buy_reasons),
         "relative_resilience": _refusal_pullback_score(row, buy_reasons),
         "ma_alignment": _ma_alignment_score(row, buy_reasons, include_row_level=False),
-        "fib_ma_support": _fib_ma_support_score(row, buy_reasons, include_row_level=False),
+        "fib_ma_acceptance": _fib_ma_support_score(row, buy_reasons, include_row_level=False),
         "upper_timeframe_quality": upper_score,
         "trigger_30m": trigger_30m,
         "right_side_confirmation": right_side,
@@ -3433,7 +3427,8 @@ def _rank_reason(score_components: dict[str, float]) -> str:
         "breakout_momentum": "新高动量",
         "relative_resilience": "拒绝回调",
         "ma_alignment": "均线确认",
-        "fib_ma_support": "Fibonacci均线",
+        "fib_ma_acceptance": "斐波那切均线承接",
+        "fib_ma_support": "斐波那切均线承接",
         "upper_timeframe_quality": "周/日线",
         "trigger_30m": "30m触发",
         "right_side_confirmation": "5m/15m确认",
@@ -3467,8 +3462,8 @@ def _rank_reason(score_components: dict[str, float]) -> str:
         selected.append(("market_alignment", score_components["market_alignment"]))
     if _float(score_components.get("relative_resilience")) and not any(key == "relative_resilience" for key, _ in selected):
         selected.append(("relative_resilience", score_components["relative_resilience"]))
-    if _float(score_components.get("fib_ma_support")) and not any(key == "fib_ma_support" for key, _ in selected):
-        selected.append(("fib_ma_support", score_components["fib_ma_support"]))
+    if _float(score_components.get("fib_ma_acceptance")) and not any(key == "fib_ma_acceptance" for key, _ in selected):
+        selected.append(("fib_ma_acceptance", score_components["fib_ma_acceptance"]))
     parts = []
     for key, value in selected:
         numeric = _float(value)
@@ -3502,7 +3497,7 @@ def _watch_components(row: dict[str, Any], gate_status: str) -> dict[str, float]
         "breakout_momentum": _new_high_breakout_score(row, buy_reasons),
         "relative_resilience": _refusal_pullback_score(row, buy_reasons),
         "ma_alignment": _ma_alignment_score(row, buy_reasons, include_row_level=False),
-        "fib_ma_support": _fib_ma_support_score(row, buy_reasons, include_row_level=False),
+        "fib_ma_acceptance": _fib_ma_support_score(row, buy_reasons, include_row_level=False),
         "hot_sector": hot_sector,
     }
     return {key: round(value, 3) for key, value in components.items()}
@@ -4433,6 +4428,7 @@ def _slim_ma_alignment_for_pool(value: Any) -> dict[str, Any]:
         return {}
     keys = (
         "latest_close",
+        "latest_low",
         "ma5",
         "ma8",
         "ma10",
@@ -4442,6 +4438,15 @@ def _slim_ma_alignment_for_pool(value: Any) -> dict[str, Any]:
         "ma34",
         "ma55",
         "ma89",
+        "previous_ma5",
+        "previous_ma8",
+        "previous_ma10",
+        "previous_ma13",
+        "previous_ma20",
+        "previous_ma21",
+        "previous_ma34",
+        "previous_ma55",
+        "previous_ma89",
         "above_ma5",
         "above_ma8",
         "above_ma10",
@@ -4478,12 +4483,28 @@ def _slim_ma_alignment_for_pool(value: Any) -> dict[str, Any]:
         "distance_ma34_pct",
         "distance_ma55_pct",
         "distance_ma89_pct",
+        "low_distance_ma5_pct",
+        "low_distance_ma8_pct",
+        "low_distance_ma10_pct",
+        "low_distance_ma13_pct",
+        "low_distance_ma20_pct",
+        "low_distance_ma21_pct",
+        "low_distance_ma34_pct",
+        "low_distance_ma55_pct",
+        "low_distance_ma89_pct",
         "ma_stack",
         "ma20_direction",
         "above_count",
         "reclaim_count",
         "fib_above_count",
         "fib_reclaim_count",
+        "fib_touch_count",
+        "fib_accept_count",
+        "fib_accept_periods",
+        "fib_touch_periods",
+        "fib_ma_array",
+        "fib_array_summary",
+        "fib_ma_array_state",
         "fib_support_score",
         "score",
         "summary",
@@ -4783,7 +4804,7 @@ def _split_pool_rows(
             _float((item.get("score_components") or {}).get("indicator_breadth")),
             _float((item.get("score_components") or {}).get("buy_point_quality")),
             _float((item.get("score_components") or {}).get("ma_alignment")),
-            _float((item.get("score_components") or {}).get("fib_ma_support")),
+            _float((item.get("score_components") or {}).get("fib_ma_acceptance")),
             _float((item.get("score_components") or {}).get("hot_sector")),
             _float(item.get("score")),
         ),
@@ -5068,7 +5089,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "ranking_version": POOL_RANKING_VERSION,
         "source": "whitebox_pool_builder",
         "source_policy": "postmarket_strict_with_fallback_watch" if strict_sources and fallback_enabled else ("postmarket_strict_technical_knowledge_chain" if strict_sources else "runtime_watch_and_signal_blend"),
-        "selection_policy": "strict_fresh_30m_daily_weekly_anchor__multi_indicator_resonance__ma_fib_support__clue_source_only",
+        "selection_policy": "strict_fresh_30m_daily_weekly_anchor__multi_indicator_resonance__fib_ma_array_acceptance__clue_source_only",
     }
     db["terminal_stock_pool"].update_one(
         {"pool": "terminal_stock_pool", "market": "A"},

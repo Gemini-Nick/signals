@@ -14,12 +14,14 @@ from signals.sync.modules.technical_signal_scan import (
     _doc_to_rawbar,
     _entry_factor_docs,
     _entry_factor_score,
+    _append_quote_snapshot_daily_bar,
     _load_bars,
     _ma_alignment_from_daily_bars,
     _refusal_pullback_factor,
     _resampled_5m_docs,
     _resonance_context,
     _symbols_for_scope,
+    _use_intraday_daily_acceptance,
 )
 from signals.core.entry_factors import detect_200d_new_high_entries
 
@@ -227,11 +229,41 @@ def test_ma_alignment_marks_reclaim_and_above_key_daily_averages():
     assert alignment["above_ma21"] is True
     assert alignment["reclaim_ma20"] is True
     assert alignment["above_count"] == 3
-    assert alignment["fib_above_count"] >= 1
-    assert alignment["fib_support_score"] > 0
+    assert alignment["fib_ma_array"]
     assert alignment["score"] > 0
     assert "站上20日线" in alignment["tags"]
-    assert "Fibonacci均线支撑" in alignment["tags"]
+
+
+def test_ma_alignment_marks_fibonacci_ma_pullback_acceptance_array():
+    bars = []
+    dates = pd.date_range("2026-04-01", periods=14, freq="B")
+    for dt in dates[:-1]:
+        bars.append(_OhlcvBar(
+            dt=dt.to_pydatetime(),
+            open=10.0,
+            high=10.2,
+            low=9.8,
+            close=10.0,
+            vol=1000,
+        ))
+    bars.append(_OhlcvBar(
+        dt=dates[-1].to_pydatetime(),
+        open=10.1,
+        high=10.6,
+        low=9.95,
+        close=10.5,
+        vol=1200,
+    ))
+
+    alignment = _ma_alignment_from_daily_bars(bars)
+    ma13 = next(item for item in alignment["fib_ma_array"] if item["period"] == 13)
+
+    assert ma13["pullback_touch"] is True
+    assert ma13["pullback_acceptance"] is True
+    assert 13 in alignment["fib_accept_periods"]
+    assert alignment["fib_accept_count"] >= 1
+    assert alignment["fib_support_score"] > 0
+    assert "斐波那切均线回踩承接" in alignment["tags"]
 
 
 def test_doc_to_rawbar_preserves_market_naive_datetime():
@@ -287,6 +319,45 @@ def test_load_bars_prefers_canonical_freq_on_duplicate_dt():
     assert len(bars) == 1
     assert bars[0].close == 4
     assert bars[0].vol == 200
+
+
+def test_intraday_daily_acceptance_uses_quote_only_inside_a_share_session():
+    assert _use_intraday_daily_acceptance(INTRADAY_SCAN_SCOPE, "A", datetime(2026, 5, 12, 14, 30)) is True
+    assert _use_intraday_daily_acceptance(INTRADAY_SCAN_SCOPE, "A", datetime(2026, 5, 12, 15, 1)) is False
+    assert _use_intraday_daily_acceptance(POSTMARKET_SCAN_SCOPE, "A", datetime(2026, 5, 12, 14, 30)) is False
+
+
+def test_quote_snapshot_daily_bar_is_intraday_only_overlay():
+    daily = [_OhlcvBar(
+        dt=datetime(2026, 5, 11),
+        open=58.2,
+        high=60.43,
+        low=57.61,
+        close=59.56,
+        vol=127793600,
+    )]
+    db = _Db({
+        "quote_snapshots": _Collection(doc={
+            "dt": "2026-05-12",
+            "symbol": "SZ.002709",
+            "code": "002709",
+            "open": 59.24,
+            "high": 59.8,
+            "low": 56.05,
+            "close": 58.58,
+            "vol": 137992900,
+            "amount": 7943891489,
+        }),
+    })
+
+    assert _append_quote_snapshot_daily_bar(db, "002709", daily, Freq.D, enabled=False) == daily
+
+    with_overlay = _append_quote_snapshot_daily_bar(db, "002709", daily, Freq.D, enabled=True)
+
+    assert len(with_overlay) == 2
+    assert with_overlay[-1].dt.to_pydatetime() == datetime(2026, 5, 12)
+    assert with_overlay[-1].low == 56.05
+    assert with_overlay[-1].close == 58.58
 
 
 class _Bars:

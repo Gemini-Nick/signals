@@ -420,7 +420,7 @@ def test_chart_adds_volume_expansion_signal(monkeypatch):
     )
     chart = workbench._chart_from_df(df, symbol="SZ.002709", freq="30min", source="test_bars")
     monkeypatch.setattr(workbench, "_load_signal_pool_rows", lambda limit=200, symbol=None: [])
-    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [])
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300, kind="stock": [])
 
     merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002709", "30min")
 
@@ -449,7 +449,7 @@ def test_chart_adds_extreme_volume_contraction_signal(monkeypatch):
     )
     chart = workbench._chart_from_df(df, symbol="SZ.002709", freq="30min", source="test_bars")
     monkeypatch.setattr(workbench, "_load_signal_pool_rows", lambda limit=200, symbol=None: [])
-    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [])
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300, kind="stock": [])
 
     merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002709", "30min")
 
@@ -487,7 +487,7 @@ def test_weekly_chart_aligns_custom_signal_to_containing_week(monkeypatch):
             "source": "sqlite.backtest.signal_records",
         }
     ])
-    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [])
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300, kind="stock": [])
 
     merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002759", "weekly")
 
@@ -527,7 +527,7 @@ def test_intraday_chart_includes_higher_timeframe_custom_context(monkeypatch):
             "source": "sqlite.backtest.signal_records",
         },
     ])
-    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [])
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300, kind="stock": [])
 
     merged = workbench._merge_signal_pool_into_chart(chart, "SZ.002759", "30min")
     by_type = {item["type"]: item for item in merged["signals"]}
@@ -543,8 +543,32 @@ def test_intraday_chart_merges_terminal_technical_signals(monkeypatch):
 
     df = _intraday_bars()
     chart = workbench._chart_from_df(df, symbol="SZ.002759", freq="30min", source="test_bars")
+    ma_alignment = {
+        "latest_close": 58.59,
+        "latest_low": 56.05,
+        "ma13": 56.787,
+        "previous_ma13": 56.076,
+        "fib_accept_periods": [13],
+        "fib_touch_periods": [13],
+        "fib_array_summary": "MA13回踩承接",
+        "fib_ma_array_state": "bullish",
+        "fib_ma_array": [
+            {
+                "period": 13,
+                "name": "MA13",
+                "value": 56.787,
+                "previous_value": 56.076,
+                "pullback_touch": True,
+                "pullback_acceptance": True,
+                "distance_pct": 3.176,
+                "low_distance_pct": -1.297,
+                "touch_distance_pct": -0.046,
+                "acceptance_score": 2.5,
+            }
+        ],
+    }
     monkeypatch.setattr(workbench, "_load_signal_pool_rows", lambda limit=200, symbol=None: [])
-    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300, kind="stock": [
         {
             "symbol": "SZ.002759",
             "dt": "2026-03-15 10:30",
@@ -553,7 +577,8 @@ def test_intraday_chart_merges_terminal_technical_signals(monkeypatch):
             "freq": "30分钟",
             "confidence": 0.8,
             "price": 10.7,
-            "technical_evidence": {"details": "30m detector"},
+            "technical_evidence": {"details": "30m detector", "ma_alignment": ma_alignment},
+            "ma_alignment": ma_alignment,
         }
     ])
 
@@ -562,6 +587,107 @@ def test_intraday_chart_merges_terminal_technical_signals(monkeypatch):
     assert merged["signals"][-1]["type"] == "MACD绿柱缩小_零下"
     assert merged["signals"][-1]["source"] == "terminal_technical_signals"
     assert merged["signals"][-1]["display_scope"] == "current_timeframe"
+    assert merged["signals"][-1]["ma_acceptance"]["summary"] == "MA13回踩承接"
+    assert merged["signals"][-1]["ma_acceptance"]["primary"]["touch_distance_pct"] == -0.046
+    assert "MA13回踩承接" in merged["signals"][-1]["details"]
+
+
+def test_slim_signal_reason_preserves_fib_ma_acceptance():
+    from signals.web.api import workbench
+
+    reason = {
+        "signal_type": "一买",
+        "freq": "15分钟",
+        "ma_alignment": {
+            "latest_close": 58.59,
+            "latest_low": 56.05,
+            "ma13": 56.787,
+            "previous_ma13": 56.076,
+            "above_ma13": True,
+            "distance_ma13_pct": 3.176,
+            "low_distance_ma13_pct": -1.297,
+            "fib_accept_periods": [13],
+            "fib_array_summary": "MA13回踩承接",
+            "fib_ma_array": [
+                {
+                    "period": 13,
+                    "name": "MA13",
+                    "value": 56.787,
+                    "previous_value": 56.076,
+                    "pullback_touch": True,
+                    "pullback_acceptance": True,
+                    "distance_pct": 3.176,
+                    "low_distance_pct": -1.297,
+                    "touch_distance_pct": -0.046,
+                }
+            ],
+        },
+    }
+
+    slim = workbench._slim_shell_signal_reason(reason)
+
+    assert slim["ma_alignment"]["fib_accept_periods"] == [13]
+    assert slim["ma_alignment"]["fib_array_summary"] == "MA13回踩承接"
+    assert slim["ma_acceptance"]["summary"] == "MA13回踩承接"
+    assert slim["ma_acceptance"]["primary"]["name"] == "MA13"
+    assert slim["ma_acceptance"]["primary"]["touch_distance_pct"] == -0.046
+
+
+def test_slim_stock_row_exposes_ma_acceptance_badge():
+    from signals.web.api import workbench
+
+    row = {
+        "symbol": "SZ.002709",
+        "name": "天赐材料",
+        "pool_type": "focus",
+        "entry_gate_status": "entry_attack_confirmed",
+        "trade_stage": "attack_entry",
+        "ma_alignment": {
+            "fib_accept_periods": [13],
+            "fib_array_summary": "MA13回踩承接",
+            "fib_ma_array": [
+                {
+                    "period": 13,
+                    "name": "MA13",
+                    "value": 56.787,
+                    "pullback_touch": True,
+                    "pullback_acceptance": True,
+                    "touch_distance_pct": -0.046,
+                }
+            ],
+        },
+    }
+
+    slim = workbench._slim_shell_stock_row(row)
+
+    assert slim["ma_acceptance"]["summary"] == "MA13回踩承接"
+    assert any(item["label"] == "MA13承接" for item in slim["display_badges"])
+
+
+def test_index_report_chart_signals_add_multi_timeframe_context():
+    from signals.web.api import workbench
+
+    chart = workbench._chart_from_df(_intraday_bars(), symbol="sz399006", freq="30min", source="index_bars")
+    signals = workbench._index_report_chart_signals(
+        {
+            "symbol": "sz399006",
+            "daily_latest_signal": "无",
+            "f30_latest_signal": "二买",
+            "f15_latest_signal": "一卖",
+            "f30_trend": "上涨趋势",
+            "f15_trend": "回落",
+        },
+        chart,
+        "30min",
+    )
+    by_freq = {item["freq"]: item for item in signals}
+
+    assert by_freq["30min"]["type"] == "二买"
+    assert by_freq["30min"]["display_scope"] == "current_timeframe"
+    assert by_freq["30min"]["signal_side"] == "buy"
+    assert by_freq["15min"]["type"] == "一卖"
+    assert by_freq["15min"]["display_scope"] == "lower_timeframe_context"
+    assert by_freq["15min"]["signal_side"] == "sell"
 
 
 def test_terminal_technical_rows_use_latest_as_of(monkeypatch):
@@ -1007,7 +1133,7 @@ def test_manual_clue_rows_reuse_stock_pool_decision_fields(monkeypatch):
     monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"terminal_manual_clues": _ManualClues()}))
     monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (_bars_current(), "test_bars"))
     monkeypatch.setattr(workbench, "_stock_chain_position_summary", lambda symbol: {})
-    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300: [
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=300, kind="stock": [
         {
             "symbol": "SZ.002354",
             "dt": "2026-04-29 15:00",
@@ -1081,6 +1207,18 @@ def test_manual_clue_preheat_requests_full_execution_bundle():
 
     assert workbench._manual_clue_preheat_freqs("30min") == ["30min", "daily", "15min", "5min"]
     assert workbench._manual_clue_preheat_freqs("daily") == ["daily", "30min", "15min", "5min"]
+
+
+def test_manual_clue_remains_when_symbol_already_in_system_focus():
+    from signals.web.api import workbench
+
+    manual_clues = [{"symbol": "SZ.002759", "source_collection": "terminal_manual_clues"}]
+
+    assert workbench._remaining_manual_clues_after_attack_focus(manual_clues, []) == manual_clues
+    assert workbench._remaining_manual_clues_after_attack_focus(
+        manual_clues,
+        [{"symbol": "SZ.002759", "manual_attack_focus": True}],
+    ) == []
 
 
 def test_manual_clue_delete_requires_confirmation():
@@ -1751,6 +1889,45 @@ def test_index_intraday_day_change_uses_previous_daily_close(monkeypatch):
     assert row["daily_change_pct"] == 10.0
     assert row["today_change_pct"] == 10.0
     assert row["day_change_source"] == "index_bars:5min"
+
+
+def test_index_row_exposes_timeframe_signal_badges(monkeypatch):
+    from signals.web.api import workbench
+
+    daily = pd.DataFrame(
+        {"open": [1000.0, 1080.0], "close": [1000.0, 1100.0]},
+        index=pd.to_datetime(["2026-04-29", "2026-04-30"]),
+    )
+    monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (daily, "index_daily"))
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-04-30")
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {"quote_status": "missing", "quote_status_label": "无行情"})
+
+    row = workbench._enrich_index_row(
+        {
+            "symbol": "sz399006",
+            "name": "创业板指",
+            "daily_latest_signal": "无",
+            "f30_latest_signal": "二买",
+            "f15_latest_signal": "无",
+        },
+        [],
+    )
+
+    assert row["latest_signal"] == "二买"
+    assert row["buy_timeframes"] == [
+        {
+            "freq": "30min",
+            "badge": "30m",
+            "side": "buy",
+            "signal_type": "二买",
+            "score": 0,
+            "confidence": None,
+            "signal_date": "",
+            "price": None,
+        }
+    ]
+    assert row["sell_timeframes"] == []
 
 
 def test_scored_stock_rows_refresh_even_when_stale_price_present(monkeypatch):
@@ -2465,7 +2642,7 @@ def test_related_custom_signals_round_robin_symbols(monkeypatch):
             {"signal_type": "信号C0", "freq": "30min", "signal_date": "2026-05-07T10:20:00"}
         ],
     }
-    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=80: rows_by_symbol.get(symbol, []))
+    monkeypatch.setattr(workbench, "_load_terminal_technical_signal_rows", lambda symbol, limit=80, kind="stock": rows_by_symbol.get(symbol, []))
     monkeypatch.setattr(workbench, "_custom_signal_rows", lambda symbol, limit=200: [])
 
     related = workbench._related_custom_signals_from_candidates([
@@ -2976,6 +3153,8 @@ def test_static_index_minute_request_does_not_fallback_to_daily(monkeypatch):
 
     monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (pd.DataFrame(), "index_bars"))
     monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "miss"}})
+    monkeypatch.setattr(workbench, "_cached_static_index_signal_context", lambda name, symbol: {})
+    monkeypatch.setattr(workbench, "_merge_signal_pool_into_chart", lambda chart, symbol, freq, kind="stock": chart)
 
     payload = asyncio.run(workbench._build_static_index_target("上证指数", "sh000001", "30min"))
 
@@ -2989,12 +3168,24 @@ def test_static_index_minute_request_does_not_fallback_to_daily(monkeypatch):
 def test_static_index_targets_do_not_use_recent_stock_candidate_fallback(monkeypatch):
     from signals.web.api import workbench
 
-    monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (_intraday_bars(), "index_bars"))
+    chart_stub = {
+        "symbol": "sz399006",
+        "freq": "30分钟",
+        "meta": {"freq": "30min", "source": "index_bars", "market": "A"},
+        "ohlcv": [{"time": 1778569200, "open": 3900, "high": 3950, "low": 3880, "close": 3934.88, "volume": 1000}],
+        "signals": [],
+        "ma_lines": [],
+    }
+    monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (pd.DataFrame(), "index_bars"))
+    monkeypatch.setattr(workbench, "_chart_from_df", lambda *args, **kwargs: dict(chart_stub))
+    monkeypatch.setattr(workbench, "_mark_chart_readiness", lambda chart, **kwargs: chart)
     monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "hit"}})
     monkeypatch.setattr(workbench, "_ensure_engine", lambda: (_ for _ in ()).throw(RuntimeError("engine unavailable")))
     monkeypatch.setattr(workbench, "_recent_custom_signal_candidates", lambda limit=10: [
         {"symbol": "SH.601958", "name": "金钼股份", "relation": "最近自定义信号"}
     ])
+    monkeypatch.setattr(workbench, "_cached_static_index_signal_context", lambda name, symbol: {})
+    monkeypatch.setattr(workbench, "_merge_signal_pool_into_chart", lambda chart, symbol, freq, kind="stock": chart)
 
     payloads = [
         asyncio.run(workbench._build_static_index_target("上证指数", "sh000001", "30min")),
@@ -3007,6 +3198,73 @@ def test_static_index_targets_do_not_use_recent_stock_candidate_fallback(monkeyp
         assert payload["candidate_stocks"] == []
         assert payload["related_custom_signals"] == []
         assert "金钼股份" not in str(payload)
+
+
+def test_static_index_target_uses_cached_timeframe_signal_for_summary_and_chart(monkeypatch):
+    from signals.web.api import workbench
+
+    chart_stub = {
+        "symbol": "sz399006",
+        "freq": "30分钟",
+        "meta": {"freq": "30min", "source": "index_bars", "market": "A"},
+        "ohlcv": [{"time": 1778569200, "open": 3900, "high": 3950, "low": 3880, "close": 3934.88, "volume": 1000}],
+        "signals": [],
+        "ma_lines": [],
+    }
+    monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (pd.DataFrame(), "index_bars"))
+    monkeypatch.setattr(workbench, "_chart_from_df", lambda *args, **kwargs: dict(chart_stub))
+    monkeypatch.setattr(workbench, "_mark_chart_readiness", lambda chart, **kwargs: chart)
+    monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "hit"}})
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_shortest_realtime_day_change", lambda kind, symbol: {})
+    monkeypatch.setattr(workbench, "_apply_quote_overlay", lambda summary, symbol: summary)
+    monkeypatch.setattr(workbench, "_ensure_engine", lambda: (_ for _ in ()).throw(RuntimeError("engine unavailable")))
+    monkeypatch.setattr(workbench, "_cached_static_index_signal_context", lambda name, symbol: {
+        "name": name,
+        "symbol": symbol,
+        "daily_latest_signal": "无",
+        "f30_latest_signal": "二买",
+        "f15_latest_signal": "一卖",
+        "f30_trend": "上涨趋势",
+        "f15_trend": "回落",
+    })
+    monkeypatch.setattr(workbench, "_merge_signal_pool_into_chart", lambda chart, symbol, freq, kind="stock": chart)
+
+    payload = asyncio.run(workbench._build_static_index_target("创业板指", "sz399006", "30min"))
+    by_freq = {item["freq"]: item for item in payload["chart"]["signals"]}
+
+    assert payload["summary"]["latest_signal"] == "二买/一卖"
+    assert by_freq["30min"]["type"] == "二买"
+    assert by_freq["30min"]["display_scope"] == "current_timeframe"
+    assert by_freq["15min"]["type"] == "一卖"
+    assert by_freq["15min"]["display_scope"] == "lower_timeframe_context"
+
+
+def test_index_summary_uses_intraday_signal_when_daily_is_empty(monkeypatch):
+    from signals.web.api import workbench
+
+    class Engine:
+        def get_market_context(self):
+            return None
+
+    monkeypatch.setattr(workbench, "get_engine", lambda: Engine())
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_shortest_realtime_day_change", lambda kind, symbol: {})
+    monkeypatch.setattr(workbench, "_apply_quote_overlay", lambda summary, symbol: summary)
+
+    summary = workbench._summary_from_index(
+        {
+            "name": "创业板指",
+            "symbol": "sz399006",
+            "latest_price": 3934.88,
+            "daily_latest_signal": "无",
+            "f30_latest_signal": "二买",
+            "f15_latest_signal": "无",
+        },
+        {"report": {}},
+    )
+
+    assert summary["latest_signal"] == "二买"
 
 
 def test_engine_index_target_does_not_use_global_scored_stock_candidates(monkeypatch):
@@ -3036,6 +3294,7 @@ def test_engine_index_target_does_not_use_global_scored_stock_candidates(monkeyp
     monkeypatch.setattr(workbench, "_target_diagnostics", lambda *args, **kwargs: {"cache_probe": {"status": "hit"}})
     monkeypatch.setattr(workbench, "_plan_for_index", lambda *args, **kwargs: None)
     monkeypatch.setattr(workbench, "_summary_from_index", lambda report, chart: {"title": report["name"]})
+    monkeypatch.setattr(workbench, "_merge_signal_pool_into_chart", lambda chart, symbol, freq, kind="stock": chart)
 
     payload = asyncio.run(workbench._build_index_target(Engine(), "上证指数", "30min"))
 
@@ -3051,6 +3310,7 @@ def test_us_index_minute_request_is_explicitly_unsupported(monkeypatch):
     monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (pd.DataFrame(), "index_bars"))
     monkeypatch.setattr(workbench, "_ensure_engine", lambda: (_ for _ in ()).throw(RuntimeError("engine unavailable")))
     monkeypatch.setattr(workbench, "_recent_custom_signal_candidates", lambda limit=10: [])
+    monkeypatch.setattr(workbench, "_merge_signal_pool_into_chart", lambda chart, symbol, freq, kind="stock": chart)
 
     payload = asyncio.run(workbench._build_static_index_target("标普500", "US.SPY", "30min"))
 
