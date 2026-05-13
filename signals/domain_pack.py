@@ -658,11 +658,27 @@ class SignalsPack:
         ]
         return filtered or rows
 
+    def _cache_daily_coverage_date(self, db, trade_date: str) -> str:
+        fallback = str(trade_date or "")[:10]
+        latest = self._find_one(db, "bars", {"meta.freq": "日线"}, {"dt": 1}, sort=[("dt", -1)]) or {}
+        latest_dt = self._coerce_datetime(latest.get("dt"))
+        if latest_dt:
+            return latest_dt.date().isoformat()
+        run = self._find_one(
+            db,
+            "sync_runs",
+            {"run_id": {"$regex": "^postmarket:"}},
+            {"trade_date": 1, "started_at": 1, "updated_at": 1},
+            sort=[("started_at", -1), ("updated_at", -1)],
+        ) or {}
+        return str(run.get("trade_date") or fallback)[:10]
+
     def _cache_mongo_stock_cache(self, db, trade_date: str) -> Dict[str, Any]:
         freqs = ["日线", "周线", "5分钟", "15分钟", "30分钟", "60分钟"]
         rows: List[Dict[str, Any]] = []
         stock_daily_progress = self._find_one(db, "sync_log", {"_id": "stock_daily:progress:_meta"}) or {}
-        daily_snapshot_coverage = self._cache_daily_snapshot_coverage(db, trade_date)
+        daily_coverage_date = self._cache_daily_coverage_date(db, trade_date)
+        daily_snapshot_coverage = self._cache_daily_snapshot_coverage(db, daily_coverage_date)
         stock_minute_doc = (
             self._find_one(db, "sync_log", {"_id": "stock_minute:selection:_meta"})
             or self._find_one(db, "sync_log", {"_id": "stock_minute:_meta"})
@@ -713,6 +729,7 @@ class SignalsPack:
                 "latest_dt": self._iso(latest.get("dt") if latest else None),
                 "latest_symbol": latest_symbol,
                 "source": source,
+                "coverage_date": daily_coverage_date if freq == "日线" else trade_date,
             })
 
         daily = next((item for item in rows if item.get("freq") == "日线"), {})
@@ -721,6 +738,7 @@ class SignalsPack:
             "summary": {
                 "daily_symbols": daily.get("symbols", 0),
                 "daily_today_symbols": daily.get("today_symbols", 0),
+                "daily_coverage_date": daily_coverage_date,
                 "latest_daily_dt": daily.get("latest_dt") or self._iso((daily_latest or {}).get("dt") if daily_latest else None),
                 "minute_universe_total": minute_universe.get("total", 0),
                 "minute_universe_cached": minute_universe.get("cached", 0),

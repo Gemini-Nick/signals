@@ -150,6 +150,42 @@ def test_cache_trade_date_prefers_current_market_day(monkeypatch):
     assert SignalsPack()._cache_trade_date(db) == "2026-04-30"
 
 
+def test_mongo_stock_cache_uses_latest_daily_bar_date_for_daily_coverage(monkeypatch):
+    from signals.domain_pack import SignalsPack
+
+    pack = SignalsPack()
+    requested_dates = []
+
+    def fake_find_one(db, collection, query, projection=None, sort=None):
+        if collection == "sync_log" and query.get("_id") == "stock_daily:progress:_meta":
+            return {"total": 5515, "processed": 5515, "inserted": 5490, "progress_pct": 100.0}
+        if collection == "bars" and query.get("meta.freq") == "日线":
+            return {"dt": datetime(2026, 5, 12), "meta": {"symbol": "920957"}}
+        return None
+
+    def fake_daily_snapshot_coverage(db, trade_date):
+        requested_dates.append(trade_date)
+        return {
+            "valid_universe": 5490,
+            "cached_today": 5490,
+            "invalid_rows": 358,
+            "source": "fullmarket_spot_snapshots.valid_universe + bars.daily",
+        }
+
+    monkeypatch.setattr(pack, "_find_one", fake_find_one)
+    monkeypatch.setattr(pack, "_cache_daily_snapshot_coverage", fake_daily_snapshot_coverage)
+    monkeypatch.setattr(pack, "_cache_minute_universe", lambda db, trade_date: {})
+
+    result = pack._cache_mongo_stock_cache(_Db(), "2026-05-13")
+
+    assert requested_dates == ["2026-05-12"]
+    assert result["summary"]["daily_coverage_date"] == "2026-05-12"
+    assert result["summary"]["daily_symbols"] == 5490
+    assert result["summary"]["daily_today_symbols"] == 5490
+    assert result["summary"]["daily_missing_symbols"] == 0
+    assert result["freqs"][0]["coverage_date"] == "2026-05-12"
+
+
 def test_live_low_latency_strict_status_and_stock_selection_merge(monkeypatch):
     from signals import domain_pack
     from signals.domain_pack import SignalsPack

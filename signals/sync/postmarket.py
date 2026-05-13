@@ -160,7 +160,7 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     PostmarketTaskSpec(
         "postmarket_chain_rebuild",
         "chain_context",
-        depends_on=("fullmarket_spot_snapshot:all", *_STOCK_DAILY_DEPS, "board_ranking:all", *_BOARD_CONS_DEPS, "chain_heat_snapshots:all", "security_business_facts:all"),
+        depends_on=("fullmarket_spot_snapshot:all", *_STOCK_DAILY_DEPS, "board_ranking:all", *_BOARD_CONS_DEPS, "chain_heat_snapshots:all"),
     ),
     PostmarketTaskSpec(
         "stock_minute",
@@ -410,6 +410,15 @@ def _result_number(task_doc: dict[str, Any], key: str, default: float = 0.0) -> 
         return default
 
 
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _stock_daily_dependency_ok(task_doc: dict[str, Any]) -> bool:
     status = str(task_doc.get("status") or "pending")
     summary, nested = _result_sources(task_doc)
@@ -584,6 +593,89 @@ class PostmarketRunner:
                     "updated_at": now,
                 }},
             )
+
+    def _stock_daily_aggregate_summary(self) -> dict[str, Any]:
+        try:
+            progress = self.db["sync_log"].find_one({"_id": "stock_daily:progress:_meta"}) or {}
+        except Exception:
+            progress = {}
+        if not isinstance(progress, dict) or not progress:
+            return {}
+
+        total = _number(progress.get("total") or progress.get("expected_codes") or progress.get("global_total"))
+        processed = _number(progress.get("processed"))
+        inserted = _number(progress.get("inserted") or progress.get("covered_codes") or processed)
+        progress_pct = _number(progress.get("progress_pct"))
+        if progress_pct <= 0 and total > 0:
+            progress_pct = processed / total * 100.0
+        coverage_pct = _number(progress.get("coverage_pct"))
+        if coverage_pct <= 0 and total > 0:
+            coverage_pct = inserted / total * 100.0
+        errors = _number(progress.get("errors"))
+        missing = _number(progress.get("missing_symbols"))
+        deferred_symbols = _number(progress.get("deferred_symbols"))
+        deferred = _number(progress.get("deferred") or deferred_symbols)
+
+        min_coverage = _env_float("SIGNALS_POSTMARKET_STOCK_DAILY_PARTIAL_MIN_COVERAGE", 40.0)
+        max_errors = _env_int("SIGNALS_POSTMARKET_STOCK_DAILY_PARTIAL_MAX_ERRORS", 25, minimum=0)
+        max_error_pct = _env_float("SIGNALS_POSTMARKET_STOCK_DAILY_PARTIAL_MAX_ERROR_PCT", 6.0)
+        processed_all = bool(total > 0 and processed >= total)
+        progress_done = bool(progress_pct >= 99.9)
+        error_pct = (errors / total * 100.0) if total > 0 else 0.0
+        sparse_errors_ok = bool(errors <= max_errors and error_pct <= max_error_pct)
+        if not ((processed_all or progress_done) and sparse_errors_ok and coverage_pct >= min_coverage):
+            return {}
+        if missing > 0 or deferred > 0 or deferred_symbols > 0:
+            return {}
+
+        return {
+            "status": str(progress.get("status") or ("partial" if errors else "ok")),
+            "processed": int(processed),
+            "total": int(total),
+            "inserted": int(inserted),
+            "errors": int(errors),
+            "deferred": int(deferred),
+            "missing_symbols": int(missing),
+            "deferred_symbols": int(deferred_symbols),
+            "progress_pct": round(progress_pct, 2),
+            "coverage_pct": round(coverage_pct, 2),
+            "source": "sync_log:stock_daily:progress:_meta",
+        }
+
+    def _repair_effective_stock_daily_tasks(self, run_id: str) -> int:
+        aggregate_summary = self._stock_daily_aggregate_summary()
+        if not aggregate_summary:
+            return 0
+        repaired = 0
+        now = _naive_bj()
+        for doc in self.db["sync_tasks"].find(
+            {"run_id": run_id, "module": "stock_daily"},
+            {"_id": 1, "status": 1, "result_summary": 1},
+        ):
+            task_id = str(doc.get("_id") or "")
+            if not task_id:
+                continue
+            status = str(doc.get("status") or "pending")
+            if status == "ok" or status not in RETRYABLE_TASK_STATUSES:
+                continue
+            current = dict(doc.get("result_summary") or {})
+            if current and _stock_daily_dependency_ok(dict(doc)):
+                continue
+            merged = {**current, **aggregate_summary}
+            self.db["sync_tasks"].update_one(
+                {"_id": task_id},
+                {"$set": {
+                    "result_summary": merged,
+                    "cursor": {
+                        "processed": merged["processed"],
+                        "total": merged["total"],
+                        "progress_pct": merged["progress_pct"],
+                    },
+                    "updated_at": now,
+                }},
+            )
+            repaired += 1
+        return repaired
 
     def _heartbeat(self, run_id: str, phase: str = "") -> None:
         now = _naive_bj()
@@ -841,6 +933,9 @@ class PostmarketRunner:
 
         self._init_run(run_id, trade_date)
         self._init_tasks(run_id, trade_date)
+        repaired = self._repair_effective_stock_daily_tasks(run_id)
+        if repaired:
+            logger.info("postmarket repaired effective stock_daily task summaries: run=%s repaired=%d", run_id, repaired)
         released = self._release_stale_running_tasks(run_id)
         if released:
             logger.warning("postmarket released stale tasks: run=%s released=%d", run_id, released)
