@@ -54,6 +54,31 @@ def _intraday_bars():
     )
 
 
+def _fib_acceptance_bars():
+    dates = pd.date_range("2026-04-01", periods=14, freq="B")
+    rows = []
+    for dt in dates[:-1]:
+        rows.append({
+            "dt": dt,
+            "open": 10.0,
+            "high": 10.2,
+            "low": 9.8,
+            "close": 10.0,
+            "vol": 1000,
+            "amount": 10000,
+        })
+    rows.append({
+        "dt": dates[-1],
+        "open": 10.1,
+        "high": 10.6,
+        "low": 9.95,
+        "close": 10.5,
+        "vol": 1200,
+        "amount": 12000,
+    })
+    return pd.DataFrame(rows).set_index("dt")
+
+
 def test_watchlist_range_columns_include_all_key_presets():
     from signals.web.api import workbench
 
@@ -688,6 +713,25 @@ def test_index_report_chart_signals_add_multi_timeframe_context():
     assert by_freq["15min"]["type"] == "一卖"
     assert by_freq["15min"]["display_scope"] == "lower_timeframe_context"
     assert by_freq["15min"]["signal_side"] == "sell"
+
+
+def test_index_row_exposes_fibonacci_ma_acceptance(monkeypatch):
+    from signals.web.api import workbench
+
+    df = _fib_acceptance_bars()
+    monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (df, "index_bars"))
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
+    monkeypatch.setattr(workbench, "_daily_close_day_change_pct", lambda frame: (1.23, "test_daily", "2026-04-20"))
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode: "2026-04-20")
+    monkeypatch.setattr(workbench, "_apply_quote_overlay", lambda row, symbol: row)
+
+    row = workbench._enrich_index_row({"name": "上证指数", "symbol": "sh000001"}, [])
+
+    assert 13 in row["ma_alignment"]["fib_accept_periods"]
+    assert "MA13回踩承接" in row["ma_alignment"]["fib_array_summary"]
+    assert "MA13回踩承接" in row["ma_acceptance"]["summary"]
+    assert any(item["name"] == "MA13" for item in row["ma_acceptance"]["items"])
+    assert row["target_kind"] == "index"
 
 
 def test_terminal_technical_rows_use_latest_as_of(monkeypatch):

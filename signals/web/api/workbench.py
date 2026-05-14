@@ -2774,6 +2774,40 @@ def _shell_ma_acceptance_summary(ma_alignment: Any) -> dict[str, Any]:
     }
 
 
+def _ma_alignment_from_price_df(df: pd.DataFrame) -> dict[str, Any]:
+    if df is None or df.empty or "close" not in df.columns:
+        return {}
+    try:
+        from signals.sync.modules.technical_signal_scan import _ma_alignment_from_daily_bars
+
+        working = df.sort_index().copy()
+        working["close"] = pd.to_numeric(working["close"], errors="coerce")
+        for col in ("open", "high", "low"):
+            if col not in working.columns:
+                working[col] = working["close"]
+            else:
+                working[col] = pd.to_numeric(working[col], errors="coerce").fillna(working["close"])
+        working = working.dropna(subset=["close"])
+        if len(working) < 5:
+            return {}
+        bars = list(working[["open", "high", "low", "close"]].itertuples(index=False))
+        return _ma_alignment_from_daily_bars(bars)
+    except Exception:
+        return {}
+
+
+def _index_ma_fields_from_daily_df(df: pd.DataFrame) -> dict[str, Any]:
+    ma_alignment = _ma_alignment_from_price_df(df)
+    slim_ma = _slim_shell_ma_alignment(ma_alignment)
+    if not slim_ma:
+        return {}
+    fields: dict[str, Any] = {"ma_alignment": slim_ma}
+    ma_acceptance = _shell_ma_acceptance_summary(ma_alignment)
+    if ma_acceptance:
+        fields["ma_acceptance"] = ma_acceptance
+    return fields
+
+
 def _slim_shell_signal_reason(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -3546,6 +3580,7 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
     day_change_source = minute_change.get("day_change_source") if minute_change else (daily_day_source if day_change_mode == "daily_close" else "")
     effective_day_change_mode = minute_change.get("day_change_mode") if minute_change else day_change_mode
     day_change_as_of = minute_change.get("day_change_as_of") if minute_change else (daily_as_of if day_change_mode == "daily_close" else "")
+    ma_fields = _index_ma_fields_from_daily_df(df)
     enriched = dict(row)
     enriched.update({
         "kind": "index",
@@ -3572,6 +3607,8 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "target_symbol": symbol,
         "target_freq": DEFAULT_TERMINAL_FREQ,
     })
+    if ma_fields:
+        enriched.update(ma_fields)
     return _apply_quote_overlay(enriched, symbol)
 
 
@@ -9725,6 +9762,7 @@ def _summary_from_index(report: Dict[str, Any], chart: Dict[str, Any]) -> Dict[s
     symbol = str(report.get("symbol") or "")
     day_change_mode = _a_day_change_mode()
     daily_day_change = None
+    daily_df = pd.DataFrame()
     if day_change_mode == "daily_close":
         try:
             daily_df, _daily_source = _index_df(symbol, "daily")
@@ -9757,6 +9795,12 @@ def _summary_from_index(report: Dict[str, Any], chart: Dict[str, Any]) -> Dict[s
     summary = _apply_quote_overlay(summary, symbol)
     if summary.get("today_change_pct") is not None:
         summary["gain_pct"] = summary.get("today_change_pct")
+    if (daily_df is None or daily_df.empty) and symbol:
+        try:
+            daily_df, _daily_source = _index_df(symbol, "daily")
+        except Exception:
+            daily_df = pd.DataFrame()
+    summary.update(_index_ma_fields_from_daily_df(daily_df))
     return summary
 
 
@@ -9775,6 +9819,7 @@ def _summary_from_static_index(name: str, symbol: str, chart: Dict[str, Any]) ->
     }
     day_change_mode = _a_day_change_mode()
     daily_day_change = None
+    daily_df = pd.DataFrame()
     if day_change_mode == "daily_close":
         try:
             daily_df, _daily_source = _index_df(symbol, "daily")
@@ -9807,6 +9852,12 @@ def _summary_from_static_index(name: str, symbol: str, chart: Dict[str, Any]) ->
     summary = _apply_quote_overlay(summary, symbol)
     if summary.get("today_change_pct") is not None:
         summary["gain_pct"] = summary.get("today_change_pct")
+    if (daily_df is None or daily_df.empty) and symbol:
+        try:
+            daily_df, _daily_source = _index_df(symbol, "daily")
+        except Exception:
+            daily_df = pd.DataFrame()
+    summary.update(_index_ma_fields_from_daily_df(daily_df))
     chain_position = _stock_chain_position_summary(symbol)
     if chain_position:
         trade_role = _trade_role_for_stock_summary(chain_position)
