@@ -4502,7 +4502,6 @@ def _slim_ma_alignment_for_pool(value: Any) -> dict[str, Any]:
         "fib_accept_count",
         "fib_accept_periods",
         "fib_touch_periods",
-        "fib_ma_array",
         "fib_array_summary",
         "fib_ma_array_state",
         "fib_support_score",
@@ -4510,7 +4509,33 @@ def _slim_ma_alignment_for_pool(value: Any) -> dict[str, Any]:
         "summary",
         "tags",
     )
-    return {key: value.get(key) for key in keys if value.get(key) not in (None, "", [], {})}
+    out = {key: value.get(key) for key in keys if value.get(key) not in (None, "", [], {})}
+    fib_items = []
+    for item in value.get("fib_ma_array") or []:
+        if not isinstance(item, dict):
+            continue
+        slim = {
+            key: item.get(key)
+            for key in (
+                "period",
+                "name",
+                "value",
+                "distance_pct",
+                "low_distance_pct",
+                "pullback_touch",
+                "pullback_acceptance",
+                "acceptance_score",
+                "state",
+            )
+            if item.get(key) not in (None, "", [], {})
+        }
+        if slim:
+            fib_items.append(slim)
+        if len(fib_items) >= 8:
+            break
+    if fib_items:
+        out["fib_ma_array"] = fib_items
+    return out
 
 
 def _slim_resonance_for_pool(value: Any) -> dict[str, Any]:
@@ -4600,19 +4625,62 @@ def _slim_evidence_for_pool(value: Any) -> dict[str, Any]:
     return out
 
 
-def _slim_reason_for_pool(value: Any) -> dict[str, Any]:
+def _slim_reason_for_pool(value: Any, *, include_analysis: bool = True) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
-    out = dict(value)
-    out["evidence"] = _slim_evidence_for_pool(value.get("evidence"))
+    keys = (
+        "reason_type",
+        "source_collection",
+        "source_doc_id",
+        "source_role",
+        "signal_family",
+        "signal_side",
+        "signal_type",
+        "freq",
+        "queue_lane",
+        "actionability",
+        "decision_effect",
+        "confidence",
+        "score",
+        "weight",
+        "as_of",
+        "event_dt",
+        "event_date",
+        "signal_age_trading_days",
+        "chain_id",
+        "chain_name",
+        "node_id",
+        "node_name",
+        "layer",
+        "stage",
+        "membership_type",
+        "membership_confidence",
+        "exposure_score",
+        "board_or_concept",
+        "knowledge_status",
+        "knowledge_effect",
+    )
+    out = {key: value.get(key) for key in keys if value.get(key) not in (None, "", [], {})}
+    evidence = _slim_evidence_for_pool(value.get("evidence"))
+    if evidence and not include_analysis:
+        evidence.pop("ma_alignment", None)
+        evidence.pop("resonance_context", None)
+    if evidence:
+        out["evidence"] = evidence
     resonance = _slim_resonance_for_pool(value.get("resonance_context"))
     if resonance:
         out["resonance_context"] = resonance
-    elif "resonance_context" in out:
-        out.pop("resonance_context", None)
-    ma_alignment = _slim_ma_alignment_for_pool(value.get("ma_alignment"))
-    if ma_alignment:
-        out["ma_alignment"] = ma_alignment
+    if include_analysis:
+        ma_alignment = _slim_ma_alignment_for_pool(value.get("ma_alignment"))
+        if ma_alignment:
+            out["ma_alignment"] = ma_alignment
+        backtest_quality = value.get("backtest_quality") if isinstance(value.get("backtest_quality"), dict) else {}
+        if backtest_quality:
+            out["backtest_quality"] = {
+                key: backtest_quality.get(key)
+                for key in ("score", "sample_size", "win_rate", "avg_return", "max_drawdown", "status")
+                if backtest_quality.get(key) not in (None, "", [], {})
+            }
     elif "ma_alignment" in out:
         out.pop("ma_alignment", None)
     return {key: item for key, item in out.items() if item not in (None, "", [], {})}
@@ -4631,9 +4699,9 @@ def _slim_pool_row_for_storage(row: dict[str, Any]) -> dict[str, Any]:
     out = dict(row)
     out["inclusion_reasons"] = [
         slim
-        for slim in (_slim_reason_for_pool(reason) for reason in row.get("inclusion_reasons") or [])
+        for slim in (_slim_reason_for_pool(reason, include_analysis=False) for reason in row.get("inclusion_reasons") or [])
         if slim
-    ][:12]
+    ][:6]
     for key in ("top_buy_reason", "top_risk_reason", "technical_evidence"):
         slim = _slim_reason_for_pool(row.get(key))
         if slim:

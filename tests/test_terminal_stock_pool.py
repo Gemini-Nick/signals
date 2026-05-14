@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from bson import BSON
+
 from signals.sync.modules.terminal_pool import _add_fallback_watch_rows, _add_reason, _add_signal_rows, _add_user_pinned, _backfill_watch_from_clue_candidates, _default_opportunity_candidate_rows, _entry_age_limit, _fib_ma_support_score_from_alignment, _reason_is_current_for_entry, _reason_type_for_signal, _selected_rows, _split_pool_rows
+from signals.sync.modules.terminal_pool import _slim_pool_row_for_storage
 
 
 class _Cursor(list):
@@ -2274,6 +2277,80 @@ def test_terminal_stock_pool_clue_overflow_backfills_watch_pool():
     assert all(row["entry_gate_status"] == "watch_only_not_hard_buy" for row in watch_stocks)
     assert all(row["market_setup_bias"] == "watch_only" for row in watch_stocks)
     assert all(row["can_trade_now"] is False for row in watch_stocks)
+
+
+def test_terminal_stock_pool_storage_row_compacts_repeated_reason_analysis():
+    ma_alignment = {
+        "ma13": 10.0,
+        "above_ma13": True,
+        "fib_array_summary": "MA13回踩承接",
+        "fib_ma_array": [
+            {
+                "period": period,
+                "name": f"MA{period}",
+                "value": 10.0 + period / 100,
+                "pullback_touch": True,
+                "pullback_acceptance": True,
+                "acceptance_score": 3.5,
+                "notes": "x" * 4000,
+            }
+            for period in (8, 13, 21, 34, 55, 89)
+        ],
+        "tags": ["MA13承接", "多周期共振"],
+    }
+    reason = {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "large-reason",
+        "signal_type": "三买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 120,
+        "confidence": 0.9,
+        "as_of": "2026-05-13",
+        "event_dt": "2026-05-13 15:00:00",
+        "evidence": {
+            "details": "y" * 8000,
+            "entry_factor": {
+                "group": "200d_new_high_breakout",
+                "breakout_pct": 3.2,
+                "volume_ratio": 2.1,
+            },
+            "ma_alignment": ma_alignment,
+        },
+        "resonance_context": {
+            "grade": "multi_period",
+            "aligned_freqs": ["日线", "30分钟", "15分钟"],
+            "tags": ["多周期共振"],
+        },
+        "ma_alignment": ma_alignment,
+    }
+    row = {
+        "symbol": "SZ.300575",
+        "code": "300575",
+        "raw_code": "300575",
+        "name": "中旗新材",
+        "pool_type": "focus",
+        "rank": 1,
+        "rank_score": 300,
+        "latest_signal": "三买",
+        "inclusion_reasons": [dict(reason, source_doc_id=f"large-reason-{idx}") for idx in range(12)],
+        "top_buy_reason": reason,
+        "technical_evidence": reason,
+        "ma_alignment": ma_alignment,
+        "broad_market_context": {"summary": "z" * 10000},
+    }
+
+    raw_size = len(BSON.encode(row))
+    slim = _slim_pool_row_for_storage(row)
+    slim_size = len(BSON.encode(slim))
+
+    assert raw_size > 500_000
+    assert slim_size < 120_000
+    assert len(slim["inclusion_reasons"]) == 6
+    assert all("ma_alignment" not in item for item in slim["inclusion_reasons"])
+    assert slim["technical_evidence"]["ma_alignment"]["fib_array_summary"] == "MA13回踩承接"
+    assert slim["top_buy_reason"]["evidence"]["entry_factor"]["group"] == "200d_new_high_breakout"
 
 
 def test_gate_progress_returns_zero_for_no_technical_reasons():
