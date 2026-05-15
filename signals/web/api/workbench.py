@@ -55,7 +55,7 @@ router = APIRouter(prefix="/api/workbench", tags=["workbench"])
 UI_FREQS = ["30min", "15min", "5min", "daily", "weekly"]
 DEFAULT_TERMINAL_FREQ = "30min"
 MINUTE_FREQS = {"5min", "5m", "15min", "15m", "30min", "30m"}
-REALTIME_DAY_CHANGE_FREQS = ("5min", "15min", "30min")
+REALTIME_DAY_CHANGE_FREQS = ("5min",)
 BUY_FREQS = ["weekly", "daily", "30min", "15min", "5min"]
 CHART_FREQ_ORDER = {"weekly": 0, "daily": 1, "30min": 2, "15min": 3, "5min": 4}
 SECOND_SCREEN_LANES = {
@@ -143,6 +143,7 @@ _SHELL_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None, "refreshed_a
 _SHELL_QUOTE_REFRESH_GROUPS = ("indices", "watchlist", "buy_candidates", "sell_warnings")
 _SHELL_REBUILD_WATERMARK_KEYS = {
     "terminal_stock_pool",
+    "stock_minute",
     "market_pools",
     "strategy_snapshots",
     "board_heat_ticks",
@@ -205,6 +206,27 @@ def _quote_snapshot_watermark() -> str:
         parts.append(f"terminal_stock_pool:{pool_value.isoformat()}:{pool_version}")
     elif pool_value:
         parts.append(f"terminal_stock_pool:{pool_value}:{pool_version}")
+    try:
+        minute_doc = (
+            db["sync_log"].find_one(
+                {"_id": "stock_minute:selection:_meta"},
+                {"_id": 0, "last_run": 1, "latest_dt": 1, "result": 1},
+                sort=[("last_run", -1)],
+            )
+            or db["sync_log"].find_one(
+                {"_id": "stock_minute:_meta"},
+                {"_id": 0, "last_run": 1, "latest_dt": 1, "result": 1},
+                sort=[("last_run", -1)],
+            )
+            or {}
+        )
+    except Exception:
+        minute_doc = {}
+    minute_value = minute_doc.get("latest_dt") or minute_doc.get("last_run") or (minute_doc.get("result") or {}).get("last_dt")
+    if isinstance(minute_value, datetime):
+        parts.append(f"stock_minute:{minute_value.isoformat()}")
+    elif minute_value:
+        parts.append(f"stock_minute:{minute_value}")
     for collection, field, query in (
         ("market_pools", "updated_at", {"market": "A"}),
         ("strategy_snapshots", "updated_at", {}),
@@ -1710,6 +1732,7 @@ def _shortest_realtime_day_change(kind: str, symbol: str) -> dict[str, Any]:
             "day_change_mode": "minute_intraday",
             "day_change_as_of": as_of,
             "day_change_freq": freq,
+            "day_change_basis": "prev_close" if previous_close is not None and previous_close > 0 else "open",
         }
     return {}
 
@@ -2307,6 +2330,13 @@ def _apply_quote_overlay(row: dict[str, Any], symbol: str, overlay: Optional[dic
     overlay_mode = _text(overlay.get("day_change_mode")) or _a_day_change_mode()
     row_kind = _text(updated.get("target_kind") or updated.get("kind")).lower()
     quote_change = _float(overlay.get("day_change_pct"))
+    if overlay_mode == "quote_intraday" and _has_minute_day_change(updated):
+        quote_only = {
+            key: value for key, value in overlay.items()
+            if key not in {"latest_price", "realtime_price", "day_change_pct", "daily_change_pct", "today_change_pct", "gain_pct", "day_change_source", "day_change_mode", "day_change_as_of", "day_change_freq", "day_change_basis"}
+        }
+        updated.update(quote_only)
+        return updated
     if overlay_mode == "quote_intraday" and overlay.get("quote_status") in {"realtime", "delayed"} and quote_change is not None:
         updated.update(overlay)
         updated.update({
@@ -2334,13 +2364,6 @@ def _apply_quote_overlay(row: dict[str, Any], symbol: str, overlay: Optional[dic
                 "day_change_as_of": overlay.get("quote_as_of") or "",
             })
             return updated
-    if _has_minute_day_change(updated):
-        quote_only = {
-            key: value for key, value in overlay.items()
-            if key not in {"latest_price", "realtime_price", "day_change_pct", "daily_change_pct", "today_change_pct", "gain_pct", "day_change_source", "day_change_mode", "day_change_as_of", "day_change_freq"}
-        }
-        updated.update(quote_only)
-        return updated
     if overlay.get("quote_status") in {"stale", "missing"} and row_kind != "index":
         current_daily_close = (
             overlay_mode == "daily_close"
@@ -2396,7 +2419,9 @@ def _enrich_stock_row(
     metadata = dict(row.get("metadata") or {}) if isinstance(row.get("metadata"), dict) else {}
     latest_signal = _text(row.get("latest_signal") or row.get("signal") or row.get("reason") or row.get("direction"))
     if lightweight:
-        day_change_pct = _first_numeric(
+        day_change_mode = _a_day_change_mode()
+        minute_change = _shortest_realtime_day_change("stock", normalized) if day_change_mode != "daily_close" else {}
+        row_day_change_pct = _first_numeric(
             row.get("day_change_pct"),
             row.get("today_change_pct"),
             row.get("daily_change_pct"),
@@ -2404,13 +2429,15 @@ def _enrich_stock_row(
             row.get("change_pct"),
             metadata.get("change_pct"),
         )
-        latest_price = _first_numeric(
+        day_change_pct = minute_change.get("day_change_pct") if minute_change else row_day_change_pct
+        row_latest_price = _first_numeric(
             row.get("latest_price"),
             row.get("price"),
             row.get("close"),
             metadata.get("price"),
             metadata.get("close"),
         )
+        latest_price = minute_change.get("latest_price") if minute_change else row_latest_price
         range_returns: dict[str, Any]
         range_return_source: str
         range_return_status = _text(row.get("range_return_status"))
@@ -2436,12 +2463,13 @@ def _enrich_stock_row(
             "latest_price": latest_price,
             "day_change_pct": day_change_pct,
             "daily_change_pct": day_change_pct,
-            "today_change_pct": day_change_pct,
-            "gain_pct": day_change_pct if day_change_pct is not None else row.get("gain_pct"),
-            "day_change_source": row.get("day_change_source") or ("row_snapshot" if day_change_pct is not None else ""),
-            "day_change_mode": row.get("day_change_mode") or _a_day_change_mode(),
-            "day_change_as_of": row.get("day_change_as_of") or row.get("as_of") or row.get("event_date") or "",
-            "day_change_freq": row.get("day_change_freq") or "",
+            "today_change_pct": minute_change.get("today_change_pct") if minute_change else day_change_pct,
+            "gain_pct": minute_change.get("gain_pct") if minute_change else (day_change_pct if day_change_pct is not None else row.get("gain_pct")),
+            "day_change_source": minute_change.get("day_change_source") if minute_change else (row.get("day_change_source") or ("row_snapshot" if day_change_pct is not None else "")),
+            "day_change_mode": minute_change.get("day_change_mode") if minute_change else (row.get("day_change_mode") or day_change_mode),
+            "day_change_as_of": minute_change.get("day_change_as_of") if minute_change else (row.get("day_change_as_of") or row.get("as_of") or row.get("event_date") or ""),
+            "day_change_freq": minute_change.get("day_change_freq") if minute_change else (row.get("day_change_freq") or ""),
+            "day_change_basis": minute_change.get("day_change_basis") or row.get("day_change_basis") or "",
             "latest_signal": latest_signal or "待观察",
             "range_returns": range_returns,
             "range_return_source": range_return_source,
@@ -3240,6 +3268,7 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "day_change_mode",
         "day_change_as_of",
         "day_change_basis",
+        "day_change_freq",
         "realtime_price",
         "quote_price",
         "quote_open_price",

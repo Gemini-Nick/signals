@@ -1123,6 +1123,7 @@ def test_terminal_stock_pool_group_rows_reads_clue_stocks_with_quote_overlay(mon
     monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
     monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-08")
     monkeypatch.setattr(workbench, "_market_now", lambda market="A": datetime(2026, 5, 8, 10, 0, 5))
+    monkeypatch.setattr(workbench, "_shortest_realtime_day_change", lambda kind, symbol: {})
     refresh_calls = []
     monkeypatch.setattr(
         workbench,
@@ -1510,6 +1511,37 @@ def test_quote_snapshot_watermark_includes_same_day_fullmarket(monkeypatch):
     assert "fullmarket_spot_snapshots:2026-05-08T15:05:00" in watermark
 
 
+def test_quote_snapshot_watermark_includes_stock_minute_sync(monkeypatch):
+    from signals.web.api import workbench
+
+    class _EmptyCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return None
+
+    class _SyncLogCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            if query == {"_id": "stock_minute:selection:_meta"}:
+                return {"last_run": datetime(2026, 5, 8, 10, 5)}
+            return None
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({
+        "quote_snapshots": _EmptyCollection(),
+        "fullmarket_spot_snapshots": _EmptyCollection(),
+        "terminal_stock_pool": _EmptyCollection(),
+        "sync_log": _SyncLogCollection(),
+    }))
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-08")
+
+    watermark = workbench._quote_snapshot_watermark()
+
+    assert "stock_minute:2026-05-08T10:05:00" in watermark
+
+
 def test_quote_overlay_marks_old_intraday_quote_stale(monkeypatch):
     from signals.web.api import workbench
 
@@ -1606,6 +1638,7 @@ def test_enrich_scored_stock_rows_refreshes_visible_quotes(monkeypatch):
 
     refresh_calls = []
     monkeypatch.setattr(workbench, "_mongo_db", lambda: {"quote_snapshots": object()})
+    monkeypatch.setattr(workbench, "_shortest_realtime_day_change", lambda kind, symbol: {})
     monkeypatch.setattr(
         workbench,
         "_refresh_realtime_quotes_for_rows",
@@ -1641,6 +1674,7 @@ def test_slim_shell_stock_row_preserves_quote_basis_fields():
         "latest_price": 38.02,
         "day_change_pct": -1.985,
         "day_change_basis": "prev_close",
+        "day_change_freq": "5min",
         "quote_open_price": 38.89,
         "quote_open_change_pct": -2.2371,
         "quote_prev_close_change_pct": -1.985,
@@ -1663,6 +1697,7 @@ def test_slim_shell_stock_row_preserves_quote_basis_fields():
     })
 
     assert row["day_change_basis"] == "prev_close"
+    assert row["day_change_freq"] == "5min"
     assert row["quote_open_price"] == 38.89
     assert row["quote_prev_close_change_pct"] == -1.985
     assert row["setup_rank_tier"] == 0
@@ -1677,7 +1712,7 @@ def test_slim_shell_stock_row_preserves_quote_basis_fields():
     assert row["promotion_gates"] == ["missing_buy_technical"]
 
 
-def test_quote_overlay_prefers_realtime_quote_over_minute_change(monkeypatch):
+def test_quote_overlay_preserves_intraday_minute_change(monkeypatch):
     from signals.web.api import workbench
 
     monkeypatch.setattr(
@@ -1711,14 +1746,15 @@ def test_quote_overlay_prefers_realtime_quote_over_minute_change(monkeypatch):
         "sh000688",
     )
 
-    assert row["latest_price"] == 1691.07
-    assert row["day_change_pct"] == 7.64
-    assert row["daily_change_pct"] == 7.64
-    assert row["today_change_pct"] == 7.64
-    assert row["gain_pct"] == 7.64
-    assert row["day_change_mode"] == "quote_intraday"
-    assert row["day_change_source"] == "quote_snapshots"
-    assert row["day_change_freq"] == ""
+    assert row["latest_price"] == 1692.61
+    assert row["day_change_pct"] == 3.57
+    assert row["daily_change_pct"] == 3.57
+    assert row["today_change_pct"] == 3.57
+    assert row["gain_pct"] == 3.57
+    assert row["day_change_mode"] == "minute_intraday"
+    assert row["day_change_source"] == "index_bars:5min"
+    assert row["day_change_freq"] == "5min"
+    assert row["quote_status"] == "realtime"
 
 
 def test_lightweight_stock_row_uses_quote_without_kline(monkeypatch):
@@ -1752,6 +1788,50 @@ def test_lightweight_stock_row_uses_quote_without_kline(monkeypatch):
     assert row["day_change_pct"] == 3.2
     assert row["day_change_source"] == "quote_snapshots"
     assert row["range_returns"] == {}
+
+
+def test_lightweight_stock_row_prefers_5min_cache_change_over_quote(monkeypatch):
+    from signals.web.api import workbench
+
+    daily = pd.DataFrame(
+        {"open": [10.0], "close": [10.0]},
+        index=pd.to_datetime(["2026-05-07"]),
+    )
+    minute_5 = pd.DataFrame(
+        {"open": [10.8, 11.0], "close": [11.0, 11.2]},
+        index=pd.to_datetime(["2026-05-08 09:35", "2026-05-08 09:40"]),
+    )
+
+    def fake_stock_df(symbol, freq):
+        return (minute_5, "bars") if freq == "5min" else (daily, "daily_bars")
+
+    monkeypatch.setattr(workbench, "_stock_df", fake_stock_df)
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(
+        workbench,
+        "_quote_overlay_for_symbol",
+        lambda symbol: {
+            "day_change_mode": "quote_intraday",
+            "quote_status": "realtime",
+            "quote_status_label": "实时",
+            "latest_price": 10.5,
+            "realtime_price": 10.5,
+            "day_change_pct": 3.2,
+            "daily_change_pct": 3.2,
+            "today_change_pct": 3.2,
+            "day_change_source": "quote_snapshots",
+            "day_change_as_of": "2026-05-08",
+        },
+    )
+
+    row = workbench._enrich_stock_row({"symbol": "SH.600000", "latest_signal": "一买"}, [], lightweight=True)
+
+    assert row["latest_price"] == 11.2
+    assert row["day_change_pct"] == 12.0
+    assert row["day_change_mode"] == "minute_intraday"
+    assert row["day_change_source"] == "bars:5min"
+    assert row["day_change_freq"] == "5min"
+    assert row["quote_status"] == "realtime"
 
 
 def test_lightweight_stock_row_uses_closed_quote_without_kline(monkeypatch):
