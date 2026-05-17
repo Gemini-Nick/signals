@@ -266,6 +266,38 @@ def test_ma_alignment_marks_fibonacci_ma_pullback_acceptance_array():
     assert "斐波那切均线回踩承接" in alignment["tags"]
 
 
+def test_ma_alignment_marks_touched_close_below_fibonacci_ma_as_breakdown():
+    bars = []
+    dates = pd.date_range("2026-04-01", periods=22, freq="B")
+    for dt in dates[:-1]:
+        bars.append(_OhlcvBar(
+            dt=dt.to_pydatetime(),
+            open=10.0,
+            high=10.1,
+            low=9.95,
+            close=10.0,
+            vol=1000,
+        ))
+    bars.append(_OhlcvBar(
+        dt=dates[-1].to_pydatetime(),
+        open=10.08,
+        high=10.2,
+        low=9.9,
+        close=9.95,
+        vol=1200,
+    ))
+
+    alignment = _ma_alignment_from_daily_bars(bars)
+    ma21 = next(item for item in alignment["fib_ma_array"] if item["period"] == 21)
+
+    assert ma21["pullback_touch"] is True
+    assert ma21["pullback_acceptance"] is False
+    assert ma21["pullback_breakdown"] is True
+    assert 21 in alignment["fib_breakdown_periods"]
+    assert "MA21跌破待修复" in alignment["fib_array_summary"]
+    assert "MA21触碰待确认" not in alignment["fib_array_summary"]
+
+
 def test_doc_to_rawbar_preserves_market_naive_datetime():
     raw_dt = datetime(2026, 4, 30, 13, 30)
 

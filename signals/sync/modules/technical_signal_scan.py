@@ -663,6 +663,7 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
     fib_reclaim_count = 0
     fib_touch_count = 0
     fib_accept_count = 0
+    fib_breakdown_count = 0
     fib_ma_array: list[dict[str, Any]] = []
     for period in PRIMARY_MA_PERIODS + FIBONACCI_MA_PERIODS:
         ma_value = _rolling_ma(closes, period)
@@ -700,6 +701,7 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
                 or -FIB_MA_TOUCH_UNDERSHOOT_PCT <= low_distance_pct <= FIB_MA_TOUCH_OVERSHOOT_PCT
             )
             accepted = bool(touched and latest >= touch_reference and latest_close_position >= 0.45)
+            breakdown = bool(touched and not accepted and latest < ma_value)
             if above:
                 fib_above_count += 1
             elif near:
@@ -708,12 +710,14 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
                 fib_reclaim_count += 1
             if touched:
                 fib_touch_count += 1
+            if breakdown:
+                fib_breakdown_count += 1
             if accepted:
                 fib_accept_count += 1
                 fib_support_score += weight
             elif reclaim:
                 fib_support_score += min(4.0, weight)
-            elif near:
+            elif near and not breakdown:
                 fib_support_score += weight * 0.45
             fib_ma_array.append({
                 "period": period,
@@ -725,10 +729,11 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
                 "reclaim": reclaim,
                 "pullback_touch": touched,
                 "pullback_acceptance": accepted,
+                "pullback_breakdown": breakdown,
                 "distance_pct": round(distance_pct, 3),
                 "low_distance_pct": round(low_distance_pct, 3),
                 "touch_distance_pct": round(touch_distance_pct, 3),
-                "acceptance_score": round(weight if accepted else min(4.0, weight) if reclaim else weight * 0.45 if near else 0.0, 3),
+                "acceptance_score": round(weight if accepted else min(4.0, weight) if reclaim else weight * 0.45 if near and not breakdown else 0.0, 3),
             })
     ma5 = out.get("ma5")
     ma10 = out.get("ma10")
@@ -771,9 +776,19 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
             out["fib_ma_array_state"] = "mixed"
     accepted_periods = [item["period"] for item in fib_ma_array if item.get("pullback_acceptance")]
     touched_periods = [item["period"] for item in fib_ma_array if item.get("pullback_touch")]
+    breakdown_periods = [item["period"] for item in fib_ma_array if item.get("pullback_breakdown")]
+    pending_touch_periods = [
+        item["period"]
+        for item in fib_ma_array
+        if item.get("pullback_touch") and not item.get("pullback_acceptance") and not item.get("pullback_breakdown")
+    ]
     if accepted_periods:
         tags.append("斐波那切均线回踩承接")
-    elif touched_periods:
+    elif breakdown_periods:
+        tags.append("斐波那切均线跌破待修复")
+        if pending_touch_periods:
+            tags.append("斐波那切均线回踩待确认")
+    elif pending_touch_periods:
         tags.append("斐波那切均线回踩待确认")
     out["above_count"] = above_count
     out["reclaim_count"] = reclaim_count
@@ -781,10 +796,20 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
     out["fib_reclaim_count"] = fib_reclaim_count
     out["fib_touch_count"] = fib_touch_count
     out["fib_accept_count"] = fib_accept_count
+    out["fib_breakdown_count"] = fib_breakdown_count
     out["fib_accept_periods"] = accepted_periods[:6]
     out["fib_touch_periods"] = touched_periods[:6]
+    out["fib_breakdown_periods"] = breakdown_periods[:6]
     out["fib_ma_array"] = fib_ma_array
-    out["fib_array_summary"] = " / ".join(f"MA{period}回踩承接" for period in accepted_periods[:3]) or " / ".join(f"MA{period}触碰待确认" for period in touched_periods[:3])
+    out["fib_array_summary"] = (
+        " / ".join(f"MA{period}回踩承接" for period in accepted_periods[:3])
+        or " / ".join(
+            [
+                *(f"MA{period}跌破待修复" for period in breakdown_periods[:3]),
+                *(f"MA{period}触碰待确认" for period in pending_touch_periods[: max(0, 3 - len(breakdown_periods[:3]))]),
+            ]
+        )
+    )
     out["fib_support_score"] = round(min(16.0, fib_support_score), 3)
     out["score"] = round(max(0.0, min(60.0, score + out["fib_support_score"])), 3)
     out["summary"] = " / ".join(tags[:5]) if tags else "均线未确认"
