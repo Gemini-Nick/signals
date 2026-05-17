@@ -79,6 +79,23 @@ def _fib_acceptance_bars():
     return pd.DataFrame(rows).set_index("dt")
 
 
+def test_hk_symbol_aliases_normalize_for_manual_clues(monkeypatch):
+    from signals.core.stock_names import StockNameResolver
+    from signals.layers import industry
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(industry, "_INDUSTRY_LEADERS", {})
+    monkeypatch.setattr(industry, "_build_name_to_code_map", lambda: {})
+    monkeypatch.setattr(industry, "_code6_to_futu", lambda code: "")
+    monkeypatch.setattr(workbench, "get_resolver", lambda: StockNameResolver())
+
+    assert workbench._normalize_stock_symbol("522") == ("HK.00522", "00522")
+    assert workbench._normalize_stock_symbol("0522.hk") == ("HK.00522", "00522")
+    assert workbench._normalize_stock_symbol("HK:522") == ("HK.00522", "00522")
+    assert workbench._normalize_stock_symbol("asmpt") == ("HK.00522", "00522")
+    assert workbench._looks_like_stock("0522.hk")
+
+
 def test_watchlist_range_columns_include_all_key_presets():
     from signals.web.api import workbench
 

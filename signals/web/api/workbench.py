@@ -1859,9 +1859,26 @@ def _looks_like_stock(raw: str) -> bool:
     value = raw.strip().upper()
     if not value:
         return False
-    if value.startswith(("SH.", "SZ.", "BJ.", "HK.")):
+    if value.startswith(("SH.", "SZ.", "BJ.")):
         return True
-    return value.isdigit() and len(value) in (5, 6)
+    if _normalize_hk_code_text(value):
+        return True
+    return value.isdigit() and len(value) == 6
+
+
+def _normalize_hk_code_text(raw: str) -> Optional[str]:
+    value = str(raw or "").strip().upper().replace(" ", "")
+    if not value:
+        return None
+    if value.endswith(".HK"):
+        value = value[:-3]
+    if value.startswith(("HK.", "HK:", "HK-")):
+        value = value[3:]
+    elif value.startswith("HK") and value[2:].isdigit():
+        value = value[2:]
+    if value.isdigit() and 1 <= len(value) <= 5:
+        return value.zfill(5)
+    return None
 
 
 def _normalize_stock_symbol(raw: str) -> Tuple[Optional[str], Optional[str]]:
@@ -1870,12 +1887,14 @@ def _normalize_stock_symbol(raw: str) -> Tuple[Optional[str], Optional[str]]:
     if not value:
         return None, None
 
-    if value.startswith(("SH.", "SZ.", "BJ.", "HK.")):
+    if value.startswith(("SH.", "SZ.", "BJ.")):
         return value, value.split(".", 1)[1]
 
+    hk_code = _normalize_hk_code_text(value)
+    if hk_code:
+        return f"HK.{hk_code}", hk_code
+
     if value.isdigit():
-        if len(value) == 5:
-            return f"HK.{value}", value
         if len(value) == 6:
             if value.startswith(("5", "6", "9")):
                 return f"SH.{value}", value

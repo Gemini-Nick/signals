@@ -2,6 +2,14 @@
 """股票名称解析器 — Futu 代码 → 公司名 + 行业"""
 
 
+_DEFAULT_STOCK_ALIASES = {
+    "HK.00522": {
+        "name": "ASMPT",
+        "aliases": ("ASMPT", "ASMPT Limited", "ASM Pacific Technology"),
+    },
+}
+
+
 class StockNameResolver:
     """
     将 Futu 格式代码（SZ.001400）解析为公司名和行业。
@@ -16,7 +24,17 @@ class StockNameResolver:
         self._code_to_name: dict = {}
         self._code_to_industry: dict = {}
         self._name_to_code: dict = {}
+        self._alias_to_code: dict = {}
         self._fallback_loaded = False
+
+    @staticmethod
+    def _alias_key(value: str) -> str:
+        return str(value or "").strip().casefold()
+
+    def _remember_alias(self, futu_code: str, alias: str):
+        key = self._alias_key(alias)
+        if key:
+            self._alias_to_code[key] = futu_code
 
     def _remember_name(self, futu_code: str, name: str, *, override_code_name: bool = False):
         """记录双向映射；旧静态名保留为 name->code 别名。"""
@@ -25,8 +43,17 @@ class StockNameResolver:
         if not futu_code or not name:
             return
         self._name_to_code[name] = futu_code
+        self._remember_alias(futu_code, name)
         if override_code_name or futu_code not in self._code_to_name:
             self._code_to_name[futu_code] = name
+
+    def _load_default_aliases(self):
+        for futu_code, payload in _DEFAULT_STOCK_ALIASES.items():
+            display_name = str(payload.get("name") or "").strip()
+            if display_name:
+                self._remember_name(futu_code, display_name)
+            for alias in payload.get("aliases") or ():
+                self._remember_alias(futu_code, alias)
 
     def inject_from_rankings(self, merged_list):
         """从 L2 IndustryRanking 注入 code→name 和 code→industry。"""
@@ -70,6 +97,8 @@ class StockNameResolver:
         except Exception:
             pass
 
+        self._load_default_aliases()
+
     def get_name(self, futu_code: str) -> str:
         """返回公司名。未知则返回代码后缀（如 SPY）。"""
         if futu_code in self._code_to_name:
@@ -83,15 +112,21 @@ class StockNameResolver:
         name = str(name or "").strip()
         if not name:
             return ""
+        alias_key = self._alias_key(name)
+        if alias_key in self._alias_to_code:
+            return self._alias_to_code[alias_key]
         if name in self._name_to_code:
             return self._name_to_code[name]
         # 精确匹配
         for code, n in self._code_to_name.items():
-            if n == name:
+            if n == name or self._alias_key(n) == alias_key:
                 return code
         # 模糊匹配（名称包含查询词）
-        candidates = [(code, n) for n, code in self._name_to_code.items()
-                      if name in n]
+        candidates = [
+            (code, n)
+            for n, code in self._name_to_code.items()
+            if name in n or (alias_key and alias_key in self._alias_key(n))
+        ]
         unique_codes = {code for code, _ in candidates}
         if len(unique_codes) == 1:
             return candidates[0][0]
@@ -103,8 +138,23 @@ class StockNameResolver:
         keyword = str(keyword or "").strip()
         if not keyword:
             return []
-        return [(code, n) for n, code in self._name_to_code.items()
-                if keyword in n]
+        alias_key = self._alias_key(keyword)
+        results = []
+        seen = set()
+
+        def add(code: str):
+            if code in seen:
+                return
+            seen.add(code)
+            results.append((code, self.get_name(code)))
+
+        for alias, code in self._alias_to_code.items():
+            if alias_key and alias_key in alias:
+                add(code)
+        for n, code in self._name_to_code.items():
+            if keyword in n or (alias_key and alias_key in self._alias_key(n)):
+                add(code)
+        return results
 
     def get_industry(self, futu_code: str) -> str:
         """返回行业名。未知则返回空字符串。"""

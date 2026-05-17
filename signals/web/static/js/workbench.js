@@ -41,8 +41,8 @@ function wbShowToast(message, timeout = 2200) {
   wbShowToast._timer = setTimeout(() => el.classList.remove('show'), timeout);
 }
 
-async function wbApiFetch(path) {
-  const res = await fetch(path);
+async function wbApiFetch(path, options = undefined) {
+  const res = await fetch(path, options);
   let data = {};
   try {
     data = await res.json();
@@ -1107,6 +1107,24 @@ async function wbLoadShell() {
   wbRenderClusters(shell.cluster_summary || {});
 }
 
+async function wbMaybeAddHongKongManualClue(target) {
+  const symbol = target?.symbol || '';
+  if (!symbol.startsWith('HK.')) return;
+  try {
+    await wbApiFetch('/api/workbench/manual-clues', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        symbol,
+        freq: target.effective_freq || target.requested_freq || WB_STATE.target.freq || 'daily',
+      }),
+    });
+    await wbLoadShell();
+  } catch (error) {
+    wbShowToast(error.message || '港股线索入池失败', 2800);
+  }
+}
+
 async function wbLoadCluster(direction = '', mode = 'belief') {
   const query = new URLSearchParams();
   if (direction) query.set('direction', direction);
@@ -1161,6 +1179,7 @@ async function wbLoadSymbol(label, kind = 'auto', silent = false) {
     wbUpdateFreqButtons(data.target || {});
     wbRenderReview(data.review || {});
     wbRenderTrades(data.trade || { summary: {}, related_trades: [], missed_signals: [] });
+    void wbMaybeAddHongKongManualClue(data.target || {});
     if (data.analysis_target) {
       try {
         await wbLoadBacktest(data.analysis_target, data.target?.effective_freq || 'daily');
