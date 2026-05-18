@@ -1675,6 +1675,7 @@ def _shortest_realtime_day_change(kind: str, symbol: str) -> dict[str, Any]:
     target = _text(symbol)
     if not target:
         return {}
+    expected_day = _day_change_expected_day("quote_intraday") if _a_day_change_mode() == "quote_intraday" else ""
     for freq in REALTIME_DAY_CHANGE_FREQS:
         try:
             if kind == "index":
@@ -1709,6 +1710,8 @@ def _shortest_realtime_day_change(kind: str, symbol: str) -> dict[str, Any]:
         except Exception:
             continue
         latest_ts = _df_latest_timestamp(df)
+        if expected_day and latest_ts is not None and _date_text(latest_ts) != expected_day:
+            continue
         previous_close: Optional[float] = None
         try:
             if latest_ts is not None and kind == "index":
@@ -1738,7 +1741,14 @@ def _shortest_realtime_day_change(kind: str, symbol: str) -> dict[str, Any]:
 
 
 def _has_minute_day_change(row: dict[str, Any]) -> bool:
-    return _text(row.get("day_change_mode")) == "minute_intraday" or _text(row.get("day_change_freq")) in REALTIME_DAY_CHANGE_FREQS
+    has_minute = _text(row.get("day_change_mode")) == "minute_intraday" or _text(row.get("day_change_freq")) in REALTIME_DAY_CHANGE_FREQS
+    if not has_minute:
+        return False
+    if _a_day_change_mode() != "quote_intraday":
+        return True
+    as_of = _date_text(row.get("day_change_as_of") or row.get("as_of") or row.get("dt") or row.get("date"))
+    expected_day = _day_change_expected_day("quote_intraday")
+    return bool(as_of and expected_day and as_of == expected_day)
 
 
 def _ma_signal_from_df(df: pd.DataFrame) -> str:

@@ -331,6 +331,79 @@ def test_intraday_chart_does_not_render_previous_day_after_call_auction(monkeypa
     assert "minute_cache_older_than_realtime_day" in chart["meta"]["stale_reason"]
 
 
+def test_realtime_day_change_skips_previous_day_minute_cache_during_auction(monkeypatch):
+    from signals.web.api import workbench
+
+    minute_df = pd.DataFrame(
+        [
+            {"open": 55.0, "high": 58.0, "low": 54.8, "close": 56.8, "vol": 1000, "amount": 10000},
+            {"open": 56.8, "high": 58.2, "low": 56.4, "close": 57.54, "vol": 1000, "amount": 10000},
+        ],
+        index=[pd.Timestamp("2026-05-15 14:55"), pd.Timestamp("2026-05-15 15:00")],
+    )
+    daily_df = pd.DataFrame(
+        [
+            {"open": 54.0, "high": 56.0, "low": 53.5, "close": 55.51, "vol": 1000, "amount": 10000},
+            {"open": 55.0, "high": 58.2, "low": 54.8, "close": 57.54, "vol": 1000, "amount": 10000},
+        ],
+        index=[pd.Timestamp("2026-05-14"), pd.Timestamp("2026-05-15")],
+    )
+
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-18")
+    monkeypatch.setattr(
+        workbench,
+        "_stock_df",
+        lambda symbol, freq: (minute_df, "bars") if freq == "5min" else (daily_df, "bars"),
+    )
+
+    assert workbench._shortest_realtime_day_change("stock", "SZ.002709") == {}
+
+
+def test_quote_overlay_replaces_stale_minute_intraday_change(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-18")
+
+    row = {
+        "kind": "stock",
+        "symbol": "SZ.002709",
+        "latest_price": 57.54,
+        "day_change_pct": 3.66,
+        "daily_change_pct": 3.66,
+        "today_change_pct": 3.66,
+        "day_change_source": "bars:5min",
+        "day_change_mode": "minute_intraday",
+        "day_change_as_of": "2026-05-15",
+        "day_change_freq": "5min",
+    }
+    overlay = {
+        "day_change_mode": "quote_intraday",
+        "quote_status": "realtime",
+        "quote_price": 56.22,
+        "latest_price": 56.22,
+        "realtime_price": 56.22,
+        "day_change_pct": -2.2941,
+        "daily_change_pct": -2.2941,
+        "today_change_pct": -2.2941,
+        "gain_pct": -2.2941,
+        "day_change_source": "quote_snapshots",
+        "day_change_as_of": "2026-05-18",
+        "quote_as_of": "2026-05-18",
+        "day_change_basis": "prev_close",
+    }
+
+    updated = workbench._apply_quote_overlay(row, "SZ.002709", overlay)
+
+    assert updated["latest_price"] == 56.22
+    assert updated["day_change_pct"] == -2.2941
+    assert updated["daily_change_pct"] == -2.2941
+    assert updated["today_change_pct"] == -2.2941
+    assert updated["day_change_source"] == "quote_snapshots"
+    assert updated["day_change_as_of"] == "2026-05-18"
+
+
 def test_intraday_chart_preserves_history_when_today_cache_is_ready(monkeypatch):
     from signals.web.api import workbench
 
@@ -1732,6 +1805,8 @@ def test_slim_shell_stock_row_preserves_quote_basis_fields():
 def test_quote_overlay_preserves_intraday_minute_change(monkeypatch):
     from signals.web.api import workbench
 
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-06")
     monkeypatch.setattr(
         workbench,
         "_quote_overlay_for_symbol",
@@ -1758,6 +1833,7 @@ def test_quote_overlay_preserves_intraday_minute_change(monkeypatch):
             "gain_pct": 3.57,
             "day_change_mode": "minute_intraday",
             "day_change_source": "index_bars:5min",
+            "day_change_as_of": "2026-05-06",
             "day_change_freq": "5min",
         },
         "sh000688",
@@ -1824,6 +1900,7 @@ def test_lightweight_stock_row_prefers_5min_cache_change_over_quote(monkeypatch)
 
     monkeypatch.setattr(workbench, "_stock_df", fake_stock_df)
     monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-08")
     monkeypatch.setattr(
         workbench,
         "_quote_overlay_for_symbol",
@@ -2021,6 +2098,7 @@ def test_index_intraday_day_change_uses_previous_daily_close(monkeypatch):
 
     monkeypatch.setattr(workbench, "_index_df", fake_index_df)
     monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "quote_intraday")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-06")
     monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {"quote_status": "missing", "quote_status_label": "无行情"})
 
     row = workbench._enrich_index_row({"symbol": "sh000688", "name": "科创50"}, [])
