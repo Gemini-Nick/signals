@@ -102,7 +102,12 @@ def test_watchlist_range_columns_include_all_key_presets():
     columns = workbench._watchlist_range_columns(date(2026, 4, 26))
     keys = [item["key"] for item in columns]
 
-    assert {"ytd", "1w", "1m", "3m", "924", "deepseek", "tariff"} <= set(keys)
+    assert {"ytd", "1w", "1m", "3m", "924", "deepseek", "tariff", "growth_rebound"} <= set(keys)
+    rebound = next(item for item in columns if item["key"] == "growth_rebound")
+    assert rebound["label"] == "2026-04-08 成长反弹确认"
+    assert rebound["start_date"] == "2026-04-08"
+    assert rebound["tier"] == "sector"
+    assert keys.index("growth_rebound") < keys.index("lianghui")
     assert len(columns) > 4
 
 
