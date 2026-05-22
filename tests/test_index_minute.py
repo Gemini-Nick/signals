@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from signals.sync.modules import index_minute, minute_readiness
-from signals.core.macro_universe import macro_a_index_codes
+from signals.core.macro_universe import macro_a_index_codes, macro_industry_etf_pure_codes, macro_watchlist
 
 
 class _BulkResult:
@@ -154,6 +154,7 @@ def test_index_minute_replaces_tail_docs_for_timeseries_compat_collection():
 
 def test_index_minute_universe_includes_macro_watchlist_a_indices_only():
     codes = macro_a_index_codes()
+    watchlist_names = {item["name"] for item in macro_watchlist()}
 
     assert codes["科创综指"] == "sh000680"
     assert codes["中证银行"] == "sz399986"
@@ -161,6 +162,23 @@ def test_index_minute_universe_includes_macro_watchlist_a_indices_only():
     assert "恒生科技ETF" not in codes
     assert "30年国债ETF" not in codes
     assert "中国石油" not in codes
+    assert "中国石油" not in watchlist_names
+    assert "半导体ETF" in watchlist_names
+    assert "半导体设备ETF" in watchlist_names
+    assert "通信ETF" in watchlist_names
+    assert "纳指100ETF" in watchlist_names
+    assert "机器人ETF" in watchlist_names
+    assert "恒生医药ETF" in watchlist_names
+    assert {
+        "511090",
+        "513130",
+        "512480",
+        "562590",
+        "515880",
+        "513100",
+        "159770",
+        "159506",
+    } <= set(macro_industry_etf_pure_codes())
 
 
 def test_minute_readiness_probe_uses_macro_index_universe():

@@ -409,6 +409,7 @@ def test_pinned_candidate_source_promotes_existing_terminal_symbol(monkeypatch):
 def test_stock_minute_selection_includes_terminal_clue_stocks(monkeypatch):
     monkeypatch.delenv("STOCK_MINUTE_SCOPE", raising=False)
     monkeypatch.setattr(stock_minute, "_iter_static_chain_representative_symbols", lambda: [])
+    monkeypatch.setattr(stock_minute, "_macro_etf_pure_codes", lambda: [])
 
     db = _Db({
         "terminal_stock_pool": _ProjectingCollection(doc={
@@ -429,6 +430,25 @@ def test_stock_minute_selection_includes_terminal_clue_stocks(monkeypatch):
     assert selected == ["300001", "300010"]
     assert meta["source_counts"]["terminal_stock_pool"] == 2
     assert meta["source_counts"]["technical_trigger"] == 1
+
+
+def test_stock_minute_selection_pins_macro_industry_etfs(monkeypatch):
+    monkeypatch.delenv("STOCK_MINUTE_SCOPE", raising=False)
+    monkeypatch.setenv("STOCK_MINUTE_SIGNAL_MAX_CODES", "10")
+    monkeypatch.setattr(stock_minute, "_macro_etf_pure_codes", lambda: ["511090", "512480"])
+
+    db = _Db({
+        "terminal_stock_pool": _ProjectingCollection(doc={}),
+        "sync_log": _Collection(),
+    })
+
+    selected, meta = stock_minute._get_active_symbols_with_meta(db)
+
+    assert selected == ["511090", "512480"]
+    assert meta["priority_symbols"] == ["511090", "512480"]
+    assert meta["pinned_symbols"] == ["511090", "512480"]
+    assert meta["source_counts"]["macro_industry_etfs"] == 2
+    assert meta["minute_scope"] == "terminal_stock_pool"
 
 
 def test_split_current_minute_tasks_skips_already_closed_bars():

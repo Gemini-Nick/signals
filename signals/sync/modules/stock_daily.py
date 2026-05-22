@@ -20,6 +20,7 @@ import pandas as pd
 import requests
 from pymongo.database import Database
 
+from signals.core.macro_universe import macro_industry_etf_pure_codes
 from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import is_trading_day, trading_day_key
 from ..proxy import em_proxy
@@ -63,6 +64,10 @@ _EM_SPOT_HEADERS = {
 }
 _SPOT_BATCH_LOCK = threading.Lock()
 _SPOT_BATCH_CACHE: dict[str, pd.DataFrame] = {}
+
+
+def _macro_etf_pure_codes() -> list[str]:
+    return macro_industry_etf_pure_codes()
 
 
 def _stock_daily_end_date_key(now: datetime | None = None) -> str:
@@ -775,6 +780,9 @@ def _get_active_stock_codes(db: Database) -> list[str]:
         "SIGNALS_PRIORITY_STOCK_CODES",
         default=os.getenv("STOCK_DAILY_DEFAULT_PRIORITY_CODES", _DEFAULT_PRIORITY_CODES),
     ):
+        add(symbol, priority=True)
+
+    for symbol in _macro_etf_pure_codes():
         add(symbol, priority=True)
 
     terminal_pool = db["terminal_stock_pool"].find_one(

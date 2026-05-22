@@ -11,6 +11,11 @@ def test_stock_to_market_symbol_maps_bj_920_codes():
     assert minute_sources.stock_to_market_symbol("900901") == "sh900901"
 
 
+def test_stock_to_market_symbol_maps_shenzhen_etfs():
+    assert minute_sources.stock_to_market_symbol("159770") == "sz159770"
+    assert minute_sources.stock_to_market_symbol("SZ.159506") == "sz159506"
+
+
 def test_fetch_public_minute_uses_sina_only_for_bj_symbols(monkeypatch):
     calls = []
 

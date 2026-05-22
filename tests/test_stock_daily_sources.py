@@ -127,6 +127,26 @@ def test_active_stock_codes_include_all_terminal_stock_pool_groups():
     assert "300004" in codes
 
 
+def test_active_stock_codes_include_macro_industry_etfs(monkeypatch):
+    monkeypatch.delenv("STOCK_DAILY_ONLY_CODES", raising=False)
+    monkeypatch.setenv("STOCK_DAILY_MAX_CODES", "0")
+    monkeypatch.setattr(stock_daily, "_macro_etf_pure_codes", lambda: ["511090", "513130"])
+
+    db = _DB({
+        "terminal_stock_pool": _Collection([{
+            "pool": "terminal_stock_pool",
+            "market": "A",
+            "stocks": [{"raw_code": "600001"}],
+        }]),
+    })
+
+    codes = stock_daily._get_active_stock_codes(db)
+
+    assert "511090" in codes
+    assert "513130" in codes
+    assert codes.index("511090") < codes.index("600001")
+
+
 def test_get_all_stock_codes_falls_back_to_cached_universe(monkeypatch):
     db = _DB({
         "sync_log": _Collection([

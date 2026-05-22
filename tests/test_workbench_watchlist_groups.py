@@ -446,14 +446,28 @@ def test_macro_indices_have_day_and_range_returns(monkeypatch):
 
     df = _bars()
     monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (df, "test_index_bars"))
-    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {"quote_status": "missing", "quote_status_label": "无行情"})
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (df, "test_stock_bars"))
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {
+        "quote_status": "missing",
+        "quote_status_label": "无行情",
+    } if "." not in str(symbol) else {
+        "quote_status": "realtime",
+        "latest_price": 120.0,
+        "day_change_pct": 0.5,
+        "day_change_mode": "quote_intraday",
+        "day_change_source": "test_quote",
+    })
 
     columns = workbench._watchlist_range_columns(date(2026, 4, 26))
     rows = workbench._build_macro_index_rows(reports=[], range_columns=columns)
+    names = {row["name"] for row in rows}
 
     assert rows
     assert rows[0]["kind"] == "index"
     assert rows[0]["target_kind"] == "index"
+    assert rows[0]["macro_group"] == "major_indices"
+    assert rows[0]["macro_group_label"] == "大盘指数"
+    assert rows[0]["display_type_label"] == "指数"
     assert rows[0]["target_freq"] == "30min"
     assert "5min" in rows[0]["available_freqs"]
     assert rows[0]["latest_price"] is not None
@@ -462,6 +476,35 @@ def test_macro_indices_have_day_and_range_returns(monkeypatch):
     assert rows[0]["latest_signal"]
     assert rows[0]["range_returns"]
     assert "theme_tags" in rows[0]
+    assert "中国石油" not in names
+    assert "半导体ETF" in names
+    assert "半导体设备ETF" in names
+    assert "通信ETF" in names
+    assert "纳指100ETF" in names
+    assert "机器人ETF" in names
+    assert "恒生医药ETF" in names
+
+    etf_row = next(row for row in rows if row["name"] == "30年国债ETF")
+    assert etf_row["target_kind"] == "stock"
+    assert etf_row["macro_group"] == "industry_etfs"
+    assert etf_row["macro_group_label"] == "行业ETF"
+    assert etf_row["display_type_label"] == "行业ETF"
+
+
+def test_macro_watchlist_rows_split_into_major_indices_and_industry_etfs():
+    from signals.web.api import workbench
+
+    rows = [
+        {"name": "上证指数", "target_kind": "index", "macro_group": "major_indices"},
+        {"name": "30年国债ETF", "target_kind": "stock", "macro_group": "industry_etfs"},
+        {"name": "兼容指数", "target_kind": "index"},
+        {"name": "兼容ETF", "target_kind": "stock"},
+    ]
+
+    major_indices, industry_etfs = workbench._split_macro_watchlist_rows(rows)
+
+    assert [row["name"] for row in major_indices] == ["上证指数", "兼容指数"]
+    assert [row["name"] for row in industry_etfs] == ["30年国债ETF", "兼容ETF"]
 
 
 def test_static_index_alias_resolves_shanghai_composite():

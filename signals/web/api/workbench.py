@@ -26,6 +26,10 @@ from signals.core.market_time import (
 )
 from signals.core.concept_carriers import load_industry_chains, non_chain_reason
 from signals.core.macro_universe import (
+    MACRO_GROUP_INDUSTRY_ETFS,
+    MACRO_GROUP_MAJOR_INDICES,
+    macro_group_label,
+    macro_group_type_label,
     macro_index_themes,
     macro_watchlist,
     supports_a_index_minute_cache,
@@ -5331,6 +5335,9 @@ def _build_macro_index_rows(
         name = _text(item.get("name"))
         symbol = _text(item.get("symbol"))
         kind = _text(item.get("kind")) or "index"
+        macro_group = _text(item.get("macro_group")) or (
+            MACRO_GROUP_MAJOR_INDICES if kind == "index" else MACRO_GROUP_INDUSTRY_ETFS
+        )
         if not name or not symbol:
             continue
         key = f"{kind}:{symbol.lower()}"
@@ -5368,6 +5375,9 @@ def _build_macro_index_rows(
             target_symbol = symbol
         enriched.update({
             "group": "macro_indices",
+            "macro_group": macro_group,
+            "macro_group_label": macro_group_label(macro_group),
+            "display_type_label": macro_group_type_label(macro_group),
             "lane": "quote_lane",
             "second_screen_role": "market_direction_anchor",
             "action_status": "观察",
@@ -5389,6 +5399,19 @@ def _build_macro_index_rows(
         })
         rows.append(enriched)
     return rows
+
+
+def _split_macro_watchlist_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    major_indices: list[dict[str, Any]] = []
+    industry_etfs: list[dict[str, Any]] = []
+    for row in rows:
+        macro_group = _text(row.get("macro_group"))
+        target_kind = _text(row.get("target_kind") or row.get("kind"))
+        if macro_group == MACRO_GROUP_INDUSTRY_ETFS or target_kind == "stock":
+            industry_etfs.append(row)
+        else:
+            major_indices.append(row)
+    return major_indices, industry_etfs
 
 
 def _preview_carrier(candidates: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -8206,6 +8229,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     ]
     reports = [_enrich_index_row(report, range_columns) for report in reports_raw]
     macro_indices = _build_macro_index_rows(reports=reports_raw, range_columns=range_columns)
+    major_indices, industry_etfs = _split_macro_watchlist_rows(macro_indices)
     strategy_candidates = [
         dict(item)
         for item in strategy_snapshot.get("candidates", [])
@@ -8313,6 +8337,8 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
             "data_warning": cluster.get("data_warning", ""),
         },
         "watchlist_groups": {
+            "major_indices": major_indices,
+            "industry_etfs": industry_etfs,
             "macro_indices": macro_indices,
             "sector_boards": sector_boards_shell,
             "buy_candidates": scored_shell,
@@ -8321,6 +8347,16 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
             "watch_stocks": watch_stocks_shell,
         },
         "watchlist_groups_meta": {
+            "major_indices": {
+                "label": "大盘指数",
+                "source_collection": "index_bars",
+                "count": len(major_indices),
+            },
+            "industry_etfs": {
+                "label": "行业ETF",
+                "source_collection": "bars + quote_snapshots",
+                "count": len(industry_etfs),
+            },
             "macro_indices": {
                 "label": "宏观指数",
                 "source_collection": "index_bars",

@@ -32,7 +32,7 @@ def stock_to_market_symbol(code: str) -> str:
         return f"bj{pure}"
     if pure.startswith(("6", "5", "9")):
         return f"sh{pure}"
-    if pure.startswith(("0", "2", "3")):
+    if pure.startswith(("0", "1", "2", "3")):
         return f"sz{pure}"
     if pure.startswith(("4", "8")):
         return f"bj{pure}"

@@ -18,7 +18,7 @@ import akshare as ak
 import pandas as pd
 from pymongo.database import Database
 
-from signals.core.macro_universe import macro_a_index_pure_codes
+from signals.core.macro_universe import macro_a_index_pure_codes, macro_industry_etf_pure_codes
 from signals.core.market_time import naive_market_now, to_market_naive
 from ..proxy import em_proxy
 from ..retry import sync_retry
@@ -31,6 +31,10 @@ logger = logging.getLogger("signals.sync.stock_minute")
 _MINUTE_FREQS = ["5分钟", "15分钟", "30分钟"]
 _DEFAULT_PRIORITY_CODES = "688802,300575"
 _DEFAULT_TAIL_COUNTS = {"5分钟": 240, "15分钟": 160, "30分钟": 120}
+
+
+def _macro_etf_pure_codes() -> list[str]:
+    return macro_industry_etf_pure_codes()
 
 
 def _parse_freqs(raw: str) -> list[str]:
@@ -845,6 +849,21 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
             pinned=True,
             symbol_sources=symbol_sources,
         )
+
+    if not postmarket_scope:
+        for symbol in _macro_etf_pure_codes():
+            _add_candidate(
+                symbols,
+                source_counts,
+                priority_symbols,
+                pinned_symbols,
+                index_codes,
+                symbol,
+                "macro_industry_etfs",
+                priority=True,
+                pinned=True,
+                symbol_sources=symbol_sources,
+            )
 
     if not symbols and postmarket_scope:
         _add_postmarket_expanded_candidates(
