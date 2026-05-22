@@ -353,6 +353,10 @@ class SignalsPack:
             "mode": mode,
             "updated_at": utc_now().isoformat(),
             "error": error,
+            "recovery_state": "unavailable",
+            "critical_blocker": {},
+            "daily_coverage_date": "",
+            "terminal_ready_date": "",
             "live_low_latency": {"modules": [], "summary": {}},
             "postmarket_backfill": {"run": None, "tasks": [], "summary": {}},
             "mongo_stock_cache": {"freqs": [], "summary": {}},
@@ -381,11 +385,25 @@ class SignalsPack:
         terminal_outputs = self._cache_terminal_outputs(db)
         provider_health = self._cache_provider_health(db)
         blockers = self._cache_blockers(live, postmarket, provider_health)
+        daily_coverage_date = str((mongo_cache.get("summary") or {}).get("daily_coverage_date") or "")
+        terminal_ready_date = self._cache_terminal_ready_date(trade_date, postmarket, terminal_outputs)
+        critical_blocker = self._cache_critical_blocker(postmarket, provider_health)
+        recovery_state = self._cache_recovery_state(
+            trade_date=trade_date,
+            daily_coverage_date=daily_coverage_date,
+            terminal_ready_date=terminal_ready_date,
+            postmarket=postmarket,
+            critical_blocker=critical_blocker,
+        )
         return {
             "available": True,
             "mode": "mongo",
             "updated_at": utc_now().isoformat(),
             "trade_date": trade_date,
+            "recovery_state": recovery_state,
+            "critical_blocker": critical_blocker,
+            "daily_coverage_date": daily_coverage_date,
+            "terminal_ready_date": terminal_ready_date,
             "live_low_latency": live,
             "postmarket_backfill": postmarket,
             "mongo_stock_cache": mongo_cache,
@@ -611,6 +629,10 @@ class SignalsPack:
                 "run_id": run_id,
                 "trade_date": str(run.get("trade_date") or ""),
                 "status": run_status,
+                "recovery_state": str(run.get("recovery_state") or ""),
+                "critical_blocker": _json_safe(run.get("critical_blocker") or {}),
+                "blocked_tasks": _json_safe(run.get("blocked_tasks") or []),
+                "optional_blocked_tasks": _json_safe(run.get("optional_blocked_tasks") or []),
                 "phase": str(run.get("phase") or ""),
                 "owner_pid": run.get("owner_pid") or "",
                 "started_at": self._iso(run.get("started_at")),
@@ -635,6 +657,8 @@ class SignalsPack:
                 "optional_status_counts": optional_status_counts,
                 "eta_seconds": eta_seconds,
                 "sample_errors": _json_safe(sample_errors[:10]),
+                "recovery_state": str(run.get("recovery_state") or ""),
+                "critical_blocker": _json_safe(run.get("critical_blocker") or {}),
                 "stock_daily_landing_rate": stock_daily_progress.get("landing_rate", 0),
                 "stock_daily_inserted_per_min": stock_daily_progress.get("inserted_per_min", 0),
                 "stock_daily_missing_symbols": stock_daily_progress.get("missing_symbols", 0),
@@ -836,9 +860,44 @@ class SignalsPack:
                 "generated": bool(latest),
                 "count": self._count(db, collection, {}),
                 "latest_at": self._iso((latest or {}).get(sort_field) or (latest or {}).get("updated_at")),
+                "ready_date": self._terminal_doc_date(latest or {}),
                 "status": (latest or {}).get("status") or ("ok" if latest else "missing"),
             })
         return rows
+
+    def _terminal_doc_date(self, doc: Mapping[str, Any]) -> str:
+        for key in ("trade_date", "as_of", "date", "dt"):
+            value = doc.get(key)
+            if value:
+                text = self._iso(value)[:10]
+                if text:
+                    return text
+        return ""
+
+    def _cache_terminal_ready_date(
+        self,
+        trade_date: str,
+        postmarket: Mapping[str, Any],
+        terminal_outputs: List[Dict[str, Any]],
+    ) -> str:
+        tasks = [
+            task
+            for task in postmarket.get("tasks", [])
+            if str(task.get("module") or "") in {"terminal_realtime_pool", "strategy_snapshot", "cache_preheat"}
+        ]
+        if (
+            str((postmarket.get("run") or {}).get("trade_date") or "")[:10] == str(trade_date or "")[:10]
+            and tasks
+            and all(str(task.get("status") or "") == "ok" for task in tasks)
+        ):
+            return str(trade_date or "")[:10]
+        dates = [
+            str(item.get("ready_date") or "")[:10]
+            for item in terminal_outputs
+            if str(item.get("collection") or "") in {"terminal_stock_pool", "strategy_snapshots"}
+            and str(item.get("ready_date") or "")[:10]
+        ]
+        return min(dates) if dates else ""
 
     def _cache_provider_health(self, db) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
@@ -867,8 +926,108 @@ class SignalsPack:
             })
         return rows
 
+    def _provider_blocker_row(self, item: Mapping[str, Any]) -> Dict[str, Any]:
+        return {
+            "scope": "provider_health",
+            "module": item.get("provider"),
+            "provider": item.get("provider"),
+            "endpoint": item.get("endpoint"),
+            "domain": item.get("domain") or "",
+            "status": item.get("status"),
+            "error_msg": item.get("last_error_type") or item.get("cooldown_hit_type") or "",
+            "last_error_at": item.get("last_error_at") or "",
+            "last_success_at": item.get("last_success_at") or "",
+            "cooldown_until": item.get("cooldown_until") or "",
+        }
+
+    @staticmethod
+    def _is_fullmarket_provider(item: Mapping[str, Any]) -> bool:
+        return (
+            str(item.get("provider") or "") == "eastmoney"
+            and str(item.get("endpoint") or "") == "fullmarket_spot_snapshot"
+        )
+
+    def _provider_problem_blockers(self, provider_health: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for item in provider_health or []:
+            status = str(item.get("status") or "")
+            if status in {"degraded", "error", "stale"} and not item.get("updated_at"):
+                continue
+            if status in {"degraded", "cooldown", "error", "stale"} and self._provider_has_healthy_peer(item, provider_health or []):
+                continue
+            if status in {"degraded", "cooldown", "error", "stale"}:
+                rows.append(self._provider_blocker_row(item))
+        rows.sort(key=lambda item: 0 if self._is_fullmarket_provider(item) else 1)
+        return rows
+
+    def _cache_critical_blocker(
+        self,
+        postmarket: Mapping[str, Any],
+        provider_health: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        provider_blocker = next(
+            (item for item in self._provider_problem_blockers(provider_health) if self._is_fullmarket_provider(item)),
+            None,
+        )
+        if provider_blocker:
+            return provider_blocker
+        provider_recovered = any(
+            self._is_fullmarket_provider(item)
+            and str(item.get("status") or "") in {"ok", "running"}
+            and bool(item.get("last_success_at"))
+            for item in provider_health or []
+        )
+        run = postmarket.get("run") if isinstance(postmarket.get("run"), Mapping) else {}
+        run_blocker = run.get("critical_blocker") if isinstance(run.get("critical_blocker"), Mapping) else {}
+        if run_blocker and self._is_fullmarket_provider(run_blocker) and not provider_recovered:
+            return _json_safe(dict(run_blocker))
+        if not provider_recovered:
+            for task in postmarket.get("tasks", []):
+                if str(task.get("module") or "") != "fullmarket_spot_snapshot":
+                    continue
+                status = str(task.get("status") or "")
+                if status in {"degraded", "error", "stale"}:
+                    return {
+                        "scope": "postmarket_backfill",
+                        "module": "fullmarket_spot_snapshot",
+                        "provider": "eastmoney",
+                        "endpoint": "fullmarket_spot_snapshot",
+                        "status": status,
+                        "error_msg": task.get("error_msg") or "",
+                    }
+        return {}
+
+    def _cache_recovery_state(
+        self,
+        *,
+        trade_date: str,
+        daily_coverage_date: str,
+        terminal_ready_date: str,
+        postmarket: Mapping[str, Any],
+        critical_blocker: Mapping[str, Any],
+    ) -> str:
+        if critical_blocker:
+            run_state = str(((postmarket.get("run") or {}).get("recovery_state") if isinstance(postmarket.get("run"), Mapping) else "") or "")
+            return run_state if run_state in {"waiting_for_source", "partial/source_blocked"} else "source_blocked"
+        run = postmarket.get("run") if isinstance(postmarket.get("run"), Mapping) else {}
+        run_status = str(run.get("status") or "")
+        if (
+            str(trade_date or "")[:10]
+            and str(daily_coverage_date or "")[:10]
+            and str(daily_coverage_date or "")[:10] != str(trade_date or "")[:10]
+        ):
+            return "old_cache_readable"
+        if str(trade_date or "")[:10] and terminal_ready_date and terminal_ready_date == str(trade_date or "")[:10]:
+            return "terminal_ready"
+        if run_status in {"running", "partial"}:
+            return "postmarket_running"
+        if run_status == "ok":
+            return "ok"
+        return run_status or "unknown"
+
     def _cache_blockers(self, live: Dict[str, Any], postmarket: Dict[str, Any], provider_health: List[Dict[str, Any]] | None = None) -> List[Dict[str, Any]]:
         blockers: List[Dict[str, Any]] = []
+        provider_blockers = self._provider_problem_blockers(provider_health or [])
         for item in live.get("modules", []):
             status = str(item.get("status") or "")
             failed_calls = self._int_from_result(item, "failed_calls") or self._int_from_result(item, "errors")
@@ -918,22 +1077,7 @@ class SignalsPack:
                 if isinstance(errors, list):
                     row["sample_errors"] = [*row.get("sample_errors", []), *errors[:3]][:6]
         blockers.extend(postmarket_by_module.values())
-        for item in provider_health or []:
-            status = str(item.get("status") or "")
-            if status in {"degraded", "error", "stale"} and not item.get("updated_at"):
-                continue
-            if status in {"degraded", "cooldown", "error", "stale"} and self._provider_has_healthy_peer(item, provider_health or []):
-                continue
-            if status in {"degraded", "cooldown", "error", "stale"}:
-                blockers.append({
-                    "scope": "provider_health",
-                    "module": item.get("provider"),
-                    "endpoint": item.get("endpoint"),
-                    "status": status,
-                    "error_msg": item.get("last_error_type") or item.get("cooldown_hit_type") or "",
-                    "cooldown_until": item.get("cooldown_until") or "",
-                })
-        return blockers[:12]
+        return [*provider_blockers, *blockers][:12]
 
     @staticmethod
     def _provider_has_healthy_peer(item: Mapping[str, Any], provider_health: List[Dict[str, Any]]) -> bool:

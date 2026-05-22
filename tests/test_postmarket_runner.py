@@ -540,6 +540,96 @@ def test_postmarket_same_phase_dependency_runs_after_parent_finishes(monkeypatch
     assert db["sync_tasks"].docs["postmarket:2026-04-28:beta:all"]["status"] == "ok"
 
 
+def test_postmarket_fullmarket_degraded_sets_source_blocker_and_fallback_tasks(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("fullmarket_spot_snapshot", "market_data"),
+        pm.PostmarketTaskSpec("quote_snapshots", "market_data", depends_on=("fullmarket_spot_snapshot:all",)),
+        pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00", depends_on=("fullmarket_spot_snapshot:all",)),
+        pm.PostmarketTaskSpec("weekly_rollup", "derived", depends_on=("stock_daily:shard_00",)),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data", "derived"))
+
+    calls = []
+
+    def fullmarket(db, proxy_url=None):
+        calls.append("fullmarket_spot_snapshot")
+        return {"status": "degraded", "reason": "SSLError: certificate verify failed", "count": 0}
+
+    def quote_snapshots(db, proxy_url=None):
+        calls.append("quote_snapshots")
+        return {"status": "ok", "count": 10, "live": 8, "errors": 0}
+
+    def stock_daily(db, proxy_url=None):
+        calls.append("stock_daily")
+        return {
+            "status": "ok",
+            "processed": 100,
+            "total": 100,
+            "progress_pct": 100.0,
+            "coverage_pct": 100.0,
+            "errors": 0,
+            "deferred": 0,
+        }
+
+    def weekly_rollup(db, proxy_url=None):
+        calls.append("weekly_rollup")
+        return {"status": "ok"}
+
+    db = _Db()
+    engine = _Engine(db, {
+        "fullmarket_spot_snapshot": (fullmarket, ""),
+        "quote_snapshots": (quote_snapshots, ""),
+        "stock_daily": (stock_daily, ""),
+        "weekly_rollup": (weekly_rollup, ""),
+    })
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(trade_date="2026-04-28")
+
+    assert result["status"] == "partial"
+    assert result["recovery_state"] == "partial/source_blocked"
+    assert result["critical_blocker"]["provider"] == "eastmoney"
+    assert result["critical_blocker"]["endpoint"] == "fullmarket_spot_snapshot"
+    assert result["blocked_tasks"] == ["fullmarket_spot_snapshot:all"]
+    assert calls == ["fullmarket_spot_snapshot", "quote_snapshots", "stock_daily", "weekly_rollup"]
+    quote_task = db["sync_tasks"].docs["postmarket:2026-04-28:quote_snapshots:all"]
+    stock_task = db["sync_tasks"].docs["postmarket:2026-04-28:stock_daily:shard_00"]
+    assert quote_task["status"] == "partial"
+    assert quote_task["result_summary"]["source_fallback"] is True
+    assert quote_task["result_summary"]["partial_usable"] is True
+    assert stock_task["status"] == "partial"
+    assert stock_task["result_summary"]["source_fallback"] is True
+    assert stock_task["result_summary"]["partial_usable"] is True
+    assert db["sync_tasks"].docs["postmarket:2026-04-28:weekly_rollup:all"]["status"] == "ok"
+
+
+def test_postmarket_init_run_clears_stale_terminal_blocker_fields():
+    db = _Db()
+    db["sync_runs"].docs["postmarket:2026-04-28"] = {
+        "_id": "postmarket:2026-04-28",
+        "run_id": "postmarket:2026-04-28",
+        "trade_date": "2026-04-28",
+        "status": "partial",
+        "finished_at": datetime(2026, 4, 28, 18, 0),
+        "blocked_tasks": ["fullmarket_spot_snapshot:all"],
+        "optional_blocked_tasks": ["hk_stock_daily:shard_00"],
+        "critical_blocker": {"endpoint": "fullmarket_spot_snapshot"},
+        "recovery_state": "waiting_for_source",
+    }
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+
+    runner._init_run("postmarket:2026-04-28", "2026-04-28")
+
+    run = db["sync_runs"].docs["postmarket:2026-04-28"]
+    assert run["status"] == "running"
+    assert run["finished_at"] is None
+    assert run["blocked_tasks"] == []
+    assert run["optional_blocked_tasks"] == []
+    assert run["critical_blocker"] == {}
+    assert run["recovery_state"] == "running"
+
+
 def test_postmarket_stock_daily_cooling_partial_unlocks_downstream(monkeypatch):
     tasks = (
         pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00"),

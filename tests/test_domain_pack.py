@@ -410,6 +410,97 @@ def test_provider_health_blocker_ignores_degraded_source_with_healthy_peer():
     assert blockers == []
 
 
+def test_cache_recovery_state_reports_old_daily_cache():
+    from signals.domain_pack import SignalsPack
+
+    state = SignalsPack()._cache_recovery_state(
+        trade_date="2026-05-13",
+        daily_coverage_date="2026-05-12",
+        terminal_ready_date="",
+        postmarket={"run": {"status": "running"}},
+        critical_blocker={},
+    )
+
+    assert state == "old_cache_readable"
+
+
+def test_fullmarket_provider_blocker_is_prioritized():
+    from signals.domain_pack import SignalsPack
+
+    pack = SignalsPack()
+    provider_health = [
+        {
+            "provider": "sina",
+            "endpoint": "stock_minute",
+            "domain": "minute",
+            "status": "degraded",
+            "last_error_type": "ReadTimeout",
+            "last_error_at": "2026-05-13T09:01:00",
+            "updated_at": "2026-05-13T09:01:00",
+        },
+        {
+            "provider": "eastmoney",
+            "endpoint": "fullmarket_spot_snapshot",
+            "domain": "market_data",
+            "status": "degraded",
+            "last_error_type": "SSLError",
+            "last_error_at": "2026-05-13T09:02:00",
+            "last_success_at": "2026-05-12T16:12:00",
+            "updated_at": "2026-05-13T09:02:00",
+        },
+    ]
+
+    blocker = pack._cache_critical_blocker({"run": {}, "tasks": []}, provider_health)
+    blockers = pack._cache_blockers({"modules": []}, {"tasks": []}, provider_health)
+
+    assert blocker["provider"] == "eastmoney"
+    assert blocker["endpoint"] == "fullmarket_spot_snapshot"
+    assert blocker["last_success_at"] == "2026-05-12T16:12:00"
+    assert blockers[0]["endpoint"] == "fullmarket_spot_snapshot"
+
+
+def test_fullmarket_provider_recovery_hides_stale_run_blocker():
+    from signals.domain_pack import SignalsPack
+
+    pack = SignalsPack()
+    postmarket = {
+        "run": {
+            "status": "partial",
+            "recovery_state": "waiting_for_source",
+            "critical_blocker": {
+                "provider": "eastmoney",
+                "endpoint": "fullmarket_spot_snapshot",
+                "status": "degraded",
+            },
+        },
+        "tasks": [
+            {"module": "fullmarket_spot_snapshot", "status": "degraded", "error_msg": "old SSL error"},
+        ],
+    }
+    provider_health = [
+        {
+            "provider": "eastmoney",
+            "endpoint": "fullmarket_spot_snapshot",
+            "domain": "market_data",
+            "status": "ok",
+            "last_success_at": "2026-05-13T09:10:00",
+            "updated_at": "2026-05-13T09:10:00",
+        }
+    ]
+
+    blocker = pack._cache_critical_blocker(postmarket, provider_health)
+    state = pack._cache_recovery_state(
+        trade_date="2026-05-13",
+        daily_coverage_date="2026-05-13",
+        terminal_ready_date="",
+        postmarket=postmarket,
+        critical_blocker=blocker,
+    )
+
+    assert blocker == {}
+    assert state == "postmarket_running"
+
+
 def test_completed_postmarket_progress_is_done_even_with_stale_task_progress():
     from signals.domain_pack import SignalsPack
 

@@ -23,6 +23,9 @@ RUN_OK_STATUSES = {"ok"}
 TASK_OK_STATUSES = {"ok"}
 RUN_TERMINAL_STATUSES = {"ok"}
 RETRYABLE_TASK_STATUSES = {"pending", "running", "stale", "partial", "degraded", "error", "deferred"}
+FULLMARKET_SPOT_TASK_KEY = "fullmarket_spot_snapshot:all"
+SOURCE_FALLBACK_MODULES = {"quote_snapshots", "stock_daily"}
+SOURCE_BLOCKED_STATUSES = {"degraded", "error", "stale"}
 
 
 @dataclass(frozen=True)
@@ -376,6 +379,10 @@ def _summarize_result(result: Any) -> dict[str, Any]:
         "original_groups",
         "incremental",
         "reason_counts",
+        "source_fallback",
+        "partial_usable",
+        "degraded_dependencies",
+        "recovery_state",
         "result",
     }
     summary: dict[str, Any] = {}
@@ -441,20 +448,80 @@ def _stock_daily_dependency_ok(task_doc: dict[str, Any]) -> bool:
     return sparse_errors_ok and (processed_all or progress_done) and coverage_pct >= min_coverage
 
 
+def _quote_snapshots_dependency_ok(task_doc: dict[str, Any]) -> bool:
+    summary, nested = _result_sources(task_doc)
+    if not (summary.get("partial_usable") or nested.get("partial_usable")):
+        return False
+    count = _result_number(task_doc, "count")
+    live = _result_number(task_doc, "live")
+    errors = _result_number(task_doc, "errors")
+    if count <= 0:
+        return False
+    coverage_pct = live / count * 100.0
+    min_coverage = _env_float("SIGNALS_POSTMARKET_QUOTE_PARTIAL_MIN_COVERAGE", 50.0)
+    max_error_pct = _env_float("SIGNALS_POSTMARKET_QUOTE_PARTIAL_MAX_ERROR_PCT", 50.0)
+    error_pct = errors / count * 100.0
+    return coverage_pct >= min_coverage and error_pct <= max_error_pct
+
+
 def _dependency_status_ok(task_doc: dict[str, Any]) -> bool:
     status = str(task_doc.get("status") or "pending")
     if status in TASK_OK_STATUSES:
         return True
     if status not in {"partial", "degraded"}:
         return False
-    if str(task_doc.get("module") or "") in {"stock_daily", "hk_stock_daily"}:
+    module = str(task_doc.get("module") or "")
+    if module in {"stock_daily", "hk_stock_daily"}:
         return _stock_daily_dependency_ok(task_doc)
+    if module == "quote_snapshots":
+        return _quote_snapshots_dependency_ok(task_doc)
     return False
 
 
 def _task_effectively_done(task_doc: dict[str, Any]) -> bool:
     """True when a previous task attempt is good enough to resume past."""
     return _dependency_status_ok(task_doc)
+
+
+def _source_dependency_blocked(task_doc: dict[str, Any]) -> bool:
+    status = str(task_doc.get("status") or "pending")
+    if status in TASK_OK_STATUSES or status in {"pending", "running"}:
+        return False
+    return status in SOURCE_BLOCKED_STATUSES or bool(task_doc.get("error_msg"))
+
+
+def _source_fallback_usable(spec: PostmarketTaskSpec, result: dict[str, Any]) -> bool:
+    result_summary = _summarize_result(result)
+    task_doc = {"module": spec.module, "status": "partial", "result_summary": result_summary}
+    if spec.module == "stock_daily":
+        return _stock_daily_dependency_ok(task_doc)
+    if spec.module == "quote_snapshots":
+        return _quote_snapshots_dependency_ok({
+            **task_doc,
+            "result_summary": {
+                **result_summary,
+                "partial_usable": True,
+            },
+        })
+    return False
+
+
+def _source_blocker_from_task(task_doc: dict[str, Any]) -> dict[str, Any]:
+    summary, nested = _result_sources(task_doc)
+    error_msg = (
+        str(task_doc.get("error_msg") or "")
+        or str(summary.get("reason") or summary.get("error") or summary.get("error_msg") or "")
+        or str(nested.get("reason") or nested.get("error") or nested.get("error_msg") or "")
+    )
+    return {
+        "scope": "postmarket_backfill",
+        "module": "fullmarket_spot_snapshot",
+        "provider": "eastmoney",
+        "endpoint": "fullmarket_spot_snapshot",
+        "task_key": FULLMARKET_SPOT_TASK_KEY,
+        "status": str(task_doc.get("status") or "pending"),
+        "error_msg": error_msg[:1000],
+    }
 
 
 class PostmarketRunner:
@@ -499,11 +566,29 @@ class PostmarketRunner:
         doc = self.db["sync_tasks"].find_one({"_id": f"{run_id}:{task_key}"}, {"status": 1}) or {}
         return str(doc.get("status") or "pending")
 
+    def _soft_dependency_allowed(self, spec: PostmarketTaskSpec, dep: str, dep_doc: dict[str, Any]) -> bool:
+        return (
+            dep == FULLMARKET_SPOT_TASK_KEY
+            and spec.module in SOURCE_FALLBACK_MODULES
+            and _source_dependency_blocked(dep_doc)
+        )
+
+    def _soft_failed_dependencies(self, run_id: str, spec: PostmarketTaskSpec) -> list[dict[str, Any]]:
+        failed: list[dict[str, Any]] = []
+        for dep in spec.depends_on:
+            doc = self.db["sync_tasks"].find_one({"_id": f"{run_id}:{dep}"}) or {}
+            if _dependency_status_ok(doc):
+                continue
+            if self._soft_dependency_allowed(spec, dep, doc):
+                failed.append({"task_key": dep, "status": str(doc.get("status") or "pending")})
+        return failed
+
     def _dependencies_ok(self, run_id: str, spec: PostmarketTaskSpec) -> bool:
         for dep in spec.depends_on:
             doc = self.db["sync_tasks"].find_one({"_id": f"{run_id}:{dep}"}) or {}
             if not _dependency_status_ok(doc):
-                return False
+                if not self._soft_dependency_allowed(spec, dep, doc):
+                    return False
         return True
 
     def _init_run(self, run_id: str, trade_date: str) -> None:
@@ -519,11 +604,15 @@ class PostmarketRunner:
                     "heartbeat_at": now,
                     "updated_at": now,
                     "task_count": len(POSTMARKET_TASKS),
+                    "finished_at": None,
+                    "blocked_tasks": [],
+                    "optional_blocked_tasks": [],
+                    "critical_blocker": {},
+                    "recovery_state": "running",
                 },
                 "$setOnInsert": {
                     "started_at": now,
                     "phase": "",
-                    "finished_at": None,
                 },
             },
             upsert=True,
@@ -795,6 +884,7 @@ class PostmarketRunner:
         return EnvGuard(env)
 
     def _run_task(self, run_id: str, spec: PostmarketTaskSpec) -> dict[str, Any]:
+        soft_failed_deps = self._soft_failed_dependencies(run_id, spec)
         if spec.module not in self.engine.module_map:
             self._mark_task_started(run_id, spec)
             result = {"module": spec.module, "status": "error", "error": "module_missing"}
@@ -811,6 +901,23 @@ class PostmarketRunner:
                 with semaphore:
                     self._mark_task_started(run_id, spec)
                     result = self.engine.run_module(spec.module, fn, plan=plan)
+        if soft_failed_deps and isinstance(result, dict):
+            result = dict(result)
+            nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+            partial_usable = _source_fallback_usable(spec, result)
+            if str(result.get("status") or "ok") == "ok":
+                result["status"] = "partial"
+            result["source_fallback"] = True
+            result["partial_usable"] = partial_usable
+            result["degraded_dependencies"] = soft_failed_deps
+            result["recovery_state"] = "source_fallback"
+            if nested:
+                result["result"] = {
+                    **nested,
+                    "source_fallback": True,
+                    "partial_usable": partial_usable,
+                    "degraded_dependencies": soft_failed_deps,
+                }
         self._mark_task_finished(run_id, spec, result)
         return result
 
@@ -1000,7 +1107,7 @@ class PostmarketRunner:
 
         task_docs = list(self.db["sync_tasks"].find(
             {"run_id": run_id},
-            {"module": 1, "task_key": 1, "status": 1, "phase": 1, "updated_at": 1, "result_summary": 1},
+            {"module": 1, "task_key": 1, "status": 1, "phase": 1, "updated_at": 1, "result_summary": 1, "error_msg": 1},
         ))
         blocking_task_keys = {task.task_key for task in POSTMARKET_TASKS if task.blocks_run}
         incomplete = [
@@ -1015,7 +1122,30 @@ class PostmarketRunner:
         ]
         blocked_critical = {task_key for task_key in blocked if task_key in blocking_task_keys}
         blocked_optional = {task_key for task_key in blocked if task_key not in blocking_task_keys}
+        source_blocker_task = next(
+            (
+                doc for doc in task_docs
+                if str(doc.get("task_key") or "") == FULLMARKET_SPOT_TASK_KEY
+                and not _task_effectively_done(doc)
+                and _source_dependency_blocked(doc)
+            ),
+            None,
+        )
+        critical_blocker = _source_blocker_from_task(source_blocker_task) if source_blocker_task else {}
+        if critical_blocker:
+            blocked_critical.add(FULLMARKET_SPOT_TASK_KEY)
+        source_fallback_used = False
+        for doc in task_docs:
+            summary = doc.get("result_summary") if isinstance(doc.get("result_summary"), dict) else {}
+            nested = summary.get("result") if isinstance(summary.get("result"), dict) else {}
+            if summary.get("source_fallback") or nested.get("source_fallback"):
+                source_fallback_used = True
+                break
         status = "ok" if not incomplete and not blocked_critical else "partial"
+        if critical_blocker:
+            recovery_state = "partial/source_blocked" if source_fallback_used else "waiting_for_source"
+        else:
+            recovery_state = "ok" if status == "ok" else "partial"
         now = _naive_bj()
         self.db["sync_runs"].update_one(
             {"_id": run_id},
@@ -1027,6 +1157,8 @@ class PostmarketRunner:
                 "finished_at": now,
                 "blocked_tasks": sorted(blocked_critical),
                 "optional_blocked_tasks": sorted(blocked_optional),
+                "critical_blocker": critical_blocker,
+                "recovery_state": recovery_state,
                 "ok_tasks": len(task_docs) - len(incomplete),
                 "incomplete_tasks": len(incomplete),
                 "optional_incomplete_tasks": len(optional_incomplete),
@@ -1039,6 +1171,8 @@ class PostmarketRunner:
             "results": results,
             "blocked_tasks": sorted(blocked_critical),
             "optional_blocked_tasks": sorted(blocked_optional),
+            "critical_blocker": critical_blocker,
+            "recovery_state": recovery_state,
             "ok_tasks": len(task_docs) - len(incomplete),
             "incomplete_tasks": len(incomplete),
             "optional_incomplete_tasks": len(optional_incomplete),
