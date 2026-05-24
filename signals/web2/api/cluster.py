@@ -230,12 +230,31 @@ def get_board_stocks(board: str = ""):
 
     try:
         from signals.layers.industry import get_industry_stocks
+        try:
+            from signals.core.stock_names import get_resolver
+            resolver = get_resolver()
+        except Exception:
+            resolver = None
+
         symbols = get_industry_stocks(board)
         if not symbols:
             return {"board": board, "stocks": [], "error": f"未找到 {board} 的成分股"}
 
         # 获取实时快照（涨跌幅）
         stocks = []
+        def futu_symbol(symbol: str, code: str) -> str:
+            if "." in symbol:
+                return symbol
+            if len(code) == 6:
+                return f"SH.{code}" if code.startswith(("5", "6", "9")) else f"SZ.{code}"
+            return symbol
+
+        def display_name(symbol: str, code: str) -> str:
+            if resolver is None:
+                return code
+            name = resolver.get_name(futu_symbol(symbol, code))
+            return name if name and name != code else code
+
         try:
             import akshare as ak
             # 尝试获取实时行情
@@ -244,11 +263,18 @@ def get_board_stocks(board: str = ""):
                 stocks.append({
                     "symbol": sym,
                     "code": code,
-                    "name": code,  # 后续可从缓存获取名称
+                    "name": display_name(sym, code),
                 })
         except Exception:
             # 降级: 仅返回代码列表
-            stocks = [{"symbol": s, "code": s.replace("SH.", "").replace("SZ.", ""), "name": ""} for s in symbols[:50]]
+            stocks = [
+                {
+                    "symbol": s,
+                    "code": s.replace("SH.", "").replace("SZ.", ""),
+                    "name": display_name(s, s.replace("SH.", "").replace("SZ.", "")),
+                }
+                for s in symbols[:50]
+            ]
 
         return {
             "board": board,
