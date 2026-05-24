@@ -16,7 +16,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import config
-from signals.core.backtest_terminal import build_backtest_terminal, build_scan_terminal
+from signals.core.backtest_terminal import build_backtest_terminal, build_batch_terminal, build_scan_terminal
 from signals.core.market_time import to_unix_seconds
 
 logger = logging.getLogger(__name__)
@@ -2173,7 +2173,11 @@ async def backtest_batch(request: Request):
             try:
                 market = _detect_market(code)
                 symbol = _build_symbol(code, market)
-                freq_label = "日线" if freq == "daily" else "周线"
+                freq_norm = _normalize_freq(freq)
+                freq_label = _freq_label(freq_norm)
+                stock_result["symbol"] = symbol
+                stock_result["market"] = market
+                stock_result["freq"] = freq_label
 
                 # 获取名称
                 if resolver:
@@ -2191,6 +2195,10 @@ async def backtest_batch(request: Request):
                     stock_result["error"] = "无可用数据"
                     stocks.append(stock_result)
                     continue
+                meta = _kline_meta(df, freq_norm)
+                stock_result.update(meta)
+                stock_result["bar_count"] = int(len(df))
+                stock_result["ohlcv_tail"] = _serialize_ohlcv(df.tail(120))
 
                 # 信号检测
                 all_signals, _, _, _ = _detect_all_signals(
@@ -2231,7 +2239,7 @@ async def backtest_batch(request: Request):
         ok_stocks = [s for s in stocks if s["status"] == "ok" and s.get("trade_count", 0) > 0]
         overall_expectancy = round(sum(s.get("expectancy", 0) for s in ok_stocks) / len(ok_stocks), 2) if ok_stocks else 0
 
-        return {
+        result = {
             "summary": {
                 "total_stocks": len(codes),
                 "ok_stocks": len(ok_stocks),
@@ -2239,9 +2247,21 @@ async def backtest_batch(request: Request):
                 "total_trades": total_trades,
                 "overall_win_rate": overall_win_rate,
                 "overall_expectancy": overall_expectancy,
+                "bar_count": sum(int(s.get("bar_count") or 0) for s in stocks),
             },
             "stocks": stocks,
         }
+        result["terminal"] = build_batch_terminal(result, context={
+            "freq": _freq_label(_normalize_freq(freq)),
+            "market": "A" if any(_detect_market(code) == "A" for code in codes) else "HK",
+            "sim_config": dataclasses.asdict(sim_config),
+            "benchmark_symbol": body.get("benchmark_symbol", ""),
+            "benchmark_name": body.get("benchmark_name", ""),
+            "benchmark_phase": body.get("benchmark_phase", ""),
+            "benchmark_return_pct": body.get("benchmark_return_pct", 0),
+            "date_presets": _get_date_presets(),
+        })
+        return result
 
     except Exception as e:
         logger.exception("批量回测失败")

@@ -77,6 +77,501 @@ def build_scan_terminal(
     }
 
 
+def build_batch_terminal(
+    batch_result: Mapping[str, Any],
+    *,
+    context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the terminal contract for multi-symbol backtest reviews."""
+    ctx = context or {}
+    stocks = [_as_record(item) for item in _as_list(batch_result.get("stocks"))]
+    summary = _as_record(batch_result.get("summary"))
+    ok_stocks = [row for row in stocks if _text(row.get("status") or "ok") == "ok"]
+    freq = _text(ctx.get("freq_label") or ctx.get("freq"))
+    market = _text(ctx.get("market") or _batch_market(stocks))
+    benchmark = _batch_benchmark(ctx, market)
+    target = {
+        "symbol": _text(ctx.get("symbol") or "MULTI"),
+        "code": _text(ctx.get("code") or "MULTI"),
+        "name": _text(ctx.get("name") or "多标的回测复盘"),
+        "market": market,
+        "freq": freq,
+        "as_of": _latest_text(stocks, "as_of") or _text(ctx.get("as_of") or datetime.now().date().isoformat()),
+        "bar_count": int(_num(summary.get("bar_count"), sum(int(_num(row.get("bar_count"), 0) or 0) for row in stocks)) or 0),
+        "data_source": _text(ctx.get("data_source") or "batch"),
+        "freshness": _text(ctx.get("freshness") or _batch_freshness(stocks)),
+        "data_source_detail": _text(ctx.get("data_source_detail") or f"{len(stocks)} symbols batch backtest"),
+    }
+    trade_assumptions = _build_trade_assumptions({"sim_config": ctx.get("sim_config") or ctx}, target)
+    ranking_rows = [_batch_ranking_row(row, idx + 1, benchmark) for idx, row in enumerate(_rank_batch_stocks(stocks))]
+    overview_rows = [_batch_interval_row(row) for row in _rank_batch_stocks(stocks)]
+    chart_items = [_batch_chart_item(row) for row in _rank_batch_stocks(stocks)]
+    script_cards = [_batch_script_card(row, idx + 1, benchmark) for idx, row in enumerate(_rank_batch_stocks(stocks))]
+    metrics = _batch_metrics(summary, ranking_rows, ok_stocks)
+    risk_rows = _batch_risk_rows(ranking_rows)
+
+    return {
+        "version": TERMINAL_VERSION,
+        "mode": "multi",
+        "target": target,
+        "market_snapshot": _empty_market_snapshot(),
+        "trade_assumptions": trade_assumptions,
+        "metrics": metrics,
+        "chart": {
+            "date_presets": _as_list(ctx.get("date_presets")),
+            "ohlcv": [],
+            "ma_lines": [],
+            "macd": [],
+            "signal_markers": [],
+            "trade_markers": [],
+            "risk_bands": [],
+            "multi_charts": chart_items,
+        },
+        "panels": {
+            "perf": {
+                "groups": [
+                    {"title": "批量绩效", "items": metrics["performance"]},
+                    {"title": "风险分布", "items": metrics["risk"]},
+                    {"title": "交易质量", "items": metrics["trade_quality"]},
+                ],
+                "summary": ranking_rows,
+            },
+            "trades": {
+                "rows": [],
+                "filled_count": int(_num(summary.get("total_trades"), 0) or 0),
+                "skipped_count": max(len(stocks) - len(ok_stocks), 0),
+            },
+            "signals": {
+                "rows": [],
+                "count": int(_num(summary.get("total_signals"), 0) or 0),
+                "groups": [],
+            },
+            "scan": {"rows": ranking_rows, "best_params": {}, "heatmap": None},
+            "risk": {"summary": risk_rows, "rows": risk_rows, "skip_reasons": _batch_skip_reasons(stocks)},
+            "config": {
+                "data_health": {
+                    "symbol_count": len(stocks),
+                    "ok_count": len(ok_stocks),
+                    "freshness": target["freshness"],
+                    "as_of": target["as_of"],
+                    "data_source": target["data_source"],
+                    "data_source_detail": target["data_source_detail"],
+                },
+                "warnings": _as_list(batch_result.get("warnings")),
+            },
+            "ranking": {
+                "columns": [
+                    "rank", "code", "name", "benchmark_symbol", "benchmark_phase",
+                    "strength_grade", "range_return_pct", "max_drawdown_pct",
+                    "up_bar_ratio_pct", "relative_excess_pct", "turning_point",
+                    "current_character", "trade_difficulty", "review_level",
+                    "review_conclusion",
+                ],
+                "rows": ranking_rows,
+            },
+            "interval_overview": {"rows": overview_rows},
+            "multi_charts": {"items": chart_items},
+            "scripts": {"cards": script_cards},
+        },
+    }
+
+
+def _rank_batch_stocks(stocks: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    return sorted(
+        stocks,
+        key=lambda row: (
+            _text(row.get("status") or "ok") == "ok",
+            _num(row.get("total_return") or row.get("range_return_pct"), -999) or -999,
+            _num(row.get("sharpe"), -999) or -999,
+        ),
+        reverse=True,
+    )
+
+
+def _batch_market(stocks: list[Mapping[str, Any]]) -> str:
+    markets = [_text(row.get("market")) for row in stocks if _text(row.get("market"))]
+    if markets:
+        return markets[0]
+    symbols = [_text(row.get("symbol")) for row in stocks]
+    if any(item.startswith("HK.") for item in symbols):
+        return "HK"
+    return "A" if stocks else ""
+
+
+def _batch_benchmark(context: Mapping[str, Any], market: str) -> dict[str, Any]:
+    symbol = _text(context.get("benchmark_symbol"))
+    name = _text(context.get("benchmark_name"))
+    if not symbol:
+        symbol = "HSI.HK" if market == "HK" else "000852.SH"
+    if not name:
+        name = "恒生指数" if market == "HK" else "中证1000"
+    return {
+        "symbol": symbol,
+        "name": name,
+        "phase": _text(context.get("benchmark_phase") or "指数待校准"),
+        "return_pct": _num(context.get("benchmark_return_pct"), 0) or 0,
+    }
+
+
+def _batch_freshness(stocks: list[Mapping[str, Any]]) -> str:
+    values = {_text(row.get("freshness")) for row in stocks if _text(row.get("freshness"))}
+    if not values:
+        return "unknown"
+    if values == {"fresh"}:
+        return "fresh"
+    if "degraded" in values:
+        return "degraded"
+    if "stale" in values:
+        return "stale"
+    return "mixed"
+
+
+def _latest_text(rows: list[Mapping[str, Any]], key: str) -> str:
+    values = sorted(_text(row.get(key)) for row in rows if _text(row.get(key)))
+    return values[-1] if values else ""
+
+
+def _batch_ranking_row(row: Mapping[str, Any], rank: int, benchmark: Mapping[str, Any]) -> dict[str, Any]:
+    ohlcv = [_as_record(item) for item in _as_list(row.get("ohlcv_tail") or row.get("ohlcv"))]
+    interval = _batch_interval_metrics(row, ohlcv)
+    range_return = interval["range_return_pct"]
+    max_drawdown = interval["max_drawdown_pct"]
+    benchmark_return = _num(benchmark.get("return_pct"), 0) or 0
+    relative_excess = _round((range_return or 0) - benchmark_return)
+    grade = _strength_grade(range_return, relative_excess, max_drawdown, _num(row.get("sharpe"), 0))
+    difficulty = _trade_difficulty(max_drawdown, interval["volatility_pct"])
+    review_level = _review_level(grade, range_return, max_drawdown)
+    conclusion = _review_conclusion(review_level, grade)
+    turning_point = _turning_point(row)
+    character = _current_character(range_return, max_drawdown)
+    return {
+        "rank": rank,
+        "code": _text(row.get("code")),
+        "symbol": _text(row.get("symbol")),
+        "name": _text(row.get("name") or row.get("code")),
+        "benchmark_symbol": _text(benchmark.get("symbol")),
+        "benchmark_name": _text(benchmark.get("name")),
+        "benchmark_phase": _text(benchmark.get("phase")),
+        "strength_grade": grade,
+        "range_return_pct": range_return,
+        "max_drawdown_pct": max_drawdown,
+        "max_runup_pct": interval["max_runup_pct"],
+        "volatility_pct": interval["volatility_pct"],
+        "up_bar_ratio_pct": interval["up_bar_ratio_pct"],
+        "relative_excess_pct": relative_excess,
+        "turning_point": turning_point,
+        "current_character": character,
+        "trade_difficulty": difficulty,
+        "review_level": review_level,
+        "review_conclusion": conclusion,
+        "signal_count": int(_num(row.get("signal_count"), 0) or 0),
+        "trade_count": int(_num(row.get("trade_count"), 0) or 0),
+        "win_rate": _round(row.get("win_rate")),
+        "expectancy_pct": _round(row.get("expectancy")),
+        "sharpe": _round(row.get("sharpe"), 2),
+        "status": _text(row.get("status") or "ok"),
+        "error": _text(row.get("error")),
+    }
+
+
+def _batch_interval_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    ohlcv = [_as_record(item) for item in _as_list(row.get("ohlcv_tail") or row.get("ohlcv"))]
+    interval = _batch_interval_metrics(row, ohlcv)
+    return {
+        "code": _text(row.get("code")),
+        "symbol": _text(row.get("symbol")),
+        "name": _text(row.get("name") or row.get("code")),
+        "bar_count": int(_num(row.get("bar_count"), len(ohlcv)) or 0),
+        **interval,
+    }
+
+
+def _batch_chart_item(row: Mapping[str, Any]) -> dict[str, Any]:
+    ohlcv = [_as_record(item) for item in _as_list(row.get("ohlcv_tail") or row.get("ohlcv"))]
+    interval = _batch_interval_metrics(row, ohlcv)
+    return {
+        "code": _text(row.get("code")),
+        "symbol": _text(row.get("symbol")),
+        "name": _text(row.get("name") or row.get("code")),
+        "ohlcv": ohlcv[-120:],
+        "regimes": _chart_regimes(ohlcv[-120:]),
+        "range_return_pct": interval["range_return_pct"],
+        "max_drawdown_pct": interval["max_drawdown_pct"],
+        "up_bar_ratio_pct": interval["up_bar_ratio_pct"],
+    }
+
+
+def _batch_script_card(row: Mapping[str, Any], rank: int, benchmark: Mapping[str, Any]) -> dict[str, Any]:
+    ranking = _batch_ranking_row(row, rank, benchmark)
+    code = ranking["code"]
+    name = ranking["name"]
+    return {
+        "code": code,
+        "symbol": ranking["symbol"],
+        "name": name,
+        "rank": rank,
+        "tone": "up" if (_num(ranking["range_return_pct"], 0) or 0) >= 0 else "down",
+        "stats": [
+            {"label": "区间表现", "value": ranking["range_return_pct"], "unit": "%"},
+            {"label": "锐评档位", "value": ranking["review_level"]},
+            {"label": "交易难度", "value": ranking["trade_difficulty"]},
+            {"label": "收盘回撤", "value": ranking["max_drawdown_pct"], "unit": "%"},
+        ],
+        "positioning": f"第{rank}，{ranking['current_character']}，强弱等级{ranking['strength_grade']}。",
+        "difficulty": f"{ranking['trade_difficulty']}。最大收盘回撤{_fmt_pct(ranking['max_drawdown_pct'])}，上涨K占比{_fmt_pct(ranking['up_bar_ratio_pct'])}。",
+        "one_liner": ranking["review_conclusion"],
+    }
+
+
+def _batch_interval_metrics(row: Mapping[str, Any], ohlcv: list[Mapping[str, Any]]) -> dict[str, Any]:
+    closes = [_num(item.get("close")) for item in ohlcv]
+    closes = [item for item in closes if item is not None]
+    opens = [_num(item.get("open")) for item in ohlcv]
+    opens = [item for item in opens if item is not None]
+    range_return = _num(row.get("range_return_pct") or row.get("total_return"))
+    if range_return is None and len(closes) >= 2 and closes[0]:
+        range_return = (closes[-1] - closes[0]) / closes[0] * 100
+    max_drawdown = _num(row.get("max_drawdown"))
+    if max_drawdown is None:
+        max_drawdown = _series_max_drawdown_pct(closes)
+    max_drawdown = -abs(max_drawdown or 0)
+    max_runup = _series_max_runup_pct(closes)
+    up_bar_ratio = _up_bar_ratio_pct(ohlcv)
+    volatility = _annualized_volatility(ohlcv, row.get("freq"))
+    return {
+        "range_return_pct": _round(range_return),
+        "max_drawdown_pct": _round(max_drawdown),
+        "max_runup_pct": _round(max_runup),
+        "volatility_pct": _round(volatility),
+        "up_bar_ratio_pct": _round(up_bar_ratio),
+    }
+
+
+def _batch_metrics(
+    summary: Mapping[str, Any],
+    ranking_rows: list[Mapping[str, Any]],
+    ok_stocks: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    returns = [_num(row.get("range_return_pct")) for row in ranking_rows]
+    returns = [item for item in returns if item is not None]
+    drawdowns = [_num(row.get("max_drawdown_pct")) for row in ranking_rows]
+    drawdowns = [item for item in drawdowns if item is not None]
+    avg_return = _average(returns)
+    avg_drawdown = _average(drawdowns)
+    total_trades = int(_num(summary.get("total_trades"), 0) or 0)
+    total_signals = int(_num(summary.get("total_signals"), 0) or 0)
+    win_rate = _num(summary.get("overall_win_rate"), 0) or 0
+    expectancy = _num(summary.get("overall_expectancy"), 0) or 0
+    flat = {
+        "total_return_pct": _round(avg_return),
+        "benchmark_return_pct": 0,
+        "excess_return_pct": _round(avg_return),
+        "annual_return_pct": _round(avg_return),
+        "max_drawdown_pct": _round(abs(avg_drawdown)),
+        "volatility_pct": _round(_average([_num(row.get("volatility_pct")) for row in ranking_rows])),
+        "sharpe": _round(_average([_num(row.get("sharpe")) for row in ranking_rows]), 2),
+        "calmar": _calmar(avg_return, avg_drawdown),
+        "filled_trades": total_trades,
+        "win_rate": _round(win_rate),
+        "profit_factor": 0,
+        "expectancy_pct": _round(expectancy),
+        "avg_win_pct": 0,
+        "avg_loss_pct": 0,
+        "avg_holding_days": _round(_average([_num(row.get("avg_hold_days")) for row in ok_stocks]), 1),
+        "max_consecutive_losses": 0,
+        "exposure_pct": 0,
+        "signal_count": total_signals,
+        "evaluated_count": total_trades,
+        "avg_t5_pct": 0,
+        "avg_t10_pct": _round(expectancy),
+        "avg_mfe_pct": _round(_average([_num(row.get("max_runup_pct")) for row in ranking_rows])),
+        "avg_mae_pct": _round(avg_drawdown),
+    }
+    flat["performance"] = _metric_group([
+        ("symbol_count", "标的数", len(ranking_rows), "", None),
+        ("ok_count", "成功标的", int(_num(summary.get("ok_stocks"), len(ok_stocks)) or 0), "", None),
+        ("total_return_pct", "平均区间", flat["total_return_pct"], "%", 0),
+        ("excess_return_pct", "平均超额", flat["excess_return_pct"], "%", 0),
+    ])
+    flat["risk"] = _metric_group([
+        ("max_drawdown_pct", "平均回撤", flat["max_drawdown_pct"], "%", None, "down"),
+        ("volatility_pct", "平均波动", flat["volatility_pct"], "%", None),
+        ("sharpe", "平均Sharpe", flat["sharpe"], "", 1),
+        ("calmar", "平均Calmar", flat["calmar"], "", 1),
+    ])
+    flat["trade_quality"] = _metric_group([
+        ("signal_count", "总信号", total_signals, "", None),
+        ("filled_trades", "总成交", total_trades, "", None),
+        ("win_rate", "整体胜率", flat["win_rate"], "%", 50),
+        ("expectancy_pct", "整体期望", flat["expectancy_pct"], "%", 0),
+    ])
+    flat["execution"] = _metric_group([])
+    flat["signal_quality"] = _metric_group([])
+    return flat
+
+
+def _batch_risk_rows(ranking_rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "code": row.get("code"),
+            "name": row.get("name"),
+            "risk": row.get("trade_difficulty"),
+            "max_drawdown_pct": row.get("max_drawdown_pct"),
+            "volatility_pct": row.get("volatility_pct"),
+            "action": "小仓观察" if row.get("strength_grade") in {"A", "B"} else "等待修复",
+        }
+        for row in ranking_rows
+    ]
+
+
+def _batch_skip_reasons(stocks: list[Mapping[str, Any]]) -> dict[str, int]:
+    reasons: dict[str, int] = {}
+    for row in stocks:
+        reason = _text(row.get("error"))
+        if not reason:
+            continue
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return reasons
+
+
+def _series_max_drawdown_pct(closes: list[float]) -> float:
+    if not closes:
+        return 0
+    peak = closes[0]
+    max_drawdown = 0.0
+    for close in closes:
+        peak = max(peak, close)
+        if peak:
+            max_drawdown = min(max_drawdown, (close - peak) / peak * 100)
+    return max_drawdown
+
+
+def _series_max_runup_pct(closes: list[float]) -> float:
+    if not closes:
+        return 0
+    trough = closes[0]
+    runup = 0.0
+    for close in closes:
+        trough = min(trough, close)
+        if trough:
+            runup = max(runup, (close - trough) / trough * 100)
+    return runup
+
+
+def _up_bar_ratio_pct(ohlcv: list[Mapping[str, Any]]) -> float:
+    if not ohlcv:
+        return 0
+    up_count = 0
+    valid_count = 0
+    for row in ohlcv:
+        open_price = _num(row.get("open"))
+        close = _num(row.get("close"))
+        if open_price is None or close is None:
+            continue
+        valid_count += 1
+        if close >= open_price:
+            up_count += 1
+    return up_count / valid_count * 100 if valid_count else 0
+
+
+def _chart_regimes(ohlcv: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    if not ohlcv:
+        return []
+    window = max(8, len(ohlcv) // 5)
+    regimes = []
+    for start in range(0, len(ohlcv), window):
+        segment = ohlcv[start:start + window]
+        closes = [_num(row.get("close")) for row in segment]
+        closes = [item for item in closes if item is not None]
+        if len(closes) < 2 or not closes[0]:
+            continue
+        ret = (closes[-1] - closes[0]) / closes[0] * 100
+        label = "上涨" if ret >= 3 else "下跌" if ret <= -3 else "震荡"
+        regimes.append({
+            "start_index": start,
+            "end_index": min(start + len(segment) - 1, len(ohlcv) - 1),
+            "label": label,
+            "tone": "up" if ret >= 0 else "down",
+        })
+    return regimes
+
+
+def _strength_grade(ret: float | None, excess: float | None, drawdown: float | None, sharpe: float | None) -> str:
+    value = ret or 0
+    rel = excess or 0
+    dd = abs(drawdown or 0)
+    sr = sharpe or 0
+    if value >= 25 and rel >= 10 and dd <= 35 and sr >= 0.8:
+        return "A"
+    if value >= 8 and rel >= 0 and dd <= 30:
+        return "B"
+    if value >= 0:
+        return "C"
+    return "D"
+
+
+def _trade_difficulty(drawdown: float | None, volatility: float | None) -> str:
+    dd = abs(drawdown or 0)
+    vol = volatility or 0
+    if dd >= 28 or vol >= 55:
+        return "极高"
+    if dd >= 15 or vol >= 35:
+        return "高"
+    return "中"
+
+
+def _review_level(grade: str, ret: float | None, drawdown: float | None) -> str:
+    value = ret or 0
+    dd = abs(drawdown or 0)
+    if grade == "A" and value >= 20:
+        return "人上人"
+    if grade in {"B", "C"} and value >= 0:
+        return "路边"
+    if dd >= 35 or value < -15:
+        return "拉完了"
+    return "观察"
+
+
+def _review_conclusion(level: str, grade: str) -> str:
+    if level == "人上人":
+        return "人上人，不一定最疯，但资金认可度在线。"
+    if level == "路边":
+        return "路边，看着有动作，实际地位一般。"
+    if level == "拉完了":
+        return "拉完了，反弹归反弹，别硬讲主线。"
+    if grade == "A":
+        return "强度在线，但还要看回撤能不能收住。"
+    return "先观察，等强弱和回撤给出更干净的信号。"
+
+
+def _turning_point(row: Mapping[str, Any]) -> str:
+    signal_count = int(_num(row.get("signal_count"), 0) or 0)
+    if signal_count >= 10:
+        return "放量长上影/高开低走"
+    if signal_count > 0:
+        return "20日线观察"
+    return "无明确信号"
+
+
+def _current_character(ret: float | None, drawdown: float | None) -> str:
+    value = ret or 0
+    dd = abs(drawdown or 0)
+    if value >= 20:
+        return "弹性冲浪"
+    if value >= 0:
+        return "震荡修复"
+    if dd >= 25:
+        return "弱势反抽"
+    return "回撤整理"
+
+
+def _fmt_pct(value: Any) -> str:
+    number = _num(value)
+    if number is None:
+        return "N/A"
+    return f"{number:.2f}%"
+
+
 def _build_target(payload: Mapping[str, Any], ohlcv: list[Mapping[str, Any]]) -> dict[str, Any]:
     existing = _as_record(payload.get("target"))
     symbol = _text(existing.get("symbol") or payload.get("symbol"))

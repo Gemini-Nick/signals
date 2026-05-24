@@ -236,8 +236,8 @@ function _collectScanParams() {
 // ═══════════════════════════════════════════════════
 
 async function _runAnalyze() {
-  if (_btBatchMode) return _runBatchAnalyze();
   const code = document.getElementById('bt-code').value.trim();
+  if (_btBatchMode || _parseBatchCodes(code).length > 1) return _runBatchAnalyze();
   if (!code) return;
 
   const freq = document.getElementById('bt-freq').value;
@@ -1529,6 +1529,21 @@ function _groupBadge(group) {
 
 let _btBatchMode = false;
 
+function _parseBatchCodes(value) {
+  const seen = new Set();
+  return String(value || '')
+    .split(/[\s,，、;；]+/)
+    .map(v => v.trim())
+    .filter(Boolean)
+    .map(v => v.replace(/^(SZ|SH|HK|US)\./i, ''))
+    .filter(v => {
+      const key = v.toUpperCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
 function _onBatchModeChange(e) {
   _btBatchMode = e.target.checked;
   const codeInput = document.getElementById('bt-code');
@@ -1555,7 +1570,7 @@ async function _runBatchAnalyze() {
   statusEl.textContent = '正在批量回测...';
 
   try {
-    const body = { codes: codeStr };
+    const body = { codes: _parseBatchCodes(codeStr) };
 
     // 信号参数
     const sigParams = _collectSignalParams();
@@ -1589,6 +1604,8 @@ async function _runBatchAnalyze() {
 
     _renderBatchResults(data);
     _showResultArea();
+    const batchTab = document.querySelector('.bt-tab-btn[data-tab="batch"]');
+    if (batchTab) batchTab.style.display = '';
     _switchBtTab('batch');
 
     const s = data.summary;
@@ -1608,51 +1625,188 @@ async function _runBatchAnalyze() {
 function _renderBatchResults(data) {
   const summaryEl = document.getElementById('bt-batch-summary');
   const tableEl = document.getElementById('bt-batch-table');
-  const s = data.summary;
+  const terminal = data.terminal || {};
+  const panels = terminal.panels || {};
+  const metrics = terminal.metrics || {};
+  const summary = data.summary || {};
+  const rankingRows = (panels.ranking && panels.ranking.rows) || _legacyBatchRanking(data.stocks || []);
+  const overviewRows = (panels.interval_overview && panels.interval_overview.rows) || [];
+  const chartItems = (panels.multi_charts && panels.multi_charts.items) || (terminal.chart && terminal.chart.multi_charts) || [];
+  const scriptCards = (panels.scripts && panels.scripts.cards) || [];
 
-  // 汇总卡片
   summaryEl.innerHTML = [
-    { value: s.total_stocks, label: '总股票', cls: '' },
-    { value: s.ok_stocks + '/' + s.total_stocks, label: '成功', cls: '' },
-    { value: s.total_signals, label: '总信号', cls: '' },
-    { value: s.total_trades, label: '总成交', cls: '' },
-    { value: s.overall_win_rate + '%', label: '整体胜率', cls: s.overall_win_rate >= 50 ? 'up' : 'down' },
-    { value: (s.overall_expectancy >= 0 ? '+' : '') + s.overall_expectancy + '%', label: '整体期望', cls: s.overall_expectancy >= 0 ? 'up' : 'down' },
+    { value: rankingRows.length, label: '标的', cls: '' },
+    { value: `${summary.ok_stocks ?? 0}/${summary.total_stocks ?? rankingRows.length}`, label: '成功', cls: '' },
+    { value: metrics.signal_count ?? summary.total_signals ?? 0, label: '总信号', cls: '' },
+    { value: metrics.filled_trades ?? summary.total_trades ?? 0, label: '总成交', cls: '' },
+    { value: _fmtTerminalPct(metrics.win_rate ?? summary.overall_win_rate), label: '整体胜率', cls: (Number(metrics.win_rate ?? summary.overall_win_rate ?? 0) >= 50) ? 'up' : 'down' },
+    { value: _fmtTerminalPct(metrics.total_return_pct), label: '平均区间', cls: (Number(metrics.total_return_pct ?? 0) >= 0) ? 'up' : 'down' },
   ].map(it => `
     <div class="bt-metric-card">
-      <div class="bt-metric-label">${it.label}</div>
-      <div class="bt-metric-value ${it.cls}">${it.value}</div>
+      <div class="bt-metric-label">${_esc(it.label)}</div>
+      <div class="bt-metric-value ${it.cls}">${_esc(it.value)}</div>
     </div>
   `).join('');
 
-  // 股票对比表
-  // 按胜率排序
-  const sorted = [...data.stocks].sort((a, b) => (b.win_rate || 0) - (a.win_rate || 0));
+  tableEl.innerHTML = `
+    <div class="bt-multi-report">
+      <div class="bt-multi-band">
+        <div class="bt-multi-panel">
+          <div class="bt-multi-title">排名与锐评</div>
+          ${_renderBatchRankingTable(rankingRows)}
+        </div>
+        <div class="bt-multi-panel">
+          <div class="bt-multi-title">原始区间概览</div>
+          ${_renderBatchOverviewTable(overviewRows)}
+        </div>
+      </div>
+      <div class="bt-multi-panel">
+        <div class="bt-multi-title">多股票 K 线复盘</div>
+        <div class="bt-multi-chart-grid">
+          ${chartItems.length ? chartItems.map(_renderMiniKlineCard).join('') : '<div class="empty-state">暂无多标的图表。</div>'}
+        </div>
+      </div>
+      <div class="bt-multi-panel">
+        <div class="bt-multi-title">视频脚本 / 交易员结论</div>
+        <div class="bt-script-grid">
+          ${scriptCards.length ? scriptCards.map(_renderScriptCard).join('') : '<div class="empty-state">暂无锐评卡片。</div>'}
+        </div>
+      </div>
+    </div>
+  `;
+}
 
-  let html = '<table class="bt-stats-table"><thead><tr>';
-  html += '<th>代码</th><th>名称</th><th>信号</th><th>成交</th><th>胜率</th><th>期望</th><th>总收益</th><th>最大回撤</th><th>Sharpe</th><th>均持日</th>';
-  html += '</tr></thead><tbody>';
+function _legacyBatchRanking(stocks) {
+  return [...stocks].sort((a, b) => (b.total_return || 0) - (a.total_return || 0)).map((st, idx) => ({
+    rank: idx + 1,
+    code: st.code,
+    name: st.name,
+    signal_count: st.signal_count,
+    trade_count: st.trade_count,
+    win_rate: st.win_rate,
+    range_return_pct: st.total_return,
+    max_drawdown_pct: st.max_drawdown == null ? null : -Math.abs(st.max_drawdown),
+    sharpe: st.sharpe,
+    trade_difficulty: '待评估',
+    review_level: '观察',
+    review_conclusion: st.error || '已完成批量回测。',
+  }));
+}
 
-  for (const st of sorted) {
-    if (st.status === 'error') {
-      html += `<tr class="bt-batch-error"><td>${st.code}</td><td colspan="9" style="color:var(--text-secondary);">❌ ${st.error || '失败'}</td></tr>`;
-      continue;
-    }
-    html += `<tr class="bt-batch-row" data-code="${st.code}" onclick="_btLoadSingle('${st.code}')">
-      <td><b>${st.code}</b></td>
-      <td>${st.name || ''}</td>
-      <td>${st.signal_count || 0}</td>
-      <td>${st.trade_count || 0}</td>
-      <td class="${(st.win_rate || 0) >= 50 ? 'up' : 'down'}">${st.win_rate || 0}%</td>
-      <td class="${(st.expectancy || 0) >= 0 ? 'up' : 'down'}">${_fmtRet(st.expectancy)}</td>
-      <td class="${(st.total_return || 0) >= 0 ? 'up' : 'down'}">${_fmtRet(st.total_return)}</td>
-      <td class="down">${st.max_drawdown || 0}%</td>
-      <td>${st.sharpe || 0}</td>
-      <td>${st.avg_hold_days || 0}</td>
-    </tr>`;
+function _renderBatchRankingTable(rows) {
+  if (!rows.length) return '<div class="empty-state">暂无排名结果。</div>';
+  const headers = [
+    ['rank', '排名'], ['code', '代码'], ['name', '股票'], ['benchmark_symbol', '对标指数'],
+    ['strength_grade', '强弱'], ['range_return_pct', '区间收益'], ['max_drawdown_pct', '最大回撤'],
+    ['up_bar_ratio_pct', '上涨K占比'], ['relative_excess_pct', '相对超额'], ['current_character', '当前性质'],
+    ['trade_difficulty', '交易难度'], ['review_level', '锐评档位'], ['review_conclusion', '锐评结论'],
+  ];
+  return `<div class="bt-multi-table-wrap"><table class="bt-multi-table"><thead><tr>${headers.map(([, label]) => `<th>${_esc(label)}</th>`).join('')}</tr></thead><tbody>${
+    rows.map(row => `<tr class="bt-batch-row" onclick="_btLoadSingle('${_escAttr(row.code || '')}')">${
+      headers.map(([key]) => `<td class="${_cellClass(key, row[key])}">${_esc(_formatBatchCell(key, row[key]))}</td>`).join('')
+    }</tr>`).join('')
+  }</tbody></table></div>`;
+}
+
+function _renderBatchOverviewTable(rows) {
+  if (!rows.length) return '<div class="empty-state">暂无区间概览。</div>';
+  const headers = [
+    ['code', '代码'], ['name', '股票'], ['bar_count', 'K线数'], ['range_return_pct', '区间收益'],
+    ['max_drawdown_pct', '最大回撤'], ['max_runup_pct', '最大浮盈'], ['volatility_pct', '波动率'], ['up_bar_ratio_pct', '上涨K占比'],
+  ];
+  return `<div class="bt-multi-table-wrap"><table class="bt-multi-table"><thead><tr>${headers.map(([, label]) => `<th>${_esc(label)}</th>`).join('')}</tr></thead><tbody>${
+    rows.map(row => `<tr>${headers.map(([key]) => `<td class="${_cellClass(key, row[key])}">${_esc(_formatBatchCell(key, row[key]))}</td>`).join('')}</tr>`).join('')
+  }</tbody></table></div>`;
+}
+
+function _renderMiniKlineCard(item) {
+  return `<div class="bt-mini-card">
+    <div class="bt-mini-head">
+      <div><div class="bt-mini-name">${_esc(item.name || item.code || '')}</div><div class="bt-mini-code">${_esc(item.code || item.symbol || '')}</div></div>
+      <div class="bt-mini-return ${Number(item.range_return_pct || 0) >= 0 ? 'up' : 'down'}">${_fmtTerminalPct(item.range_return_pct)}</div>
+    </div>
+    ${_miniKlineSvg(item.ohlcv || [], item.regimes || [])}
+  </div>`;
+}
+
+function _miniKlineSvg(rows, regimes) {
+  if (!rows.length) return '<div class="empty-state">暂无K线。</div>';
+  const width = 320;
+  const height = 150;
+  const highs = rows.map(r => Number(r.high)).filter(Number.isFinite);
+  const lows = rows.map(r => Number(r.low)).filter(Number.isFinite);
+  const maxPrice = Math.max(...highs);
+  const minPrice = Math.min(...lows);
+  const span = Math.max(maxPrice - minPrice, 0.0001);
+  const xStep = width / Math.max(rows.length - 1, 1);
+  const candleWidth = Math.max(2, Math.min(7, xStep * 0.56));
+  const yFor = price => 12 + (maxPrice - Number(price)) / span * (height - 30);
+  const line = rows.map((row, idx) => `${idx * xStep},${yFor(row.close)}`).join(' ');
+  const regimeSvg = regimes.map((regime, idx) => {
+    const start = Number(regime.start_index || 0);
+    const end = Number(regime.end_index || start);
+    const x = Math.max(0, start * xStep);
+    const w = Math.min(Math.max(8, (end - start + 1) * xStep), width - x);
+    const cls = regime.tone === 'down' ? 'down' : 'up';
+    return `<g><rect x="${x}" y="0" width="${w}" height="${height - 18}" class="bt-regime ${cls}"></rect><text x="${x + 4}" y="13">${_esc(regime.label || '')}</text></g>`;
+  }).join('');
+  const candles = rows.map((row, idx) => {
+    const x = idx * xStep;
+    const openY = yFor(row.open);
+    const closeY = yFor(row.close);
+    const highY = yFor(row.high);
+    const lowY = yFor(row.low);
+    const cls = Number(row.close) >= Number(row.open) ? 'up' : 'down';
+    return `<g class="bt-candle ${cls}"><line x1="${x}" x2="${x}" y1="${highY}" y2="${lowY}"></line><rect x="${x - candleWidth / 2}" y="${Math.min(openY, closeY)}" width="${candleWidth}" height="${Math.max(1, Math.abs(openY - closeY))}" rx="0.8"></rect></g>`;
+  }).join('');
+  return `<svg class="bt-mini-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="mini kline">
+    <rect class="bt-mini-bg" x="0" y="0" width="${width}" height="${height}"></rect>
+    ${[0, 1, 2, 3].map(i => `<line class="bt-grid-line" x1="0" x2="${width}" y1="${14 + i * ((height - 34) / 3)}" y2="${14 + i * ((height - 34) / 3)}"></line>`).join('')}
+    ${regimeSvg}
+    <polyline points="${line}" class="bt-close-line"></polyline>
+    ${candles}
+  </svg>`;
+}
+
+function _renderScriptCard(card) {
+  const stats = Array.isArray(card.stats) ? card.stats : [];
+  const tone = card.tone === 'down' ? 'down' : 'up';
+  return `<div class="bt-script-card ${tone}">
+    <div class="bt-script-head"><div><div class="bt-terminal-label">视频脚本</div><div class="bt-script-name">${_esc(card.name || card.code || '')}</div></div><div class="bt-mini-code">${_esc(card.code || '')}</div></div>
+    <div class="bt-script-stats">${stats.slice(0, 4).map(item => `<div class="bt-script-stat"><span>${_esc(item.label || '')}</span><b class="${_cellClass(String(item.label || ''), item.value)}">${_esc(item.unit === '%' ? _fmtTerminalPct(item.value) : (item.value ?? '—'))}</b></div>`).join('')}</div>
+    <div class="bt-script-line"><span>定位</span>${_esc(card.positioning || '—')}</div>
+    <div class="bt-script-line"><span>交易难度</span>${_esc(card.difficulty || '—')}</div>
+    <div class="bt-script-line strong"><span>一句话</span>${_esc(card.one_liner || '—')}</div>
+  </div>`;
+}
+
+function _formatBatchCell(key, value) {
+  if (value == null || value === '') return '—';
+  if (key.includes('pct') || key.includes('return') || key.includes('drawdown') || key.includes('ratio')) return _fmtTerminalPct(value);
+  return String(value);
+}
+
+function _fmtTerminalPct(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return (n > 0 ? '+' : '') + n.toFixed(2) + '%';
+}
+
+function _cellClass(key, value) {
+  const n = Number(value);
+  if (key.includes('drawdown')) return 'down';
+  if (Number.isFinite(n) && (key.includes('return') || key.includes('excess') || key.includes('pct') || key.includes('表现'))) {
+    return n >= 0 ? 'up' : 'down';
   }
-  html += '</tbody></table>';
-  tableEl.innerHTML = html;
+  return '';
+}
+
+function _esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+
+function _escAttr(value) {
+  return _esc(value).replace(/`/g, '&#96;');
 }
 
 /** 批量表格点击 → 切回单股模式加载该股 */

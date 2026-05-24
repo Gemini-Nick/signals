@@ -112,6 +112,65 @@ def test_backtest_terminal_empty_signals_and_no_trades():
     assert terminal["chart"]["trade_markers"] == []
 
 
+def test_batch_terminal_multi_symbol_panels():
+    from signals.core.backtest_terminal import build_batch_terminal
+
+    sample_ohlcv = _sample_payload()["ohlcv"]
+    batch = {
+        "summary": {
+            "total_stocks": 2,
+            "ok_stocks": 2,
+            "total_signals": 7,
+            "total_trades": 3,
+            "overall_win_rate": 66.7,
+            "overall_expectancy": 1.8,
+        },
+        "stocks": [
+            {
+                "code": "002759",
+                "symbol": "SZ.002759",
+                "name": "天赐材料",
+                "status": "ok",
+                "bar_count": 4,
+                "ohlcv_tail": sample_ohlcv,
+                "signal_count": 4,
+                "trade_count": 2,
+                "win_rate": 50,
+                "expectancy": 1.2,
+                "total_return": 12.5,
+                "max_drawdown": 8.4,
+                "sharpe": 1.1,
+            },
+            {
+                "code": "600519",
+                "symbol": "SH.600519",
+                "name": "贵州茅台",
+                "status": "ok",
+                "bar_count": 4,
+                "ohlcv_tail": sample_ohlcv,
+                "signal_count": 3,
+                "trade_count": 1,
+                "win_rate": 100,
+                "expectancy": 2.4,
+                "total_return": -3.2,
+                "max_drawdown": 12.0,
+                "sharpe": 0.4,
+            },
+        ],
+    }
+
+    terminal = build_batch_terminal(batch, context={"freq": "日线", "market": "A"})
+
+    assert terminal["version"] == "backtest-terminal.v1"
+    assert terminal["mode"] == "multi"
+    assert terminal["metrics"]["signal_count"] == 7
+    assert terminal["metrics"]["filled_trades"] == 3
+    assert terminal["panels"]["ranking"]["rows"][0]["code"] == "002759"
+    assert terminal["panels"]["interval_overview"]["rows"]
+    assert terminal["panels"]["multi_charts"]["items"][0]["ohlcv"]
+    assert terminal["panels"]["scripts"]["cards"][0]["one_liner"]
+
+
 def test_generate_backtest_report_html_and_dispatch(tmp_path):
     from signals.core.backtest_report import generate_backtest_report, generate_html_backtest_report
 
