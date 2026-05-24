@@ -2300,7 +2300,7 @@ async def backtest_batch(request: Request):
                 meta = _kline_meta(df, freq_norm)
                 stock_result.update(meta)
                 stock_result["bar_count"] = int(len(df))
-                stock_result["ohlcv_tail"] = _serialize_ohlcv(df.tail(120))
+                stock_result["ohlcv_tail"] = _serialize_ohlcv(df.tail(520))
 
                 # 信号检测
                 all_signals, _, _, _ = _detect_all_signals(

@@ -291,13 +291,14 @@ def _batch_interval_row(row: Mapping[str, Any]) -> dict[str, Any]:
 def _batch_chart_item(row: Mapping[str, Any]) -> dict[str, Any]:
     ohlcv = [_as_record(item) for item in _as_list(row.get("ohlcv_tail") or row.get("ohlcv"))]
     interval = _batch_interval_metrics(row, ohlcv)
+    visible_ohlcv = ohlcv[-520:]
     return {
         "code": _text(row.get("code")),
         "symbol": _text(row.get("symbol")),
         "name": _text(row.get("name") or row.get("code")),
         "bar_count": int(_num(row.get("bar_count"), len(ohlcv)) or 0),
-        "ohlcv": ohlcv[-120:],
-        "regimes": _chart_regimes(ohlcv[-120:]),
+        "ohlcv": visible_ohlcv,
+        "regimes": _chart_regimes(visible_ohlcv),
         "range_return_pct": interval["range_return_pct"],
         "max_drawdown_pct": interval["max_drawdown_pct"],
         "max_runup_pct": interval["max_runup_pct"],

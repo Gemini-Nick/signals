@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """行业聚类 API — 行业板块(东财) + 概念板块(THS) 双维聚类 + 盘中定时器"""
 import logging
+import re
 import threading
 from datetime import datetime
+from typing import Any
 
 from fastapi import APIRouter
 
@@ -189,6 +191,168 @@ def refresh(top: int = 3):
 
 # ── 观察池 + 成分股 ─────────────────────────────────────
 
+_CONSTITUENT_COLLECTIONS = (
+    ("concept_constituents", "concept"),
+    ("board_constituents", "board"),
+)
+
+
+def _text(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _code_from_symbol(symbol: Any) -> str:
+    text = _text(symbol).upper()
+    if not text:
+        return ""
+    if "." in text:
+        parts = text.split(".")
+        return parts[-1] if parts[0] in {"SH", "SZ", "BJ"} else parts[0]
+    return text
+
+
+def _futu_symbol(symbol: str, code: str) -> str:
+    if "." in symbol:
+        return symbol
+    if len(code) == 6:
+        return f"SH.{code}" if code.startswith(("5", "6", "9")) else f"SZ.{code}"
+    return symbol
+
+
+def _board_doc_name(doc: dict[str, Any]) -> str:
+    return (
+        _text(doc.get("concept_name"))
+        or _text(doc.get("board_name"))
+        or _text(doc.get("name"))
+        or _text(doc.get("_id"))
+    )
+
+
+def _constituent_symbols(doc: dict[str, Any]) -> list[str]:
+    values = doc.get("symbols") or doc.get("stocks") or doc.get("constituents") or []
+    symbols: list[str] = []
+    for item in values:
+        if isinstance(item, str):
+            symbol = item
+        elif isinstance(item, dict):
+            symbol = (
+                _text(item.get("symbol"))
+                or _text(item.get("futu_symbol"))
+                or _text(item.get("code"))
+                or _text(item.get("股票代码"))
+            )
+        else:
+            symbol = ""
+        code = _code_from_symbol(symbol)
+        if code:
+            symbols.append(_futu_symbol(symbol, code))
+    seen: set[str] = set()
+    unique: list[str] = []
+    for symbol in symbols:
+        key = symbol.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(symbol)
+    return unique
+
+
+def _constituent_names(doc: dict[str, Any]) -> dict[str, str]:
+    names: dict[str, str] = {}
+    raw_names = doc.get("stock_names")
+    if isinstance(raw_names, dict):
+        for raw_symbol, raw_name in raw_names.items():
+            name = _text(raw_name)
+            code = _code_from_symbol(raw_symbol)
+            if code and name:
+                names[code] = name
+                names[_futu_symbol(_text(raw_symbol), code)] = name
+    for field in ("stocks", "constituents"):
+        values = doc.get(field)
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            symbol = (
+                _text(item.get("symbol"))
+                or _text(item.get("futu_symbol"))
+                or _text(item.get("code"))
+                or _text(item.get("股票代码"))
+            )
+            name = _text(item.get("name")) or _text(item.get("股票名称"))
+            code = _code_from_symbol(symbol)
+            if code and name:
+                names[code] = name
+                names[_futu_symbol(symbol, code)] = name
+    return names
+
+
+def _board_doc_matches(query: str, limit: int = 8) -> list[dict[str, Any]]:
+    needle = query.strip()
+    if not needle:
+        return []
+    try:
+        from signals.sync.db import get_db
+        db = get_db()
+        escaped = re.escape(needle)
+        projection = {
+            "_id": 1,
+            "concept_name": 1,
+            "board_name": 1,
+            "name": 1,
+            "symbols": 1,
+            "stock_names": 1,
+            "stocks": 1,
+            "constituents": 1,
+            "source": 1,
+            "updated_at": 1,
+        }
+        queries = [
+            {"$or": [{"_id": needle}, {"concept_name": needle}, {"board_name": needle}, {"name": needle}]},
+            {"$or": [
+                {"_id": {"$regex": escaped, "$options": "i"}},
+                {"concept_name": {"$regex": escaped, "$options": "i"}},
+                {"board_name": {"$regex": escaped, "$options": "i"}},
+                {"name": {"$regex": escaped, "$options": "i"}},
+            ]},
+        ]
+        docs: list[dict[str, Any]] = []
+        for collection, kind in _CONSTITUENT_COLLECTIONS:
+            for query_doc in queries:
+                cursor = db[collection].find(query_doc, projection).sort("updated_at", -1).limit(limit * 2)
+                for doc in cursor:
+                    doc["_match_collection"] = collection
+                    doc["_match_kind"] = kind
+                    docs.append(doc)
+        deduped: dict[str, dict[str, Any]] = {}
+        for doc in docs:
+            name = _board_doc_name(doc)
+            key = f"{doc.get('_match_collection')}:{name}"
+            if key and key not in deduped:
+                deduped[key] = doc
+
+        def score(doc: dict[str, Any]) -> tuple[int, int, int, int]:
+            name = _board_doc_name(doc)
+            symbols = _constituent_symbols(doc)
+            exact = int(name == needle)
+            starts = int(name.startswith(needle))
+            return (int(bool(symbols)), exact, starts, len(symbols))
+
+        return sorted(deduped.values(), key=score, reverse=True)[:limit]
+    except Exception as exc:
+        logger.warning("板块模糊匹配失败: %s", exc)
+        return []
+
+
+def _match_payload(doc: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": _board_doc_name(doc),
+        "kind": _text(doc.get("_match_kind")) or "board",
+        "source": _text(doc.get("source")) or _text(doc.get("_match_collection")),
+        "total": len(_constituent_symbols(doc)),
+    }
+
 @router.get("/watchlist")
 def get_watchlist(direction: str = "", mode: str = "belief", top: int = 30):
     """
@@ -236,48 +400,55 @@ def get_board_stocks(board: str = ""):
         except Exception:
             resolver = None
 
-        symbols = get_industry_stocks(board)
+        matches = _board_doc_matches(board)
+        selected_doc = next((doc for doc in matches if _constituent_symbols(doc)), None)
+        stock_names: dict[str, str] = {}
+        source = "industry"
+        resolved_board = board
+        if selected_doc:
+            symbols = _constituent_symbols(selected_doc)
+            stock_names = _constituent_names(selected_doc)
+            resolved_board = _board_doc_name(selected_doc) or board
+            source = _text(selected_doc.get("_match_collection")) or source
+        else:
+            symbols = get_industry_stocks(board)
         if not symbols:
-            return {"board": board, "stocks": [], "error": f"未找到 {board} 的成分股"}
+            return {
+                "board": board,
+                "query": board,
+                "resolved_board": resolved_board,
+                "matches": [_match_payload(doc) for doc in matches],
+                "stocks": [],
+                "error": f"未找到 {board} 的成分股，可从匹配板块中选择。",
+            }
 
-        # 获取实时快照（涨跌幅）
         stocks = []
-        def futu_symbol(symbol: str, code: str) -> str:
-            if "." in symbol:
-                return symbol
-            if len(code) == 6:
-                return f"SH.{code}" if code.startswith(("5", "6", "9")) else f"SZ.{code}"
-            return symbol
-
         def display_name(symbol: str, code: str) -> str:
+            for key in (symbol, symbol.upper(), code, _futu_symbol(symbol, code)):
+                name = stock_names.get(key) or stock_names.get(key.upper())
+                if name and name != code:
+                    return name
             if resolver is None:
                 return code
-            name = resolver.get_name(futu_symbol(symbol, code))
+            name = resolver.get_name(_futu_symbol(symbol, code))
             return name if name and name != code else code
 
-        try:
-            import akshare as ak
-            # 尝试获取实时行情
-            for sym in symbols[:50]:  # 最多50只
-                code = sym.replace("SH.", "").replace("SZ.", "")
-                stocks.append({
-                    "symbol": sym,
-                    "code": code,
-                    "name": display_name(sym, code),
-                })
-        except Exception:
-            # 降级: 仅返回代码列表
-            stocks = [
-                {
-                    "symbol": s,
-                    "code": s.replace("SH.", "").replace("SZ.", ""),
-                    "name": display_name(s, s.replace("SH.", "").replace("SZ.", "")),
-                }
-                for s in symbols[:50]
-            ]
+        for sym in symbols[:60]:
+            code = _code_from_symbol(sym)
+            if not code:
+                continue
+            stocks.append({
+                "symbol": _futu_symbol(sym, code),
+                "code": code,
+                "name": display_name(sym, code),
+            })
 
         return {
-            "board": board,
+            "board": resolved_board,
+            "query": board,
+            "resolved_board": resolved_board,
+            "source": source,
+            "matches": [_match_payload(doc) for doc in matches],
             "total": len(symbols),
             "showing": len(stocks),
             "stocks": stocks,
