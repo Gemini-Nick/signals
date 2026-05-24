@@ -68,6 +68,7 @@ function _initBtEvents() {
   document.getElementById('bt-code')?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') _runAnalyze();
   });
+  document.addEventListener('keydown', _handleBacktestHotkeys);
 
   // 批量模式切换
   document.getElementById('bt-batch-mode')?.addEventListener('change', _onBatchModeChange);
@@ -86,6 +87,45 @@ function _initBtEvents() {
   document.querySelectorAll('.bt-tab-btn').forEach(btn => {
     btn.addEventListener('click', () => _switchBtTab(btn.dataset.tab));
   });
+}
+
+function _handleBacktestHotkeys(e) {
+  const page = document.getElementById('page-backtest');
+  if (!page?.classList.contains('active')) return;
+  const target = e.target;
+  const tag = (target?.tagName || '').toLowerCase();
+  const typing = tag === 'input' || tag === 'textarea' || tag === 'select' || target?.isContentEditable;
+
+  if (e.key === '/' && !typing) {
+    e.preventDefault();
+    document.getElementById('bt-code')?.focus();
+    return;
+  }
+  if (typing) return;
+
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    _runAnalyze();
+    return;
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    document.activeElement?.blur?.();
+    return;
+  }
+  const tabByKey = { '1': 'perf', '2': 'trades', '3': 'signals', '4': 'scan', '5': 'risk' };
+  if (tabByKey[e.key]) {
+    e.preventDefault();
+    _switchBtTab(tabByKey[e.key]);
+    return;
+  }
+  const freqByKey = { d: 'daily', w: 'weekly', m: 'monthly' };
+  const nextFreq = freqByKey[e.key.toLowerCase()];
+  if (nextFreq) {
+    e.preventDefault();
+    const freqEl = document.getElementById('bt-freq');
+    if (freqEl) freqEl.value = nextFreq;
+  }
 }
 
 // ── Expander 折叠 ──────────────────────────────────
@@ -229,22 +269,27 @@ async function _runAnalyze() {
     _btLastData = data;
     _btActiveRange = null;
 
-    const filledCount = (data.sim_kpi || {}).filled_trades || 0;
-    showToast(`${data.symbol} ${data.freq} — ${data.signals.length} 信号, ${filledCount} 笔成交`);
-    statusEl.textContent = `${data.signals.length} 信号 | ${filledCount} 笔成交`;
+    const terminal = _terminal(data);
+    const metrics = _terminalMetrics(data);
+    const signalCount = metrics.signal_count ?? (data.signals || []).length;
+    const filledCount = metrics.filled_trades ?? ((data.sim_kpi || {}).filled_trades || 0);
+    showToast(`${data.symbol} ${data.freq} — ${signalCount} 信号, ${filledCount} 笔成交`);
+    statusEl.textContent = `${signalCount} 信号 | ${filledCount} 笔成交`;
 
     // 渲染所有组件
+    _renderTerminalSummary(data);
     _createBtChart(data);
     _showResultArea();
-    _renderKPI(data.kpi);
+    _renderKPI(data.kpi, terminal);
     _renderSignalTable(data.signals);
-    _renderDatePresets(data.date_presets);
+    _renderDatePresets((terminal.chart || {}).date_presets || data.date_presets);
 
     // 模拟结果
-    _renderSimKPI(data.sim_kpi || {});
+    _renderSimKPI(data.sim_kpi || {}, terminal);
     _renderEquityCurve(data.sim_equity || []);
     _renderTradeTable(data.sim_trades || []);
     _renderSkipReasons(data.sim_skip_reasons || {});
+    _renderRiskPanel(terminal);
 
     // 清空扫描
     document.getElementById('bt-scan-best').innerHTML = '';
@@ -768,9 +813,90 @@ function _drawBtSignalMarkers(signals) {
 // 渲染函数
 // ═══════════════════════════════════════════════════
 
-function _renderKPI(kpi) {
+function _terminal(data) {
+  return data?.terminal || {};
+}
+
+function _terminalMetrics(dataOrTerminal) {
+  const terminal = dataOrTerminal?.version === 'backtest-terminal.v1' ? dataOrTerminal : _terminal(dataOrTerminal);
+  return terminal.metrics || {};
+}
+
+function _metric(m, key, fallback = 0) {
+  const value = m?.[key];
+  return value == null || Number.isNaN(Number(value)) ? fallback : value;
+}
+
+function _fmtCorePct(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '—';
+  return (num >= 0 ? '+' : '') + num.toFixed(2) + '%';
+}
+
+function _terminalTone(value, inverse = false) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num === 0) return '';
+  const up = inverse ? num < 0 : num > 0;
+  return up ? 'up' : 'down';
+}
+
+function _renderTerminalSummary(data) {
+  const el = document.getElementById('bt-terminal-summary');
+  if (!el) return;
+  const terminal = _terminal(data);
+  if (!terminal.version) {
+    el.innerHTML = '';
+    return;
+  }
+  const target = terminal.target || {};
+  const snap = terminal.market_snapshot || {};
+  const m = terminal.metrics || {};
+  const title = [target.symbol || data.symbol, target.name].filter(Boolean).join(' · ');
+  const cells = [
+    { label: '标的', value: title || data.code || '—', cls: '' },
+    { label: '最新/涨跌', value: `${_fmtPrice(snap.last)} / ${_fmtCorePct(snap.change_pct)}`, cls: _terminalTone(snap.change_pct) },
+    { label: 'PnL', value: _fmtCorePct(m.total_return_pct), cls: _terminalTone(m.total_return_pct) },
+    { label: 'DD', value: _fmtCorePct(-Math.abs(Number(m.max_drawdown_pct || 0))), cls: 'down' },
+    { label: 'WinRate', value: _fmtCorePct(m.win_rate), cls: _terminalTone(Number(m.win_rate || 0) - 50) },
+    { label: 'Trades/Sharpe', value: `${m.filled_trades ?? 0} / ${_fmtNumber(m.sharpe, 2)}`, cls: '' },
+  ];
+  el.innerHTML = cells.map(cell => `
+    <div class="bt-terminal-cell">
+      <div class="bt-terminal-label">${cell.label}</div>
+      <div class="bt-terminal-value ${cell.cls}">${cell.value}</div>
+    </div>
+  `).join('');
+}
+
+function _fmtPrice(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '—';
+  return num.toFixed(num >= 100 ? 2 : 3);
+}
+
+function _fmtNumber(value, digits = 2) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '—';
+  return num.toFixed(digits);
+}
+
+function _renderKPI(kpi, terminal) {
   const el = document.getElementById('bt-kpis');
   const byTypeEl = document.getElementById('bt-kpi-bytype');
+  const terminalMetrics = terminal?.metrics || {};
+  if (terminal?.version) {
+    kpi = {
+      ...(kpi || {}),
+      total: terminalMetrics.signal_count,
+      evaluated: terminalMetrics.evaluated_count,
+      win_rate: kpi?.win_rate ?? terminalMetrics.win_rate,
+      expectancy: terminalMetrics.avg_t10_pct,
+      avg_return_t5: terminalMetrics.avg_t5_pct,
+      avg_return_t10: terminalMetrics.avg_t10_pct,
+      avg_mfe: terminalMetrics.avg_mfe_pct,
+      avg_mae: terminalMetrics.avg_mae_pct,
+    };
+  }
   if (!kpi || kpi.total === 0) {
     el.innerHTML = '<div class="empty-state">无信号数据</div>';
     if (byTypeEl) byTypeEl.innerHTML = '';
@@ -782,7 +908,8 @@ function _renderKPI(kpi) {
     { value: (kpi.evaluated || kpi.total) + '/' + kpi.total, label: '已评估', cls: '' },
     { value: kpi.win_rate + '%', label: '胜率(T+10)', cls: kpi.win_rate >= 50 ? 'up' : 'down' },
     { value: (kpi.expectancy >= 0 ? '+' : '') + kpi.expectancy + '%', label: '期望收益', cls: kpi.expectancy >= 0 ? 'up' : 'down' },
-    { value: kpi.avg_return_t10 + '%', label: '平均T+10', cls: kpi.avg_return_t10 >= 0 ? 'up' : 'down' },
+    { value: (kpi.avg_return_t5 >= 0 ? '+' : '') + (kpi.avg_return_t5 ?? 0) + '%', label: '平均T+5', cls: (kpi.avg_return_t5 ?? 0) >= 0 ? 'up' : 'down' },
+    { value: (kpi.avg_return_t10 >= 0 ? '+' : '') + kpi.avg_return_t10 + '%', label: '平均T+10', cls: kpi.avg_return_t10 >= 0 ? 'up' : 'down' },
     { value: '+' + (kpi.avg_mfe || 0) + '%', label: 'MFE均', cls: 'up' },
     { value: (kpi.avg_mae || 0) + '%', label: 'MAE均', cls: 'down' },
   ];
@@ -832,8 +959,29 @@ function _renderKPI(kpi) {
   }
 }
 
-function _renderSimKPI(kpi) {
+function _renderSimKPI(kpi, terminal) {
   const el = document.getElementById('bt-sim-kpis');
+  if (terminal?.version) {
+    const m = terminal.metrics || {};
+    kpi = {
+      ...(kpi || {}),
+      filled_trades: m.filled_trades,
+      win_rate: m.win_rate,
+      total_return_pct: m.total_return_pct,
+      benchmark_return_pct: m.benchmark_return_pct,
+      excess_return_pct: m.excess_return_pct,
+      annual_return_pct: m.annual_return_pct,
+      max_drawdown_pct: m.max_drawdown_pct,
+      volatility_pct: m.volatility_pct,
+      sharpe: m.sharpe,
+      calmar: m.calmar,
+      profit_factor: m.profit_factor,
+      expectancy: m.expectancy_pct,
+      avg_hold_days: m.avg_holding_days,
+      avg_mfe: m.avg_mfe_pct,
+      avg_mae: m.avg_mae_pct,
+    };
+  }
   if (!kpi || !kpi.filled_trades) {
     el.innerHTML = '<div class="empty-state">无成交记录</div>';
     return;
@@ -842,8 +990,9 @@ function _renderSimKPI(kpi) {
     { value: kpi.filled_trades, label: '成交笔数', cls: '' },
     { value: kpi.win_rate + '%', label: '胜率', cls: kpi.win_rate >= 50 ? 'up' : 'down' },
     { value: (kpi.total_return_pct >= 0 ? '+' : '') + kpi.total_return_pct + '%', label: '总收益', cls: kpi.total_return_pct >= 0 ? 'up' : 'down' },
+    { value: (kpi.excess_return_pct >= 0 ? '+' : '') + kpi.excess_return_pct + '%', label: '超额', cls: kpi.excess_return_pct >= 0 ? 'up' : 'down' },
     { value: kpi.sharpe, label: 'Sharpe', cls: kpi.sharpe >= 1 ? 'up' : kpi.sharpe < 0 ? 'down' : '' },
-    { value: kpi.sortino, label: 'Sortino', cls: kpi.sortino >= 1 ? 'up' : kpi.sortino < 0 ? 'down' : '' },
+    { value: kpi.calmar, label: 'Calmar', cls: kpi.calmar >= 1 ? 'up' : kpi.calmar < 0 ? 'down' : '' },
     { value: kpi.profit_factor, label: '盈亏比', cls: kpi.profit_factor >= 1 ? 'up' : 'down' },
     { value: '-' + kpi.max_drawdown_pct + '%', label: '最大回撤', cls: 'down' },
     { value: (kpi.expectancy >= 0 ? '+' : '') + kpi.expectancy + '%', label: '期望', cls: kpi.expectancy >= 0 ? 'up' : 'down' },
@@ -920,7 +1069,13 @@ function _renderSignalTable(signals, filterGroups) {
       <th>T+5</th><th>T+10</th><th>T+20</th><th>MFE</th><th>MAE</th>
     </tr></thead><tbody>`;
   for (const s of filtered) {
-    const ev = s.eval || {};
+    const ev = s.eval || {
+      return_t5: s.return_t5,
+      return_t10: s.return_t10,
+      return_t20: s.return_t20,
+      mfe: s.mfe_pct,
+      mae: s.mae_pct,
+    };
     const t10 = ev.return_t10;
     const isWin = t10 != null && t10 > 0;
     const isLoss = t10 != null && t10 < 0;
@@ -930,11 +1085,13 @@ function _renderSignalTable(signals, filterGroups) {
     const maCls = s.ma_confirmed ? 'up' : '';
     const volStatus = s.volume_status || '—';
     const volCls = s.vol_confirmed ? 'up' : '';
-    html += `<tr class="bt-signal-row ${rowCls}" onclick="_btScrollTo(${s.dt})">
-      <td>${s.date_str}</td>
-      <td><b>${s.type}</b></td>
+    const scrollTime = s.dt || s.time || 0;
+    const price = Number(s.price);
+    html += `<tr class="bt-signal-row ${rowCls}" onclick="_btScrollTo(${scrollTime});_switchBtTab('signals')">
+      <td>${s.date_str || s.date || '—'}</td>
+      <td><b>${s.type || 'Signal'}</b></td>
       <td>${groupBadge}</td>
-      <td>${s.price.toFixed(2)}</td>
+      <td>${Number.isFinite(price) ? price.toFixed(2) : '—'}</td>
       <td>${s.confidence != null ? (s.confidence * 100).toFixed(0) + '%' : '—'}</td>
       <td class="${maCls}" style="font-size:11px;">${maStatus}</td>
       <td class="${volCls}" style="font-size:11px;">${volStatus}</td>
@@ -1056,6 +1213,54 @@ function _renderSkipReasons(skipReasons) {
   };
   el.innerHTML = '<div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">跳过原因: ' +
     keys.map(k => `${labels[k] || k} (${skipReasons[k]})`).join(' | ') + '</div>';
+}
+
+function _renderRiskPanel(terminal) {
+  const el = document.getElementById('bt-risk-summary');
+  if (!el) return;
+  if (!terminal?.version) {
+    el.innerHTML = '<div class="empty-state">运行后显示风控摘要</div>';
+    return;
+  }
+  const risk = terminal.panels?.risk || {};
+  const config = terminal.panels?.config || {};
+  const assumptions = terminal.trade_assumptions || risk.assumptions || {};
+  const bands = risk.bands || terminal.chart?.risk_bands || [];
+  const dataHealth = config.data_health || {};
+  const skipReasons = risk.skip_reasons || {};
+  const metricRows = (terminal.metrics?.risk || []).map(item => [item.label, `${item.value ?? '—'}${item.unit || ''}`]);
+  const assumptionRows = [
+    ['初始资金', assumptions.initial_capital],
+    ['仓位', assumptions.position_size],
+    ['佣金', `${assumptions.commission_pct ?? '—'}%`],
+    ['印花税', `${assumptions.stamp_tax_pct ?? '—'}%`],
+    ['滑点', `${assumptions.slippage_pct ?? '—'}%`],
+    ['手数', assumptions.lot_size],
+    ['最长持仓', `${assumptions.max_hold_days ?? '—'}D`],
+  ];
+  const bandRows = bands.map(item => [item.label, item.price != null ? `${_fmtPrice(item.price)} / ${item.pct}%` : `${item.pct}%`]);
+  const healthRows = [
+    ['数据源', dataHealth.data_source_detail || dataHealth.data_source || '—'],
+    ['新鲜度', dataHealth.freshness || '—'],
+    ['截至', dataHealth.as_of || '—'],
+    ['K线数', dataHealth.bar_count ?? '—'],
+  ];
+  const skipRows = Object.keys(skipReasons).length
+    ? Object.entries(skipReasons).map(([key, value]) => [key, value])
+    : [['跳过原因', '无']];
+  el.innerHTML = [
+    _riskBlock('风险指标', metricRows),
+    _riskBlock('交易假设', assumptionRows),
+    _riskBlock('止损/止盈带', bandRows.length ? bandRows : [['风控线', '未启用']]),
+    _riskBlock('数据健康', healthRows.concat(skipRows)),
+  ].join('');
+}
+
+function _riskBlock(title, rows) {
+  return `<div class="bt-risk-panel">
+    <div class="bt-risk-title">${title}</div>
+    ${rows.map(([label, value]) => `<div class="bt-risk-line"><span>${label}</span><span>${value ?? '—'}</span></div>`).join('')}
+  </div>`;
 }
 
 function _renderDatePresets(presets) {

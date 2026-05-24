@@ -24,6 +24,7 @@ from signals.core.market_time import (
     timestamp_range_to_dates,
     to_unix_seconds,
 )
+from signals.core.backtest_terminal import build_backtest_terminal
 from signals.core.concept_carriers import load_industry_chains, non_chain_reason
 from signals.core.macro_universe import (
     MACRO_GROUP_INDUSTRY_ETFS,
@@ -11202,4 +11203,5 @@ async def get_workbench_backtest(
         "requested_freq": freq,
         "effective_freq": freq if freq in {"daily", "weekly", "monthly"} else "daily",
     }
+    filtered["terminal"] = build_backtest_terminal(filtered)
     return filtered

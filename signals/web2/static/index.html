@@ -70,6 +70,7 @@
         <select id="bt-freq" class="bt-select">
           <option value="daily">日线</option>
           <option value="weekly">周线</option>
+          <option value="monthly">月线</option>
         </select>
         <select id="bt-signal-type" class="bt-select">
           <optgroup label="经典信号">
@@ -140,6 +141,7 @@
 
       <!-- 日期快捷跳转 -->
       <div id="bt-presets" class="preset-chips"></div>
+      <div id="bt-terminal-summary" class="bt-terminal-summary"></div>
     </div>
 
     <!-- ⚙️ 模拟参数折叠面板 -->
@@ -277,6 +279,7 @@
         <button class="bt-tab-btn" data-tab="trades">📝 交易明细</button>
         <button class="bt-tab-btn" data-tab="signals">🔍 信号详情</button>
         <button class="bt-tab-btn" data-tab="scan">🔎 参数扫描</button>
+        <button class="bt-tab-btn" data-tab="risk">🛡 风控摘要</button>
         <button class="bt-tab-btn" data-tab="batch" style="display:none;">📋 批量对比</button>
       </div>
 
@@ -325,7 +328,12 @@
         <div id="bt-scan-table" class="bt-signal-list-wrapper"></div>
       </div>
 
-      <!-- Tab 6: 批量对比 -->
+      <!-- Tab 6: 风控摘要 -->
+      <div class="bt-tab-panel" data-tab="risk">
+        <div id="bt-risk-summary" class="bt-risk-summary"></div>
+      </div>
+
+      <!-- Tab 7: 批量对比 -->
       <div class="bt-tab-panel" data-tab="batch">
         <div id="bt-batch-summary" class="bt-kpis"></div>
         <div id="bt-batch-table" class="bt-signal-list-wrapper"></div>
@@ -338,6 +346,6 @@
 
   <script src="/static/js/app.js?v=8"></script>
   <script src="/static/js/cluster.js?v=8"></script>
-  <script src="/static/js/backtest.js?v=9"></script>
+  <script src="/static/js/backtest.js?v=10"></script>
 </body>
 </html>

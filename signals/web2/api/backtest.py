@@ -16,6 +16,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import config
+from signals.core.backtest_terminal import build_backtest_terminal, build_scan_terminal
 from signals.core.market_time import to_unix_seconds
 
 logger = logging.getLogger(__name__)
@@ -1388,6 +1389,7 @@ async def analyze_backtest_payload(
             warnings.append(f"{code} {freq_label} 有K线但暂无命中信号")
         if warnings:
             result["warnings"] = warnings
+        result["terminal"] = build_backtest_terminal(result)
         return result
 
     except Exception as e:
@@ -1608,6 +1610,16 @@ async def backtest_scan(
             param2_name=p2_name, param2_values=values2,
             metric=scan_metric,
         )
+        scan_result["metric"] = scan_metric
+        scan_result["terminal"] = build_scan_terminal(scan_result, context={
+            "symbol": symbol,
+            "code": code,
+            "market": market,
+            "freq": freq_label,
+            "bar_count": len(df),
+            "data_source": df.attrs.get("data_source", ""),
+            "freshness": "fresh" if df.attrs.get("data_source") else "unknown",
+        })
         return scan_result
 
     except Exception as e:
@@ -1910,6 +1922,7 @@ async def backtest_simulate(
             result["scan"] = scan_result
         if warnings:
             result["warnings"] = warnings
+        result["terminal"] = build_backtest_terminal(result, scan=scan_result)
 
         return result
 
@@ -1982,59 +1995,66 @@ async def backtest_export(
     batch2_target: float = Query(10),
 ):
     """Phase 5: CSV 导出"""
-    from signals.core.trade_simulator import SimConfig, simulate_trades
     from fastapi.responses import StreamingResponse
     import io
     import csv
 
     try:
-        code = code.strip()
-        market = _detect_market(code)
-        symbol = _build_symbol(code, market)
-        freq_label = "日线" if freq == "daily" else "周线"
-
-        df = _fetch_kline(code, market, freq)
-        if df.empty:
-            return JSONResponse(status_code=404, content={"error": f"无数据: {code}"})
-
-        # 信号检测 (同 /simulate)
-        all_signals = []
-        if signal_group in ("macd", "all"):
-            all_signals.extend(_detect_macd(df, symbol, freq_label, min(lookback, len(df) - 35)))
-        if signal_group in ("czsc", "all"):
-            try:
-                czsc_sigs, _, _ = _detect_czsc(df, symbol, freq_label)
-                all_signals.extend(czsc_sigs)
-            except Exception as czsc_err:
-                logger.warning("导出: 缠论信号检测失败: %s", czsc_err)
-        if factor:
-            all_signals.extend(_detect_entry_factors(df, factor, lookback,
-                gap_pct_min=gap_pct_min, volume_ratio_min=volume_ratio_min,
-                trend_lookback=trend_lookback, bb_period=bb_period,
-                squeeze_threshold=squeeze_threshold))
-        all_signals.sort(key=lambda s: s["dt"])
-
-        # 模拟
-        import dataclasses
-        sim_kwargs = dict(
-            stop_loss_pct=stop_loss, trail_stop_pct=trail_stop,
-            max_hold_days=max_hold, slippage=slippage / 100.0,
+        analysis = await analyze_backtest_payload(
+            code=code,
+            freq=freq,
+            signal_group=signal_group,
+            lookback=lookback,
+            factor=factor,
+            gap_pct_min=gap_pct_min,
+            volume_ratio_min=volume_ratio_min,
+            trend_lookback=trend_lookback,
+            bb_period=bb_period,
+            squeeze_threshold=squeeze_threshold,
+            stop_loss=stop_loss,
+            trail_stop=trail_stop,
+            max_hold=max_hold,
+            slippage=slippage,
+            take_profit=take_profit,
+            ma_exit_period=ma_exit_period,
+            profit_drawdown=profit_drawdown,
+            batch_exit=batch_exit,
+            batch1_ratio=batch1_ratio,
+            batch1_target=batch1_target,
+            batch2_target=batch2_target,
         )
-        if take_profit > 0:
-            sim_kwargs["take_profit_pct"] = take_profit
-        valid_fields = {f.name for f in dataclasses.fields(SimConfig)}
-        sim_kwargs = {k: v for k, v in sim_kwargs.items() if k in valid_fields}
-        sim = simulate_trades(df, all_signals, SimConfig(**sim_kwargs))
+        if isinstance(analysis, JSONResponse):
+            return analysis
+        terminal = analysis.get("terminal") or build_backtest_terminal(analysis)
 
         # 构建 CSV
         output = io.StringIO()
         writer = csv.writer(output)
+        writer.writerow(["section", "key", "value", "detail"])
+        for key, value in (terminal.get("target") or {}).items():
+            writer.writerow(["target", key, value, ""])
+        for key, value in (terminal.get("market_snapshot") or {}).items():
+            writer.writerow(["market_snapshot", key, value, ""])
+        for key, value in (terminal.get("trade_assumptions") or {}).items():
+            writer.writerow(["trade_assumptions", key, value, ""])
+        metric_keys = [
+            "total_return_pct", "benchmark_return_pct", "excess_return_pct", "annual_return_pct",
+            "max_drawdown_pct", "volatility_pct", "sharpe", "calmar",
+            "filled_trades", "win_rate", "profit_factor", "expectancy_pct",
+            "avg_win_pct", "avg_loss_pct", "avg_holding_days", "max_consecutive_losses",
+            "exposure_pct", "signal_count", "evaluated_count", "avg_t5_pct", "avg_t10_pct",
+            "avg_mfe_pct", "avg_mae_pct",
+        ]
+        metrics = terminal.get("metrics") or {}
+        for key in metric_keys:
+            writer.writerow(["metrics", key, metrics.get(key, ""), ""])
+        writer.writerow([])
         writer.writerow([
             "信号日", "类型", "组", "入场日", "入场价", "成交方式",
             "出场日", "出场价", "出场原因", "持仓天",
             "毛利%", "净利%", "成本%", "MFE%", "MAE%", "跳过原因",
         ])
-        for t in sim.trades:
+        for t in ((terminal.get("panels") or {}).get("trades") or {}).get("rows", []):
             writer.writerow([
                 t.get("signal_date", ""), t.get("signal_type", ""), t.get("signal_group", ""),
                 t.get("entry_date", ""), t.get("entry_price", ""), t.get("fill_type", ""),
@@ -2045,7 +2065,8 @@ async def backtest_export(
             ])
 
         output.seek(0)
-        filename = f"backtest_{code}_{datetime.now().strftime('%Y%m%d')}.csv"
+        target = terminal.get("target") or {}
+        filename = f"backtest_{target.get('code') or code}_{datetime.now().strftime('%Y%m%d')}.csv"
         return StreamingResponse(
             iter([output.getvalue()]),
             media_type="text/csv",

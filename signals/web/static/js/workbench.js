@@ -966,7 +966,9 @@ function wbRenderBacktestEmpty(message) {
 }
 
 function wbRenderBacktest(backtest) {
-  document.getElementById('wb-backtest-target').textContent = `${backtest.target?.symbol || ''} · ${backtest.target?.effective_freq || ''}`;
+  const terminal = backtest.terminal || {};
+  const target = terminal.target || backtest.target || {};
+  document.getElementById('wb-backtest-target').textContent = `${target.symbol || backtest.symbol || ''} · ${target.freq || target.effective_freq || ''}`;
   wbSetBacktestReportButtons(true);
   const kpiEl = document.getElementById('wb-backtest-kpis');
   const simEl = document.getElementById('wb-sim-kpis');
@@ -975,34 +977,38 @@ function wbRenderBacktest(backtest) {
 
   const kpi = backtest.kpi || backtest.forward_kpi || {};
   const sim = backtest.sim_kpi || {};
+  const metrics = terminal.metrics || {};
   kpiEl.innerHTML = [
-    wbKpiCard('信号总数', String(kpi.total ?? backtest.signals?.length ?? 0), `已评估 ${kpi.evaluated ?? 0}`),
-    wbKpiCard('T+5', wbFormatPct(kpi.return_t5_avg ?? 0, 2), '平均前瞻'),
-    wbKpiCard('T+10', wbFormatPct(kpi.return_t10_avg ?? 0, 2), '平均前瞻'),
-    wbKpiCard('胜率', wbFormatPct(sim.win_rate ?? 0, 1), `${sim.filled_trades ?? 0} 笔成交`),
+    wbKpiCard('信号总数', String(metrics.signal_count ?? kpi.total ?? backtest.signals?.length ?? 0), `已评估 ${metrics.evaluated_count ?? kpi.evaluated ?? 0}`),
+    wbKpiCard('T+5', wbFormatPct(metrics.avg_t5_pct ?? kpi.return_t5_avg ?? kpi.avg_return_t5 ?? 0, 2), '平均前瞻'),
+    wbKpiCard('T+10', wbFormatPct(metrics.avg_t10_pct ?? kpi.return_t10_avg ?? kpi.avg_return_t10 ?? 0, 2), '平均前瞻'),
+    wbKpiCard('胜率', wbFormatPct(metrics.win_rate ?? sim.win_rate ?? 0, 1), `${metrics.filled_trades ?? sim.filled_trades ?? 0} 笔成交`),
   ].join('');
 
   simEl.innerHTML = [
-    wbKpiCard('Sharpe', wbFormatNumber(sim.sharpe ?? 0, 2)),
-    wbKpiCard('期望收益', wbFormatPct(sim.expectancy ?? 0, 2)),
-    wbKpiCard('总收益', wbFormatPct(sim.total_return_pct ?? 0, 2)),
-    wbKpiCard('最大回撤', wbFormatPct(sim.max_drawdown_pct ?? 0, 2)),
+    wbKpiCard('Sharpe', wbFormatNumber(metrics.sharpe ?? sim.sharpe ?? 0, 2)),
+    wbKpiCard('期望收益', wbFormatPct(metrics.expectancy_pct ?? sim.expectancy ?? 0, 2)),
+    wbKpiCard('总收益', wbFormatPct(metrics.total_return_pct ?? sim.total_return_pct ?? 0, 2)),
+    wbKpiCard('最大回撤', wbFormatPct(metrics.max_drawdown_pct ?? sim.max_drawdown_pct ?? 0, 2)),
   ].join('');
 
-  const warnings = backtest.warnings || [];
-  const config = {
-    range: backtest.range || null,
-    warnings,
-    sim_config: backtest.sim_config || {},
-    skip_reasons: backtest.sim_skip_reasons || {},
-  };
-  configEl.textContent = JSON.stringify(config, null, 2);
+  const warnings = terminal.panels?.config?.warnings || backtest.warnings || [];
+  const health = terminal.panels?.config?.data_health || {};
+  const assumptions = terminal.trade_assumptions || {};
+  const skipReasons = terminal.panels?.risk?.skip_reasons || backtest.sim_skip_reasons || {};
+  configEl.textContent = [
+    `数据源: ${health.data_source_detail || health.data_source || backtest.data_source_detail || backtest.data_source || '-'}`,
+    `截至: ${health.as_of || backtest.as_of || '-'} · K线 ${health.bar_count ?? backtest.bar_count ?? '-'}`,
+    `假设: 止损 ${assumptions.stop_loss_pct ?? backtest.sim_config?.stop_loss_pct ?? '-'}%, 滑点 ${assumptions.slippage_pct ?? backtest.sim_config?.slippage_pct ?? '-'}%, 最长 ${assumptions.max_hold_days ?? backtest.sim_config?.max_hold_days ?? '-'}D`,
+    `跳过: ${Object.entries(skipReasons).map(([key, value]) => `${key}=${value}`).join(', ') || '无'}`,
+    warnings.length ? `提示: ${warnings.join(' | ')}` : '',
+  ].filter(Boolean).join('\n');
 
-  const signals = backtest.signals || [];
+  const signals = terminal.panels?.signals?.rows || backtest.signals || [];
   signalEl.innerHTML = signals.length ? signals.slice(-18).reverse().map(item => `
     <tr>
       <td>${wbEscapeHtml(item.type || item.signal_type || '')}</td>
-      <td>${wbEscapeHtml(item.date_str || item.signal_date || '')}</td>
+      <td>${wbEscapeHtml(item.date || item.date_str || item.signal_date || '')}</td>
       <td>${wbEscapeHtml(wbFormatNumber(item.price, 2))}</td>
       <td>${wbEscapeHtml(item.freq || '')}</td>
       <td>${wbEscapeHtml(wbFormatNumber(item.confidence, 2))}</td>

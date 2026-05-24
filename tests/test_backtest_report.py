@@ -20,8 +20,14 @@ def _sample_payload():
         "data_source": "bars",
         "data_source_detail": "002759 daily local bars",
         "generated_at": "2026-05-08T10:00:00",
+        "ohlcv": [
+            {"time": 1767225600, "open": 10.0, "high": 10.3, "low": 9.8, "close": 10.1, "volume": 1000},
+            {"time": 1767312000, "open": 10.1, "high": 10.8, "low": 10.0, "close": 10.6, "volume": 1400},
+            {"time": 1767398400, "open": 10.6, "high": 11.0, "low": 10.4, "close": 10.8, "volume": 1600},
+            {"time": 1767484800, "open": 10.8, "high": 11.2, "low": 10.5, "close": 11.0, "volume": 1800},
+        ],
         "signals": [
-            {"type": "Pattern A", "group": "macd", "date_str": "2026-01-01", "eval": {"return_t10": 3.2, "direction_correct": 1, "mfe": 5.0, "mae": -1.0}},
+            {"dt": 1767225600, "type": "Pattern A", "group": "macd", "date_str": "2026-01-01", "price": 10.1, "eval": {"return_t5": 2.1, "return_t10": 3.2, "direction_correct": 1, "mfe": 5.0, "mae": -1.0}},
         ],
         "kpi": {
             "total": 1,
@@ -39,9 +45,11 @@ def _sample_payload():
                 "exit_date": "2026-01-04",
                 "signal_type": "Pattern A",
                 "net_return_pct": 3.5,
+                "return_pct": 3.9,
                 "holding_days": 2,
                 "exit_reason": "data_end",
                 "entry_price": 10.1,
+                "exit_price": 10.8,
             }
         ],
         "sim_kpi": {
@@ -56,7 +64,52 @@ def _sample_payload():
         },
         "sim_config": {"stop_loss_pct": 5, "max_hold_days": 20, "slippage_pct": 0.1},
         "warnings": ["数据源: local bars"],
-    }
+}
+
+
+def test_backtest_terminal_core_contract():
+    from signals.core.backtest_terminal import TERMINAL_VERSION, build_backtest_terminal
+
+    terminal = build_backtest_terminal(_sample_payload())
+
+    assert terminal["version"] == TERMINAL_VERSION
+    assert terminal["target"]["symbol"] == "SZ.002759"
+    assert terminal["target"]["code"] == "002759"
+    assert terminal["target"]["market"] == "A"
+    assert terminal["market_snapshot"]["last"] == 11.0
+    assert terminal["market_snapshot"]["prev_close"] == 10.8
+    assert terminal["trade_assumptions"]["initial_capital"] == 100000
+    assert terminal["trade_assumptions"]["lot_size"] == 100
+    for key in [
+        "total_return_pct", "benchmark_return_pct", "excess_return_pct", "annual_return_pct",
+        "max_drawdown_pct", "volatility_pct", "sharpe", "calmar", "filled_trades",
+        "win_rate", "profit_factor", "expectancy_pct", "avg_win_pct", "avg_loss_pct",
+        "avg_holding_days", "max_consecutive_losses", "exposure_pct", "signal_count",
+        "evaluated_count", "avg_t5_pct", "avg_t10_pct", "avg_mfe_pct", "avg_mae_pct",
+    ]:
+        assert key in terminal["metrics"]
+    assert terminal["chart"]["ohlcv"]
+    assert terminal["chart"]["signal_markers"][0]["kind"] == "signal"
+    assert terminal["chart"]["trade_markers"][0]["kind"] == "entry"
+    assert set(["perf", "trades", "signals", "scan", "risk", "config"]).issubset(terminal["panels"])
+
+
+def test_backtest_terminal_empty_signals_and_no_trades():
+    from signals.core.backtest_terminal import build_backtest_terminal
+
+    payload = _sample_payload()
+    payload["signals"] = []
+    payload["sim_trades"] = []
+    payload["sim_kpi"] = {"filled_trades": 0, "total_return_pct": 0}
+
+    terminal = build_backtest_terminal(payload)
+
+    assert terminal["metrics"]["signal_count"] == 0
+    assert terminal["metrics"]["filled_trades"] == 0
+    assert terminal["panels"]["signals"]["rows"] == []
+    assert terminal["panels"]["trades"]["rows"] == []
+    assert terminal["chart"]["signal_markers"] == []
+    assert terminal["chart"]["trade_markers"] == []
 
 
 def test_generate_backtest_report_html_and_dispatch(tmp_path):
@@ -157,5 +210,7 @@ def test_service_analyze_uses_plain_defaults(monkeypatch):
 
     result = asyncio.run(backtest_service.backtest_analyze(code="002759", freq="daily", lookback=180))
     assert result["code"] == "002759"
+    assert result["terminal"]["version"] == "backtest-terminal.v1"
+    assert result["terminal"]["metrics"]["signal_count"] >= 1
     assert result["sim_config"]["slippage_pct"] == 0.1
     assert result["sim_kpi"]["filled_trades"] >= 1

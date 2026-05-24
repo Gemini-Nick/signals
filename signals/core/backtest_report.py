@@ -48,22 +48,25 @@ def render_backtest_report(payload: dict[str, Any], report_format: str, title: s
 
 def report_filename(payload: dict[str, Any], report_format: str) -> str:
     """Build a stable download filename for a payload."""
-    code = _safe_filename_part(payload.get("code") or payload.get("symbol") or "unknown")
-    freq = _safe_filename_part(_freq_slug(payload.get("freq") or "daily"))
+    target = (payload.get("terminal") or {}).get("target") or {}
+    code = _safe_filename_part(target.get("code") or payload.get("code") or payload.get("symbol") or "unknown")
+    freq = _safe_filename_part(_freq_slug(target.get("freq") or payload.get("freq") or "daily"))
     suffix = "pdf" if report_format.lower().lstrip(".") == "pdf" else "html"
     return f"backtest_{code}_{freq}.{suffix}"
 
 
 def _render_html(payload: dict[str, Any], title: str) -> str:
+    terminal = payload.get("terminal") or {}
     code = _h(payload.get("code") or "")
     symbol = _h(payload.get("symbol") or "")
     freq = _h(payload.get("freq") or "")
     source = _h(payload.get("data_source_detail") or payload.get("data_source") or "")
-    signals = payload.get("signals") or []
-    trades = [t for t in payload.get("sim_trades") or [] if t.get("entry_price") is not None]
+    signals = (terminal.get("panels") or {}).get("signals", {}).get("rows") or payload.get("signals") or []
+    trades = (terminal.get("panels") or {}).get("trades", {}).get("rows") or payload.get("sim_trades") or []
+    trades = [t for t in trades if t.get("entry_price") is not None]
     warnings = payload.get("warnings") or []
 
-    kpi_cards = _metric_cards(payload.get("kpi") or {}, payload.get("sim_kpi") or {})
+    kpi_cards = _metric_cards(payload.get("kpi") or {}, payload.get("sim_kpi") or {}, terminal=terminal)
     html_parts = [
         "<!doctype html>",
         '<html lang="zh-CN">',
@@ -174,7 +177,7 @@ def _render_pdf(payload: dict[str, Any], title: str) -> bytes:
         Spacer(1, 0.3 * cm),
     ]
 
-    cards = _metric_cards(payload.get("kpi") or {}, payload.get("sim_kpi") or {})
+    cards = _metric_cards(payload.get("kpi") or {}, payload.get("sim_kpi") or {}, terminal=payload.get("terminal") or {})
     story.append(_pdf_table([[label, value] for label, value, _ in cards], col_widths=[3.1 * cm, 2.5 * cm], grid=False))
     story.append(Spacer(1, 0.35 * cm))
 
@@ -185,7 +188,9 @@ def _render_pdf(payload: dict[str, Any], title: str) -> bytes:
         story.append(Image(BytesIO(chart), width=17.5 * cm, height=6.2 * cm))
         story.append(Spacer(1, 0.35 * cm))
 
-    trades = [t for t in payload.get("sim_trades") or [] if t.get("entry_price") is not None]
+    terminal = payload.get("terminal") or {}
+    trades = (terminal.get("panels") or {}).get("trades", {}).get("rows") or payload.get("sim_trades") or []
+    trades = [t for t in trades if t.get("entry_price") is not None]
     story.append(Paragraph("交易明细", heading))
     story.append(_pdf_table(
         [["入场", "出场", "信号", "收益", "持仓", "原因"]]
@@ -208,7 +213,8 @@ def _render_pdf(payload: dict[str, Any], title: str) -> bytes:
     story.append(_pdf_table(_signal_type_rows(payload.get("kpi") or {}), header=True))
     story.append(Spacer(1, 0.3 * cm))
 
-    config_rows = [["参数", "取值"]] + [[_text(k), _text(v)] for k, v in (payload.get("sim_config") or {}).items()]
+    config = (terminal.get("trade_assumptions") or payload.get("sim_config") or {})
+    config_rows = [["参数", "取值"]] + [[_text(k), _text(v)] for k, v in config.items()]
     story.append(Paragraph("参数", heading))
     story.append(_pdf_table(config_rows, header=True))
 
@@ -222,7 +228,21 @@ def _render_pdf(payload: dict[str, Any], title: str) -> bytes:
     return buffer.getvalue()
 
 
-def _metric_cards(kpi: dict[str, Any], sim_kpi: dict[str, Any]) -> list[tuple[str, str, str]]:
+def _metric_cards(kpi: dict[str, Any], sim_kpi: dict[str, Any], *, terminal: dict[str, Any] | None = None) -> list[tuple[str, str, str]]:
+    metrics = (terminal or {}).get("metrics") or {}
+    if metrics:
+        return [
+            ("信号数", _text(metrics.get("signal_count", 0)), ""),
+            ("T+10 均值", _fmt_pct(metrics.get("avg_t10_pct")), _cls(metrics.get("avg_t10_pct"), 0)),
+            ("成交笔数", _text(metrics.get("filled_trades", 0)), ""),
+            ("胜率", _fmt_rate(metrics.get("win_rate")), _cls(metrics.get("win_rate"), 50)),
+            ("总收益", _fmt_pct(metrics.get("total_return_pct")), _cls(metrics.get("total_return_pct"), 0)),
+            ("超额收益", _fmt_pct(metrics.get("excess_return_pct")), _cls(metrics.get("excess_return_pct"), 0)),
+            ("最大回撤", _fmt_pct(-abs(float(metrics.get("max_drawdown_pct") or 0))), "down"),
+            ("Sharpe", _fmt_num(metrics.get("sharpe")), _cls(metrics.get("sharpe"), 1)),
+            ("盈亏比", _fmt_num(metrics.get("profit_factor")), _cls(metrics.get("profit_factor"), 1)),
+            ("Calmar", _fmt_num(metrics.get("calmar")), _cls(metrics.get("calmar"), 1)),
+        ]
     return [
         ("信号数", _text(kpi.get("total", 0)), ""),
         ("T+10 胜率", _fmt_rate(kpi.get("win_rate")), _cls(kpi.get("win_rate"), 50)),
