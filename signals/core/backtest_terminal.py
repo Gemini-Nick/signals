@@ -107,6 +107,7 @@ def build_batch_terminal(
     overview_rows = [_batch_interval_row(row) for row in _rank_batch_stocks(stocks)]
     chart_items = [_batch_chart_item(row) for row in _rank_batch_stocks(stocks)]
     script_cards = [_batch_script_card(row, idx + 1, benchmark) for idx, row in enumerate(_rank_batch_stocks(stocks))]
+    signal_rows = _batch_signal_rows(stocks)
     metrics = _batch_metrics(summary, ranking_rows, ok_stocks)
     risk_rows = _batch_risk_rows(ranking_rows)
 
@@ -142,9 +143,9 @@ def build_batch_terminal(
                 "skipped_count": max(len(stocks) - len(ok_stocks), 0),
             },
             "signals": {
-                "rows": [],
+                "rows": signal_rows,
                 "count": int(_num(summary.get("total_signals"), 0) or 0),
-                "groups": [],
+                "groups": [str(row.get("signal_type")) for row in signal_rows],
             },
             "scan": {"rows": ranking_rows, "best_params": {}, "heatmap": None},
             "risk": {"summary": risk_rows, "rows": risk_rows, "skip_reasons": _batch_skip_reasons(stocks)},
@@ -239,7 +240,7 @@ def _batch_ranking_row(row: Mapping[str, Any], rank: int, benchmark: Mapping[str
     benchmark_return = _num(benchmark.get("return_pct"), 0) or 0
     relative_excess = _round((range_return or 0) - benchmark_return)
     grade = _strength_grade(range_return, relative_excess, max_drawdown, _num(row.get("sharpe"), 0))
-    difficulty = _trade_difficulty(max_drawdown, interval["volatility_pct"])
+    difficulty = _trade_difficulty(max_drawdown, interval["volatility_pct"], interval["median_5d_high_low_pct"])
     review_level = _review_level(grade, range_return, max_drawdown)
     conclusion = _review_conclusion(review_level, grade)
     turning_point = _turning_point(row)
@@ -257,6 +258,7 @@ def _batch_ranking_row(row: Mapping[str, Any], rank: int, benchmark: Mapping[str
         "max_drawdown_pct": max_drawdown,
         "max_runup_pct": interval["max_runup_pct"],
         "volatility_pct": interval["volatility_pct"],
+        "median_5d_high_low_pct": interval["median_5d_high_low_pct"],
         "up_bar_ratio_pct": interval["up_bar_ratio_pct"],
         "relative_excess_pct": relative_excess,
         "turning_point": turning_point,
@@ -293,10 +295,14 @@ def _batch_chart_item(row: Mapping[str, Any]) -> dict[str, Any]:
         "code": _text(row.get("code")),
         "symbol": _text(row.get("symbol")),
         "name": _text(row.get("name") or row.get("code")),
+        "bar_count": int(_num(row.get("bar_count"), len(ohlcv)) or 0),
         "ohlcv": ohlcv[-120:],
         "regimes": _chart_regimes(ohlcv[-120:]),
         "range_return_pct": interval["range_return_pct"],
         "max_drawdown_pct": interval["max_drawdown_pct"],
+        "max_runup_pct": interval["max_runup_pct"],
+        "volatility_pct": interval["volatility_pct"],
+        "median_5d_high_low_pct": interval["median_5d_high_low_pct"],
         "up_bar_ratio_pct": interval["up_bar_ratio_pct"],
     }
 
@@ -313,12 +319,13 @@ def _batch_script_card(row: Mapping[str, Any], rank: int, benchmark: Mapping[str
         "tone": "up" if (_num(ranking["range_return_pct"], 0) or 0) >= 0 else "down",
         "stats": [
             {"label": "区间表现", "value": ranking["range_return_pct"], "unit": "%"},
+            {"label": "5日高低幅", "value": ranking["median_5d_high_low_pct"], "unit": "%"},
             {"label": "锐评档位", "value": ranking["review_level"]},
             {"label": "交易难度", "value": ranking["trade_difficulty"]},
             {"label": "收盘回撤", "value": ranking["max_drawdown_pct"], "unit": "%"},
         ],
         "positioning": f"第{rank}，{ranking['current_character']}，强弱等级{ranking['strength_grade']}。",
-        "difficulty": f"{ranking['trade_difficulty']}。最大收盘回撤{_fmt_pct(ranking['max_drawdown_pct'])}，上涨K占比{_fmt_pct(ranking['up_bar_ratio_pct'])}。",
+        "difficulty": f"{ranking['trade_difficulty']}。5日高低幅中位{_fmt_pct(ranking['median_5d_high_low_pct'])}，最大收盘回撤{_fmt_pct(ranking['max_drawdown_pct'])}。",
         "one_liner": ranking["review_conclusion"],
     }
 
@@ -338,13 +345,93 @@ def _batch_interval_metrics(row: Mapping[str, Any], ohlcv: list[Mapping[str, Any
     max_runup = _series_max_runup_pct(closes)
     up_bar_ratio = _up_bar_ratio_pct(ohlcv)
     volatility = _annualized_volatility(ohlcv, row.get("freq"))
+    median_5d_high_low = _rolling_high_low_median_pct(ohlcv)
     return {
         "range_return_pct": _round(range_return),
         "max_drawdown_pct": _round(max_drawdown),
         "max_runup_pct": _round(max_runup),
         "volatility_pct": _round(volatility),
+        "median_5d_high_low_pct": _round(median_5d_high_low),
         "up_bar_ratio_pct": _round(up_bar_ratio),
     }
+
+
+def _batch_signal_rows(stocks: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for stock in stocks:
+        code = _text(stock.get("code"))
+        name = _text(stock.get("name") or code)
+        for item in _as_list(stock.get("signal_breakdown")):
+            row = _as_record(item)
+            signal_type = _text(row.get("signal_type") or row.get("signal_group") or "unknown")
+            group = groups.setdefault(signal_type, {
+                "signal_type": signal_type,
+                "symbol_codes": set(),
+                "signal_count": 0,
+                "evaluated_count": 0,
+                "win_count": 0,
+                "trade_count": 0,
+                "trade_win_count": 0,
+                "t5_values": [],
+                "t10_weighted": [],
+                "t20_values": [],
+                "mfe_values": [],
+                "mae_values": [],
+                "trade_return_weighted": [],
+                "best_symbol": "",
+                "best_return_pct": None,
+            })
+            group["symbol_codes"].add(code)
+            signal_count = int(_num(row.get("signal_count"), 0) or 0)
+            evaluated_count = int(_num(row.get("evaluated_count"), 0) or 0)
+            trade_count = int(_num(row.get("trade_count"), 0) or 0)
+            group["signal_count"] += signal_count
+            group["evaluated_count"] += evaluated_count
+            group["win_count"] += int(_num(row.get("win_count"), 0) or 0)
+            group["trade_count"] += trade_count
+            group["trade_win_count"] += int(_num(row.get("trade_win_count"), 0) or 0)
+            for key, bucket in (
+                ("avg_t5_pct", "t5_values"),
+                ("avg_t20_pct", "t20_values"),
+                ("avg_mfe_pct", "mfe_values"),
+                ("avg_mae_pct", "mae_values"),
+            ):
+                value = _num(row.get(key))
+                if value is not None:
+                    group[bucket].append(value)
+            avg_t10 = _num(row.get("avg_t10_pct"))
+            if avg_t10 is not None and evaluated_count > 0:
+                group["t10_weighted"].append((avg_t10, evaluated_count))
+                best = _num(group["best_return_pct"])
+                if best is None or avg_t10 > best:
+                    group["best_return_pct"] = avg_t10
+                    group["best_symbol"] = " ".join(item for item in [code, name] if item)
+            avg_trade = _num(row.get("avg_trade_return_pct"))
+            if avg_trade is not None and trade_count > 0:
+                group["trade_return_weighted"].append((avg_trade, trade_count))
+
+    rows: list[dict[str, Any]] = []
+    for group in groups.values():
+        evaluated_count = int(group["evaluated_count"])
+        trade_count = int(group["trade_count"])
+        rows.append({
+            "signal_type": group["signal_type"],
+            "symbol_count": len(group["symbol_codes"]),
+            "signal_count": int(group["signal_count"]),
+            "evaluated_count": evaluated_count,
+            "trade_count": trade_count,
+            "win_rate": _round(int(group["win_count"]) / evaluated_count * 100) if evaluated_count else 0,
+            "trade_win_rate": _round(int(group["trade_win_count"]) / trade_count * 100) if trade_count else 0,
+            "avg_t5_pct": _round(_average(group["t5_values"])),
+            "avg_t10_pct": _round(_weighted_average(group["t10_weighted"])),
+            "avg_t20_pct": _round(_average(group["t20_values"])),
+            "avg_mfe_pct": _round(_average(group["mfe_values"])),
+            "avg_mae_pct": _round(_average(group["mae_values"])),
+            "avg_trade_return_pct": _round(_weighted_average(group["trade_return_weighted"])),
+            "best_symbol": group["best_symbol"],
+            "best_return_pct": _round(group["best_return_pct"]),
+        })
+    return sorted(rows, key=lambda row: (_num(row.get("signal_count"), 0) or 0, _num(row.get("avg_t10_pct"), -999) or -999), reverse=True)
 
 
 def _batch_metrics(
@@ -369,6 +456,7 @@ def _batch_metrics(
         "annual_return_pct": _round(avg_return),
         "max_drawdown_pct": _round(abs(avg_drawdown)),
         "volatility_pct": _round(_average([_num(row.get("volatility_pct")) for row in ranking_rows])),
+        "median_5d_high_low_pct": _round(_median([_num(row.get("median_5d_high_low_pct")) for row in ranking_rows])),
         "sharpe": _round(_average([_num(row.get("sharpe")) for row in ranking_rows]), 2),
         "calmar": _calmar(avg_return, avg_drawdown),
         "filled_trades": total_trades,
@@ -474,6 +562,27 @@ def _up_bar_ratio_pct(ohlcv: list[Mapping[str, Any]]) -> float:
     return up_count / valid_count * 100 if valid_count else 0
 
 
+def _rolling_high_low_median_pct(ohlcv: list[Mapping[str, Any]], window: int = 5) -> float:
+    rows = [row for row in ohlcv if _num(row.get("high")) is not None and _num(row.get("low")) is not None]
+    if not rows:
+        return 0
+    window = max(1, window)
+    segments = [rows] if len(rows) < window else [rows[index:index + window] for index in range(0, len(rows) - window + 1)]
+    values: list[float] = []
+    for segment in segments:
+        highs = [_num(row.get("high")) for row in segment]
+        lows = [_num(row.get("low")) for row in segment]
+        highs = [value for value in highs if value is not None]
+        lows = [value for value in lows if value is not None]
+        if not highs or not lows:
+            continue
+        high = max(highs)
+        low = min(lows)
+        if high > 0:
+            values.append((high - low) / high * 100)
+    return _median(values)
+
+
 def _chart_regimes(ohlcv: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     if not ohlcv:
         return []
@@ -510,12 +619,13 @@ def _strength_grade(ret: float | None, excess: float | None, drawdown: float | N
     return "D"
 
 
-def _trade_difficulty(drawdown: float | None, volatility: float | None) -> str:
+def _trade_difficulty(drawdown: float | None, volatility: float | None, high_low_median: float | None = None) -> str:
     dd = abs(drawdown or 0)
     vol = volatility or 0
-    if dd >= 28 or vol >= 55:
+    swing = high_low_median or 0
+    if dd >= 28 or vol >= 55 or swing >= 10:
         return "极高"
-    if dd >= 15 or vol >= 35:
+    if dd >= 15 or vol >= 35 or swing >= 6:
         return "高"
     return "中"
 
@@ -1156,6 +1266,25 @@ def _average(values: list[Any]) -> float:
     if not numbers:
         return 0
     return sum(numbers) / len(numbers)
+
+
+def _median(values: list[Any]) -> float:
+    numbers = [_num(value) for value in values]
+    numbers = [value for value in numbers if value is not None]
+    return statistics.median(numbers) if numbers else 0
+
+
+def _weighted_average(values: list[tuple[Any, Any]]) -> float:
+    weighted_sum = 0.0
+    weight_sum = 0.0
+    for value, weight in values:
+        number = _num(value)
+        weight_number = _num(weight)
+        if number is None or not weight_number:
+            continue
+        weighted_sum += number * weight_number
+        weight_sum += weight_number
+    return weighted_sum / weight_sum if weight_sum else 0
 
 
 def _first_num(record: Mapping[str, Any], keys: list[str], default: Any = None) -> float | None:

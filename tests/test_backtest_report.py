@@ -140,6 +140,21 @@ def test_batch_terminal_multi_symbol_panels():
                 "total_return": 12.5,
                 "max_drawdown": 8.4,
                 "sharpe": 1.1,
+                "signal_breakdown": [
+                    {
+                        "signal_type": "Pattern A",
+                        "signal_count": 3,
+                        "evaluated_count": 2,
+                        "win_count": 1,
+                        "avg_t5_pct": 2.0,
+                        "avg_t10_pct": 3.0,
+                        "avg_mfe_pct": 5.0,
+                        "avg_mae_pct": -1.0,
+                        "trade_count": 1,
+                        "trade_win_count": 1,
+                        "avg_trade_return_pct": 4.0,
+                    }
+                ],
             },
             {
                 "code": "600519",
@@ -155,6 +170,21 @@ def test_batch_terminal_multi_symbol_panels():
                 "total_return": -3.2,
                 "max_drawdown": 12.0,
                 "sharpe": 0.4,
+                "signal_breakdown": [
+                    {
+                        "signal_type": "Pattern A",
+                        "signal_count": 1,
+                        "evaluated_count": 1,
+                        "win_count": 0,
+                        "avg_t5_pct": -1.0,
+                        "avg_t10_pct": -2.0,
+                        "avg_mfe_pct": 1.0,
+                        "avg_mae_pct": -4.0,
+                        "trade_count": 1,
+                        "trade_win_count": 0,
+                        "avg_trade_return_pct": -3.0,
+                    }
+                ],
             },
         ],
     }
@@ -167,7 +197,14 @@ def test_batch_terminal_multi_symbol_panels():
     assert terminal["metrics"]["filled_trades"] == 3
     assert terminal["panels"]["ranking"]["rows"][0]["code"] == "002759"
     assert terminal["panels"]["interval_overview"]["rows"]
+    assert terminal["panels"]["signals"]["rows"][0]["signal_type"] == "Pattern A"
+    assert terminal["panels"]["signals"]["rows"][0]["signal_count"] == 4
+    assert terminal["panels"]["signals"]["rows"][0]["avg_t10_pct"] == 1.33
     assert terminal["panels"]["multi_charts"]["items"][0]["ohlcv"]
+    assert terminal["panels"]["multi_charts"]["items"][0]["max_runup_pct"] is not None
+    assert terminal["panels"]["multi_charts"]["items"][0]["bar_count"] == 4
+    assert terminal["panels"]["multi_charts"]["items"][0]["median_5d_high_low_pct"] == 12.5
+    assert terminal["metrics"]["median_5d_high_low_pct"] == 12.5
     assert terminal["panels"]["scripts"]["cards"][0]["one_liner"]
 
 

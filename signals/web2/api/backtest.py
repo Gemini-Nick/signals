@@ -5,6 +5,7 @@
 输入股票代码 + 频率 + 信号组，返回 K线 + MACD + MA + 信号标记 + 前瞻评估。
 """
 import logging
+import math
 import traceback
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -824,6 +825,102 @@ def _compute_kpi(signal_evals: list) -> dict:
     }
 
 
+def _avg(values: list[float]) -> float:
+    numbers = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            numbers.append(number)
+    return round(sum(numbers) / len(numbers), 2) if numbers else 0
+
+
+def _batch_signal_breakdown(code: str, name: str, signals: list[dict], trades: list[dict]) -> list[dict]:
+    """Aggregate one stock's all-signal forward returns and simulated trade returns."""
+    groups: dict[str, dict] = {}
+
+    def group_for(sig_type: str, sig_group: str = "") -> dict:
+        key = sig_type or sig_group or "unknown"
+        if key not in groups:
+            groups[key] = {
+                "signal_type": key,
+                "signal_group": sig_group,
+                "code": code,
+                "name": name,
+                "signal_count": 0,
+                "evaluated_count": 0,
+                "win_count": 0,
+                "returns_t5": [],
+                "returns_t10": [],
+                "returns_t20": [],
+                "mfes": [],
+                "maes": [],
+                "trade_count": 0,
+                "trade_win_count": 0,
+                "trade_returns": [],
+            }
+        return groups[key]
+
+    for signal in signals:
+        sig_type = str(signal.get("type") or signal.get("group") or "unknown")
+        sig_group = str(signal.get("group") or "")
+        group = group_for(sig_type, sig_group)
+        group["signal_count"] += 1
+        ev = signal.get("eval") or {}
+        return_t10 = ev.get("return_t10")
+        if return_t10 is not None:
+            group["evaluated_count"] += 1
+            if ev.get("direction_correct") == 1:
+                group["win_count"] += 1
+            group["returns_t10"].append(float(return_t10))
+        if ev.get("return_t5") is not None:
+            group["returns_t5"].append(float(ev["return_t5"]))
+        if ev.get("return_t20") is not None:
+            group["returns_t20"].append(float(ev["return_t20"]))
+        if ev.get("mfe") is not None:
+            group["mfes"].append(float(ev["mfe"]))
+        if ev.get("mae") is not None:
+            group["maes"].append(float(ev["mae"]))
+
+    for trade in trades:
+        sig_type = str(trade.get("signal_type") or trade.get("signal_group") or "unknown")
+        group = group_for(sig_type, str(trade.get("signal_group") or ""))
+        if trade.get("entry_price") is None or trade.get("net_return_pct") is None:
+            continue
+        net_return = float(trade["net_return_pct"])
+        group["trade_count"] += 1
+        if net_return > 0:
+            group["trade_win_count"] += 1
+        group["trade_returns"].append(net_return)
+
+    rows = []
+    for group in groups.values():
+        evaluated = group["evaluated_count"]
+        trade_count = group["trade_count"]
+        rows.append({
+            "signal_type": group["signal_type"],
+            "signal_group": group["signal_group"],
+            "code": group["code"],
+            "name": group["name"],
+            "signal_count": group["signal_count"],
+            "evaluated_count": evaluated,
+            "win_count": group["win_count"],
+            "win_rate": round(group["win_count"] / evaluated * 100, 1) if evaluated else 0,
+            "avg_t5_pct": _avg(group["returns_t5"]),
+            "avg_t10_pct": _avg(group["returns_t10"]),
+            "avg_t20_pct": _avg(group["returns_t20"]),
+            "avg_mfe_pct": _avg(group["mfes"]),
+            "avg_mae_pct": _avg(group["maes"]),
+            "trade_count": trade_count,
+            "trade_win_count": group["trade_win_count"],
+            "trade_win_rate": round(group["trade_win_count"] / trade_count * 100, 1) if trade_count else 0,
+            "avg_trade_return_pct": _avg(group["trade_returns"]),
+        })
+    return sorted(rows, key=lambda item: (item["signal_count"], item["avg_t10_pct"]), reverse=True)
+
+
 _PRESET_STALE_DAYS = 14  # 最后标签超过此天数视为过期
 
 
@@ -1220,6 +1317,8 @@ def _annotate_signals_ma_vol(df: pd.DataFrame, signals: list):
 
         row = df.iloc[idx]
         price = float(row["close"])
+        if not math.isfinite(price):
+            continue
 
         # MA标注: 找最近的MA支撑
         best_ma = None
@@ -1230,7 +1329,10 @@ def _annotate_signals_ma_vol(df: pd.DataFrame, signals: list):
             ma_val = row.get(name)
             if pd.isna(ma_val):
                 continue
-            dist_pct = (price - ma_val) / ma_val * 100
+            ma_number = float(ma_val)
+            if not math.isfinite(ma_number) or ma_number == 0:
+                continue
+            dist_pct = (price - ma_number) / ma_number * 100
             # 在MA附近5%以内 = 有锚点
             if abs(dist_pct) <= 5.0 and abs(dist_pct) < best_dist:
                 best_dist = abs(dist_pct)
@@ -2220,6 +2322,12 @@ async def backtest_batch(request: Request):
                 stock_result["max_drawdown"] = kpi.get("max_drawdown_pct", 0)
                 stock_result["sharpe"] = kpi.get("sharpe", 0)
                 stock_result["avg_hold_days"] = kpi.get("avg_hold_days", 0)
+                stock_result["signal_breakdown"] = _batch_signal_breakdown(
+                    code,
+                    stock_result.get("name") or code,
+                    all_signals,
+                    sim.trades,
+                )
 
                 total_signals += len(all_signals)
                 total_trades += stock_result["trade_count"]
