@@ -157,6 +157,54 @@ def macro_industry_etf_symbols() -> list[str]:
     return symbols
 
 
+def macro_industry_etfs_by_code() -> dict[str, dict[str, str]]:
+    rows: "OrderedDict[str, dict[str, str]]" = OrderedDict()
+    for item in macro_watchlist():
+        if _text(item.get("macro_group")) != MACRO_GROUP_INDUSTRY_ETFS:
+            continue
+        symbol = _text(item.get("symbol")).upper()
+        code = _pure_stock_code(symbol)
+        name = _text(item.get("name"))
+        if code and code not in rows:
+            rows[code] = {
+                "name": name,
+                "symbol": symbol,
+                "kind": _text(item.get("kind")) or "stock",
+                "macro_group": MACRO_GROUP_INDUSTRY_ETFS,
+            }
+    return dict(rows)
+
+
+def macro_industry_etf_symbol_by_code() -> dict[str, str]:
+    return {
+        code: row["symbol"]
+        for code, row in macro_industry_etfs_by_code().items()
+        if _text(row.get("symbol"))
+    }
+
+
+def macro_industry_etf_name_by_code() -> dict[str, str]:
+    return {
+        code: row["name"]
+        for code, row in macro_industry_etfs_by_code().items()
+        if _text(row.get("name"))
+    }
+
+
+def canonical_macro_industry_etf_symbol(symbol: Any) -> str:
+    code = _pure_stock_code(symbol)
+    if not code:
+        return ""
+    return macro_industry_etf_symbol_by_code().get(code, "")
+
+
+def macro_industry_etf_name(symbol: Any) -> str:
+    code = _pure_stock_code(symbol)
+    if not code:
+        return ""
+    return macro_industry_etf_name_by_code().get(code, "")
+
+
 def macro_industry_etf_pure_codes() -> list[str]:
     codes: list[str] = []
     for symbol in macro_industry_etf_symbols():

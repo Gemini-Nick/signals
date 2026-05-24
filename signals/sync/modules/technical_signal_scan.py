@@ -12,6 +12,7 @@ import pandas as pd
 from pymongo import UpdateOne
 from pymongo.database import Database
 
+from signals.core.macro_universe import canonical_macro_industry_etf_symbol
 from signals.core.market_time import naive_market_now, to_market_naive
 from signals.sync.task_context import get_task_env
 
@@ -148,6 +149,9 @@ def _prefixed_symbol(symbol: Any) -> str:
     code = _pure_a_code(symbol)
     if not code:
         return str(symbol or "").strip()
+    macro_symbol = canonical_macro_industry_etf_symbol(code)
+    if macro_symbol:
+        return macro_symbol
     if code.startswith(("6", "9")):
         return f"SH.{code}"
     if code.startswith(("4", "8")):

@@ -4,7 +4,14 @@ from __future__ import annotations
 from datetime import datetime
 
 from signals.sync.modules import index_minute, minute_readiness
-from signals.core.macro_universe import macro_a_index_codes, macro_industry_etf_pure_codes, macro_watchlist
+from signals.core.macro_universe import (
+    canonical_macro_industry_etf_symbol,
+    macro_a_index_codes,
+    macro_industry_etf_name,
+    macro_industry_etf_pure_codes,
+    macro_industry_etf_symbol_by_code,
+    macro_watchlist,
+)
 
 
 class _BulkResult:
@@ -179,6 +186,9 @@ def test_index_minute_universe_includes_macro_watchlist_a_indices_only():
         "159770",
         "159506",
     } <= set(macro_industry_etf_pure_codes())
+    assert macro_industry_etf_symbol_by_code()["562590"] == "SH.562590"
+    assert canonical_macro_industry_etf_symbol("SZ.562590") == "SH.562590"
+    assert macro_industry_etf_name("562590") == "半导体设备ETF"
 
 
 def test_minute_readiness_probe_uses_macro_index_universe():

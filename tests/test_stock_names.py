@@ -33,3 +33,18 @@ def test_hk_english_alias_resolves_case_insensitively(monkeypatch):
     assert resolver.get_code("ASM Pacific Technology") == "HK.00522"
     assert resolver.get_name("HK.00522") == "ASMPT"
     assert resolver.search("asmpt") == [("HK.00522", "ASMPT")]
+
+
+def test_macro_industry_etf_names_resolve_even_with_wrong_prefix(monkeypatch):
+    from signals.core.stock_names import StockNameResolver
+    from signals.layers import industry
+
+    monkeypatch.setattr(industry, "_INDUSTRY_LEADERS", {})
+    monkeypatch.setattr(industry, "_build_name_to_code_map", lambda: {})
+    monkeypatch.setattr(industry, "_code6_to_futu", lambda code: "")
+
+    resolver = StockNameResolver()
+
+    assert resolver.get_name("SH.562590") == "半导体设备ETF"
+    assert resolver.get_name("SZ.562590") == "半导体设备ETF"
+    assert resolver.get_code("半导体设备ETF") == "SH.562590"

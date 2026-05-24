@@ -96,6 +96,13 @@ def test_hk_symbol_aliases_normalize_for_manual_clues(monkeypatch):
     assert workbench._looks_like_stock("0522.hk")
 
 
+def test_macro_etf_wrong_prefix_is_canonicalized_for_workbench():
+    from signals.web.api import workbench
+
+    assert workbench._normalize_stock_symbol("SZ.562590") == ("SH.562590", "562590")
+    assert workbench._stock_name("SZ.562590") == "半导体设备ETF"
+
+
 def test_watchlist_range_columns_include_all_key_presets():
     from signals.web.api import workbench
 

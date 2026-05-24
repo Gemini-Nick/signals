@@ -97,6 +97,25 @@ def _ma_alignment(*, above5=True, above10=True, above20=True, near10=False, near
     }
 
 
+def test_terminal_stock_pool_uses_macro_etf_symbol_and_name():
+    rows = {}
+    _add_reason(rows, "562590", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "etf-30m",
+        "signal_type": "二买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+    }, index_codes=set())
+
+    row = rows["562590"]
+
+    assert row["symbol"] == "SH.562590"
+    assert row["code"] == "SH.562590"
+    assert row["target_label"] == "SH.562590"
+    assert row["name"] == "半导体设备ETF"
+
+
 def _add_chain_context(
     rows,
     code,
@@ -2076,6 +2095,57 @@ def test_review_sector_bullish_creates_candidate_with_correct_weight():
     assert row["inclusion_reasons"][0]["reason_type"] == "review_sector_bullish"
     assert row["inclusion_reasons"][0]["source_role"] == "review_clue"
     assert row["inclusion_reasons"][0]["board_or_concept"] == "银行"
+
+
+def test_add_review_clue_rows_uses_recent_review_window(monkeypatch):
+    from datetime import date, datetime
+    from signals.sync.modules import terminal_pool
+
+    captured = {}
+
+    def fake_iter_review_notes(db, since=None):
+        captured["since"] = since
+        return []
+
+    monkeypatch.setenv("TERMINAL_REVIEW_CLUE_LOOKBACK_DAYS", "14")
+    monkeypatch.setattr(terminal_pool, "naive_market_now", lambda market: datetime(2026, 5, 24, 10, 0))
+    monkeypatch.setattr(terminal_pool, "_iter_review_notes", fake_iter_review_notes)
+
+    terminal_pool._add_review_clue_rows({}, _Db({}), set())
+
+    assert captured["since"] == date(2026, 5, 10)
+
+
+def test_iter_review_notes_filters_stale_frontmatter(tmp_path, monkeypatch):
+    from datetime import date
+    from signals.sync.modules import knowledge_market_views, terminal_pool
+
+    inbox = tmp_path / "10 Inbox" / "WeChat"
+    inbox.mkdir(parents=True)
+    (inbox / "old.md").write_text(
+        "---\n"
+        "title: 旧银行复盘\n"
+        "author_focus: daozhang\n"
+        "created_at: 2026-04-28T09:00:00\n"
+        "---\n"
+        "银行继续防御反击，可以关注。",
+        encoding="utf-8",
+    )
+    (inbox / "new.md").write_text(
+        "---\n"
+        "title: 新半导体复盘\n"
+        "author_focus: pangge\n"
+        "created_at: 2026-05-17T09:00:00\n"
+        "---\n"
+        "半导体中期仍有机会，可以关注。",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(knowledge_market_views, "_vault_dir", lambda: tmp_path)
+
+    notes = terminal_pool._iter_review_notes(_Db({}), since=date(2026, 5, 10))
+
+    assert [note["title"] for note in notes] == ["新半导体复盘"]
+    assert notes[0]["sectors"][0]["keyword"] == "半导体"
 
 
 def test_review_sector_bearish_has_zero_weight():

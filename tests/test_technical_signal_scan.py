@@ -17,6 +17,7 @@ from signals.sync.modules.technical_signal_scan import (
     _append_quote_snapshot_daily_bar,
     _load_bars,
     _ma_alignment_from_daily_bars,
+    _prefixed_symbol,
     _refusal_pullback_factor,
     _resampled_5m_docs,
     _resonance_context,
@@ -56,6 +57,12 @@ WEIGHTS = {
     "背驰买": 70,
     "一卖": -100,
 }
+
+
+def test_technical_scan_preserves_macro_etf_exchange_prefix():
+    assert _prefixed_symbol("562590") == "SH.562590"
+    assert _prefixed_symbol("SZ.562590") == "SH.562590"
+    assert _prefixed_symbol("511090") == "SH.511090"
 
 
 def test_detect_200d_new_high_entries_reports_breakout_metrics():

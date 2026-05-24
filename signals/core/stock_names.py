@@ -55,6 +55,17 @@ class StockNameResolver:
             for alias in payload.get("aliases") or ():
                 self._remember_alias(futu_code, alias)
 
+        try:
+            from signals.core.macro_universe import macro_industry_etfs_by_code
+
+            for payload in macro_industry_etfs_by_code().values():
+                symbol = str(payload.get("symbol") or "").strip()
+                name = str(payload.get("name") or "").strip()
+                if symbol and name:
+                    self._remember_name(symbol, name, override_code_name=True)
+        except Exception:
+            pass
+
     def inject_from_rankings(self, merged_list):
         """从 L2 IndustryRanking 注入 code→name 和 code→industry。"""
         for ranking in merged_list:
@@ -104,6 +115,14 @@ class StockNameResolver:
         if futu_code in self._code_to_name:
             return self._code_to_name[futu_code]
         self._lazy_load_fallback()
+        try:
+            from signals.core.macro_universe import macro_industry_etf_name
+
+            macro_name = macro_industry_etf_name(futu_code)
+            if macro_name:
+                return macro_name
+        except Exception:
+            pass
         return self._code_to_name.get(futu_code, futu_code.split(".")[-1])
 
     def get_code(self, name: str) -> str:

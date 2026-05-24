@@ -29,6 +29,8 @@ from signals.core.concept_carriers import load_industry_chains, non_chain_reason
 from signals.core.macro_universe import (
     MACRO_GROUP_INDUSTRY_ETFS,
     MACRO_GROUP_MAJOR_INDICES,
+    canonical_macro_industry_etf_symbol,
+    macro_industry_etf_name,
     macro_group_label,
     macro_group_type_label,
     macro_index_themes,
@@ -1902,6 +1904,10 @@ def _normalize_stock_symbol(raw: str) -> Tuple[Optional[str], Optional[str]]:
     if not value:
         return None, None
 
+    macro_symbol = canonical_macro_industry_etf_symbol(value)
+    if macro_symbol:
+        return macro_symbol, macro_symbol.split(".", 1)[1]
+
     if value.startswith(("SH.", "SZ.", "BJ.")):
         return value, value.split(".", 1)[1]
 
@@ -2049,6 +2055,9 @@ def _stock_name(symbol: str, row: Optional[dict[str, Any]] = None) -> str:
     explicit = str(row.get("name") or row.get("stock_name") or "").strip()
     if explicit:
         return explicit
+    macro_name = macro_industry_etf_name(symbol)
+    if macro_name:
+        return macro_name
     try:
         name = get_resolver().get_name(symbol)
         return "" if name == symbol.split(".")[-1] else name

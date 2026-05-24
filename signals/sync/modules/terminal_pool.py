@@ -11,6 +11,7 @@ from typing import Any
 from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
+from signals.core.macro_universe import canonical_macro_industry_etf_symbol, macro_industry_etf_name
 from signals.core.scorer import FREQ_MULTIPLIER
 from signals.core.trading_dates import a_share_realtime_day_key, trading_day
 from signals.sync.task_context import get_task_env
@@ -461,6 +462,9 @@ def _pure_a_code(symbol: Any) -> str:
 def _prefixed_symbol(code: str) -> str:
     if not code:
         return ""
+    macro_symbol = canonical_macro_industry_etf_symbol(code)
+    if macro_symbol:
+        return macro_symbol
     if code.startswith(("6", "9")):
         return f"SH.{code}"
     if code.startswith(("4", "8")):
@@ -896,11 +900,12 @@ def _reason_key(reason: dict[str, Any]) -> str:
 
 def _empty_row(code: str, name: str = "") -> dict[str, Any]:
     symbol = _prefixed_symbol(code)
+    display_name = name or macro_industry_etf_name(symbol)
     return {
         "symbol": symbol,
         "code": symbol,
         "raw_code": code,
-        "name": name,
+        "name": display_name,
         "kind": "stock",
         "score": 0.0,
         "sort_score": 0.0,
@@ -934,9 +939,10 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
         return
     if code not in rows and reason.get("can_create_candidate") is False:
         return
-    row = rows.setdefault(code, _empty_row(code, name))
-    if name and not row.get("name"):
-        row["name"] = name
+    display_name = name or macro_industry_etf_name(code)
+    row = rows.setdefault(code, _empty_row(code, display_name))
+    if display_name and not row.get("name"):
+        row["name"] = display_name
     reason_type = _text(reason.get("reason_type"))
     base_weight = REASON_WEIGHTS.get(reason_type, 100)
     freq = _text(reason.get("freq"))
@@ -1479,6 +1485,16 @@ def _extract_sector_directions(body: str, keyword_index: dict[str, list[str]]) -
     return results
 
 
+def _review_clue_since_date() -> date | None:
+    try:
+        lookback_days = int(os.getenv("TERMINAL_REVIEW_CLUE_LOOKBACK_DAYS", "14"))
+    except ValueError:
+        lookback_days = 14
+    if lookback_days <= 0:
+        return None
+    return naive_market_now("A").date() - timedelta(days=lookback_days)
+
+
 def _iter_review_notes(db: Database, since: date | None = None) -> list[dict[str, Any]]:
     from pathlib import Path
 
@@ -1509,13 +1525,15 @@ def _iter_review_notes(db: Database, since: date | None = None) -> list[dict[str
         if author not in ("daozhang", "pangge"):
             continue
         created = meta.get("created_at", "")
-        if since and created:
+        if since:
             try:
-                note_date = datetime.fromisoformat(created.replace("Z", "+00:00")).date()
+                note_date = datetime.fromisoformat(created.replace("Z", "+00:00")).date() if created else None
+                if note_date is None:
+                    continue
                 if note_date < since:
                     continue
             except Exception:
-                pass
+                continue
         sectors = _extract_sector_directions(body, keyword_index)
         if not sectors:
             continue
@@ -1529,7 +1547,7 @@ def _iter_review_notes(db: Database, since: date | None = None) -> list[dict[str
 
 
 def _add_review_clue_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str]) -> None:
-    notes = _iter_review_notes(db)
+    notes = _iter_review_notes(db, since=_review_clue_since_date())
     if not notes:
         return
     for note in notes:
