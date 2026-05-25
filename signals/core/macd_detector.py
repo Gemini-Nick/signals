@@ -297,7 +297,7 @@ def _check_support(df: pd.DataFrame, idx: int) -> Tuple[str, float]:
     只使用 idx 及之前的数据，避免未来函数。
 
     支撑来源:
-    1. MA 均线支撑（MA20/60/120/250）
+    1. 关键 MA 均线支撑（MA5/8/10/13/20/21）
     2. 前期摆动低点支撑（60根内显著低点）
     3. Fibonacci 回撤位支撑（38.2%/50%/61.8%）
     4. 前期横盘平台支撑（密集成交区）
@@ -312,13 +312,15 @@ def _check_support(df: pd.DataFrame, idx: int) -> Tuple[str, float]:
     supports_found = []
 
     # ── 1. MA 均线支撑 ──
-    for period, name in [(20, "MA20"), (60, "MA60"), (120, "MA120"), (250, "MA250")]:
+    from signals.core.ma_levels import KEY_MA_PERIODS
+
+    for period in KEY_MA_PERIODS:
         if len(closes_before) < period:
             continue
         ma_val = closes_before.iloc[-period:].mean()
         distance_pct = (close - ma_val) / ma_val * 100
         if -5 <= distance_pct <= 3:  # 在MA附近（下方5%到上方3%）
-            supports_found.append((name, abs(distance_pct), 0.1))
+            supports_found.append((f"MA{period}", abs(distance_pct), 0.1))
 
     # ── 2. 前期摆动低点支撑 ──
     swing_lows = _find_swing_lows(df, idx, lookback=60)

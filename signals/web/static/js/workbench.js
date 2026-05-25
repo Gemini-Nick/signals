@@ -602,9 +602,11 @@ function wbChartOption(data) {
     text: wbCssVar('--text-secondary') || '#787b86',
     accent: wbCssVar('--accent') || '#2962ff',
     ma5: wbCssVar('--ma5-color') || '#f7931a',
+    ma8: wbCssVar('--ma8-color') || '#d97757',
     ma10: wbCssVar('--ma10-color') || '#2962ff',
+    ma13: wbCssVar('--ma13-color') || '#6a9bcc',
     ma20: wbCssVar('--ma20-color') || '#e040fb',
-    ma60: wbCssVar('--ma60-color') || '#26a69a',
+    ma21: wbCssVar('--ma21-color') || '#26a69a',
     zhongshu: wbCssVar('--zhongshu-stroke') || 'rgba(41, 98, 255, 0.6)',
     macdDif: wbCssVar('--macd-dif') || '#f7931a',
     macdDea: wbCssVar('--macd-dea') || '#2962ff',
@@ -640,9 +642,11 @@ function wbChartOption(data) {
 
   const maColorMap = {
     MA5: colors.ma5,
+    MA8: colors.ma8,
     MA10: colors.ma10,
+    MA13: colors.ma13,
     MA20: colors.ma20,
-    MA60: colors.ma60,
+    MA21: colors.ma21,
   };
 
   const series = [

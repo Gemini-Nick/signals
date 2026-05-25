@@ -236,7 +236,7 @@ def test_ma_alignment_marks_reclaim_and_above_key_daily_averages():
     assert alignment["above_ma21"] is True
     assert alignment["reclaim_ma20"] is True
     assert alignment["above_count"] == 3
-    assert alignment["fib_ma_array"]
+    assert [item["period"] for item in alignment["fib_ma_array"]] == [5, 8, 10, 13, 20, 21]
     assert alignment["score"] > 0
     assert "站上20日线" in alignment["tags"]
 
@@ -270,7 +270,7 @@ def test_ma_alignment_marks_fibonacci_ma_pullback_acceptance_array():
     assert 13 in alignment["fib_accept_periods"]
     assert alignment["fib_accept_count"] >= 1
     assert alignment["fib_support_score"] > 0
-    assert "斐波那切均线回踩承接" in alignment["tags"]
+    assert "关键均线回踩承接" in alignment["tags"]
 
 
 def test_ma_alignment_marks_touched_close_below_fibonacci_ma_as_breakdown():

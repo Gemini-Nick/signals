@@ -23,6 +23,7 @@ from signals.sync.task_context import get_task_env
 from signals.sync.volume_units import CANONICAL_STOCK_VOLUME_UNIT, normalize_stock_volume
 
 logger = logging.getLogger("signals.sync.hk_stock_daily")
+MIN_DAILY_HISTORY_DAYS = 365 * 5
 
 DAILY_FREQ = "日线"
 _PROGRESS_META_ID = "hk_stock_daily:progress:_meta"
@@ -215,6 +216,24 @@ def _latest_daily_dates_by_symbol(db: Database, symbols: list[str]) -> dict[str,
         }
     except Exception as exc:
         logger.debug("读取 HK bars 日线最新日期失败: %s", exc)
+        return {}
+
+
+def _earliest_daily_dates_by_symbol(db: Database, symbols: list[str]) -> dict[str, datetime]:
+    if not symbols:
+        return {}
+    try:
+        rows = db["bars"].aggregate([
+            {"$match": {"meta.freq": DAILY_FREQ, "meta.symbol": {"$in": symbols}}},
+            {"$group": {"_id": "$meta.symbol", "earliest_dt": {"$min": "$dt"}}},
+        ])
+        return {
+            str(row.get("_id")): row.get("earliest_dt")
+            for row in rows
+            if row.get("_id") and isinstance(row.get("earliest_dt"), datetime)
+        }
+    except Exception as exc:
+        logger.debug("读取 HK bars 日线最早日期失败: %s", exc)
         return {}
 
 
@@ -553,7 +572,8 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
         )
         if doc.get("symbol")
     }
-    bars_latest = _latest_daily_dates_by_symbol(db, [_hk_symbol(code) for code in codes])
+    hk_symbols = [_hk_symbol(code) for code in codes]
+    bars_latest = _latest_daily_dates_by_symbol(db, hk_symbols)
     sync_docs.update(bars_latest)
 
     run_started_at = now
@@ -566,7 +586,16 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
     workers = _env_int("HK_STOCK_DAILY_WORKERS", 3, minimum=1, maximum=8)
     call_interval = _env_float("HK_STOCK_DAILY_CALL_INTERVAL", 0.12, minimum=0.0)
     write_batch_symbols = _env_int("HK_STOCK_DAILY_WRITE_BATCH_SYMBOLS", 40, minimum=1)
-    lookback_days = _env_int("HK_STOCK_DAILY_LOOKBACK_DAYS", 730, minimum=30)
+    lookback_days = _env_int("HK_STOCK_DAILY_LOOKBACK_DAYS", MIN_DAILY_HISTORY_DAYS, minimum=30)
+    history_cutoff = (now - timedelta(days=max(lookback_days, MIN_DAILY_HISTORY_DAYS))).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    bars_earliest = _earliest_daily_dates_by_symbol(db, hk_symbols)
+    short_history_codes = {
+        code
+        for code in codes
+        if _coerce_last_dt(bars_earliest.get(_hk_symbol(code))) is None
+        or _coerce_last_dt(bars_earliest.get(_hk_symbol(code))) > history_cutoff
+    }
     pending_docs: dict[str, list[dict[str, Any]]] = {}
 
     _write_progress(
@@ -597,17 +626,20 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
     def _process(code: str) -> tuple[str, list[dict[str, Any]], str]:
         symbol = _hk_symbol(code)
         last_dt = _coerce_last_dt(sync_docs.get(symbol))
+        short_history = code in short_history_codes
         if last_dt:
             inc_start = (last_dt + timedelta(days=1)).strftime("%Y%m%d")
             if inc_start > end_date:
-                return code, [], "skip"
+                if not short_history:
+                    return code, [], "skip"
+                inc_start = history_cutoff.strftime("%Y%m%d")
         else:
-            inc_start = (now - timedelta(days=lookback_days)).strftime("%Y%m%d")
+            inc_start = history_cutoff.strftime("%Y%m%d")
         try:
             docs = _fetch_one_hk_daily(code, inc_start, end_date)
             if call_interval:
                 time.sleep(call_interval)
-            return code, docs, "ok" if docs else "empty_docs"
+            return code, docs, "history_backfill" if short_history and docs else ("ok" if docs else "empty_docs")
         except Exception as exc:
             return code, [], str(exc)[:240]
 
@@ -620,7 +652,7 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
                 code, docs, latest_status = future.result()
                 if latest_status in {"skip", "empty_docs"}:
                     total_skipped += 1
-                elif latest_status == "ok":
+                elif latest_status in {"ok", "history_backfill"}:
                     pending_docs[code] = docs
                     if len(pending_docs) >= write_batch_symbols:
                         total_inserted += _flush_pending()
@@ -711,4 +743,5 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
         "global_total": global_total,
         "sample_errors": errors[:8],
         "sample_deferred": deferred[:8],
+        "short_history_backfill_codes": len(short_history_codes),
     }

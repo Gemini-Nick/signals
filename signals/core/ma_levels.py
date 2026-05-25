@@ -16,6 +16,16 @@ from typing import List, Optional
 import pandas as pd
 from czsc import RawBar
 
+KEY_MA_PERIODS = (5, 8, 10, 13, 20, 21)
+KEY_MA_COLORS = {
+    5: "#f7931a",
+    8: "#d97757",
+    10: "#6a9bcc",
+    13: "#2962ff",
+    20: "#e040fb",
+    21: "#26a69a",
+}
+
 
 # ─────────────────────────────────────────────────────────
 # 数据类
@@ -23,7 +33,7 @@ from czsc import RawBar
 
 @dataclass
 class MALevel:
-    name: str           # "5周线", "10月线", "20日线"
+    name: str           # "5周线", "13周线", "20日线"
     value: float        # 均线值
     distance_pct: float # 当前价距该均线 %（正=上方，负=下方）
     position: str       # "上方" / "下方" / "贴合"
@@ -93,8 +103,8 @@ def compute_ma_levels(bars: List[RawBar], symbol: str) -> Optional[MAContext]:
     从日线 RawBar 计算多周期均线关键位。
 
     计算均线：
-    - 日线: MA5, MA10, MA20, MA50, MA60, MA200
-    - 周线: MA5, MA10, MA20, MA50（日线 resample 周线后计算）
+    - 日线: MA5, MA8, MA10, MA13, MA20, MA21
+    - 周线: MA5, MA8, MA10, MA13, MA20, MA21（日线 resample 周线后计算）
 
     :param bars: 日线 RawBar 列表（建议 >= 200 根）
     :param symbol: 标的代码
@@ -111,22 +121,15 @@ def compute_ma_levels(bars: List[RawBar], symbol: str) -> Optional[MAContext]:
     # ── 日线均线 ──
     daily_roles = {
         5: "短线趋势/止损线",
+        8: "短线动能观察",
         10: "第一次回踩买点/弱势反弹阻力",
+        13: "关键节奏线",
         20: "中期趋势转折线",
-        50: "阶段性大底/恐慌加仓参考",
-        60: "做多防守线",
-        200: "长期趋势压力/止盈区",
+        21: "趋势防守线",
     }
-    for period, label in [
-        (5, "5日线"),
-        (10, "10日线"),
-        (20, "20日线"),
-        (50, "50日线"),
-        (60, "60日线"),
-        (200, "200日线"),
-    ]:
+    for period in KEY_MA_PERIODS:
         lv = _make_level(
-            label,
+            f"{period}日线",
             _compute_ma(df["close"], period),
             price,
             closes=df["close"],
@@ -145,13 +148,15 @@ def compute_ma_levels(bars: List[RawBar], symbol: str) -> Optional[MAContext]:
     if len(weekly) >= 5:
         weekly_roles = {
             5: "持股信心线",
+            8: "短周节奏线",
             10: "中期底部反抽目标",
+            13: "周线关键节奏",
             20: "熊市反弹压力位",
-            50: "牛熊分界/夹板下沿",
+            21: "周线趋势防守",
         }
-        for period, label in [(5, "5周线"), (10, "10周线"), (20, "20周线"), (50, "50周线")]:
+        for period in KEY_MA_PERIODS:
             lv = _make_level(
-                label,
+                f"{period}周线",
                 _compute_ma(weekly["close"], period),
                 price,
                 closes=weekly["close"],
@@ -178,7 +183,7 @@ def compute_ma_levels(bars: List[RawBar], symbol: str) -> Optional[MAContext]:
     # ── 提炼 key_levels（最关键的2-3个）──
     key = _extract_key_levels(supports, resistances, levels)
 
-    # ── 趋势判断（日线 MA5 > MA20 > MA60 → 多头排列）──
+    # ── 趋势判断（日线 MA5 > MA13 > MA21 → 多头排列）──
     trend = _judge_ma_trend(df["close"], levels)
 
     return MAContext(
@@ -203,18 +208,8 @@ def _extract_key_levels(supports: List[MALevel],
     used_names: set = set()
 
     # 大级别优先排序
-    _PRIORITY = {
-        "50周线": 0,
-        "20周线": 1,
-        "10周线": 2,
-        "5周线": 3,
-        "200日线": 4,
-        "60日线": 5,
-        "50日线": 6,
-        "20日线": 7,
-        "10日线": 8,
-        "5日线": 9,
-    }
+    _PRIORITY = {f"{period}周线": idx for idx, period in enumerate((21, 20, 13, 10, 8, 5))}
+    _PRIORITY.update({f"{period}日线": idx + 10 for idx, period in enumerate((21, 20, 13, 10, 8, 5))})
 
     def add(level: Optional[MALevel]) -> None:
         if level and level.name not in used_names:
@@ -253,36 +248,36 @@ def _ma_direction(closes: Optional[pd.Series], period: int) -> str:
 def _judge_ma_trend(closes: pd.Series, levels: List[MALevel]) -> str:
     """
     日线均线排列判断：
-    - MA5 > MA20 > MA60 → 多头排列
-    - MA5 < MA20 < MA60 → 空头排列
+    - MA5 > MA13 > MA21 → 多头排列
+    - MA5 < MA13 < MA21 → 空头排列
     - 其他 → 交织
     """
     ma5 = _compute_ma(closes, 5)
-    ma20 = _compute_ma(closes, 20)
-    ma60 = _compute_ma(closes, 60)
+    ma13 = _compute_ma(closes, 13)
+    ma21 = _compute_ma(closes, 21)
 
-    if ma5 is None or ma20 is None or ma60 is None:
+    if ma5 is None or ma13 is None or ma21 is None:
         return "未知"
 
-    if ma5 > ma20 > ma60:
+    if ma5 > ma13 > ma21:
         base = "多头排列"
-    elif ma5 < ma20 < ma60:
+    elif ma5 < ma13 < ma21:
         base = "空头排列"
     else:
         base = "交织"
 
     level_by_name = {lv.name: lv for lv in levels}
-    weekly_20 = level_by_name.get("20周线")
-    weekly_50 = level_by_name.get("50周线")
-    if weekly_20 and weekly_50:
-        lower = min(weekly_20.value, weekly_50.value)
-        upper = max(weekly_20.value, weekly_50.value)
+    weekly_13 = level_by_name.get("13周线")
+    weekly_21 = level_by_name.get("21周线")
+    if weekly_13 and weekly_21:
+        lower = min(weekly_13.value, weekly_21.value)
+        upper = max(weekly_13.value, weekly_21.value)
         latest = closes.iloc[-1]
         if lower <= latest <= upper:
-            return f"{base} · 20周/50周夹板区"
-    ma20_direction = _ma_direction(closes, 20)
-    if ma20_direction in {"向上", "走平", "向下"}:
-        return f"{base} · 20日线{ma20_direction}"
+            return f"{base} · 13周/21周夹板区"
+    ma21_direction = _ma_direction(closes, 21)
+    if ma21_direction in {"向上", "走平", "向下"}:
+        return f"{base} · 21日线{ma21_direction}"
     return base
 
 
@@ -293,7 +288,7 @@ def _judge_ma_trend(closes: pd.Series, levels: List[MALevel]) -> str:
 def format_key_levels(ctx: MAContext) -> str:
     """
     格式化关键价位行，用于终端和飞书输出。
-    示例：关键位: ▼5周线 2970(-2.5%)  ▼10月线 2870(-5.8%)  ▲前高 3177(+4.3%)
+    示例：关键位: ▼5周线 2970(-2.5%)  ▼13周线 2870(-5.8%)  ▲前高 3177(+4.3%)
     """
     if not ctx.key_levels:
         return ""
@@ -324,21 +319,33 @@ class ScenarioBranch:
 
 # 情景文案模板
 _SUPPORT_TEMPLATES = {
-    "10月线":  ("长期趋势维持,月线级别支撑有效",      "长期趋势走坏,月线级别破位,宜大幅降仓"),
+    "21周线":  ("周线趋势防守有效,中期结构仍可观察",  "周线趋势防守失效,降低仓位"),
     "20周线":  ("中期趋势维持,周线级别震荡偏强",      "中期走弱,周线级别转空,切防守"),
+    "13周线":  ("周线节奏维持,反弹仍有延续条件",      "周线节奏转弱,等待重新站回"),
     "10周线":  ("中短期趋势维持,关注科技轮动",        "中期走弱,切防守降仓"),
+    "8周线":   ("短周动能维持,观察板块扩散",          "短周动能转弱,降低进攻仓"),
     "5周线":   ("短期反弹延续,关注板块轮动",          "短期转弱,降低仓位观望"),
-    "60日线":  ("日线级别趋势维持,可持股待涨",        "日线趋势转空,减仓观望"),
+    "21日线":  ("日线趋势防守有效,可继续观察",        "日线趋势防守失效,减仓观望"),
     "20日线":  ("短线支撑有效,可继续持有",            "短线走弱,注意止损"),
+    "13日线":  ("短线节奏保持,可跟踪承接",            "短线节奏走弱,控制仓位"),
+    "10日线":  ("短线回踩有效,可继续观察",            "短线回踩失败,等待修复"),
+    "8日线":   ("短线动能保持,关注延续",              "短线动能衰减,等待企稳"),
+    "5日线":   ("超短线承接有效,保持跟踪",            "超短线失守,观察回补"),
 }
 
 _RESISTANCE_TEMPLATES = {
-    "10月线":  ("月线级别突破,长期趋势反转向上",       "月线压力有效,反弹空间受限"),
+    "21周线":  ("周线趋势重新转强,中期空间打开",       "周线趋势压力仍在,反弹受限"),
     "20周线":  ("周线级别突破,中期转强",              "周线压力仍在,震荡格局延续"),
+    "13周线":  ("周线节奏转强,观察放量确认",          "周线节奏压力仍在,继续震荡"),
     "10周线":  ("中短期突破,上方空间打开",            "反弹受阻,继续震荡"),
+    "8周线":   ("短周动能突破,关注延续",              "短周动能压力有效,继续观察"),
     "5周线":   ("短期突破向上,追踪板块强度",          "短期反弹受压,观望为主"),
-    "60日线":  ("日线级别突破,趋势转多",              "日线压力有效,短期震荡"),
+    "21日线":  ("日线趋势转强,观察回踩确认",          "日线趋势压力有效,短期震荡"),
     "20日线":  ("短线突破,可适度参与",                "短线压力仍在,等待突破"),
+    "13日线":  ("短线节奏突破,跟踪延续",              "短线节奏压力仍在,等待站回"),
+    "10日线":  ("短线突破,观察量能",                  "短线压力有效,继续等待"),
+    "8日线":   ("短线动能突破,关注持续性",            "短线动能受压,降低预期"),
+    "5日线":   ("超短线站回,观察承接",                "超短线压力有效,等待修复"),
 }
 
 _DEFAULT_SUPPORT = ("趋势维持,支撑有效", "支撑破位,注意风险")

@@ -29,11 +29,13 @@ REQUIRED_FULL_FREQS = ("日线", "周线", "30分钟")
 OPTIONAL_ON_DEMAND_FREQS = ("15分钟", "5分钟")
 INTRADAY_SCAN_SCOPE = "intraday_active"
 POSTMARKET_SCAN_SCOPE = "postmarket"
+KEY_MA_PERIODS = (5, 8, 10, 13, 20, 21)
 PRIMARY_MA_PERIODS = (5, 10, 20)
-FIBONACCI_MA_PERIODS = (8, 13, 21, 34, 55, 89)
 FIB_MA_TOUCH_UNDERSHOOT_PCT = 1.5
 FIB_MA_TOUCH_OVERSHOOT_PCT = 0.8
 FIB_MA_NEAR_PCT = 1.0
+DAILY_ANALYSIS_BAR_LIMIT = 1320
+WEEKLY_ANALYSIS_BAR_LIMIT = 280
 FREQ_ORDER = {
     "周线": 0,
     "weekly": 0,
@@ -661,7 +663,7 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
     }
     stand_weights = {5: 6.0, 10: 10.0, 20: 16.0}
     reclaim_weights = {5: 4.0, 10: 7.0, 20: 11.0}
-    fib_weights = {8: 2.0, 13: 2.5, 21: 3.0, 34: 4.0, 55: 5.0, 89: 6.0}
+    fib_weights = {5: 1.6, 8: 2.0, 10: 2.2, 13: 2.5, 20: 2.8, 21: 3.0}
     fib_support_score = 0.0
     fib_above_count = 0
     fib_reclaim_count = 0
@@ -669,7 +671,7 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
     fib_accept_count = 0
     fib_breakdown_count = 0
     fib_ma_array: list[dict[str, Any]] = []
-    for period in PRIMARY_MA_PERIODS + FIBONACCI_MA_PERIODS:
+    for period in KEY_MA_PERIODS:
         ma_value = _rolling_ma(closes, period)
         if ma_value is None:
             continue
@@ -698,7 +700,7 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
             if reclaim:
                 reclaim_count += 1
                 score += reclaim_weights[period]
-        elif period in fib_weights:
+        if period in fib_weights:
             weight = fib_weights[period]
             touched = (
                 -FIB_MA_TOUCH_UNDERSHOOT_PCT <= touch_distance_pct <= FIB_MA_TOUCH_OVERSHOOT_PCT
@@ -770,7 +772,7 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
         tags.append("重新站上均线")
     if out.get("ma_stack") == "bullish":
         tags.append("均线多头")
-    fib_ma_values = [out.get(f"ma{period}") for period in FIBONACCI_MA_PERIODS if out.get(f"ma{period}")]
+    fib_ma_values = [out.get(f"ma{period}") for period in KEY_MA_PERIODS if out.get(f"ma{period}")]
     if len(fib_ma_values) >= 2:
         if all(left >= right for left, right in zip(fib_ma_values, fib_ma_values[1:])):
             out["fib_ma_array_state"] = "bullish"
@@ -787,13 +789,13 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
         if item.get("pullback_touch") and not item.get("pullback_acceptance") and not item.get("pullback_breakdown")
     ]
     if accepted_periods:
-        tags.append("斐波那切均线回踩承接")
+        tags.append("关键均线回踩承接")
     elif breakdown_periods:
-        tags.append("斐波那切均线跌破待修复")
+        tags.append("关键均线跌破待修复")
         if pending_touch_periods:
-            tags.append("斐波那切均线回踩待确认")
+            tags.append("关键均线回踩待确认")
     elif pending_touch_periods:
-        tags.append("斐波那切均线回踩待确认")
+        tags.append("关键均线回踩待确认")
     out["above_count"] = above_count
     out["reclaim_count"] = reclaim_count
     out["fib_above_count"] = fib_above_count
@@ -805,12 +807,15 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
     out["fib_touch_periods"] = touched_periods[:6]
     out["fib_breakdown_periods"] = breakdown_periods[:6]
     out["fib_ma_array"] = fib_ma_array
+    summary_accept_periods = sorted(accepted_periods, reverse=True)[:3]
+    summary_breakdown_periods = sorted(breakdown_periods, reverse=True)[:3]
+    summary_pending_periods = sorted(pending_touch_periods, reverse=True)[: max(0, 3 - len(summary_breakdown_periods))]
     out["fib_array_summary"] = (
-        " / ".join(f"MA{period}回踩承接" for period in accepted_periods[:3])
+        " / ".join(f"MA{period}回踩承接" for period in summary_accept_periods)
         or " / ".join(
             [
-                *(f"MA{period}跌破待修复" for period in breakdown_periods[:3]),
-                *(f"MA{period}触碰待确认" for period in pending_touch_periods[: max(0, 3 - len(breakdown_periods[:3]))]),
+                *(f"MA{period}跌破待修复" for period in summary_breakdown_periods),
+                *(f"MA{period}触碰待确认" for period in summary_pending_periods),
             ]
         )
     )
@@ -1102,7 +1107,7 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
 
     market = _symbol_market(symbol)
     resample_intraday = scan_scope == INTRADAY_SCAN_SCOPE and market == "A"
-    daily_bars = _load_bars(db, symbol, DAILY_FREQS, Freq.D, limit=360, label="日线")
+    daily_bars = _load_bars(db, symbol, DAILY_FREQS, Freq.D, limit=DAILY_ANALYSIS_BAR_LIMIT, label="日线")
     now = naive_market_now(market)
     daily_bars = _append_quote_snapshot_daily_bar(
         db,
@@ -1123,7 +1128,7 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
     )
     bars_by_freq: list[tuple[str, Any, list[Any], int]] = [
         ("日线", Freq.D, daily_bars, 200),
-        ("周线", Freq.W, _load_bars(db, symbol, WEEKLY_FREQS, Freq.W, limit=180, label="周线"), 100),
+        ("周线", Freq.W, _load_bars(db, symbol, WEEKLY_FREQS, Freq.W, limit=WEEKLY_ANALYSIS_BAR_LIMIT, label="周线"), 100),
         ("30分钟", Freq.F30, _load_bars(db, symbol, MINUTE_FREQS["30分钟"], Freq.F30, limit=260, label="30分钟", resample_intraday=resample_intraday), 80),
         ("15分钟", Freq.F15, _load_bars(db, symbol, MINUTE_FREQS["15分钟"], Freq.F15, limit=260, label="15分钟", resample_intraday=resample_intraday), 80),
         ("5分钟", Freq.F5, _load_bars(db, symbol, MINUTE_FREQS["5分钟"], Freq.F5, limit=260, label="5分钟"), 80),

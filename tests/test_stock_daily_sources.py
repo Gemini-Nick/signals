@@ -95,12 +95,12 @@ def test_stock_daily_provider_prefix_maps_bj_920_codes():
     assert stock_daily._daily_provider_prefix("900901") == "sh"
 
 
-def test_stock_daily_active_repair_lookback_defaults_to_two_years(monkeypatch):
+def test_stock_daily_active_repair_lookback_defaults_to_incremental(monkeypatch):
     monkeypatch.delenv("STOCK_DAILY_REPAIR_LOOKBACK_DAYS", raising=False)
     monkeypatch.delenv("STOCK_DAILY_ACTIVE_REPAIR_LOOKBACK_DAYS", raising=False)
 
-    assert stock_daily._repair_lookback_days_for_scope("active") == 730
-    assert stock_daily._repair_lookback_days_for_scope("manual_only_codes") == 730
+    assert stock_daily._repair_lookback_days_for_scope("active") == 0
+    assert stock_daily._repair_lookback_days_for_scope("manual_only_codes") == 0
     assert stock_daily._repair_lookback_days_for_scope("all") == 0
 
     monkeypatch.setenv("STOCK_DAILY_REPAIR_LOOKBACK_DAYS", "30")

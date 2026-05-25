@@ -31,7 +31,7 @@ class ScanResult:
     change_pct: float = 0.0
 
     # 三个维度
-    ma_status: str = ""          # "MA60支撑(+1.2%)" / "多头排列" / ""
+    ma_status: str = ""          # "MA21支撑(+1.2%)" / "多头排列" / ""
     ma_near_support: bool = False
     czsc_signals: List[str] = field(default_factory=list)  # ["二买(conf=75%)"]
     has_buy_signal: bool = False

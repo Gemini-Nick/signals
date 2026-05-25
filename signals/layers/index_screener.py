@@ -60,7 +60,7 @@ class IndexScreener:
         """
         import config
         lb = lookback_days or getattr(config, "INDEX_LOOKBACK_DAYS", 180)
-        # 均线计算需要更多历史数据（10月线需 ~200交易日）
+        # 均线计算需要更多历史数据（覆盖 5/8/10/13/20/21 日周关键周期）
         ma_lb = getattr(config, "INDEX_MA_LOOKBACK_DAYS", 300)
         lb = max(lb, ma_lb)
         self._load_ak_indices(lookback_days=lb)

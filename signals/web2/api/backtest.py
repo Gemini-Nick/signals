@@ -430,7 +430,7 @@ def _fetch_kline_legacy(code: str, market: str, freq: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     # ── 日线 / 周线 ──────────────────────────────────
-    days = 730 if freq == "daily" else 1460
+    days = 365 * 5
     sdt = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
     edt = datetime.now().strftime("%Y%m%d")
     period = {"daily": "daily", "weekly": "weekly", "monthly": "monthly"}.get(freq, "weekly")
@@ -670,14 +670,11 @@ def _compute_macd_data(df: pd.DataFrame) -> list:
 
 def _compute_ma_lines(df: pd.DataFrame) -> list:
     """计算 MA 均线，返回 [{label, color, data: [{time, value}]}]"""
+    from signals.core.ma_levels import KEY_MA_COLORS, KEY_MA_PERIODS
+
     closes = df["close"]
     ma_lines = []
-    for period, label, color in [
-        (20, "MA20", "#e040fb"),
-        (60, "MA60", "#26a69a"),
-        (120, "MA120", "#ff6d00"),
-        (250, "MA250", "#78909c"),
-    ]:
+    for period in KEY_MA_PERIODS:
         if len(closes) < period:
             continue
         ma_vals = closes.rolling(period).mean()
@@ -687,7 +684,7 @@ def _compute_ma_lines(df: pd.DataFrame) -> list:
                 "time": _dt_to_unix(dt_idx),
                 "value": round(float(val), 4),
             })
-        ma_lines.append({"label": label, "color": color, "data": line_data})
+        ma_lines.append({"label": f"MA{period}", "color": KEY_MA_COLORS.get(period, "#2962ff"), "data": line_data})
     return ma_lines
 
 
@@ -781,7 +778,7 @@ def _compute_kpi(signal_evals: list) -> dict:
     # 按信号类型分组
     by_type = {}
     for s in valid:
-        sig_type = s.get("type", "")
+        sig_type = _signal_breakdown_label(s.get("type", ""), s.get("group", ""))
         if sig_type not in by_type:
             by_type[sig_type] = {"count": 0, "wins": 0, "returns": []}
         by_type[sig_type]["count"] += 1
@@ -837,12 +834,65 @@ def _avg(values: list[float]) -> float:
     return round(sum(numbers) / len(numbers), 2) if numbers else 0
 
 
+def _signal_breakdown_label(sig_type: str, sig_group: str = "") -> str:
+    """Return stable, user-facing signal buckets for return breakdown tables."""
+    text = str(sig_type or "").strip()
+    group = str(sig_group or "").strip()
+    if not text and not group:
+        return "unknown"
+
+    if group == "macd":
+        if text.startswith("A_") or "零上回踩" in text or "Pattern A" in text:
+            return "MACD · A零上回踩"
+        if text.startswith("B_") or "零下企稳" in text or "Pattern B" in text:
+            return "MACD · B零下企稳"
+        return f"MACD · {text or '信号'}"
+
+    if group == "czsc":
+        if text.startswith("形态:"):
+            return f"形态 · {text.split(':', 1)[1]}"
+        if text.startswith("缺口"):
+            if "买" in text:
+                return "缺口 · 买点"
+            if "卖" in text:
+                return "缺口 · 卖点"
+            return "缺口 · 结构"
+        if "买" in text or "卖" in text or "背驰" in text or "趋势" in text:
+            return f"缠论 · {text}"
+        return f"缠论 · {text or '结构信号'}"
+
+    if group == "trend" or text.startswith("Breakout_"):
+        if text.startswith("Breakout_") and text.endswith("D"):
+            days = text.replace("Breakout_", "").replace("D", "")
+            return f"突破 · {days}日新高"
+        return "突破 · 趋势突破"
+
+    if group == "200d_new_high_breakout" or "200日新高" in text:
+        return "突破 · 200日新高"
+
+    if group == "gap" or text.startswith("Gap_"):
+        return "缺口 · 跳空买点"
+
+    if group == "vol" or text.startswith("VolSqueeze_"):
+        return "波动收缩 · 布林突破"
+
+    if group == "candle_run" or text.startswith("CandleRun_"):
+        count = text.replace("CandleRun_", "") if text.startswith("CandleRun_") else ""
+        return f"K线 · 连续阳线{count}" if count else "K线 · 连续阳线"
+
+    if group == "candle_accel" or text.startswith("CandleAccel_"):
+        count = text.replace("CandleAccel_", "") if text.startswith("CandleAccel_") else ""
+        return f"K线 · 加速阳线{count}" if count else "K线 · 加速阳线"
+
+    return text or group or "unknown"
+
+
 def _batch_signal_breakdown(code: str, name: str, signals: list[dict], trades: list[dict]) -> list[dict]:
     """Aggregate one stock's all-signal forward returns and simulated trade returns."""
     groups: dict[str, dict] = {}
 
     def group_for(sig_type: str, sig_group: str = "") -> dict:
-        key = sig_type or sig_group or "unknown"
+        key = _signal_breakdown_label(sig_type, sig_group)
         if key not in groups:
             groups[key] = {
                 "signal_type": key,
@@ -1005,15 +1055,15 @@ def _detect_macd(df: pd.DataFrame, symbol: str, freq_label: str, lookback: int) 
 # 缠论信号检测
 # ─────────────────────────────────────────────────────
 
-def _detect_czsc(df: pd.DataFrame, symbol: str, freq_label: str) -> tuple:
+def _detect_czsc(df: pd.DataFrame, symbol: str, freq_label: str, lookback: int = 999) -> tuple:
     """
     运行缠论信号检测，返回 (signals_list, bi_list, zhongshu_list)。
-    从 DataFrame 构建 CZSC 对象，然后调用 detect_all_signals。
+    对历史前缀滚动构建 CZSC 对象，避免只拿到最后一个结构信号。
     """
     from czsc import CZSC, RawBar, Freq
     from signals.core.detectors import detect_all_signals
 
-    freq_map = {"日线": Freq.D, "周线": Freq.W}
+    freq_map = {"日线": Freq.D, "周线": Freq.W, "月线": Freq.M}
     freq_enum = freq_map.get(freq_label, Freq.D)
 
     # DataFrame → RawBar list
@@ -1030,34 +1080,43 @@ def _detect_czsc(df: pd.DataFrame, symbol: str, freq_label: str) -> tuple:
         return [], [], []
 
     czsc_obj = CZSC(bars, max_bi_num=200)
-    events = detect_all_signals(czsc_obj, symbol)
-
-    # 过滤掉 MACD 类信号（避免与 macd group 重复）
-    events = [e for e in events if "MACD" not in e.signal_type]
-
-    # 转换信号
-    signals = []
-    for ev in events:
-        # 找到对应的 df index (pandas 3.0+ 不支持 method="nearest")
+    scan_start = max(35, len(bars) - max(int(lookback or 0), 1))
+    signals_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for end in range(scan_start, len(bars) + 1):
         try:
-            sig_idx = df.index.get_indexer([ev.dt], method="nearest")[0]
-            if sig_idx < 0:
-                continue
+            rolling_obj = CZSC(bars[:end], max_bi_num=200)
+            events = detect_all_signals(rolling_obj, symbol)
         except Exception:
             continue
 
-        eval_data = _compute_forward_eval(df, sig_idx)
+        for ev in events:
+            # MACD has its own detector; keep CZSC rows focused on buy/sell/structure.
+            if "MACD" in ev.signal_type:
+                continue
+            try:
+                sig_idx = df.index.get_indexer([ev.dt], method="nearest")[0]
+                if sig_idx < scan_start or sig_idx < 0 or sig_idx >= end:
+                    continue
+            except Exception:
+                continue
 
-        signals.append({
-            "dt": _dt_to_unix(ev.dt),
-            "date_str": ev.dt.strftime("%Y-%m-%d") if hasattr(ev.dt, "strftime") else str(ev.dt)[:10],
-            "type": ev.signal_type,
-            "group": "czsc",
-            "price": round(ev.price, 4),
-            "confidence": ev.confidence,
-            "details": ev.details,
-            "eval": eval_data,
-        })
+            date_str = ev.dt.strftime("%Y-%m-%d") if hasattr(ev.dt, "strftime") else str(ev.dt)[:10]
+            key = (date_str, ev.signal_type)
+            row = {
+                "dt": _dt_to_unix(ev.dt),
+                "date_str": date_str,
+                "type": ev.signal_type,
+                "group": "czsc",
+                "price": round(ev.price, 4),
+                "confidence": ev.confidence,
+                "details": ev.details,
+                "eval": _compute_forward_eval(df, sig_idx),
+            }
+            existing = signals_by_key.get(key)
+            if not existing or float(row.get("confidence") or 0) >= float(existing.get("confidence") or 0):
+                signals_by_key[key] = row
+
+    signals = sorted(signals_by_key.values(), key=lambda item: item["dt"])
 
     # 序列化笔线
     bi_list = []
@@ -1241,7 +1300,7 @@ def _detect_all_signals(df, symbol, freq_label, signal_group, lookback, factor,
 
     if signal_group in ("czsc", "all"):
         try:
-            czsc_sigs, bi_list, zhongshu = _detect_czsc(df, symbol, freq_label)
+            czsc_sigs, bi_list, zhongshu = _detect_czsc(df, symbol, freq_label, lookback=lookback)
             all_signals.extend(czsc_sigs)
         except Exception as czsc_err:
             logger.warning("缠论信号检测失败: %s", czsc_err)
@@ -1271,7 +1330,7 @@ def _annotate_signals_ma_vol(df: pd.DataFrame, signals: list):
     给每个信号补充 MA 位置和量能状态标注。
 
     在信号 dict 中新增:
-    - ma_status: "MA60支撑(+1.2%)" / "MA20阻力" / "多头排列" / ""
+    - ma_status: "MA21支撑(+1.2%)" / "MA13阻力" / "多头排列" / ""
     - volume_status: "放量(2.1σ)" / "缩量(-1.8σ)" / "正常"
     - ma_confirmed: bool (MA支撑/阻力确认)
     - vol_confirmed: bool (放量确认)
@@ -1280,7 +1339,9 @@ def _annotate_signals_ma_vol(df: pd.DataFrame, signals: list):
         return
 
     # 预计算MA
-    ma_periods = {"MA20": 20, "MA60": 60, "MA120": 120, "MA250": 250}
+    from signals.core.ma_levels import KEY_MA_PERIODS
+
+    ma_periods = {f"MA{period}": period for period in KEY_MA_PERIODS}
     for name, period in ma_periods.items():
         if len(df) >= period:
             df[name] = df["close"].rolling(period).mean()
@@ -1345,7 +1406,7 @@ def _annotate_signals_ma_vol(df: pd.DataFrame, signals: list):
         else:
             # 判断均线排列
             ma_vals = {}
-            for name in ["MA20", "MA60", "MA120"]:
+            for name in ["MA5", "MA13", "MA21"]:
                 if name in df.columns and not pd.isna(row.get(name)):
                     ma_vals[name] = float(row[name])
             if len(ma_vals) >= 3:

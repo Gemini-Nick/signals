@@ -417,20 +417,15 @@ def serialize_scored_symbol(scored) -> dict:
 
 def compute_ma_lines(bars_raw) -> list:
     """
-    从 bars_raw (RawBar list) 计算 MA5/10/20/60 线。
+    从 bars_raw (RawBar list) 计算 MA5/8/10/13/20/21 线。
     返回 [{label, color, data: [{time, value}]}]
     """
-    from signals.core.ma_levels import _bars_to_df
+    from signals.core.ma_levels import KEY_MA_COLORS, KEY_MA_PERIODS, _bars_to_df
     df = _bars_to_df(bars_raw)
     closes = df["close"]
 
     ma_lines = []
-    for period, label, color in [
-        (5, "MA5", "#f7931a"),
-        (10, "MA10", "#2962ff"),
-        (20, "MA20", "#e040fb"),
-        (60, "MA60", "#26a69a"),
-    ]:
+    for period in KEY_MA_PERIODS:
         if len(closes) >= period:
             ma_vals = closes.rolling(period).mean()
             line_data = []
@@ -440,8 +435,8 @@ def compute_ma_lines(bars_raw) -> list:
                     "value": round(val, 4),
                 })
             ma_lines.append({
-                "label": label,
-                "color": color,
+                "label": f"MA{period}",
+                "color": KEY_MA_COLORS.get(period, "#2962ff"),
                 "data": line_data,
             })
     return ma_lines

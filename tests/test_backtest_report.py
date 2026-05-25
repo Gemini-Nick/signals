@@ -208,6 +208,46 @@ def test_batch_terminal_multi_symbol_panels():
     assert terminal["panels"]["scripts"]["cards"][0]["one_liner"]
 
 
+def test_batch_signal_breakdown_uses_canonical_signal_labels():
+    from signals.web2.api.backtest import _batch_signal_breakdown
+
+    signals = [
+        {
+            "type": "A_零上回踩",
+            "group": "macd",
+            "eval": {"return_t10": 1.2, "direction_correct": 1, "return_t5": 0.5},
+        },
+        {
+            "type": "Gap_2.1%",
+            "group": "gap",
+            "eval": {"return_t10": -0.2, "direction_correct": 0, "return_t5": -0.1},
+        },
+        {
+            "type": "Gap_5.8%",
+            "group": "gap",
+            "eval": {"return_t10": 2.4, "direction_correct": 1, "return_t5": 1.1},
+        },
+        {
+            "type": "二买",
+            "group": "czsc",
+            "eval": {"return_t10": 3.0, "direction_correct": 1, "return_t5": 1.4},
+        },
+    ]
+    trades = [
+        {"signal_type": "A_零上回踩", "signal_group": "macd", "entry_price": 10, "net_return_pct": 2.0},
+        {"signal_type": "Gap_2.1%", "signal_group": "gap", "entry_price": 10, "net_return_pct": -1.0},
+    ]
+
+    rows = _batch_signal_breakdown("002759", "天赐材料", signals, trades)
+    by_type = {row["signal_type"]: row for row in rows}
+
+    assert "MACD · A零上回踩" in by_type
+    assert by_type["MACD · A零上回踩"]["trade_count"] == 1
+    assert by_type["缺口 · 跳空买点"]["signal_count"] == 2
+    assert by_type["缺口 · 跳空买点"]["trade_count"] == 1
+    assert by_type["缠论 · 二买"]["signal_count"] == 1
+
+
 def test_generate_backtest_report_html_and_dispatch(tmp_path):
     from signals.core.backtest_report import generate_backtest_report, generate_html_backtest_report
 

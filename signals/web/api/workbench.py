@@ -26,6 +26,7 @@ from signals.core.market_time import (
 )
 from signals.core.backtest_terminal import build_backtest_terminal
 from signals.core.concept_carriers import load_industry_chains, non_chain_reason
+from signals.core.ma_levels import KEY_MA_COLORS, KEY_MA_PERIODS
 from signals.core.macro_universe import (
     MACRO_GROUP_INDUSTRY_ETFS,
     MACRO_GROUP_MAJOR_INDICES,
@@ -729,13 +730,22 @@ def _chart_from_df(
     live_render: bool = False,
 ) -> dict[str, Any]:
     market = infer_market(symbol=symbol, source=source)
-    limit = 900 if _canonical_freq(freq) in {"5min", "15min", "30min"} else 720
+    canonical_freq = _canonical_freq(freq)
+    if canonical_freq == "weekly":
+        limit = 280
+    elif canonical_freq == "daily":
+        limit = 1320
+    elif canonical_freq in {"5min", "15min", "30min"}:
+        limit = 900
+    else:
+        limit = 1320
     working = _normalize_chart_df(df, freq, live_render=live_render)
     live_overlay_source = ""
     if live_render:
         working, live_overlay_source = _append_live_daily_quote_bar(working, symbol=symbol, freq=freq)
     effective_source = f"{source};{live_overlay_source}" if live_overlay_source else source
     cache_meta = _chart_cache_meta(working, source=effective_source, freq=freq)
+    ma_lines = _compute_chart_ma_lines(working, limit=limit, market=market, symbol=symbol, source=source)
     return {
         "symbol": symbol,
         "freq": _freq_label(freq),
@@ -750,8 +760,40 @@ def _chart_from_df(
         },
         "ohlcv": _serialize_ohlcv_df(working, limit=limit, market=market, symbol=symbol, source=source),
         "signals": [],
-        "ma_lines": [],
+        "ma_lines": ma_lines,
     }
+
+
+def _compute_chart_ma_lines(
+    df: pd.DataFrame,
+    *,
+    limit: int,
+    market: str,
+    symbol: str,
+    source: str,
+) -> list[dict[str, Any]]:
+    if df is None or df.empty or "close" not in df.columns:
+        return []
+    closes = pd.to_numeric(df["close"], errors="coerce")
+    out: list[dict[str, Any]] = []
+    for period in KEY_MA_PERIODS:
+        if len(closes) < period:
+            continue
+        ma_vals = closes.rolling(period).mean().dropna().tail(limit)
+        data = [
+            {
+                "time": _dt_to_unix(dt_idx, market=market, symbol=symbol, source=source),
+                "value": round(float(value), 4),
+            }
+            for dt_idx, value in ma_vals.items()
+            if pd.notna(value)
+        ]
+        out.append({
+            "label": f"MA{period}",
+            "color": KEY_MA_COLORS.get(period, "#2962ff"),
+            "data": data,
+        })
+    return out
 
 
 def _chart_has_ohlcv(chart: dict[str, Any]) -> bool:
@@ -1782,6 +1824,94 @@ def _ma_signal_from_df(df: pd.DataFrame) -> str:
     return "震荡观察"
 
 
+def _ma5_line_label(freq: Any) -> str:
+    bucket = _freq_bucket(freq)
+    if bucket == "weekly":
+        return "5周线"
+    if bucket == "monthly":
+        return "5月线"
+    if bucket == "daily":
+        return "5日线"
+    return "5根线"
+
+
+def _weekly_close_subject(date_text: str) -> str:
+    try:
+        bar_day = date.fromisoformat(str(date_text)[:10])
+        today = _market_today("A")
+        days_since_friday = (today.weekday() - 4) % 7
+        last_friday = today - timedelta(days=days_since_friday)
+        if bar_day == last_friday and bar_day.weekday() == 4:
+            return "上周五收盘价"
+    except Exception:
+        pass
+    return f"{date_text}周线收盘价" if date_text else "最新周线收盘价"
+
+
+def _current_timeframe_ma_state(chart: dict[str, Any], freq: Any = "") -> dict[str, Any]:
+    ohlcv = chart.get("ohlcv") if isinstance(chart, dict) else []
+    if not isinstance(ohlcv, list) or len(ohlcv) < 5:
+        return {}
+    chart_meta = chart.get("meta") if isinstance(chart.get("meta"), dict) else {}
+    bucket = _freq_bucket(freq or chart_meta.get("freq") or chart.get("freq"))
+    rows = [row for row in ohlcv if isinstance(row, dict) and _float(row.get("close")) is not None]
+    if len(rows) < 5:
+        return {}
+    closes = [_float(row.get("close"), 0) or 0 for row in rows]
+    latest = rows[-1]
+    latest_close = closes[-1]
+    ma5 = sum(closes[-5:]) / 5
+    if ma5 <= 0 or latest_close >= ma5:
+        return {}
+    latest_ts = int(latest.get("time") or 0)
+    symbol = _text(chart.get("symbol"))
+    source = _text(chart_meta.get("source"))
+    market = _text(chart_meta.get("market")) or infer_market(symbol=symbol, source=source)
+    date_text = _timestamp_date(latest_ts, market=market, symbol=symbol, source=source) if latest_ts else ""
+    line_label = _ma5_line_label(bucket)
+    distance_pct = (latest_close - ma5) / ma5 * 100
+    if bucket == "weekly":
+        summary = f"{_weekly_close_subject(date_text)}没站稳{line_label}"
+    else:
+        summary = f"收盘价没站稳{line_label}"
+    detail = f"收盘 {latest_close:.2f} < {line_label} {ma5:.2f}，差 {distance_pct:+.2f}%"
+    return {
+        "summary": summary,
+        "signal_type": f"未站稳{line_label}",
+        "details": detail,
+        "freq": bucket,
+        "date_str": date_text,
+        "dt": latest_ts,
+        "price": round(latest_close, 4),
+        "ma5": round(ma5, 4),
+        "latest_close": round(latest_close, 4),
+        "distance_pct": round(distance_pct, 4),
+    }
+
+
+def _current_timeframe_ma_signal(chart: dict[str, Any], freq: Any = "") -> dict[str, Any]:
+    state = _current_timeframe_ma_state(chart, freq)
+    if not state:
+        return {}
+    return {
+        "dt": state["dt"],
+        "date_str": state["date_str"],
+        "type": state["signal_type"],
+        "signal_type": state["signal_type"],
+        "price": state["price"],
+        "confidence": 0.76,
+        "freq": state["freq"],
+        "details": state["details"],
+        "source": "workbench.current_timeframe_ma",
+        "pool_status": "current_timeframe_ma",
+        "chart_aligned": True,
+        "display_scope": "current_timeframe",
+        "signal_side": "sell",
+        "signal_family": "ma_state",
+        "ma_state": state,
+    }
+
+
 def _signal_or_fallback(row: dict[str, Any], df: pd.DataFrame) -> str:
     for key in ("daily_latest_signal", "latest_signal", "signal"):
         value = _text(row.get(key))
@@ -1793,6 +1923,35 @@ def _signal_or_fallback(row: dict[str, Any], df: pd.DataFrame) -> str:
     if minute_signals:
         return "/".join(minute_signals[:2])
     return _ma_signal_from_df(df)
+
+
+def _index_weekly_ma_state(symbol: str) -> dict[str, Any]:
+    if not _text(symbol):
+        return {}
+    try:
+        weekly_df, source = _index_df(symbol, "weekly")
+        chart = _chart_from_df(weekly_df, symbol=symbol, freq="weekly", source=source)
+        return _current_timeframe_ma_state(chart, "weekly")
+    except Exception:
+        return {}
+
+
+def _index_key_signal(row: dict[str, Any], symbol: str, daily_df: pd.DataFrame) -> tuple[str, dict[str, Any]]:
+    explicit = _signal_or_fallback(row, daily_df)
+    raw_explicit = [
+        _text(row.get("daily_latest_signal")),
+        _text(row.get("latest_signal")),
+        _text(row.get("signal")),
+        _text(row.get("f30_latest_signal")),
+        _text(row.get("f15_latest_signal")),
+    ]
+    has_explicit = any(value and value.lower() not in {"none", "n/a"} and value != "无" for value in raw_explicit)
+    if has_explicit and explicit:
+        return explicit, {}
+    weekly_ma = _index_weekly_ma_state(symbol)
+    if weekly_ma.get("signal_type"):
+        return _text(weekly_ma.get("signal_type")), weekly_ma
+    return explicit, {}
 
 
 def _timeframe_signal_value(row: dict[str, Any], key: str) -> str:
@@ -2765,7 +2924,7 @@ def _slim_shell_ma_alignment(value: Any) -> dict[str, Any]:
         "summary",
         "tags",
     }
-    for period in (5, 8, 10, 13, 20, 21, 34, 55, 60, 89):
+    for period in (5, 8, 10, 13, 20, 21):
         keep.update({
             f"ma{period}",
             f"previous_ma{period}",
@@ -2782,7 +2941,7 @@ def _slim_shell_ma_alignment(value: Any) -> dict[str, Any]:
         if item
     ]
     if fib_items:
-        out["fib_ma_array"] = fib_items[:8]
+        out["fib_ma_array"] = fib_items[:6]
     return out
 
 
@@ -3656,6 +3815,7 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
     effective_day_change_mode = minute_change.get("day_change_mode") if minute_change else day_change_mode
     day_change_as_of = minute_change.get("day_change_as_of") if minute_change else (daily_as_of if day_change_mode == "daily_close" else "")
     ma_fields = _index_ma_fields_from_daily_df(df)
+    key_signal, key_ma_state = _index_key_signal(row, symbol, df)
     enriched = dict(row)
     enriched.update({
         "kind": "index",
@@ -3671,7 +3831,7 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "day_change_mode": effective_day_change_mode,
         "day_change_as_of": day_change_as_of,
         "day_change_freq": minute_change.get("day_change_freq") if minute_change else "",
-        "latest_signal": _signal_or_fallback(row, df),
+        "latest_signal": key_signal,
         "buy_timeframes": buy_timeframes,
         "sell_timeframes": sell_timeframes,
         "range_returns": _compute_range_returns(df, range_columns),
@@ -3684,6 +3844,9 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
     })
     if ma_fields:
         enriched.update(ma_fields)
+    if key_ma_state:
+        enriched["current_timeframe_ma"] = key_ma_state
+        enriched["signal_detail"] = key_ma_state.get("summary") or key_ma_state.get("details")
     return _apply_quote_overlay(enriched, symbol)
 
 
@@ -5394,7 +5557,7 @@ def _build_macro_index_rows(
             "trader_action": "观察关键指数方向和主题共振",
             "invalidates_when": "指数跌破对应周期防守均线或主题扩散失败",
             "theme_tags": MINGDAO_INDEX_THEMES.get(name, []),
-            "latest_signal": (
+            "latest_signal": enriched.get("latest_signal") or (
                 _signal_or_fallback(row, _index_df(symbol, "daily")[0] if kind != "stock" else _stock_df(str(target_symbol), "daily")[0])
             ),
             "signal_stack": {
@@ -9277,7 +9440,7 @@ def _ensure_daily_bars(symbol: str, raw_code: str) -> bool:
         now = _sync_now()
         docs = _sync_one_stock(
             code,
-            (now - timedelta(days=730)).strftime("%Y%m%d"),
+            (now - timedelta(days=365 * 5)).strftime("%Y%m%d"),
             now.strftime("%Y%m%d"),
         )
         if not docs:
@@ -10205,12 +10368,20 @@ async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
     df, source = _index_df(str(report.get("symbol") or name), requested_freq)
     chart = _chart_from_df(df, symbol=str(report.get("symbol") or name), freq=requested_freq, source=source, live_render=True)
     chart = _mark_chart_readiness(chart, kind="index", requested_freq=requested_freq)
+    ma_signal = _current_timeframe_ma_signal(chart, requested_freq)
     chart["signals"] = [
         *(chart.get("signals") if isinstance(chart.get("signals"), list) else []),
         *_index_report_chart_signals(report, chart, requested_freq),
+        *([ma_signal] if ma_signal else []),
     ]
     chart = _merge_signal_pool_into_chart(chart, str(report.get("symbol") or name), requested_freq, kind="index")
     plan = _plan_for_index(engine, name)
+    summary = _summary_from_index(report, chart)
+    ma_state = ma_signal.get("ma_state") if isinstance(ma_signal, dict) else {}
+    if isinstance(ma_state, dict) and ma_state:
+        summary["latest_signal"] = ma_signal.get("signal_type") or ma_state.get("signal_type")
+        summary["conclusion"] = ma_state.get("summary") or summary.get("conclusion")
+        summary["current_timeframe_ma"] = ma_state
 
     return {
         "target": {
@@ -10226,7 +10397,7 @@ async def _build_index_target(engine, name: str, freq: str) -> Dict[str, Any]:
             **_target_diagnostics("index", str(report.get("symbol") or name), requested_freq),
         },
         "chart": chart,
-        "summary": _summary_from_index(report, chart),
+        "summary": summary,
         "signals": chart.get("signals", []),
         "plan": plan,
         "review": _review_context(engine, "index", name),
@@ -10249,10 +10420,16 @@ async def _build_static_index_target(name: str, symbol: str, freq: str) -> Dict[
     chart = _chart_from_df(df, symbol=symbol, freq=requested_freq, source=source, live_render=True)
     chart = _mark_chart_readiness(chart, kind="index", requested_freq=requested_freq)
     signal_context = _cached_static_index_signal_context(name, symbol)
+    ma_signal = _current_timeframe_ma_signal(chart, requested_freq)
     if signal_context:
         chart["signals"] = [
             *(chart.get("signals") if isinstance(chart.get("signals"), list) else []),
             *_index_report_chart_signals(signal_context, chart, requested_freq),
+        ]
+    if ma_signal:
+        chart["signals"] = [
+            *(chart.get("signals") if isinstance(chart.get("signals"), list) else []),
+            ma_signal,
         ]
     chart = _merge_signal_pool_into_chart(chart, symbol, requested_freq, kind="index")
     summary = _summary_from_static_index(name, symbol, chart)
@@ -10271,11 +10448,16 @@ async def _build_static_index_target(name: str, symbol: str, freq: str) -> Dict[
             if _text(signal_context.get(key)):
                 summary[key] = signal_context[key]
     summary["latest_signal"] = (
-        context_signal
+        (ma_signal.get("signal_type") if ma_signal else "")
+        or context_signal
         or summary.get("latest_signal")
         or chart_report_signal
         or _ma_signal_from_df(df)
     )
+    ma_state = ma_signal.get("ma_state") if isinstance(ma_signal, dict) else {}
+    if isinstance(ma_state, dict) and ma_state:
+        summary["conclusion"] = ma_state.get("summary") or summary.get("conclusion")
+        summary["current_timeframe_ma"] = ma_state
     try:
         engine = _ensure_engine()
     except Exception:

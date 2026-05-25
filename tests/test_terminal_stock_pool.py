@@ -42,18 +42,18 @@ def _ma_alignment(*, above5=True, above10=True, above20=True, near10=False, near
         "reclaim_ma10": False,
         "reclaim_ma20": False,
         **({
+            "ma8": 10.1,
+            "ma13": 10.0,
             "ma21": 10.0,
-            "ma34": 9.8,
-            "ma55": 9.5,
+            "above_ma8": True,
+            "above_ma13": True,
             "above_ma21": True,
-            "above_ma34": True,
-            "above_ma55": True,
+            "near_ma8": False,
+            "near_ma13": True,
             "near_ma21": True,
-            "near_ma34": False,
-            "near_ma55": False,
+            "reclaim_ma8": False,
+            "reclaim_ma13": False,
             "reclaim_ma21": False,
-            "reclaim_ma34": False,
-            "reclaim_ma55": False,
             "fib_ma_array": [
                 {
                     "period": 13,
@@ -72,9 +72,9 @@ def _ma_alignment(*, above5=True, above10=True, above20=True, near10=False, near
                     "acceptance_score": 3.5,
                 },
                 {
-                    "period": 34,
-                    "name": "MA34",
-                    "value": 9.8,
+                    "period": 8,
+                    "name": "MA8",
+                    "value": 10.1,
                     "pullback_touch": False,
                     "pullback_acceptance": False,
                     "acceptance_score": 0.0,
@@ -1499,7 +1499,7 @@ def test_terminal_stock_pool_scores_fibonacci_ma_acceptance_separately():
     by_code = {row["raw_code"]: row for row in split["watch"]}
     assert by_code["300421"]["score_components"]["fib_ma_acceptance"] > 0
     assert by_code["300422"]["score_components"]["fib_ma_acceptance"] == 0
-    assert "斐波那切均线承接" in by_code["300421"]["rank_reason"]
+    assert "关键均线承接" in by_code["300421"]["rank_reason"]
 
 
 def test_terminal_stock_pool_watch_rank_rewards_multi_period_and_indicator_breadth():
@@ -2364,7 +2364,7 @@ def test_terminal_stock_pool_storage_row_compacts_repeated_reason_analysis():
                 "acceptance_score": 3.5,
                 "notes": "x" * 4000,
             }
-            for period in (8, 13, 21, 34, 55, 89)
+            for period in (5, 8, 10, 13, 20, 21)
         ],
         "tags": ["MA13承接", "多周期共振"],
     }

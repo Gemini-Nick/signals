@@ -26,6 +26,7 @@ _HAND_VOLUME_SOURCES = {
 }
 _SHARE_VOLUME_SOURCES = {
     "sina",
+    "sina_etf",
     "baostock",
     "bars_latest",
     "fullmarket_spot_snapshot",

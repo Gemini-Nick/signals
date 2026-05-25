@@ -36,6 +36,7 @@ from ..volume_units import (
 from .daily_sources import fetch_tencent_daily
 
 logger = logging.getLogger("signals.sync.stock_daily")
+MIN_DAILY_HISTORY_DAYS = 365 * 5
 
 # Keep the default serial. AKShare's Eastmoney daily path can native-crash when
 # multiple MiniRacer initializations happen in parallel on macOS.
@@ -154,7 +155,7 @@ def _repair_lookback_days_for_scope(scope: str) -> int:
     if raw not in (None, ""):
         return max(0, int(raw or 0))
     if scope in {"active", "manual_only_codes"}:
-        return max(0, int(get_task_env("STOCK_DAILY_ACTIVE_REPAIR_LOOKBACK_DAYS", "730") or 0))
+        return max(0, int(get_task_env("STOCK_DAILY_ACTIVE_REPAIR_LOOKBACK_DAYS", "0") or 0))
     return 0
 
 
@@ -235,6 +236,24 @@ def _latest_daily_dates_by_symbol(db: Database, codes: list[str]) -> dict[str, d
         }
     except Exception as exc:
         logger.debug("读取 bars 日线最新日期失败: %s", exc)
+        return {}
+
+
+def _earliest_daily_dates_by_symbol(db: Database, codes: list[str]) -> dict[str, datetime]:
+    if not codes:
+        return {}
+    try:
+        rows = db["bars"].aggregate([
+            {"$match": {"meta.freq": "日线", "meta.symbol": {"$in": codes}}},
+            {"$group": {"_id": "$meta.symbol", "earliest_dt": {"$min": "$dt"}}},
+        ])
+        return {
+            str(row.get("_id")): row.get("earliest_dt")
+            for row in rows
+            if row.get("_id") and isinstance(row.get("earliest_dt"), datetime)
+        }
+    except Exception as exc:
+        logger.debug("读取 bars 日线最早日期失败: %s", exc)
         return {}
 
 
@@ -1276,9 +1295,15 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
     """同步单只股票日线，返回文档列表"""
     start = last_dt or "19900101"
     primary_source = os.getenv("STOCK_DAILY_PRIMARY_SOURCE", "tencent").lower()
+    try:
+        requested_days = (pd.to_datetime(end_date) - pd.to_datetime(start)).days
+    except Exception:
+        requested_days = 0
+    prefer_range_provider = requested_days >= 900 and code.startswith(("5", "15"))
+    tencent_count = min(3000, max(800, int(requested_days * 0.75) + 80))
     failures: list[tuple[str, BaseException]] = []
     attempted: set[str] = set()
-    if primary_source == "tencent":
+    if primary_source == "tencent" and not prefer_range_provider:
         attempted.add("tencent")
         try:
             df = provider_call(
@@ -1288,6 +1313,7 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
                     code,
                     start_date=start,
                     end_date=end_date,
+                    count=tencent_count,
                     timeout=float(os.getenv("STOCK_DAILY_TENCENT_TIMEOUT", "8")),
                 ),
                 db=db,
@@ -1332,6 +1358,38 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
         }
     except Exception as em_exc:
         failures.append(("eastmoney", em_exc))
+        if code.startswith(("5", "15")):
+            source = "sina_etf"
+            prefix = _daily_provider_prefix(code)
+            attempted.add("sina_etf")
+            try:
+                df = provider_call(
+                    "sina",
+                    "stock_daily",
+                    lambda: _call_provider(lambda: ak.fund_etf_hist_sina(symbol=f"{prefix}{code}")),
+                    db=db,
+                )
+                if df is not None and not df.empty and "date" in df.columns:
+                    df = df.copy()
+                    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                    start_dt = pd.to_datetime(start, errors="coerce")
+                    end_dt = pd.to_datetime(end_date, errors="coerce")
+                    if pd.notna(start_dt):
+                        df = df[df["date"] >= start_dt]
+                    if pd.notna(end_dt):
+                        df = df[df["date"] <= end_dt]
+                column_map = {
+                    "dt": "date",
+                    "open": "open",
+                    "high": "high",
+                    "low": "low",
+                    "close": "close",
+                    "vol": "volume",
+                    "amount": "amount",
+                }
+                return _docs_from_daily_df(code, df, column_map, source, end_date=end_date)
+            except Exception as sina_etf_exc:
+                failures.append(("sina_etf", sina_etf_exc))
         source = "sina"
         prefix = _daily_provider_prefix(code)
         attempted.add("sina")
@@ -1371,6 +1429,7 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
                             code,
                             start_date=start,
                             end_date=end_date,
+                            count=tencent_count,
                             timeout=float(os.getenv("STOCK_DAILY_TENCENT_TIMEOUT", "8")),
                         ),
                         db=db,
@@ -1434,6 +1493,14 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         current = _coerce_last_dt(sync_docs.get(code))
         if current is None or latest_dt != current:
             sync_docs[code] = latest_dt
+    history_cutoff = (now - timedelta(days=MIN_DAILY_HISTORY_DAYS)).replace(hour=0, minute=0, second=0, microsecond=0)
+    bars_earliest = _earliest_daily_dates_by_symbol(db, codes)
+    short_history_codes = {
+        code
+        for code in codes
+        if _coerce_last_dt(bars_earliest.get(code)) is None
+        or _coerce_last_dt(bars_earliest.get(code)) > history_cutoff
+    }
 
     total_inserted = 0
     total_skipped = 0
@@ -1466,7 +1533,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         batch_inserted = sum(int(value or 0) for value in written_by_code.values())
         total_inserted += batch_inserted
         if repair_lookback_days <= 0:
-            processed_count += len(batch_codes)
+            processed_count += len(batch_codes - short_history_codes)
         _write_progress(
             sync_col,
             status="running" if processed_count < len(codes) else "ok",
@@ -1497,16 +1564,16 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
     def _process(code):
         last_dt_raw = sync_docs.get(code)
         last_dt = _coerce_last_dt(last_dt_raw)
+        short_history = code in short_history_codes
         if last_dt:
             # 增量：从 last_dt 下一天开始
             inc_start = (last_dt + timedelta(days=1)).strftime("%Y%m%d")
             if inc_start > end_date:
-                if repair_lookback_days <= 0:
+                if repair_lookback_days <= 0 and not short_history:
                     return code, [], "skip"
-                inc_start = (now - timedelta(days=repair_lookback_days)).strftime("%Y%m%d")
+                inc_start = history_cutoff.strftime("%Y%m%d") if short_history else (now - timedelta(days=repair_lookback_days)).strftime("%Y%m%d")
         else:
-            # 全量：近 2 年
-            inc_start = (now - timedelta(days=730)).strftime("%Y%m%d")
+            inc_start = history_cutoff.strftime("%Y%m%d")
         if repair_lookback_days > 0:
             repair_start = (now - timedelta(days=repair_lookback_days)).strftime("%Y%m%d")
             if inc_start > repair_start:
@@ -1523,7 +1590,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
                     raise
                 docs = _sync_one_stock(code, inc_start, end_date, proxy_url)
             time.sleep(_CALL_INTERVAL)
-            return code, docs, "ok"
+            return code, docs, "history_backfill" if short_history else "ok"
         except Exception as e:
             if isinstance(e, ProviderCoolingDown):
                 return code, [], f"deferred/cooling_down:{e}"
@@ -1550,7 +1617,9 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         return sum(int(value or 0) for value in written_by_code.values())
 
     # 并行拉取
-    remaining_codes = codes if repair_lookback_days > 0 else [code for code in codes if code not in batch_codes]
+    remaining_codes = codes if repair_lookback_days > 0 else [
+        code for code in codes if code not in batch_codes or code in short_history_codes
+    ]
     with ThreadPoolExecutor(max_workers=_BATCH_WORKERS) as executor:
         futures = {executor.submit(_process, c): c for c in remaining_codes}
         for future in as_completed(futures):
@@ -1564,12 +1633,12 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
                 latest_status = status
                 if status == "skip":
                     total_skipped += 1
-                elif status == "ok" and docs:
+                elif status in {"ok", "history_backfill"} and docs:
                     pending_docs[code] = docs
                     if len(pending_docs) >= write_batch_symbols:
                         latest_written = _flush_pending()
                         total_inserted += latest_written
-                elif status == "ok":
+                elif status in {"ok", "history_backfill"}:
                     latest_status = "empty_docs"
                     errors.append((code, "empty_docs"))
                 elif status != "ok":
@@ -1660,4 +1729,5 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         "batch_today_inserted": batch_inserted,
         "batch_today_reason": batch_reason,
         "repair_lookback_days": repair_lookback_days,
+        "short_history_backfill_codes": len(short_history_codes),
     }

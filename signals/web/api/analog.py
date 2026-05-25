@@ -289,13 +289,9 @@ def get_analog_kline(
 
     # MA 均线
     ma_lines = []
-    for period, label, color in [
-        (5, "MA5", "#f7931a"),
-        (13, "MA13", "#e040fb"),
-        (21, "MA21", "#2962ff"),
-        (55, "MA55", "#26a69a"),
-        (144, "MA144", "#787b86"),
-    ]:
+    from signals.core.ma_levels import KEY_MA_COLORS, KEY_MA_PERIODS
+
+    for period in KEY_MA_PERIODS:
         if len(closes) >= period:
             line_data = []
             for i in range(period - 1, len(closes)):
@@ -304,7 +300,11 @@ def get_analog_kline(
                     "time": ohlcv[i]["time"],
                     "value": round(avg, 2),
                 })
-            ma_lines.append({"label": label, "color": color, "data": line_data})
+            ma_lines.append({
+                "label": f"MA{period}",
+                "color": KEY_MA_COLORS.get(period, "#2962ff"),
+                "data": line_data,
+            })
 
     return {
         "ohlcv": ohlcv,

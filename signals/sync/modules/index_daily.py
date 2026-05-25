@@ -81,6 +81,54 @@ def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict], re
     return len(index_docs)
 
 
+def _merge_existing_older_index_docs(db: Database, symbol: str, freq: str, docs: list[dict]) -> list[dict]:
+    """Keep older cached index history when the current provider returns a shorter window."""
+    if not docs:
+        return []
+    first_dt = min(doc["dt"] for doc in docs if doc.get("dt") is not None)
+    cached: list[dict] = []
+    for collection in ("index_bars", "bars"):
+        try:
+            cached.extend(list(db[collection].find(
+                {"meta.symbol": symbol, "meta.freq": freq, "dt": {"$lt": first_dt}},
+                {"_id": 0},
+            )))
+        except Exception as exc:
+            logger.debug("读取旧指数缓存失败 %s %s: %s", collection, symbol, exc)
+
+    deduped: dict[object, dict] = {}
+    for doc in cached + docs:
+        dt = doc.get("dt")
+        if dt is None:
+            continue
+        item = dict(doc)
+        item.pop("_id", None)
+        item["meta"] = {**item.get("meta", {}), "symbol": symbol, "freq": freq, "asset_type": "index"}
+        deduped[dt] = item
+    return [deduped[dt] for dt in sorted(deduped)]
+
+
+def _fetch_a_index_daily_frame(symbol: str, start_date: str, end_date: str, proxy_url: str | None = None) -> tuple[pd.DataFrame, str]:
+    start_compact = pd.to_datetime(start_date).strftime("%Y%m%d")
+    end_compact = pd.to_datetime(end_date).strftime("%Y%m%d")
+    source_errors: list[str] = []
+    with em_proxy(proxy_url):
+        try:
+            df = ak.stock_zh_index_daily_em(symbol=symbol, start_date=start_compact, end_date=end_compact)
+            if df is not None and not df.empty:
+                return df, "akshare_em"
+        except Exception as exc:
+            source_errors.append(f"stock_zh_index_daily_em:{exc}")
+        try:
+            df = ak.stock_zh_index_daily(symbol=symbol)
+            if df is not None and not df.empty:
+                return df, "akshare_sina"
+        except Exception as exc:
+            source_errors.append(f"stock_zh_index_daily:{exc}")
+    logger.warning("  ✗ %s: 指数历史源失败 %s", symbol, "; ".join(source_errors)[:240])
+    return pd.DataFrame(), ""
+
+
 def _replace_exact_bar_docs(col, docs: list[dict]) -> int:
     """Replace exact bar measurements without UpdateOne; Mongo time-series rejects non-multi updates."""
     if not docs:
@@ -353,11 +401,11 @@ def _sync_a_index(db: Database, ak_codes: dict, start_date: str,
     """A 股 7 只指数日线"""
     sync_col = db["sync_log"]
     inserted = 0
+    end_date = naive_market_now("A").strftime("%Y-%m-%d")
 
     for name, symbol in ak_codes.items():
         try:
-            with em_proxy(proxy_url):
-                df = ak.stock_zh_index_daily(symbol=symbol)
+            df, source = _fetch_a_index_daily_frame(symbol, start_date, end_date, proxy_url)
             if df is None or df.empty:
                 logger.warning(f"  ✗ {name} ({symbol}): 无数据")
                 continue
@@ -374,16 +422,19 @@ def _sync_a_index(db: Database, ak_codes: dict, start_date: str,
             for _, row in df.iterrows():
                 docs.append({
                     "dt": row["date"],
-                        "meta": {"symbol": symbol, "freq": "日线", "asset_type": "index", "market": "A", "source": "akshare"},
+                    "meta": {"symbol": symbol, "freq": "日线", "asset_type": "index", "market": "A", "source": source or "akshare"},
                     "open": float(row["open"]),
                     "high": float(row["high"]),
                     "low": float(row["low"]),
                     "close": float(row["close"]),
                     "vol": int(row["volume"]) if pd.notna(row["volume"]) else 0,
-                    "amount": 0,
+                    "amount": float(row.get("amount", 0) or 0),
                 })
 
             if docs:
+                docs = _merge_existing_older_index_docs(db, symbol, "日线", docs)
+                history_days = (docs[-1]["dt"] - docs[0]["dt"]).days if len(docs) >= 2 else 0
+                history_short = docs[0]["dt"] > cutoff
                 written = _write_index_docs(db, symbol, "日线", docs)
                 inserted += written
 
@@ -396,6 +447,9 @@ def _sync_a_index(db: Database, ak_codes: dict, start_date: str,
                         "last_run": naive_market_now("A"),
                         "status": "ok",
                         "bar_count": written,
+                        "history_start": docs[0]["dt"],
+                        "history_days": history_days,
+                        "history_short": history_short,
                     }},
                     upsert=True,
                 )
@@ -430,7 +484,15 @@ def _sync_us_index(db: Database, us_codes: dict):
     for name, futu_code in us_codes.items():
         ticker = ticker_map.get(futu_code, futu_code.split(".")[-1])
         try:
-            data = yf.download(ticker, period="2y", progress=False)
+            now = naive_market_now("US")
+            data = yf.download(
+                ticker,
+                start=(now - timedelta(days=365 * 5)).strftime("%Y-%m-%d"),
+                end=(now + timedelta(days=1)).strftime("%Y-%m-%d"),
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+            )
             if data is None or data.empty:
                 continue
 
@@ -451,6 +513,10 @@ def _sync_us_index(db: Database, us_codes: dict):
                 })
 
             if docs:
+                cutoff = naive_market_now("US") - timedelta(days=365 * 5)
+                docs = _merge_existing_older_index_docs(db, futu_code, "日线", docs)
+                history_days = (docs[-1]["dt"] - docs[0]["dt"]).days if len(docs) >= 2 else 0
+                history_short = docs[0]["dt"].to_pydatetime() > cutoff if hasattr(docs[0]["dt"], "to_pydatetime") else docs[0]["dt"] > cutoff
                 written = _write_index_docs(db, futu_code, "日线", docs)
                 inserted += written
 
@@ -463,6 +529,9 @@ def _sync_us_index(db: Database, us_codes: dict):
                         "last_run": naive_market_now("US"),
                         "status": "ok",
                         "bar_count": written,
+                        "history_start": docs[0]["dt"],
+                        "history_days": history_days,
+                        "history_short": history_short,
                     }},
                     upsert=True,
                 )

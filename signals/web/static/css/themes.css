@@ -53,9 +53,11 @@
 
   /* MA 均线颜色 */
   --ma5-color:       #f7931a;
+  --ma8-color:       #c9573f;
   --ma10-color:      #6a9bcc;
+  --ma13-color:      #4f7ac8;
   --ma20-color:      #d97757;
-  --ma60-color:      #788c5d;
+  --ma21-color:      #788c5d;
   --support-color:   #788c5d;
   --resistance-color:#d97757;
   --conclusion-bg:   #2a2518;
@@ -132,9 +134,11 @@
 
   /* MA 均线颜色 */
   --ma5-color:       #f7931a;
+  --ma8-color:       #f23645;
   --ma10-color:      #2962ff;
+  --ma13-color:      #6a9bcc;
   --ma20-color:      #e040fb;
-  --ma60-color:      #26a69a;
+  --ma21-color:      #26a69a;
   --support-color:   #26a69a;
   --resistance-color:#f23645;
   --conclusion-bg:   #1a2535;
@@ -194,9 +198,11 @@
   --vol-up:          rgba(242, 54, 69, 0.5);
   --vol-down:        rgba(38, 166, 154, 0.5);
   --ma5-color:       #f7931a;
+  --ma8-color:       #f23645;
   --ma10-color:      #2962ff;
+  --ma13-color:      #6a9bcc;
   --ma20-color:      #e040fb;
-  --ma60-color:      #26a69a;
+  --ma21-color:      #26a69a;
   --support-color:   #26a69a;
   --resistance-color:#f23645;
   --conclusion-bg:   #1a2535;

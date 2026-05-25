@@ -155,12 +155,12 @@ BUY_FREQ_BONUS = {"30分钟": 120, "30min": 120, "30m": 120, "15分钟": 110, "1
 ENTRY_30M_FREQS = {"30分钟", "30min", "30m", "F30", "f30"}
 ENTRY_UPPER_FREQS = {"日线", "daily", "1d", "D", "d", "周线", "weekly", "1w", "W", "w"}
 DEFAULT_CANDIDATE_ANCHOR_FREQS = ENTRY_30M_FREQS | ENTRY_UPPER_FREQS
+KEY_MA_PERIODS = (5, 8, 10, 13, 20, 21)
 PRIMARY_MA_PERIODS = (5, 10, 20)
-FIBONACCI_MA_PERIODS = (8, 13, 21, 34, 55, 89)
 ENTRY_PARTNER_FREQS = ENTRY_UPPER_FREQS | RIGHT_SIDE_FREQS
 ENTRY_QUEUE_LANES = {"entry_ready", "entry_waiting_confirm", "entry_waiting_upper_context", "entry_waiting_right_side_confirm"}
 RISK_ACTION_STATUSES = {"risk_review", "chain_risk_review", "knowledge_blocked", "knowledge_conflict"}
-POOL_RANKING_VERSION = "tech_ma_hot_sector_v11_fib_ma_acceptance"
+POOL_RANKING_VERSION = "tech_ma_hot_sector_v12_key_ma_acceptance"
 SETUP_RANK_TIERS = {
     "right_executable": 300,
     "right_attack": 200,
@@ -2416,7 +2416,7 @@ def _ma_alignment_score_from_alignment(ma: dict[str, Any]) -> float:
 def _fib_ma_support_score_from_alignment(ma: dict[str, Any]) -> float:
     if not isinstance(ma, dict) or not ma:
         return 0.0
-    weights = {8: 2.0, 13: 2.5, 21: 3.5, 34: 4.0, 55: 5.0, 89: 6.0}
+    weights = {5: 1.6, 8: 2.0, 10: 2.2, 13: 2.5, 20: 2.8, 21: 3.5}
     score = 0.0
     array = ma.get("fib_ma_array")
     if isinstance(array, list):
@@ -2456,7 +2456,7 @@ def _ma_left_attack_confirmed(ma: dict[str, Any]) -> bool:
     )
     fib_key_support = any(
         _truthy_bool(ma.get(key))
-        for period in (21, 34, 55)
+        for period in (8, 13, 21)
         for key in (f"near_ma{period}", f"reclaim_ma{period}")
     )
     return primary_support or fib_key_support
@@ -3445,8 +3445,8 @@ def _rank_reason(score_components: dict[str, float]) -> str:
         "breakout_momentum": "新高动量",
         "relative_resilience": "拒绝回调",
         "ma_alignment": "均线确认",
-        "fib_ma_acceptance": "斐波那切均线承接",
-        "fib_ma_support": "斐波那切均线承接",
+        "fib_ma_acceptance": "关键均线承接",
+        "fib_ma_support": "关键均线承接",
         "upper_timeframe_quality": "周/日线",
         "trigger_30m": "30m触发",
         "right_side_confirmation": "5m/15m确认",
@@ -4453,63 +4453,42 @@ def _slim_ma_alignment_for_pool(value: Any) -> dict[str, Any]:
         "ma13",
         "ma20",
         "ma21",
-        "ma34",
-        "ma55",
-        "ma89",
         "previous_ma5",
         "previous_ma8",
         "previous_ma10",
         "previous_ma13",
         "previous_ma20",
         "previous_ma21",
-        "previous_ma34",
-        "previous_ma55",
-        "previous_ma89",
         "above_ma5",
         "above_ma8",
         "above_ma10",
         "above_ma13",
         "above_ma20",
         "above_ma21",
-        "above_ma34",
-        "above_ma55",
-        "above_ma89",
         "near_ma5",
         "near_ma8",
         "near_ma10",
         "near_ma13",
         "near_ma20",
         "near_ma21",
-        "near_ma34",
-        "near_ma55",
-        "near_ma89",
         "reclaim_ma5",
         "reclaim_ma8",
         "reclaim_ma10",
         "reclaim_ma13",
         "reclaim_ma20",
         "reclaim_ma21",
-        "reclaim_ma34",
-        "reclaim_ma55",
-        "reclaim_ma89",
         "distance_ma5_pct",
         "distance_ma8_pct",
         "distance_ma10_pct",
         "distance_ma13_pct",
         "distance_ma20_pct",
         "distance_ma21_pct",
-        "distance_ma34_pct",
-        "distance_ma55_pct",
-        "distance_ma89_pct",
         "low_distance_ma5_pct",
         "low_distance_ma8_pct",
         "low_distance_ma10_pct",
         "low_distance_ma13_pct",
         "low_distance_ma20_pct",
         "low_distance_ma21_pct",
-        "low_distance_ma34_pct",
-        "low_distance_ma55_pct",
-        "low_distance_ma89_pct",
         "ma_stack",
         "ma20_direction",
         "above_count",
@@ -4549,7 +4528,7 @@ def _slim_ma_alignment_for_pool(value: Any) -> dict[str, Any]:
         }
         if slim:
             fib_items.append(slim)
-        if len(fib_items) >= 8:
+        if len(fib_items) >= len(KEY_MA_PERIODS):
             break
     if fib_items:
         out["fib_ma_array"] = fib_items
@@ -5175,7 +5154,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "ranking_version": POOL_RANKING_VERSION,
         "source": "whitebox_pool_builder",
         "source_policy": "postmarket_strict_with_fallback_watch" if strict_sources and fallback_enabled else ("postmarket_strict_technical_knowledge_chain" if strict_sources else "runtime_watch_and_signal_blend"),
-        "selection_policy": "strict_fresh_30m_daily_weekly_anchor__multi_indicator_resonance__fib_ma_array_acceptance__clue_source_only",
+        "selection_policy": "strict_fresh_30m_daily_weekly_anchor__multi_indicator_resonance__key_ma_array_acceptance__clue_source_only",
     }
     db["terminal_stock_pool"].update_one(
         {"pool": "terminal_stock_pool", "market": "A"},

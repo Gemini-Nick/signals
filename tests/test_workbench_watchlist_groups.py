@@ -103,6 +103,76 @@ def test_macro_etf_wrong_prefix_is_canonicalized_for_workbench():
     assert workbench._stock_name("SZ.562590") == "半导体设备ETF"
 
 
+def test_index_weekly_ma_state_flags_close_below_ma5(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_market_today", lambda market="A": date(2026, 5, 24))
+    df = pd.DataFrame(
+        {
+            "open": [4100.0, 4120.0, 4140.0, 4160.0, 4120.0],
+            "high": [4120.0, 4140.0, 4165.0, 4180.0, 4170.0],
+            "low": [4080.0, 4100.0, 4120.0, 4140.0, 4107.0],
+            "close": [4100.0, 4120.0, 4140.0, 4160.0, 4112.9],
+            "vol": [1000] * 5,
+            "amount": [10000] * 5,
+        },
+        index=pd.to_datetime(["2026-04-24", "2026-05-01", "2026-05-08", "2026-05-15", "2026-05-22"]),
+    )
+    chart = workbench._chart_from_df(df, symbol="sh000001", freq="weekly", source="index_bars")
+
+    signal = workbench._current_timeframe_ma_signal(chart, "weekly")
+
+    assert signal["type"] == "未站稳5周线"
+    assert signal["signal_side"] == "sell"
+    assert signal["ma_state"]["summary"] == "上周五收盘价没站稳5周线"
+    assert signal["ma_state"]["distance_pct"] < 0
+
+
+def test_macro_index_row_surfaces_weekly_ma_risk_in_signal_column(monkeypatch):
+    from signals.web.api import workbench
+
+    daily = pd.DataFrame(
+        {
+            "open": [4100.0, 4120.0, 4140.0, 4160.0, 4120.0],
+            "high": [4120.0, 4140.0, 4165.0, 4180.0, 4170.0],
+            "low": [4080.0, 4100.0, 4120.0, 4140.0, 4107.0],
+            "close": [4100.0, 4120.0, 4140.0, 4160.0, 4112.9],
+            "vol": [1000] * 5,
+            "amount": [10000] * 5,
+        },
+        index=pd.to_datetime(["2026-05-18", "2026-05-19", "2026-05-20", "2026-05-21", "2026-05-22"]),
+    )
+    weekly = pd.DataFrame(
+        {
+            "open": [4100.0, 4120.0, 4140.0, 4160.0, 4120.0],
+            "high": [4120.0, 4140.0, 4165.0, 4180.0, 4170.0],
+            "low": [4080.0, 4100.0, 4120.0, 4140.0, 4107.0],
+            "close": [4100.0, 4120.0, 4140.0, 4160.0, 4112.9],
+            "vol": [1000] * 5,
+            "amount": [10000] * 5,
+        },
+        index=pd.to_datetime(["2026-04-24", "2026-05-01", "2026-05-08", "2026-05-15", "2026-05-22"]),
+    )
+
+    def fake_index_df(symbol, freq):
+        return (weekly, "index_bars") if freq == "weekly" else (daily, "index_bars")
+
+    monkeypatch.setattr(workbench, "_index_df", fake_index_df)
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: "2026-05-22")
+    monkeypatch.setattr(workbench, "_market_today", lambda market="A": date(2026, 5, 24))
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {"quote_status": "missing", "quote_status_label": "无行情"})
+    monkeypatch.setattr(workbench, "MINGDAO_MACRO_WATCHLIST", [
+        {"name": "上证指数", "symbol": "sh000001", "kind": "index", "macro_group": "major_indices"},
+    ])
+
+    rows = workbench._build_macro_index_rows(reports=[], range_columns=[])
+
+    assert rows[0]["latest_signal"] == "未站稳5周线"
+    assert rows[0]["current_timeframe_ma"]["summary"] == "上周五收盘价没站稳5周线"
+    assert rows[0]["signal_detail"] == "上周五收盘价没站稳5周线"
+
+
 def test_watchlist_range_columns_include_all_key_presets():
     from signals.web.api import workbench
 

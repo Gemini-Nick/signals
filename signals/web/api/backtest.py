@@ -47,7 +47,7 @@ def _fetch_kline_legacy(code: str, market: str, freq: str) -> pd.DataFrame:
     import akshare as ak
     from signals.data.fetcher import _no_proxy
 
-    days = 730 if freq == "daily" else 1460
+    days = 365 * 5
     now = market_now(market, symbol=_build_symbol(code, market))
     sdt = (now - timedelta(days=days)).strftime("%Y%m%d")
     edt = now.strftime("%Y%m%d")
@@ -139,14 +139,11 @@ def _compute_macd_data(df: pd.DataFrame, *, market: str = "", symbol: str = "") 
 
 def _compute_ma_lines(df: pd.DataFrame, *, market: str = "", symbol: str = "") -> list:
     """计算 MA 均线，返回 [{label, color, data: [{time, value}]}]"""
+    from signals.core.ma_levels import KEY_MA_COLORS, KEY_MA_PERIODS
+
     closes = df["close"]
     ma_lines = []
-    for period, label, color in [
-        (20, "MA20", "#e040fb"),
-        (60, "MA60", "#26a69a"),
-        (120, "MA120", "#ff6d00"),
-        (250, "MA250", "#78909c"),
-    ]:
+    for period in KEY_MA_PERIODS:
         if len(closes) < period:
             continue
         ma_vals = closes.rolling(period).mean()
@@ -156,7 +153,7 @@ def _compute_ma_lines(df: pd.DataFrame, *, market: str = "", symbol: str = "") -
                 "time": _dt_to_unix(dt_idx, market=market, symbol=symbol),
                 "value": round(float(val), 4),
             })
-        ma_lines.append({"label": label, "color": color, "data": line_data})
+        ma_lines.append({"label": f"MA{period}", "color": KEY_MA_COLORS.get(period, "#2962ff"), "data": line_data})
     return ma_lines
 
 
