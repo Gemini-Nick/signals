@@ -2,8 +2,16 @@
 from __future__ import annotations
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from signals.notify.trading_workbench_summary import build_summary, window_gate
+from signals.notify.trading_workbench_summary import (
+    build_summary,
+    window_gate,
+    _breakpoint_watch_lines,
+    _board_heat_event_lines_from_docs,
+    _limit_contexts_to_window,
+    _market_event_lines,
+)
 
 
 def _dashboard():
@@ -112,6 +120,195 @@ def test_trading_workbench_summary_dont_notify_when_no_actionable_rows():
     assert result.notify is False
     assert result.status == "DONT_NOTIFY"
     assert "结论：只观察，不打断" in result.text
+
+
+def test_trading_workbench_summary_keeps_market_event_lines():
+    result = build_summary(
+        _dashboard(),
+        _shell(),
+        _snapshot(),
+        window="close",
+        event_lines=["上证14:10低点4068.80杀破4070，按恐慌测试处理"],
+    )
+
+    assert "关键盘面事件：" in result.text
+    assert "杀破4070" in result.text
+
+
+def test_market_event_lines_trigger_notify_without_stock_candidates():
+    shell = _shell()
+    shell["decision_queue"] = []
+    shell["watchlist_groups"]["focus_stocks"] = []
+
+    result = build_summary(
+        _dashboard(),
+        shell,
+        _snapshot(),
+        window="ten",
+        event_lines=["创业板10:30首次按点位超过上证，成长强于权重"],
+    )
+
+    assert result.notify is True
+    assert result.status == "NOTIFY"
+    assert result.reason == "market_event_lines"
+
+
+def test_market_event_lines_detects_index_anomalies():
+    def ts(hour: int, minute: int) -> int:
+        return int(datetime(2026, 5, 27, hour, minute, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+
+    def payload(label: str, rows: list[dict]) -> dict:
+        return {
+            "target": {"label": label, "market_timezone": "Asia/Shanghai"},
+            "chart": {"ohlcv": rows},
+        }
+
+    contexts = {
+        "上证指数": payload(
+            "上证指数",
+            [
+                {"time": ts(9, 35), "low": 4101.0, "close": 4102.0},
+                {"time": ts(10, 30), "low": 4075.0, "close": 4080.0},
+                {"time": ts(14, 10), "low": 4068.8, "close": 4072.0},
+            ],
+        ),
+        "创业板指": payload(
+            "创业板指",
+            [
+                {"time": ts(9, 35), "low": 4098.0, "close": 4099.0},
+                {"time": ts(10, 30), "low": 4082.0, "close": 4083.0},
+                {"time": ts(14, 10), "low": 4062.0, "close": 4070.0},
+            ],
+        ),
+    }
+    contexts["上证指数"]["summary"] = {
+        "key_levels": [{"name": "20周线", "value": 4069.21}]
+    }
+
+    lines = _market_event_lines(contexts)
+
+    assert any("杀破4070" in line for line in lines)
+    assert any("创业板10:30" in line and "首次按点位超过上证" in line for line in lines)
+    assert any("未维持" in line for line in lines)
+
+
+def test_breakpoint_watch_lines_frame_ten_oclock_confirmation():
+    def ts(hour: int, minute: int) -> int:
+        return int(datetime(2026, 5, 27, hour, minute, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+
+    contexts = {
+        "上证指数": {
+            "target": {"label": "上证指数", "market_timezone": "Asia/Shanghai"},
+            "summary": {"key_levels": [{"name": "20周线", "value": 4069.21}]},
+            "chart": {
+                "ohlcv": [
+                    {"time": ts(9, 35), "low": 4072.0, "close": 4080.0},
+                    {"time": ts(9, 45), "low": 4071.0, "close": 4082.0},
+                ]
+            },
+        },
+        "创业板指": {
+            "target": {"label": "创业板指", "market_timezone": "Asia/Shanghai"},
+            "chart": {
+                "ohlcv": [
+                    {"time": ts(9, 35), "low": 4075.0, "close": 4078.0},
+                    {"time": ts(9, 45), "low": 4088.0, "close": 4090.0},
+                ]
+            },
+        },
+    }
+
+    lines = _breakpoint_watch_lines(contexts, "ten")
+
+    assert any("9:45变盘前" in line and "10:00前" in line for line in lines)
+    assert any("创业板4090.00 vs 上证4082.00" in line for line in lines)
+
+
+def test_ten_window_does_not_look_past_945_when_replayed_later():
+    def ts(hour: int, minute: int) -> int:
+        return int(datetime(2026, 5, 27, hour, minute, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+
+    def payload(rows: list[dict]) -> dict:
+        return {
+            "target": {"market_timezone": "Asia/Shanghai"},
+            "chart": {"ohlcv": rows},
+        }
+
+    contexts = {
+        "上证指数": payload(
+            [
+                {"time": ts(9, 45), "low": 4080.0, "close": 4081.0},
+                {"time": ts(10, 30), "low": 4077.0, "close": 4130.0},
+            ]
+        ),
+        "创业板指": payload(
+            [
+                {"time": ts(9, 45), "low": 4078.0, "close": 4079.0},
+                {"time": ts(10, 30), "low": 4131.0, "close": 4136.0},
+            ]
+        ),
+    }
+
+    limited = _limit_contexts_to_window(contexts, "ten")
+    lines = _market_event_lines(limited)
+
+    assert not any("10:30" in line for line in lines)
+
+
+def test_breakpoint_watch_lines_frame_two_oclock_confirmation():
+    def ts(hour: int, minute: int) -> int:
+        return int(datetime(2026, 5, 27, hour, minute, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+
+    contexts = {
+        "上证指数": {
+            "target": {"label": "上证指数", "market_timezone": "Asia/Shanghai"},
+            "summary": {"key_levels": [{"name": "20周线", "value": 4069.21}]},
+            "chart": {
+                "ohlcv": [
+                    {"time": ts(11, 25), "low": 4080.0, "close": 4085.0},
+                    {"time": ts(13, 45), "low": 4068.0, "close": 4071.0},
+                ]
+            },
+        },
+        "创业板指": {
+            "target": {"label": "创业板指", "market_timezone": "Asia/Shanghai"},
+            "chart": {
+                "ohlcv": [
+                    {"time": ts(11, 25), "low": 4070.0, "close": 4074.0},
+                    {"time": ts(13, 45), "low": 4074.0, "close": 4078.0},
+                ]
+            },
+        },
+    }
+
+    lines = _breakpoint_watch_lines(contexts, "two")
+
+    assert any("13:45变盘前" in line and "14:00后" in line for line in lines)
+    assert any("已破4070" in line for line in lines)
+
+
+def test_board_heat_event_lines_detects_generic_afternoon_reversal():
+    def t(hour: int, minute: int) -> datetime:
+        return datetime(2026, 5, 27, hour, minute)
+
+    latest_docs = [
+        {"kind": "industry", "name": "白酒Ⅱ", "change_pct": 2.96, "leader_name": "水井坊"},
+        {"kind": "industry", "name": "超市", "change_pct": 4.47, "leader_name": "步步高"},
+    ]
+    morning_docs = [
+        {"kind": "industry", "name": "白酒Ⅱ", "change_pct": -0.31},
+        {"kind": "industry", "name": "超市", "change_pct": 3.31},
+    ]
+    pm_docs = [
+        {"kind": "industry", "name": "白酒Ⅱ", "change_pct": 5.2, "trade_minute": t(13, 45), "leader_name": "水井坊"},
+        {"kind": "industry", "name": "白酒Ⅲ", "change_pct": 5.2, "trade_minute": t(13, 45), "leader_name": "水井坊"},
+        {"kind": "industry", "name": "超市", "change_pct": 5.53, "trade_minute": t(13, 51), "leader_name": "步步高"},
+    ]
+
+    lines = _board_heat_event_lines_from_docs(latest_docs, morning_docs, pm_docs)
+
+    assert lines[0].startswith("白酒午后异动")
+    assert len([line for line in lines if line.startswith("白酒")]) == 1
 
 
 def test_window_gate_blocks_weekend_intraday_summary():
