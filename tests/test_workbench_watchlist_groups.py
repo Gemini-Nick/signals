@@ -93,6 +93,8 @@ def test_hk_symbol_aliases_normalize_for_manual_clues(monkeypatch):
     assert workbench._normalize_stock_symbol("0522.hk") == ("HK.00522", "00522")
     assert workbench._normalize_stock_symbol("HK:522") == ("HK.00522", "00522")
     assert workbench._normalize_stock_symbol("asmpt") == ("HK.00522", "00522")
+    assert workbench._normalize_stock_symbol("宁德时代h") == ("HK.03750", "03750")
+    assert workbench._stock_name("HK.03750") == "宁德时代 H"
     assert workbench._looks_like_stock("0522.hk")
 
 

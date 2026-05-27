@@ -7,6 +7,17 @@ _DEFAULT_STOCK_ALIASES = {
         "name": "ASMPT",
         "aliases": ("ASMPT", "ASMPT Limited", "ASM Pacific Technology"),
     },
+    "HK.03750": {
+        "name": "宁德时代 H",
+        "aliases": (
+            "宁德时代H",
+            "宁德时代 H",
+            "宁德时代港股",
+            "寧德時代",
+            "CATL H",
+            "CATL-H",
+        ),
+    },
 }
 
 
