@@ -18,7 +18,7 @@ import akshare as ak
 import pandas as pd
 from pymongo.database import Database
 
-from signals.core.macro_universe import macro_a_index_pure_codes, macro_industry_etf_pure_codes
+from signals.core.macro_universe import macro_a_index_pure_codes, macro_a_index_symbols, macro_industry_etf_pure_codes
 from signals.core.market_time import naive_market_now, to_market_naive
 from ..proxy import em_proxy
 from ..retry import sync_retry
@@ -147,6 +147,26 @@ def _tail_count_for_freq(freq: str) -> int:
 
 def _index_codes() -> set[str]:
     return macro_a_index_pure_codes()
+
+
+def _explicit_index_symbol(symbol: object, index_codes: set[str] | None = None) -> bool:
+    raw = str(symbol or "").strip()
+    if not raw:
+        return False
+    upper = raw.upper()
+    code = _pure_a_code(raw)
+    if not code and upper.endswith((".SH", ".SZ")) and len(upper) >= 9:
+        suffix_code = upper[:6]
+        code = suffix_code if suffix_code.isdigit() else ""
+    if not code or code not in (index_codes or _index_codes()):
+        return False
+    compact = upper.replace(".", "")
+    normalized = ""
+    if compact.startswith(("SH", "SZ")) and len(compact) >= 8:
+        normalized = compact[:8].lower()
+    elif upper.endswith((".SH", ".SZ")) and len(upper) >= 9:
+        normalized = f"{upper[-2:]}{upper[:6]}".lower()
+    return normalized in set(macro_a_index_symbols())
 
 
 def _pure_a_code(symbol: object) -> str:
@@ -278,7 +298,7 @@ def _add_candidate(
     symbol_sources: dict[str, set[str]] | None = None,
 ) -> str:
     code = _pure_a_code(value)
-    if not code or code in index_codes:
+    if not code or _explicit_index_symbol(value, index_codes):
         return ""
     if priority:
         priority_symbols.add(code)
@@ -795,7 +815,7 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
         symbols: list[str] = []
         for symbol in only_codes.replace(";", ",").split(","):
             code = _pure_a_code(symbol)
-            if code and code not in index_codes and code not in symbols:
+            if code and not _explicit_index_symbol(symbol, index_codes) and code not in symbols:
                 symbols.append(code)
         return symbols, {
             "priority_symbols": symbols,

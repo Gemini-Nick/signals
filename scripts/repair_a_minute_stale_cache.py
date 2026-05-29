@@ -20,7 +20,7 @@ from typing import Any
 
 from pymongo import MongoClient
 
-from signals.sync.modules.stock_minute import _index_codes, _insert_new_minute_docs, _pure_a_code, _sync_one_minute
+from signals.sync.modules.stock_minute import _insert_new_minute_docs, _pure_a_code, _sync_one_minute
 
 
 MONGO_URL = "mongodb://127.0.0.1:27017/signals"
@@ -57,10 +57,9 @@ def _parse_freqs(raw: str) -> list[str]:
 def _parse_symbols(raw: str) -> list[str]:
     symbols: list[str] = []
     seen: set[str] = set()
-    index_codes = _index_codes()
     for item in str(raw or "").replace(";", ",").split(","):
         code = _pure_a_code(item)
-        if code and code not in index_codes and code not in seen:
+        if code and code not in seen:
             seen.add(code)
             symbols.append(code)
     return symbols
@@ -108,14 +107,13 @@ def _stale_tasks(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     tasks: list[dict[str, Any]] = []
     expected_by_freq: dict[str, datetime] = {}
-    index_codes = _index_codes()
-    symbol_filter = {"$in": symbols} if symbols else {"$exists": True}
+    symbol_filter = {"$in": symbols} if symbols else {"$regex": r"^\d{6}$"}
 
     daily_symbols: set[str] = set()
     if include_missing:
-        for symbol in db["bars"].distinct("meta.symbol", {"meta.market": "A", "meta.freq": "日线"}):
+        for symbol in db["bars"].distinct("meta.symbol", {"meta.market": "A", "meta.freq": "日线", "meta.symbol": {"$regex": r"^\d{6}$"}}):
             code = _pure_a_code(symbol)
-            if code and code not in index_codes and not _excluded(code, exclude_prefixes) and (not symbols or code in symbols):
+            if code and not _excluded(code, exclude_prefixes) and (not symbols or code in symbols):
                 daily_symbols.add(code)
 
     for freq in freqs:
@@ -130,7 +128,7 @@ def _stale_tasks(
         ]
         for row in db["bars"].aggregate(pipeline, allowDiskUse=True):
             code = _pure_a_code(row.get("_id"))
-            if not code or code in index_codes or _excluded(code, exclude_prefixes):
+            if not code or _excluded(code, exclude_prefixes):
                 continue
             seen.add(code)
             latest_dt = row.get("latest_dt")

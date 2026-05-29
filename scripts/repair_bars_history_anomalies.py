@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from bson import ObjectId
-from pymongo import DeleteOne, MongoClient, ReplaceOne
+from pymongo import DeleteMany, DeleteOne, InsertOne, MongoClient, ReplaceOne
 
 
 MONGO_URL = "mongodb://127.0.0.1:27017/signals"
@@ -141,22 +141,38 @@ def _same_values(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return all(left.get(key) == right.get(key) for key in keys)
 
 
-def _flush_repairs(bars, backup, backup_ops: list[ReplaceOne], delete_ops: list[DeleteOne]) -> tuple[int, int]:
+def _is_timeseries(db, collection: str) -> bool:
+    try:
+        info = next(db.list_collections(filter={"name": collection}), {})
+    except Exception:
+        return False
+    return info.get("type") == "timeseries"
+
+
+def _flush_repairs(
+    bars,
+    backup,
+    backup_ops: list[ReplaceOne],
+    bar_ops: list[DeleteOne | DeleteMany | InsertOne],
+) -> tuple[int, int, int]:
     if not backup_ops:
-        return 0, 0
+        return 0, 0, 0
     backup_result = backup.bulk_write(backup_ops, ordered=False)
-    delete_result = bars.bulk_write(delete_ops, ordered=False)
+    bar_result = bars.bulk_write(bar_ops, ordered=True) if bar_ops else None
     backed = backup_result.upserted_count + backup_result.modified_count + backup_result.matched_count
-    return int(backed), int(delete_result.deleted_count)
+    deleted = int(getattr(bar_result, "deleted_count", 0) or 0) if bar_result else 0
+    inserted = int(getattr(bar_result, "inserted_count", 0) or 0) if bar_result else 0
+    return int(backed), deleted, inserted
 
 
 def _process_block(
     *,
     block: list[dict[str, Any]],
     apply: bool,
+    timeseries_replace: bool,
     backup,
     backup_ops: list[ReplaceOne],
-    delete_ops: list[DeleteOne],
+    bar_ops: list[DeleteOne | DeleteMany | InsertOne],
     backup_collection: str,
     repair_started_at: datetime,
     max_extra_docs: int,
@@ -204,7 +220,8 @@ def _process_block(
         if not apply:
             continue
 
-        for doc in delete_docs:
+        backup_docs = docs if timeseries_replace else delete_docs
+        for doc in backup_docs:
             backup_doc = dict(doc)
             backup_doc["repair"] = {
                 "type": "bars_duplicate_dedupe",
@@ -218,14 +235,32 @@ def _process_block(
                 "deleted_at": repair_started_at,
             }
             backup_ops.append(ReplaceOne({"_id": doc["_id"]}, backup_doc, upsert=True))
-            delete_ops.append(DeleteOne({"_id": doc["_id"]}))
+        if timeseries_replace:
+            keep_doc = {field: value for field, value in keep.items() if field != "_id"}
+            bar_ops.extend(
+                [
+                    DeleteMany(
+                        {
+                            "meta.market": key["market"],
+                            "meta.symbol": key["symbol"],
+                            "meta.freq": key["freq"],
+                            "dt": key["dt"],
+                        }
+                    ),
+                    InsertOne(keep_doc),
+                ]
+            )
+        else:
+            for doc in delete_docs:
+                bar_ops.append(DeleteOne({"_id": doc["_id"]}))
 
-        if len(delete_ops) >= int(state["batch_size"]):
-            backed, deleted = _flush_repairs(backup.database["bars"], backup, backup_ops, delete_ops)
+        if len(bar_ops) >= int(state["batch_size"]):
+            backed, deleted, inserted = _flush_repairs(backup.database["bars"], backup, backup_ops, bar_ops)
             state["backed_up"] += backed
             state["deleted"] += deleted
+            state["inserted"] += inserted
             backup_ops.clear()
-            delete_ops.clear()
+            bar_ops.clear()
 
 
 def run_dedupe(args: argparse.Namespace) -> dict[str, Any]:
@@ -234,6 +269,7 @@ def run_dedupe(args: argparse.Namespace) -> dict[str, Any]:
     bars = db["bars"]
     backup_collection = args.backup_collection or f"{DEFAULT_BACKUP_PREFIX}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     backup = db[backup_collection]
+    timeseries_replace = _is_timeseries(db, "bars")
     if args.apply:
         backup.create_index([("repair.deleted_at", 1)])
         backup.create_index(
@@ -281,9 +317,10 @@ def run_dedupe(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": args.write_batch_size,
         "backed_up": 0,
         "deleted": 0,
+        "inserted": 0,
     }
     backup_ops: list[ReplaceOne] = []
-    delete_ops: list[DeleteOne] = []
+    bar_ops: list[DeleteOne | DeleteMany | InsertOne] = []
     scanned = 0
     blocks = 0
     current_base: tuple[str, str, Any] | None = None
@@ -311,9 +348,10 @@ def run_dedupe(args: argparse.Namespace) -> dict[str, Any]:
             _process_block(
                 block=block,
                 apply=args.apply,
+                timeseries_replace=timeseries_replace,
                 backup=backup,
                 backup_ops=backup_ops,
-                delete_ops=delete_ops,
+                bar_ops=bar_ops,
                 backup_collection=backup_collection,
                 repair_started_at=started_at,
                 max_extra_docs=args.max_extra_docs,
@@ -342,25 +380,28 @@ def run_dedupe(args: argparse.Namespace) -> dict[str, Any]:
     if not (args.max_extra_docs > 0 and int(state["extra_docs"]) >= args.max_extra_docs):
         blocks += 1
         _process_block(
-            block=block,
-            apply=args.apply,
-            backup=backup,
-            backup_ops=backup_ops,
-            delete_ops=delete_ops,
-            backup_collection=backup_collection,
-            repair_started_at=started_at,
+        block=block,
+        apply=args.apply,
+        timeseries_replace=timeseries_replace,
+        backup=backup,
+        backup_ops=backup_ops,
+        bar_ops=bar_ops,
+        backup_collection=backup_collection,
+        repair_started_at=started_at,
             max_extra_docs=args.max_extra_docs,
             state=state,
-        )
+    )
     if args.apply:
-        backed, deleted = _flush_repairs(bars, backup, backup_ops, delete_ops)
+        backed, deleted, inserted = _flush_repairs(bars, backup, backup_ops, bar_ops)
         state["backed_up"] += backed
         state["deleted"] += deleted
+        state["inserted"] += inserted
 
     summary = {
         "mode": "dedupe",
         "apply": args.apply,
         "query": query,
+        "timeseries_replace": timeseries_replace,
         "scanned": scanned,
         "blocks": blocks,
         "duplicate_groups": state["duplicate_groups"],
@@ -368,6 +409,7 @@ def run_dedupe(args: argparse.Namespace) -> dict[str, Any]:
         "identical_value_extra_docs": state["identical_value_extra_docs"],
         "backed_up": state["backed_up"],
         "deleted": state["deleted"],
+        "inserted": state["inserted"],
         "backup_collection": backup_collection if args.apply else None,
         "distribution": [
             {"market": key[0], "freq": key[1], "sources": list(key[2]), "extra_docs": value}

@@ -141,6 +141,20 @@ def test_shanghai_composite_is_treated_as_index_not_stock():
     assert "000001" in stock_minute._index_codes()
     assert "000680" in stock_minute._index_codes()
     assert "513130" not in stock_minute._index_codes()
+    assert stock_minute._explicit_index_symbol("sh000680", stock_minute._index_codes())
+    assert stock_minute._explicit_index_symbol("SH.000680", stock_minute._index_codes())
+    assert stock_minute._explicit_index_symbol("000680.SH", stock_minute._index_codes())
+    assert not stock_minute._explicit_index_symbol("000680", stock_minute._index_codes())
+    assert not stock_minute._explicit_index_symbol("SZ.000680", stock_minute._index_codes())
+
+
+def test_only_codes_keeps_stock_code_that_overlaps_index(monkeypatch):
+    monkeypatch.setenv("STOCK_MINUTE_ONLY_CODES", "000680,sh000680,SZ.000001,sh000001")
+
+    selected, meta = stock_minute._get_active_symbols_with_meta(_Db())
+
+    assert selected == ["000680", "000001"]
+    assert meta["source_counts"] == {"only_codes": 2}
 
 
 def test_stock_minute_worker_count_is_constrained(monkeypatch):
