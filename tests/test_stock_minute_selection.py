@@ -41,6 +41,66 @@ class _ProjectingCollection(_Collection):
         return {key: value for key, value in self.doc.items() if projection.get(key)}
 
 
+class _WriteResult:
+    def __init__(self, *, inserted_ids=None, deleted_count=0):
+        self.inserted_ids = inserted_ids or []
+        self.deleted_count = deleted_count
+
+
+class _MinuteBarsCollection:
+    def __init__(self, docs):
+        self.docs = [dict(doc) for doc in docs]
+        self.next_id = 1
+
+    @staticmethod
+    def _matches(doc, query):
+        meta = doc.get("meta") or {}
+        if query.get("meta.symbol") is not None and meta.get("symbol") != query.get("meta.symbol"):
+            return False
+        if query.get("meta.freq") is not None and meta.get("freq") != query.get("meta.freq"):
+            return False
+        dt_filter = query.get("dt")
+        if isinstance(dt_filter, dict) and "$in" in dt_filter and doc.get("dt") not in dt_filter["$in"]:
+            return False
+        return True
+
+    @staticmethod
+    def _project(doc, projection):
+        if not projection:
+            return dict(doc)
+        projected = {"_id": doc.get("_id")}
+        for key, include in projection.items():
+            if include and key in doc:
+                projected[key] = doc[key]
+        return projected
+
+    def find_one(self, query, projection=None, sort=None):
+        matches = [doc for doc in self.docs if self._matches(doc, query)]
+        if sort:
+            for key, direction in reversed(sort):
+                matches.sort(key=lambda doc: doc.get(key), reverse=direction < 0)
+        return self._project(matches[0], projection) if matches else None
+
+    def find(self, query, projection=None):
+        return _Cursor([self._project(doc, projection) for doc in self.docs if self._matches(doc, query)])
+
+    def delete_many(self, query):
+        ids = set(query.get("_id", {}).get("$in", []))
+        before = len(self.docs)
+        self.docs = [doc for doc in self.docs if doc.get("_id") not in ids]
+        return _WriteResult(deleted_count=before - len(self.docs))
+
+    def insert_many(self, docs, ordered=False):
+        inserted_ids = []
+        for doc in docs:
+            new_doc = dict(doc)
+            new_doc.setdefault("_id", f"new-{self.next_id}")
+            self.next_id += 1
+            inserted_ids.append(new_doc["_id"])
+            self.docs.append(new_doc)
+        return _WriteResult(inserted_ids=inserted_ids)
+
+
 class _Db(dict):
     def __missing__(self, key):
         self[key] = _Collection()
@@ -114,6 +174,80 @@ def test_stock_minute_tail_count_defaults_and_overrides(monkeypatch):
     monkeypatch.setenv("STOCK_MINUTE_TAIL_COUNT_30", "90")
     assert stock_minute._tail_count_for_freq("5分钟") == 80
     assert stock_minute._tail_count_for_freq("30分钟") == 90
+
+
+def test_stock_minute_provider_order_reads_env(monkeypatch):
+    monkeypatch.delenv("STOCK_MINUTE_PROVIDERS", raising=False)
+    assert stock_minute._minute_providers() == ("sina", "tencent")
+
+    monkeypatch.setenv("STOCK_MINUTE_PROVIDERS", "tencent,sina,unknown,tencent")
+    assert stock_minute._minute_providers() == ("tencent", "sina")
+
+
+def test_insert_new_minute_docs_refreshes_changed_tail_bar(monkeypatch):
+    monkeypatch.delenv("STOCK_MINUTE_REFRESH_EXISTING_BARS", raising=False)
+    dt = datetime(2026, 5, 29, 15, 0)
+    existing = {
+        "_id": "old-1",
+        "dt": dt,
+        "meta": {"symbol": "300750", "freq": "30分钟", "source": "sina", "market": "A"},
+        "open": 423.0,
+        "high": 424.0,
+        "low": 422.0,
+        "close": 423.53,
+        "vol": 594700,
+        "amount": 100,
+    }
+    candidate = {
+        "dt": dt,
+        "meta": {"symbol": "300750", "freq": "30分钟", "source": "sina", "market": "A"},
+        "open": 423.0,
+        "high": 424.2,
+        "low": 422.0,
+        "close": 424.0,
+        "vol": 7750361,
+        "amount": 200,
+    }
+    bars = _MinuteBarsCollection([existing])
+
+    result = stock_minute._insert_new_minute_docs(bars, "300750", "30分钟", [candidate])
+
+    assert result["inserted"] == 0
+    assert result["deleted"] == 1
+    assert result["refreshed"] == 1
+    assert result["written"] == 1
+    assert result["skipped_existing"] == 0
+    assert len(bars.docs) == 1
+    assert bars.docs[0]["_id"] != "old-1"
+    assert bars.docs[0]["close"] == 424.0
+    assert bars.docs[0]["vol"] == 7750361
+
+
+def test_insert_new_minute_docs_skips_unchanged_existing_tail_bar(monkeypatch):
+    monkeypatch.delenv("STOCK_MINUTE_REFRESH_EXISTING_BARS", raising=False)
+    dt = datetime(2026, 5, 29, 15, 0)
+    existing = {
+        "_id": "old-1",
+        "dt": dt,
+        "meta": {"symbol": "300750", "freq": "5分钟", "source": "tencent", "market": "A"},
+        "open": 424.0,
+        "high": 424.0,
+        "low": 424.0,
+        "close": 424.0,
+        "vol": 24022,
+        "amount": 0,
+    }
+    candidate = {key: value for key, value in existing.items() if key != "_id"}
+    bars = _MinuteBarsCollection([existing])
+
+    result = stock_minute._insert_new_minute_docs(bars, "300750", "5分钟", [candidate])
+
+    assert result["inserted"] == 0
+    assert result["deleted"] == 0
+    assert result["refreshed"] == 0
+    assert result["written"] == 0
+    assert result["skipped_existing"] == 1
+    assert bars.docs == [existing]
 
 
 def test_stock_minute_strict_public_errors_reraises(monkeypatch):

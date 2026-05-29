@@ -28,6 +28,7 @@ MIN_DAILY_HISTORY_DAYS = 365 * 5
 DAILY_FREQ = "日线"
 _PROGRESS_META_ID = "hk_stock_daily:progress:_meta"
 _HKEX_SECURITIES_XLSX_URL = "https://www.hkex.com.hk/eng/services/trading/securities/securitieslists/ListOfSecurities.xlsx"
+_TENCENT_FQKLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 _SINA_DAILY_LOCK = threading.Lock()
 
 
@@ -349,7 +350,7 @@ def _hk_history_sources() -> list[str]:
     if single:
         raw = single
     if not raw or str(raw).strip().lower() == "auto":
-        raw = "hist,daily"
+        raw = "daily,tencent,hist"
     sources: list[str] = []
     seen: set[str] = set()
     aliases = {
@@ -358,13 +359,15 @@ def _hk_history_sources() -> list[str]:
         "eastmoney": "hist",
         "em": "hist",
         "stock_hk_hist": "hist",
+        "qq": "tencent",
+        "tencent_hk": "tencent",
     }
     for item in str(raw).split(","):
         source = aliases.get(item.strip().lower(), item.strip().lower())
-        if source in {"daily", "hist"} and source not in seen:
+        if source in {"daily", "tencent", "hist"} and source not in seen:
             sources.append(source)
             seen.add(source)
-    return sources or ["daily", "hist"]
+    return sources or ["daily", "tencent", "hist"]
 
 
 def _get_all_hk_codes(db: Database | None = None) -> list[str]:
@@ -389,6 +392,68 @@ def _get_all_hk_codes(db: Database | None = None) -> list[str]:
                 logger.warning("使用 Mongo cached HK universe: %d 只", len(cached))
                 return cached
     raise RuntimeError("hk_universe_empty")
+
+
+def _parse_only_hk_codes(raw: str) -> list[str]:
+    codes: list[str] = []
+    seen: set[str] = set()
+    for item in str(raw or "").replace(";", ",").split(","):
+        code = _pure_hk_code(item)
+        if code and code not in seen:
+            seen.add(code)
+            codes.append(code)
+    return codes
+
+
+def _fetch_tencent_hk_daily_df(code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    website_symbol = f"hk{_pure_hk_code(code)}"
+    count = _env_int("HK_STOCK_DAILY_TENCENT_COUNT", 900, minimum=30, maximum=2000)
+    timeout = _env_float("HK_STOCK_DAILY_TENCENT_TIMEOUT", 10.0, minimum=1.0)
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        response = session.get(
+            _TENCENT_FQKLINE_URL,
+            params={"param": f"{website_symbol},day,,,{count},qfq"},
+            headers={
+                "User-Agent": "Mozilla/5.0 Signals HK stock daily sync",
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": "https://gu.qq.com/",
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    finally:
+        session.close()
+
+    rows = (
+        payload.get("data", {}).get(website_symbol, {}).get("qfqday")
+        or payload.get("data", {}).get(website_symbol, {}).get("day")
+        or []
+    )
+    parsed: list[dict[str, Any]] = []
+    start_dt = datetime.strptime(start_date[:8], "%Y%m%d")
+    end_dt = datetime.strptime(end_date[:8], "%Y%m%d")
+    for row in rows:
+        if len(row) < 6:
+            continue
+        dt = pd.to_datetime(row[0], errors="coerce")
+        if pd.isna(dt):
+            continue
+        py_dt = dt.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0)
+        if py_dt < start_dt or py_dt > end_dt:
+            continue
+        parsed.append({
+            "日期": py_dt,
+            "开盘": float(row[1]),
+            "收盘": float(row[2]),
+            "最高": float(row[3]),
+            "最低": float(row[4]),
+            "成交量": float(row[5]),
+            "成交额": 0,
+        })
+    return pd.DataFrame(parsed)
 
 
 def _fetch_one_hk_daily(code: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
@@ -427,6 +492,14 @@ def _fetch_one_hk_daily(code: str, start_date: str, end_date: str) -> list[dict[
                     return filter_start(docs)
             except Exception as exc:
                 source_errors.append(f"stock_hk_daily: {exc}")
+        elif source == "tencent":
+            try:
+                df = _fetch_tencent_hk_daily_df(code, start_date, end_date)
+                docs = _docs_from_hk_daily_df(code, df, "website_tencent_hk", end_date=end_date)
+                if docs:
+                    return filter_start(docs)
+            except Exception as exc:
+                source_errors.append(f"tencent_hk_daily: {exc}")
     if source_errors:
         raise RuntimeError("; ".join(source_errors))
     return []
@@ -445,7 +518,7 @@ def _write_daily_docs_batch(bars_col, sync_col, docs_by_code: dict[str, list[dic
     all_docs = [doc for docs in docs_by_code.values() for doc in docs]
     symbols = [_hk_symbol(code) for code in docs_by_code]
     dts = [doc["dt"] for doc in all_docs]
-    existing_keys: set[tuple[str, datetime]] = set()
+    existing_by_key: dict[tuple[str, datetime], dict[str, Any]] = {}
     try:
         for item in bars_col.find(
             {
@@ -453,20 +526,57 @@ def _write_daily_docs_batch(bars_col, sync_col, docs_by_code: dict[str, list[dic
                 "meta.freq": DAILY_FREQ,
                 "dt": {"$in": dts},
             },
-            {"dt": 1, "meta.symbol": 1},
+            {"dt": 1, "meta": 1, "open": 1, "high": 1, "low": 1, "close": 1, "vol": 1, "amount": 1},
         ):
             symbol = str((item.get("meta") or {}).get("symbol") or "")
             dt = item.get("dt")
             if symbol and isinstance(dt, datetime):
-                existing_keys.add((symbol, dt))
+                existing_by_key[(symbol, dt)] = item
     except Exception as exc:
         logger.debug("批量查询已有 HK 日线失败，继续尝试写入: %s", exc)
 
-    new_docs = [
-        doc for doc in all_docs
-        if (str((doc.get("meta") or {}).get("symbol") or ""), doc.get("dt")) not in existing_keys
-    ]
+    def changed(existing: dict[str, Any], candidate: dict[str, Any]) -> bool:
+        for field in ("open", "high", "low", "close", "vol"):
+            if existing.get(field) != candidate.get(field):
+                return True
+        candidate_amount = candidate.get("amount")
+        if candidate_amount not in (None, 0) and existing.get("amount") != candidate_amount:
+            return True
+        return False
+
+    new_docs: list[dict[str, Any]] = []
+    refresh_docs: list[dict[str, Any]] = []
+    refresh_ids: list[Any] = []
+    for doc in all_docs:
+        key = (str((doc.get("meta") or {}).get("symbol") or ""), doc.get("dt"))
+        existing = existing_by_key.get(key)
+        if existing is None:
+            new_docs.append(doc)
+        elif changed(existing, doc):
+            refresh_doc = dict(doc)
+            if not refresh_doc.get("amount") and existing.get("amount"):
+                refresh_doc["amount"] = existing.get("amount")
+            refresh_docs.append(refresh_doc)
+            refresh_ids.append(existing["_id"])
+
     written_by_code = {code: 0 for code in docs_by_code}
+    refreshed_count = 0
+    if refresh_docs:
+        deleted_docs: list[dict[str, Any]] = []
+        for old_id, refresh_doc in zip(refresh_ids, refresh_docs):
+            delete_result = bars_col.delete_many({"_id": {"$in": [old_id]}})
+            deleted_count = int(getattr(delete_result, "deleted_count", 0) or 0)
+            if deleted_count == 1:
+                deleted_docs.append(refresh_doc)
+            elif deleted_count:
+                logger.warning("HK 日线刷新删除数量异常 id=%s deleted=%d", old_id, deleted_count)
+        if deleted_docs:
+            result = bars_col.insert_many(deleted_docs, ordered=False)
+            refreshed_count = len(getattr(result, "inserted_ids", []) or [])
+            for doc in deleted_docs[:refreshed_count]:
+                raw_code = _pure_hk_code((doc.get("meta") or {}).get("raw_code") or (doc.get("meta") or {}).get("symbol"))
+                if raw_code in written_by_code:
+                    written_by_code[raw_code] += 1
     if new_docs:
         result = bars_col.insert_many(new_docs, ordered=False)
         inserted_count = len(getattr(result, "inserted_ids", []) or [])
@@ -474,6 +584,8 @@ def _write_daily_docs_batch(bars_col, sync_col, docs_by_code: dict[str, list[dic
             raw_code = _pure_hk_code((doc.get("meta") or {}).get("raw_code") or (doc.get("meta") or {}).get("symbol"))
             if raw_code in written_by_code:
                 written_by_code[raw_code] += 1
+    if refreshed_count:
+        logger.info("HK 日线刷新已存在 bar: %d", refreshed_count)
     now = naive_market_now("HK")
     for code, docs in docs_by_code.items():
         latest = max(doc["dt"] for doc in docs)
@@ -552,7 +664,8 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
     sync_col = db["sync_log"]
     now = naive_market_now("HK")
     end_date = _hk_daily_end_date_key(now)
-    all_codes = _get_all_hk_codes(db)
+    only_codes = _parse_only_hk_codes(get_task_env("HK_STOCK_DAILY_ONLY_CODES", os.getenv("HK_STOCK_DAILY_ONLY_CODES", "")))
+    all_codes = only_codes if only_codes else _get_all_hk_codes(db)
     max_codes = _env_int("HK_STOCK_DAILY_MAX_CODES", 0)
     if max_codes > 0:
         all_codes = all_codes[:max_codes]
@@ -587,6 +700,7 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
     call_interval = _env_float("HK_STOCK_DAILY_CALL_INTERVAL", 0.12, minimum=0.0)
     write_batch_symbols = _env_int("HK_STOCK_DAILY_WRITE_BATCH_SYMBOLS", 40, minimum=1)
     lookback_days = _env_int("HK_STOCK_DAILY_LOOKBACK_DAYS", MIN_DAILY_HISTORY_DAYS, minimum=30)
+    refresh_lookback_days = _env_int("HK_STOCK_DAILY_REFRESH_LOOKBACK_DAYS", 5, minimum=0, maximum=30)
     history_cutoff = (now - timedelta(days=max(lookback_days, MIN_DAILY_HISTORY_DAYS))).replace(
         hour=0, minute=0, second=0, microsecond=0)
     bars_earliest = _earliest_daily_dates_by_symbol(db, hk_symbols)
@@ -629,6 +743,8 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
         short_history = code in short_history_codes
         if last_dt:
             inc_start = (last_dt + timedelta(days=1)).strftime("%Y%m%d")
+            if refresh_lookback_days:
+                inc_start = min(inc_start, (last_dt - timedelta(days=refresh_lookback_days)).strftime("%Y%m%d"))
             if inc_start > end_date:
                 if not short_history:
                     return code, [], "skip"

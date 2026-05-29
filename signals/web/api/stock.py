@@ -5,6 +5,56 @@ from fastapi import APIRouter, HTTPException
 router = APIRouter(prefix="/api/stock", tags=["stock"])
 
 
+def _normalize_stock_symbol(symbol: str) -> str:
+    clean = str(symbol or "").strip()
+    if not clean:
+        return ""
+    upper = clean.upper()
+    if "." in upper:
+        market, code = upper.split(".", 1)
+        if market in {"SZ", "SH", "HK", "BJ", "US"} and code:
+            return f"{market}.{code}"
+    if clean.isdigit() and len(clean) == 6:
+        if clean.startswith("6"):
+            return f"SH.{clean}"
+        if clean.startswith(("0", "3")):
+            return f"SZ.{clean}"
+        if clean.startswith(("8", "4")):
+            return f"BJ.{clean}"
+    return upper
+
+
+@router.get("/resolve/{symbol}")
+def resolve_stock_name(symbol: str):
+    """轻量解析股票代码/名称，不触发 K 线或 CZSC 分析。"""
+    try:
+        from signals.core.stock_names import get_resolver
+        resolver = get_resolver()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"名称解析器不可用: {e}")
+
+    query = str(symbol or "").strip()
+    normalized = _normalize_stock_symbol(query)
+    resolved_symbol = normalized
+    if not resolved_symbol or (not query.isdigit() and "." not in query and not normalized.startswith(("SZ.", "SH.", "BJ.", "HK.", "US."))):
+        resolved_symbol = resolver.get_code(query) or normalized
+
+    name = resolver.get_name(resolved_symbol) if resolved_symbol else ""
+    industry = resolver.get_industry(resolved_symbol) if resolved_symbol else ""
+    code = resolved_symbol.split(".")[-1] if resolved_symbol else query
+    return {
+        "query": query,
+        "symbol": resolved_symbol,
+        "code": code,
+        "name": name if name and name != code else "",
+        "industry": industry,
+        "matches": [
+            {"symbol": code_item, "code": code_item.split(".")[-1], "name": name_item}
+            for code_item, name_item in resolver.search(query)[:8]
+        ],
+    }
+
+
 def _serialize_tf(tf) -> dict:
     """TimeframeAnalysis → JSON"""
     return {

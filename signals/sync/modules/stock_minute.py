@@ -81,6 +81,18 @@ def _env_value(name: str, default: str = "") -> str:
     return str(get_task_env(name, os.getenv(name, default)) or default)
 
 
+def _minute_providers() -> tuple[str, ...]:
+    raw = _env_value("STOCK_MINUTE_PROVIDERS", "")
+    if not raw.strip():
+        return ("sina", "tencent")
+    providers = []
+    for item in raw.replace(";", ",").split(","):
+        provider = item.strip().lower()
+        if provider in {"sina", "tencent"} and provider not in providers:
+            providers.append(provider)
+    return tuple(providers or ["sina", "tencent"])
+
+
 def _call_interval() -> float:
     return _float_env("STOCK_MINUTE_CALL_INTERVAL", 0.5, min_value=0.0, max_value=10.0)
 
@@ -998,6 +1010,7 @@ def _sync_one_minute(code: str, freq: str, proxy_url: str = None, *, tail_count:
         df, source = fetch_public_minute(
             stock_to_market_symbol(code),
             period,
+            providers=_minute_providers(),
             timeout=_public_timeout(),
             datalen=tail_count,
             count=tail_count,
@@ -1036,9 +1049,32 @@ def _sync_one_minute(code: str, freq: str, proxy_url: str = None, *, tail_count:
     return recalculate_minute_change_pct(db, code, docs, asset_type="stock")
 
 
+def _minute_doc_changed(existing: dict, candidate: dict) -> bool:
+    for key in ("open", "high", "low", "close", "vol", "amount"):
+        if existing.get(key) != candidate.get(key):
+            return True
+    existing_meta = existing.get("meta") or {}
+    candidate_meta = candidate.get("meta") or {}
+    return existing_meta.get("source") != candidate_meta.get("source")
+
+
+def _minute_write_mode() -> str:
+    if _bool_env("STOCK_MINUTE_REFRESH_EXISTING_BARS", True):
+        return "insert_new+refresh_existing"
+    return "insert_new"
+
+
 def _insert_new_minute_docs(bars_col, code: str, freq: str, docs: list[dict]) -> dict:
     if not docs:
-        return {"written": 0, "bar_count": 0, "last_dt": None}
+        return {
+            "written": 0,
+            "inserted": 0,
+            "refreshed": 0,
+            "deleted": 0,
+            "skipped_existing": 0,
+            "bar_count": 0,
+            "last_dt": None,
+        }
 
     latest_before = bars_col.find_one(
         {"meta.symbol": code, "meta.freq": freq},
@@ -1046,15 +1082,60 @@ def _insert_new_minute_docs(bars_col, code: str, freq: str, docs: list[dict]) ->
         sort=[("dt", -1)],
     )
     latest_dt = latest_before.get("dt") if latest_before else None
-    new_docs = [doc for doc in docs if latest_dt is None or doc["dt"] > latest_dt]
-    written = 0
+    deduped_by_dt = {doc["dt"]: dict(doc) for doc in docs}
+    dts = list(deduped_by_dt)
+    existing_by_dt = {}
+    existing_lookup_failed = False
+    try:
+        for item in bars_col.find(
+            {"meta.symbol": code, "meta.freq": freq, "dt": {"$in": dts}},
+            {"dt": 1, "meta": 1, "open": 1, "high": 1, "low": 1, "close": 1, "vol": 1, "amount": 1},
+        ):
+            existing_by_dt[item.get("dt")] = item
+    except Exception as exc:
+        existing_lookup_failed = True
+        logger.debug("查询已有分钟线失败，退回 insert_new 模式 %s %s: %s", code, freq, exc)
+
+    new_docs = []
+    refresh_docs = []
+    refresh_ids = []
+    for dt, doc in deduped_by_dt.items():
+        if existing_lookup_failed:
+            if latest_dt is None or dt > latest_dt:
+                new_docs.append(doc)
+            continue
+        existing = existing_by_dt.get(dt)
+        if existing is None:
+            new_docs.append(doc)
+        elif _minute_doc_changed(existing, doc):
+            refresh_docs.append(doc)
+            refresh_ids.append(existing["_id"])
+
+    inserted = 0
+    refreshed = 0
+    deleted = 0
+    if refresh_docs and _bool_env("STOCK_MINUTE_REFRESH_EXISTING_BARS", True):
+        deleted_docs = []
+        for old_id, refresh_doc in zip(refresh_ids, refresh_docs):
+            delete_result = bars_col.delete_many({"_id": {"$in": [old_id]}})
+            deleted_count = int(getattr(delete_result, "deleted_count", 0) or 0)
+            if deleted_count == 1:
+                deleted += 1
+                deleted_docs.append(refresh_doc)
+            elif deleted_count:
+                logger.warning("分钟线刷新删除数量异常 %s %s id=%s deleted=%d", code, freq, old_id, deleted_count)
+        if deleted_docs:
+            refreshed = len(bars_col.insert_many(deleted_docs, ordered=False).inserted_ids)
     if new_docs:
         result = bars_col.insert_many(new_docs, ordered=False)
-        written = len(result.inserted_ids)
+        inserted = len(result.inserted_ids)
+    written = inserted + refreshed
     return {
         "written": written,
-        "inserted": written,
-        "skipped_existing": len(docs) - len(new_docs),
+        "inserted": inserted,
+        "refreshed": refreshed,
+        "deleted": deleted,
+        "skipped_existing": max(0, len(deduped_by_dt) - inserted - refreshed),
         "bar_count": len(docs),
         "last_dt": docs[-1]["dt"],
         "latest_before": latest_dt,
@@ -1082,6 +1163,9 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
     minute_freqs = _active_minute_freqs()
     tail_counts = {freq: _tail_count_for_freq(freq) for freq in minute_freqs}
     total_written = 0
+    total_inserted = 0
+    total_refreshed = 0
+    total_deleted = 0
     total_skipped_existing = 0
     total_skipped_current_calls = 0
     empty = 0
@@ -1122,14 +1206,14 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
                 "tail_counts": tail_counts,
                 "minute_freqs": minute_freqs,
                 "incremental": True,
-                "write_mode": "insert_new",
+                "write_mode": _minute_write_mode(),
             },
             "degraded_reason": "",
             "error_msg": "",
             "workers": workers,
             "tail_counts": tail_counts,
             "incremental": True,
-            "write_mode": "insert_new",
+            "write_mode": _minute_write_mode(),
             "lane": os.getenv("SIGNALS_CURRENT_SYNC_LANE", ""),
             "market": os.getenv("SIGNALS_CURRENT_SYNC_MARKET", ""),
         }},
@@ -1150,7 +1234,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
                     "last_run": naive_market_now("A"),
                     "status": "empty",
                     "incremental": True,
-                    "write_mode": "insert_new",
+                    "write_mode": _minute_write_mode(),
                     "tail_count": tail_counts[freq],
                     "elapsed": round(time.monotonic() - started, 3),
                 }},
@@ -1171,9 +1255,11 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
                 "bar_count": write_result["bar_count"],
                 "written": write_result["written"],
                 "inserted": write_result["inserted"],
+                "refreshed": write_result["refreshed"],
+                "deleted": write_result["deleted"],
                 "skipped_existing": write_result["skipped_existing"],
                 "incremental": True,
-                "write_mode": "insert_new",
+                "write_mode": _minute_write_mode(),
                 "tail_count": tail_counts[freq],
                 "latest_before": write_result.get("latest_before"),
                 "source": docs[-1].get("meta", {}).get("source"),
@@ -1194,6 +1280,9 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
                 if result.get("status") == "empty":
                     empty += 1
                 total_written += int(result.get("written") or 0)
+                total_inserted += int(result.get("inserted") or 0)
+                total_refreshed += int(result.get("refreshed") or 0)
+                total_deleted += int(result.get("deleted") or 0)
                 total_skipped_existing += int(result.get("skipped_existing") or 0)
             except Exception as e:
                 per_symbol[code]["freq_status"][freq] = "error"
@@ -1209,7 +1298,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
                         "status": "error",
                         "error": str(e)[:300],
                         "incremental": True,
-                        "write_mode": "insert_new",
+                        "write_mode": _minute_write_mode(),
                         "tail_count": tail_counts.get(freq),
                     }},
                     upsert=True,
@@ -1246,13 +1335,16 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
             "minute_freqs": minute_freqs,
             "opening_phase": _opening_phase(),
             "incremental": True,
-            "write_mode": "insert_new",
+            "write_mode": _minute_write_mode(),
             "planned_calls": len(planned_tasks),
             "requested_calls": len(tasks),
             "skipped_current_calls": total_skipped_current_calls,
             "empty_calls": empty,
             "failed_calls": len(errors),
             "written": total_written,
+            "inserted": total_inserted,
+            "refreshed": total_refreshed,
+            "deleted": total_deleted,
             "skipped_existing": total_skipped_existing,
             "error_msg": "" if not errors else f"{len(errors)} minute fetch errors",
             "degraded_reason": "" if not errors else f"{len(errors)} minute fetch errors",
@@ -1267,7 +1359,9 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
             "status": final_status,
             "last_run": naive_market_now("A"),
             "result": {
-                "inserted": total_written,
+                "inserted": total_inserted,
+                "refreshed": total_refreshed,
+                "deleted": total_deleted,
                 "written": total_written,
                 "skipped_existing": total_skipped_existing,
                 "skipped_current_calls": total_skipped_current_calls,
@@ -1282,7 +1376,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
                 "planned_calls": len(planned_tasks),
                 "requested_calls": len(tasks),
                 "incremental": True,
-                "write_mode": "insert_new",
+                "write_mode": _minute_write_mode(),
             },
             "error_msg": "" if not errors else f"{len(errors)} minute fetch errors",
             "degraded_reason": "" if not errors else f"{len(errors)} minute fetch errors",
@@ -1292,6 +1386,9 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
             "planned_calls": len(planned_tasks),
             "requested_calls": len(tasks),
             "written": total_written,
+            "inserted": total_inserted,
+            "refreshed": total_refreshed,
+            "deleted": total_deleted,
             "skipped_existing": total_skipped_existing,
             "skipped_current_calls": total_skipped_current_calls,
             "failed_calls": len(errors),
@@ -1303,11 +1400,13 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
     )
 
     logger.info(
-        "分钟线完成: %d/%d calls, inserted=%d skipped_existing=%d skipped_current=%d empty=%d failed=%d, %d cap跳过",
-        len(tasks), len(planned_tasks), total_written, total_skipped_existing, total_skipped_current_calls, empty, len(errors), len(skipped_symbols),
+        "分钟线完成: %d/%d calls, inserted=%d refreshed=%d skipped_existing=%d skipped_current=%d empty=%d failed=%d, %d cap跳过",
+        len(tasks), len(planned_tasks), total_inserted, total_refreshed, total_skipped_existing, total_skipped_current_calls, empty, len(errors), len(skipped_symbols),
     )
     return {
-        "inserted": total_written,
+        "inserted": total_inserted,
+        "refreshed": total_refreshed,
+        "deleted": total_deleted,
         "written": total_written,
         "skipped_existing": total_skipped_existing,
         "skipped_current_calls": total_skipped_current_calls,
@@ -1331,5 +1430,5 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
         "planned_calls": len(planned_tasks),
         "requested_calls": len(tasks),
         "incremental": True,
-        "write_mode": "insert_new",
+        "write_mode": _minute_write_mode(),
     }
