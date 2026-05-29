@@ -353,6 +353,418 @@ def _match_payload(doc: dict[str, Any]) -> dict[str, Any]:
         "total": len(_constituent_symbols(doc)),
     }
 
+
+def _clamp_limit(value: int, default: int = 8, maximum: int = 24) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(1, min(number, maximum))
+
+
+def _norm_token(value: Any) -> str:
+    return _text(value).lower()
+
+
+def _text_matches_query(query: str, values: list[Any]) -> bool:
+    needle = _norm_token(query)
+    if not needle:
+        return True
+    return any(needle in _norm_token(value) for value in values if _text(value))
+
+
+def _symbol_payload(symbol: Any, *, name: Any = "", group: str = "", role: Any = "", source: str = "") -> dict[str, Any]:
+    raw_symbol = _text(symbol)
+    code = _code_from_symbol(raw_symbol)
+    if not code:
+        return {}
+    return {
+        "symbol": _futu_symbol(raw_symbol, code),
+        "code": code,
+        "name": _text(name) or code,
+        "group": group,
+        "role": _text(role),
+        "source": source,
+    }
+
+
+def _symbol_payload_from_rep(rep: dict[str, Any], *, group: str, source: str) -> dict[str, Any]:
+    return _symbol_payload(
+        rep.get("symbol") or rep.get("futu_symbol") or rep.get("code"),
+        name=rep.get("name"),
+        group=group,
+        role=rep.get("relation") or rep.get("chain_role") or rep.get("representative_type"),
+        source=source,
+    )
+
+
+def _dedupe_symbol_payloads(items: list[dict[str, Any]], limit: int = 24) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        code = _code_from_symbol(item.get("code") or item.get("symbol"))
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        output.append({**item, "code": code})
+        if len(output) >= limit:
+            break
+    return output
+
+
+def _basket_payload(
+    *,
+    basket_id: str,
+    label: str,
+    source: str,
+    domain: str,
+    symbols: list[dict[str, Any]],
+    description: str = "",
+    chain_id: str = "",
+    node_id: str = "",
+    confidence: Any = None,
+) -> dict[str, Any] | None:
+    codes = _dedupe_symbol_payloads([item for item in symbols if item], limit=24)
+    if not codes:
+        return None
+    return {
+        "id": basket_id,
+        "label": label,
+        "source": source,
+        "domain": domain,
+        "description": description,
+        "chain_id": chain_id,
+        "node_id": node_id,
+        "confidence": confidence,
+        "codes": codes,
+    }
+
+
+def _graph_doc_matches(doc: dict[str, Any], query: str) -> bool:
+    if not query:
+        return True
+    values: list[Any] = [
+        doc.get("chain_id"),
+        doc.get("chain_name"),
+        doc.get("node_id"),
+        doc.get("node_name"),
+        doc.get("layer"),
+        doc.get("stage"),
+        *(doc.get("concepts") or []),
+    ]
+    for domain in doc.get("domains") or []:
+        if isinstance(domain, dict):
+            values.extend([domain.get("name"), domain.get("kind")])
+    return _text_matches_query(query, values)
+
+
+def _relationship_graph_baskets(query: str, limit: int) -> list[dict[str, Any]]:
+    try:
+        from signals.sync.db import get_db
+
+        db = get_db()
+        if "concept_relationship_graph" not in db.list_collection_names():
+            return []
+        projection = {
+            "_id": 0,
+            "chain_id": 1,
+            "chain_name": 1,
+            "node_id": 1,
+            "node_name": 1,
+            "layer": 1,
+            "stage": 1,
+            "phase": 1,
+            "heat_score": 1,
+            "change_pct": 1,
+            "confidence": 1,
+            "concepts": 1,
+            "domains": 1,
+            "representative_groups": 1,
+            "updated_at": 1,
+            "trade_minute": 1,
+        }
+        cursor = db["concept_relationship_graph"].find({"market": "A"}, projection).sort([
+            ("trade_minute", -1),
+            ("heat_score", -1),
+            ("updated_at", -1),
+        ]).limit(limit * 5)
+        output: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for doc in cursor:
+            if not _graph_doc_matches(doc, query):
+                continue
+            key = f"{_text(doc.get('chain_id'))}:{_text(doc.get('node_id'))}"
+            if key in seen:
+                continue
+            seen.add(key)
+            chain_name = _text(doc.get("chain_name"))
+            node_name = _text(doc.get("node_name"))
+            label = node_name if node_name and node_name != chain_name else chain_name
+            group = " · ".join([item for item in [chain_name, node_name] if item])
+            groups = doc.get("representative_groups") if isinstance(doc.get("representative_groups"), dict) else {}
+            reps: list[dict[str, Any]] = []
+            for group_key in ("leaders", "elastic", "source_leaders", "constituents"):
+                rows = groups.get(group_key) if isinstance(groups.get(group_key), list) else []
+                for row in rows:
+                    if isinstance(row, dict):
+                        reps.append(_symbol_payload_from_rep(row, group=group or label, source="concept_relationship_graph"))
+            basket = _basket_payload(
+                basket_id=f"graph:{key}",
+                label=label,
+                source="自建产业链图谱",
+                domain="chain_graph",
+                symbols=reps,
+                description="盘后物化图谱：链主、弹性和成分候选",
+                chain_id=_text(doc.get("chain_id")),
+                node_id=_text(doc.get("node_id")),
+                confidence=doc.get("confidence"),
+            )
+            if basket:
+                output.append(basket)
+            if len(output) >= limit:
+                break
+        return output
+    except Exception as exc:
+        logger.warning("动态产业链图谱篮子加载失败: %s", exc)
+        return []
+
+
+def _chain_heat_doc_matches(doc: dict[str, Any], query: str) -> bool:
+    if not query:
+        return True
+    values: list[Any] = [
+        doc.get("chain_id"),
+        doc.get("chain_name"),
+        doc.get("node_id"),
+        doc.get("node_name"),
+        doc.get("phase"),
+    ]
+    for domain in doc.get("integrated_domains") or []:
+        if isinstance(domain, dict):
+            values.extend([domain.get("name"), domain.get("kind")])
+    return _text_matches_query(query, values)
+
+
+def _chain_heat_baskets(query: str, limit: int) -> list[dict[str, Any]]:
+    try:
+        from signals.sync.db import get_db
+
+        db = get_db()
+        if "chain_heat_snapshots" not in db.list_collection_names():
+            return []
+        latest = db["chain_heat_snapshots"].find_one(
+            {"market": "A"},
+            {"trade_minute": 1},
+            sort=[("trade_minute", -1)],
+        )
+        if not latest or latest.get("trade_minute") is None:
+            return []
+        cursor = db["chain_heat_snapshots"].find(
+            {"market": "A", "trade_minute": latest["trade_minute"]},
+            {"_id": 0},
+        ).sort([("rank", 1), ("heat_score", -1)]).limit(limit * 5)
+        output: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for doc in cursor:
+            if not _chain_heat_doc_matches(doc, query):
+                continue
+            key = f"{_text(doc.get('chain_id'))}:{_text(doc.get('node_id'))}"
+            if key in seen:
+                continue
+            seen.add(key)
+            chain_name = _text(doc.get("chain_name"))
+            node_name = _text(doc.get("node_name"))
+            label = node_name if node_name and node_name != chain_name else chain_name
+            group = " · ".join([item for item in [chain_name, node_name] if item])
+            reps = [
+                _symbol_payload_from_rep(row, group=group or label, source="chain_heat_snapshots")
+                for row in (doc.get("representatives") or [])
+                if isinstance(row, dict)
+            ]
+            basket = _basket_payload(
+                basket_id=f"chain_heat:{key}",
+                label=label,
+                source="产业链热度",
+                domain="chain_heat",
+                symbols=reps,
+                description="chain_heat_snapshots：按最新链热排序",
+                chain_id=_text(doc.get("chain_id")),
+                node_id=_text(doc.get("node_id")),
+                confidence=doc.get("mapping_confidence"),
+            )
+            if basket:
+                output.append(basket)
+            if len(output) >= limit:
+                break
+        return output
+    except Exception as exc:
+        logger.warning("链热篮子加载失败: %s", exc)
+        return []
+
+
+def _node_representatives(node: dict[str, Any], *, group: str, source: str) -> list[dict[str, Any]]:
+    reps: list[dict[str, Any]] = []
+    for key in ("core_representatives", "elastic_representatives", "upstream_representatives", "downstream_representatives"):
+        for row in node.get(key) or []:
+            if isinstance(row, dict):
+                reps.append(_symbol_payload_from_rep(row, group=group, source=source))
+    return reps
+
+
+def _industry_chain_baskets(query: str, limit: int) -> list[dict[str, Any]]:
+    try:
+        from signals.core.concept_carriers import load_industry_chains, match_industry_chains
+
+        output: list[dict[str, Any]] = []
+        if query:
+            matches = match_industry_chains(query)
+            for match in matches:
+                chain_name = _text(match.get("chain_name"))
+                node_name = _text(match.get("node_name"))
+                label = node_name if node_name and node_name != chain_name else chain_name
+                group = " · ".join([item for item in [chain_name, node_name] if item])
+                reps = [
+                    _symbol_payload_from_rep(row, group=group or label, source="industry_chains.yaml")
+                    for row in (match.get("representatives") or [])
+                    if isinstance(row, dict)
+                ]
+                basket = _basket_payload(
+                    basket_id=f"industry_chain:{_text(match.get('chain_id'))}:{_text(match.get('node_id'))}",
+                    label=label,
+                    source="自建产业链图谱",
+                    domain="industry_chain_yaml",
+                    symbols=reps,
+                    description="industry_chains.yaml：人工维护链条代表标的",
+                    chain_id=_text(match.get("chain_id")),
+                    node_id=_text(match.get("node_id")),
+                    confidence=match.get("confidence"),
+                )
+                if basket:
+                    output.append(basket)
+                if len(output) >= limit:
+                    break
+            return output
+
+        chains = load_industry_chains()
+        for chain in chains.values():
+            nodes_by_id = chain.get("nodes_by_id") if isinstance(chain.get("nodes_by_id"), dict) else {}
+            default_id = _text(chain.get("default_node_id"))
+            node = nodes_by_id.get(default_id) if default_id else None
+            if node is None:
+                nodes = chain.get("nodes") or []
+                node = nodes[0] if nodes else None
+            if not isinstance(node, dict):
+                continue
+            chain_name = _text(chain.get("name"))
+            node_name = _text(node.get("name"))
+            label = node_name if node_name and node_name != chain_name else chain_name
+            group = " · ".join([item for item in [chain_name, node_name] if item])
+            basket = _basket_payload(
+                basket_id=f"industry_chain:{_text(chain.get('chain_id'))}:{_text(node.get('node_id'))}",
+                label=label,
+                source="自建产业链图谱",
+                domain="industry_chain_yaml",
+                symbols=_node_representatives(node, group=group or label, source="industry_chains.yaml"),
+                description="industry_chains.yaml：默认链条代表标的",
+                chain_id=_text(chain.get("chain_id")),
+                node_id=_text(node.get("node_id")),
+            )
+            if basket:
+                output.append(basket)
+            if len(output) >= limit:
+                break
+        return output
+    except Exception as exc:
+        logger.warning("自建产业链 YAML 篮子加载失败: %s", exc)
+        return []
+
+
+def _board_constituent_baskets(query: str, limit: int) -> list[dict[str, Any]]:
+    if not query:
+        return []
+    output: list[dict[str, Any]] = []
+    for doc in _board_doc_matches(query, limit=limit):
+        name = _board_doc_name(doc)
+        symbols = []
+        stock_names = _constituent_names(doc)
+        for symbol in _constituent_symbols(doc):
+            code = _code_from_symbol(symbol)
+            symbols.append(_symbol_payload(
+                symbol,
+                name=stock_names.get(symbol) or stock_names.get(symbol.upper()) or stock_names.get(code),
+                group=name,
+                role=_text(doc.get("_match_kind")) or "board",
+                source=_text(doc.get("_match_collection")),
+            ))
+        basket_label = f"{name}成分股"
+        basket = _basket_payload(
+            basket_id=f"constituents:{_text(doc.get('_match_collection'))}:{name}",
+            label=basket_label,
+            source=_text(doc.get("source")) or _text(doc.get("_match_collection")) or "板块成分股缓存",
+            domain=_text(doc.get("_match_kind")) or "board",
+            symbols=symbols,
+            description="东财/同花顺等板块成分股缓存兜底",
+        )
+        if basket:
+            output.append(basket)
+        if len(output) >= limit:
+            break
+    return output
+
+
+def _dedupe_baskets(baskets: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_labels: set[str] = set()
+    for basket in baskets:
+        basket_id = _text(basket.get("id"))
+        label_key = _text(basket.get("label")).lower()
+        if not basket_id or basket_id in seen_ids or label_key in seen_labels:
+            continue
+        seen_ids.add(basket_id)
+        seen_labels.add(label_key)
+        output.append(basket)
+        if len(output) >= limit:
+            break
+    return output
+
+
+@router.get("/baskets")
+def get_dynamic_baskets(query: str = "", limit: int = 8):
+    """
+    动态回测篮子。
+
+    优先级：
+    1. 自建盘后产业链图谱 concept_relationship_graph
+    2. 产业链热度 chain_heat_snapshots
+    3. 人工维护 industry_chains.yaml
+    4. 东财/同花顺等板块/概念成分股缓存兜底
+    """
+    query_text = _text(query)
+    max_items = _clamp_limit(limit)
+    candidates: list[dict[str, Any]] = []
+    for loader in (
+        _relationship_graph_baskets,
+        _chain_heat_baskets,
+        _industry_chain_baskets,
+        _board_constituent_baskets,
+    ):
+        candidates.extend(loader(query_text, max_items))
+        if len(_dedupe_baskets(candidates, max_items)) >= max_items:
+            break
+    baskets = _dedupe_baskets(candidates, max_items)
+    return {
+        "query": query_text,
+        "total": len(baskets),
+        "baskets": baskets,
+        "source_order": [
+            "concept_relationship_graph",
+            "chain_heat_snapshots",
+            "industry_chains.yaml",
+            "board_constituents/concept_constituents",
+        ],
+    }
+
 @router.get("/watchlist")
 def get_watchlist(direction: str = "", mode: str = "belief", top: int = 30):
     """
