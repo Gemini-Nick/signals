@@ -37,6 +37,20 @@ def _detect_market(code: str) -> str:
     return "A"
 
 
+def _plain_stock_code(code: str) -> str:
+    value = str(code or "").strip().upper()
+    for prefix in ("SZ.", "SH.", "HK.", "US.", "BJ."):
+        if value.startswith(prefix):
+            return value[len(prefix):]
+    return value
+
+
+def _is_unsupported_backtest_code(code: str) -> bool:
+    """Current kline backtest path does not yet support BJ/New Third Board symbols."""
+    normalized = _plain_stock_code(code)
+    return len(normalized) == 6 and normalized.startswith(("4", "8", "920"))
+
+
 def _build_symbol(code: str, market: str) -> str:
     """构造 Futu 格式代码"""
     if market == "HK":
@@ -187,7 +201,7 @@ def _records_to_df(records: list[dict[str, Any]]) -> pd.DataFrame:
     return df[~df.index.duplicated(keep="last")]
 
 
-def _load_mongo_bars(code: str, market: str, freq: str) -> pd.DataFrame:
+def _load_mongo_bars(code: str, market: str, freq: str, limit: int = 1600) -> pd.DataFrame:
     from signals.data.mongo_fallback import get_db
 
     db = get_db()
@@ -202,12 +216,18 @@ def _load_mongo_bars(code: str, market: str, freq: str) -> pd.DataFrame:
     }.get(freq, [freq])
     symbol_candidates = [code, symbol, symbol.lower(), symbol.replace(".", "").lower()]
     try:
-        docs = list(db.bars.find({
-            "$or": [
-                {"meta.symbol": {"$in": symbol_candidates}, "meta.freq": {"$in": freq_candidates}},
-                {"symbol": {"$in": symbol_candidates}, "freq": {"$in": freq_candidates}},
-            ],
-        }, {"_id": 0}).sort("dt", 1))
+        meta_query = {"meta.symbol": {"$in": symbol_candidates}, "meta.freq": {"$in": freq_candidates}}
+        cursor = db.bars.find(meta_query, {"_id": 0}).sort("dt", -1)
+        if limit > 0:
+            cursor = cursor.limit(limit)
+        docs = list(cursor)
+        if not docs:
+            legacy_query = {"symbol": {"$in": symbol_candidates}, "freq": {"$in": freq_candidates}}
+            cursor = db.bars.find(legacy_query, {"_id": 0}).sort("dt", -1).max_time_ms(3000)
+            if limit > 0:
+                cursor = cursor.limit(limit)
+            docs = list(cursor)
+        docs.reverse()
     except Exception as e:
         logger.warning("Mongo bars 读取失败: %s %s — %s", code, freq, str(e)[:80])
         return pd.DataFrame()
@@ -219,12 +239,12 @@ def _load_mongo_bars(code: str, market: str, freq: str) -> pd.DataFrame:
     return df
 
 
-def _load_mongo_direct_or_derived(code: str, market: str, freq: str) -> pd.DataFrame:
-    direct = _load_mongo_bars(code, market, freq)
+def _load_mongo_direct_or_derived(code: str, market: str, freq: str, limit: int = 1600) -> pd.DataFrame:
+    direct = _load_mongo_bars(code, market, freq, limit=limit)
     if not direct.empty:
         return direct
     if freq in {"weekly", "monthly"}:
-        daily = _load_mongo_bars(code, market, "daily")
+        daily = _load_mongo_bars(code, market, "daily", limit=limit)
         derived = _resample_daily(daily, freq)
         if not derived.empty:
             derived.attrs["data_source"] = f"mongodb_daily_resampled_{freq}"
@@ -570,11 +590,19 @@ def _fetch_kline(code: str, market: str, freq: str) -> pd.DataFrame:
     from signals.data.gateway import get_kline
     from signals.data.models import DataRequest
 
+    freq_norm = _normalize_freq(freq)
+    local_cached = _load_mongo_direct_or_derived(code, market, freq_norm)
+    if not local_cached.empty:
+        return local_cached
+    disk_cached = _load_cached_kline_or_daily_derived(code, freq_norm)
+    if not disk_cached.empty:
+        return disk_cached
+
     request = DataRequest(
         domain="kline",
         mode="historical",
         market=market,
-        freq=_normalize_freq(freq),
+        freq=freq_norm,
         symbol=code,
         purpose="backtest",
     )
@@ -1477,6 +1505,12 @@ async def analyze_backtest_payload(
                 "error": f"不支持的周期: {freq}",
                 "supported_freqs": ["daily", "weekly", "monthly", "30m"],
             })
+        if _is_unsupported_backtest_code(code):
+            return JSONResponse(status_code=422, content={
+                "error": f"当前回测暂不支持北交所/新三板标的: {_plain_stock_code(code)}",
+                "code": _plain_stock_code(code),
+                "market": "BJ",
+            })
         market = _detect_market(code)
         symbol = _build_symbol(code, market)
         freq_label = _freq_label(freq)
@@ -1488,6 +1522,8 @@ async def analyze_backtest_payload(
                 "data_source": df.attrs.get("data_source", ""),
                 "last_upstream_error": df.attrs.get("last_upstream_error", ""),
             })
+        if lookback > 0 and len(df) > lookback:
+            df = df.tail(lookback).copy()
         meta = _kline_meta(df, freq)
         data_source = meta["data_source"]
         data_source_detail = meta["data_source_detail"]
@@ -2332,12 +2368,31 @@ async def backtest_batch(request: Request):
         total_evaluated = 0
 
         for code in codes:
+            code = _plain_stock_code(code)
             stock_result = {"code": code, "status": "ok"}
             try:
-                market = _detect_market(code)
-                symbol = _build_symbol(code, market)
                 freq_norm = _normalize_freq(freq)
                 freq_label = _freq_label(freq_norm)
+                if _is_unsupported_backtest_code(code):
+                    symbol = f"BJ.{code}"
+                    stock_result.update({
+                        "status": "error",
+                        "symbol": symbol,
+                        "market": "BJ",
+                        "freq": freq_label,
+                        "error": "北交所/新三板标的暂不支持当前回测数据源",
+                    })
+                    if resolver:
+                        try:
+                            stock_result["name"] = resolver.get_name(symbol)
+                        except Exception:
+                            stock_result["name"] = code
+                    else:
+                        stock_result["name"] = code
+                    stocks.append(stock_result)
+                    continue
+                market = _detect_market(code)
+                symbol = _build_symbol(code, market)
                 stock_result["symbol"] = symbol
                 stock_result["market"] = market
                 stock_result["freq"] = freq_label
@@ -2358,6 +2413,8 @@ async def backtest_batch(request: Request):
                     stock_result["error"] = "无可用数据"
                     stocks.append(stock_result)
                     continue
+                if lookback > 0 and len(df) > lookback:
+                    df = df.tail(lookback).copy()
                 meta = _kline_meta(df, freq_norm)
                 stock_result.update(meta)
                 stock_result["bar_count"] = int(len(df))
