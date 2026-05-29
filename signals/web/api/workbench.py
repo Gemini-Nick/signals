@@ -61,7 +61,7 @@ from .stock import analyze_stock
 router = APIRouter(prefix="/api/workbench", tags=["workbench"])
 
 UI_FREQS = ["30min", "15min", "5min", "daily", "weekly"]
-DEFAULT_TERMINAL_FREQ = "30min"
+DEFAULT_TERMINAL_FREQ = "daily"
 MINUTE_FREQS = {"5min", "5m", "15min", "15m", "30min", "30m"}
 REALTIME_DAY_CHANGE_FREQS = ("5min",)
 BUY_FREQS = ["weekly", "daily", "30min", "15min", "5min"]
@@ -281,19 +281,20 @@ def _shell_cache_usable(payload: Any, engine: Any, quote_watermark: Optional[str
     if not isinstance(payload, dict):
         return False
     session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
-    if session and not session.get("ready") and engine.is_ready():
+    if session and not session.get("ready") and engine.is_ready() and not _shell_payload_has_read_model(payload):
         return False
     if quote_watermark is not None and _shell_watermark_requires_rebuild(quote_watermark, _SHELL_CACHE.get("quote_watermark")):
         return False
     return True
 
 
-def _shell_cache_ttl_seconds(payload: dict[str, Any]) -> float:
-    session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
-    has_read_model = any(
+def _shell_payload_has_read_model(payload: dict[str, Any]) -> bool:
+    groups = payload.get("watchlist_groups")
+    if isinstance(groups, dict) and any(bool(value) for value in groups.values() if isinstance(value, list)):
+        return True
+    return any(
         payload.get(key)
         for key in (
-            "watchlist_groups",
             "buy_candidates",
             "sell_warnings",
             "cluster_summary",
@@ -301,6 +302,11 @@ def _shell_cache_ttl_seconds(payload: dict[str, Any]) -> float:
             "strategy_kpis",
         )
     )
+
+
+def _shell_cache_ttl_seconds(payload: dict[str, Any]) -> float:
+    session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
+    has_read_model = _shell_payload_has_read_model(payload)
     if session.get("ready") or has_read_model:
         return _SHELL_CACHE_TTL_SECONDS
     return 2.0
@@ -364,6 +370,72 @@ def _payload_from_shell_cache(cached_payload: dict[str, Any], status: str, now: 
         "quote_watermark": quote_watermark,
     }
     return payload
+
+
+def _build_shell_placeholder_payload(engine: Any, status: str, now: float, quote_watermark: str) -> dict[str, Any]:
+    try:
+        session = _serialize_session(engine.get_status())
+    except Exception:
+        session = {"ready": False}
+    range_columns = _watchlist_range_columns()
+    return {
+        "session": session,
+        "market": None,
+        "indices": [],
+        "buy_candidates": [],
+        "sell_warnings": [],
+        "cluster_summary": {
+            "industry_top": [],
+            "concept_top": [],
+            "market_status": {},
+            "data_warning": "Signals shell 正在构建，稍后自动刷新。",
+        },
+        "watchlist_groups": {
+            "major_indices": [],
+            "industry_etfs": [],
+            "macro_indices": [],
+            "sector_boards": [],
+            "buy_candidates": [],
+            "focus_stocks": [],
+            "risk_stocks": [],
+            "watch_stocks": [],
+        },
+        "watchlist_groups_meta": {},
+        "watchlist": [],
+        "watchlist_range_columns": range_columns,
+        "kline_cache_coverage": {},
+        "sync_lanes": {},
+        "trade_map": {
+            "as_of": _day_change_expected_day(),
+            "day_change_mode": _a_day_change_mode(),
+            "headline": "",
+            "items": [],
+            "role_filters": TRADE_ROLE_FILTERS,
+            "role_definitions": TRADE_ROLE_DEFINITIONS,
+            "role_counts": {item["key"]: 0 for item in TRADE_ROLE_FILTERS if item["key"] != "all"},
+        },
+        "ai_alerts": [],
+        "command_suggestions": [],
+        "daily_brief": {},
+        "decision_queue": [],
+        "strategy_kpis": {},
+        "source_confidence": {},
+        "watchlist_directions": [],
+        "default_target": {
+            "kind": "index",
+            "label": "上证指数",
+            "freq": DEFAULT_TERMINAL_FREQ,
+        },
+        "legacy_url": "/legacy",
+        "notices": ["Signals shell 正在构建，稍后自动刷新。"],
+        "cache": {
+            "status": status,
+            "age_seconds": 0,
+            "ttl_seconds": 0,
+            "quote_watermark": quote_watermark,
+            "building": True,
+        },
+    }
 _CHART_LOAD_LOCK = threading.Lock()
 _CHART_LOAD_JOBS: dict[str, dict[str, Any]] = {}
 _CHART_LOAD_JOB_TTL_SECONDS = 120.0
@@ -6419,7 +6491,7 @@ def _candidate_groups_from_representatives(row: dict[str, Any], *, lightweight: 
             heat_score=heat_score,
             leader_rank=leader_rank,
             daily_cache=daily_cache,
-            lightweight=False,
+            lightweight=lightweight,
         ) or item
         if lightweight:
             payload = _enrich_stock_row(payload, [], lightweight=True)
@@ -6450,6 +6522,10 @@ def _chain_heat_max_nodes_per_chain() -> int:
         return max(1, int(os.getenv("WORKBENCH_CHAIN_HEAT_MAX_NODES_PER_CHAIN", "2")))
     except Exception:
         return 2
+
+
+def _chain_heat_shell_graph_enabled() -> bool:
+    return _text(os.getenv("WORKBENCH_CHAIN_HEAT_SHELL_GRAPH")).lower() in {"1", "true", "yes", "on"}
 
 
 def _chain_representative_quote_rows(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -6535,6 +6611,43 @@ _CHAIN_SOURCE_KIND_LABELS = {
     "industry": "行业",
     "concept": "概念",
     "theme": "主题",
+}
+
+_CHAIN_HEAT_SHELL_PROJECTION = {
+    "_id": 0,
+    "market": 1,
+    "trade_date": 1,
+    "dt": 1,
+    "trade_minute": 1,
+    "rank": 1,
+    "chain_id": 1,
+    "chain_name": 1,
+    "node_id": 1,
+    "node_name": 1,
+    "layer": 1,
+    "stage": 1,
+    "phase": 1,
+    "heat_score": 1,
+    "change_pct": 1,
+    "momentum_5m": 1,
+    "momentum_15m": 1,
+    "momentum_30m": 1,
+    "range_pattern": 1,
+    "integrated_count": 1,
+    "integrated_domains": 1,
+    "representatives": 1,
+    "source_driver": 1,
+    "source_events": 1,
+    "source_kind_mix": 1,
+    "route_explain": 1,
+    "mapping_status": 1,
+    "mapping_confidence": 1,
+    "evidence_sources": 1,
+    "trading_signal": 1,
+    "trader_action": 1,
+    "invalidates_when": 1,
+    "up_count": 1,
+    "down_count": 1,
 }
 
 
@@ -7295,7 +7408,7 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             return []
         docs = list(db["chain_heat_snapshots"].find(
             {"market": "A", "trade_minute": latest["trade_minute"]},
-            {"_id": 0},
+            _CHAIN_HEAT_SHELL_PROJECTION,
         ).sort("rank", 1).limit(limit * 5))
         docs = _diversify_chain_heat_docs(
             docs,
@@ -7344,8 +7457,8 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         display_context["source_theme_overlays"] = theme_overlays
         display_context["source_event_theme_overlays"] = source_event_theme_overlays
         display_rank_score = _chain_heat_display_rank_score(doc, display_context)
-        graph = _chain_graph_doc(doc.get("chain_id"), doc.get("node_id"))
-        viewpoint_context = _viewpoint_context_from_graph(graph)
+        graph = _chain_graph_doc(doc.get("chain_id"), doc.get("node_id")) if _chain_heat_shell_graph_enabled() else {}
+        viewpoint_context = _viewpoint_context_from_graph(graph) if graph else {}
         doc_trade_day = _date_text(doc.get("trade_date") or doc.get("dt") or doc.get("trade_minute"))
         data_truth = _data_truth_payload(
             collection="chain_heat_snapshots",
@@ -7485,6 +7598,8 @@ def _refresh_realtime_quotes_for_rows(
     refresh_key: str,
     limit: int,
 ) -> dict[str, Any]:
+    if _text(os.getenv("TERMINAL_WORKBENCH_VISIBLE_QUOTE_REFRESH")).lower() not in {"1", "true", "yes", "on"}:
+        return {"status": "skipped", "reason": "disabled"}
     if _a_day_change_mode() != "quote_intraday":
         return {"status": "skipped", "reason": "not_intraday"}
     try:
@@ -7534,6 +7649,20 @@ def _shell_stock_range_return_limit(group: str) -> int:
         return max(0, int(os.getenv(env_name, str(defaults.get(group, 12)))))
     except (TypeError, ValueError):
         return defaults.get(group, 12)
+
+
+def _shell_manual_clue_limit() -> int:
+    try:
+        return max(1, int(os.getenv("TERMINAL_WORKBENCH_MANUAL_CLUE_LIMIT", "12")))
+    except (TypeError, ValueError):
+        return 12
+
+
+def _shell_manual_clue_decision_limit() -> int:
+    try:
+        return max(0, int(os.getenv("TERMINAL_WORKBENCH_MANUAL_CLUE_DECISION_LIMIT", "3")))
+    except (TypeError, ValueError):
+        return 3
 
 
 def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: str = "focus_stocks", limit: Optional[int] = None) -> list[dict[str, Any]]:
@@ -7634,8 +7763,13 @@ def _terminal_stock_pool_rows(range_columns: list[dict[str, Any]], limit: Option
     return _terminal_stock_pool_group_rows(range_columns, "focus_stocks", limit)
 
 
-def _manual_clue_rows(range_columns: list[dict[str, Any]], limit: Optional[int] = None) -> list[dict[str, Any]]:
-    limit = limit or max(1, int(os.getenv("TERMINAL_WORKBENCH_MANUAL_CLUE_LIMIT", "36")))
+def _manual_clue_rows(
+    range_columns: list[dict[str, Any]],
+    limit: Optional[int] = None,
+    *,
+    decision_enrich_limit: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    limit = limit or _shell_manual_clue_limit()
     try:
         db = _mongo_db()
         docs = list(db["terminal_manual_clues"].find(
@@ -7690,7 +7824,8 @@ def _manual_clue_rows(range_columns: list[dict[str, Any]], limit: Optional[int] 
             "explanation": "手动加入线索池；只触发单票缓存和分析，不参与自动入池排序。",
             "trace_summary": "manual_clue:terminal_manual_clues",
         })
-        row = _enrich_manual_clue_decision(row, normalized)
+        if decision_enrich_limit is None or len(rows) < decision_enrich_limit:
+            row = _enrich_manual_clue_decision(row, normalized)
         rows.append(row)
     return rows
 
@@ -8440,7 +8575,11 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     risk_stocks = _terminal_stock_pool_group_rows(range_columns, "risk_stocks")
     watch_stocks = _terminal_stock_pool_group_rows(range_columns, "watch_stocks")
     clue_stocks = _terminal_stock_pool_group_rows(range_columns, "clue_stocks")
-    manual_clues = _manual_clue_rows(range_columns)
+    manual_clues = _manual_clue_rows(
+        range_columns,
+        limit=_shell_manual_clue_limit(),
+        decision_enrich_limit=_shell_manual_clue_decision_limit(),
+    )
     manual_attack_focus = _manual_clue_attack_focus_rows(manual_clues, focus_stocks)
     focus_stocks = _merge_stock_rows_by_symbol(manual_attack_focus + focus_stocks)
     manual_focus_count = len(manual_attack_focus)
@@ -8581,36 +8720,19 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         "default_target": {
             "kind": "index",
             "label": macro_indices[0]["name"] if macro_indices else "沪深300",
-            "freq": "30min",
+            "freq": DEFAULT_TERMINAL_FREQ,
         },
         "legacy_url": "/legacy",
         "notices": notices,
     }
 
 
-def _build_shell_payload(engine) -> Dict[str, Any]:
-    now = time.monotonic()
-    quote_watermark = _quote_snapshot_watermark()
-    cached_payload = _SHELL_CACHE.get("payload")
-    if _shell_cache_usable(cached_payload, engine, quote_watermark=quote_watermark) and now < float(_SHELL_CACHE.get("expires_at") or 0):
-        return _payload_from_shell_cache(cached_payload, "hit", now, quote_watermark)
-
+def _refresh_shell_cache_once(engine: Any) -> None:
     acquired = _SHELL_CACHE_LOCK.acquire(blocking=False)
     if not acquired:
-        if _shell_cache_usable(cached_payload, engine, quote_watermark=quote_watermark):
-            return _payload_from_shell_cache(cached_payload, "stale_refreshing", now, quote_watermark)
-        with _SHELL_CACHE_LOCK:
-            cached_payload = _SHELL_CACHE.get("payload")
-            quote_watermark = _quote_snapshot_watermark()
-            if _shell_cache_usable(cached_payload, engine, quote_watermark=quote_watermark):
-                return _payload_from_shell_cache(cached_payload, "waited_hit", time.monotonic(), quote_watermark)
-
+        return
     try:
         refreshed_now = time.monotonic()
-        quote_watermark = _quote_snapshot_watermark()
-        cached_payload = _SHELL_CACHE.get("payload")
-        if _shell_cache_usable(cached_payload, engine, quote_watermark=quote_watermark) and refreshed_now < float(_SHELL_CACHE.get("expires_at") or 0):
-            return _payload_from_shell_cache(cached_payload, "hit_after_lock", refreshed_now, quote_watermark)
         payload = _build_shell_payload_uncached(engine)
         quote_watermark = _quote_snapshot_watermark()
         ttl_seconds = _shell_cache_ttl_seconds(payload)
@@ -8620,16 +8742,33 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
             "expires_at": refreshed_now + ttl_seconds,
             "quote_watermark": quote_watermark,
         })
-        payload["cache"] = {
-            "status": "refreshed",
-            "age_seconds": 0,
-            "ttl_seconds": ttl_seconds,
-            "quote_watermark": quote_watermark,
-        }
-        return payload
     finally:
-        if acquired:
-            _SHELL_CACHE_LOCK.release()
+        _SHELL_CACHE_LOCK.release()
+
+
+def _schedule_shell_cache_refresh(engine: Any) -> None:
+    thread = threading.Thread(
+        target=_refresh_shell_cache_once,
+        args=(engine,),
+        name="signals-shell-cache-refresh",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _build_shell_payload(engine) -> Dict[str, Any]:
+    now = time.monotonic()
+    cached_payload = _SHELL_CACHE.get("payload")
+    cached_quote_watermark = str(_SHELL_CACHE.get("quote_watermark") or "")
+    if _shell_cache_usable(cached_payload, engine) and now < float(_SHELL_CACHE.get("expires_at") or 0):
+        return _payload_from_shell_cache(cached_payload, "hit", now, cached_quote_watermark)
+
+    quote_watermark = cached_quote_watermark
+    _schedule_shell_cache_refresh(engine)
+    if _shell_cache_usable(cached_payload, engine):
+        cache_status = "stale_refreshing" if _shell_cache_usable(cached_payload, engine, quote_watermark=quote_watermark) else "stale_refreshing_watermark"
+        return _payload_from_shell_cache(cached_payload, cache_status, now, quote_watermark)
+    return _build_shell_placeholder_payload(engine, "building", now, quote_watermark)
 
 
 def _safe_strategy_snapshot() -> Dict[str, Any]:
@@ -11341,7 +11480,7 @@ async def get_workbench_cluster(
 async def get_workbench_symbol(
     symbol: str,
     kind: str = Query("auto", description="auto / index / industry / concept / stock"),
-    freq: str = Query("30min", description="5min / 15min / 30min / daily / weekly"),
+    freq: str = Query(DEFAULT_TERMINAL_FREQ, description="5min / 15min / 30min / daily / weekly"),
 ):
     engine = _ensure_engine()
     if not engine.is_ready() and kind in {"auto", "index"}:

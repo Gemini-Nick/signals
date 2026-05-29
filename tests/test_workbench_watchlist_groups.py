@@ -371,6 +371,89 @@ def test_shell_cache_rebuilds_when_board_watermark_changes():
         workbench._invalidate_shell_cache()
 
 
+def test_shell_payload_reuses_fresh_ttl_cache_when_board_watermark_changes(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Engine:
+        def is_ready(self):
+            return True
+
+    def _fail_uncached_build(engine):
+        raise AssertionError("fresh shell cache should not rebuild inside ttl")
+
+    try:
+        cached_payload = {
+            "session": {"ready": True},
+            "watchlist_groups": {
+                "sector_boards": [
+                    {"name": "cached-board", "target_kind": "sector", "symbol": "商业地产"},
+                ],
+            },
+        }
+        workbench._SHELL_CACHE.update({
+            "expires_at": workbench.time.monotonic() + 60,
+            "payload": cached_payload,
+            "refreshed_at": workbench.time.monotonic(),
+            "quote_watermark": "quote_snapshots:old|board_heat_ticks:old",
+        })
+        monkeypatch.setattr(
+            workbench,
+            "_quote_snapshot_watermark",
+            lambda: (_ for _ in ()).throw(AssertionError("fresh ttl shell cache should not read watermarks")),
+        )
+        monkeypatch.setattr(workbench, "_build_shell_payload_uncached", _fail_uncached_build)
+
+        payload = workbench._build_shell_payload(_Engine())
+
+        assert payload["watchlist_groups"]["sector_boards"][0]["name"] == "cached-board"
+        assert payload["cache"]["status"] == "hit"
+    finally:
+        workbench._invalidate_shell_cache()
+
+
+def test_shell_payload_returns_placeholder_when_cache_miss_and_lock_busy(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Engine:
+        def is_ready(self):
+            return True
+
+        def get_status(self):
+            return {"ready": True, "active_markets": ["A"]}
+
+    class _BusyLock:
+        def acquire(self, blocking=True):
+            return False
+
+    try:
+        workbench._SHELL_CACHE.update({
+            "expires_at": 0.0,
+            "payload": None,
+            "refreshed_at": 0.0,
+            "quote_watermark": "",
+        })
+        monkeypatch.setattr(workbench, "_SHELL_CACHE_LOCK", _BusyLock())
+        monkeypatch.setattr(workbench, "_quote_snapshot_watermark", lambda: "quote_snapshots:new")
+        monkeypatch.setattr(
+            workbench,
+            "_build_shell_payload_uncached",
+            lambda engine: (_ for _ in ()).throw(AssertionError("busy shell request should not build")),
+        )
+
+        payload = workbench._build_shell_payload(_Engine())
+
+        assert payload["cache"]["status"] == "building"
+        assert payload["cache"]["building"] is True
+        assert payload["watchlist_groups"]["sector_boards"] == []
+    finally:
+        workbench._SHELL_CACHE.update({
+            "expires_at": 0.0,
+            "payload": None,
+            "refreshed_at": 0.0,
+            "quote_watermark": "",
+        })
+
+
 def test_daily_chart_appends_live_quote_bar_after_call_auction(monkeypatch):
     from signals.web.api import workbench
 
