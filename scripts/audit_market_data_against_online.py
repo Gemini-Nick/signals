@@ -25,8 +25,9 @@ import requests
 from pymongo import MongoClient
 
 from signals.sync.modules.daily_sources import fetch_tencent_daily
-from signals.sync.modules.hk_stock_daily import _docs_from_hk_daily_df, _pure_hk_code
+from signals.sync.modules.hk_stock_daily import _docs_from_hk_daily_df, _normalize_ohlc_bounds, _pure_hk_code
 from signals.sync.modules.minute_sources import fetch_public_minute, stock_to_market_symbol
+from signals.sync.volume_units import normalize_stock_volume, tencent_daily_volume_unit
 
 
 MONGO_URL = "mongodb://127.0.0.1:27017/signals"
@@ -44,6 +45,7 @@ WEBSITE_HEADERS = {
     ),
     "Accept": "application/json,text/plain,*/*",
 }
+WEBSITE_DF_COLUMNS = ["时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额"]
 
 
 def _json_default(value: Any) -> str:
@@ -151,8 +153,7 @@ def _website_tencent_daily(code: str, *, count: int, timeout: float) -> tuple[pd
                 "收盘": _num(row[2]),
                 "最高": _num(row[3]),
                 "最低": _num(row[4]),
-                # Tencent daily website volume is in hands; Mongo canonical stock daily vol is shares.
-                "成交量": (_num(row[5]) or 0.0) * 100,
+                "成交量": normalize_stock_volume(row[5], source="tencent", source_unit=tencent_daily_volume_unit(code))[0],
                 "成交额": 0.0,
             }
         )
@@ -263,6 +264,8 @@ def _website_yahoo_hk_daily(symbol: str, target_dt: datetime, *, timeout: float)
                 "成交额": 0.0,
             }
         )
+    if not rows:
+        return pd.DataFrame(columns=WEBSITE_DF_COLUMNS), response.url
     return pd.DataFrame(rows).dropna(subset=["时间"]), response.url
 
 
@@ -276,7 +279,11 @@ def _website_tencent_hk_daily(symbol: str, *, count: int, timeout: float) -> tup
         referer="https://gu.qq.com/",
     )
     payload = response.json()
-    rows = payload.get("data", {}).get(website_symbol, {}).get("qfqday") or payload.get("data", {}).get(website_symbol, {}).get("day") or []
+    data = payload.get("data")
+    symbol_payload = data.get(website_symbol) if isinstance(data, dict) else {}
+    if not isinstance(symbol_payload, dict):
+        symbol_payload = {}
+    rows = symbol_payload.get("qfqday") or symbol_payload.get("day") or []
     parsed = []
     for row in rows:
         if len(row) < 6:
@@ -292,6 +299,8 @@ def _website_tencent_hk_daily(symbol: str, *, count: int, timeout: float) -> tup
                 "成交额": 0.0,
             }
         )
+    if not parsed:
+        return pd.DataFrame(columns=WEBSITE_DF_COLUMNS), response.url
     return pd.DataFrame(parsed).dropna(subset=["时间"]).reset_index(drop=True), response.url
 
 
@@ -388,6 +397,54 @@ def _sample_latest_docs(db, *, market: str, freq: str, limit: int, symbols: list
     return docs[:limit]
 
 
+def _sample_random_docs(
+    db,
+    *,
+    market: str,
+    freq: str,
+    limit: int,
+    symbols: list[str] | None = None,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
+) -> list[dict[str, Any]]:
+    match: dict[str, Any] = {"meta.market": market, "meta.freq": freq}
+    if symbols:
+        match["meta.symbol"] = {"$in": symbols}
+    dt_filter: dict[str, Any] = {}
+    if date_from:
+        dt_filter["$gte"] = date_from
+    if date_to:
+        dt_filter["$lte"] = date_to
+    if dt_filter:
+        match["dt"] = dt_filter
+    pipeline: list[dict[str, Any]] = [{"$match": match}]
+    if limit > 0:
+        pipeline.append({"$sample": {"size": limit}})
+    pipeline.append({"$sort": {"meta.symbol": 1, "dt": 1}})
+    return list(db["bars"].aggregate(pipeline, allowDiskUse=True))
+
+
+def _sample_docs_for_group(
+    db,
+    *,
+    market: str,
+    freq: str,
+    args: argparse.Namespace,
+    symbols: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    if args.sample_mode == "random":
+        return _sample_random_docs(
+            db,
+            market=market,
+            freq=freq,
+            limit=args.samples_per_group,
+            symbols=symbols,
+            date_from=_dt(args.date_from) if args.date_from else None,
+            date_to=_dt(args.date_to) if args.date_to else None,
+        )
+    return _sample_latest_docs(db, market=market, freq=freq, limit=args.samples_per_group, symbols=symbols)
+
+
 def _previous_local_close(db, symbol: str, market: str, dt: datetime) -> float | None:
     prev = db["bars"].find_one(
         {
@@ -464,6 +521,8 @@ def _audit_a_minute(db, doc: dict[str, Any], args: argparse.Namespace) -> dict[s
     provider_docs: dict[str, dict[str, Any]] = {}
     provider_latest_dates: dict[str, datetime] = {}
     errors: list[str] = []
+    latest_doc = db["bars"].find_one({"meta.symbol": symbol, "meta.market": "A", "meta.freq": freq}, {"dt": 1}, sort=[("dt", -1)])
+    latest_local_dt = _dt(latest_doc.get("dt")) if latest_doc else None
     for provider, fetcher in (("website:tencent", _website_tencent_minute), ("website:sina", _website_sina_minute)):
         try:
             df, source_url = fetcher(symbol, freq, count=args.minute_count, timeout=args.provider_timeout)
@@ -488,7 +547,7 @@ def _audit_a_minute(db, doc: dict[str, Any], args: argparse.Namespace) -> dict[s
     if not provider_docs:
         provider_notes = []
         for provider, latest_dt in provider_latest_dates.items():
-            if latest_dt and latest_dt > target_dt:
+            if latest_dt and latest_local_dt and latest_dt > latest_local_dt:
                 provider_notes.append(f"local_missing_latest_online_date:{provider}:{latest_dt.isoformat()}")
         result.update(
             {
@@ -510,13 +569,12 @@ def _audit_a_minute(db, doc: dict[str, Any], args: argparse.Namespace) -> dict[s
     online = provider_docs[preferred]
     provider_notes: list[str] = []
     for provider, latest_dt in provider_latest_dates.items():
-        if latest_dt and latest_dt > target_dt:
+        if latest_dt and latest_local_dt and latest_dt > latest_local_dt:
             provider_notes.append(f"local_missing_latest_online_date:{provider}:{latest_dt.isoformat()}")
     if len(provider_docs) > 1:
         closes = {name: item.get("close") for name, item in provider_docs.items()}
         if len({value for value in closes.values() if value is not None}) > 1:
             provider_notes.append(f"website_provider_conflict_close:{closes}")
-    latest_doc = db["bars"].find_one({"meta.symbol": symbol, "meta.market": "A", "meta.freq": freq}, {"dt": 1}, sort=[("dt", -1)])
     if latest_doc and latest_doc.get("dt") == target_dt:
         provider_notes.append("latest_insert_new_maybe_stale")
 
@@ -575,15 +633,18 @@ def _fetch_hk_yahoo_doc(code: str, target_dt: datetime, args: argparse.Namespace
     row = _row_by_date(df, "时间", target_dt)
     if row is None:
         return None, source_url, latest_online_dt
+    prices = _normalize_ohlc_bounds(row.get("开盘"), row.get("最高"), row.get("最低"), row.get("收盘"))
+    if prices is None:
+        return None, source_url, latest_online_dt
     symbol = f"HK.{_pure_hk_code(code)}"
     return (
         {
             "dt": pd.to_datetime(row["时间"]).to_pydatetime(),
             "meta": {"symbol": symbol, "raw_code": _pure_hk_code(code), "freq": DAILY_FREQ, "market": "HK", "source": "website_yahoo"},
-            "open": _num(row.get("开盘")),
-            "high": _num(row.get("最高")),
-            "low": _num(row.get("最低")),
-            "close": _num(row.get("收盘")),
+            "open": prices["open"],
+            "high": prices["high"],
+            "low": prices["low"],
+            "close": prices["close"],
             "vol": int(_num(row.get("成交量")) or 0),
             "amount": int(_num(row.get("成交额")) or 0),
             "source": "website_yahoo",
@@ -601,15 +662,18 @@ def _fetch_hk_tencent_doc(code: str, target_dt: datetime, args: argparse.Namespa
     row = _row_by_date(df, "时间", target_dt)
     if row is None:
         return None, source_url, latest_online_dt
+    prices = _normalize_ohlc_bounds(row.get("开盘"), row.get("最高"), row.get("最低"), row.get("收盘"))
+    if prices is None:
+        return None, source_url, latest_online_dt
     symbol = f"HK.{_pure_hk_code(code)}"
     return (
         {
             "dt": pd.to_datetime(row["时间"]).to_pydatetime(),
             "meta": {"symbol": symbol, "raw_code": _pure_hk_code(code), "freq": DAILY_FREQ, "market": "HK", "source": "website_tencent_hk"},
-            "open": _num(row.get("开盘")),
-            "high": _num(row.get("最高")),
-            "low": _num(row.get("最低")),
-            "close": _num(row.get("收盘")),
+            "open": prices["open"],
+            "high": prices["high"],
+            "low": prices["low"],
+            "close": prices["close"],
             "vol": int(_num(row.get("成交量")) or 0),
             "amount": int(_num(row.get("成交额")) or 0),
             "source": "website_tencent_hk",
@@ -724,18 +788,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     for group in requested:
         if group == "A:daily":
-            docs = _sample_latest_docs(db, market="A", freq=DAILY_FREQ, limit=args.samples_per_group, symbols=explicit.get("A"))
+            docs = _sample_docs_for_group(db, market="A", freq=DAILY_FREQ, args=args, symbols=explicit.get("A"))
             for doc in docs:
                 results.append(_audit_a_daily(db, doc, args))
                 time.sleep(args.call_interval)
         elif group == "HK:daily":
-            docs = _sample_latest_docs(db, market="HK", freq=DAILY_FREQ, limit=args.samples_per_group, symbols=explicit.get("HK"))
+            docs = _sample_docs_for_group(db, market="HK", freq=DAILY_FREQ, args=args, symbols=explicit.get("HK"))
             for doc in docs:
                 results.append(_audit_hk_daily(db, doc, args))
                 time.sleep(args.call_interval)
         elif group.startswith("A:") and group.split(":", 1)[1] in MINUTE_FREQS:
             freq = group.split(":", 1)[1]
-            docs = _sample_latest_docs(db, market="A", freq=freq, limit=args.samples_per_group, symbols=explicit.get("A"))
+            docs = _sample_docs_for_group(db, market="A", freq=freq, args=args, symbols=explicit.get("A"))
             for doc in docs:
                 results.append(_audit_a_minute(db, doc, args))
                 time.sleep(args.call_interval)
@@ -750,6 +814,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "generated_at": datetime.now(),
         "groups": requested,
+        "sample_mode": args.sample_mode,
+        "date_from": args.date_from,
+        "date_to": args.date_to,
         "samples": len(results),
         "status_counts": dict(status_counts),
         "mismatch_field_counts": dict(mismatch_field_counts),
@@ -770,6 +837,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db-name", default=DB_NAME)
     parser.add_argument("--groups", default="A:daily,A:5分钟,A:15分钟,A:30分钟,HK:daily")
     parser.add_argument("--symbols", default="", help="Optional comma list such as 300750,HK.03750.")
+    parser.add_argument("--sample-mode", choices=["latest", "random"], default="latest")
+    parser.add_argument("--date-from", default="", help="Optional inclusive lower dt bound, e.g. 2024-01-01.")
+    parser.add_argument("--date-to", default="", help="Optional inclusive upper dt bound, e.g. 2026-05-29.")
     parser.add_argument("--samples-per-group", type=int, default=8)
     parser.add_argument("--daily-count", type=int, default=900)
     parser.add_argument("--minute-count", type=int, default=400)
@@ -779,7 +849,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--volume-rel-tol", type=float, default=0.02)
     parser.add_argument("--provider-timeout", type=float, default=10.0)
     parser.add_argument("--call-interval", type=float, default=0.2)
-    parser.add_argument("--hk-adjust", default="qfq")
+    parser.add_argument("--hk-adjust", default="")
     parser.add_argument("--output", default="/tmp/signals_market_data_online_audit.json")
     return parser
 

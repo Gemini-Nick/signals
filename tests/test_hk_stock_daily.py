@@ -85,6 +85,44 @@ def test_docs_from_hk_daily_df_writes_canonical_bar_docs():
     assert docs[0]["vol"] == 123400
 
 
+def test_docs_from_hk_daily_df_normalizes_provider_ohlc_bounds():
+    df = pd.DataFrame([
+        {
+            "日期": "2026-04-20",
+            "开盘": 2.4,
+            "最高": 2.4,
+            "最低": 2.4,
+            "收盘": 2.43,
+            "成交量": 500,
+            "成交额": 1200,
+        }
+    ])
+
+    docs = _docs_from_hk_daily_df("80737", df, "test_source", end_date="20260420")
+
+    assert len(docs) == 1
+    assert docs[0]["high"] == 2.43
+    assert docs[0]["low"] == 2.4
+
+
+def test_docs_from_hk_daily_df_drops_zero_price_placeholders():
+    df = pd.DataFrame([
+        {
+            "日期": "2026-04-20",
+            "开盘": 0.0,
+            "最高": 0.0,
+            "最低": 0.0,
+            "收盘": 2.43,
+            "成交量": 0,
+            "成交额": 0,
+        }
+    ])
+
+    docs = _docs_from_hk_daily_df("80737", df, "test_source", end_date="20260420")
+
+    assert docs == []
+
+
 def test_write_daily_docs_batch_inserts_for_timeseries_collection():
     class InsertResult:
         def __init__(self, count):
@@ -207,7 +245,7 @@ def test_fetch_one_hk_daily_falls_back_when_hist_raises(monkeypatch):
 
     def fake_daily(symbol, adjust):
         assert symbol == "00700"
-        assert adjust == "qfq"
+        assert adjust == ""
         return pd.DataFrame([
             {
                 "date": "2026-04-20",

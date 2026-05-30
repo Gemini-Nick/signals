@@ -139,6 +139,18 @@ def _valid_hk_daily_doc(doc: dict[str, Any], *, end_date: str | None = None) -> 
         return False
     if end_date and dt.strftime("%Y%m%d") > str(end_date)[:8]:
         return False
+    prices = [doc.get(field) for field in ("open", "high", "low", "close")]
+    try:
+        if any(float(value) <= 0 for value in prices):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if doc.get("low") > doc.get("high"):
+        return False
+    if doc.get("open") > doc.get("high") or doc.get("open") < doc.get("low"):
+        return False
+    if doc.get("close") > doc.get("high") or doc.get("close") < doc.get("low"):
+        return False
     return is_trading_day("HK", dt.date())
 
 
@@ -152,6 +164,23 @@ def _pick_column(df: pd.DataFrame, *names: str) -> str | None:
         if found is not None:
             return found
     return None
+
+
+def _normalize_ohlc_bounds(open_value: Any, high_value: Any, low_value: Any, close_value: Any) -> dict[str, float] | None:
+    try:
+        values = {
+            "open": float(open_value),
+            "high": float(high_value),
+            "low": float(low_value),
+            "close": float(close_value),
+        }
+    except (TypeError, ValueError):
+        return None
+    if any(pd.isna(value) for value in values.values()):
+        return None
+    values["high"] = max(values.values())
+    values["low"] = min(values.values())
+    return values
 
 
 def _docs_from_hk_daily_df(code: str, df: pd.DataFrame, source: str, *, end_date: str | None = None) -> list[dict[str, Any]]:
@@ -173,6 +202,14 @@ def _docs_from_hk_daily_df(code: str, df: pd.DataFrame, source: str, *, end_date
     symbol = _hk_symbol(code)
     pure = _pure_hk_code(code)
     for _, row in df.iterrows():
+        prices = _normalize_ohlc_bounds(
+            row[columns["open"]],
+            row[columns["high"]],
+            row[columns["low"]],
+            row[columns["close"]],
+        )
+        if prices is None:
+            continue
         source_vol = row[columns["vol"]] if pd.notna(row[columns["vol"]]) else 0
         vol, source_volume_unit = normalize_stock_volume(source_vol, source=source, default_source_unit="shares")
         amount_col = columns.get("amount")
@@ -189,10 +226,10 @@ def _docs_from_hk_daily_df(code: str, df: pd.DataFrame, source: str, *, end_date
                 "source_volume_unit": source_volume_unit,
                 "source_vol": float(source_vol or 0),
             },
-            "open": float(row[columns["open"]]),
-            "high": float(row[columns["high"]]),
-            "low": float(row[columns["low"]]),
-            "close": float(row[columns["close"]]),
+            "open": prices["open"],
+            "high": prices["high"],
+            "low": prices["low"],
+            "close": prices["close"],
             "vol": vol,
             "amount": int(float(amount_value or 0)),
             "source": source,
@@ -427,11 +464,11 @@ def _fetch_tencent_hk_daily_df(code: str, start_date: str, end_date: str) -> pd.
     finally:
         session.close()
 
-    rows = (
-        payload.get("data", {}).get(website_symbol, {}).get("qfqday")
-        or payload.get("data", {}).get(website_symbol, {}).get("day")
-        or []
-    )
+    data = payload.get("data")
+    symbol_payload = data.get(website_symbol) if isinstance(data, dict) else {}
+    if not isinstance(symbol_payload, dict):
+        symbol_payload = {}
+    rows = symbol_payload.get("qfqday") or symbol_payload.get("day") or []
     parsed: list[dict[str, Any]] = []
     start_dt = datetime.strptime(start_date[:8], "%Y%m%d")
     end_dt = datetime.strptime(end_date[:8], "%Y%m%d")
@@ -457,7 +494,7 @@ def _fetch_tencent_hk_daily_df(code: str, start_date: str, end_date: str) -> pd.
 
 
 def _fetch_one_hk_daily(code: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
-    adjust = str(get_task_env("HK_STOCK_DAILY_ADJUST", os.getenv("HK_STOCK_DAILY_ADJUST", "qfq")) or "qfq")
+    adjust = str(get_task_env("HK_STOCK_DAILY_ADJUST", os.getenv("HK_STOCK_DAILY_ADJUST", "")) or "")
     source_errors: list[str] = []
     start_dt = datetime.strptime(start_date[:8], "%Y%m%d")
 

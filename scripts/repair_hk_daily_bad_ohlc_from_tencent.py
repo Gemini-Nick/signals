@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.audit_market_data_against_online import _num, _row_by_date, _website_tencent_hk_daily
+from signals.sync.modules.hk_stock_daily import _normalize_ohlc_bounds
 
 
 MONGO_URL = "mongodb://127.0.0.1:27017/signals"
@@ -37,15 +38,20 @@ def _bad_ohlc_query() -> dict[str, Any]:
     return {
         "meta.market": "HK",
         "meta.freq": "日线",
-        "$expr": {
-            "$or": [
-                {"$gt": ["$low", "$high"]},
-                {"$gt": ["$open", "$high"]},
-                {"$lt": ["$open", "$low"]},
-                {"$gt": ["$close", "$high"]},
-                {"$lt": ["$close", "$low"]},
-            ]
-        },
+        "$or": [
+            {"open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0},
+            {
+                "$expr": {
+                    "$or": [
+                        {"$gt": ["$low", "$high"]},
+                        {"$gt": ["$open", "$high"]},
+                        {"$lt": ["$open", "$low"]},
+                        {"$gt": ["$close", "$high"]},
+                        {"$lt": ["$close", "$low"]},
+                    ]
+                }
+            },
+        ],
     }
 
 
@@ -86,21 +92,18 @@ def _docs_for_symbol(db, symbol: str) -> list[dict[str, Any]]:
 
 
 def _doc_from_online(original: dict[str, Any], row) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    open_ = _num(row.get("开盘"))
-    high = _num(row.get("最高"))
-    low = _num(row.get("最低"))
-    close = _num(row.get("收盘"))
-    if any(value is None or value <= 0 for value in (open_, high, low, close)):
+    prices = _normalize_ohlc_bounds(row.get("开盘"), row.get("最高"), row.get("最低"), row.get("收盘"))
+    if prices is None or any(value <= 0 for value in prices.values()):
         return None, None
     corrected = {key: value for key, value in original.items() if key != "_id"}
     meta = dict(corrected.get("meta") or {})
     meta["source"] = "website_tencent_hk"
     corrected["meta"] = meta
     corrected["source"] = "website_tencent_hk"
-    corrected["open"] = open_
-    corrected["high"] = high
-    corrected["low"] = low
-    corrected["close"] = close
+    corrected["open"] = prices["open"]
+    corrected["high"] = prices["high"]
+    corrected["low"] = prices["low"]
+    corrected["close"] = prices["close"]
     online_vol = _num(row.get("成交量"))
     if online_vol is not None:
         corrected["vol"] = int(online_vol)
