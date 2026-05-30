@@ -305,6 +305,40 @@ def test_ma_alignment_marks_touched_close_below_fibonacci_ma_as_breakdown():
     assert "MA21触碰待确认" not in alignment["fib_array_summary"]
 
 
+def test_ma_alignment_marks_touched_close_above_but_weak_as_reclaim():
+    bars = []
+    dates = pd.date_range("2026-04-01", periods=22, freq="B")
+    for dt in dates[:-1]:
+        bars.append(_OhlcvBar(
+            dt=dt.to_pydatetime(),
+            open=10.0,
+            high=10.1,
+            low=9.95,
+            close=10.0,
+            vol=1000,
+        ))
+    bars.append(_OhlcvBar(
+        dt=dates[-1].to_pydatetime(),
+        open=10.5,
+        high=10.7,
+        low=9.95,
+        close=10.03,
+        vol=1200,
+    ))
+
+    alignment = _ma_alignment_from_daily_bars(bars)
+    ma20 = next(item for item in alignment["fib_ma_array"] if item["period"] == 20)
+
+    assert ma20["pullback_touch"] is True
+    assert ma20["pullback_acceptance"] is False
+    assert ma20["pullback_breakdown"] is False
+    assert ma20["touch_reclaim"] is True
+    assert ma20["interaction"] == "touch_reclaim"
+    assert 20 in alignment["fib_touch_reclaim_periods"]
+    assert "触线收回" in alignment["fib_array_summary"]
+    assert "回踩承接" not in alignment["fib_array_summary"]
+
+
 def test_doc_to_rawbar_preserves_market_naive_datetime():
     raw_dt = datetime(2026, 4, 30, 13, 30)
 

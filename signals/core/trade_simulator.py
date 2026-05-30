@@ -300,6 +300,13 @@ def simulate_trades(
 
     # 按时间排序
     buy_signals.sort(key=lambda s: s.get("dt", 0))
+    index_pos_by_ts: dict[int, int] = {}
+    index_pos_by_date: dict[str, int] = {}
+    for i, dt_idx in enumerate(df.index):
+        timestamp = int(pd.Timestamp(dt_idx).timestamp())
+        index_pos_by_ts[timestamp] = i
+        date_key = str(dt_idx.date()) if hasattr(dt_idx, 'date') else str(dt_idx)[:10]
+        index_pos_by_date[date_key] = i
 
     # 持仓状态: 同一时间只持有一个仓位
     in_position = False
@@ -314,21 +321,21 @@ def simulate_trades(
         sig_confidence = sig.get("confidence", 0)
 
         # 找到信号在 df 中的位置
-        sig_idx = None
-        for i, (dt_idx, row) in enumerate(df.iterrows()):
-            row_ts = int(pd.Timestamp(dt_idx).timestamp())
-            if row_ts == sig_dt:
-                sig_idx = i
-                break
+        sig_idx = index_pos_by_ts.get(int(sig_dt or 0))
+        if sig_idx is None and sig_date_str:
+            sig_idx = index_pos_by_date.get(str(sig_date_str)[:10])
         if sig_idx is None:
             # 尝试最近匹配
             try:
-                sig_idx = df.index.get_loc(
-                    pd.Timestamp(sig_date_str), method="nearest"
-                )
+                sig_idx = int(df.index.get_indexer([pd.Timestamp(sig_date_str)], method="nearest")[0])
+                if sig_idx < 0:
+                    sig_idx = None
             except Exception:
                 skip_counts["date_not_found"] = skip_counts.get("date_not_found", 0) + 1
                 continue
+        if sig_idx is None:
+            skip_counts["date_not_found"] = skip_counts.get("date_not_found", 0) + 1
+            continue
 
         # 检查是否还在持仓中
         if in_position and sig_idx <= position_exit_idx:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -25,6 +26,7 @@ from signals.core.market_time import (
     to_unix_seconds,
 )
 from signals.core.backtest_terminal import build_backtest_terminal
+from signals.core.chart_patterns import classify_latest_chart_pattern
 from signals.core.concept_carriers import load_industry_chains, non_chain_reason
 from signals.core.ma_levels import KEY_MA_COLORS, KEY_MA_PERIODS
 from signals.core.macro_universe import (
@@ -59,6 +61,7 @@ from .plan import _serialize_plan
 from .stock import analyze_stock
 
 router = APIRouter(prefix="/api/workbench", tags=["workbench"])
+logger = logging.getLogger(__name__)
 
 UI_FREQS = ["30min", "15min", "5min", "daily", "weekly"]
 DEFAULT_TERMINAL_FREQ = "daily"
@@ -378,11 +381,26 @@ def _build_shell_placeholder_payload(engine: Any, status: str, now: float, quote
     except Exception:
         session = {"ready": False}
     range_columns = _watchlist_range_columns()
+    major_indices = _macro_shell_raw_rows(MACRO_GROUP_MAJOR_INDICES)
+    industry_etfs = _macro_shell_raw_rows(MACRO_GROUP_INDUSTRY_ETFS)
+    focus_stocks = _terminal_stock_pool_raw_group_rows("focus_stocks", _shell_stock_group_display_cap("focus_stocks"))
+    risk_stocks = _terminal_stock_pool_raw_group_rows("risk_stocks", _shell_stock_group_display_cap("risk_stocks"))
+    watch_stocks = _terminal_stock_pool_raw_group_rows("watch_stocks", _shell_stock_group_display_cap("watch_stocks"))
+    clue_stocks = _terminal_stock_pool_raw_group_rows("clue_stocks", _shell_stock_group_display_cap("clue_stocks"))
+    manual_clues = _manual_clue_raw_rows(_shell_manual_clue_limit())
+    buy_candidates = _merge_stock_rows_by_symbol(manual_clues + clue_stocks)
+    trade_map = _build_trade_map(
+        sector_boards=[],
+        focus_stocks=focus_stocks,
+        watch_stocks=watch_stocks,
+        risk_stocks=risk_stocks,
+        clue_stocks=buy_candidates,
+    )
     return {
         "session": session,
         "market": None,
         "indices": [],
-        "buy_candidates": [],
+        "buy_candidates": buy_candidates,
         "sell_warnings": [],
         "cluster_summary": {
             "industry_top": [],
@@ -391,29 +409,52 @@ def _build_shell_placeholder_payload(engine: Any, status: str, now: float, quote
             "data_warning": "Signals shell 正在构建，稍后自动刷新。",
         },
         "watchlist_groups": {
-            "major_indices": [],
-            "industry_etfs": [],
-            "macro_indices": [],
+            "major_indices": major_indices,
+            "industry_etfs": industry_etfs,
+            "macro_indices": [*major_indices, *industry_etfs],
             "sector_boards": [],
-            "buy_candidates": [],
-            "focus_stocks": [],
-            "risk_stocks": [],
-            "watch_stocks": [],
+            "buy_candidates": buy_candidates,
+            "focus_stocks": focus_stocks,
+            "risk_stocks": risk_stocks,
+            "watch_stocks": watch_stocks,
         },
-        "watchlist_groups_meta": {},
+        "watchlist_groups_meta": {
+            "major_indices": {
+                "label": "大盘指数",
+                "source_collection": "macro_universe",
+                "count": len(major_indices),
+            },
+            "industry_etfs": {
+                "label": "行业ETF",
+                "source_collection": "macro_universe",
+                "count": len(industry_etfs),
+            },
+            "buy_candidates": {
+                "label": "线索池",
+                "source_collection": "terminal_manual_clues + terminal_stock_pool.clue_stocks",
+                "count": len(buy_candidates),
+            },
+            "focus_stocks": {
+                "label": "买点池",
+                "source_collection": "terminal_stock_pool.focus_stocks",
+                "count": len(focus_stocks),
+            },
+            "watch_stocks": {
+                "label": "盯盘池",
+                "source_collection": "terminal_stock_pool.watch_stocks",
+                "count": len(watch_stocks),
+            },
+            "risk_stocks": {
+                "label": "暂不参与",
+                "source_collection": "terminal_stock_pool.risk_stocks",
+                "count": len(risk_stocks),
+            },
+        },
         "watchlist": [],
         "watchlist_range_columns": range_columns,
         "kline_cache_coverage": {},
         "sync_lanes": {},
-        "trade_map": {
-            "as_of": _day_change_expected_day(),
-            "day_change_mode": _a_day_change_mode(),
-            "headline": "",
-            "items": [],
-            "role_filters": TRADE_ROLE_FILTERS,
-            "role_definitions": TRADE_ROLE_DEFINITIONS,
-            "role_counts": {item["key"]: 0 for item in TRADE_ROLE_FILTERS if item["key"] != "all"},
-        },
+        "trade_map": trade_map,
         "ai_alerts": [],
         "command_suggestions": [],
         "daily_brief": {},
@@ -1929,35 +1970,48 @@ def _current_timeframe_ma_state(chart: dict[str, Any], freq: Any = "") -> dict[s
     rows = [row for row in ohlcv if isinstance(row, dict) and _float(row.get("close")) is not None]
     if len(rows) < 5:
         return {}
-    closes = [_float(row.get("close"), 0) or 0 for row in rows]
     latest = rows[-1]
-    latest_close = closes[-1]
-    ma5 = sum(closes[-5:]) / 5
-    if ma5 <= 0 or latest_close >= ma5:
+    pattern = classify_latest_chart_pattern(rows, bucket)
+    primary = pattern.get("primary_chart_signal") if isinstance(pattern, dict) else {}
+    if not isinstance(primary, dict) or not primary.get("signal_type"):
         return {}
     latest_ts = int(latest.get("time") or 0)
     symbol = _text(chart.get("symbol"))
     source = _text(chart_meta.get("source"))
     market = _text(chart_meta.get("market")) or infer_market(symbol=symbol, source=source)
     date_text = _timestamp_date(latest_ts, market=market, symbol=symbol, source=source) if latest_ts else ""
+    level_interactions = pattern.get("level_interactions") if isinstance(pattern.get("level_interactions"), list) else []
+    primary_level = primary.get("level") if isinstance(primary.get("level"), dict) else {}
+    ma5_level = next(
+        (item for item in level_interactions if isinstance(item, dict) and int(item.get("period") or 0) == 5),
+        {},
+    )
+    latest_close = _float(latest.get("close"), _float(primary_level.get("latest_close"), 0)) or 0
     line_label = _ma5_line_label(bucket)
-    distance_pct = (latest_close - ma5) / ma5 * 100
-    if bucket == "weekly":
+    signal_type = _text(primary.get("signal_type"))
+    if signal_type == f"未站稳{line_label}" and bucket == "weekly":
         summary = f"{_weekly_close_subject(date_text)}没站稳{line_label}"
-    else:
+    elif signal_type == f"未站稳{line_label}":
         summary = f"收盘价没站稳{line_label}"
-    detail = f"收盘 {latest_close:.2f} < {line_label} {ma5:.2f}，差 {distance_pct:+.2f}%"
+    else:
+        summary = _text(primary.get("label")) or signal_type
+    detail = _text(primary.get("details"))
+    ma5_value = _float(ma5_level.get("value"))
+    ma5_distance = _float(ma5_level.get("distance_pct"))
     return {
         "summary": summary,
-        "signal_type": f"未站稳{line_label}",
+        "signal_type": signal_type,
         "details": detail,
         "freq": bucket,
         "date_str": date_text,
         "dt": latest_ts,
         "price": round(latest_close, 4),
-        "ma5": round(ma5, 4),
+        "ma5": round(ma5_value, 4) if ma5_value is not None else None,
         "latest_close": round(latest_close, 4),
-        "distance_pct": round(distance_pct, 4),
+        "distance_pct": round(ma5_distance, 4) if ma5_distance is not None else None,
+        "signal_side": _text(primary.get("side")) or "sell",
+        "priority": int(primary.get("priority") or 0),
+        "chart_pattern": pattern,
     }
 
 
@@ -1971,14 +2025,14 @@ def _current_timeframe_ma_signal(chart: dict[str, Any], freq: Any = "") -> dict[
         "type": state["signal_type"],
         "signal_type": state["signal_type"],
         "price": state["price"],
-        "confidence": 0.76,
+        "confidence": 0.86 if state.get("priority", 0) >= 80 else 0.76,
         "freq": state["freq"],
         "details": state["details"],
         "source": "workbench.current_timeframe_ma",
         "pool_status": "current_timeframe_ma",
         "chart_aligned": True,
         "display_scope": "current_timeframe",
-        "signal_side": "sell",
+        "signal_side": state.get("signal_side") or "sell",
         "signal_family": "ma_state",
         "ma_state": state,
     }
@@ -1997,15 +2051,19 @@ def _signal_or_fallback(row: dict[str, Any], df: pd.DataFrame) -> str:
     return _ma_signal_from_df(df)
 
 
-def _index_weekly_ma_state(symbol: str) -> dict[str, Any]:
+def _index_chart_pattern_state(symbol: str, freq: str) -> dict[str, Any]:
     if not _text(symbol):
         return {}
     try:
-        weekly_df, source = _index_df(symbol, "weekly")
-        chart = _chart_from_df(weekly_df, symbol=symbol, freq="weekly", source=source)
-        return _current_timeframe_ma_state(chart, "weekly")
+        df, source = _index_df(symbol, freq)
+        chart = _chart_from_df(df, symbol=symbol, freq=freq, source=source)
+        return _current_timeframe_ma_state(chart, freq)
     except Exception:
         return {}
+
+
+def _index_weekly_ma_state(symbol: str) -> dict[str, Any]:
+    return _index_chart_pattern_state(symbol, "weekly")
 
 
 def _index_key_signal(row: dict[str, Any], symbol: str, daily_df: pd.DataFrame) -> tuple[str, dict[str, Any]]:
@@ -2020,9 +2078,21 @@ def _index_key_signal(row: dict[str, Any], symbol: str, daily_df: pd.DataFrame) 
     has_explicit = any(value and value.lower() not in {"none", "n/a"} and value != "无" for value in raw_explicit)
     if has_explicit and explicit:
         return explicit, {}
-    weekly_ma = _index_weekly_ma_state(symbol)
-    if weekly_ma.get("signal_type"):
-        return _text(weekly_ma.get("signal_type")), weekly_ma
+    states = [
+        _index_chart_pattern_state(symbol, "daily"),
+        _index_chart_pattern_state(symbol, "weekly"),
+    ]
+    states = [state for state in states if state.get("signal_type")]
+    if states:
+        selected = sorted(
+            states,
+            key=lambda item: (
+                int(item.get("priority") or 0),
+                1 if _text(item.get("freq")) == "weekly" else 0,
+            ),
+            reverse=True,
+        )[0]
+        return _text(selected.get("signal_type")), selected
     return explicit, {}
 
 
@@ -2831,6 +2901,19 @@ def _enrich_shell_stock_row(
         if "require_range_returns" not in str(exc):
             raise
         return _enrich_stock_row(row, range_columns, lightweight=True)
+    except RuntimeError as exc:
+        message = str(exc)
+        if not message.startswith("range_returns_"):
+            raise
+        enriched = _enrich_stock_row(
+            row,
+            range_columns,
+            lightweight=True,
+            require_range_returns=False,
+        )
+        enriched["range_return_status"] = _text(enriched.get("range_return_status")) or message.split(":", 1)[0]
+        enriched["range_return_error"] = message
+        return enriched
 
 
 def _chain_position_from_membership_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -2963,6 +3046,8 @@ def _slim_shell_fib_ma_item(item: Any) -> dict[str, Any]:
         "pullback_touch",
         "pullback_acceptance",
         "pullback_breakdown",
+        "touch_reclaim",
+        "interaction",
         "distance_pct",
         "low_distance_pct",
         "touch_distance_pct",
@@ -2990,6 +3075,7 @@ def _slim_shell_ma_alignment(value: Any) -> dict[str, Any]:
         "fib_accept_periods",
         "fib_touch_periods",
         "fib_breakdown_periods",
+        "fib_touch_reclaim_periods",
         "fib_array_summary",
         "fib_support_score",
         "score",
@@ -3861,7 +3947,12 @@ def _slim_shell_sector_row(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) -> dict[str, Any]:
+def _enrich_index_row(
+    row: dict[str, Any],
+    range_columns: list[dict[str, Any]],
+    *,
+    include_range_returns: bool = True,
+) -> dict[str, Any]:
     symbol = str(row.get("symbol") or row.get("code") or row.get("label") or row.get("name") or "").strip()
     df, source = _index_df(symbol, "daily") if symbol else (pd.DataFrame(), "")
     buy_timeframes, sell_timeframes = _index_timeframe_signal_entries(row)
@@ -3906,8 +3997,9 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         "latest_signal": key_signal,
         "buy_timeframes": buy_timeframes,
         "sell_timeframes": sell_timeframes,
-        "range_returns": _compute_range_returns(df, range_columns),
+        "range_returns": _compute_range_returns(df, range_columns) if include_range_returns else {},
         "range_return_source": source,
+        "range_return_status": "ok" if include_range_returns else "lazy",
         "available_freqs": UI_FREQS,
         "target_kind": "index",
         "target_label": row.get("name") or row.get("label") or symbol,
@@ -3918,7 +4010,11 @@ def _enrich_index_row(row: dict[str, Any], range_columns: list[dict[str, Any]]) 
         enriched.update(ma_fields)
     if key_ma_state:
         enriched["current_timeframe_ma"] = key_ma_state
-        enriched["signal_detail"] = key_ma_state.get("summary") or key_ma_state.get("details")
+        signal_type = _text(key_ma_state.get("signal_type"))
+        if signal_type.startswith("未站稳"):
+            enriched["signal_detail"] = key_ma_state.get("summary") or key_ma_state.get("details")
+        else:
+            enriched["signal_detail"] = key_ma_state.get("details") or key_ma_state.get("summary")
     return _apply_quote_overlay(enriched, symbol)
 
 
@@ -5589,7 +5685,8 @@ def _build_macro_index_rows(
         if key in seen:
             continue
         seen.add(key)
-        row = dict(reports_by_name.get(name) or reports_by_symbol.get(symbol.lower()) or {
+        source_report = reports_by_name.get(name) or reports_by_symbol.get(symbol.lower())
+        row = dict(source_report or {
             "name": name,
             "label": name,
             "symbol": symbol,
@@ -5598,21 +5695,48 @@ def _build_macro_index_rows(
         row.setdefault("name", name)
         row.setdefault("label", name)
         row.setdefault("symbol", symbol)
-        if kind == "stock":
+        if not source_report and kind != "stock" and not _macro_shell_fallback_load_enabled():
+            daily_df, daily_source = _index_df(symbol, "daily") if symbol else (pd.DataFrame(), "")
+            key_signal, key_ma_state = _index_key_signal({}, symbol, daily_df)
+            latest_price = (
+                float(daily_df["close"].iloc[-1])
+                if daily_df is not None and not daily_df.empty and "close" in daily_df.columns
+                else None
+            )
+            enriched = {
+                **row,
+                "kind": "index",
+                "latest_price": latest_price,
+                "latest_signal": key_signal or "待观察",
+                "range_returns": {},
+                "range_return_source": daily_source,
+                "range_return_status": "lazy",
+            }
+            if key_ma_state:
+                enriched["current_timeframe_ma"] = key_ma_state
+                signal_type = _text(key_ma_state.get("signal_type"))
+                if signal_type.startswith("未站稳"):
+                    enriched["signal_detail"] = key_ma_state.get("summary") or key_ma_state.get("details")
+                else:
+                    enriched["signal_detail"] = key_ma_state.get("details") or key_ma_state.get("summary")
+            target_kind = "index"
+            target_label = name
+            target_symbol = symbol
+        elif kind == "stock":
             enriched = _enrich_stock_row({
                 **row,
                 "name": name,
                 "label": symbol,
                 "symbol": symbol,
                 "kind": "stock",
-            }, range_columns)
+            }, range_columns, lightweight=True, require_range_returns=False)
             if not enriched.get("latest_price"):
                 continue
             target_kind = "stock"
             target_label = enriched.get("symbol") or symbol
             target_symbol = enriched.get("symbol") or symbol
         else:
-            enriched = _enrich_index_row(row, range_columns)
+            enriched = _enrich_index_row(row, range_columns, include_range_returns=False)
             if not enriched.get("latest_price"):
                 continue
             target_kind = "index"
@@ -5629,9 +5753,7 @@ def _build_macro_index_rows(
             "trader_action": "观察关键指数方向和主题共振",
             "invalidates_when": "指数跌破对应周期防守均线或主题扩散失败",
             "theme_tags": MINGDAO_INDEX_THEMES.get(name, []),
-            "latest_signal": enriched.get("latest_signal") or (
-                _signal_or_fallback(row, _index_df(symbol, "daily")[0] if kind != "stock" else _stock_df(str(target_symbol), "daily")[0])
-            ),
+            "latest_signal": enriched.get("latest_signal") or "待观察",
             "signal_stack": {
                 "daily": row.get("daily_latest_signal") or "",
                 "30min": row.get("f30_latest_signal") or "",
@@ -5643,6 +5765,43 @@ def _build_macro_index_rows(
             "target_freq": DEFAULT_TERMINAL_FREQ,
         })
         rows.append(enriched)
+    return rows
+
+
+def _macro_shell_fallback_load_enabled() -> bool:
+    return _text(os.getenv("WORKBENCH_MACRO_SHELL_LOAD_FALLBACK")).lower() in {"1", "true", "yes", "on"}
+
+
+def _macro_shell_raw_rows(macro_group: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in MINGDAO_MACRO_WATCHLIST:
+        if _text(item.get("macro_group")) != macro_group:
+            continue
+        name = _text(item.get("name"))
+        symbol = _text(item.get("symbol"))
+        kind = _text(item.get("kind")) or ("stock" if "." in symbol else "index")
+        normalized, raw_code = _normalize_stock_symbol(symbol) if kind == "stock" else ("", "")
+        target_symbol = normalized or symbol
+        rows.append({
+            "kind": kind,
+            "label": name or target_symbol,
+            "name": name or target_symbol,
+            "symbol": target_symbol,
+            "code": target_symbol,
+            "raw_code": raw_code or target_symbol.split(".")[-1],
+            "macro_group": macro_group,
+            "macro_group_label": macro_group_label(macro_group),
+            "display_type_label": macro_group_type_label(macro_group),
+            "lane": "quote_lane",
+            "second_screen_role": "market_direction_anchor",
+            "latest_signal": "待观察",
+            "range_returns": {},
+            "range_return_status": "lazy",
+            "target_kind": kind,
+            "target_label": target_symbol if kind == "stock" else (name or target_symbol),
+            "target_symbol": target_symbol,
+            "target_freq": DEFAULT_TERMINAL_FREQ,
+        })
     return rows
 
 
@@ -6526,6 +6685,14 @@ def _chain_heat_max_nodes_per_chain() -> int:
 
 def _chain_heat_shell_graph_enabled() -> bool:
     return _text(os.getenv("WORKBENCH_CHAIN_HEAT_SHELL_GRAPH")).lower() in {"1", "true", "yes", "on"}
+
+
+def _chain_heat_shell_range_returns_enabled() -> bool:
+    return _text(os.getenv("WORKBENCH_CHAIN_HEAT_SHELL_RANGE_RETURNS")).lower() in {"1", "true", "yes", "on"}
+
+
+def _chain_heat_shell_theme_rows_enabled() -> bool:
+    return _text(os.getenv("WORKBENCH_CHAIN_HEAT_SHELL_THEME_ROWS")).lower() in {"1", "true", "yes", "on"}
 
 
 def _chain_representative_quote_rows(docs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -7430,14 +7597,16 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         return []
     rows: list[dict[str, Any]] = []
     range_columns = _watchlist_range_columns()
+    range_returns_enabled = _chain_heat_shell_range_returns_enabled()
     range_targets: list[tuple[str, str]] = []
-    for doc in docs:
-        integrated = doc.get("integrated_domains") if isinstance(doc.get("integrated_domains"), list) else []
-        primary = integrated[0] if integrated and isinstance(integrated[0], dict) else {}
-        target_kind = _text(primary.get("kind")) or "industry"
-        target_label = _text(primary.get("name")) or _text(doc.get("node_name") or doc.get("chain_name"))
-        range_targets.append((target_kind, target_label))
-    range_lookup = _board_heat_range_returns_batch(range_targets, range_columns)
+    if range_returns_enabled:
+        for doc in docs:
+            integrated = doc.get("integrated_domains") if isinstance(doc.get("integrated_domains"), list) else []
+            primary = integrated[0] if integrated and isinstance(integrated[0], dict) else {}
+            target_kind = _text(primary.get("kind")) or "industry"
+            target_label = _text(primary.get("name")) or _text(doc.get("node_name") or doc.get("chain_name"))
+            range_targets.append((target_kind, target_label))
+    range_lookup = _board_heat_range_returns_batch(range_targets, range_columns) if range_targets else {}
     for doc in docs:
         integrated = doc.get("integrated_domains") if isinstance(doc.get("integrated_domains"), list) else []
         primary = integrated[0] if integrated and isinstance(integrated[0], dict) else {}
@@ -7482,7 +7651,8 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         day_change_as_of = doc_trade_day
         day_change_pct = _float(doc.get("change_pct")) if day_change_as_of == _day_change_expected_day() else None
         range_key = (_normalize_board_heat_kind(target_kind), target_label)
-        range_returns, range_source, range_meta = range_lookup.get(range_key, ({}, "", {"status": "missing_target"}))
+        missing_range_status = "missing_target" if range_returns_enabled else "lazy"
+        range_returns, range_source, range_meta = range_lookup.get(range_key, ({}, "", {"status": missing_range_status}))
         row = {
             **doc,
             **display_context,
@@ -7567,10 +7737,11 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             },
         }
         rows.append(row)
-    try:
-        rows.extend(_non_chain_theme_sector_rows(db, limit=4))
-    except Exception:
-        pass
+    if _chain_heat_shell_theme_rows_enabled():
+        try:
+            rows.extend(_non_chain_theme_sector_rows(db, limit=4))
+        except Exception:
+            pass
     rows.sort(key=lambda item: (_float(item.get("display_rank_score"), 0) or 0, _float(item.get("heat_score"), 0) or 0), reverse=True)
     return rows[:limit]
 
@@ -7637,18 +7808,121 @@ def _refresh_realtime_quotes_for_rows(
 
 def _shell_stock_range_return_limit(group: str) -> int:
     defaults = {
-        "focus_stocks": 24,
-        "risk_stocks": 8,
-        "watch_stocks": 16,
-        "clue_stocks": 12,
-        "manual_clues": 3,
-        "scored_stocks": 12,
+        "focus_stocks": 6,
+        "risk_stocks": 3,
+        "watch_stocks": 4,
+        "clue_stocks": 3,
+        "manual_clues": 0,
+        "scored_stocks": 3,
     }
     env_name = f"TERMINAL_WORKBENCH_{group.upper()}_RANGE_RETURN_LIMIT"
     try:
         return max(0, int(os.getenv(env_name, str(defaults.get(group, 12)))))
     except (TypeError, ValueError):
         return defaults.get(group, 12)
+
+
+def _shell_stock_group_display_cap(group: str) -> int:
+    defaults = {
+        "focus_stocks": 36,
+        "risk_stocks": 12,
+        "watch_stocks": 24,
+        "clue_stocks": 24,
+    }
+    env_name = f"TERMINAL_WORKBENCH_{group.upper()}_SHELL_CAP"
+    try:
+        return max(1, int(os.getenv(env_name, str(defaults.get(group, 24)))))
+    except (TypeError, ValueError):
+        return defaults.get(group, 24)
+
+
+def _raw_shell_stock_row(item: dict[str, Any], *, group: str) -> dict[str, Any]:
+    symbol = _text(item.get("symbol") or item.get("code") or item.get("raw_code") or item.get("label"))
+    normalized, raw_code = _normalize_stock_symbol(symbol)
+    normalized = normalized or symbol
+    pool_defaults = {
+        "focus_stocks": ("focus", "confirmed_entry", "买点池", "entry_ready"),
+        "watch_stocks": ("watch", "watch_pool", "盯盘池", "watch"),
+        "clue_stocks": ("clue_pool", "clue_pool", "线索池", "manual_review"),
+        "manual_clues": ("clue_pool", "clue_pool", "线索池", "manual_review"),
+    }
+    pool_type, trade_stage, stage_label, action_status = pool_defaults.get(group, ("watch", "watch_pool", "观察", "watch"))
+    row = dict(item)
+    row.update({
+        "kind": "stock",
+        "label": normalized,
+        "symbol": normalized,
+        "code": normalized,
+        "raw_code": raw_code or normalized.split(".")[-1],
+        "name": _text(item.get("name")) or normalized,
+        "pool_type": _text(item.get("pool_type")) or pool_type,
+        "trade_stage": _text(item.get("trade_stage")) or trade_stage,
+        "stage_label": _text(item.get("stage_label")) or stage_label,
+        "action_status": _text(item.get("action_status")) or action_status,
+        "latest_signal": _text(item.get("latest_signal") or item.get("reason")) or stage_label,
+        "range_returns": {},
+        "range_return_status": _text(item.get("range_return_status")) or "lazy",
+        "target_kind": "stock",
+        "target_label": normalized,
+        "target_symbol": normalized,
+        "target_freq": DEFAULT_TERMINAL_FREQ,
+    })
+    return row
+
+
+def _terminal_stock_pool_raw_group_rows(group: str, limit: int) -> list[dict[str, Any]]:
+    try:
+        db = _mongo_db()
+        doc = db["terminal_stock_pool"].find_one(
+            {"pool": "terminal_stock_pool", "market": "A"},
+            {
+                "stocks": 1,
+                "focus_stocks": 1,
+                "risk_stocks": 1,
+                "watch_stocks": 1,
+                "clue_stocks": 1,
+            },
+            sort=[("updated_at", -1)],
+        ) or {}
+    except Exception:
+        return []
+    source_rows = doc.get(group)
+    if source_rows is None and group == "focus_stocks":
+        source_rows = doc.get("stocks")
+    rows: list[dict[str, Any]] = []
+    for item in source_rows or []:
+        if not isinstance(item, dict):
+            continue
+        row = _raw_shell_stock_row(item, group=group)
+        if not _text(row.get("symbol")):
+            continue
+        rows.append(row)
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _manual_clue_raw_rows(limit: int) -> list[dict[str, Any]]:
+    try:
+        db = _mongo_db()
+        docs = list(db["terminal_manual_clues"].find(
+            {"active": {"$ne": False}},
+            {"_id": 0, "symbol": 1, "raw_code": 1, "name": 1, "reason": 1, "updated_at": 1},
+        ).sort([("updated_at", -1), ("created_at", -1)]).limit(limit))
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for doc in docs:
+        if isinstance(doc, dict):
+            row = _raw_shell_stock_row(doc, group="manual_clues")
+            row.update({
+                "source_collection": "terminal_manual_clues",
+                "source_tags": ["用户探索", "临时线索"],
+                "manual_clue": True,
+                "deletable": True,
+            })
+            rows.append(row)
+    return rows
 
 
 def _shell_manual_clue_limit() -> int:
@@ -7660,9 +7934,9 @@ def _shell_manual_clue_limit() -> int:
 
 def _shell_manual_clue_decision_limit() -> int:
     try:
-        return max(0, int(os.getenv("TERMINAL_WORKBENCH_MANUAL_CLUE_DECISION_LIMIT", "3")))
+        return max(0, int(os.getenv("TERMINAL_WORKBENCH_MANUAL_CLUE_DECISION_LIMIT", "0")))
     except (TypeError, ValueError):
-        return 3
+        return 0
 
 
 def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: str = "focus_stocks", limit: Optional[int] = None) -> list[dict[str, Any]]:
@@ -8571,10 +8845,25 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     industry_top = snapshot_cluster.get("industry_top") or _gateway_rank_rows("board", top=8)
     concept_top = snapshot_cluster.get("concept_top") or _gateway_rank_rows("concept", top=8)
     sector_boards = _chain_heat_sector_rows()
-    focus_stocks = _terminal_stock_pool_rows(range_columns)
-    risk_stocks = _terminal_stock_pool_group_rows(range_columns, "risk_stocks")
-    watch_stocks = _terminal_stock_pool_group_rows(range_columns, "watch_stocks")
-    clue_stocks = _terminal_stock_pool_group_rows(range_columns, "clue_stocks")
+    focus_stocks = _terminal_stock_pool_rows(
+        range_columns,
+        limit=_shell_stock_group_display_cap("focus_stocks"),
+    )
+    risk_stocks = _terminal_stock_pool_group_rows(
+        range_columns,
+        "risk_stocks",
+        limit=_shell_stock_group_display_cap("risk_stocks"),
+    )
+    watch_stocks = _terminal_stock_pool_group_rows(
+        range_columns,
+        "watch_stocks",
+        limit=_shell_stock_group_display_cap("watch_stocks"),
+    )
+    clue_stocks = _terminal_stock_pool_group_rows(
+        range_columns,
+        "clue_stocks",
+        limit=_shell_stock_group_display_cap("clue_stocks"),
+    )
     manual_clues = _manual_clue_rows(
         range_columns,
         limit=_shell_manual_clue_limit(),
@@ -8742,6 +9031,8 @@ def _refresh_shell_cache_once(engine: Any) -> None:
             "expires_at": refreshed_now + ttl_seconds,
             "quote_watermark": quote_watermark,
         })
+    except Exception:
+        logger.exception("Workbench shell cache refresh failed")
     finally:
         _SHELL_CACHE_LOCK.release()
 

@@ -6,8 +6,12 @@
 """
 import logging
 import math
+import os
 import traceback
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -1083,13 +1087,20 @@ def _detect_macd(df: pd.DataFrame, symbol: str, freq_label: str, lookback: int) 
 # 缠论信号检测
 # ─────────────────────────────────────────────────────
 
-def _detect_czsc(df: pd.DataFrame, symbol: str, freq_label: str, lookback: int = 999) -> tuple:
+def _detect_czsc(
+    df: pd.DataFrame,
+    symbol: str,
+    freq_label: str,
+    lookback: int = 999,
+    *,
+    include_auxiliary: bool = True,
+) -> tuple:
     """
     运行缠论信号检测，返回 (signals_list, bi_list, zhongshu_list)。
     对历史前缀滚动构建 CZSC 对象，避免只拿到最后一个结构信号。
     """
     from czsc import CZSC, RawBar, Freq
-    from signals.core.detectors import detect_all_signals
+    from signals.core.detectors import detect_all_signals, detect_structural_signals
 
     freq_map = {"日线": Freq.D, "周线": Freq.W, "月线": Freq.M}
     freq_enum = freq_map.get(freq_label, Freq.D)
@@ -1107,13 +1118,16 @@ def _detect_czsc(df: pd.DataFrame, symbol: str, freq_label: str, lookback: int =
     if len(bars) < 35:
         return [], [], []
 
-    czsc_obj = CZSC(bars, max_bi_num=200)
     scan_start = max(35, len(bars) - max(int(lookback or 0), 1))
+    start_end = max(scan_start, 35)
+    rolling_obj = CZSC(bars[:start_end], max_bi_num=200)
+    detector = detect_all_signals if include_auxiliary else detect_structural_signals
     signals_by_key: dict[tuple[str, str], dict[str, Any]] = {}
-    for end in range(scan_start, len(bars) + 1):
+    for end in range(start_end, len(bars) + 1):
         try:
-            rolling_obj = CZSC(bars[:end], max_bi_num=200)
-            events = detect_all_signals(rolling_obj, symbol)
+            if end > start_end:
+                rolling_obj.update(bars[end - 1])
+            events = detector(rolling_obj, symbol)
         except Exception:
             continue
 
@@ -1130,6 +1144,10 @@ def _detect_czsc(df: pd.DataFrame, symbol: str, freq_label: str, lookback: int =
 
             date_str = ev.dt.strftime("%Y-%m-%d") if hasattr(ev.dt, "strftime") else str(ev.dt)[:10]
             key = (date_str, ev.signal_type)
+            confidence = float(ev.confidence or 0)
+            existing = signals_by_key.get(key)
+            if existing and confidence <= float(existing.get("confidence") or 0):
+                continue
             row = {
                 "dt": _dt_to_unix(ev.dt),
                 "date_str": date_str,
@@ -1140,15 +1158,13 @@ def _detect_czsc(df: pd.DataFrame, symbol: str, freq_label: str, lookback: int =
                 "details": ev.details,
                 "eval": _compute_forward_eval(df, sig_idx),
             }
-            existing = signals_by_key.get(key)
-            if not existing or float(row.get("confidence") or 0) >= float(existing.get("confidence") or 0):
-                signals_by_key[key] = row
+            signals_by_key[key] = row
 
     signals = sorted(signals_by_key.values(), key=lambda item: item["dt"])
 
     # 序列化笔线
     bi_list = []
-    for bi in czsc_obj.bi_list:
+    for bi in rolling_obj.bi_list:
         bi_list.append({
             "sdt": _dt_to_unix(bi.fx_a.dt),
             "edt": _dt_to_unix(bi.fx_b.dt),
@@ -1159,7 +1175,7 @@ def _detect_czsc(df: pd.DataFrame, symbol: str, freq_label: str, lookback: int =
         })
 
     # 序列化中枢（从笔中提取）
-    zhongshu = _extract_zhongshu(czsc_obj)
+    zhongshu = _extract_zhongshu(rolling_obj)
 
     return signals, bi_list, zhongshu
 
@@ -1328,7 +1344,13 @@ def _detect_all_signals(df, symbol, freq_label, signal_group, lookback, factor,
 
     if signal_group in ("czsc", "all"):
         try:
-            czsc_sigs, bi_list, zhongshu = _detect_czsc(df, symbol, freq_label, lookback=lookback)
+            czsc_sigs, bi_list, zhongshu = _detect_czsc(
+                df,
+                symbol,
+                freq_label,
+                lookback=lookback,
+                include_auxiliary=signal_group != "all",
+            )
             all_signals.extend(czsc_sigs)
         except Exception as czsc_err:
             logger.warning("缠论信号检测失败: %s", czsc_err)
@@ -2277,6 +2299,116 @@ async def backtest_export(
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+def _batch_worker_count(total_codes: int) -> int:
+    if total_codes <= 1:
+        return 1
+    try:
+        configured = int(os.getenv("SIGNALS_BACKTEST_BATCH_WORKERS", "0"))
+    except ValueError:
+        configured = 0
+    if configured > 0:
+        return max(1, min(total_codes, configured))
+    cpu_count = os.cpu_count() or 4
+    return max(1, min(total_codes, max(2, min(8, cpu_count))))
+
+
+def _resolve_batch_stock_name(resolver: Any, symbol: str, code: str) -> str:
+    if resolver is None:
+        return code
+    try:
+        return resolver.get_name(symbol)
+    except Exception:
+        return code
+
+
+def _batch_stock_result(
+    code: str,
+    *,
+    freq: str,
+    signal_group: str,
+    lookback: int,
+    factor: str,
+    gap_pct_min: float,
+    volume_ratio_min: float,
+    trend_lookback: int,
+    bb_period: int,
+    squeeze_threshold: float,
+    run_count: int,
+    body_ratio: float,
+    accel_count: int,
+    sim_config: Any,
+    resolver: Any,
+) -> dict[str, Any]:
+    from signals.core.trade_simulator import simulate_trades
+
+    code = _plain_stock_code(code)
+    stock_result: dict[str, Any] = {"code": code, "status": "ok"}
+    try:
+        freq_norm = _normalize_freq(freq)
+        freq_label = _freq_label(freq_norm)
+        if _is_unsupported_backtest_code(code):
+            symbol = f"BJ.{code}"
+            stock_result.update({
+                "status": "error",
+                "symbol": symbol,
+                "market": "BJ",
+                "freq": freq_label,
+                "error": "北交所/新三板标的暂不支持当前回测数据源",
+                "name": _resolve_batch_stock_name(resolver, symbol, code),
+            })
+            return stock_result
+
+        market = _detect_market(code)
+        symbol = _build_symbol(code, market)
+        stock_result.update({
+            "symbol": symbol,
+            "market": market,
+            "freq": freq_label,
+            "name": _resolve_batch_stock_name(resolver, symbol, code),
+        })
+
+        df = _fetch_kline(code, market, freq_norm)
+        if df.empty:
+            stock_result["status"] = "error"
+            stock_result["error"] = "无可用数据"
+            return stock_result
+        if lookback > 0 and len(df) > lookback:
+            df = df.tail(lookback).copy()
+
+        meta = _kline_meta(df, freq_norm)
+        stock_result.update(meta)
+        stock_result["bar_count"] = int(len(df))
+        stock_result["ohlcv_tail"] = _serialize_ohlcv(df.tail(520))
+
+        all_signals, _, _, _ = _detect_all_signals(
+            df, symbol, freq_label, signal_group, lookback, factor,
+            gap_pct_min, volume_ratio_min, trend_lookback, bb_period, squeeze_threshold,
+            run_count=run_count, body_ratio=body_ratio, accel_count=accel_count,
+        )
+        sim = simulate_trades(df, all_signals, sim_config)
+        kpi = sim.kpi
+        stock_result["signal_count"] = len(all_signals)
+        stock_result["trade_count"] = kpi.get("filled_trades", 0)
+        stock_result["win_rate"] = kpi.get("win_rate", 0)
+        stock_result["expectancy"] = kpi.get("expectancy", 0)
+        stock_result["total_return"] = kpi.get("total_return_pct", 0)
+        stock_result["max_drawdown"] = kpi.get("max_drawdown_pct", 0)
+        stock_result["sharpe"] = kpi.get("sharpe", 0)
+        stock_result["avg_hold_days"] = kpi.get("avg_hold_days", 0)
+        stock_result["signal_breakdown"] = _batch_signal_breakdown(
+            code,
+            stock_result.get("name") or code,
+            all_signals,
+            sim.trades,
+        )
+    except Exception as e:
+        stock_result["status"] = "error"
+        stock_result["error"] = str(e)[:100]
+        logger.warning("批量回测 %s 失败: %s", code, e)
+
+    return stock_result
+
+
 @router.post("/batch")
 async def backtest_batch(request: Request):
     """
@@ -2360,110 +2492,46 @@ async def backtest_batch(request: Request):
         except Exception:
             resolver = None
 
-        # 逐股执行
-        stocks = []
-        total_signals = 0
-        total_trades = 0
-        total_wins = 0
-        total_evaluated = 0
+        worker_count = _batch_worker_count(len(codes))
+        worker = partial(
+            _batch_stock_result,
+            freq=freq,
+            signal_group=signal_group,
+            lookback=lookback,
+            factor=factor,
+            gap_pct_min=gap_pct_min,
+            volume_ratio_min=volume_ratio_min,
+            trend_lookback=trend_lookback,
+            bb_period=bb_period,
+            squeeze_threshold=squeeze_threshold,
+            run_count=run_count,
+            body_ratio=body_ratio_val,
+            accel_count=accel_count,
+            sim_config=sim_config,
+            resolver=resolver,
+        )
+        if worker_count <= 1:
+            stocks = [worker(code) for code in codes]
+        else:
+            loop = asyncio.get_running_loop()
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="signals-backtest") as executor:
+                stocks = await asyncio.gather(*[
+                    loop.run_in_executor(executor, worker, code)
+                    for code in codes
+                ])
 
-        for code in codes:
-            code = _plain_stock_code(code)
-            stock_result = {"code": code, "status": "ok"}
-            try:
-                freq_norm = _normalize_freq(freq)
-                freq_label = _freq_label(freq_norm)
-                if _is_unsupported_backtest_code(code):
-                    symbol = f"BJ.{code}"
-                    stock_result.update({
-                        "status": "error",
-                        "symbol": symbol,
-                        "market": "BJ",
-                        "freq": freq_label,
-                        "error": "北交所/新三板标的暂不支持当前回测数据源",
-                    })
-                    if resolver:
-                        try:
-                            stock_result["name"] = resolver.get_name(symbol)
-                        except Exception:
-                            stock_result["name"] = code
-                    else:
-                        stock_result["name"] = code
-                    stocks.append(stock_result)
-                    continue
-                market = _detect_market(code)
-                symbol = _build_symbol(code, market)
-                stock_result["symbol"] = symbol
-                stock_result["market"] = market
-                stock_result["freq"] = freq_label
-
-                # 获取名称
-                if resolver:
-                    try:
-                        stock_result["name"] = resolver.get_name(symbol)
-                    except Exception:
-                        stock_result["name"] = code
-                else:
-                    stock_result["name"] = code
-
-                # K线
-                df = _fetch_kline(code, market, freq)
-                if df.empty:
-                    stock_result["status"] = "error"
-                    stock_result["error"] = "无可用数据"
-                    stocks.append(stock_result)
-                    continue
-                if lookback > 0 and len(df) > lookback:
-                    df = df.tail(lookback).copy()
-                meta = _kline_meta(df, freq_norm)
-                stock_result.update(meta)
-                stock_result["bar_count"] = int(len(df))
-                stock_result["ohlcv_tail"] = _serialize_ohlcv(df.tail(520))
-
-                # 信号检测
-                all_signals, _, _, _ = _detect_all_signals(
-                    df, symbol, freq_label, signal_group, lookback, factor,
-                    gap_pct_min, volume_ratio_min, trend_lookback, bb_period, squeeze_threshold,
-                    run_count=run_count, body_ratio=body_ratio_val, accel_count=accel_count,
-                )
-
-                # 交易模拟
-                sim = simulate_trades(df, all_signals, sim_config)
-
-                # 提取摘要
-                kpi = sim.kpi
-                stock_result["signal_count"] = len(all_signals)
-                stock_result["trade_count"] = kpi.get("filled_trades", 0)
-                stock_result["win_rate"] = kpi.get("win_rate", 0)
-                stock_result["expectancy"] = kpi.get("expectancy", 0)
-                stock_result["total_return"] = kpi.get("total_return_pct", 0)
-                stock_result["max_drawdown"] = kpi.get("max_drawdown_pct", 0)
-                stock_result["sharpe"] = kpi.get("sharpe", 0)
-                stock_result["avg_hold_days"] = kpi.get("avg_hold_days", 0)
-                stock_result["signal_breakdown"] = _batch_signal_breakdown(
-                    code,
-                    stock_result.get("name") or code,
-                    all_signals,
-                    sim.trades,
-                )
-
-                total_signals += len(all_signals)
-                total_trades += stock_result["trade_count"]
-                wins = int(stock_result["trade_count"] * stock_result["win_rate"] / 100) if stock_result["trade_count"] > 0 else 0
-                total_wins += wins
-                total_evaluated += stock_result["trade_count"]
-
-            except Exception as e:
-                stock_result["status"] = "error"
-                stock_result["error"] = str(e)[:100]
-                logger.warning("批量回测 %s 失败: %s", code, e)
-
-            stocks.append(stock_result)
+        total_signals = sum(int(stock.get("signal_count") or 0) for stock in stocks)
+        total_trades = sum(int(stock.get("trade_count") or 0) for stock in stocks)
+        total_wins = sum(
+            int(int(stock.get("trade_count") or 0) * float(stock.get("win_rate") or 0) / 100)
+            for stock in stocks
+        )
+        total_evaluated = total_trades
 
         # 汇总
-        overall_win_rate = round(total_wins / total_evaluated * 100, 1) if total_evaluated > 0 else 0
+        overall_win_rate = float(round(total_wins / total_evaluated * 100, 1)) if total_evaluated > 0 else 0
         ok_stocks = [s for s in stocks if s["status"] == "ok" and s.get("trade_count", 0) > 0]
-        overall_expectancy = round(sum(s.get("expectancy", 0) for s in ok_stocks) / len(ok_stocks), 2) if ok_stocks else 0
+        overall_expectancy = float(round(sum(float(s.get("expectancy") or 0) for s in ok_stocks) / len(ok_stocks), 2)) if ok_stocks else 0
 
         result = {
             "summary": {

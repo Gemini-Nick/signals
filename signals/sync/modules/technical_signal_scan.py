@@ -708,6 +708,21 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
             )
             accepted = bool(touched and latest >= touch_reference and latest_close_position >= 0.45)
             breakdown = bool(touched and not accepted and latest < ma_value)
+            touch_reclaim = bool(touched and not accepted and not breakdown and latest >= ma_value)
+            if accepted:
+                interaction = "acceptance"
+            elif breakdown:
+                interaction = "breakdown"
+            elif touch_reclaim:
+                interaction = "touch_reclaim"
+            elif touched:
+                interaction = "touch_pending"
+            elif reclaim:
+                interaction = "reclaim"
+            elif near:
+                interaction = "near"
+            else:
+                interaction = "above" if above else "below"
             if above:
                 fib_above_count += 1
             elif near:
@@ -736,6 +751,8 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
                 "pullback_touch": touched,
                 "pullback_acceptance": accepted,
                 "pullback_breakdown": breakdown,
+                "touch_reclaim": touch_reclaim,
+                "interaction": interaction,
                 "distance_pct": round(distance_pct, 3),
                 "low_distance_pct": round(low_distance_pct, 3),
                 "touch_distance_pct": round(touch_distance_pct, 3),
@@ -783,10 +800,12 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
     accepted_periods = [item["period"] for item in fib_ma_array if item.get("pullback_acceptance")]
     touched_periods = [item["period"] for item in fib_ma_array if item.get("pullback_touch")]
     breakdown_periods = [item["period"] for item in fib_ma_array if item.get("pullback_breakdown")]
+    touch_reclaim_periods = [item["period"] for item in fib_ma_array if item.get("touch_reclaim")]
     pending_touch_periods = [
         item["period"]
         for item in fib_ma_array
         if item.get("pullback_touch") and not item.get("pullback_acceptance") and not item.get("pullback_breakdown")
+        and not item.get("touch_reclaim")
     ]
     if accepted_periods:
         tags.append("关键均线回踩承接")
@@ -794,6 +813,8 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
         tags.append("关键均线跌破待修复")
         if pending_touch_periods:
             tags.append("关键均线回踩待确认")
+    elif touch_reclaim_periods:
+        tags.append("关键均线触线收回")
     elif pending_touch_periods:
         tags.append("关键均线回踩待确认")
     out["above_count"] = above_count
@@ -806,15 +827,18 @@ def _ma_alignment_from_daily_bars(bars: list[Any]) -> dict[str, Any]:
     out["fib_accept_periods"] = accepted_periods[:6]
     out["fib_touch_periods"] = touched_periods[:6]
     out["fib_breakdown_periods"] = breakdown_periods[:6]
+    out["fib_touch_reclaim_periods"] = touch_reclaim_periods[:6]
     out["fib_ma_array"] = fib_ma_array
     summary_accept_periods = sorted(accepted_periods, reverse=True)[:3]
     summary_breakdown_periods = sorted(breakdown_periods, reverse=True)[:3]
-    summary_pending_periods = sorted(pending_touch_periods, reverse=True)[: max(0, 3 - len(summary_breakdown_periods))]
+    summary_reclaim_periods = sorted(touch_reclaim_periods, reverse=True)[: max(0, 3 - len(summary_breakdown_periods))]
+    summary_pending_periods = sorted(pending_touch_periods, reverse=True)[: max(0, 3 - len(summary_breakdown_periods) - len(summary_reclaim_periods))]
     out["fib_array_summary"] = (
         " / ".join(f"MA{period}回踩承接" for period in summary_accept_periods)
         or " / ".join(
             [
                 *(f"MA{period}跌破待修复" for period in summary_breakdown_periods),
+                *(f"MA{period}触线收回" for period in summary_reclaim_periods),
                 *(f"MA{period}触碰待确认" for period in summary_pending_periods),
             ]
         )

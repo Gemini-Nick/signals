@@ -175,6 +175,82 @@ def test_macro_index_row_surfaces_weekly_ma_risk_in_signal_column(monkeypatch):
     assert rows[0]["signal_detail"] == "上周五收盘价没站稳5周线"
 
 
+def test_index_row_prefers_daily_ma20_touch_reclaim_over_ma5_noise(monkeypatch):
+    from signals.web.api import workbench
+
+    daily = pd.DataFrame(
+        {
+            "open": [100.0] * 19 + [105.0],
+            "high": [102.0] * 19 + [106.0],
+            "low": [98.0] * 19 + [99.0],
+            "close": [100.0] * 19 + [100.5],
+            "vol": [1000] * 20,
+            "amount": [10000] * 20,
+        },
+        index=pd.date_range("2026-04-27", periods=20, freq="B"),
+    )
+    weekly = pd.DataFrame(
+        {
+            "open": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "high": [101.0, 102.0, 103.0, 104.0, 105.0],
+            "low": [99.0, 100.0, 101.0, 102.0, 103.0],
+            "close": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "vol": [1000] * 5,
+            "amount": [10000] * 5,
+        },
+        index=pd.date_range("2026-04-24", periods=5, freq="W-FRI"),
+    )
+
+    monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (weekly, "index_bars") if freq == "weekly" else (daily, "index_bars"))
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: str(daily.index[-1].date()))
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {"quote_status": "missing", "quote_status_label": "无行情"})
+
+    row = workbench._enrich_index_row({"symbol": "sh000688", "name": "科创50"}, [])
+
+    assert row["latest_signal"] == "MA20触线收回"
+    assert row["current_timeframe_ma"]["summary"] == "MA20触线收回"
+    assert row["current_timeframe_ma"]["signal_side"] == "neutral"
+
+
+def test_index_row_prefers_weekly_descending_channel_over_ma5_line(monkeypatch):
+    from signals.web.api import workbench
+
+    daily = pd.DataFrame(
+        {
+            "open": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "high": [101.0, 102.0, 103.0, 104.0, 105.0],
+            "low": [99.0, 100.0, 101.0, 102.0, 103.0],
+            "close": [100.0, 101.0, 102.0, 103.0, 104.0],
+            "vol": [1000] * 5,
+            "amount": [10000] * 5,
+        },
+        index=pd.date_range("2026-05-18", periods=5, freq="B"),
+    )
+    weekly = pd.DataFrame(
+        {
+            "open": [84.0, 94.0, 109.0, 106.0, 104.0],
+            "high": [90.0, 100.0, 120.0, 115.0, 108.0],
+            "low": [80.0, 90.0, 100.0, 95.0, 90.0],
+            "close": [85.0, 95.0, 110.0, 105.0, 92.0],
+            "vol": [1000] * 5,
+            "amount": [10000] * 5,
+        },
+        index=pd.date_range("2026-04-24", periods=5, freq="W-FRI"),
+    )
+
+    monkeypatch.setattr(workbench, "_index_df", lambda symbol, freq: (weekly, "index_bars") if freq == "weekly" else (daily, "index_bars"))
+    monkeypatch.setattr(workbench, "_a_day_change_mode", lambda: "daily_close")
+    monkeypatch.setattr(workbench, "_day_change_expected_day", lambda mode=None: str(daily.index[-1].date()))
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {"quote_status": "missing", "quote_status_label": "无行情"})
+
+    row = workbench._enrich_index_row({"symbol": "sh000852", "name": "中证1000"}, [])
+
+    assert row["latest_signal"] == "周线下降通道"
+    assert row["current_timeframe_ma"]["summary"] == "周线下降通道"
+    assert "5周线反抽未过" in row["signal_detail"]
+
+
 def test_watchlist_range_columns_include_all_key_presets():
     from signals.web.api import workbench
 

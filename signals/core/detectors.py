@@ -30,14 +30,21 @@ class SignalEvent:
 def detect_all_signals(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
     """对一个 CZSC 对象运行全部检测器，返回 SignalEvent 列表。"""
     signals: List[SignalEvent] = []
+    signals.extend(detect_structural_signals(czsc_obj, symbol))
+    signals.extend(_detect_macd_convergence(czsc_obj, symbol))
+    signals.extend(_detect_gaps(czsc_obj, symbol))
+    return signals
+
+
+def detect_structural_signals(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
+    """Run only CZSC structure detectors, excluding auxiliary MACD/gap scans."""
+    signals: List[SignalEvent] = []
     signals.extend(_detect_first_bs(czsc_obj, symbol))
     signals.extend(_detect_second_bs(czsc_obj, symbol))
     signals.extend(_detect_third_bs(czsc_obj, symbol))
     signals.extend(_detect_divergence(czsc_obj, symbol))
     signals.extend(_detect_trend(czsc_obj, symbol))
     signals.extend(_detect_patterns(czsc_obj, symbol))
-    signals.extend(_detect_macd_convergence(czsc_obj, symbol))
-    signals.extend(_detect_gaps(czsc_obj, symbol))
     return signals
 
 
