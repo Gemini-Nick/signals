@@ -51,6 +51,7 @@ class _MinuteBarsCollection:
     def __init__(self, docs):
         self.docs = [dict(doc) for doc in docs]
         self.next_id = 1
+        self.delete_queries = []
 
     @staticmethod
     def _matches(doc, query):
@@ -85,9 +86,9 @@ class _MinuteBarsCollection:
         return _Cursor([self._project(doc, projection) for doc in self.docs if self._matches(doc, query)])
 
     def delete_many(self, query):
-        ids = set(query.get("_id", {}).get("$in", []))
+        self.delete_queries.append(query)
         before = len(self.docs)
-        self.docs = [doc for doc in self.docs if doc.get("_id") not in ids]
+        self.docs = [doc for doc in self.docs if not self._matches(doc, query)]
         return _WriteResult(deleted_count=before - len(self.docs))
 
     def insert_many(self, docs, ordered=False):
@@ -231,6 +232,9 @@ def test_insert_new_minute_docs_refreshes_changed_tail_bar(monkeypatch):
     assert result["refreshed"] == 1
     assert result["written"] == 1
     assert result["skipped_existing"] == 0
+    assert bars.delete_queries == [
+        {"meta.symbol": "300750", "meta.freq": "30分钟", "dt": {"$in": [dt]}}
+    ]
     assert len(bars.docs) == 1
     assert bars.docs[0]["_id"] != "old-1"
     assert bars.docs[0]["close"] == 424.0

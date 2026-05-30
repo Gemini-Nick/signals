@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """Signals domain-pack contract endpoints."""
+import asyncio
+
 from fastapi import APIRouter, Query
+from starlette.concurrency import run_in_threadpool
 
 from signals.domain_pack import SignalsPack
 
@@ -13,12 +16,15 @@ async def pack_dashboard(
     backlog_limit: int = Query(10, ge=1, le=50),
     include_ai_factor_factory: bool = Query(False),
 ):
-    pack = SignalsPack()
-    return await pack.dashboard(
-        recent_limit=recent_limit,
-        backlog_limit=backlog_limit,
-        include_ai_factor_factory=include_ai_factor_factory,
-    )
+    def _dashboard():
+        pack = SignalsPack()
+        return asyncio.run(pack.dashboard(
+            recent_limit=recent_limit,
+            backlog_limit=backlog_limit,
+            include_ai_factor_factory=include_ai_factor_factory,
+        ))
+
+    return await run_in_threadpool(_dashboard)
 
 
 @router.get("/descriptor")

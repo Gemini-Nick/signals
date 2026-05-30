@@ -1118,7 +1118,6 @@ def _insert_new_minute_docs(bars_col, code: str, freq: str, docs: list[dict]) ->
 
     new_docs = []
     refresh_docs = []
-    refresh_ids = []
     for dt, doc in deduped_by_dt.items():
         if existing_lookup_failed:
             if latest_dt is None or dt > latest_dt:
@@ -1129,21 +1128,35 @@ def _insert_new_minute_docs(bars_col, code: str, freq: str, docs: list[dict]) ->
             new_docs.append(doc)
         elif _minute_doc_changed(existing, doc):
             refresh_docs.append(doc)
-            refresh_ids.append(existing["_id"])
 
     inserted = 0
     refreshed = 0
     deleted = 0
     if refresh_docs and _bool_env("STOCK_MINUTE_REFRESH_EXISTING_BARS", True):
-        deleted_docs = []
-        for old_id, refresh_doc in zip(refresh_ids, refresh_docs):
-            delete_result = bars_col.delete_many({"_id": {"$in": [old_id]}})
-            deleted_count = int(getattr(delete_result, "deleted_count", 0) or 0)
-            if deleted_count == 1:
-                deleted += 1
-                deleted_docs.append(refresh_doc)
-            elif deleted_count:
-                logger.warning("分钟线刷新删除数量异常 %s %s id=%s deleted=%d", code, freq, old_id, deleted_count)
+        refresh_dts = [doc["dt"] for doc in refresh_docs]
+        delete_filter = {"meta.symbol": code, "meta.freq": freq, "dt": {"$in": refresh_dts}}
+        delete_result = bars_col.delete_many(delete_filter)
+        deleted = int(getattr(delete_result, "deleted_count", 0) or 0)
+        if deleted < len(refresh_docs):
+            remaining_dts = {
+                item.get("dt")
+                for item in bars_col.find(
+                    delete_filter,
+                    {"dt": 1},
+                )
+            }
+            deleted_docs = [doc for doc in refresh_docs if doc["dt"] not in remaining_dts]
+            if len(deleted_docs) != len(refresh_docs):
+                logger.warning(
+                    "分钟线刷新删除未完全命中 %s %s expected=%d deleted=%d remaining=%d",
+                    code,
+                    freq,
+                    len(refresh_docs),
+                    deleted,
+                    len(remaining_dts),
+                )
+        else:
+            deleted_docs = refresh_docs
         if deleted_docs:
             refreshed = len(bars_col.insert_many(deleted_docs, ordered=False).inserted_ids)
     if new_docs:

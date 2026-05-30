@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import logging
 import math
@@ -162,11 +164,81 @@ _SHELL_REBUILD_WATERMARK_KEYS = {
 }
 _VISIBLE_QUOTE_REFRESH_LOCK = threading.Lock()
 _VISIBLE_QUOTE_REFRESH_LAST: dict[str, float] = {}
+_SYMBOL_PAYLOAD_CACHE_TTL_SECONDS = 60.0
+_SYMBOL_PAYLOAD_CACHE_MAX_ITEMS = 160
+_SYMBOL_PAYLOAD_CACHE_LOCK = threading.RLock()
+_SYMBOL_PAYLOAD_CACHE: dict[str, dict[str, Any]] = {}
+_SYMBOL_PAYLOAD_BUILD_LOCKS: dict[str, threading.Lock] = {}
 
 
 def _invalidate_shell_cache() -> None:
     with _SHELL_CACHE_LOCK:
         _SHELL_CACHE.update({"expires_at": 0.0, "payload": None, "refreshed_at": 0.0, "quote_watermark": ""})
+
+
+def _symbol_payload_cache_key(symbol: str, kind: str, freq: str) -> str:
+    return "|".join((
+        _text(kind).strip().lower() or "auto",
+        _canonical_freq(freq),
+        _text(symbol).strip().upper(),
+    ))
+
+
+def _symbol_payload_build_lock(key: str) -> threading.Lock:
+    with _SYMBOL_PAYLOAD_CACHE_LOCK:
+        lock = _SYMBOL_PAYLOAD_BUILD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _SYMBOL_PAYLOAD_BUILD_LOCKS[key] = lock
+        return lock
+
+
+def _get_symbol_payload_cache(key: str) -> Optional[Dict[str, Any]]:
+    now = time.monotonic()
+    with _SYMBOL_PAYLOAD_CACHE_LOCK:
+        entry = _SYMBOL_PAYLOAD_CACHE.get(key)
+        if not entry:
+            return None
+        if float(entry.get("expires_at") or 0.0) <= now:
+            _SYMBOL_PAYLOAD_CACHE.pop(key, None)
+            return None
+        payload = entry.get("payload")
+    if isinstance(payload, dict):
+        return copy.deepcopy(payload)
+    return None
+
+
+def _set_symbol_payload_cache(key: str, payload: Dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        return
+    now = time.monotonic()
+    with _SYMBOL_PAYLOAD_CACHE_LOCK:
+        _SYMBOL_PAYLOAD_CACHE[key] = {
+            "expires_at": now + _SYMBOL_PAYLOAD_CACHE_TTL_SECONDS,
+            "payload": copy.deepcopy(payload),
+            "stored_at": now,
+        }
+        while len(_SYMBOL_PAYLOAD_CACHE) > _SYMBOL_PAYLOAD_CACHE_MAX_ITEMS:
+            oldest_key = min(
+                _SYMBOL_PAYLOAD_CACHE,
+                key=lambda item: float(_SYMBOL_PAYLOAD_CACHE[item].get("stored_at") or 0.0),
+            )
+            _SYMBOL_PAYLOAD_CACHE.pop(oldest_key, None)
+
+
+def _cached_build_workbench_symbol_payload(symbol: str, kind: str, freq: str) -> Dict[str, Any] | JSONResponse:
+    key = _symbol_payload_cache_key(symbol, kind, freq)
+    cached = _get_symbol_payload_cache(key)
+    if cached is not None:
+        return cached
+    with _symbol_payload_build_lock(key):
+        cached = _get_symbol_payload_cache(key)
+        if cached is not None:
+            return cached
+        payload = _build_workbench_symbol_payload(symbol, kind, freq)
+        if isinstance(payload, dict):
+            _set_symbol_payload_cache(key, payload)
+        return payload
 
 
 def _quote_snapshot_watermark() -> str:
@@ -1677,6 +1749,14 @@ def _range_return_column_keys(columns: list[dict[str, Any]]) -> list[str]:
         if key and column.get("start_date"):
             keys.append(key)
     return keys
+
+
+def _range_return_status_from_returns(returns: dict[str, Any], columns: list[dict[str, Any]]) -> str:
+    if not returns:
+        return "missing"
+    required_keys = _range_return_column_keys(columns)
+    missing_keys = [key for key in required_keys if key not in returns or returns.get(key) is None]
+    return "partial_history" if missing_keys else "ok"
 
 
 def _stock_current_no_trade_close(symbol: str) -> tuple[pd.Timestamp, float, str] | None:
@@ -3955,6 +4035,7 @@ def _enrich_index_row(
 ) -> dict[str, Any]:
     symbol = str(row.get("symbol") or row.get("code") or row.get("label") or row.get("name") or "").strip()
     df, source = _index_df(symbol, "daily") if symbol else (pd.DataFrame(), "")
+    range_returns = _compute_range_returns(df, range_columns) if include_range_returns else {}
     buy_timeframes, sell_timeframes = _index_timeframe_signal_entries(row)
     day_change_mode = _a_day_change_mode()
     daily_day_change, daily_day_source, daily_as_of = _daily_close_day_change_pct(df)
@@ -3997,9 +4078,9 @@ def _enrich_index_row(
         "latest_signal": key_signal,
         "buy_timeframes": buy_timeframes,
         "sell_timeframes": sell_timeframes,
-        "range_returns": _compute_range_returns(df, range_columns) if include_range_returns else {},
+        "range_returns": range_returns,
         "range_return_source": source,
-        "range_return_status": "ok" if include_range_returns else "lazy",
+        "range_return_status": _range_return_status_from_returns(range_returns, range_columns) if include_range_returns else "lazy",
         "available_freqs": UI_FREQS,
         "target_kind": "index",
         "target_label": row.get("name") or row.get("label") or symbol,
@@ -5703,14 +5784,18 @@ def _build_macro_index_rows(
                 if daily_df is not None and not daily_df.empty and "close" in daily_df.columns
                 else None
             )
+            range_returns = _compute_range_returns(daily_df, range_columns)
             enriched = {
                 **row,
                 "kind": "index",
                 "latest_price": latest_price,
+                "day_change_pct": None,
+                "daily_change_pct": None,
                 "latest_signal": key_signal or "待观察",
-                "range_returns": {},
+                "range_returns": range_returns,
                 "range_return_source": daily_source,
-                "range_return_status": "lazy",
+                "range_return_status": _range_return_status_from_returns(range_returns, range_columns),
+                "available_freqs": UI_FREQS,
             }
             if key_ma_state:
                 enriched["current_timeframe_ma"] = key_ma_state
@@ -5729,14 +5814,17 @@ def _build_macro_index_rows(
                 "label": symbol,
                 "symbol": symbol,
                 "kind": "stock",
-            }, range_columns, lightweight=True, require_range_returns=False)
+            }, range_columns)
             if not enriched.get("latest_price"):
                 continue
+            if not _text(enriched.get("range_return_status")):
+                range_returns = enriched.get("range_returns") if isinstance(enriched.get("range_returns"), dict) else {}
+                enriched["range_return_status"] = _range_return_status_from_returns(range_returns, range_columns)
             target_kind = "stock"
             target_label = enriched.get("symbol") or symbol
             target_symbol = enriched.get("symbol") or symbol
         else:
-            enriched = _enrich_index_row(row, range_columns, include_range_returns=False)
+            enriched = _enrich_index_row(row, range_columns)
             if not enriched.get("latest_price"):
                 continue
             target_kind = "index"
@@ -11773,11 +11861,19 @@ async def get_workbench_symbol(
     kind: str = Query("auto", description="auto / index / industry / concept / stock"),
     freq: str = Query(DEFAULT_TERMINAL_FREQ, description="5min / 15min / 30min / daily / weekly"),
 ):
+    return await run_in_threadpool(_cached_build_workbench_symbol_payload, symbol, kind, freq)
+
+
+def _run_workbench_target_builder(builder: Any) -> Dict[str, Any]:
+    return asyncio.run(builder)
+
+
+def _build_workbench_symbol_payload(symbol: str, kind: str, freq: str) -> Dict[str, Any] | JSONResponse:
     engine = _ensure_engine()
     if not engine.is_ready() and kind in {"auto", "index"}:
         static_index = _resolve_static_index(symbol)
         if static_index is not None:
-            return await _build_static_index_target(static_index[0], static_index[1], freq)
+            return _run_workbench_target_builder(_build_static_index_target(static_index[0], static_index[1], freq))
         status = engine.get_status()
         return JSONResponse(
             status_code=503,
@@ -11789,12 +11885,12 @@ async def get_workbench_symbol(
 
     resolved = _resolve_target(symbol, kind, engine)
     if resolved["kind"] == "index":
-        return await _build_index_target(engine, resolved["label"], freq)
+        return _run_workbench_target_builder(_build_index_target(engine, resolved["label"], freq))
     if resolved["kind"] == "industry":
-        return await _build_industry_target(engine, resolved["label"], freq)
+        return _run_workbench_target_builder(_build_industry_target(engine, resolved["label"], freq))
     if resolved["kind"] == "concept":
-        return await _build_concept_target(engine, resolved["label"], freq)
-    return await _build_stock_target(resolved["label"], resolved["raw_code"], freq)
+        return _run_workbench_target_builder(_build_concept_target(engine, resolved["label"], freq))
+    return _run_workbench_target_builder(_build_stock_target(resolved["label"], resolved["raw_code"], freq))
 
 
 @router.get("/backtest")

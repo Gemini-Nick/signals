@@ -3,6 +3,7 @@
 from typing import Any
 
 from fastapi import APIRouter, Body, Query
+from starlette.concurrency import run_in_threadpool
 
 from signals.strategy.ai_factor_factory import (
     build_ai_factor_factory,
@@ -22,19 +23,20 @@ router = APIRouter(prefix="/api/strategy", tags=["strategy"])
 async def strategy_snapshot(
     persist: bool = Query(False, description="Persist the generated snapshot to Mongo"),
 ):
-    return get_strategy_snapshot(persist=persist)
+    return await run_in_threadpool(get_strategy_snapshot, persist=persist)
 
 
 @router.get("/ai-factor-factory")
 async def ai_factor_factory():
-    return build_ai_factor_factory()
+    return await run_in_threadpool(build_ai_factor_factory)
 
 
 @router.post("/ai-factor-factory/draft")
 async def ai_factor_factory_draft(
     payload: dict[str, Any] = Body(default_factory=dict),
 ):
-    return create_factor_draft(
+    return await run_in_threadpool(
+        create_factor_draft,
         idea=str(payload.get("idea") or payload.get("hypothesis") or ""),
         factor_id=str(payload.get("factor_id") or ""),
         persist=bool(payload.get("persist", True)),
@@ -51,7 +53,8 @@ async def ai_factor_factory_validate(
     mode = str(payload.get("mode") or "").lower()
     environment_id = str(payload.get("environment_id") or "")
     if mode == "signal_first" or environment_id:
-        return run_signal_first_environment_validation(
+        return await run_in_threadpool(
+            run_signal_first_environment_validation,
             environment_id=environment_id or str(payload.get("factor_id") or ""),
             observations=observations,
             persist=bool(payload.get("persist", True)),
@@ -59,7 +62,8 @@ async def ai_factor_factory_validate(
     demo_mode = _payload_bool(payload.get("demo_mode"), default=observations is None)
     if mode == "demo":
         demo_mode = True
-    return run_factor_validation(
+    return await run_in_threadpool(
+        run_factor_validation,
         factor_id=str(payload.get("factor_id") or ""),
         idea=str(payload.get("idea") or payload.get("hypothesis") or ""),
         observations=observations,
@@ -72,7 +76,8 @@ async def ai_factor_factory_validate(
 async def ai_factor_factory_rhythm_demo(
     payload: dict[str, Any] = Body(default_factory=dict),
 ):
-    return run_factor_rhythm_demo(
+    return await run_in_threadpool(
+        run_factor_rhythm_demo,
         factor_id=str(payload.get("factor_id") or ""),
         idea=str(payload.get("idea") or payload.get("hypothesis") or ""),
         persist=bool(payload.get("persist", True)),
@@ -83,7 +88,8 @@ async def ai_factor_factory_rhythm_demo(
 async def ai_factor_factory_publish(
     payload: dict[str, Any] = Body(default_factory=dict),
 ):
-    return publish_factor(
+    return await run_in_threadpool(
+        publish_factor,
         factor_id=str(payload.get("factor_id") or ""),
         live_enabled=bool(payload.get("live_enabled", True)),
         approved_by=str(payload.get("approved_by") or "trader"),
@@ -94,7 +100,8 @@ async def ai_factor_factory_publish(
 async def ai_factor_factory_disable(
     payload: dict[str, Any] = Body(default_factory=dict),
 ):
-    return disable_factor(
+    return await run_in_threadpool(
+        disable_factor,
         factor_id=str(payload.get("factor_id") or ""),
         reason=str(payload.get("reason") or ""),
     )

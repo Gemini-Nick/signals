@@ -1,4 +1,6 @@
 import asyncio
+import threading
+import time
 from datetime import date, datetime
 
 import pandas as pd
@@ -706,7 +708,7 @@ def test_macro_indices_have_day_and_range_returns(monkeypatch):
     assert rows[0]["macro_group"] == "major_indices"
     assert rows[0]["macro_group_label"] == "大盘指数"
     assert rows[0]["display_type_label"] == "指数"
-    assert rows[0]["target_freq"] == "30min"
+    assert rows[0]["target_freq"] == workbench.DEFAULT_TERMINAL_FREQ
     assert "5min" in rows[0]["available_freqs"]
     assert rows[0]["latest_price"] is not None
     assert rows[0]["day_change_pct"] is None
@@ -727,6 +729,9 @@ def test_macro_indices_have_day_and_range_returns(monkeypatch):
     assert etf_row["macro_group"] == "industry_etfs"
     assert etf_row["macro_group_label"] == "行业ETF"
     assert etf_row["display_type_label"] == "行业ETF"
+    assert etf_row["latest_signal"] != "待观察"
+    assert etf_row["range_returns"]
+    assert etf_row["range_return_status"] in {"ok", "partial_history"}
 
 
 def test_macro_watchlist_rows_split_into_major_indices_and_industry_etfs():
@@ -3851,6 +3856,62 @@ def test_stock_minute_request_does_not_fallback_to_daily(monkeypatch):
     assert payload["chart"]["meta"]["fallback_reason"] == ""
     assert payload["chart"]["meta"]["load_status"] == "triggered"
     assert payload["chart"]["meta"]["load_eta_seconds"] == 10
+
+
+def test_workbench_symbol_route_offloads_blocking_builder(monkeypatch):
+    from signals.web.api import workbench
+
+    def fake_build(symbol, kind, freq):
+        time.sleep(0.2)
+        return {"target": {"label": symbol, "kind": kind, "requested_freq": freq}}
+
+    monkeypatch.setattr(workbench, "_build_workbench_symbol_payload", fake_build)
+
+    async def run_pair():
+        started = time.perf_counter()
+        results = await asyncio.gather(
+            workbench.get_workbench_symbol("SH.600000", "stock", "daily"),
+            workbench.get_workbench_symbol("SZ.000001", "stock", "daily"),
+        )
+        return time.perf_counter() - started, results
+
+    elapsed, results = asyncio.run(run_pair())
+
+    assert elapsed < 0.35
+    assert [item["target"]["label"] for item in results] == ["SH.600000", "SZ.000001"]
+
+
+def test_workbench_symbol_route_coalesces_identical_builds(monkeypatch):
+    from signals.web.api import workbench
+
+    calls = 0
+    call_lock = threading.Lock()
+
+    def fake_build(symbol, kind, freq):
+        nonlocal calls
+        time.sleep(0.2)
+        with call_lock:
+            calls += 1
+        return {"target": {"label": symbol, "kind": kind, "requested_freq": freq}}
+
+    monkeypatch.setattr(workbench, "_build_workbench_symbol_payload", fake_build)
+    with workbench._SYMBOL_PAYLOAD_CACHE_LOCK:
+        workbench._SYMBOL_PAYLOAD_CACHE.clear()
+        workbench._SYMBOL_PAYLOAD_BUILD_LOCKS.clear()
+
+    async def run_pair():
+        started = time.perf_counter()
+        results = await asyncio.gather(
+            workbench.get_workbench_symbol("SH.600000", "stock", "daily"),
+            workbench.get_workbench_symbol("SH.600000", "stock", "daily"),
+        )
+        return time.perf_counter() - started, results
+
+    elapsed, results = asyncio.run(run_pair())
+
+    assert elapsed < 0.35
+    assert calls == 1
+    assert [item["target"]["label"] for item in results] == ["SH.600000", "SH.600000"]
 
 
 def test_stock_30min_uses_bars_chart_not_backtest_override(monkeypatch):

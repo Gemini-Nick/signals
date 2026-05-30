@@ -140,6 +140,18 @@ def test_batch_terminal_multi_symbol_panels():
                 "total_return": 12.5,
                 "max_drawdown": 8.4,
                 "sharpe": 1.1,
+                "sim_trades": [
+                    {
+                        "signal_type": "Pattern A",
+                        "signal_group": "macd",
+                        "signal_date": "2026-01-01",
+                        "entry_date": "2026-01-02",
+                        "entry_price": 10.1,
+                        "exit_date": "2026-01-04",
+                        "exit_price": 10.8,
+                        "net_return_pct": 3.5,
+                    }
+                ],
                 "signal_breakdown": [
                     {
                         "signal_type": "Pattern A",
@@ -201,8 +213,15 @@ def test_batch_terminal_multi_symbol_panels():
     assert terminal["panels"]["signals"]["rows"][0]["signal_count"] == 4
     assert terminal["panels"]["signals"]["rows"][0]["avg_t10_pct"] == 1.33
     assert terminal["panels"]["multi_charts"]["items"][0]["ohlcv"]
+    assert terminal["panels"]["multi_charts"]["items"][0]["start_date"] == "2026-01-01"
+    assert terminal["panels"]["multi_charts"]["items"][0]["end_date"] == "2026-01-04"
+    assert terminal["panels"]["multi_charts"]["items"][0]["trade_markers"][0]["kind"] == "entry"
+    assert terminal["panels"]["multi_charts"]["items"][0]["trade_markers"][1]["kind"] == "exit"
+    assert terminal["panels"]["interval_overview"]["rows"][0]["start_date"] == "2026-01-01"
     assert terminal["panels"]["multi_charts"]["items"][0]["max_runup_pct"] is not None
     assert terminal["panels"]["multi_charts"]["items"][0]["bar_count"] == 4
+    assert terminal["panels"]["multi_charts"]["items"][0]["visible_bar_count"] == 4
+    assert terminal["panels"]["multi_charts"]["items"][0]["filled_trade_count"] == 1
     assert terminal["panels"]["multi_charts"]["items"][0]["median_5d_high_low_pct"] == 12.5
     assert terminal["metrics"]["median_5d_high_low_pct"] == 12.5
     assert terminal["panels"]["scripts"]["cards"][0]["one_liner"]

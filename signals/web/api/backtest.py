@@ -10,15 +10,58 @@ from datetime import datetime, timedelta
 from io import BytesIO
 
 import pandas as pd
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import config
+from signals.core.backtest_history import BacktestHistoryStore, SCHEMA_VERSION
 from signals.core.market_time import market_now, to_unix_seconds
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
+
+
+def _history_store() -> BacktestHistoryStore:
+    return BacktestHistoryStore()
+
+
+@router.get("/history")
+async def backtest_history(limit: int = Query(50, ge=1, le=200)):
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "items": _history_store().list(limit=limit),
+        "limit": limit,
+    }
+
+
+@router.get("/history/{history_id}")
+async def backtest_history_item(history_id: str):
+    try:
+        item = _history_store().get(history_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if item is None:
+        raise HTTPException(status_code=404, detail="backtest history entry not found")
+    return item
+
+
+@router.post("/history")
+async def save_backtest_history(request: Request):
+    try:
+        payload = await request.json()
+        return _history_store().save(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/history/{history_id}")
+async def delete_backtest_history(history_id: str):
+    try:
+        item = _history_store().delete(history_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "id": item.get("id"), "deletedAt": item.get("deletedAt")}
 
 
 # ─────────────────────────────────────────────────────

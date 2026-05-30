@@ -8,6 +8,8 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
+from signals.core.market_time import timestamp_range_to_dates
+
 TERMINAL_VERSION = "backtest-terminal.v1"
 
 
@@ -283,6 +285,8 @@ def _batch_interval_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "code": _text(row.get("code")),
         "symbol": _text(row.get("symbol")),
         "name": _text(row.get("name") or row.get("code")),
+        "start_date": _first_date(ohlcv),
+        "end_date": _last_date(ohlcv),
         "bar_count": int(_num(row.get("bar_count"), len(ohlcv)) or 0),
         **interval,
     }
@@ -292,13 +296,21 @@ def _batch_chart_item(row: Mapping[str, Any]) -> dict[str, Any]:
     ohlcv = [_as_record(item) for item in _as_list(row.get("ohlcv_tail") or row.get("ohlcv"))]
     interval = _batch_interval_metrics(row, ohlcv)
     visible_ohlcv = ohlcv[-520:]
+    trades = [_as_record(item) for item in _as_list(row.get("sim_trades") or row.get("trades"))]
     return {
         "code": _text(row.get("code")),
         "symbol": _text(row.get("symbol")),
         "name": _text(row.get("name") or row.get("code")),
+        "start_date": _first_date(ohlcv),
+        "end_date": _last_date(ohlcv),
+        "visible_start_date": _first_date(visible_ohlcv),
+        "visible_end_date": _last_date(visible_ohlcv),
         "bar_count": int(_num(row.get("bar_count"), len(ohlcv)) or 0),
+        "visible_bar_count": len(visible_ohlcv),
+        "filled_trade_count": len([trade for trade in trades if _num(trade.get("entry_price")) is not None]),
         "ohlcv": visible_ohlcv,
         "regimes": _chart_regimes(visible_ohlcv),
+        "trade_markers": _trade_markers(trades, visible_ohlcv),
         "range_return_pct": interval["range_return_pct"],
         "max_drawdown_pct": interval["max_drawdown_pct"],
         "max_runup_pct": interval["max_runup_pct"],
@@ -1194,6 +1206,13 @@ def _bar_time_by_date(ohlcv: list[Mapping[str, Any]]) -> dict[str, int]:
     return mapping
 
 
+def _first_date(ohlcv: list[Mapping[str, Any]]) -> str:
+    if not ohlcv:
+        return ""
+    ts = _time(ohlcv[0].get("time") or ohlcv[0].get("dt") or ohlcv[0].get("timestamp"))
+    return _date_from_time(ts) if ts is not None else ""
+
+
 def _last_date(ohlcv: list[Mapping[str, Any]]) -> str:
     if not ohlcv:
         return ""
@@ -1204,7 +1223,8 @@ def _last_date(ohlcv: list[Mapping[str, Any]]) -> str:
 def _date_from_time(ts: int) -> str:
     try:
         value = ts / 1000 if ts > 10_000_000_000 else ts
-        return datetime.fromtimestamp(value).date().isoformat()
+        start, _ = timestamp_range_to_dates(int(value), int(value), market="A")
+        return start or ""
     except Exception:
         return ""
 
