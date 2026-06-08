@@ -483,6 +483,7 @@ def _build_shell_placeholder_payload(engine: Any, status: str, now: float, quote
         "watchlist_groups": {
             "major_indices": major_indices,
             "industry_etfs": industry_etfs,
+            "all_etfs": [],
             "macro_indices": [*major_indices, *industry_etfs],
             "sector_boards": [],
             "buy_candidates": buy_candidates,
@@ -500,6 +501,13 @@ def _build_shell_placeholder_payload(engine: Any, status: str, now: float, quote
                 "label": "行业ETF",
                 "source_collection": "macro_universe",
                 "count": len(industry_etfs),
+            },
+            "all_etfs": {
+                "label": "全量ETF",
+                "source_collection": "strategy_snapshots.etf_analysis",
+                "count": 0,
+                "review_count": 0,
+                "role": "all_market_etf_review_universe",
             },
             "buy_candidates": {
                 "label": "线索池",
@@ -523,6 +531,7 @@ def _build_shell_placeholder_payload(engine: Any, status: str, now: float, quote
             },
         },
         "watchlist": [],
+        "etf_analysis": {},
         "watchlist_range_columns": range_columns,
         "kline_cache_coverage": {},
         "sync_lanes": {},
@@ -5924,6 +5933,82 @@ def _macro_shell_raw_rows(macro_group: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _shell_etf_analysis(strategy_snapshot: dict[str, Any]) -> dict[str, Any]:
+    etf_analysis = strategy_snapshot.get("etf_analysis")
+    return dict(etf_analysis) if isinstance(etf_analysis, dict) else {}
+
+
+def _shell_etf_universe_total(etf_analysis: dict[str, Any], review_count: int) -> int:
+    universe = etf_analysis.get("universe")
+    if isinstance(universe, dict):
+        total = _float(universe.get("total"))
+        if total is not None:
+            return int(total)
+    total = _float(etf_analysis.get("total"))
+    return int(total) if total is not None else review_count
+
+
+def _shell_etf_review_rows(strategy_snapshot: dict[str, Any], *, limit: int = 80) -> list[dict[str, Any]]:
+    etf_analysis = _shell_etf_analysis(strategy_snapshot)
+    review_rows = etf_analysis.get("review_universe")
+    if not isinstance(review_rows, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in review_rows[: max(0, limit)]:
+        if not isinstance(item, dict):
+            continue
+        symbol = _text(item.get("symbol") or item.get("code"))
+        name = _text(item.get("name")) or symbol
+        normalized, raw_code = _normalize_stock_symbol(symbol)
+        target_symbol = normalized or symbol
+        if not target_symbol:
+            continue
+        sources = item.get("sources") if isinstance(item.get("sources"), list) else []
+        quote_source = "+".join(_text(source) for source in sources if _text(source))
+        asset_class = _text(item.get("asset_class"))
+        category = _text(item.get("category"))
+        action_line = "全量ETF先看成交额/涨跌幅/资产类别，再送回测验证可重复性。"
+        rows.append({
+            **item,
+            "kind": "stock",
+            "label": target_symbol,
+            "name": name or target_symbol,
+            "symbol": target_symbol,
+            "code": target_symbol,
+            "raw_code": raw_code or target_symbol.split(".")[-1],
+            "macro_group": "all_etfs",
+            "macro_group_label": "全量ETF",
+            "display_type_label": "全量ETF",
+            "lane": "quote_lane",
+            "second_screen_role": "all_market_etf_review",
+            "latest_price": item.get("price"),
+            "day_change_pct": item.get("change_pct"),
+            "daily_change_pct": item.get("change_pct"),
+            "today_change_pct": item.get("change_pct"),
+            "gain_pct": item.get("change_pct"),
+            "latest_signal": category or asset_class or "ETF观察",
+            "signal_detail": " / ".join(part for part in (asset_class, category) if part),
+            "action_status": "观察",
+            "trader_action": action_line,
+            "rank_reason": f"成交额/涨跌幅排序 · {category or asset_class or 'ETF'}",
+            "invalidates_when": "成交额回落或同类ETF涨跌幅不再共振。",
+            "range_returns": item.get("range_returns") if isinstance(item.get("range_returns"), dict) else {},
+            "range_return_status": _text(item.get("range_return_status")) or "lazy",
+            "target_kind": "stock",
+            "target_label": target_symbol,
+            "target_symbol": target_symbol,
+            "target_freq": DEFAULT_TERMINAL_FREQ,
+            "quote_source": quote_source or _text(item.get("source")) or "strategy_snapshot.etf_analysis",
+            "source": "strategy_snapshot.etf_analysis",
+            "source_collection": "strategy_snapshots.etf_analysis",
+            "asset_class": asset_class,
+            "category": category,
+            "amount": item.get("amount"),
+            "vol": item.get("vol"),
+        })
+    return rows
+
+
 def _split_macro_watchlist_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     major_indices: list[dict[str, Any]] = []
     industry_etfs: list[dict[str, Any]] = []
@@ -8931,6 +9016,12 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     reports = [_enrich_index_row(report, range_columns) for report in reports_raw]
     macro_indices = _build_macro_index_rows(reports=reports_raw, range_columns=range_columns)
     major_indices, industry_etfs = _split_macro_watchlist_rows(macro_indices)
+    etf_analysis = _shell_etf_analysis(strategy_snapshot)
+    all_etfs = _shell_etf_review_rows(strategy_snapshot)
+    all_etfs_total = _shell_etf_universe_total(etf_analysis, len(all_etfs))
+    etf_universe = etf_analysis.get("universe") if isinstance(etf_analysis.get("universe"), dict) else {}
+    etf_source_counts = etf_universe.get("source_counts") if isinstance(etf_universe.get("source_counts"), dict) else {}
+    etf_asset_class_counts = etf_analysis.get("asset_class_counts") if isinstance(etf_analysis.get("asset_class_counts"), dict) else {}
     strategy_candidates = [
         dict(item)
         for item in strategy_snapshot.get("candidates", [])
@@ -9000,6 +9091,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         focus_stocks_meta["source_collection"] = "terminal_stock_pool + terminal_manual_clues.attack_focus"
     for rows, lane in (
         (macro_indices, "quote_lane"),
+        (all_etfs, "quote_lane"),
         (sector_boards, "board_lane"),
         (focus_stocks, "signal_lane"),
         (risk_stocks, "signal_lane"),
@@ -9059,6 +9151,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         "watchlist_groups": {
             "major_indices": major_indices,
             "industry_etfs": industry_etfs,
+            "all_etfs": all_etfs,
             "macro_indices": macro_indices,
             "sector_boards": sector_boards_shell,
             "buy_candidates": scored_shell,
@@ -9076,6 +9169,17 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
                 "label": "行业ETF",
                 "source_collection": "bars + quote_snapshots",
                 "count": len(industry_etfs),
+            },
+            "all_etfs": {
+                "label": "全量ETF",
+                "source_collection": "strategy_snapshots.etf_analysis",
+                "count": all_etfs_total,
+                "review_count": len(all_etfs),
+                "role": "all_market_etf_review_universe",
+                "source": _text(etf_universe.get("source")) or "strategy_snapshot.etf_analysis",
+                "source_counts": dict(etf_source_counts),
+                "asset_class_counts": dict(etf_asset_class_counts),
+                "as_of": _text(etf_universe.get("as_of")),
             },
             "macro_indices": {
                 "label": "宏观指数",
@@ -9114,6 +9218,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
             },
         },
         "watchlist": [],
+        "etf_analysis": etf_analysis,
         "watchlist_range_columns": range_columns,
         "kline_cache_coverage": _kline_cache_coverage_shell_summary(),
         "sync_lanes": sync_lanes,
@@ -9181,7 +9286,16 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
     return _build_shell_placeholder_payload(engine, "building", now, quote_watermark)
 
 
+def _strategy_snapshot_has_etf_analysis(snapshot: dict[str, Any]) -> bool:
+    etf_analysis = snapshot.get("etf_analysis")
+    if not isinstance(etf_analysis, dict):
+        return False
+    review_rows = etf_analysis.get("review_universe")
+    return isinstance(review_rows, list) and len(review_rows) > 0
+
+
 def _safe_strategy_snapshot() -> Dict[str, Any]:
+    fallback_snapshot: dict[str, Any] = {}
     try:
         from signals.data.mongo_fallback import get_db
 
@@ -9195,13 +9309,18 @@ def _safe_strategy_snapshot() -> Dict[str, Any]:
             if doc and isinstance(doc.get("snapshot"), dict):
                 snapshot = dict(doc["snapshot"])
                 snapshot.setdefault("read_model_source", "mongodb.strategy_snapshots")
-                return snapshot
+                if _strategy_snapshot_has_etf_analysis(snapshot):
+                    return snapshot
+                fallback_snapshot = snapshot
     except Exception:
         pass
     try:
         snapshot = get_strategy_snapshot()
-        return dict(snapshot) if isinstance(snapshot, dict) else {}
+        return dict(snapshot) if isinstance(snapshot, dict) else fallback_snapshot
     except Exception as exc:
+        if fallback_snapshot:
+            fallback_snapshot.setdefault("read_model_source", "mongodb.strategy_snapshots_without_etf_analysis")
+            return fallback_snapshot
         return {
             "daily_brief": {"summary": f"strategy_snapshot_error:{exc.__class__.__name__}"},
             "candidates": [],

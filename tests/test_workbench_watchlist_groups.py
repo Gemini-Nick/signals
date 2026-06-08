@@ -750,6 +750,48 @@ def test_macro_watchlist_rows_split_into_major_indices_and_industry_etfs():
     assert [row["name"] for row in industry_etfs] == ["30年国债ETF", "兼容ETF"]
 
 
+def test_shell_etf_review_rows_expose_all_etf_universe_shape():
+    from signals.web.api import workbench
+
+    snapshot = {
+        "etf_analysis": {
+            "universe": {
+                "total": 1495,
+                "source": "eastmoney_etf_spot+stock_names",
+                "source_counts": {"eastmoney_etf_spot": 1494, "stock_names": 4},
+                "as_of": "2026-06-08",
+            },
+            "asset_class_counts": {"theme_equity": 214},
+            "review_universe": [
+                {
+                    "symbol": "SH.511880",
+                    "name": "银华日利ETF",
+                    "price": 101.23,
+                    "change_pct": 0.12,
+                    "amount": 123456789,
+                    "asset_class": "money_market",
+                    "category": "货币ETF",
+                    "sources": ["eastmoney_etf_spot"],
+                }
+            ],
+        }
+    }
+
+    rows = workbench._shell_etf_review_rows(snapshot)
+
+    assert workbench._shell_etf_universe_total(snapshot["etf_analysis"], len(rows)) == 1495
+    assert rows[0]["macro_group"] == "all_etfs"
+    assert rows[0]["macro_group_label"] == "全量ETF"
+    assert rows[0]["display_type_label"] == "全量ETF"
+    assert rows[0]["target_kind"] == "stock"
+    assert rows[0]["target_freq"] == workbench.DEFAULT_TERMINAL_FREQ
+    assert rows[0]["latest_price"] == 101.23
+    assert rows[0]["day_change_pct"] == 0.12
+    assert rows[0]["latest_signal"] == "货币ETF"
+    assert rows[0]["quote_source"] == "eastmoney_etf_spot"
+    assert rows[0]["source_collection"] == "strategy_snapshots.etf_analysis"
+
+
 def test_static_index_alias_resolves_shanghai_composite():
     from signals.web.api import workbench
 
