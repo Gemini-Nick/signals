@@ -2503,7 +2503,7 @@ def test_concept_sector_preview_returns_explicit_chain_carrier(monkeypatch):
     row = workbench._sector_board_preview({"label": "电解液", "change_pct": 2.2}, "concept")
 
     assert row["target_kind"] == "concept"
-    assert row["target_freq"] == "30min"
+    assert row["target_freq"] == workbench.DEFAULT_TERMINAL_FREQ
     assert row["fallback_target"]["symbol"] == "SZ.002709"
     assert row["mapping_chain"]["node_id"] == "electrolyte"
     assert row["latest_price"] is None
@@ -2562,7 +2562,7 @@ def test_non_chain_sector_preview_is_not_forced_to_carrier(monkeypatch):
 
     assert row["non_chain_reason"]
     assert row["chart_target_status"] == "non_chain"
-    assert row["target_freq"] == "30min"
+    assert row["target_freq"] == workbench.DEFAULT_TERMINAL_FREQ
     assert row["carrier"] == {}
     assert row["fallback_target"] == {}
     assert row["action_status"] == "非产业链观察"

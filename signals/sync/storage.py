@@ -83,7 +83,7 @@ def ensure_storage_model(db: Database) -> None:
     """
     now = naive_market_now("A")
 
-    for name in ("board_ranking", "concept_ranking", "board_heat_ticks", "chain_heat_snapshots", "bars", "index_bars"):
+    for name in ("board_ranking", "concept_ranking", "board_heat_ticks", "chain_heat_snapshots", "bars", "index_bars", "market_limit_pools"):
         _drop_ttl_indexes(db[name])
 
     _safe_create_index(db["bars"], [("meta.symbol", ASCENDING), ("meta.freq", ASCENDING), ("dt", ASCENDING)])
@@ -128,6 +128,10 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["quote_snapshots"], [("expires_at", ASCENDING)], expireAfterSeconds=0)
     _safe_create_index(db["market_pools"], [("pool", ASCENDING), ("dt", ASCENDING)])
     _safe_create_index(db["market_pools"], [("expires_at", ASCENDING)], expireAfterSeconds=0)
+    _safe_create_index(db["market_limit_pools"], [("trade_date", ASCENDING), ("snapshot_minute", ASCENDING), ("pool", ASCENDING), ("code", ASCENDING)])
+    _safe_create_index(db["market_limit_pools"], [("trade_date", ASCENDING), ("pool", ASCENDING), ("first_limit_up_time", ASCENDING)])
+    _safe_create_index(db["market_limit_pools"], [("trade_date", ASCENDING), ("industry", ASCENDING), ("pool", ASCENDING)])
+    _safe_create_index(db["market_limit_pools"], [("trade_date", ASCENDING), ("updated_at", DESCENDING)])
     _safe_create_index(db["terminal_realtime_pool"], [("pool", ASCENDING), ("market", ASCENDING), ("updated_at", ASCENDING)])
     _safe_create_index(db["terminal_stock_pool"], [("pool", ASCENDING), ("market", ASCENDING), ("updated_at", ASCENDING)])
     _safe_create_index(db["terminal_technical_signals"], [("dedupe_key", ASCENDING)], unique=True, sparse=True)

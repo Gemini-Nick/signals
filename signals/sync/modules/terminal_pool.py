@@ -150,6 +150,9 @@ BROAD_MARKET_FALL_THRESHOLD = -0.2
 BROAD_MARKET_NEUTRAL_THRESHOLD = 0.08
 BROAD_MARKET_VOLUME_EXPAND_THRESHOLD = 1.08
 BROAD_MARKET_VOLUME_SHRINK_THRESHOLD = 0.85
+INTRADAY_DROP_FOCUS_BLOCK_PCT = -5.0
+INTRADAY_DROP_SCORE_PENALTY_START_PCT = -2.0
+BUY_POINT_POOL_ANCHOR_MAX_AGE_DAYS = 2
 RIGHT_SIDE_FREQS = {"5分钟", "5min", "5m", "F5", "f5", "15分钟", "15min", "15m", "F15", "f15"}
 BUY_FREQ_BONUS = {"30分钟": 120, "30min": 120, "30m": 120, "15分钟": 110, "15min": 110, "15m": 110, "5分钟": 80, "5min": 80, "5m": 80}
 ENTRY_30M_FREQS = {"30分钟", "30min", "30m", "F30", "f30"}
@@ -160,7 +163,7 @@ PRIMARY_MA_PERIODS = (5, 10, 20)
 ENTRY_PARTNER_FREQS = ENTRY_UPPER_FREQS | RIGHT_SIDE_FREQS
 ENTRY_QUEUE_LANES = {"entry_ready", "entry_waiting_confirm", "entry_waiting_upper_context", "entry_waiting_right_side_confirm"}
 RISK_ACTION_STATUSES = {"risk_review", "chain_risk_review", "knowledge_blocked", "knowledge_conflict"}
-POOL_RANKING_VERSION = "tech_ma_hot_sector_v12_key_ma_acceptance"
+POOL_RANKING_VERSION = "tech_ma_hot_sector_v13_upper_primary"
 SETUP_RANK_TIERS = {
     "right_executable": 300,
     "right_attack": 200,
@@ -202,8 +205,9 @@ TRADE_INTENT_LABELS = {
     "attack_entry": "进攻买点",
     "right_momentum": "右侧动量",
     "probe_candidate": "试仓候选",
+    "wait_execution": "等下单周期",
     "wait_30m": "等30m买点",
-    "wait_big_cycle": "等大周期",
+    "wait_big_cycle": "等日/周买点",
     "confirmed_entry": "确认买点",
     "skip_now": "暂不参与",
 }
@@ -223,6 +227,7 @@ TRADE_INTENT_PRIORITY = {
     "left_attack": 88,
     "right_momentum": 86,
     "probe_candidate": 78,
+    "wait_execution": 68,
     "wait_30m": 62,
     "wait_big_cycle": 54,
     "left_dip": 44,
@@ -254,8 +259,8 @@ MISSING_GATE_LABELS = {
     "30m_attack_missing": "30m未补齐，按进攻买点小仓复核",
     "30m_stale": "30m信号过期，等新的30m",
     "30m_right_side_missing": "30m还没走出确认买点",
-    "daily_or_weekly_missing": "缺日/周大周期位置",
-    "daily_or_weekly_stale": "日/周结构过期，等重新确认",
+    "daily_or_weekly_missing": "缺日/周买点",
+    "daily_or_weekly_stale": "日/周买点过期，等重新确认",
     "partner_period_missing": "缺多周期共振",
     "5m_or_15m_missing": "缺5m/15m下单周期",
     "5m_or_15m_stale": "5m/15m信号过期",
@@ -529,6 +534,97 @@ def _change_pct_from_doc(doc: dict[str, Any]) -> float | None:
     if close > 0 and prev_close > 0:
         return (close / prev_close - 1.0) * 100.0
     return None
+
+
+def _row_day_change_pct(row: dict[str, Any]) -> float | None:
+    for key in ("day_change_pct", "today_change_pct", "daily_change_pct", "change_pct", "gain_pct"):
+        if row.get(key) not in (None, ""):
+            return _float(row.get(key))
+    return None
+
+
+def _spot_quote_symbol_candidates(code: str) -> list[str]:
+    if not code:
+        return []
+    return list(dict.fromkeys([_prefixed_symbol(code), _prefixed_symbol(code).replace(".", ""), code]))
+
+
+def _latest_spot_quote_docs(db: Database, rows: dict[str, dict[str, Any]], trade_date: str) -> dict[str, dict[str, Any]]:
+    date_key = str(trade_date or "").replace("-", "")[:8]
+    if not date_key:
+        return {}
+    codes: set[str] = set()
+    symbols: set[str] = set()
+    for key, row in rows.items():
+        code = _pure_a_code(row.get("symbol") or row.get("code") or row.get("raw_code") or key)
+        if not code:
+            continue
+        codes.add(code)
+        symbols.update(_spot_quote_symbol_candidates(code))
+    if not codes and not symbols:
+        return {}
+    try:
+        cursor = db["fullmarket_spot_snapshots"].find(
+            {
+                "date_key": date_key,
+                "$or": [
+                    {"code": {"$in": sorted(codes)}},
+                    {"symbol": {"$in": sorted(symbols)}},
+                ],
+            },
+            {
+                "_id": 0,
+                "code": 1,
+                "symbol": 1,
+                "trade_date": 1,
+                "date_key": 1,
+                "snapshot_at": 1,
+                "source": 1,
+                "name": 1,
+                "latest": 1,
+                "price": 1,
+                "close": 1,
+                "change": 1,
+                "change_pct": 1,
+                "prev_close": 1,
+            },
+        ).sort("snapshot_at", -1)
+    except Exception:
+        return {}
+    quote_by_code: dict[str, dict[str, Any]] = {}
+    for doc in cursor:
+        quote_code = _pure_a_code(doc.get("symbol") or doc.get("code"))
+        if not quote_code or quote_code in quote_by_code:
+            continue
+        if _doc_date_text(doc) != trade_date:
+            continue
+        if _change_pct_from_doc(doc) is None:
+            continue
+        quote_by_code[quote_code] = doc
+    return quote_by_code
+
+
+def _attach_stock_quote_context(rows: dict[str, dict[str, Any]], db: Database, trade_date: str) -> None:
+    quote_by_code = _latest_spot_quote_docs(db, rows, trade_date)
+    if not quote_by_code:
+        return
+    for key, row in rows.items():
+        code = _pure_a_code(row.get("symbol") or row.get("code") or row.get("raw_code") or key)
+        doc = quote_by_code.get(code)
+        if not doc:
+            continue
+        pct = _change_pct_from_doc(doc)
+        if pct is None:
+            continue
+        price = _float(doc.get("price") or doc.get("latest") or doc.get("close"))
+        row["day_change_pct"] = round(pct, 4)
+        row["today_change_pct"] = round(pct, 4)
+        row["daily_change_pct"] = round(pct, 4)
+        row["gain_pct"] = round(pct, 4)
+        row["day_change_source"] = "fullmarket_spot_snapshots"
+        row["day_change_as_of"] = _doc_date_text(doc)
+        if price > 0:
+            row["latest_price"] = price
 
 
 def _index_change_doc_from_quotes(db: Database, symbol: str, trade_date: str) -> dict[str, Any]:
@@ -843,7 +939,7 @@ def _upper_context_confirmed(aligned_freqs: list[str]) -> bool:
 
 def _entry_waiting_label(queue_lane: str) -> str:
     if queue_lane == "entry_waiting_upper_context":
-        return "等待日/周确认"
+        return "等待日/周买点"
     if queue_lane == "entry_waiting_right_side_confirm":
         return "等待5m/15m确认"
     return "等待共振确认"
@@ -2231,13 +2327,52 @@ def _is_strong_30m_anchor_reason(reason: dict[str, Any]) -> bool:
     return any(token in text for token in strong_tokens)
 
 
+def _is_strong_upper_anchor_reason(reason: dict[str, Any]) -> bool:
+    if not _is_default_candidate_anchor_reason(reason) or not _is_upper_freq(reason.get("freq")):
+        return False
+    text = _reason_signal_text(reason)
+    weak_tokens = (
+        "MACD绿柱扩大",
+        "MACD绿柱缩小",
+        "零上绿柱扩大",
+        "零下绿柱缩小",
+        "relative_resilience_refusal_pullback",
+        "拒绝回调",
+        "相对强度",
+        "200d_new_high_breakout",
+        "200日新高",
+        "新高突破",
+        "缺口买:普通",
+    )
+    if any(token in text for token in weak_tokens):
+        return False
+    strong_tokens = (
+        "一买",
+        "二买",
+        "三买",
+        "趋势买",
+        "背驰买",
+        "底背离",
+        "形态",
+        "头肩底",
+        "双底",
+        "上升三角",
+        "缺口买:持续",
+        "缺口买:突破",
+        "trend_breakout",
+        "candle_run",
+        "candle_accel",
+    )
+    return any(token in text for token in strong_tokens)
+
+
 def _has_default_candidate_anchor(row: dict[str, Any]) -> bool:
     anchors = [
         reason
         for reason in row.get("inclusion_reasons") or []
         if _is_default_candidate_anchor_reason(reason)
     ]
-    if any(_is_upper_freq(reason.get("freq")) for reason in anchors):
+    if any(_is_strong_upper_anchor_reason(reason) for reason in anchors):
         return True
     return any(_is_strong_30m_anchor_reason(reason) for reason in anchors)
 
@@ -2596,6 +2731,133 @@ def _risk_reasons(row: dict[str, Any]) -> list[dict[str, Any]]:
     return reasons
 
 
+def _intraday_day_drop_risk_reason(row: dict[str, Any]) -> dict[str, Any] | None:
+    pct = _row_day_change_pct(row)
+    if pct is None or pct > INTRADAY_DROP_FOCUS_BLOCK_PCT:
+        return None
+    as_of = _text(row.get("day_change_as_of")) or _text(row.get("trade_date")) or _text(row.get("dt"))
+    return {
+        "reason_type": "intraday_day_drop",
+        "source_collection": _text(row.get("day_change_source")) or "fullmarket_spot_snapshots",
+        "source_doc_id": f"{_text(row.get('symbol') or row.get('raw_code'))}:{as_of}:{pct:.2f}",
+        "signal_type": f"当天跌幅{pct:.2f}%",
+        "signal_side": "sell",
+        "freq": "日内",
+        "score": -min(100.0, abs(pct) * 12.0),
+        "confidence": 1.0,
+        "decision_effect": "block",
+        "event_dt": as_of,
+        "as_of": as_of,
+        "evidence": {
+            "day_change_pct": round(pct, 4),
+            "block_threshold_pct": INTRADAY_DROP_FOCUS_BLOCK_PCT,
+            "source": _text(row.get("day_change_source")) or "fullmarket_spot_snapshots",
+        },
+    }
+
+
+def _risk_reason_blocks_entry(reason: dict[str, Any] | None) -> bool:
+    if not isinstance(reason, dict) or not reason:
+        return False
+    reason_type = _text(reason.get("reason_type"))
+    decision_effect = _text(reason.get("decision_effect"))
+    knowledge_effect = _text(reason.get("knowledge_effect"))
+    signal_side = _text(reason.get("signal_side"))
+    if reason_type == "period_conflict" or decision_effect == "mark_only":
+        return False
+    if reason_type == "intraday_day_drop":
+        return True
+    if decision_effect in {"exit_priority", "block"} or knowledge_effect in {"block", "exit_priority"}:
+        return True
+    return signal_side == "sell" and _reason_is_current_for_entry(reason)
+
+
+def _risk_blocked_by_code(reason: dict[str, Any] | None) -> list[str]:
+    reason_type = _text(reason.get("reason_type")) if isinstance(reason, dict) else ""
+    if reason_type == "intraday_day_drop":
+        return ["intraday_day_drop"]
+    if reason_type == "knowledge_conflict":
+        return ["knowledge_conflict"]
+    return ["risk_signal_present"]
+
+
+def _ma_trend_red_state(ma: dict[str, Any]) -> bool | None:
+    if not isinstance(ma, dict) or not ma:
+        return None
+    above_count = sum(1 for period in PRIMARY_MA_PERIODS if _truthy_bool(ma.get(f"above_ma{period}")))
+    above_count = max(above_count, int(_float(ma.get("above_count"))))
+    stack = _text(ma.get("ma_stack"))
+    direction = _text(ma.get("ma20_direction")).lower()
+    if stack == "bearish" or (direction in {"向下", "down", "downward", "falling"} and above_count < 2):
+        return False
+    if above_count >= 2 or stack == "bullish" or direction in {"向上", "up", "upward", "rising"}:
+        return True
+    return False
+
+
+def _row_trend_red_state(row: dict[str, Any], buy_reasons: list[dict[str, Any]] | None = None) -> bool | None:
+    pct = _row_day_change_pct(row)
+    if pct is not None:
+        return pct > 0
+    ma = _best_ma_alignment(row, buy_reasons, include_row_level=True)
+    return _ma_trend_red_state(ma)
+
+
+def _pool_validation_risk_reason(row: dict[str, Any], *, reason_type: str, signal_type: str, score: float, details: str = "") -> dict[str, Any]:
+    as_of = _text(row.get("day_change_as_of")) or _text(row.get("trade_date")) or _text(row.get("dt"))
+    pct = _row_day_change_pct(row)
+    evidence = {
+        "validation": "focus_watch_pool_reverse_check",
+        "source": _text(row.get("day_change_source")),
+    }
+    if pct is not None:
+        evidence["day_change_pct"] = round(pct, 4)
+    if details:
+        evidence["details"] = details
+    return {
+        "reason_type": reason_type,
+        "source_collection": "terminal_stock_pool_validation",
+        "source_doc_id": f"{_text(row.get('symbol') or row.get('raw_code'))}:{as_of}:{reason_type}",
+        "signal_type": signal_type,
+        "signal_side": "sell",
+        "freq": "日内",
+        "score": score,
+        "confidence": 1.0,
+        "decision_effect": "block",
+        "event_dt": as_of,
+        "as_of": as_of,
+        "evidence": evidence,
+    }
+
+
+def _focus_watch_pool_validation_blocker(row: dict[str, Any], top_buy: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(top_buy, dict) or not top_buy:
+        return None
+    if _has_current_upper_buy_point(row):
+        return None
+    age = _reason_age_trading_days(top_buy)
+    if age is not None and age > BUY_POINT_POOL_ANCHOR_MAX_AGE_DAYS:
+        return _pool_validation_risk_reason(
+            row,
+            reason_type="pool_buy_point_stale",
+            signal_type=f"买点超过{BUY_POINT_POOL_ANCHOR_MAX_AGE_DAYS}天",
+            score=-42.0,
+            details=f"top_buy_age={age}",
+        )
+    buy_reasons = _current_buy_technical_reasons(row) or [top_buy]
+    trend_red = _row_trend_red_state(row, buy_reasons)
+    if trend_red is False:
+        pct = _row_day_change_pct(row)
+        label = f"趋势未红{pct:.2f}%" if pct is not None else "趋势未红"
+        return _pool_validation_risk_reason(
+            row,
+            reason_type="pool_trend_not_red",
+            signal_type=label,
+            score=-36.0 if pct is None else -min(80.0, max(18.0, abs(pct) * 12.0)),
+        )
+    return None
+
+
 def _source_collections(row: dict[str, Any]) -> list[str]:
     values = []
     for reason in row.get("inclusion_reasons") or []:
@@ -2765,6 +3027,8 @@ def _has_left_attack_setup(row: dict[str, Any], buy_reasons: list[dict[str, Any]
     ]
     if not current_left:
         return False
+    if not any(_is_upper_freq(reason.get("freq")) for reason in current_left):
+        return False
     return _ma_left_attack_confirmed(_best_ma_alignment(row, _current_buy_technical_reasons(row), include_row_level=False))
 
 
@@ -2779,6 +3043,24 @@ def _has_right_attack_setup(row: dict[str, Any], buy_reasons: list[dict[str, Any
     return _ma_right_attack_confirmed(_best_ma_alignment(row, _current_buy_technical_reasons(row), include_row_level=False))
 
 
+def _has_current_upper_buy_point(row: dict[str, Any], buy_reasons: list[dict[str, Any]] | None = None) -> bool:
+    reasons = _buy_technical_reasons(row) if buy_reasons is None else buy_reasons
+    return any(
+        _is_upper_freq(reason.get("freq"))
+        and _reason_is_current_for_entry(reason)
+        and _technical_opportunity_side(reason) in {"left", "right"}
+        for reason in reasons
+    )
+
+
+def _hard_risk_still_blocks_upper_buy(reason: dict[str, Any] | None) -> bool:
+    if not isinstance(reason, dict) or not reason:
+        return False
+    reason_type = _text(reason.get("reason_type"))
+    knowledge_effect = _text(reason.get("knowledge_effect"))
+    return reason_type == "knowledge_conflict" or knowledge_effect in {"block", "exit_priority"}
+
+
 def _has_attack_entry_setup(row: dict[str, Any], buy_reasons: list[dict[str, Any]]) -> bool:
     """Allow hot right-side setups into focus without waiting for a 30m print."""
     if not _has_right_attack_setup(row, buy_reasons):
@@ -2786,7 +3068,7 @@ def _has_attack_entry_setup(row: dict[str, Any], buy_reasons: list[dict[str, Any
     upper_reasons = [
         reason
         for reason in buy_reasons
-        if _reason_has_freq(reason, _is_upper_freq) and _reason_is_current_for_entry(reason)
+        if _is_upper_freq(reason.get("freq")) and _reason_is_current_for_entry(reason)
     ]
     right_side_reasons = _current_direct_reasons_for_freq(buy_reasons, _is_right_side_freq, side="right")
     if not upper_reasons or not right_side_reasons:
@@ -2849,6 +3131,8 @@ def _focus_mainline_rank_tier(row: dict[str, Any]) -> int:
 def _right_review_allowed_in_focus(row: dict[str, Any], entry_gate_status: str, top_buy: dict[str, Any] | None) -> bool:
     if entry_gate_status not in FOCUS_REVIEW_GATE_STATUSES or not top_buy:
         return False
+    if entry_gate_status == "entry_waiting_upper_context":
+        return False
     if _focus_mainline_rank_tier(row) <= 0:
         return False
     if _sector_policy(row).get("policy") == "defensive_strict":
@@ -2904,9 +3188,17 @@ def _chain_entry_blocker(row: dict[str, Any]) -> str:
 def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, Any] | None, dict[str, Any] | None]:
     buy_reasons = _buy_technical_reasons(row)
     risk_reasons = _risk_reasons(row)
+    intraday_drop_risk = _intraday_day_drop_risk_reason(row)
+    if intraday_drop_risk:
+        risk_reasons.append(intraday_drop_risk)
     current_buy_reasons = [reason for reason in buy_reasons if _reason_is_current_for_entry(reason)]
     top_buy = max(current_buy_reasons, key=_buy_reason_priority, default=None) or max(buy_reasons, key=_buy_reason_priority, default=None)
     top_risk = max(risk_reasons, key=lambda item: (_float(item.get("weight")), abs(_float(item.get("score")))), default=None)
+    blocking_risk = max(
+        (reason for reason in risk_reasons if _risk_reason_blocks_entry(reason)),
+        key=lambda item: (_float(item.get("weight")), abs(_float(item.get("score")))),
+        default=None,
+    )
     chain_blocker = _chain_entry_blocker(row)
     if not top_buy:
         if top_risk:
@@ -2940,13 +3232,16 @@ def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, An
             "decision_effect": "mark_only",
             "details": chain_blocker,
         }
+    upper_buy_priority = _has_current_upper_buy_point(row, current_buy_reasons or buy_reasons)
+    if blocking_risk and (not upper_buy_priority or _hard_risk_still_blocks_upper_buy(blocking_risk)):
+        return False, "blocked_by_risk", _risk_blocked_by_code(blocking_risk), top_buy, blocking_risk
     has_30m = _has_direct_reason_for_freq(buy_reasons, _is_30m_freq)
-    has_upper = any(_is_upper_freq(freq) for freq in freqs)
+    has_upper = _has_direct_reason_for_freq(buy_reasons, _is_upper_freq)
     has_right_side = _has_direct_reason_for_freq(buy_reasons, _is_right_side_freq, side="right")
     has_partner = any(_is_entry_partner_freq(freq) for freq in freqs)
     fresh_30m = _has_current_direct_reason_for_freq(buy_reasons, _is_30m_freq)
     fresh_30m_right = _has_current_direct_reason_for_freq(buy_reasons, _is_30m_freq, side="right")
-    fresh_upper = _has_current_reason_for_freq(buy_reasons, _is_upper_freq)
+    fresh_upper = _has_current_direct_reason_for_freq(buy_reasons, _is_upper_freq)
     fresh_right_side = _has_current_direct_reason_for_freq(buy_reasons, _is_right_side_freq, side="right")
     fresh_right_side_confirmed = fresh_right_side
     if (
@@ -2962,6 +3257,10 @@ def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, An
     ):
         return True, "entry_confirmed", [], top_buy, top_risk
     defensive_strict = _sector_policy(row).get("policy") == "defensive_strict"
+    if not has_upper:
+        return False, "entry_waiting_upper_context", ["daily_or_weekly_missing"], top_buy, top_risk
+    if not fresh_upper:
+        return False, "entry_waiting_upper_context", ["daily_or_weekly_stale"], top_buy, top_risk
     if _has_left_attack_setup(row, current_buy_reasons):
         if defensive_strict:
             return False, "entry_waiting_defensive_confirmation", ["defensive_strict_requires_full_confirmation"], top_buy, top_risk
@@ -2976,10 +3275,6 @@ def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, An
         return False, "entry_waiting_30m_confirm", ["30m_stale"], top_buy, top_risk
     if not fresh_30m_right:
         return False, "entry_waiting_30m_confirm", ["30m_right_side_missing"], top_buy, top_risk
-    if not has_upper:
-        return False, "entry_waiting_upper_context", ["daily_or_weekly_missing"], top_buy, top_risk
-    if not fresh_upper:
-        return False, "entry_waiting_upper_context", ["daily_or_weekly_stale"], top_buy, top_risk
     if not has_partner:
         return False, "entry_waiting_resonance_confirm", ["partner_period_missing"], top_buy, top_risk
     if not has_right_side:
@@ -3390,6 +3685,14 @@ def _mainline_alignment_level(score: float) -> str:
     return "neutral"
 
 
+def _intraday_change_components(row: dict[str, Any]) -> dict[str, float]:
+    pct = _row_day_change_pct(row)
+    if pct is None or pct >= INTRADAY_DROP_SCORE_PENALTY_START_PCT:
+        return {}
+    penalty = max(-45.0, (pct - INTRADAY_DROP_SCORE_PENALTY_START_PCT) * 8.0)
+    return {"intraday_change_penalty": round(penalty, 3)}
+
+
 def _row_buy_freqs(row: dict[str, Any], top_buy: dict[str, Any]) -> set[str]:
     freqs = {_text(top_buy.get("freq"))}
     for reason in _current_buy_technical_reasons(row):
@@ -3427,6 +3730,7 @@ def _entry_components(row: dict[str, Any], top_buy: dict[str, Any]) -> dict[str,
         "context_adjust": _context_adjust(row),
     }
     components.update(_sector_policy_components(row))
+    components.update(_intraday_change_components(row))
     return {key: round(value, 3) for key, value in components.items()}
 
 
@@ -3460,6 +3764,7 @@ def _rank_reason(score_components: dict[str, float]) -> str:
         "defensive_lenient_policy": "防守放宽",
         "defensive_strict_policy": "防守严格",
         "context_adjust": "观点修正",
+        "intraday_change_penalty": "当天跌幅",
         "sell_strength": "风险强度",
         "timeframe_severity": "级别严重度",
         "chain_or_knowledge_risk": "知识/产业链风险",
@@ -3518,6 +3823,7 @@ def _watch_components(row: dict[str, Any], gate_status: str) -> dict[str, float]
         "fib_ma_acceptance": _fib_ma_support_score(row, buy_reasons, include_row_level=False),
         "hot_sector": hot_sector,
     }
+    components.update(_intraday_change_components(row))
     return {key: round(value, 3) for key, value in components.items()}
 
 
@@ -3696,10 +4002,12 @@ def _trade_stage_from_context(
     execution_side = _text(timeframe_sides.get("execution", {}).get("side"))
     upper_side = _text(timeframe_sides.get("upper", {}).get("side"))
     has_trade = trade_side != "none"
-    has_execution = execution_side != "none"
+    has_execution_confirm = _side_is_confirming(execution_side)
     if entry_gate_status == "entry_confirmed" and _side_is_confirming(trade_side) and _side_is_confirming(execution_side):
         return "confirmed_entry"
-    if has_trade and (entry_gate_status == "entry_waiting_right_side_confirm" or has_execution):
+    if top_buy and upper_side == "none":
+        return "watch_pool"
+    if has_trade and has_execution_confirm:
         return "probe_candidate"
     if trade_side == "left" or execution_side == "left" or upper_side == "left":
         return "dip_watch"
@@ -3716,7 +4024,7 @@ def _timeframe_reads(timeframe_sides: dict[str, dict[str, Any]]) -> dict[str, di
             "label": "大周期",
             "freqs": "日/周",
             "side": _text(timeframe_sides.get("upper", {}).get("side")) or "none",
-            "status": "有方向" if _text(timeframe_sides.get("upper", {}).get("side")) != "none" else "待确认",
+            "status": "日/周买点" if _text(timeframe_sides.get("upper", {}).get("side")) != "none" else "缺日/周买点",
             "evidence": timeframe_sides.get("upper", {}),
         },
         "trade_cycle": {
@@ -3821,10 +4129,14 @@ def _trade_intent_from_context(
     upper_side = _text(timeframe_sides.get("upper", {}).get("side"))
     if not top_buy or any(code == "missing_buy_technical" for code in blocked_by):
         return "clue_only"
+    if upper_side == "none":
+        return "wait_big_cycle"
     if trade_side == "left" or upper_side == "left":
         return "left_dip"
-    if entry_gate_status == "entry_waiting_right_side_confirm" or trade_stage == "probe_candidate":
+    if trade_stage == "probe_candidate":
         return "probe_candidate"
+    if entry_gate_status == "entry_waiting_right_side_confirm":
+        return "wait_execution"
     if trade_side in {"right", "mixed"} or execution_side in {"right", "mixed"}:
         return "right_momentum"
     if upper_side in {"right", "mixed"}:
@@ -3860,21 +4172,23 @@ def _setup_mode_from_context(
 
 def _setup_explanation(intent: str, missing_condition: str) -> str:
     if intent == "confirmed_entry":
-        return "30m买点和5m/15m下单周期都已确认，复核位置、止损和仓位。"
+        return "日/周买点、30m买点和5m/15m下单周期都已确认，复核位置、止损和仓位。"
     if intent == "attack_entry":
-        return "日/周背景和5m/15m右侧已经给出，30m未补齐，按进攻买点小仓复核。"
+        return "日/周买点和5m/15m右侧已经给出，30m未补齐，按进攻买点小仓复核。"
     if intent == "left_attack":
-        return "左侧买点叠加10/20日线承接，按低吸进攻复核，不按追涨买点处理。"
+        return "日/周左侧买点叠加10/20日线承接，按低吸进攻复核，不按追涨买点处理。"
     if intent == "right_momentum":
-        return "已有右侧动量或大周期走强，但30m交易买点还没补齐。"
+        return "日/周买点已有方向，但30m交易买点还没补齐。"
     if intent == "probe_candidate":
-        return "30m或上级结构有动作，离买点近，等5m/15m下单确认。"
+        return "日/周和30m已有动作，离买点近，等5m/15m下单确认。"
+    if intent == "wait_execution":
+        return "日/周或30m已有买点，但5m/15m还没给下单确认，先盯确认，不标试仓。"
     if intent == "left_dip":
-        return "偏左侧低吸，只能观察承接，不能当追涨买点。"
+        return "日/周偏左侧低吸，只能观察承接，不能当追涨买点。"
     if intent == "wait_big_cycle":
-        return "短周期有动作，但日/周大周期还没站住。"
+        return "短周期有动作，但日/周买点还没确认。"
     if intent == "clue_only":
-        return "只有来源或主题线索，还没有硬技术买点。"
+        return "只有来源或短周期线索，还没有日/周硬买点。"
     if intent == "skip_now":
         return "已有卖点、冲突、过期或产业链高潮，暂不参与。"
     return missing_condition or "盯盘等买点。"
@@ -3890,7 +4204,7 @@ def _entry_logic_summary(
     execution = _bucket_side_labels(timeframe_sides.get("execution", {})) or "5m/15m未确认"
     upper = _bucket_side_labels(timeframe_sides.get("upper", {})) or "日/周未确认"
     chain = _text(chain_position.get("chain") or chain_position.get("board_or_concept") or chain_position.get("node"))
-    parts = [f"30m: {trade}", f"5m/15m: {execution}", f"日/周: {upper}"]
+    parts = [f"日/周: {upper}", f"30m: {trade}", f"5m/15m: {execution}"]
     if chain:
         parts.append(f"产业链: {chain}")
     if missing_condition and missing_condition != "买点路径已走通":
@@ -4204,6 +4518,13 @@ def _finalize_pool_row(
     row["upper_timeframe_side"] = timeframe_sides["upper"]["side"]
     row["trade_timeframe_side"] = timeframe_sides["trade"]["side"]
     row["execution_timeframe_side"] = timeframe_sides["execution"]["side"]
+    upper_signal = _bucket_side_labels(timeframe_sides.get("upper", {}))
+    trade_signal = _bucket_side_labels(timeframe_sides.get("trade", {}))
+    execution_signal = _bucket_side_labels(timeframe_sides.get("execution", {}))
+    row["daily_weekly_signal"] = upper_signal
+    row["trade_cycle_signal"] = trade_signal
+    row["execution_cycle_signal"] = execution_signal
+    row["primary_timeframe_signal"] = upper_signal or "缺日/周买点"
     row["chain_phase"] = _text((row.get("chain_context") or {}).get("phase")) if isinstance(row.get("chain_context"), dict) else ""
     theme_rank_bonus = _mainline_alignment_score(row)
     row["theme_rank_bonus"] = theme_rank_bonus
@@ -4250,7 +4571,11 @@ def _finalize_pool_row(
     row["missing_condition"] = _missing_condition(blocked_by, "买点路径已走通" if trade_stage == "confirmed_entry" else "等新的技术确认")
     row["primary_blocker"] = row["missing_condition"]
     row["recommended_action"] = TRADE_STAGE_ACTIONS.get(trade_stage, "盯盘等买点")
-    row["entry_reason"] = " / ".join(_technical_signal_reason_labels(technical_groups, "right") + _technical_signal_reason_labels(technical_groups, "left")) or row.get("reason") or stage_label
+    row["entry_reason"] = " / ".join(
+        item
+        for item in (upper_signal, trade_signal, execution_signal)
+        if item
+    ) or row.get("reason") or stage_label
     row["invalidation"] = row.get("invalidates_when") or "触发条件失效或关键位被破坏"
     trade_intent = _trade_intent_from_context(
         pool_type=pool_type,
@@ -4319,7 +4644,7 @@ def _finalize_pool_row(
         row["actionability"] = "left_review" if left_attack else "entry_waiting_confirm" if (attack_entry or right_review) else "entry_ready"
         row["decision_effect"] = "left_review" if left_attack else "attack_confirm" if attack_entry else "right_review" if right_review else "confirm"
         row["signal_origin"] = _text((top_buy or {}).get("reason_type")) or row.get("signal_origin")
-        row["latest_signal"] = _text((top_buy or {}).get("signal_type")) or row.get("latest_signal")
+        row["latest_signal"] = row.get("daily_weekly_signal") or _text((top_buy or {}).get("signal_type")) or row.get("latest_signal")
         if left_attack:
             row["invalidates_when"] = "跌回10/20日线、左侧买点失效或产业链风险升温"
         elif attack_entry:
@@ -4349,7 +4674,7 @@ def _finalize_pool_row(
             row["queue_lane"] = "watch_preheat"
         elif entry_gate_status == "entry_waiting_upper_context":
             row["action_status"] = "entry_waiting_upper_context"
-            row["trader_action"] = "盯盘等大周期"
+            row["trader_action"] = "盯盘等日/周买点"
             row["queue_lane"] = "watch_preheat"
         elif entry_gate_status == "entry_waiting_right_side_confirm":
             row["action_status"] = "entry_waiting_right_side_confirm"
@@ -4390,6 +4715,10 @@ def _finalize_pool_row(
         row["next_action"] = row["trader_action"]
         row["actionability"] = "observe_only"
         row["decision_effect"] = "context_only"
+        if row.get("daily_weekly_signal"):
+            row["latest_signal"] = row["daily_weekly_signal"]
+        elif top_buy and entry_gate_status == "entry_waiting_upper_context":
+            row["latest_signal"] = "短周期异动，缺日/周买点"
         row["invalidates_when"] = row.get("invalidates_when") or "买点没走出来、信号过期或关键位被破坏"
     row["recommended_action"] = row["trader_action"]
     row["invalidation"] = row["invalidates_when"]
@@ -4795,7 +5124,7 @@ def _split_pool_rows(
     prepared = _prepare_pool_rows(rows)
     for row in prepared:
         entry_ok, gate_status, blocked_by, top_buy, top_risk = _entry_gate(row)
-        if top_risk and not top_buy:
+        if top_risk and (not top_buy or gate_status == "blocked_by_risk"):
             components = _risk_components(row, top_risk)
             risk.append(_finalize_pool_row(
                 row,
@@ -4811,44 +5140,86 @@ def _split_pool_rows(
             gate_status == "left_attack_confirmed"
             and not _left_attack_allowed_in_focus(row, gate_status)
         ):
-            components = _entry_components(row, top_buy)
-            components.update(_market_alignment_components(row, gate_status, top_buy, top_risk))
-            focus.append(_finalize_pool_row(
-                row,
-                pool_type="focus",
-                rank_score=sum(components.values()),
-                score_components=components,
-                entry_gate_status=gate_status,
-                blocked_by=blocked_by,
-                top_buy=top_buy,
-                top_risk=top_risk,
-            ))
+            validation_risk = _focus_watch_pool_validation_blocker(row, top_buy)
+            if validation_risk:
+                components = _risk_components(row, validation_risk)
+                risk.append(_finalize_pool_row(
+                    row,
+                    pool_type="risk",
+                    rank_score=sum(components.values()),
+                    score_components=components,
+                    entry_gate_status="blocked_by_risk",
+                    blocked_by=[_text(validation_risk.get("reason_type"))],
+                    top_buy=top_buy,
+                    top_risk=validation_risk,
+                ))
+            else:
+                components = _entry_components(row, top_buy)
+                components.update(_market_alignment_components(row, gate_status, top_buy, top_risk))
+                focus.append(_finalize_pool_row(
+                    row,
+                    pool_type="focus",
+                    rank_score=sum(components.values()),
+                    score_components=components,
+                    entry_gate_status=gate_status,
+                    blocked_by=blocked_by,
+                    top_buy=top_buy,
+                    top_risk=top_risk,
+                ))
         elif top_buy and _right_review_allowed_in_focus(row, gate_status, top_buy) and _alignment_allows_focus(row, gate_status, top_buy, top_risk):
-            components = _focus_review_components(row, top_buy)
-            components.update(_market_alignment_components(row, gate_status, top_buy, top_risk))
-            focus.append(_finalize_pool_row(
-                row,
-                pool_type="focus",
-                rank_score=sum(components.values()),
-                score_components=components,
-                entry_gate_status=gate_status,
-                blocked_by=blocked_by,
-                top_buy=top_buy,
-                top_risk=top_risk,
-            ))
+            validation_risk = _focus_watch_pool_validation_blocker(row, top_buy)
+            if validation_risk:
+                components = _risk_components(row, validation_risk)
+                risk.append(_finalize_pool_row(
+                    row,
+                    pool_type="risk",
+                    rank_score=sum(components.values()),
+                    score_components=components,
+                    entry_gate_status="blocked_by_risk",
+                    blocked_by=[_text(validation_risk.get("reason_type"))],
+                    top_buy=top_buy,
+                    top_risk=validation_risk,
+                ))
+            else:
+                components = _focus_review_components(row, top_buy)
+                components.update(_market_alignment_components(row, gate_status, top_buy, top_risk))
+                focus.append(_finalize_pool_row(
+                    row,
+                    pool_type="focus",
+                    rank_score=sum(components.values()),
+                    score_components=components,
+                    entry_gate_status=gate_status,
+                    blocked_by=blocked_by,
+                    top_buy=top_buy,
+                    top_risk=top_risk,
+                ))
         else:
-            components = _watch_components(row, gate_status)
-            components.update(_market_alignment_components(row, gate_status, top_buy, top_risk))
-            watch.append(_finalize_pool_row(
-                row,
-                pool_type="watch",
-                rank_score=sum(components.values()),
-                score_components=components,
-                entry_gate_status=gate_status,
-                blocked_by=blocked_by,
-                top_buy=top_buy,
-                top_risk=top_risk,
-            ))
+            validation_risk = _focus_watch_pool_validation_blocker(row, top_buy)
+            if validation_risk:
+                components = _risk_components(row, validation_risk)
+                risk.append(_finalize_pool_row(
+                    row,
+                    pool_type="risk",
+                    rank_score=sum(components.values()),
+                    score_components=components,
+                    entry_gate_status="blocked_by_risk",
+                    blocked_by=[_text(validation_risk.get("reason_type"))],
+                    top_buy=top_buy,
+                    top_risk=validation_risk,
+                ))
+            else:
+                components = _watch_components(row, gate_status)
+                components.update(_market_alignment_components(row, gate_status, top_buy, top_risk))
+                watch.append(_finalize_pool_row(
+                    row,
+                    pool_type="watch",
+                    rank_score=sum(components.values()),
+                    score_components=components,
+                    entry_gate_status=gate_status,
+                    blocked_by=blocked_by,
+                    top_buy=top_buy,
+                    top_risk=top_risk,
+                ))
     focus.sort(
         key=lambda item: (
             _float(item.get("setup_rank_tier")),
@@ -5020,6 +5391,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     _attach_broad_market_context(rows, broad_market_context)
     raw_candidate_count = len(rows)
     opportunity_rows = _default_opportunity_candidate_rows(rows, include_st=include_st)
+    _attach_stock_quote_context(opportunity_rows, db, trade_date)
     default_candidate_symbols = {row.get("symbol") for row in opportunity_rows.values() if row.get("symbol")}
     strict_candidate_count = len(opportunity_rows)
 

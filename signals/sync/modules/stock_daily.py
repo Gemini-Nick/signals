@@ -1290,6 +1290,95 @@ def _daily_provider_prefix(code: str) -> str:
     return "sz"
 
 
+def _stable_price_factor_from_overlap(
+    raw_df: pd.DataFrame,
+    qfq_df: pd.DataFrame,
+    *,
+    raw_date_col: str,
+    raw_close_col: str,
+) -> float | None:
+    if raw_df is None or raw_df.empty or qfq_df is None or qfq_df.empty:
+        return None
+    if raw_date_col not in raw_df.columns or raw_close_col not in raw_df.columns:
+        return None
+    if "日期" not in qfq_df.columns or "收盘" not in qfq_df.columns:
+        return None
+
+    raw = raw_df[[raw_date_col, raw_close_col]].copy()
+    qfq = qfq_df[["日期", "收盘"]].copy()
+    raw["_date"] = pd.to_datetime(raw[raw_date_col], errors="coerce").dt.normalize()
+    qfq["_date"] = pd.to_datetime(qfq["日期"], errors="coerce").dt.normalize()
+    raw["_raw_close"] = pd.to_numeric(raw[raw_close_col], errors="coerce")
+    qfq["_qfq_close"] = pd.to_numeric(qfq["收盘"], errors="coerce")
+    merged = raw[["_date", "_raw_close"]].merge(qfq[["_date", "_qfq_close"]], on="_date", how="inner")
+    merged = merged[(merged["_raw_close"] > 0) & (merged["_qfq_close"] > 0)]
+    if len(merged) < 20:
+        return None
+
+    ratios = merged["_qfq_close"] / merged["_raw_close"]
+    median = float(ratios.median())
+    if not math.isfinite(median) or median <= 0 or abs(median - 1.0) <= 0.01:
+        return None
+    relative_error = (ratios / median - 1.0).abs()
+    if float(relative_error.quantile(0.9)) > 0.02:
+        return None
+    if float(relative_error.max()) > 0.06:
+        return None
+    return median
+
+
+def _apply_ohlc_factor(df: pd.DataFrame, column_map: dict[str, str], factor: float) -> pd.DataFrame:
+    adjusted = df.copy()
+    price_cols = [column_map[key] for key in ("open", "high", "low", "close") if column_map.get(key) in adjusted.columns]
+    for col in price_cols:
+        adjusted[col] = pd.to_numeric(adjusted[col], errors="coerce").mul(factor).round(3)
+    if {"open", "high", "low", "close"}.issubset(column_map):
+        open_col = column_map["open"]
+        high_col = column_map["high"]
+        low_col = column_map["low"]
+        close_col = column_map["close"]
+        required = {open_col, high_col, low_col, close_col}
+        if required.issubset(adjusted.columns):
+            adjusted[high_col] = adjusted[[open_col, high_col, close_col]].max(axis=1)
+            adjusted[low_col] = adjusted[[open_col, low_col, close_col]].min(axis=1)
+    return adjusted
+
+
+def _maybe_qfq_adjust_sina_etf(
+    code: str,
+    df: pd.DataFrame,
+    column_map: dict[str, str],
+    start: str,
+    end_date: str,
+    db: Database | None,
+) -> tuple[pd.DataFrame, str]:
+    try:
+        qfq_df = provider_call(
+            "tencent",
+            "stock_daily",
+            lambda: fetch_tencent_daily(
+                code,
+                start_date=start,
+                end_date=end_date,
+                count=800,
+                timeout=float(os.getenv("STOCK_DAILY_TENCENT_TIMEOUT", "8")),
+            ),
+            db=db,
+        )
+        factor = _stable_price_factor_from_overlap(
+            df,
+            qfq_df,
+            raw_date_col=column_map["dt"],
+            raw_close_col=column_map["close"],
+        )
+    except Exception as exc:
+        logger.debug("sina ETF qfq calibration skipped %s: %s", code, exc)
+        return df, "sina_etf"
+    if factor is None:
+        return df, "sina_etf"
+    return _apply_ohlc_factor(df, column_map, factor), "sina_etf_qfq_factor"
+
+
 def _sync_one_stock(code: str, last_dt: str, end_date: str,
                     proxy_url: str = None, db: Database | None = None) -> list:
     """同步单只股票日线，返回文档列表"""
@@ -1387,6 +1476,7 @@ def _sync_one_stock(code: str, last_dt: str, end_date: str,
                     "vol": "volume",
                     "amount": "amount",
                 }
+                df, source = _maybe_qfq_adjust_sina_etf(code, df, column_map, start, end_date, db)
                 return _docs_from_daily_df(code, df, column_map, source, end_date=end_date)
             except Exception as sina_etf_exc:
                 failures.append(("sina_etf", sina_etf_exc))

@@ -692,6 +692,8 @@ async def backtest_analyze(
     batch2_target: float = Query(10),
     atr_exit_period: int = Query(0),
     atr_exit_mult: float = Query(2.0),
+    start_date: str = Query("", description="可选统计起始日期 YYYY-MM-DD"),
+    end_date: str = Query("", description="可选统计结束日期 YYYY-MM-DD"),
 ):
     """Canonical Signals 回测分析入口。"""
     from signals.services.backtest import backtest_analyze as _backtest_analyze
@@ -723,6 +725,8 @@ async def backtest_analyze(
         batch2_target=batch2_target,
         atr_exit_period=atr_exit_period,
         atr_exit_mult=atr_exit_mult,
+        start_date=start_date,
+        end_date=end_date,
     )
 
 

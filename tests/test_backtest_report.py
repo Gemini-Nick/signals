@@ -140,6 +140,9 @@ def test_batch_terminal_multi_symbol_panels():
                 "total_return": 12.5,
                 "max_drawdown": 8.4,
                 "sharpe": 1.1,
+                "signals": [
+                    {"dt": 1767225600, "type": "Pattern A", "group": "macd", "date_str": "2026-01-01", "price": 10.1},
+                ],
                 "sim_trades": [
                     {
                         "signal_type": "Pattern A",
@@ -215,6 +218,7 @@ def test_batch_terminal_multi_symbol_panels():
     assert terminal["panels"]["multi_charts"]["items"][0]["ohlcv"]
     assert terminal["panels"]["multi_charts"]["items"][0]["start_date"] == "2026-01-01"
     assert terminal["panels"]["multi_charts"]["items"][0]["end_date"] == "2026-01-04"
+    assert terminal["panels"]["multi_charts"]["items"][0]["signal_markers"][0]["kind"] == "signal"
     assert terminal["panels"]["multi_charts"]["items"][0]["trade_markers"][0]["kind"] == "entry"
     assert terminal["panels"]["multi_charts"]["items"][0]["trade_markers"][1]["kind"] == "exit"
     assert terminal["panels"]["interval_overview"]["rows"][0]["start_date"] == "2026-01-01"

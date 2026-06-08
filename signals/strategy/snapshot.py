@@ -71,6 +71,7 @@ def build_strategy_snapshot(
     quotes = _quote_map(_as_list(_response_data(quote_resp)))
     themes = _build_themes(board_resp, concept_resp, chain_resp)
     source_confidence = _build_source_confidence(responses, db=db)
+    etf_analysis = _build_etf_analysis(db=db, enabled=db_provided or not responses_provided)
 
     candidates, warnings = _build_candidates(
         signals=signals,
@@ -129,6 +130,7 @@ def build_strategy_snapshot(
         "themes": themes,
         "candidates": candidates,
         "warnings": warnings,
+        "etf_analysis": etf_analysis,
         "chart_context": chart_context,
         "daily_brief": daily_brief,
         "decision_queue": decision_queue,
@@ -145,12 +147,45 @@ def build_strategy_snapshot(
                 "quote_snapshots",
                 "chain_heat_snapshots",
                 "ai_factor_experiments",
+                "eastmoney_etf_spot",
+                "stock_names",
+                "bars",
                 "board_ranking",
                 "concept_ranking",
             ],
             "fallback_policy": ".data caches are import/compat sources, not dashboard truth",
         },
     })
+
+
+def _build_etf_analysis(*, db: Any = None, enabled: bool = True) -> dict[str, Any]:
+    if not enabled:
+        return {
+            "universe": {"type": "all_etf", "total": 0, "source": "disabled"},
+            "asset_class_counts": {},
+            "top_turnover": [],
+            "top_gainers": [],
+            "top_losers": [],
+            "review_universe": [],
+        }
+    try:
+        from signals.core.etf_universe import build_etf_strategy_analysis
+
+        return build_etf_strategy_analysis(db=db)
+    except Exception as exc:
+        return {
+            "universe": {
+                "type": "all_etf",
+                "total": 0,
+                "source": "error",
+                "warnings": [f"{exc.__class__.__name__}: {exc}"],
+            },
+            "asset_class_counts": {},
+            "top_turnover": [],
+            "top_gainers": [],
+            "top_losers": [],
+            "review_universe": [],
+        }
 
 
 def _merge_ai_factor_candidates(candidates: list[dict[str, Any]], *, db: Any = None) -> list[dict[str, Any]]:

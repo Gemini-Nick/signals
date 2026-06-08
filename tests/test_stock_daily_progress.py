@@ -159,6 +159,7 @@ def test_stock_daily_uses_bars_latest_to_skip_network(monkeypatch):
     monkeypatch.setattr(stock_daily, "naive_market_now", lambda _market: datetime(2026, 4, 28, 18, 0, 0))
     monkeypatch.setattr(stock_daily, "_get_stock_codes", lambda _db: (["600001"], "all"))
     monkeypatch.setattr(stock_daily, "_latest_daily_dates_by_symbol", lambda _db, _codes: {"600001": datetime(2026, 4, 28)})
+    monkeypatch.setattr(stock_daily, "_earliest_daily_dates_by_symbol", lambda _db, _codes: {"600001": datetime(2021, 4, 28)})
     monkeypatch.setattr(stock_daily, "_progress_interval", lambda: 1)
     monkeypatch.setattr(stock_daily, "_CALL_INTERVAL", 0)
     monkeypatch.setattr(stock_daily, "_stock_daily_providers_all_cooling", lambda _db: False)
@@ -202,6 +203,7 @@ def test_stock_daily_batch_today_skips_single_symbol_fetch(monkeypatch):
     monkeypatch.setattr(stock_daily, "naive_market_now", lambda _market: datetime(2026, 4, 29, 18, 0, 0))
     monkeypatch.setattr(stock_daily, "_get_stock_codes", lambda _db: (["600001", "600002"], "all"))
     monkeypatch.setattr(stock_daily, "_latest_daily_dates_by_symbol", lambda _db, _codes: {"600001": datetime(2026, 4, 28)})
+    monkeypatch.setattr(stock_daily, "_earliest_daily_dates_by_symbol", lambda _db, _codes: {"600001": datetime(2021, 4, 28)})
     monkeypatch.setattr(stock_daily, "_progress_interval", lambda: 1)
     monkeypatch.setattr(stock_daily, "_BATCH_WORKERS", 1)
     monkeypatch.setattr(stock_daily, "_CALL_INTERVAL", 0)
@@ -239,7 +241,7 @@ def test_stock_daily_batch_today_skips_single_symbol_fetch(monkeypatch):
 
     result = stock_daily.sync_stock_daily(db)
 
-    assert calls == [("600002", "20240429", "20260429")]
+    assert calls == [("600002", "20210430", "20260429")]
     assert result["processed"] == 2
     assert result["batch_today"] == 1
     assert result["batch_today_inserted"] == 1

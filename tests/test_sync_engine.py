@@ -372,12 +372,17 @@ def test_workbench_lane_intraday_rebuilds_terminal_stock_pool():
         calls.append("terminal_realtime_pool")
         return {"inserted": 1}
 
+    def market_limit_pools(db, proxy_url=None):
+        calls.append("market_limit_pools")
+        return {"inserted": 1}
+
     def strategy_snapshot(db, proxy_url=None):
         calls.append("strategy_snapshot")
         return {"inserted": 1}
 
     engine.module_map = {
         "market_pools": (market_pools, ""),
+        "market_limit_pools": (market_limit_pools, ""),
         "strategy_snapshot": (strategy_snapshot, ""),
         "terminal_realtime_pool": (terminal_realtime_pool, ""),
     }
@@ -385,7 +390,7 @@ def test_workbench_lane_intraday_rebuilds_terminal_stock_pool():
 
     results = engine._run_intraday_bundle({Market.A}, datetime(2026, 4, 27, 10, 0))
 
-    assert calls == ["market_pools", "terminal_realtime_pool", "strategy_snapshot"]
+    assert calls == ["market_pools", "market_limit_pools", "terminal_realtime_pool", "strategy_snapshot"]
     assert [item["module"] for item in results] == calls
 
 

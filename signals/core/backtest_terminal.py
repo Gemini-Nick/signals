@@ -296,6 +296,7 @@ def _batch_chart_item(row: Mapping[str, Any]) -> dict[str, Any]:
     ohlcv = [_as_record(item) for item in _as_list(row.get("ohlcv_tail") or row.get("ohlcv"))]
     interval = _batch_interval_metrics(row, ohlcv)
     visible_ohlcv = ohlcv[-520:]
+    signals = [_as_record(item) for item in _as_list(row.get("signals") or row.get("signal_rows"))]
     trades = [_as_record(item) for item in _as_list(row.get("sim_trades") or row.get("trades"))]
     return {
         "code": _text(row.get("code")),
@@ -310,6 +311,7 @@ def _batch_chart_item(row: Mapping[str, Any]) -> dict[str, Any]:
         "filled_trade_count": len([trade for trade in trades if _num(trade.get("entry_price")) is not None]),
         "ohlcv": visible_ohlcv,
         "regimes": _chart_regimes(visible_ohlcv),
+        "signal_markers": _signal_markers(signals),
         "trade_markers": _trade_markers(trades, visible_ohlcv),
         "range_return_pct": interval["range_return_pct"],
         "max_drawdown_pct": interval["max_drawdown_pct"],

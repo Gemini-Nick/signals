@@ -155,12 +155,12 @@ def _detect_second_bs(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
     b1, b2, b3, b4, b5 = bis[-5], bis[-4], bis[-3], bis[-2], bis[-1]
     freq_val = czsc_obj.freq.value
 
-    # 二买：b1↓ b3↓ b5↑，b3 低点高于 b1 低点 且 b3 高点低于 b1 高点（完整结构确认）
+    # 二买：回调低点抬升。兼容两种触发形态：
+    # 1) b5 已经向上确认；2) b5 仍是向下回调笔但低点继续抬升。
     if (b1.direction == Direction.Down and
             b3.direction == Direction.Down and
             b5.direction == Direction.Up and
-            b3.low > b1.low and
-            b3.high < b1.high):  # 高点也在下降才是真二买
+            b3.low > b1.low):
         # 回撤比例：b3 回调幅度 / b2 上涨幅度
         b2_range = b2.high - b2.low
         b3_range = b3.high - b3.low
@@ -171,15 +171,31 @@ def _detect_second_bs(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
             dt=b5.sdt, signal_type="二买",
             confidence=conf,
             price=b5.fx_a.fx,
-            details=f"低点抬升 {b3.low:.2f}>{b1.low:.2f}，高点递降 {b3.high:.2f}<{b1.high:.2f}，回撤 {retracement:.1%}",
+            details=f"低点抬升 {b3.low:.2f}>{b1.low:.2f}，右侧向上确认，回撤 {retracement:.1%}",
         ))
 
-    # 二卖：b1↑ b3↑ b5↓，b3 高点低于 b1 高点 且 b3 低点高于 b1 低点
+    if (b1.direction == Direction.Down and
+            b3.direction == Direction.Down and
+            b5.direction == Direction.Down and
+            b3.low > b1.low and
+            b5.low > b3.low):
+        b4_range = b4.high - b4.low
+        b5_range = b5.high - b5.low
+        retracement = b5_range / (b4_range + 1e-9)
+        conf = 0.78 if retracement < 0.618 else 0.62
+        signals.append(SignalEvent(
+            symbol=symbol, freq=freq_val,
+            dt=b5.edt, signal_type="二买",
+            confidence=conf,
+            price=b5.low,
+            details=f"回调低点连续抬升 {b1.low:.2f}->{b3.low:.2f}->{b5.low:.2f}，回撤 {retracement:.1%}",
+        ))
+
+    # 二卖：反弹高点递降。兼容右侧向下确认和仍在向上反弹笔两种形态。
     if (b1.direction == Direction.Up and
             b3.direction == Direction.Up and
             b5.direction == Direction.Down and
-            b3.high < b1.high and
-            b3.low > b1.low):  # 低点也在抬升才是真二卖
+            b3.high < b1.high):
         b2_range = b2.high - b2.low
         b3_range = b3.high - b3.low
         retracement = b3_range / (b2_range + 1e-9)
@@ -189,7 +205,24 @@ def _detect_second_bs(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
             dt=b5.sdt, signal_type="二卖",
             confidence=conf,
             price=b5.fx_a.fx,
-            details=f"高点递降 {b3.high:.2f}<{b1.high:.2f}，低点抬升 {b3.low:.2f}>{b1.low:.2f}，反弹比 {retracement:.1%}",
+            details=f"高点递降 {b3.high:.2f}<{b1.high:.2f}，右侧向下确认，反弹比 {retracement:.1%}",
+        ))
+
+    if (b1.direction == Direction.Up and
+            b3.direction == Direction.Up and
+            b5.direction == Direction.Up and
+            b3.high < b1.high and
+            b5.high < b3.high):
+        b4_range = b4.high - b4.low
+        b5_range = b5.high - b5.low
+        retracement = b5_range / (b4_range + 1e-9)
+        conf = 0.78 if retracement < 0.618 else 0.62
+        signals.append(SignalEvent(
+            symbol=symbol, freq=freq_val,
+            dt=b5.edt, signal_type="二卖",
+            confidence=conf,
+            price=b5.high,
+            details=f"反弹高点连续递降 {b1.high:.2f}->{b3.high:.2f}->{b5.high:.2f}，反弹比 {retracement:.1%}",
         ))
 
     return signals
@@ -217,10 +250,9 @@ def _detect_third_bs(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
     if zs_zd >= zs_zg:
         return []  # 无有效中枢
 
-    # 三买：b4 向上离开中枢（b4.low > zs_zg 确认离开），b5↓ 回调但低点 > 中枢上沿
+    # 三买：b4 向上离开中枢，b5↓ 回调但低点不回中枢。
     if b4.direction == Direction.Up and b5.direction == Direction.Down:
-        b4_left = b4.low > zs_zg  # b4 整根笔在中枢上方 = 确认离开
-        if b5.low > zs_zg and b4_left:
+        if b4.high > zs_zg and b5.low > zs_zg:
             # 离开幅度越大、回调越浅 → 置信度越高
             leave_pct = (b4.high - zs_zg) / (zs_zg + 1e-9) * 100
             pullback_pct = (b4.high - b5.low) / (b4.high - zs_zg + 1e-9) * 100
@@ -234,10 +266,9 @@ def _detect_third_bs(czsc_obj: CZSC, symbol: str) -> List[SignalEvent]:
                         f"离开 {leave_pct:.1f}%，回撤 {pullback_pct:.0f}%",
             ))
 
-    # 三卖：b4 向下离开中枢（b4.high < zs_zd 确认离开），b5↑ 反弹但高点 < 中枢下沿
+    # 三卖：b4 向下离开中枢，b5↑ 反弹但高点不回中枢。
     if b4.direction == Direction.Down and b5.direction == Direction.Up:
-        b4_left = b4.high < zs_zd  # b4 整根笔在中枢下方 = 确认离开
-        if b5.high < zs_zd and b4_left:
+        if b4.low < zs_zd and b5.high < zs_zd:
             leave_pct = (zs_zd - b4.low) / (zs_zd + 1e-9) * 100
             pullback_pct = (b5.high - b4.low) / (zs_zd - b4.low + 1e-9) * 100
             conf = 0.80 if pullback_pct < 50 else 0.65

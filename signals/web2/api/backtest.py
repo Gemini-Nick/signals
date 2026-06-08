@@ -436,6 +436,90 @@ def _kline_meta(df: pd.DataFrame, freq: str) -> dict[str, Any]:
     }
 
 
+def _parse_backtest_boundary(value: Any, *, end: bool = False) -> pd.Timestamp | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    parsed = pd.to_datetime(raw, errors="coerce")
+    if pd.isna(parsed):
+        raise ValueError(f"日期格式无效: {raw}")
+    ts = pd.Timestamp(parsed)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert(None)
+    ts = ts.normalize()
+    if end:
+        ts = ts + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    return ts
+
+
+def _resolve_backtest_date_scope(
+    df: pd.DataFrame,
+    *,
+    start_date: Any = "",
+    end_date: Any = "",
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    start_ts = _parse_backtest_boundary(start_date)
+    end_ts = _parse_backtest_boundary(end_date, end=True)
+    if start_ts is not None and end_ts is not None and start_ts > end_ts:
+        raise ValueError("start_date 不能晚于 end_date")
+
+    analysis_df = df
+    if end_ts is not None:
+        analysis_df = analysis_df[analysis_df.index <= end_ts].copy()
+    visible_df = analysis_df
+    if start_ts is not None:
+        visible_df = visible_df[visible_df.index >= start_ts].copy()
+    if visible_df is analysis_df:
+        visible_df = visible_df.copy()
+
+    return analysis_df, visible_df, {
+        "requested_start_date": start_ts.strftime("%Y-%m-%d") if start_ts is not None else "",
+        "requested_end_date": end_ts.strftime("%Y-%m-%d") if end_ts is not None else "",
+        "start_date": visible_df.index[0].strftime("%Y-%m-%d") if not visible_df.empty else "",
+        "end_date": visible_df.index[-1].strftime("%Y-%m-%d") if not visible_df.empty else "",
+    }
+
+
+def _signal_timestamp(signal: dict[str, Any]) -> pd.Timestamp | None:
+    date_text = str(signal.get("date_str") or signal.get("date") or "").strip()
+    if date_text:
+        parsed = pd.to_datetime(date_text[:10], errors="coerce")
+        return None if pd.isna(parsed) else pd.Timestamp(parsed).normalize()
+    raw_time = signal.get("dt") or signal.get("time")
+    if raw_time is None:
+        return None
+    try:
+        timestamp = int(raw_time)
+    except (TypeError, ValueError):
+        return None
+    if timestamp > 10_000_000_000:
+        return pd.to_datetime(timestamp, unit="ms").normalize()
+    return pd.to_datetime(timestamp, unit="s").normalize()
+
+
+def _filter_signals_by_date_scope(
+    signals: list[dict[str, Any]],
+    *,
+    start_date: Any = "",
+    end_date: Any = "",
+) -> list[dict[str, Any]]:
+    start_ts = _parse_backtest_boundary(start_date)
+    end_ts = _parse_backtest_boundary(end_date, end=True)
+    if start_ts is None and end_ts is None:
+        return signals
+    filtered = []
+    for signal in signals:
+        ts = _signal_timestamp(signal)
+        if ts is None:
+            continue
+        if start_ts is not None and ts < start_ts:
+            continue
+        if end_ts is not None and ts > end_ts:
+            continue
+        filtered.append(signal)
+    return filtered
+
+
 def _fetch_kline_legacy(code: str, market: str, freq: str) -> pd.DataFrame:
     """
     拉取 K 线数据，降级链：
@@ -1557,6 +1641,8 @@ async def analyze_backtest_payload(
     batch2_target: float = 10,
     atr_exit_period: int = 0,
     atr_exit_mult: float = 2.0,
+    start_date: str = "",
+    end_date: str = "",
 ) -> dict[str, Any] | JSONResponse:
     """Pure Python backtest analysis entrypoint shared by API and services."""
     from signals.core.trade_simulator import SimConfig, simulate_trades
@@ -1589,21 +1675,40 @@ async def analyze_backtest_payload(
             })
         if lookback > 0 and len(df) > lookback:
             df = df.tail(lookback).copy()
-        meta = _kline_meta(df, freq)
+        try:
+            analysis_df, visible_df, date_scope = _resolve_backtest_date_scope(
+                df,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        if analysis_df.empty or visible_df.empty:
+            return JSONResponse(status_code=404, content={
+                "error": f"{code} 在指定日期区间内无{freq_label}数据",
+                "date_range": date_scope,
+            })
+
+        meta = _kline_meta(visible_df, freq)
         data_source = meta["data_source"]
         data_source_detail = meta["data_source_detail"]
 
         all_signals, bi_list, zhongshu, warnings = _detect_all_signals(
-            df, symbol, freq_label, signal_group, lookback, factor,
+            analysis_df, symbol, freq_label, signal_group, lookback, factor,
             gap_pct_min, volume_ratio_min, trend_lookback, bb_period, squeeze_threshold,
             run_count=run_count, body_ratio=body_ratio, accel_count=accel_count,
         )
+        all_signals = _filter_signals_by_date_scope(
+            all_signals,
+            start_date=start_date,
+            end_date=end_date,
+        )
 
-        _annotate_signals_ma_vol(df, all_signals)
+        _annotate_signals_ma_vol(analysis_df, all_signals)
 
-        ohlcv = _serialize_ohlcv(df)
-        macd_data = _compute_macd_data(df)
-        ma_lines = _compute_ma_lines(df)
+        ohlcv = _serialize_ohlcv(visible_df)
+        macd_data = _compute_macd_data(visible_df)
+        ma_lines = _compute_ma_lines(visible_df)
         kpi = _compute_kpi(all_signals)
 
         sim_kwargs = dict(
@@ -1623,11 +1728,12 @@ async def analyze_backtest_payload(
 
         valid_fields = {f.name for f in dataclasses.fields(SimConfig)}
         sim_kwargs = {k: v for k, v in sim_kwargs.items() if k in valid_fields}
-        sim = simulate_trades(df, all_signals, SimConfig(**sim_kwargs))
+        sim = simulate_trades(analysis_df, all_signals, SimConfig(**sim_kwargs))
 
         result = {
             "symbol": symbol, "code": code, "freq": freq_label,
             **meta,
+            "date_range": date_scope,
             "ohlcv": ohlcv, "macd": macd_data, "ma_lines": ma_lines,
             "signals": all_signals, "kpi": kpi,
             "date_presets": _get_date_presets(),
@@ -1686,6 +1792,8 @@ async def backtest_analyze(
     batch1_target: float = Query(5), batch2_target: float = Query(10),
     # ATR 追踪止损
     atr_exit_period: int = Query(0), atr_exit_mult: float = Query(2.0),
+    start_date: str = Query("", description="可选统计起始日期 YYYY-MM-DD"),
+    end_date: str = Query("", description="可选统计结束日期 YYYY-MM-DD"),
 ):
     """
     一体化分析 — 信号检测 + 交易模拟，一次请求返回全部数据。
@@ -1717,6 +1825,8 @@ async def backtest_analyze(
         batch2_target=batch2_target,
         atr_exit_period=atr_exit_period,
         atr_exit_mult=atr_exit_mult,
+        start_date=start_date,
+        end_date=end_date,
     )
 
 
@@ -2355,6 +2465,89 @@ def _batch_worker_count(total_codes: int) -> int:
     return max(1, min(total_codes, max(2, min(8, cpu_count))))
 
 
+def _parse_batch_codes(codes_raw: Any) -> list[str]:
+    if isinstance(codes_raw, str):
+        return [c.strip() for c in codes_raw.replace("\n", ",").split(",") if c.strip()]
+    if isinstance(codes_raw, list):
+        return [str(c).strip() for c in codes_raw if str(c).strip()]
+    return []
+
+
+def _int_body_value(body: dict[str, Any], key: str, default: int = 0) -> int:
+    try:
+        return int(body.get(key, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool_body_value(body: dict[str, Any], key: str, default: bool = False) -> bool:
+    value = body.get(key)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_batch_codes(body: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+    """Resolve manual batch codes or a named market universe such as all_etf."""
+    from signals.core.etf_universe import all_market_etf_universe, is_all_etf_universe_token
+
+    codes = _parse_batch_codes(body.get("codes", ""))
+    universe_token = str(body.get("universe") or "").strip()
+    if not universe_token and len(codes) == 1 and is_all_etf_universe_token(codes[0]):
+        universe_token = codes[0]
+
+    if is_all_etf_universe_token(universe_token):
+        try:
+            from signals.data.mongo_fallback import get_db
+
+            db = get_db()
+        except Exception:
+            db = None
+        limit = _int_body_value(body, "universe_limit", _int_env("SIGNALS_BACKTEST_ALL_ETF_LIMIT", 0))
+        require_daily_bars = _bool_body_value(
+            body,
+            "require_daily_bars",
+            _bool_env("SIGNALS_BACKTEST_ALL_ETF_REQUIRE_DAILY_BARS", True),
+        )
+        universe = all_market_etf_universe(
+            db=db,
+            include_live=True,
+            limit=limit,
+            require_daily_bars=require_daily_bars,
+        )
+        resolved_codes = [str(code) for code in universe.get("codes") or [] if str(code)]
+        meta = {
+            "type": "all_etf",
+            "requested": universe_token,
+            "total": universe.get("total", len(resolved_codes)),
+            "backtest_ready_total": universe.get("backtest_ready_total", len(resolved_codes)),
+            "require_daily_bars": universe.get("require_daily_bars", require_daily_bars),
+            "selected": len(resolved_codes),
+            "limit": universe.get("limit", limit),
+            "source": universe.get("source", ""),
+            "source_counts": universe.get("source_counts", {}),
+            "as_of": universe.get("as_of", ""),
+            "warnings": universe.get("warnings", []),
+        }
+        return resolved_codes, meta
+
+    return codes, {}
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _resolve_batch_stock_name(resolver: Any, symbol: str, code: str) -> str:
     if resolver is None:
         return code
@@ -2381,6 +2574,8 @@ def _batch_stock_result(
     accel_count: int,
     sim_config: Any,
     resolver: Any,
+    start_date: str = "",
+    end_date: str = "",
 ) -> dict[str, Any]:
     from signals.core.trade_simulator import simulate_trades
 
@@ -2418,17 +2613,39 @@ def _batch_stock_result(
         if lookback > 0 and len(df) > lookback:
             df = df.tail(lookback).copy()
 
-        meta = _kline_meta(df, freq_norm)
+        try:
+            analysis_df, visible_df, date_scope = _resolve_backtest_date_scope(
+                df,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except ValueError as exc:
+            stock_result["status"] = "error"
+            stock_result["error"] = str(exc)
+            return stock_result
+        if analysis_df.empty or visible_df.empty:
+            stock_result["status"] = "error"
+            stock_result["error"] = "指定日期区间内无可用数据"
+            stock_result["date_range"] = date_scope
+            return stock_result
+
+        meta = _kline_meta(visible_df, freq_norm)
         stock_result.update(meta)
-        stock_result["bar_count"] = int(len(df))
-        stock_result["ohlcv_tail"] = _serialize_ohlcv(df.tail(520))
+        stock_result["date_range"] = date_scope
+        stock_result["bar_count"] = int(len(visible_df))
+        stock_result["ohlcv_tail"] = _serialize_ohlcv(visible_df.tail(520))
 
         all_signals, _, _, _ = _detect_all_signals(
-            df, symbol, freq_label, signal_group, lookback, factor,
+            analysis_df, symbol, freq_label, signal_group, lookback, factor,
             gap_pct_min, volume_ratio_min, trend_lookback, bb_period, squeeze_threshold,
             run_count=run_count, body_ratio=body_ratio, accel_count=accel_count,
         )
-        sim = simulate_trades(df, all_signals, sim_config)
+        all_signals = _filter_signals_by_date_scope(
+            all_signals,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        sim = simulate_trades(analysis_df, all_signals, sim_config)
         kpi = sim.kpi
         stock_result["signal_count"] = len(all_signals)
         stock_result["trade_count"] = kpi.get("filled_trades", 0)
@@ -2438,6 +2655,7 @@ def _batch_stock_result(
         stock_result["max_drawdown"] = kpi.get("max_drawdown_pct", 0)
         stock_result["sharpe"] = kpi.get("sharpe", 0)
         stock_result["avg_hold_days"] = kpi.get("avg_hold_days", 0)
+        stock_result["signals"] = all_signals
         stock_result["sim_trades"] = sim.trades
         stock_result["signal_breakdown"] = _batch_signal_breakdown(
             code,
@@ -2474,18 +2692,11 @@ async def backtest_batch(request: Request):
     try:
         body = await request.json()
 
-        # 解析股票代码列表
-        codes_raw = body.get("codes", "")
-        if isinstance(codes_raw, str):
-            codes = [c.strip() for c in codes_raw.replace("\n", ",").split(",") if c.strip()]
-        elif isinstance(codes_raw, list):
-            codes = [str(c).strip() for c in codes_raw if str(c).strip()]
-        else:
-            return JSONResponse(status_code=400, content={"error": "codes 参数无效"})
+        codes, universe_meta = _resolve_batch_codes(body)
 
         if not codes:
             return JSONResponse(status_code=400, content={"error": "请提供至少一只股票代码"})
-        if len(codes) > 20:
+        if not universe_meta and len(codes) > 20:
             return JSONResponse(status_code=400, content={"error": "最多支持 20 只股票"})
 
         # 公共参数
@@ -2501,6 +2712,15 @@ async def backtest_batch(request: Request):
         run_count = int(body.get("run_count", 3))
         body_ratio_val = float(body.get("body_ratio", 0.5))
         accel_count = int(body.get("accel_count", 3))
+        start_date = str(body.get("start_date", "") or "").strip()
+        end_date = str(body.get("end_date", "") or "").strip()
+        try:
+            start_ts = _parse_backtest_boundary(start_date)
+            end_ts = _parse_backtest_boundary(end_date, end=True)
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        if start_ts is not None and end_ts is not None and start_ts > end_ts:
+            return JSONResponse(status_code=400, content={"error": "start_date 不能晚于 end_date"})
 
         # 模拟参数
         stop_loss = float(body.get("stop_loss", 5.0))
@@ -2553,6 +2773,8 @@ async def backtest_batch(request: Request):
             accel_count=accel_count,
             sim_config=sim_config,
             resolver=resolver,
+            start_date=start_date,
+            end_date=end_date,
         )
         if worker_count <= 1:
             stocks = [worker(code) for code in codes]
@@ -2589,14 +2811,21 @@ async def backtest_batch(request: Request):
             },
             "stocks": stocks,
         }
+        if universe_meta:
+            result["universe"] = universe_meta
         result["terminal"] = build_batch_terminal(result, context={
             "freq": _freq_label(_normalize_freq(freq)),
             "market": "A" if any(_detect_market(code) == "A" for code in codes) else "HK",
+            "name": "全量ETF回测复盘" if universe_meta.get("type") == "all_etf" else "",
             "sim_config": dataclasses.asdict(sim_config),
             "benchmark_symbol": body.get("benchmark_symbol", ""),
             "benchmark_name": body.get("benchmark_name", ""),
             "benchmark_phase": body.get("benchmark_phase", ""),
             "benchmark_return_pct": body.get("benchmark_return_pct", 0),
+            "date_range": {
+                "requested_start_date": start_date,
+                "requested_end_date": end_date,
+            },
             "date_presets": _get_date_presets(),
         })
         return result

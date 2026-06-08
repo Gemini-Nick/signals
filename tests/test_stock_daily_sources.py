@@ -90,6 +90,55 @@ def test_stock_daily_tencent_empty_returns_without_akshare(monkeypatch):
     assert stock_daily._sync_one_stock("600423", "20260427", "20260427") == []
 
 
+def test_stock_daily_sina_etf_fallback_qfq_adjusts_stable_factor(monkeypatch):
+    dates = pd.bdate_range("2026-03-02", periods=25)
+    raw_rows = []
+    qfq_rows = []
+    for idx, dt in enumerate(dates):
+        close = 3.0 + idx * 0.03
+        raw_rows.append({
+            "date": dt,
+            "open": close - 0.03,
+            "high": close + 0.06,
+            "low": close - 0.09,
+            "close": close,
+            "volume": 100000 + idx,
+            "amount": 200000 + idx,
+        })
+        qfq_rows.append({
+            "日期": dt,
+            "开盘": round((close - 0.03) / 3, 3),
+            "最高": round((close + 0.06) / 3, 3),
+            "最低": round((close - 0.09) / 3, 3),
+            "收盘": close / 3,
+            "成交量": 1000 + idx,
+            "成交额": 0,
+        })
+
+    monkeypatch.setenv("STOCK_DAILY_PRIMARY_SOURCE", "tencent")
+    monkeypatch.setattr(
+        stock_daily.ak,
+        "stock_zh_a_hist",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("eastmoney unavailable")),
+    )
+    monkeypatch.setattr(
+        stock_daily.ak,
+        "fund_etf_hist_sina",
+        lambda symbol: pd.DataFrame(raw_rows) if symbol == "sh515880" else pd.DataFrame(),
+    )
+    monkeypatch.setattr(stock_daily, "fetch_tencent_daily", lambda *args, **kwargs: pd.DataFrame(qfq_rows))
+
+    docs = stock_daily._sync_one_stock("515880", "20200101", "20260430")
+
+    assert len(docs) == len(raw_rows)
+    assert docs[0]["source"] == "sina_etf_qfq_factor"
+    assert docs[0]["meta"]["source"] == "sina_etf_qfq_factor"
+    assert docs[0]["close"] == pytest.approx(1.0)
+    assert docs[-1]["close"] == pytest.approx(round(raw_rows[-1]["close"] / 3, 3))
+    assert docs[0]["vol"] == raw_rows[0]["volume"]
+    assert docs[0]["meta"]["source_volume_unit"] == "shares"
+
+
 def test_stock_daily_provider_prefix_maps_bj_920_codes():
     assert stock_daily._daily_provider_prefix("920118") == "bj"
     assert stock_daily._daily_provider_prefix("900901") == "sh"

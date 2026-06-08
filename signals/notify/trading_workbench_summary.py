@@ -7,6 +7,7 @@ be used by Codex automations, launchd jobs, or manual dry-runs.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 from dataclasses import dataclass
@@ -43,6 +44,16 @@ WINDOW_EVENT_CUTOFFS = {
     "midday": time(11, 15),
     "two": time(13, 45),
     "close": time(14, 30),
+}
+WECHAT_HEADINGS = {
+    "preopen": ("今日盘面观察框架", "开盘后打开图复核", "回测入口"),
+    "ten": ("9:45 变盘前观察", "打开图复核", "回测入口"),
+    "midday": ("上午盘面结论", "下午打开图复核", "回测入口"),
+    "two": ("13:45 变盘前观察", "打开图复核", "回测入口"),
+    "close": ("全天盘面归纳", "收盘前复核", "盘后回测入口"),
+    "postmarket": ("今日大盘/行业归因", "明日观察", "回测入口"),
+    "weekly": ("本周大盘/行业", "候选/板块", "回测入口"),
+    "manual": ("盘面结论", "打开图复核", "回测入口"),
 }
 
 
@@ -580,6 +591,15 @@ def _source_quality(dashboard: dict[str, Any], snapshot: dict[str, Any]) -> str:
     return f"可用，confidence={score_f:.2f}"
 
 
+def _fmt_pct(value: Any, *, signed: bool = True) -> str:
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    sign = "+" if signed and pct > 0 else ""
+    return f"{sign}{pct:.2f}%"
+
+
 def _market_line(dashboard: dict[str, Any], shell: dict[str, Any], snapshot: dict[str, Any]) -> str:
     brief = dashboard.get("daily_brief") if isinstance(dashboard.get("daily_brief"), dict) else {}
     market = shell.get("market") if isinstance(shell.get("market"), dict) else {}
@@ -589,6 +609,516 @@ def _market_line(dashboard: dict[str, Any], shell: dict[str, Any], snapshot: dic
     style = _text(market.get("recommended_style"), "证据不足")
     position = _text(market.get("position_suggestion"), "证据不足")
     return f"{stance}；主线：{theme}；风格：{style}；仓位：{position}"
+
+
+def _as_of_date(dashboard: dict[str, Any], snapshot: dict[str, Any]) -> str:
+    brief = dashboard.get("daily_brief") if isinstance(dashboard.get("daily_brief"), dict) else {}
+    return _text(brief.get("as_of") or snapshot.get("as_of") or dashboard.get("status"), "unknown")
+
+
+def _index_change_map(shell: dict[str, Any]) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for row in _as_list(shell.get("indices")):
+        name = _text(row.get("name") or row.get("label") or row.get("symbol"))
+        if not name:
+            continue
+        value = _float_value(
+            row.get("day_change_pct")
+            if row.get("day_change_pct") is not None
+            else row.get("quote_change_pct")
+        )
+        if value is not None:
+            result[name] = value
+    return result
+
+
+def _index_kill_line(shell: dict[str, Any]) -> str:
+    changes = _index_change_map(shell)
+    ordered = [
+        ("上证指数", "上证"),
+        ("深证成指", "深成指"),
+        ("创业板指", "创业板"),
+        ("科创50", "科创50"),
+    ]
+    parts = [f"{label}{_fmt_pct(changes[name], signed=False)}" for name, label in ordered if name in changes]
+    if not parts:
+        return "指数结构缺少可直接引用的涨跌幅，先以板块强弱和三池变化复盘。"
+    return "，".join(parts)
+
+
+def _sector_board_rows(shell: dict[str, Any], dashboard: dict[str, Any], *, limit: int = 8) -> list[dict[str, Any]]:
+    groups = shell.get("watchlist_groups") if isinstance(shell.get("watchlist_groups"), dict) else {}
+    rows = _as_list(groups.get("sector_boards"))
+    if rows:
+        return rows[:limit]
+
+    overview = dashboard.get("overview") if isinstance(dashboard.get("overview"), dict) else {}
+    cluster = overview.get("cluster_summary") if isinstance(overview.get("cluster_summary"), dict) else {}
+    fallback: list[dict[str, Any]] = []
+    for key, kind in (("industry_top", "行业"), ("concept_top", "概念")):
+        for item in _as_list(cluster.get(key)):
+            fallback.append(
+                {
+                    "name": _text(item.get("label")),
+                    "day_change_pct": item.get("change_pct"),
+                    "trader_action": f"{kind}强势，leader={_text(item.get('leader'), '未知')}",
+                    "source": "cluster_summary",
+                }
+            )
+    fallback.sort(key=lambda item: _float_value(item.get("day_change_pct")) or -999, reverse=True)
+    return fallback[:limit]
+
+
+def _sector_name(row: dict[str, Any]) -> str:
+    name = _text(row.get("name") or row.get("label") or row.get("title"))
+    if " · " in name:
+        left, right = name.split(" · ", 1)
+        display = left if right == left or right in left else f"{left}/{right}"
+    else:
+        display = name
+    display = display or "未知板块"
+    driver = row.get("source_driver") if isinstance(row.get("source_driver"), dict) else {}
+    driver_name = _text(driver.get("name"))
+    if driver_name in {"裸眼3D", "数字孪生"} and driver_name not in display:
+        display = f"{display}/{driver_name}"
+    return display
+
+
+def _sector_change(row: dict[str, Any]) -> float | None:
+    for key in ("day_change_pct", "daily_change_pct", "quote_change_pct", "latest_change_pct", "change_pct"):
+        value = _float_value(row.get(key))
+        if value is not None:
+            return value
+    driver = row.get("source_driver") if isinstance(row.get("source_driver"), dict) else {}
+    return _float_value(driver.get("change_pct"))
+
+
+def _sector_strength_line(rows: list[dict[str, Any]], *, limit: int = 6) -> str:
+    if not rows:
+        return "板块强度缺少可引用排序。"
+    parts = []
+    for row in rows[:limit]:
+        change = _sector_change(row)
+        suffix = f" {_fmt_pct(change)}" if change is not None else ""
+        parts.append(f"{_sector_name(row)}{suffix}")
+    return "、".join(parts)
+
+
+def _clean_sector_alias(value: str) -> str:
+    text = _text(value)
+    for suffix in ("Ⅰ", "Ⅱ", "Ⅲ", "I", "II", "III"):
+        text = text.replace(suffix, "")
+    return text.strip(" /·")
+
+
+def _replay_sector_alias(row: dict[str, Any]) -> str:
+    driver = row.get("primary_domain") if isinstance(row.get("primary_domain"), dict) else {}
+    if not driver:
+        driver = row.get("source_driver") if isinstance(row.get("source_driver"), dict) else {}
+    driver_name = _clean_sector_alias(_text(driver.get("name")))
+    if driver_name and not driver_name.startswith("其他"):
+        return driver_name
+    name = _sector_name(row)
+    parts = [_clean_sector_alias(part) for part in name.split("/") if _clean_sector_alias(part)]
+    if parts:
+        return parts[-1]
+    return "未知方向"
+
+
+def _replay_strength_names(rows: list[dict[str, Any]], *, limit: int = 2) -> str:
+    selected: list[str] = []
+    for row in rows:
+        action = _text(row.get("trader_action") or row.get("rank_reason") or row.get("trace_summary"))
+        if "产业链确认" not in action:
+            continue
+        alias = _replay_sector_alias(row)
+        if alias and alias not in selected:
+            selected.append(alias)
+        if len(selected) >= limit:
+            break
+    if len(selected) < limit:
+        for row in rows:
+            alias = _replay_sector_alias(row)
+            if alias and alias not in selected:
+                selected.append(alias)
+            if len(selected) >= limit:
+                break
+    if not selected:
+        return "少数强方向"
+    if len(selected) == 1:
+        return selected[0]
+    return "和".join(selected[:limit])
+
+
+def _sector_interpretation(rows: list[dict[str, Any]], *, limit: int = 6) -> str:
+    if not rows:
+        return "板块页没有返回可解释的产业链行。"
+    parts = []
+    for row in rows[:limit]:
+        action = _text(row.get("trader_action") or row.get("rank_reason") or row.get("trace_summary"))
+        if action:
+            parts.append(f"{_sector_name(row)}：{action}")
+    return "；".join(parts) or "板块有强弱，但缺少动作解释。"
+
+
+def _pool_counts(shell: dict[str, Any]) -> dict[str, int]:
+    groups = shell.get("watchlist_groups") if isinstance(shell.get("watchlist_groups"), dict) else {}
+    return {
+        "focus": len(_as_list(groups.get("focus_stocks"))),
+        "watch": len(_as_list(groups.get("watch_stocks"))),
+        "risk": len(_as_list(groups.get("risk_stocks"))),
+        "sectors": len(_as_list(groups.get("sector_boards"))),
+        "buy": len(_as_list(groups.get("buy_candidates") or shell.get("buy_candidates"))),
+    }
+
+
+def _compact_row_names(rows: list[dict[str, Any]], *, limit: int = 3) -> str:
+    names = [_symbol_name(row) for row in rows[:limit] if _symbol_name(row) != "未知对象"]
+    return "、".join(names) if names else "暂无明确对象"
+
+
+def _narrative_notify_reason(
+    window: str,
+    selected_action: list[dict[str, Any]],
+    selected_watch: list[dict[str, Any]],
+    selected_risk: list[dict[str, Any]],
+    sector_rows: list[dict[str, Any]],
+    event_lines: list[str],
+) -> tuple[bool, str]:
+    actionable_count = sum(1 for row in selected_action if _is_actionable(row))
+    if actionable_count:
+        return True, "actionable_workbench_items"
+    if sector_rows and window in {"postmarket", "weekly", "manual"}:
+        return True, "sector_review_available"
+    if event_lines:
+        return True, "market_event_lines"
+    if window == "close" and selected_risk:
+        return True, "close_risk_items"
+    if selected_watch or selected_risk:
+        return True, "review_rows_available"
+    return False, "no_review_context"
+
+
+def _paragraph_lines(paragraphs: list[str]) -> list[str]:
+    lines: list[str] = []
+    for paragraph in paragraphs:
+        lines.extend([paragraph, ""])
+    if lines:
+        lines.pop()
+    return lines
+
+
+def _sector_names_by_action(rows: list[dict[str, Any]], keyword: str, *, limit: int = 3) -> str:
+    names = [
+        _sector_name(row)
+        for row in rows
+        if keyword in _text(row.get("trader_action") or row.get("rank_reason") or row.get("trace_summary"))
+    ]
+    return "、".join(names[:limit]) if names else "暂无明确方向"
+
+
+def _generic_replay_paragraphs(
+    *,
+    index_line: str,
+    primary_theme: str,
+    sector_rows: list[dict[str, Any]],
+    counts: dict[str, int],
+    action_names: str,
+    watch_names: str,
+    risk_names: str,
+    event_lines: list[str],
+    extra_facts: list[str],
+    market_replay_sections: list[str] | None = None,
+) -> list[str]:
+    board_line = _sector_strength_line(sector_rows, limit=8)
+    validation_line = (
+        "明日验证点要落到这些数据："
+        f"板块前排={board_line}；"
+        f"三池数量=板块{counts['sectors']}、盯盘{counts['watch']}、买点/机会{counts['focus']}、风险{counts['risk']}；"
+        f"买点池={action_names}；继续观察={watch_names}；风险/排雷={risk_names}；"
+        f"指数线={index_line if index_line.endswith('。') else index_line + '。'}"
+        "下一交易日只验证这些数据是否延续、修复或恶化，不再单独写没有证据支撑的方向判断。"
+    )
+    confirmed = _sector_names_by_action(sector_rows, "产业链确认")
+    source_weak = _sector_names_by_action(sector_rows, "源强链弱")
+    split = _sector_names_by_action(sector_rows, "链内分化")
+    factual_lines = [line for line in [*event_lines[:4], *extra_facts[:6]] if _text(line)]
+    if factual_lines:
+        flow_paragraph = (
+            f"先说资金流动链条。盘中可引用的转折线和补充事实是：{'；'.join(factual_lines)}。"
+            "没有事实覆盖的时间段不编具体时间和价位，而是把资金切换写成可验证的结构："
+            "指数是否继续杀、强板块是否扩散、弱链条是否拖累高位核心，以及尾盘是否还有承接。"
+        )
+    else:
+        flow_paragraph = (
+            "先说资金流动链条。当前没有传入可验证的分钟级转折线，所以不编具体时间和价位；"
+            "资金切换先按指数损伤、板块15强弱和三池变化来复盘：指数是否继续杀、强板块是否扩散、"
+            "弱链条是否拖累高位核心，以及尾盘是否还有承接。"
+        )
+    sections = [
+        (
+            "今天市场的真实结构是：盘面看着热闹，尾盘一锅端。"
+            f"给你一个最直接的结论—最终强度更集中在{_replay_strength_names(sector_rows, limit=2)}，"
+            "但其他交易量前排仍有复盘价值，关键要看它们是主线确认、受伤主线，还是压力锚。"
+            f"{index_line if index_line.endswith('。') else index_line + '。'}"
+            "但数字掩盖了真实杀伤力—高成交核心冲高回落无承接，会直接拖累尾盘情绪。"
+            "这类盘面不能只看最终涨幅，要同时看强度、链主确认、弹性跟随、炸板回落和尾盘承接。"
+        ),
+    ]
+    if market_replay_sections:
+        sections.extend(market_replay_sections)
+        sections.extend(
+            [
+                validation_line,
+            ]
+        )
+        return sections
+    else:
+        sections.append(flow_paragraph)
+    sections.extend(
+        [
+        (
+            f"板块结构上，产业链确认的方向主要是：{confirmed}；源强链弱的方向主要是：{source_weak}；"
+            f"链内分化的方向主要是：{split}。确认方向可以作为明日复核对象，源强链弱只能算卡位，"
+            "链内分化则只看强分支，不把整条产业链直接升级为主线。"
+        ),
+        (
+            f"三池结构上，板块池{counts['sectors']}个、盯盘池{counts['watch']}个、买点池/机会池{counts['focus']}个、风险池{counts['risk']}个。"
+            f"买点池先复核：{action_names}；继续观察：{watch_names}；暂不参与或先排雷：{risk_names}。"
+            "这些对象要和板块强弱共振才有复盘价值，单独的技术形态不应该脱离主线结构被放大。"
+        ),
+        (
+            "尾盘情绪的判断标准很简单：强板块有没有扩散，核心高位有没有承接，风险池有没有继续增加。"
+            "如果板块强但核心承接弱，就是卡位而不是主线；如果指数弱但板块池仍有清晰排序，"
+            "明日要看的不是今天谁涨得多，而是谁能在竞价和开盘阶段继续维持优势。"
+        ),
+        validation_line,
+        ]
+    )
+    return sections
+
+
+def _representative_summary(row: dict[str, Any], *, limit: int = 4) -> list[dict[str, Any]]:
+    reps = row.get("representatives") if isinstance(row.get("representatives"), dict) else {}
+    result: list[dict[str, Any]] = []
+    for tier in ("core", "elastic"):
+        for item in _as_list(reps.get(tier)):
+            result.append(
+                {
+                    "tier": tier,
+                    "symbol": _text(item.get("symbol") or item.get("code")),
+                    "name": _text(item.get("name")),
+                    "day_change_pct": _float_value(item.get("day_change_pct")),
+                    "role": _text(item.get("chain_role")),
+                }
+            )
+            if len(result) >= limit:
+                return result
+    return result
+
+
+def _row_summary(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "symbol": _text(row.get("symbol") or row.get("code") or row.get("target_symbol")),
+        "name": _text(row.get("name") or row.get("display_name") or row.get("title")),
+        "chain": _get_chain(row),
+        "action": _get_action(row),
+        "trigger": _get_trigger(row),
+        "invalidates_when": _get_invalidation(row),
+        "score": _get_score(row),
+    }
+
+
+def collect_replay_context(
+    dashboard: dict[str, Any],
+    shell: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    window: str = "postmarket",
+    max_items: int = 5,
+    event_lines: list[str] | None = None,
+    extra_facts: list[str] | None = None,
+) -> dict[str, Any]:
+    selected_action, selected_watch, selected_risk = _selected_rows(window, shell, max_items=max_items)
+    sector_rows = _sector_board_rows(shell, dashboard, limit=max(15, max_items))
+    counts = _pool_counts(shell)
+    return {
+        "trade_date": _as_of_date(dashboard, snapshot),
+        "window": window,
+        "primary_theme": _primary_theme(dashboard, snapshot),
+        "index_damage": {
+            "line": _index_kill_line(shell),
+            "changes": _index_change_map(shell),
+        },
+        "sector_boards": [
+            {
+                "name": _sector_name(row),
+                "change_pct": _sector_change(row),
+                "action": _text(row.get("trader_action") or row.get("rank_reason") or row.get("trace_summary")),
+                "source_driver": row.get("source_driver") if isinstance(row.get("source_driver"), dict) else {},
+                "representatives": _representative_summary(row),
+            }
+            for row in sector_rows
+        ],
+        "pool_counts": counts,
+        "pools": {
+            "focus": [_row_summary(row) for row in selected_action],
+            "watch": [_row_summary(row) for row in selected_watch],
+            "risk": [_row_summary(row) for row in selected_risk],
+        },
+        "event_lines": event_lines or [],
+        "extra_facts": extra_facts or [],
+        "style_contract": [
+            "先写真实市场结构，再写资金链条。",
+            "板块15是主数据面，不用 daily_brief.primary_theme 覆盖板块排序。",
+            "时间、价格、成交额、净流入等事实只从 event_lines、context 或额外事实里引用；缺失时明确不编。",
+            "结尾只写验证点，不写直接买卖指令。",
+        ],
+    }
+
+
+def build_narrative_review(
+    dashboard: dict[str, Any],
+    shell: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    window: str = "postmarket",
+    max_items: int = 5,
+    event_lines: list[str] | None = None,
+    extra_facts: list[str] | None = None,
+    market_replay_sections: list[str] | None = None,
+) -> SummaryResult:
+    selected_action, selected_watch, selected_risk = _selected_rows(window, shell, max_items=max_items)
+    event_lines = event_lines or []
+    extra_facts = extra_facts or []
+    sector_rows = _sector_board_rows(shell, dashboard, limit=max(8, max_items))
+    notify, reason = _narrative_notify_reason(
+        window,
+        selected_action,
+        selected_watch,
+        selected_risk,
+        sector_rows,
+        event_lines,
+    )
+    status = "NOTIFY" if notify else "DONT_NOTIFY"
+    as_of = _as_of_date(dashboard, snapshot)
+    counts = _pool_counts(shell)
+    primary_theme = _primary_theme(dashboard, snapshot)
+    index_line = _index_kill_line(shell)
+    action_names = _compact_row_names(selected_action, limit=3)
+    watch_names = _compact_row_names(selected_watch, limit=3)
+    risk_names = _compact_row_names(selected_risk, limit=3)
+
+    lines = [
+        status,
+        _replay_date_title(as_of),
+        "",
+    ]
+    lines.extend(
+        _paragraph_lines(
+            _generic_replay_paragraphs(
+                index_line=index_line,
+                primary_theme=primary_theme,
+                sector_rows=sector_rows,
+                counts=counts,
+                action_names=action_names,
+                watch_names=watch_names,
+                risk_names=risk_names,
+                event_lines=event_lines,
+                extra_facts=extra_facts,
+                market_replay_sections=market_replay_sections,
+            )
+        )
+    )
+    return SummaryResult(status=status, text="\n".join(lines), notify=notify, reason=reason)
+
+
+def _replay_date_title(as_of: str) -> str:
+    if as_of == "unknown":
+        return "盘后复盘"
+    try:
+        year, month, day = [int(part) for part in as_of.split("-", 2)]
+    except (TypeError, ValueError):
+        return f"{as_of}复盘"
+    return f"{year}年{month}月{day}日复盘"
+
+
+def _market_replay_sector_rows(replay_context: dict[str, Any], *, limit: int = 8) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in _as_list(replay_context.get("board_timeline")):
+        latest = item.get("latest") if isinstance(item.get("latest"), dict) else {}
+        name = _text(item.get("driver_name") or item.get("board"))
+        if not name:
+            continue
+        change = _float_value(latest.get("change_pct"))
+        rows.append(
+            {
+                "name": name,
+                "day_change_pct": change,
+                "trader_action": "全市场分钟强度：按当日 board_heat_ticks 识别",
+                "source_driver": {"kind": item.get("kind") or "board_heat", "name": name, "change_pct": change},
+            }
+        )
+        if len(rows) >= limit:
+            return rows
+    windows = replay_context.get("rotation_windows") if isinstance(replay_context.get("rotation_windows"), list) else []
+    latest_window = windows[-1] if windows else {}
+    for item in _as_list(latest_window.get("top_boards")):
+        name = _text(item.get("name"))
+        if not name:
+            continue
+        change = _float_value(item.get("change_pct"))
+        rows.append(
+            {
+                "name": name,
+                "day_change_pct": change,
+                "trader_action": "全市场分钟强度：按当日 checkpoint 排序识别",
+                "source_driver": {"kind": item.get("kind") or "board_heat", "name": name, "change_pct": change},
+            }
+        )
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _historical_replay_inputs(
+    dashboard: dict[str, Any],
+    shell: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    trade_date: str,
+    replay_context: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    adjusted_dashboard = copy.deepcopy(dashboard)
+    adjusted_shell = copy.deepcopy(shell)
+    adjusted_snapshot = copy.deepcopy(snapshot)
+
+    brief = adjusted_dashboard.setdefault("daily_brief", {})
+    if isinstance(brief, dict):
+        brief["as_of"] = trade_date
+        sector_rows = _market_replay_sector_rows(replay_context)
+        if sector_rows:
+            brief["primary_theme"] = _sector_name(sector_rows[0])
+    adjusted_snapshot["as_of"] = trade_date
+    regime = adjusted_snapshot.setdefault("market_regime", {})
+    if isinstance(regime, dict):
+        regime["primary_theme"] = _text(brief.get("primary_theme")) if isinstance(brief, dict) else regime.get("primary_theme")
+
+    groups = adjusted_shell.setdefault("watchlist_groups", {})
+    if isinstance(groups, dict):
+        sector_rows = _market_replay_sector_rows(replay_context)
+        if sector_rows:
+            groups["sector_boards"] = sector_rows
+    adjusted_shell["indices"] = []
+    return adjusted_dashboard, adjusted_shell, adjusted_snapshot
+
+
+def _send_body(text: str) -> str:
+    lines = text.splitlines()
+    if lines and lines[0].strip() in {"NOTIFY", "DONT_NOTIFY"}:
+        body = "\n".join(lines[1:]).strip()
+        return body or text
+    return text
 
 
 def _collect_rows(shell: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -626,6 +1156,21 @@ def _format_section(title: str, rows: list[dict[str, Any]], *, limit: int) -> li
     return lines
 
 
+def _selected_rows(
+    window: str,
+    shell: dict[str, Any],
+    *,
+    max_items: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    action_rows, watch_rows, risk_rows = _collect_rows(shell)
+    selected_action, selected_watch, selected_risk = _window_rows(window, action_rows, watch_rows, risk_rows)
+    return (
+        selected_action[:max_items],
+        selected_watch[:max_items],
+        selected_risk[:max_items],
+    )
+
+
 def _window_rows(
     window: str,
     action_rows: list[dict[str, Any]],
@@ -641,6 +1186,131 @@ def _window_rows(
     if window in {"postmarket", "weekly"}:
         return action_rows[:3], watch_rows[:3], risk_rows[:3]
     return action_rows[:3], watch_rows[:2], risk_rows[:2]
+
+
+def _ordered_review_rows(
+    action_rows: list[dict[str, Any]],
+    watch_rows: list[dict[str, Any]],
+    risk_rows: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    rows = _dedupe(action_rows + watch_rows)
+    if len(rows) < limit:
+        rows = _dedupe(rows + risk_rows)
+    return rows[:limit]
+
+
+def _wechat_action_label(row: dict[str, Any]) -> str:
+    lane = _text(row.get("queue_lane"))
+    status = _text(row.get("action_status") or row.get("trade_stage"))
+    action = _get_action(row)
+    trigger = _get_trigger(row)
+    if lane.startswith("risk") or "暂不参与" in action or "放弃" in action:
+        return "忽略"
+    if _is_actionable(row) and "未确认" not in trigger and "等待" not in action:
+        return "看"
+    if status in ACTIONABLE_STATUSES and "缺" not in trigger:
+        return "看"
+    return "等"
+
+
+def _compact_trigger(row: dict[str, Any]) -> str:
+    trigger = _get_trigger(row)
+    parts = [part.strip() for part in trigger.split("；") if part.strip()]
+    filtered = [part for part in parts if not part.startswith("产业链:")]
+    if not filtered:
+        return trigger
+    kept = filtered[:3]
+    missing = next((part for part in filtered[3:] if "还差" in part or "缺" in part), "")
+    if missing:
+        kept.append(missing)
+    return "；".join(kept)
+
+
+def _format_wechat_review_rows(
+    action_rows: list[dict[str, Any]],
+    watch_rows: list[dict[str, Any]],
+    risk_rows: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[str]:
+    rows = _ordered_review_rows(action_rows, watch_rows, risk_rows, limit=limit)
+    if not rows:
+        return ["- 无；等下一次触发。"]
+    return [
+        f"- {_symbol_name(row)} | 触发：{_compact_trigger(row)}。{_wechat_action_label(row)}"
+        for row in rows
+    ]
+
+
+def _primary_theme(dashboard: dict[str, Any], snapshot: dict[str, Any]) -> str:
+    brief = dashboard.get("daily_brief") if isinstance(dashboard.get("daily_brief"), dict) else {}
+    regime = snapshot.get("market_regime") if isinstance(snapshot.get("market_regime"), dict) else {}
+    return _text(brief.get("primary_theme") or regime.get("primary_theme"), "当前主线")
+
+
+def _wechat_common_line(
+    dashboard: dict[str, Any],
+    snapshot: dict[str, Any],
+    action_rows: list[dict[str, Any]],
+    watch_rows: list[dict[str, Any]],
+) -> str:
+    action_chains = {_get_chain(row) for row in action_rows if _get_chain(row)}
+    watch_chains = {_get_chain(row) for row in watch_rows if _get_chain(row)}
+    common = sorted(action_chains & watch_chains)
+    if common:
+        return f"- {common[0]} 同时出现在马上看和继续盯，先按同一板块/信号族复核。"
+    theme = _primary_theme(dashboard, snapshot)
+    return f"- 共性不足：线索池/盯盘池/买点池未稳定指向同一板块；主线仍以{theme}为基准，候选按各自触发复核。"
+
+
+def _wechat_market_lines(
+    dashboard: dict[str, Any],
+    shell: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    event_lines: list[str],
+) -> list[str]:
+    brief = dashboard.get("daily_brief") if isinstance(dashboard.get("daily_brief"), dict) else {}
+    as_of = _text(brief.get("as_of") or snapshot.get("as_of") or dashboard.get("status"), "unknown")
+    lines = [f"- 交易日：{as_of}，{_market_line(dashboard, shell, snapshot)}。"]
+    if event_lines:
+        lines.append(f"- 关键盘面事件：{'；'.join(event_lines[:2])}。")
+    else:
+        lines.append("- 关键盘面事件：暂无新的指数/风格异常，继续按主线和候选触发复核。")
+    return lines
+
+
+def _wechat_abandon_lines(
+    dashboard: dict[str, Any],
+    snapshot: dict[str, Any],
+    selected_risk: list[dict[str, Any]],
+) -> list[str]:
+    theme = _primary_theme(dashboard, snapshot)
+    lines = [
+        "- 指数关键位不能收回或继续走弱，先降级观察。",
+        f"- 主线{theme}失效、扩散不足或冲高回落，不扩散新对象。",
+        "- 复核对象的5m/15m/30m触发消失，或上级周期转弱，直接放弃。",
+    ]
+    if selected_risk:
+        lines.append("- 风险池新增或既有风险未解除，相关对象按忽略处理。")
+    return lines
+
+
+def _wechat_backtest_line(
+    dashboard: dict[str, Any],
+    snapshot: dict[str, Any],
+    action_rows: list[dict[str, Any]],
+    watch_rows: list[dict[str, Any]],
+) -> str:
+    action_chains = {_get_chain(row) for row in action_rows if _get_chain(row)}
+    watch_chains = {_get_chain(row) for row in watch_rows if _get_chain(row)}
+    common = sorted(action_chains & watch_chains)
+    if common:
+        return f"- 盘后只回测“{common[0]} + 今日触发信号”是否真的有承接，不在盘中展开研究。"
+    theme = _primary_theme(dashboard, snapshot)
+    return f"- 盘后只复盘{theme}是否维持、关键盘面事件是否修复；候选分散时不扩散回测。"
 
 
 def _next_step(window: str, notify: bool) -> str:
@@ -664,11 +1334,7 @@ def build_summary(
     max_items: int = 3,
     event_lines: list[str] | None = None,
 ) -> SummaryResult:
-    action_rows, watch_rows, risk_rows = _collect_rows(shell)
-    selected_action, selected_watch, selected_risk = _window_rows(window, action_rows, watch_rows, risk_rows)
-    selected_action = selected_action[:max_items]
-    selected_watch = selected_watch[:max_items]
-    selected_risk = selected_risk[:max_items]
+    selected_action, selected_watch, selected_risk = _selected_rows(window, shell, max_items=max_items)
     event_lines = event_lines or []
 
     actionable_count = sum(1 for row in selected_action if _is_actionable(row))
@@ -710,42 +1376,211 @@ def build_summary(
     return SummaryResult(status=status, text="\n".join(lines), notify=notify, reason=reason)
 
 
+def build_wechat_summary(
+    dashboard: dict[str, Any],
+    shell: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    window: str = "manual",
+    max_items: int = 3,
+    event_lines: list[str] | None = None,
+) -> SummaryResult:
+    selected_action, selected_watch, selected_risk = _selected_rows(window, shell, max_items=max_items)
+    event_lines = event_lines or []
+
+    actionable_count = sum(1 for row in selected_action if _is_actionable(row))
+    notify = bool(actionable_count or event_lines or (window == "close" and selected_risk))
+    status = "NOTIFY" if notify else "DONT_NOTIFY"
+    if actionable_count:
+        reason = "actionable_workbench_items"
+    elif event_lines:
+        reason = "market_event_lines"
+    elif window == "close" and selected_risk:
+        reason = "close_risk_items"
+    else:
+        reason = "no_actionable_workbench_items"
+
+    market_heading, review_heading, backtest_heading = WECHAT_HEADINGS.get(window, WECHAT_HEADINGS["manual"])
+    lines = [
+        status,
+        f"1) {market_heading}",
+        *_wechat_market_lines(dashboard, shell, snapshot, event_lines=event_lines),
+        "",
+        "2) 三池共性",
+        _wechat_common_line(dashboard, snapshot, selected_action, selected_watch),
+        "",
+        f"3) {review_heading}",
+        *_format_wechat_review_rows(selected_action, selected_watch, selected_risk, limit=max(1, min(max_items, 3))),
+        "",
+        "4) 放弃条件",
+        *_wechat_abandon_lines(dashboard, snapshot, selected_risk),
+        "",
+        f"5) {backtest_heading}",
+        _wechat_backtest_line(dashboard, snapshot, selected_action, selected_watch),
+    ]
+    return SummaryResult(status=status, text="\n".join(lines), notify=notify, reason=reason)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate a trader-facing Signals workbench summary.")
     parser.add_argument("--base-url", default=os.getenv("SIGNALS_WEB_BASE_URL", "http://127.0.0.1:8011"))
     parser.add_argument("--window", choices=sorted(WINDOW_LABELS), default="manual")
+    parser.add_argument("--trade-date", default="", help="Historical YYYY-MM-DD trade date for narrative replay.")
     parser.add_argument("--max-items", type=int, default=3)
     parser.add_argument("--send", action="store_true", help="Send to configured notification channels when result is NOTIFY.")
     parser.add_argument("--send-all", action="store_true", help="Send even when result is DONT_NOTIFY.")
     parser.add_argument("--ignore-time", action="store_true", help="Bypass A-share day/window gating for dry-run review.")
+    parser.add_argument(
+        "--allow-ignore-time-notify",
+        action="store_true",
+        help="Allow --ignore-time dry-runs to keep a NOTIFY gate. Normal automation must leave this off.",
+    )
+    parser.add_argument("--format", choices=["workbench", "wechat", "narrative"], default="workbench")
+    parser.add_argument("--training-sample", default="", help="Render a structured replay training sample; normal daily runs leave this empty.")
+    parser.add_argument(
+        "--allow-training-sample-send",
+        action="store_true",
+        help="Explicitly allow a golden training sample to use NOTIFY and --send. Normal automation must leave this off.",
+    )
+    parser.add_argument("--eval-target", default="", help="Evaluate the generated body against a replay reference before sending.")
+    parser.add_argument("--min-similarity", type=float, default=0.0, help="Minimum replay target similarity required when --eval-target is set.")
+    parser.add_argument("--require-eval-phrases", action="store_true", help="Require all replay target key phrases before sending.")
+    parser.add_argument(
+        "--extra-fact",
+        action="append",
+        default=[],
+        help="Add an externally verified replay fact such as a high-volume core, failed board, net-flow figure, or exact intraday price.",
+    )
     args = parser.parse_args(argv)
 
     allowed, gate_reason = window_gate(args.window)
-    if not allowed and not args.ignore_time:
+    if not allowed and not args.ignore_time and not args.training_sample:
         title = WINDOW_LABELS.get(args.window, WINDOW_LABELS["manual"])
         print(f"DONT_NOTIFY\n[Signals 工作台 | {title}]\n原因：{gate_reason}")
         return 0
 
-    dashboard, shell, snapshot = fetch_inputs(args.base_url)
-    event_lines = (
-        fetch_market_event_lines(args.base_url, window=args.window)
-        if args.window in {"ten", "midday", "two", "close"}
-        else []
-    )
-    result = build_summary(
-        dashboard,
-        shell,
-        snapshot,
-        window=args.window,
-        max_items=max(1, args.max_items),
-        event_lines=event_lines,
-    )
-    print(result.text)
+    if args.training_sample:
+        from signals.replay.training_renderer import load_training_facts, render_training_sample
 
-    if args.send and (result.notify or args.send_all):
+        body = render_training_sample(load_training_facts(args.training_sample))
+        status = "NOTIFY" if args.allow_training_sample_send else "DONT_NOTIFY"
+        result = SummaryResult(
+            status=status,
+            text=f"{status}\n{body}",
+            notify=args.allow_training_sample_send,
+            reason="training_sample" if args.allow_training_sample_send else "training_sample_send_blocked",
+        )
+    else:
+        dashboard, shell, snapshot = fetch_inputs(args.base_url)
+        source_trade_date = _as_of_date(dashboard, snapshot)
+        requested_trade_date = _text(args.trade_date)
+        event_lines = (
+            fetch_market_event_lines(args.base_url, window=args.window)
+            if args.window in {"ten", "midday", "two", "close"}
+            else []
+        )
+        if args.format == "wechat":
+            builder = build_wechat_summary
+        elif args.format == "narrative":
+            builder = build_narrative_review
+        else:
+            builder = build_summary
+        market_replay_sections: list[str] = []
+        if args.format == "narrative":
+            try:
+                from signals.replay.market_replay import build_market_replay_context, format_market_replay_sections
+                from signals.sync.db import get_db
+
+                groups = shell.get("watchlist_groups") if isinstance(shell.get("watchlist_groups"), dict) else {}
+                sector_boards = _as_list(groups.get("sector_boards"))
+                historical_requested = bool(requested_trade_date and requested_trade_date != source_trade_date)
+                replay_context = build_market_replay_context(
+                    get_db(),
+                    trade_date=requested_trade_date or source_trade_date,
+                    sector_boards=[] if historical_requested else sector_boards,
+                    representative_limit=max(20, args.max_items * 4),
+                    include_external_fund_flows=args.window in {"postmarket", "manual", "weekly"},
+                )
+                market_replay_sections = format_market_replay_sections(replay_context)
+                if historical_requested:
+                    dashboard, shell, snapshot = _historical_replay_inputs(
+                        dashboard,
+                        shell,
+                        snapshot,
+                        trade_date=requested_trade_date,
+                        replay_context=replay_context,
+                    )
+            except Exception:
+                market_replay_sections = []
+        builder_kwargs: dict[str, Any] = {
+            "window": args.window,
+            "max_items": max(1, args.max_items),
+            "event_lines": event_lines,
+        }
+        if args.format == "narrative":
+            builder_kwargs["extra_facts"] = args.extra_fact
+            builder_kwargs["market_replay_sections"] = market_replay_sections
+        result = builder(dashboard, shell, snapshot, **builder_kwargs)
+
+    if (
+        args.ignore_time
+        and not allowed
+        and not args.allow_ignore_time_notify
+        and not args.training_sample
+        and result.status == "NOTIFY"
+    ):
+        title = WINDOW_LABELS.get(args.window, WINDOW_LABELS["manual"])
+        result = SummaryResult(
+            status="DONT_NOTIFY",
+            text=f"DONT_NOTIFY\n[Signals 工作台 | {title}]\n原因：dry_run:{gate_reason}\n\n{_send_body(result.text)}",
+            notify=False,
+            reason=f"dry_run:{gate_reason}",
+        )
+
+    eval_failed = False
+    eval_report: dict[str, Any] | None = None
+    if args.eval_target:
+        from signals.replay.evaluate import evaluate_text, load_text
+
+        eval_report = evaluate_text(_send_body(result.text), load_text(args.eval_target))
+        eval_failed = eval_report["char_similarity"] < args.min_similarity
+        if args.require_eval_phrases and eval_report["phrase_coverage"]["missing"]:
+            eval_failed = True
+        if eval_failed:
+            block_line = (
+                "[replay-eval] send blocked: "
+                f"similarity={eval_report['char_similarity']}, "
+                f"missing_phrases={len(eval_report['phrase_coverage']['missing'])}"
+            )
+            result = SummaryResult(
+                status="DONT_NOTIFY",
+                text=f"DONT_NOTIFY\n{block_line}\n\n{_send_body(result.text)}",
+                notify=False,
+                reason="replay_eval_failed",
+            )
+
+    print(result.text)
+    if eval_report is not None:
+        print("[replay-eval] " + json.dumps(eval_report, ensure_ascii=False, sort_keys=True))
+        if eval_failed:
+            print(
+                "[replay-eval] send blocked: "
+                f"similarity={eval_report['char_similarity']}, "
+                f"missing_phrases={len(eval_report['phrase_coverage']['missing'])}"
+            )
+
+    training_sample_send_allowed = not args.training_sample or args.allow_training_sample_send
+    ignore_time_send_allowed = not (args.ignore_time and not allowed and not args.allow_ignore_time_notify)
+    if (
+        args.send
+        and (result.notify or args.send_all)
+        and not eval_failed
+        and training_sample_send_allowed
+        and ignore_time_send_allowed
+    ):
         from signals.notify import send_text
 
-        send_text(result.text)
+        send_text(_send_body(result.text))
     return 0
 
 

@@ -39,6 +39,7 @@ MODULE_TARGETS = {
     "cache_preheat": ("bars",),
     "signal_pool": ("signals",),
     "market_pools": ("market_pools",),
+    "market_limit_pools": ("market_limit_pools",),
     "fullmarket_spot_snapshot": ("fullmarket_spot_snapshots",),
     "eastmoney_ulist_quote": ("quote_snapshots",),
     "quote_snapshots": ("quote_snapshots",),
@@ -99,6 +100,7 @@ COLLECTION_DOMAINS = {
     "concept_constituents": "constituents",
     "quote_snapshots": "quote",
     "market_pools": "market_pool",
+    "market_limit_pools": "market_limit_pool",
     "fullmarket_spot_snapshots": "spot",
     "signals": "signal",
     "strategy_snapshots": "strategy",
@@ -112,6 +114,7 @@ WRITER_FRESHNESS_FIELDS = {
 
 REALTIME_MODULES = {
     "market_pools",
+    "market_limit_pools",
     "fullmarket_spot_snapshot",
     "eastmoney_ulist_quote",
     "quote_snapshots",
@@ -160,6 +163,7 @@ FULLMARKET_SPOT_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_FULLMARKET_SPOT_IN
 SIGNAL_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_SIGNAL_INTERVAL_SECONDS", 5 * 60)
 WORKBENCH_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_WORKBENCH_INTERVAL_SECONDS", 10 * 60)
 BOARD_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_BOARD_INTERVAL_SECONDS", 60)
+LIMIT_POOL_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_LIMIT_POOL_INTERVAL_SECONDS", 3 * 60)
 
 
 @dataclass(frozen=True)
@@ -186,6 +190,7 @@ LIVE_SYNC_PLANS = {
         LiveSyncPlan("minute_readiness_probe", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 60, 35),
         LiveSyncPlan("intraday_technical_signal_scan", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 240, 38),
         LiveSyncPlan("market_pools", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 60, 40),
+        LiveSyncPlan("market_limit_pools", "workbench_lane", LIMIT_POOL_INTERVAL_SECONDS, _lane_stale(LIMIT_POOL_INTERVAL_SECONDS, 4), 90, 42),
         LiveSyncPlan("terminal_realtime_pool", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 120, 50),
         LiveSyncPlan("strategy_snapshot", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 90, 55),
         LiveSyncPlan("board_heat_minute", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 180, 60),
@@ -218,6 +223,7 @@ LANE_MAINTENANCE_PLANS = {
     "stock_daily": LiveSyncPlan("stock_daily", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 3600, 30),
     "hk_stock_daily": LiveSyncPlan("hk_stock_daily", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 3600, 32),
     "stock_30m_fullmarket": LiveSyncPlan("stock_30m_fullmarket", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 5400, 35),
+    "market_limit_pools": LiveSyncPlan("market_limit_pools", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 180, 38),
     "index_daily": LiveSyncPlan("index_daily", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 40),
     "weekly_rollup": LiveSyncPlan("weekly_rollup", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 600, 45),
     "board_ranking": LiveSyncPlan("board_ranking", "board_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 60),
@@ -238,6 +244,7 @@ BOOTSTRAP_LANE_MODULES = {
     "fullmarket_spot_snapshot": {"quote_lane"},
     "quote_snapshots": {"quote_lane"},
     "market_pools": {"workbench_lane"},
+    "market_limit_pools": {"workbench_lane"},
     "cache_preheat": {"workbench_lane"},
     "signal_pool": {"workbench_lane"},
     "technical_signal_scan": {"workbench_lane"},

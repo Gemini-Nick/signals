@@ -58,6 +58,29 @@ class StockNameResolver:
         if override_code_name or futu_code not in self._code_to_name:
             self._code_to_name[futu_code] = name
 
+    def _mongo_name_row(self, query: dict) -> dict:
+        try:
+            from signals.data.mongo_fallback import get_db
+
+            db = get_db()
+            if db is None:
+                return {}
+            return db["stock_names"].find_one(query, {"_id": 0, "name": 1, "code": 1, "symbol": 1, "futu_symbol": 1}) or {}
+        except Exception:
+            return {}
+
+    def _remember_mongo_row(self, row: dict) -> str:
+        name = str(row.get("name") or "").strip()
+        futu_code = str(row.get("futu_symbol") or "").strip()
+        if not futu_code:
+            code = str(row.get("code") or row.get("symbol") or "").strip().zfill(6)
+            if code.isdigit() and len(code) == 6:
+                futu_code = ("SH." if code.startswith(("5", "6", "9")) else "SZ.") + code
+        if name and futu_code:
+            self._remember_name(futu_code, name, override_code_name=True)
+            return futu_code
+        return ""
+
     def _load_default_aliases(self):
         for futu_code, payload in _DEFAULT_STOCK_ALIASES.items():
             display_name = str(payload.get("name") or "").strip()
@@ -134,6 +157,17 @@ class StockNameResolver:
                 return macro_name
         except Exception:
             pass
+        row = self._mongo_name_row({
+            "$or": [
+                {"futu_symbol": futu_code},
+                {"symbol": futu_code},
+                {"code": futu_code.split(".")[-1]},
+            ]
+        })
+        if row:
+            self._remember_mongo_row(row)
+            if futu_code in self._code_to_name:
+                return self._code_to_name[futu_code]
         return self._code_to_name.get(futu_code, futu_code.split(".")[-1])
 
     def get_code(self, name: str) -> str:
@@ -147,6 +181,10 @@ class StockNameResolver:
             return self._alias_to_code[alias_key]
         if name in self._name_to_code:
             return self._name_to_code[name]
+        row = self._mongo_name_row({"name": name})
+        futu_code = self._remember_mongo_row(row) if row else ""
+        if futu_code:
+            return futu_code
         # 精确匹配
         for code, n in self._code_to_name.items():
             if n == name or self._alias_key(n) == alias_key:

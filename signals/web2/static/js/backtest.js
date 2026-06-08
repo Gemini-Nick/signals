@@ -1609,7 +1609,8 @@ async function _runBatchAnalyze() {
     _switchBtTab('batch');
 
     const s = data.summary;
-    statusEl.textContent = `${s.total_stocks} 只 | ${s.total_signals} 信号 | ${s.total_trades} 成交 | 胜率 ${s.overall_win_rate}%`;
+    const universeLabel = data.universe?.type === 'all_etf' ? `ETF ${data.universe.selected}/${data.universe.total} | ` : '';
+    statusEl.textContent = `${universeLabel}${s.total_stocks} 只 | ${s.total_signals} 信号 | ${s.total_trades} 成交 | 胜率 ${s.overall_win_rate}%`;
     showToast(`批量回测完成: ${s.ok_stocks}/${s.total_stocks} 只成功`);
 
   } catch (e) {

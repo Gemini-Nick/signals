@@ -3504,6 +3504,20 @@ def _shell_stock_reason_labels(row: dict[str, Any], *, side: str = "buy", limit:
     return _shell_dedupe_preserve_order(reasons)[:limit]
 
 
+def _shell_stock_timeframe_labels(row: dict[str, Any], bucket_key: str, *, limit: int = 2) -> list[str]:
+    sides = row.get("timeframe_signal_sides") if isinstance(row.get("timeframe_signal_sides"), dict) else {}
+    bucket = sides.get(bucket_key) if isinstance(sides.get(bucket_key), dict) else {}
+    labels: list[str] = []
+    for side_key in ("right", "left"):
+        for item in bucket.get(side_key) or []:
+            if not isinstance(item, dict):
+                continue
+            label = " ".join([_text(item.get("freq")), _text(item.get("label"))]).strip()
+            if label:
+                labels.append(label)
+    return _shell_dedupe_preserve_order(labels)[:limit]
+
+
 def _shell_stock_entry_factor(row: dict[str, Any]) -> dict[str, Any]:
     candidates: list[dict[str, Any]] = []
     for key in ("top_buy_reason", "technical_evidence"):
@@ -3557,6 +3571,9 @@ def _shell_stock_trade_summary(row: dict[str, Any], *, entry_factor: dict[str, A
     gate = _text(row.get("entry_gate_status"))
     trade_stage = _text(row.get("trade_stage"))
     chain = _shell_stock_chain_brief(row)
+    upper_signal = _shell_stock_timeframe_labels(row, "upper", limit=2)
+    trade_signal = _shell_stock_timeframe_labels(row, "trade", limit=2)
+    execution_signal = _shell_stock_timeframe_labels(row, "execution", limit=2)
     primary_signal = _shell_stock_reason_labels(row, side="buy", limit=2)
     left_signal = _shell_stock_reason_labels(row, side="left", limit=1)
     risk_signal = _shell_stock_reason_labels(row, side="risk", limit=2)
@@ -3575,17 +3592,17 @@ def _shell_stock_trade_summary(row: dict[str, Any], *, entry_factor: dict[str, A
     missing = _text(row.get("missing_condition") or row.get("primary_blocker"))
 
     if pool_type == "focus" and gate == "entry_confirmed":
-        lead = "买点路径已走通"
+        lead = "日/周买点已确认，执行链路走通"
     elif pool_type == "focus" and (gate == "entry_attack_confirmed" or trade_stage == "attack_entry"):
-        lead = "进攻买点，先按小仓/节奏复核"
+        lead = "日/周买点已确认，按进攻买点复核"
     elif pool_type == "focus" and trade_stage == "left_attack":
-        lead = "低吸进攻，先复核承接位"
+        lead = "日/周左侧买点，先复核承接位"
     elif gate == "entry_waiting_right_side_confirm":
         lead = "还差5m/15m下单确认"
     elif gate == "entry_waiting_30m_confirm":
         lead = "还差30m买点"
     elif gate == "entry_waiting_upper_context":
-        lead = "先等日/周大周期补强"
+        lead = "短周期有动作，缺日/周买点"
     elif pool_type == "watch":
         lead = "盯盘观察，等缺口补齐"
     elif pool_type in {"clue", "clue_pool"} or trade_stage == "clue_pool":
@@ -3596,9 +3613,15 @@ def _shell_stock_trade_summary(row: dict[str, Any], *, entry_factor: dict[str, A
         lead = _text(row.get("stage_label") or row.get("trader_action")) or "观察"
 
     evidence = []
-    if primary_signal:
-        evidence.append("买点 " + " / ".join(primary_signal[:2]))
-    if left_signal and not primary_signal:
+    if upper_signal:
+        evidence.append("日/周 " + " / ".join(upper_signal[:2]))
+    if trade_signal:
+        evidence.append("30m " + " / ".join(trade_signal[:2]))
+    if execution_signal:
+        evidence.append("5m/15m " + " / ".join(execution_signal[:2]))
+    if primary_signal and not evidence:
+        evidence.append("短周期 " + " / ".join(primary_signal[:2]))
+    if left_signal and not evidence:
         evidence.append("左侧 " + " / ".join(left_signal[:1]))
     if breakout:
         evidence.append(breakout)
@@ -3641,7 +3664,7 @@ def _shell_stock_display_action(row: dict[str, Any]) -> str:
     if gate == "entry_waiting_30m_confirm":
         return "等30m买点"
     if gate == "entry_waiting_upper_context":
-        return "等大周期补强"
+        return "等日/周买点"
     if pool_type == "watch":
         return "盯盘等买点"
     if pool_type in {"clue", "clue_pool"} or trade_stage == "clue_pool":
@@ -3796,6 +3819,10 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "left_allowed_reason",
         "setup_explanation",
         "entry_logic_summary",
+        "daily_weekly_signal",
+        "trade_cycle_signal",
+        "execution_cycle_signal",
+        "primary_timeframe_signal",
         "watch_sort_priority",
         "watch_backfill_source",
         "clue_quality_score",
@@ -4313,7 +4340,7 @@ def _manual_clue_missing_label(code: str) -> str:
         "risk_clear": "有卖点或冲突，先排雷",
         "period_conflict": "周期冲突，等共振恢复",
         "hard_technical": "还没有硬技术信号",
-        "upper_context": "等日/周背景确认",
+        "upper_context": "等日/周买点确认",
         "trigger_30m": "等30m买点",
         "right_side": "等5m/15m下单确认",
     }.get(code, code)
@@ -4470,12 +4497,16 @@ def _enrich_manual_clue_decision(row: dict[str, Any], symbol: str) -> dict[str, 
         trader_read = f"手动探索：{chain_text + '，' if chain_text else ''}有技术信号但存在卖点或周期冲突，暂不参与；非持仓不推风险动作。"
         trade_intent_label = "暂不参与"
         recommended_action = "暂不参与"
-    elif buy_reasons and has_30m and not has_execution:
-        trader_read = f"手动探索：{chain_text + '，' if chain_text else ''}日/周或30m已有信号，等5m/15m下单确认。"
+    elif buy_reasons and has_upper and has_30m and not has_execution:
+        trader_read = f"手动探索：{chain_text + '，' if chain_text else ''}日/周和30m已有信号，等5m/15m下单确认。"
         trade_intent_label = "试仓候选"
         recommended_action = "等5m/15m确认"
+    elif buy_reasons and not has_upper:
+        trader_read = f"手动探索：{chain_text + '，' if chain_text else ''}只有短周期技术线索，先等日/周买点确认。"
+        trade_intent_label = "线索来源"
+        recommended_action = "等日/周买点"
     elif buy_reasons:
-        trader_read = f"手动探索：{chain_text + '，' if chain_text else ''}已有技术线索，按缺口/30m/右侧确认逐级复核。"
+        trader_read = f"手动探索：{chain_text + '，' if chain_text else ''}已有日/周技术线索，按30m和5m/15m确认逐级复核。"
         trade_intent_label = "盯盘池"
         recommended_action = "盯盘复核"
     else:
@@ -4520,7 +4551,7 @@ def _enrich_manual_clue_decision(row: dict[str, Any], symbol: str) -> dict[str, 
         "trade_role_label": trade_role_label,
         "trade_identity": "manual_exploration",
         "trade_identity_label": "用户探索",
-        "trade_intent": "skip_now" if sell_reasons or conflict else "probe_candidate" if has_30m and not has_execution else "clue_only",
+        "trade_intent": "skip_now" if sell_reasons or conflict else "probe_candidate" if has_upper and has_30m and not has_execution else "clue_only",
         "trade_intent_label": trade_intent_label,
         "setup_side_label": trade_intent_label,
         "recommended_action": recommended_action,
@@ -8567,19 +8598,19 @@ TRADE_ROLE_FILTERS = [
 
 TRADE_ROLE_DEFINITIONS = {
     "left_attack": {
-        "definition": "一买、背驰买或低吸型二买叠加10/20日线承接，进入低吸进攻复核。",
+        "definition": "日/周一买、背驰买或低吸型二买叠加10/20日线承接，进入低吸进攻复核。",
         "source": "terminal_stock_pool.setup_mode + ma_alignment + buy_point_quality",
     },
     "right_attack": {
-        "definition": "30m/15m/5m二买、三买、趋势或突破型信号，且至少两条关键均线确认。",
+        "definition": "日/周买点成立后，用30m/15m/5m二买、三买、趋势或突破型信号确认执行。",
         "source": "terminal_stock_pool.setup_mode + ma_alignment + buy_point_quality",
     },
     "watch": {
-        "definition": "有技术买点或来源，但还缺关键均线、30m、大周期或5m/15m执行确认。",
+        "definition": "日/周有买点苗头但还缺30m、5m/15m执行确认；或短周期异动但缺日/周买点。",
         "source": "terminal_stock_pool.watch_stocks",
     },
     "clue": {
-        "definition": "只有人工/系统来源线索，还没有硬技术买点。",
+        "definition": "只有人工/系统来源或短周期线索，还没有日/周硬买点。",
         "source": "terminal_stock_pool.clue_stocks + terminal_manual_clues",
     },
     "risk_first": {
