@@ -564,6 +564,8 @@ def test_wechat_summary_preserves_signals_candidate_order():
     assert "2) 三池共性" in result.text
     assert "3) 下午打开图复核" in result.text
     assert "关键盘面事件" in result.text
+    assert "板块角色" in result.text
+    assert "截至当前窗口" in result.text
     assert result.text.index("利通电子 SH.603629") < result.text.index("环旭电子 SH.601231")
     assert result.text.index("环旭电子 SH.601231") < result.text.index("立昂微 SH.605358")
     assert "特力A SZ.000025" not in result.text

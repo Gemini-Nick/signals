@@ -409,6 +409,147 @@ def _high_turnover_cores(db: Any, trade_date: str, *, limit: int = 20) -> list[d
     return result
 
 
+def _latest_chain_membership_date(db: Any, trade_date: str) -> str:
+    if "security_chain_memberships" not in _collection_names(db):
+        return ""
+    doc = db["security_chain_memberships"].find_one(
+        {"trade_date": {"$lte": trade_date}},
+        {"_id": 0, "trade_date": 1},
+        sort=[("trade_date", -1)],
+    )
+    return _text(doc.get("trade_date")) if doc else ""
+
+
+def _chain_membership_for_symbols(db: Any, trade_date: str, symbols: list[str]) -> dict[str, dict[str, Any]]:
+    membership_date = _latest_chain_membership_date(db, trade_date)
+    if not membership_date:
+        return {}
+    codes = sorted({_pure_code(symbol) for symbol in symbols if _pure_code(symbol)})
+    prefixed = [_prefixed_symbol(code) for code in codes]
+    security_ids = [f"A:{symbol.replace('.', ':')}" for symbol in prefixed]
+    cursor = db["security_chain_memberships"].find(
+        {
+            "trade_date": membership_date,
+            "$or": [
+                {"raw_code": {"$in": codes}},
+                {"symbol": {"$in": prefixed}},
+                {"security_id": {"$in": security_ids}},
+            ],
+        },
+        {
+            "_id": 0,
+            "raw_code": 1,
+            "symbol": 1,
+            "security_id": 1,
+            "chain_name": 1,
+            "node_name": 1,
+            "is_primary_chain": 1,
+            "membership_type": 1,
+            "exposure_score": 1,
+            "confidence": 1,
+            "trade_date": 1,
+        },
+    ).sort([("is_primary_chain", -1), ("exposure_score", -1), ("confidence", -1)])
+    result: dict[str, dict[str, Any]] = {}
+    for row in cursor:
+        code = _pure_code(_text(row.get("symbol") or row.get("raw_code") or row.get("security_id")))
+        if not code or code in result:
+            continue
+        result[code] = {
+            "chain_name": _text(row.get("chain_name"), "未映射产业链"),
+            "node_name": _text(row.get("node_name")),
+            "is_primary_chain": bool(row.get("is_primary_chain")),
+            "membership_type": _text(row.get("membership_type")),
+            "exposure_score": _float(row.get("exposure_score")),
+            "confidence": _float(row.get("confidence")),
+            "source": "security_chain_memberships",
+            "membership_trade_date": _text(row.get("trade_date")),
+        }
+    return result
+
+
+def _first_red_evidence(db: Any, symbol: str, trade_date: str, prev_close: Any) -> dict[str, Any]:
+    prev = _float(prev_close)
+    if prev is None:
+        return {"status": "unknown", "note": "缺昨收，不能计算翻红时间。"}
+    rows = _minute_rows(db, symbol, trade_date)
+    if not rows:
+        return {"status": "missing", "note": "缺5分钟路径，不能判定首次翻红时间。"}
+    first_touch = None
+    first_close = None
+    for row in rows:
+        high = _float(row.get("high"))
+        close = _float(row.get("close"))
+        if first_touch is None and high is not None and high > prev:
+            first_touch = row
+        if first_close is None and close is not None and close > prev:
+            first_close = row
+        if first_touch is not None and first_close is not None:
+            break
+    if first_touch is None and first_close is None:
+        return {"status": "not_observed", "bar_count": len(rows), "note": "5分钟路径未观察到越过昨收。"}
+    touch_time = first_touch.get("dt") if first_touch else None
+    close_time = first_close.get("dt") if first_close else None
+    return {
+        "status": "confirmed",
+        "bar_count": len(rows),
+        "first_touch_time": touch_time.strftime("%H:%M") if isinstance(touch_time, datetime) else _text(touch_time),
+        "first_close_above_time": close_time.strftime("%H:%M") if isinstance(close_time, datetime) else _text(close_time),
+        "basis": "5分钟 bars 越过昨收",
+    }
+
+
+def _turnover_representatives(
+    db: Any,
+    trade_date: str,
+    high_turnover: list[dict[str, Any]],
+    *,
+    limit: int = 15,
+) -> list[dict[str, Any]]:
+    symbols = [_text(row.get("symbol")) for row in high_turnover[:limit] if _text(row.get("symbol"))]
+    chain_lookup = _chain_membership_for_symbols(db, trade_date, symbols)
+    rows: list[dict[str, Any]] = []
+    for rank, row in enumerate(high_turnover[:limit], start=1):
+        symbol = _text(row.get("symbol"))
+        prev_close = _float(row.get("prev_close"))
+        open_value = _float(row.get("open"))
+        change = _float(row.get("change_pct"))
+        high_change = _float(row.get("high_change_pct"))
+        open_gap = (open_value / prev_close - 1) * 100 if open_value is not None and prev_close else None
+        if change is not None and change > 0 and open_gap is not None and open_gap < 0:
+            role = "低开转强/修复锚"
+        elif change is not None and change > 0:
+            role = "高成交强承接"
+        elif high_change is not None and high_change > 0 and change is not None and change < 0:
+            role = "冲高回落/压力锚"
+        elif change is not None and change < 0:
+            role = "高成交压力锚"
+        else:
+            role = "高成交观察锚"
+        code = _pure_code(symbol)
+        chain = chain_lookup.get(code, {})
+        rows.append(
+            {
+                "rank": rank,
+                "symbol": symbol,
+                "code": row.get("code"),
+                "name": row.get("name"),
+                "amount_yi": row.get("amount_yi"),
+                "change_pct": change,
+                "open_gap_pct": round(open_gap, 2) if open_gap is not None else None,
+                "high_change_pct": round(high_change, 2) if high_change is not None else None,
+                "role": role,
+                "chain_name": _text(chain.get("chain_name"), "未映射产业链"),
+                "node_name": _text(chain.get("node_name")),
+                "chain_source": _text(chain.get("source"), "missing"),
+                "chain_evidence_date": _text(chain.get("membership_trade_date")),
+                "first_red": _first_red_evidence(db, symbol, trade_date, prev_close),
+                "evidence_level": "confirmed",
+            }
+        )
+    return rows
+
+
 def _snapshot_by_symbol(db: Any, trade_date: str, symbols: list[str]) -> dict[str, dict[str, Any]]:
     if not symbols:
         return {}
@@ -1886,7 +2027,7 @@ def build_market_replay_context(
     rotation_shifts = _rotation_shifts(db, trade_date, checkpoints=checkpoints, limit=10)
     rotation_symbols = _symbols_from_rotation_boards(db, rotation_windows, rotation_shifts)
     intraday_delta_symbols = _intraday_delta_board_symbols(db, trade_date)
-    high_turnover_symbols = [row["symbol"] for row in high_turnover[: min(10, len(high_turnover))]]
+    high_turnover_symbols = [row["symbol"] for row in high_turnover[: min(20, len(high_turnover))]]
     external_fund_flows = (
         _external_fund_flow_evidence(trade_date, high_turnover_symbols, limit=3)
         if include_external_fund_flows
@@ -1929,6 +2070,7 @@ def build_market_replay_context(
             flow=flow_availability,
         ),
         "high_turnover_cores": high_turnover,
+        "turnover_representatives": _turnover_representatives(db, trade_date, high_turnover, limit=15),
         "failed_boards": failed_boards,
         "board_timeline": board_timeline,
         "rotation_windows": rotation_windows,
@@ -2160,6 +2302,53 @@ def _board_role_map_section(context: dict[str, Any]) -> str:
         "为什么纳入这些板块和标的，要先看角色而不是只看涨跌。"
         + "。".join(parts)
         + "。同一条主线可以同时是交易量前排、压力锚和明日验证锚，不能因为当日承压就否认它的主线地位。"
+    )
+
+
+def _turnover_rep_phrase(row: dict[str, Any]) -> str:
+    name = _text(row.get("name"))
+    if not name:
+        return ""
+    parts = [
+        f"第{_fmt_number(row.get('rank'))}",
+        f"成交{_fmt_number(row.get('amount_yi'))}亿",
+        _fmt_pct(row.get("change_pct")),
+        _text(row.get("role")),
+    ]
+    first_red = row.get("first_red") if isinstance(row.get("first_red"), dict) else {}
+    status = _text(first_red.get("status"))
+    first_time = _text(first_red.get("first_close_above_time") or first_red.get("first_touch_time"))
+    if status == "confirmed" and first_time:
+        parts.append(f"5分钟{first_time}越过昨收")
+    elif status == "missing":
+        parts.append("分钟翻红时间缺失")
+    return f"{name}({','.join(part for part in parts if part)})"
+
+
+def _turnover_representative_section(context: dict[str, Any]) -> str:
+    rows = context.get("turnover_representatives")
+    if not isinstance(rows, list) or not rows:
+        return ""
+    chain_groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows[:15]:
+        chain = _text(row.get("chain_name"), "未映射产业链")
+        chain_groups.setdefault(chain, []).append(row)
+    ordered_groups = sorted(
+        chain_groups.items(),
+        key=lambda item: min(_float(row.get("rank")) or 999 for row in item[1]),
+    )
+    group_parts = []
+    for chain, items in ordered_groups[:6]:
+        phrases = [_turnover_rep_phrase(row) for row in items[:4]]
+        phrases = [phrase for phrase in phrases if phrase]
+        if phrases:
+            group_parts.append(f"{chain}：{'、'.join(phrases)}")
+    if not group_parts:
+        return ""
+    return (
+        "成交额代表篮子必须单独看，不能只拿一两个高成交核心代替整条主线。"
+        + "；".join(group_parts)
+        + "。这层只使用成交额排名、日内涨跌、开盘缺口、产业链映射和分钟路径；分钟路径缺失时，不写首次翻红，只保留日线可确认的低开转强或压力角色。"
     )
 
 
@@ -3045,6 +3234,7 @@ def format_market_replay_sections(context: dict[str, Any], *, max_sections: int 
     """Turn a market replay evidence graph into narrative-ready paragraphs."""
     structured_section = _structured_intraday_summary_section(context)
     role_map_section = _board_role_map_section(context)
+    turnover_representative_section = _turnover_representative_section(context)
     carding_section = _sample_style_carding_section(context) or _carding_section(context)
     emotion_section = _emotion_temperature_section(context)
     cycle_section = _index_cycle_section(context)
@@ -3070,6 +3260,7 @@ def format_market_replay_sections(context: dict[str, Any], *, max_sections: int 
         for section in (
             structured_section,
             role_map_section,
+            turnover_representative_section,
             _opening_flow_section(context),
             _aerospace_section(context),
             _turn_0933_section(context),
@@ -3091,6 +3282,8 @@ def format_market_replay_sections(context: dict[str, Any], *, max_sections: int 
         sections.append(structured_section)
     if role_map_section:
         sections.append(role_map_section)
+    if turnover_representative_section:
+        sections.append(turnover_representative_section)
 
     rotation_parts: list[str] = []
     for item in context.get("rotation_windows", [])[:5]:

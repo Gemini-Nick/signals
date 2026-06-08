@@ -95,6 +95,8 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["concept_ranking"], [("source", ASCENDING), ("dt", ASCENDING)])
     _safe_create_index(db["board_heat_ticks"], [("kind", ASCENDING), ("name", ASCENDING), ("trade_minute", ASCENDING)])
     _safe_create_index(db["board_heat_ticks"], [("source", ASCENDING), ("trade_minute", ASCENDING)])
+    _safe_create_index(db["board_heat_ticks"], [("kind", ASCENDING), ("trade_date", ASCENDING), ("trade_minute", DESCENDING), ("snapshot_at", DESCENDING)])
+    _safe_create_index(db["board_heat_ticks"], [("kind", ASCENDING), ("trade_minute", ASCENDING), ("change_pct", DESCENDING), ("rank_idx", ASCENDING)])
     _safe_create_index(db["chain_heat_snapshots"], [("market", ASCENDING), ("trade_minute", ASCENDING), ("rank", ASCENDING)])
     _safe_create_index(db["chain_heat_snapshots"], [("chain_id", ASCENDING), ("node_id", ASCENDING), ("trade_minute", ASCENDING)])
     _safe_create_index(db["source_board_catalog"], [("trade_date", ASCENDING), ("source", ASCENDING), ("kind", ASCENDING), ("canonical_name", ASCENDING)])

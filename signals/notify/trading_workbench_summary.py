@@ -618,7 +618,12 @@ def _as_of_date(dashboard: dict[str, Any], snapshot: dict[str, Any]) -> str:
 
 def _index_change_map(shell: dict[str, Any]) -> dict[str, float]:
     result: dict[str, float] = {}
-    for row in _as_list(shell.get("indices")):
+    groups = shell.get("watchlist_groups") if isinstance(shell.get("watchlist_groups"), dict) else {}
+    rows = [
+        *_as_list(shell.get("indices")),
+        *_as_list(groups.get("major_indices")),
+    ]
+    for row in rows:
         name = _text(row.get("name") or row.get("label") or row.get("symbol"))
         if not name:
             continue
@@ -855,15 +860,29 @@ def _generic_replay_paragraphs(
             "资金切换先按指数损伤、板块15强弱和三池变化来复盘：指数是否继续杀、强板块是否扩散、"
             "弱链条是否拖累高位核心，以及尾盘是否还有承接。"
         )
-    sections = [
-        (
+    has_tech_replay = bool(
+        market_replay_sections
+        and any("科技链先集中恐慌" in section or "科技高成交" in section for section in market_replay_sections)
+    )
+    if has_tech_replay:
+        opening = (
+            "今天复盘先定两个坐标：方向和节奏。方向上，涨幅榜前排不能直接代表主线；"
+            "真正决定账户体感和明日验证的是科技高成交链的压力测试，CPO/通信线缆、半导体、PCB/算力同时承担"
+            "“受伤主线”和“验证锚”。节奏上，是早盘恐慌、盘中局部抄底反弹、午后承接失败。"
+            f"{index_line if index_line.endswith('。') else index_line + '。'}"
+            "所以今天不能写成“某两个板块最强”，而要判断这轮下跌是主线换挡，还是修复前的二次压力测试。"
+        )
+    else:
+        opening = (
             "今天市场的真实结构是：盘面看着热闹，尾盘一锅端。"
             f"给你一个最直接的结论—最终强度更集中在{_replay_strength_names(sector_rows, limit=2)}，"
             "但其他交易量前排仍有复盘价值，关键要看它们是主线确认、受伤主线，还是压力锚。"
             f"{index_line if index_line.endswith('。') else index_line + '。'}"
             "但数字掩盖了真实杀伤力—高成交核心冲高回落无承接，会直接拖累尾盘情绪。"
             "这类盘面不能只看最终涨幅，要同时看强度、链主确认、弹性跟随、炸板回落和尾盘承接。"
-        ),
+        )
+    sections = [
+        opening,
     ]
     if market_replay_sections:
         sections.extend(market_replay_sections)
@@ -1282,6 +1301,22 @@ def _wechat_market_lines(
     return lines
 
 
+def _wechat_sector_role_line(dashboard: dict[str, Any], shell: dict[str, Any], *, window: str) -> str:
+    rows = _sector_board_rows(shell, dashboard, limit=5)
+    scope = "截至当前窗口" if window in {"ten", "midday", "two", "close"} else "当前"
+    if not rows:
+        return f"- 板块角色：{scope}缺少板块15排序，不写主线判断，只按候选触发复核。"
+    board_line = _sector_strength_line(rows, limit=4)
+    confirmed = _sector_names_by_action(rows, "产业链确认", limit=2)
+    split = _sector_names_by_action(rows, "链内分化", limit=2)
+    source_weak = _sector_names_by_action(rows, "源强链弱", limit=2)
+    return (
+        f"- 板块角色：{scope}前排={board_line}；"
+        f"主线确认={confirmed}；链内分化={split}；源强链弱={source_weak}。"
+        "盘中只按这些角色验证，不用最终涨跌直接下结论。"
+    )
+
+
 def _wechat_abandon_lines(
     dashboard: dict[str, Any],
     snapshot: dict[str, Any],
@@ -1405,6 +1440,7 @@ def build_wechat_summary(
         status,
         f"1) {market_heading}",
         *_wechat_market_lines(dashboard, shell, snapshot, event_lines=event_lines),
+        _wechat_sector_role_line(dashboard, shell, window=window),
         "",
         "2) 三池共性",
         _wechat_common_line(dashboard, snapshot, selected_action, selected_watch),

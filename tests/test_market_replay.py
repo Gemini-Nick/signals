@@ -641,3 +641,51 @@ def test_market_replay_sections_summarize_opening_panic_and_partial_tech_rebound
     assert "半导体材料：主线/前排观察/受伤主线/压力锚/盘中弹性/修复锚" in text
     assert "同一条主线可以同时是交易量前排、压力锚和明日验证锚" in text
     assert "非主线" not in text
+
+
+def test_market_replay_turnover_representatives_are_programmatic():
+    context = {
+        "turnover_representatives": [
+            {
+                "rank": 3,
+                "name": "中天科技",
+                "amount_yi": 252.05,
+                "change_pct": 7.5103,
+                "role": "低开转强/修复锚",
+                "chain_name": "通信网络/5G产业链",
+                "first_red": {"status": "missing", "note": "缺5分钟路径，不能判定首次翻红时间。"},
+            },
+            {
+                "rank": 9,
+                "name": "沪电股份",
+                "amount_yi": 155.45,
+                "change_pct": 2.8374,
+                "role": "低开转强/修复锚",
+                "chain_name": "PCB/CCL/服务器材料产业链",
+                "first_red": {"status": "confirmed", "first_close_above_time": "10:15", "basis": "5分钟 bars 越过昨收"},
+            },
+            {
+                "rank": 12,
+                "name": "工业富联",
+                "amount_yi": 140.14,
+                "change_pct": -4.8339,
+                "role": "高成交压力锚",
+                "chain_name": "AI算力/数据中心产业链",
+                "first_red": {"status": "not_observed"},
+            },
+        ],
+        "rotation_windows": [],
+        "rotation_shifts": [],
+        "high_turnover_cores": [],
+        "stock_event_chains": [],
+        "failed_boards": [],
+        "flow_availability": {"participant_flow_available": False},
+    }
+
+    text = "\n".join(format_market_replay_sections(context))
+
+    assert "成交额代表篮子必须单独看" in text
+    assert "中天科技(第3,成交252.05亿,+7.51%,低开转强/修复锚,分钟翻红时间缺失)" in text
+    assert "沪电股份(第9,成交155.45亿,+2.84%,低开转强/修复锚,5分钟10:15越过昨收)" in text
+    assert "工业富联(第12,成交140.14亿,-4.83%,高成交压力锚)" in text
+    assert "最先翻红" not in text
