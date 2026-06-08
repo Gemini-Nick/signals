@@ -2280,28 +2280,45 @@ def _board_role_map_section(context: dict[str, Any]) -> str:
     if not role_map:
         return ""
 
-    def role_display(roles: list[Any]) -> str:
-        parts: list[str] = []
-        for role in roles:
-            for part in _text(role).split("/"):
-                if part and part not in parts:
-                    parts.append(part)
-        return "/".join(parts)
-
-    parts = []
-    for row in role_map[:7]:
+    def row_phrase(row: dict[str, Any], *, evidence_limit: int = 2) -> str:
         name = _text(row.get("name"))
         roles = row.get("roles") if isinstance(row.get("roles"), list) else []
         evidence = row.get("evidence") if isinstance(row.get("evidence"), list) else []
-        if not name or not roles or not evidence:
+        if not name:
+            return ""
+        brief = "、".join(_text(item) for item in evidence[:evidence_limit] if _text(item))
+        return f"{name}({brief})" if brief else name
+
+    wounded = []
+    repair = []
+    front = []
+    for row in role_map[:10]:
+        roles = row.get("roles") if isinstance(row.get("roles"), list) else []
+        role_text = "/".join(_text(role) for role in roles)
+        phrase = row_phrase(row)
+        if not phrase:
             continue
-        parts.append(f"{name}：{role_display(roles[:4])}；依据={'；'.join(evidence[:4])}")
+        if "受伤主线" in role_text or "压力锚" in role_text:
+            wounded.append(phrase)
+        elif "修复锚" in role_text or "弹性锚" in role_text:
+            repair.append(phrase)
+        elif "主线/前排观察" in roles:
+            front.append(phrase)
+
+    parts = []
+    if wounded:
+        parts.append("受伤主线/压力锚=" + "、".join(wounded[:4]))
+    if repair:
+        parts.append("修复锚=" + "、".join(repair[:3]))
+    if front:
+        parts.append("涨幅卡位/前排=" + "、".join(front[:3]))
     if not parts:
         return ""
     return (
-        "为什么纳入这些板块和标的，要先看角色而不是只看涨跌。"
-        + "。".join(parts)
-        + "。同一条主线可以同时是交易量前排、压力锚和明日验证锚，不能因为当日承压就否认它的主线地位。"
+        "板块选择先按角色分层，不按涨幅榜平铺。"
+        + "；".join(parts)
+        + "。这对应“先定方向再定节奏”：强板块如果只是卡位，不直接升级为主线；"
+        "受伤主线如果仍有成交和修复锚，明日反而要继续验证承接。"
     )
 
 
@@ -2329,26 +2346,51 @@ def _turnover_representative_section(context: dict[str, Any]) -> str:
     rows = context.get("turnover_representatives")
     if not isinstance(rows, list) or not rows:
         return ""
-    chain_groups: dict[str, list[dict[str, Any]]] = {}
-    for row in rows[:15]:
-        chain = _text(row.get("chain_name"), "未映射产业链")
-        chain_groups.setdefault(chain, []).append(row)
-    ordered_groups = sorted(
-        chain_groups.items(),
-        key=lambda item: min(_float(row.get("rank")) or 999 for row in item[1]),
-    )
-    group_parts = []
-    for chain, items in ordered_groups[:6]:
-        phrases = [_turnover_rep_phrase(row) for row in items[:4]]
-        phrases = [phrase for phrase in phrases if phrase]
-        if phrases:
-            group_parts.append(f"{chain}：{'、'.join(phrases)}")
-    if not group_parts:
+
+    def concise_phrase(row: dict[str, Any]) -> str:
+        name = _text(row.get("name"))
+        if not name:
+            return ""
+        parts = [
+            f"第{_fmt_number(row.get('rank'))}",
+            f"{_fmt_number(row.get('amount_yi'))}亿",
+            _fmt_pct(row.get("change_pct")),
+        ]
+        first_red = row.get("first_red") if isinstance(row.get("first_red"), dict) else {}
+        status = _text(first_red.get("status"))
+        first_time = _text(first_red.get("first_close_above_time") or first_red.get("first_touch_time"))
+        if status == "confirmed" and first_time:
+            parts.append(f"{first_time}翻红")
+        return f"{name}({','.join(part for part in parts if part)})"
+
+    pressure_rows = []
+    repair_rows = []
+    for row in rows[:20]:
+        role = _text(row.get("role"))
+        change = _float(row.get("change_pct")) or 0.0
+        first_red = row.get("first_red") if isinstance(row.get("first_red"), dict) else {}
+        has_first_red = _text(first_red.get("status")) == "confirmed"
+        if "压力" in role or change < 0:
+            pressure_rows.append(row)
+        if "修复" in role or has_first_red or change > 0:
+            repair_rows.append(row)
+
+    pressure = [concise_phrase(row) for row in pressure_rows[:9]]
+    repair = [concise_phrase(row) for row in repair_rows[:6]]
+    pressure = [item for item in pressure if item]
+    repair = [item for item in repair if item]
+    if not pressure and not repair:
         return ""
+    parts = []
+    if pressure:
+        parts.append("压力锚=" + "、".join(pressure))
+    if repair:
+        parts.append("修复/翻红锚=" + "、".join(repair))
     return (
-        "成交额代表篮子必须单独看，不能只拿一两个高成交核心代替整条主线。"
-        + "；".join(group_parts)
-        + "。这层只使用成交额排名、日内涨跌、开盘缺口、产业链映射和分钟路径；分钟路径缺失时，不写首次翻红，只保留日线可确认的低开转强或压力角色。"
+        "成交额代表篮子只回答两个问题：谁在拖累，谁先修复。"
+        + "；".join(parts)
+        + "。这就是为什么不能只写CPO或中际旭创：同一条科技主线内部同时有压力、翻红和承接失败，"
+        "要用成交额排名、涨跌、开盘缺口和分钟路径一起定角色。"
     )
 
 
@@ -3202,18 +3244,18 @@ def _structured_intraday_summary_section(context: dict[str, Any]) -> str:
     if not panic_parts and not rebound_parts:
         return ""
 
-    sentences = ["结构化切片先给结论。"]
+    sentences = ["结构化切片先给结论：先定方向，再定节奏，最后才看标的。"]
     if panic_parts:
         sentences.append(
-            "早盘不是普通分化，而是科技链先集中恐慌："
-            + "、".join(panic_parts[:5])
-            + "。"
+            "方向上，早盘不是普通分化，而是科技链先集中恐慌："
+            + "、".join(panic_parts[:4])
+            + "；这说明CPO、通信线缆、半导体、PCB这类高成交方向当天先进入压力测试。"
         )
     if rebound_parts:
         sentences.append(
-            "后续也不是全面修复，而是部分科技分支出现抄底反弹："
-            + "、".join(rebound_parts[:5])
-            + "。"
+            "节奏上，后续不是全面修复，而是部分科技分支出现抄底反弹："
+            + "、".join(rebound_parts[:4])
+            + "；这只能证明短跌后的修复尝试，不能直接证明低点成立。"
         )
     if slices:
         confirmed = [
@@ -3225,7 +3267,7 @@ def _structured_intraday_summary_section(context: dict[str, Any]) -> str:
             sentences.append(
                 "这些判断来自固定分时切片"
                 + "、".join(confirmed[:5])
-                + "，所以主线表述应写成“先恐慌、局部反弹、再看承接”，不能只写单一强板块。"
+                + "。因此复盘主线应写成“先恐慌、局部反弹、再看承接”，而不是“涨幅榜谁强就写谁”。"
             )
     return "".join(sentences)
 

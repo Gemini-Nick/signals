@@ -636,10 +636,10 @@ def test_market_replay_sections_summarize_opening_panic_and_partial_tech_rebound
     assert "机器人增强+5.43%" in first
     assert "半导体设备增强+1.37%" in first
     text = "\n".join(sections)
-    assert "为什么纳入这些板块和标的" in text
-    assert "通信线缆及配套：主线/前排观察/受伤主线/压力锚/盘中弹性/修复锚" in text
-    assert "半导体材料：主线/前排观察/受伤主线/压力锚/盘中弹性/修复锚" in text
-    assert "同一条主线可以同时是交易量前排、压力锚和明日验证锚" in text
+    assert "板块选择先按角色分层，不按涨幅榜平铺" in text
+    assert "受伤主线/压力锚=通信线缆及配套" in text
+    assert "半导体材料" in text
+    assert "先定方向再定节奏" in text
     assert "非主线" not in text
 
 
@@ -684,8 +684,8 @@ def test_market_replay_turnover_representatives_are_programmatic():
 
     text = "\n".join(format_market_replay_sections(context))
 
-    assert "成交额代表篮子必须单独看" in text
-    assert "中天科技(第3,成交252.05亿,+7.51%,低开转强/修复锚,分钟翻红时间缺失)" in text
-    assert "沪电股份(第9,成交155.45亿,+2.84%,低开转强/修复锚,5分钟10:15越过昨收)" in text
-    assert "工业富联(第12,成交140.14亿,-4.83%,高成交压力锚)" in text
+    assert "成交额代表篮子只回答两个问题：谁在拖累，谁先修复" in text
+    assert "压力锚=工业富联(第12,140.14亿,-4.83%)" in text
+    assert "修复/翻红锚=中天科技(第3,252.05亿,+7.51%)" in text
+    assert "沪电股份(第9,155.45亿,+2.84%,10:15翻红)" in text
     assert "最先翻红" not in text
