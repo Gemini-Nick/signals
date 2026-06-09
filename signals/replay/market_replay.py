@@ -2292,17 +2292,23 @@ def _board_role_map_section(context: dict[str, Any]) -> str:
     wounded = []
     repair = []
     front = []
+    focus_tokens = ("机器人", "通信", "线缆", "CPO", "光模块", "半导体", "集成电路", "PCB", "印制电路", "算力")
+
+    def is_focus_board(row: dict[str, Any]) -> bool:
+        name = _text(row.get("name"))
+        return _is_tech_mainline_board(name) or any(token in name for token in focus_tokens)
+
     for row in role_map[:10]:
         roles = row.get("roles") if isinstance(row.get("roles"), list) else []
         role_text = "/".join(_text(role) for role in roles)
         phrase = row_phrase(row)
         if not phrase:
             continue
-        if "受伤主线" in role_text or "压力锚" in role_text:
+        if "受伤主线" in role_text:
             wounded.append(phrase)
-        elif "修复锚" in role_text or "弹性锚" in role_text:
+        elif is_focus_board(row) and ("修复锚" in role_text or "弹性锚" in role_text):
             repair.append(phrase)
-        elif "主线/前排观察" in roles:
+        elif is_focus_board(row) and "主线/前排观察" in roles:
             front.append(phrase)
 
     parts = []
@@ -2894,9 +2900,8 @@ def _turn_0933_section(context: dict[str, Any]) -> str:
             ),
             telecom_rows[-1] if telecom_rows else None,
         )
-    power = _power_events(context)
     strong, weak = _shift_leaders(_shift_by_to_time(context, "09:35"))
-    if not telecom and not power and not (strong or weak):
+    if not telecom and not (strong or weak):
         return ""
     telecom_line = ""
     if telecom:
@@ -2907,7 +2912,6 @@ def _turn_0933_section(context: dict[str, Any]) -> str:
             f"日内低点拉升，最高到{_fmt_number(high_bar.get('high') or telecom.get('high'))}，"
             f"但收盘仍是{_fmt_pct(telecom.get('close_change_pct'))}。"
         )
-    power_line = "。".join(_event_phrase(row) for row in power[:4] if _event_phrase(row))
     shift_line = ""
     if not telecom_line and (strong or weak):
         shift_line = (
@@ -2922,18 +2926,13 @@ def _turn_0933_section(context: dict[str, Any]) -> str:
             or any(token in telecom_haystack for token in ["通信", "CPO", "光模块"])
         )
     )
-    title = "9点33分附近是早盘第一个关键转折点。" if explicit_tech_reversal or power_line else "早盘第一个关键转折点。"
-    final_sentence = (
-        "电力板块内部如果涨停变成炸板、冲高变成回落，就是撤退信号。"
-        if power_line
-        else "这类回拉或切换如果不能带动板块扩散，就只能按资金试探处理。"
-    )
+    title = "9点33分附近是早盘第一个关键转折点。" if explicit_tech_reversal else "早盘第一个关键转折点。"
+    final_sentence = "这类回拉或切换如果不能带动板块扩散，就只能按资金试探处理。"
     return (
         title
         + telecom_line
         + shift_line
-        + ("这个瞬间资金被吸引回承压方向。 " if telecom_line else "")
-        + ("这时候电力方向开始跳水—" + power_line + "。" if power_line else "")
+        + ("这个瞬间资金被吸引回承压方向。" if telecom_line else "")
         + final_sentence
     )
 
@@ -3244,7 +3243,7 @@ def _structured_intraday_summary_section(context: dict[str, Any]) -> str:
     if not panic_parts and not rebound_parts:
         return ""
 
-    sentences = ["结构化切片先给结论：先定方向，再定节奏，最后才看标的。"]
+    sentences = ["对应的程序化证据如下。"]
     if panic_parts:
         sentences.append(
             "方向上，早盘不是普通分化，而是科技链先集中恐慌："

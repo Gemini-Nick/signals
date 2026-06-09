@@ -13,6 +13,7 @@ from signals.notify.trading_workbench_summary import (
     window_gate,
     _breakpoint_watch_lines,
     _board_heat_event_lines_from_docs,
+    _index_kill_line,
     _limit_contexts_to_window,
     _market_event_lines,
     _send_body,
@@ -47,6 +48,21 @@ def _snapshot():
             "confidence": 0.77,
         },
     }
+
+
+def test_index_kill_line_reads_major_indices_from_watchlist_groups():
+    shell = {
+        "watchlist_groups": {
+            "major_indices": [
+                {"name": "上证指数", "day_change_pct": -1.6982},
+                {"name": "深证成指", "day_change_pct": -3.2225},
+                {"name": "创业板指", "day_change_pct": -3.6926},
+                {"name": "科创50", "day_change_pct": -4.3013},
+            ]
+        }
+    }
+
+    assert _index_kill_line(shell) == "上证-1.70%，深成指-3.22%，创业板-3.69%，科创50-4.30%"
 
 
 def _shell():
