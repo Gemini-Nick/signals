@@ -670,6 +670,90 @@ def test_wechat_summary_preserves_signals_candidate_order():
             "rank_score": 280.0,
         },
     ]
+    shell["watchlist_groups"]["risk_stocks"].append(
+        {
+            "symbol": "SH.513130",
+            "name": "恒生科技ETF",
+            "queue_lane": "risk_exit_first",
+            "trader_action": "暂不参与",
+            "entry_logic_summary": "日/周: 缺日/周买点；30m: 一买；15m/5m右侧混合",
+            "invalidates_when": "日/周买点修复前不升级",
+            "primary_chain": "港股科技",
+            "rank_score": 210.0,
+        }
+    )
+    shell["watchlist_groups"]["major_indices"] = [
+        {
+            "name": "上证指数",
+            "day_change_pct": -0.58,
+            "daily_trend": "中枢震荡",
+            "f30_trend": "下跌趋势",
+            "f15_trend": "上涨趋势",
+            "latest_signal": "MA20回踩承接",
+        },
+        {
+            "name": "深证成指",
+            "day_change_pct": -1.94,
+            "daily_trend": "回调修正",
+            "f30_trend": "下跌趋势",
+            "f15_trend": "下跌趋势",
+            "latest_signal": "MA13回踩承接",
+        },
+        {
+            "name": "创业板指",
+            "day_change_pct": -2.29,
+            "daily_trend": "上涨趋势",
+            "f30_trend": "下跌趋势",
+            "f15_trend": "上涨趋势",
+            "latest_signal": "MA21反抽未过",
+        },
+        {
+            "name": "科创50",
+            "day_change_pct": -0.02,
+            "daily_trend": "中枢震荡",
+            "f30_trend": "下跌趋势",
+            "f15_trend": "下跌趋势",
+            "latest_signal": "MA13反抽未过",
+        },
+    ]
+    shell["watchlist_groups"]["sector_boards"] = [
+        {
+            "name": "半导体产业链 · 材料/光刻胶",
+            "day_change_pct": 4.22,
+            "trader_action": "产业链确认：链主/弹性跟随，复核扩散延续",
+            "source_driver": {"kind": "industry", "name": "半导体材料", "change_pct": 4.22},
+            "representatives": {"core": [{"name": "上海新阳", "symbol": "SZ.300236"}]},
+        },
+        {
+            "name": "大金融产业链 · 银行/券商/保险",
+            "day_change_pct": 3.20,
+            "trader_action": "待确认：保险和银行拉指数，等扩散",
+            "source_driver": {"kind": "industry", "name": "保险Ⅲ", "change_pct": 3.20},
+            "representatives": {
+                "core": [
+                    {"name": "工商银行", "symbol": "SH.601398"},
+                    {"name": "中国平安", "symbol": "SH.601318"},
+                ]
+            },
+        },
+        {
+            "name": "半导体产业链 · 半导体设备",
+            "day_change_pct": 1.64,
+            "trader_action": "产业链确认：链主/弹性跟随，复核扩散延续",
+            "source_driver": {"kind": "industry", "name": "半导体设备", "change_pct": 1.64},
+            "representatives": {
+                "core": [
+                    {"name": "北方华创", "symbol": "SZ.002371"},
+                    {"name": "中微公司", "symbol": "SH.688012"},
+                ]
+            },
+        },
+        {
+            "name": "传媒旅游产业链 · 游戏/影视/文旅",
+            "day_change_pct": 2.45,
+            "trader_action": "源强链弱：等链主确认后再当主线",
+        },
+    ]
 
     result = build_wechat_summary(
         _dashboard(),
@@ -677,20 +761,36 @@ def test_wechat_summary_preserves_signals_candidate_order():
         _snapshot(),
         window="midday",
         max_items=5,
-        event_lines=["上证11:15低点杀破10周线，按恐慌测试处理"],
+        event_lines=["创业板11:15日内修复强于上证，但30m仍待确认"],
     )
 
     assert result.status == "NOTIFY"
-    assert "1) 上午盘面结论" in result.text
-    assert "2) 三池共性" in result.text
-    assert "3) 下午打开图复核" in result.text
+    assert "1) 上午盘面总结" in result.text
+    assert "2) 板块卡位" in result.text
+    assert "3) 下午复核清单" in result.text
+    assert "4) 降级条件" in result.text
+    assert "指数结构" in result.text
+    assert "上证-0.58%" in result.text
+    assert "创业板-2.29%" in result.text
+    assert "科创50-0.02%" in result.text
+    assert "恒科代理" in result.text
+    assert "恒生科技ETF SH.513130" in result.text
     assert "关键盘面事件" in result.text
-    assert "板块角色" in result.text
+    assert "盘面含义" in result.text
+    assert "前排强度" in result.text
+    assert "金融护盘" in result.text
+    assert "科技修复" in result.text
+    assert "上海新阳、北方华创" in result.text
+    assert "日/周有买点" in result.text
+    assert "只有分钟反抽/缺日周" in result.text
+    assert "交易含义" not in result.text
+    assert "角色拆分" not in result.text
     assert "截至当前窗口" in result.text
-    assert result.text.index("利通电子 SH.603629") < result.text.index("环旭电子 SH.601231")
-    assert result.text.index("环旭电子 SH.601231") < result.text.index("立昂微 SH.605358")
-    assert "特力A SZ.000025" not in result.text
-    assert "共性不足" in result.text
+    review_block = result.text.split("4) 降级条件", 1)[0].split("3) 下午复核清单", 1)[1]
+    assert review_block.rindex("利通电子 SH.603629") < review_block.rindex("环旭电子 SH.601231")
+    assert review_block.rindex("环旭电子 SH.601231") < review_block.rindex("立昂微 SH.605358")
+    assert "特力A SZ.000025(日线一买)" in result.text
+    assert "特力A SZ.000025 | 触发" not in review_block
     assert "Mongo" not in result.text
     assert "runtime" not in result.text
 
@@ -705,7 +805,7 @@ def test_market_event_lines_trigger_notify_without_stock_candidates():
         shell,
         _snapshot(),
         window="ten",
-        event_lines=["创业板10:30首次按点位超过上证，成长强于权重"],
+        event_lines=["创业板10:30日内相对上证走强，成长修复强于权重"],
     )
 
     assert result.notify is True
@@ -748,8 +848,8 @@ def test_market_event_lines_detects_index_anomalies():
     lines = _market_event_lines(contexts)
 
     assert any("杀破4070" in line for line in lines)
-    assert any("创业板10:30" in line and "首次按点位超过上证" in line for line in lines)
-    assert any("未维持" in line for line in lines)
+    assert any("创业板截至14:10日内" in line and "成长修复强于权重" in line for line in lines)
+    assert not any("按点位" in line for line in lines)
 
 
 def test_breakpoint_watch_lines_frame_ten_oclock_confirmation():
@@ -759,7 +859,12 @@ def test_breakpoint_watch_lines_frame_ten_oclock_confirmation():
     contexts = {
         "上证指数": {
             "target": {"label": "上证指数", "market_timezone": "Asia/Shanghai"},
-            "summary": {"key_levels": [{"name": "20周线", "value": 4069.21}]},
+            "summary": {
+                "key_levels": [
+                    {"name": "5日线", "value": 4070.50},
+                    {"name": "20周线", "value": 4069.21},
+                ]
+            },
             "chart": {
                 "ohlcv": [
                     {"time": ts(9, 35), "low": 4072.0, "close": 4080.0},
@@ -781,7 +886,8 @@ def test_breakpoint_watch_lines_frame_ten_oclock_confirmation():
     lines = _breakpoint_watch_lines(contexts, "ten")
 
     assert any("9:45变盘前" in line and "10:00前" in line for line in lines)
-    assert any("创业板4090.00 vs 上证4082.00" in line for line in lines)
+    assert any("创业板日内+0.29%" in line and "上证+0.05%" in line for line in lines)
+    assert not any("5日线" in line for line in lines)
 
 
 def test_ten_window_does_not_look_past_945_when_replayed_later():

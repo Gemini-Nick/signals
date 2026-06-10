@@ -48,11 +48,11 @@ WINDOW_EVENT_CUTOFFS = {
     "close": time(14, 30),
 }
 WECHAT_HEADINGS = {
-    "preopen": ("今日盘面观察框架", "开盘后打开图复核", "回测入口"),
-    "ten": ("9:45 变盘前观察", "打开图复核", "回测入口"),
-    "midday": ("上午盘面结论", "下午打开图复核", "回测入口"),
-    "two": ("13:45 变盘前观察", "打开图复核", "回测入口"),
-    "close": ("全天盘面归纳", "收盘前复核", "盘后回测入口"),
+    "preopen": ("盘前推演", "开盘后复核清单", "开盘后验证"),
+    "ten": ("9:45 盘面先判", "10:00前复核清单", "下一窗口验证"),
+    "midday": ("上午盘面总结", "下午复核清单", "午后验证"),
+    "two": ("13:45 盘面再判", "14:00前复核清单", "收盘前验证"),
+    "close": ("全天盘面归纳", "收盘前复核清单", "盘后验证"),
     "postmarket": ("今日大盘/行业归因", "明日观察", "回测入口"),
     "weekly": ("本周大盘/行业", "候选/板块", "回测入口"),
     "manual": ("盘面结论", "打开图复核", "回测入口"),
@@ -242,6 +242,20 @@ def _float_value(value: Any) -> float | None:
         return None
 
 
+def _intraday_return(rows: list[tuple[datetime, dict[str, Any]]]) -> float | None:
+    if not rows:
+        return None
+    first = rows[0][1]
+    latest = rows[-1][1]
+    base = _float_value(first.get("open"))
+    if base is None:
+        base = _float_value(first.get("close"))
+    close = _float_value(latest.get("close"))
+    if base is None or close is None or base <= 0:
+        return None
+    return (close / base - 1.0) * 100.0
+
+
 def _day_chart_rows(payload: dict[str, Any]) -> list[tuple[datetime, dict[str, Any]]]:
     chart = payload.get("chart") if isinstance(payload.get("chart"), dict) else {}
     rows = _as_list(chart.get("ohlcv"))
@@ -294,11 +308,20 @@ def _dedupe_lines(lines: list[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for line in lines:
-        if line in seen:
+        key = _event_line_key(line)
+        if key in seen:
             continue
-        seen.add(line)
+        seen.add(key)
         result.append(line)
     return result
+
+
+def _event_line_key(line: str) -> str:
+    if "创业板" in line and "上证" in line and "权重" in line:
+        return "growth_vs_weight"
+    if "上证" in line and ("低点" in line or "杀破" in line or "逼近" in line):
+        return "sh_support"
+    return line
 
 
 def _breakpoint_watch_lines(contexts: dict[str, dict[str, Any]], window: str) -> list[str]:
@@ -344,12 +367,12 @@ def _support_watch_line(
         return None
     low, _, _ = min(low_points, key=lambda item: item[0])
     latest_close = _float_value(rows[-1][1].get("close"))
-    support = _nearest_key_level_context(payload, latest_close or low, max_distance=0.02)
+    support = _nearest_support_context(payload, latest_close or low, max_distance=0.02)
     if support is None:
-        support = _nearest_key_level_context(payload, low, max_distance=0.02)
+        support = _nearest_support_context(payload, low, max_distance=0.02)
     if support is None:
         return None
-    level_text, level_value, _ = support
+    level_text, level_value = support
     close_text = f"、最新{latest_close:.2f}" if latest_close is not None else ""
     if low < level_value:
         condition = f"已破{level_text}，{next_check}先看能否收回，否则按风险扩散处理"
@@ -367,23 +390,28 @@ def _style_watch_line(
     if not sh_rows or not cy_rows:
         return None
     sh_by_time = {dt: row for dt, row in sh_rows}
-    common: list[tuple[datetime, float, float]] = []
+    common: list[tuple[datetime, dict[str, Any], dict[str, Any]]] = []
     for dt, cy_row in cy_rows:
         sh_row = sh_by_time.get(dt)
         if not sh_row:
             continue
-        cy_close = _float_value(cy_row.get("close"))
-        sh_close = _float_value(sh_row.get("close"))
-        if cy_close is not None and sh_close is not None:
-            common.append((dt, sh_close, cy_close))
+        if _float_value(cy_row.get("close")) is not None and _float_value(sh_row.get("close")) is not None:
+            common.append((dt, sh_row, cy_row))
     if not common:
         return None
-    _, sh_close, cy_close = common[-1]
-    if cy_close > sh_close:
-        condition = "成长暂强于权重，若延续则按进攻线索优先，若回落到上证下方则降级为观察"
+    latest_dt, _, _ = common[-1]
+    sh_return = _intraday_return([(dt, row) for dt, row, _ in common])
+    cy_return = _intraday_return([(dt, row) for dt, _, row in common])
+    if sh_return is None or cy_return is None:
+        return None
+    if cy_return >= sh_return:
+        condition = "成长日内相对强，若延续才提高科技修复权重；回落则降级为反抽"
     else:
-        condition = "成长暂未强于权重，只有创业板首次超过上证并维持，才提高进攻确认"
-    return f"{label}：创业板{cy_close:.2f} vs 上证{sh_close:.2f}，{condition}，{next_check}复核"
+        condition = "成长日内弱于权重，科技反抽不能直接当主线"
+    return (
+        f"{label}：截至{latest_dt.strftime('%H:%M')}创业板日内{_fmt_pct(cy_return)}、"
+        f"上证{_fmt_pct(sh_return)}，{condition}，{next_check}复核"
+    )
 
 
 def _market_event_lines(contexts: dict[str, dict[str, Any]]) -> list[str]:
@@ -411,8 +439,7 @@ def _market_event_lines(contexts: dict[str, dict[str, Any]]) -> list[str]:
 
     if sh_rows and cy_rows:
         sh_by_time = {dt: row for dt, row in sh_rows}
-        common: list[tuple[datetime, float, float]] = []
-        crossovers: list[tuple[datetime, float, float]] = []
+        common: list[tuple[datetime, dict[str, Any], dict[str, Any]]] = []
         for dt, cy_row in cy_rows:
             sh_row = sh_by_time.get(dt)
             if not sh_row:
@@ -421,31 +448,33 @@ def _market_event_lines(contexts: dict[str, dict[str, Any]]) -> list[str]:
             sh_close = _float_value(sh_row.get("close"))
             if cy_close is None or sh_close is None:
                 continue
-            common.append((dt, sh_close, cy_close))
-            if cy_close > sh_close:
-                crossovers.append((dt, sh_close, cy_close))
-        if crossovers:
-            dt, sh_close, cy_close = crossovers[0]
-            latest_dt, latest_sh_close, latest_cy_close = common[-1]
-            if latest_cy_close > latest_sh_close:
-                lines.append(
-                    f"创业板{dt.strftime('%H:%M')}首次按点位超过上证"
-                    f"（{cy_close:.2f} vs {sh_close:.2f}），截至{latest_dt.strftime('%H:%M')}仍维持，成长强于权重"
-                )
-            else:
-                lines.append(
-                    f"创业板{dt.strftime('%H:%M')}曾首次按点位超过上证"
-                    f"（{cy_close:.2f} vs {sh_close:.2f}），但截至{latest_dt.strftime('%H:%M')}未维持，成长确认降级"
-                )
+            common.append((dt, sh_row, cy_row))
+        if common:
+            latest_dt, _, _ = common[-1]
+            sh_return = _intraday_return([(dt, row) for dt, row, _ in common])
+            cy_return = _intraday_return([(dt, row) for dt, _, row in common])
+            if sh_return is not None and cy_return is not None:
+                if cy_return >= sh_return:
+                    lines.append(
+                        f"创业板截至{latest_dt.strftime('%H:%M')}日内{_fmt_pct(cy_return)}，"
+                        f"上证{_fmt_pct(sh_return)}，成长修复强于权重"
+                    )
+                else:
+                    lines.append(
+                        f"创业板截至{latest_dt.strftime('%H:%M')}日内{_fmt_pct(cy_return)}，"
+                        f"上证{_fmt_pct(sh_return)}，成长仍弱于权重"
+                    )
 
     return lines[:2]
 
 
-def _nearest_support_context(payload: dict[str, Any], low: float) -> tuple[str, float] | None:
-    context = _nearest_key_level_context(payload, low, max_distance=0.006)
+def _nearest_support_context(payload: dict[str, Any], low: float, *, max_distance: float = 0.006) -> tuple[str, float] | None:
+    context = _nearest_key_level_context(payload, low, max_distance=max_distance)
     if context is None:
         return None
     level_text, trigger_value, _ = context
+    if any(marker in level_text for marker in ("5日线", "10日线", "13日线")):
+        return None
     return level_text, trigger_value
 
 
@@ -1325,19 +1354,266 @@ def _primary_theme(dashboard: dict[str, Any], snapshot: dict[str, Any]) -> str:
     return _text(brief.get("primary_theme") or regime.get("primary_theme"), "当前主线")
 
 
-def _wechat_common_line(
-    dashboard: dict[str, Any],
-    snapshot: dict[str, Any],
+INDEX_DISPLAY_ORDER = (
+    ("上证指数", "上证"),
+    ("深证成指", "深成"),
+    ("创业板指", "创业板"),
+    ("科创50", "科创50"),
+)
+
+
+def _major_index_rows(shell: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    groups = shell.get("watchlist_groups") if isinstance(shell.get("watchlist_groups"), dict) else {}
+    result: dict[str, dict[str, Any]] = {}
+    for row in [*_as_list(shell.get("indices")), *_as_list(groups.get("major_indices"))]:
+        name = _text(row.get("name") or row.get("label") or row.get("symbol"))
+        if not name:
+            continue
+        current = result.get(name)
+        if current is None or len(row) >= len(current):
+            result[name] = row
+    return result
+
+
+def _index_change(row: dict[str, Any]) -> float | None:
+    for key in ("day_change_pct", "quote_change_pct", "latest_change_pct", "change_pct"):
+        value = _float_value(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _index_structure_text(row: dict[str, Any], label: str) -> str:
+    change = _index_change(row)
+    change_text = _fmt_pct(change) if change is not None else "N/A"
+    daily = _text(row.get("daily_trend") or row.get("daily_stage"))
+    f30 = _text(row.get("f30_trend") or row.get("m30_trend") or row.get("thirty_trend"))
+    f15 = _text(row.get("f15_trend") or row.get("m15_trend") or row.get("fifteen_trend"))
+    structure = [f"日:{daily}" for daily in [daily] if daily]
+    if f30:
+        structure.append(f"30m:{f30}")
+    if f15:
+        structure.append(f"15m:{f15}")
+    signal = _text(row.get("latest_signal") or row.get("f15_latest_signal") or row.get("signal"))
+    ma_context = row.get("ma_context") if isinstance(row.get("ma_context"), dict) else {}
+    ma_summary = _text(ma_context.get("trend_summary"))
+    detail = "/".join(structure)
+    if not detail and ma_summary:
+        detail = ma_summary
+    suffix = f"({detail})" if detail else ""
+    if signal:
+        suffix = f"{suffix}{'，' if suffix else '('}{signal}{')' if not suffix else ''}"
+    return f"{label}{change_text}{suffix}"
+
+
+def _weak_index_labels(shell: dict[str, Any]) -> list[str]:
+    rows = _major_index_rows(shell)
+    labels: list[str] = []
+    for name, label in INDEX_DISPLAY_ORDER:
+        row = rows.get(name)
+        if not row:
+            continue
+        change = _index_change(row)
+        daily = _text(row.get("daily_trend"))
+        f30 = _text(row.get("f30_trend") or row.get("m30_trend"))
+        signal = _text(row.get("latest_signal") or row.get("f15_latest_signal") or row.get("signal"))
+        if "下跌" in f30 or "卖" in signal or (change is not None and change < -0.5 and "上涨" not in daily):
+            labels.append(label)
+    return labels
+
+
+def _wechat_index_structure_lines(shell: dict[str, Any]) -> list[str]:
+    rows = _major_index_rows(shell)
+    parts = []
+    for name, label in INDEX_DISPLAY_ORDER:
+        row = rows.get(name)
+        if row:
+            parts.append(_index_structure_text(row, label))
+    if not parts:
+        return ["- 指数结构：缺少四大指数明细，不能用概括性风格判断替代。"]
+    weak = _weak_index_labels(shell)
+    if weak:
+        read = f"{'、'.join(weak)}仍偏弱，先按指数压力处理"
+    else:
+        read = "四大指数未同时转弱，但仍要看30m结构能否延续"
+    return [
+        f"- 指数结构：{'；'.join(parts)}。",
+        f"- 指数结论：{read}；金融拉升只能托指数，成长线要看创业板、科创50和恒科代理是否同步修复。",
+    ]
+
+
+def _row_search_text(row: dict[str, Any]) -> str:
+    return " ".join(
+        [
+            _symbol_name(row),
+            _get_chain(row),
+            _get_action(row),
+            _get_trigger(row),
+            _text(row.get("daily_weekly_signal")),
+        ]
+    )
+
+
+def _find_pool_row(shell: dict[str, Any], keywords: tuple[str, ...]) -> tuple[str, dict[str, Any]] | None:
+    action_rows, watch_rows, risk_rows = _collect_rows(shell)
+    for pool_name, rows in (("买点池", action_rows), ("盯盘池", watch_rows), ("风险池", risk_rows)):
+        for row in rows:
+            text = _row_search_text(row)
+            if any(keyword in text for keyword in keywords):
+                return pool_name, row
+    return None
+
+
+def _wechat_hstech_line(shell: dict[str, Any]) -> str | None:
+    found = _find_pool_row(shell, ("恒生科技", "恒科", "HK.800700", "513130"))
+    if not found:
+        return None
+    pool_name, row = found
+    return (
+        f"- 恒科代理：{_symbol_name(row)}在{pool_name}，触发：{_compact_trigger(row)}；"
+        f"未脱离{pool_name}前，只按反抽观察。"
+    )
+
+
+def _sector_search_text(row: dict[str, Any]) -> str:
+    driver = row.get("source_driver") if isinstance(row.get("source_driver"), dict) else {}
+    primary = row.get("primary_domain") if isinstance(row.get("primary_domain"), dict) else {}
+    reps = _representative_summary(row, limit=4)
+    rep_names = " ".join(_text(item.get("name")) for item in reps)
+    return " ".join(
+        [
+            _sector_name(row),
+            _text(driver.get("name")),
+            _text(primary.get("name")),
+            _text(row.get("trader_action") or row.get("rank_reason") or row.get("trace_summary")),
+            rep_names,
+        ]
+    )
+
+
+def _sector_rows_matching(rows: list[dict[str, Any]], keywords: tuple[str, ...], *, limit: int = 2) -> list[dict[str, Any]]:
+    selected = []
+    for row in rows:
+        text = _sector_search_text(row)
+        if any(keyword in text for keyword in keywords):
+            selected.append(row)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _sector_representatives(row: dict[str, Any], *, limit: int = 3) -> str:
+    names = [_text(item.get("name")) for item in _representative_summary(row, limit=limit) if _text(item.get("name"))]
+    return "、".join(names[:limit]) if names else "代表未明"
+
+
+def _sector_representatives_for_rows(rows: list[dict[str, Any]], *, limit: int = 4) -> str:
+    names: list[str] = []
+    for row in rows:
+        for item in _representative_summary(row, limit=limit):
+            name = _text(item.get("name"))
+            if name and name not in names:
+                names.append(name)
+            if len(names) >= limit:
+                return "、".join(names)
+    return "、".join(names) if names else "代表未明"
+
+
+def _sector_brief(row: dict[str, Any]) -> str:
+    change = _sector_change(row)
+    change_text = f" {_fmt_pct(change)}" if change is not None else ""
+    return f"{_sector_name(row)}{change_text}"
+
+
+def _sector_brief_list(rows: list[dict[str, Any]], *, limit: int = 2) -> str:
+    return "、".join(_sector_brief(row) for row in rows[:limit]) if rows else "未进前排"
+
+
+def _daily_weekly_parts(row: dict[str, Any]) -> list[str]:
+    text = "；".join([_text(row.get("daily_weekly_signal")), _get_trigger(row)])
+    for sep in ("，", "、", ",", "\n"):
+        text = text.replace(sep, "；")
+    negative_markers = ("缺日/周", "缺日", "缺周", "等待日", "等待周", "未确认", "还差", "缺少")
+    parts: list[str] = []
+    for part in [item.strip() for item in text.split("；") if item.strip()]:
+        part = part.removeprefix("日/周:").strip()
+        if not ("日线" in part or "周线" in part):
+            continue
+        if any(marker in part for marker in negative_markers):
+            continue
+        if part not in parts:
+            parts.append(part)
+    return parts[:2]
+
+
+def _missing_daily_weekly(row: dict[str, Any]) -> bool:
+    text = _row_search_text(row)
+    return any(marker in text for marker in ("缺日/周", "等待日/周", "等待日线", "等待周线", "缺日", "缺周"))
+
+
+def _signal_object(row: dict[str, Any], parts: list[str] | None = None) -> str:
+    parts = parts if parts is not None else _daily_weekly_parts(row)
+    if parts:
+        return f"{_symbol_name(row)}({'/'.join(parts[:2])})"
+    return _symbol_name(row)
+
+
+def _wechat_pool_structure_lines(
     action_rows: list[dict[str, Any]],
     watch_rows: list[dict[str, Any]],
-) -> str:
-    action_chains = {_get_chain(row) for row in action_rows if _get_chain(row)}
-    watch_chains = {_get_chain(row) for row in watch_rows if _get_chain(row)}
-    common = sorted(action_chains & watch_chains)
-    if common:
-        return f"- {common[0]} 同时出现在马上看和继续盯，先按同一板块/信号族复核。"
-    theme = _primary_theme(dashboard, snapshot)
-    return f"- 共性不足：线索池/盯盘池/买点池未稳定指向同一板块；主线仍以{theme}为基准，候选按各自触发复核。"
+    risk_rows: list[dict[str, Any]],
+) -> list[str]:
+    rows = _dedupe(action_rows + watch_rows + risk_rows)
+    chain_counts: dict[str, int] = {}
+    for row in rows:
+        chain = _get_chain(row)
+        if chain:
+            chain_counts[chain] = chain_counts.get(chain, 0) + 1
+    if chain_counts:
+        top_chain, top_count = max(chain_counts.items(), key=lambda item: item[1])
+        common_line = f"- 三池共性：{top_chain}出现{top_count}次；先分清日/周确认和分钟反抽，不把同板块全部升级。"
+    else:
+        common_line = "- 三池共性：当前候选未形成稳定同板块合力，按单票证据分层复核。"
+
+    positive = [(row, parts) for row in rows if (parts := _daily_weekly_parts(row))]
+    missing = [row for row in rows if not _daily_weekly_parts(row) and _missing_daily_weekly(row)]
+    if positive:
+        positive_line = "- 日/周有买点：" + "、".join(_signal_object(row, parts) for row, parts in positive[:4]) + "。"
+    else:
+        positive_line = "- 日/周有买点：当前复核池未给出明确日线/周线买点。"
+    if missing:
+        missing_line = "- 只有分钟反抽/缺日周：" + "、".join(_symbol_name(row) for row in missing[:4]) + "；午后不按进攻主线处理。"
+    else:
+        missing_line = "- 只有分钟反抽/缺日周：当前入选对象未集中暴露该问题。"
+    return [common_line, positive_line, missing_line]
+
+
+def _window_check_text(window: str) -> str:
+    return {
+        "preopen": "开盘后",
+        "ten": "10:00前",
+        "midday": "下午开盘后",
+        "two": "14:00前",
+        "close": "收盘前",
+        "postmarket": "明日竞价",
+        "weekly": "下周开盘",
+    }.get(window, "下一窗口")
+
+
+def _wechat_market_read_line(window: str, shell: dict[str, Any]) -> str:
+    check = _window_check_text(window)
+    weak = _weak_index_labels(shell)
+    weak_text = "、".join(weak) if weak else "指数"
+    if window == "preopen":
+        return f"- 盘面含义：先定今日观察框架，{check}只看指数承接和强板块扩散，不临盘扩散新题材。"
+    if window in {"ten", "two"}:
+        deadline = check.removesuffix("前")
+        return f"- 盘面含义：{weak_text}若到{deadline}仍未修复30m结构，强板块也只能按局部修复看。"
+    if window == "midday":
+        return f"- 盘面含义：{weak_text}上午仍有压力，下午先验证金融护盘能否传导到科技修复；传导失败就只算反抽。"
+    if window == "close":
+        return "- 盘面含义：先分清全天是主线延续、链内轮动还是尾盘退潮，再决定哪些对象进入盘后回测。"
+    return "- 盘面含义：先看方向、节奏和证据质量，再决定是否进入下一轮复核。"
 
 
 def _wechat_market_lines(
@@ -1345,52 +1621,92 @@ def _wechat_market_lines(
     shell: dict[str, Any],
     snapshot: dict[str, Any],
     *,
+    window: str,
     event_lines: list[str],
 ) -> list[str]:
     brief = dashboard.get("daily_brief") if isinstance(dashboard.get("daily_brief"), dict) else {}
     as_of = _text(brief.get("as_of") or snapshot.get("as_of") or dashboard.get("status"), "unknown")
-    lines = [f"- 交易日：{as_of}，{_market_line(dashboard, shell, snapshot)}。"]
+    lines = [f"- 交易日：{as_of}。"]
+    lines.extend(_wechat_index_structure_lines(shell))
+    hstech_line = _wechat_hstech_line(shell)
+    if hstech_line:
+        lines.append(hstech_line)
     if event_lines:
         lines.append(f"- 关键盘面事件：{'；'.join(event_lines[:2])}。")
     else:
-        lines.append("- 关键盘面事件：暂无新的指数/风格异常，继续按主线和候选触发复核。")
+        lines.append("- 关键盘面事件：暂未看到新的指数/风格异常，继续按主线和候选触发复核。")
+    lines.append(_wechat_market_read_line(window, shell))
     return lines
 
 
-def _wechat_sector_role_line(dashboard: dict[str, Any], shell: dict[str, Any], *, window: str) -> str:
-    rows = _sector_board_rows(shell, dashboard, limit=5)
+def _wechat_sector_role_lines(dashboard: dict[str, Any], shell: dict[str, Any], *, window: str) -> list[str]:
+    rows = _sector_board_rows(shell, dashboard, limit=8)
     scope = "截至当前窗口" if window in {"ten", "midday", "two", "close"} else "当前"
     if not rows:
-        return f"- 板块角色：{scope}缺少板块15排序，不写主线判断，只按候选触发复核。"
-    board_line = _sector_strength_line(rows, limit=4)
-    confirmed = _sector_names_by_action(rows, "产业链确认", limit=2)
-    split = _sector_names_by_action(rows, "链内分化", limit=2)
-    source_weak = _sector_names_by_action(rows, "源强链弱", limit=2)
-    return (
-        f"- 板块角色：{scope}前排={board_line}；"
-        f"主线确认={confirmed}；链内分化={split}；源强链弱={source_weak}。"
-        "盘中只按这些角色验证，不用最终涨跌直接下结论。"
+        return [f"- 板块卡位：{scope}缺少板块15排序，不写主线判断，只按候选触发复核。"]
+    financial = _sector_rows_matching(rows, ("大金融", "银行", "保险", "券商"), limit=2)
+    tech = _sector_rows_matching(
+        rows,
+        ("半导体", "芯片", "光刻", "科创", "AI", "算力", "数据中心", "PCB", "通信", "消费电子", "机器人", "软件"),
+        limit=3,
     )
+    used = {id(row) for row in [*financial, *tech]}
+    rotation = [row for row in rows if id(row) not in used][:2]
+    financial_line = (
+        f"- 金融护盘：{scope}{_sector_brief_list(financial)}；代表{_sector_representatives(financial[0])}。"
+        "这条线负责托指数，不等于成长线确认。"
+        if financial
+        else f"- 金融护盘：{scope}大金融未进板块前排，指数判断以四大指数结构为准。"
+    )
+    tech_line = (
+        f"- 科技修复：{_sector_brief_list(tech, limit=3)}；代表{_sector_representatives_for_rows(tech)}。"
+        "需要创业板、科创50和恒科代理同步修复，否则按局部反抽。"
+        if tech
+        else "- 科技修复：半导体/芯片/成长线未进前排，不把单票反弹外推为主线。"
+    )
+    rotation_line = (
+        f"- 轮动补充：{_sector_brief_list(rotation)}；只做卡位观察，不覆盖金融护盘和科技修复这两条主判断。"
+        if rotation
+        else "- 轮动补充：暂无第三类强轮动，午后重点仍在金融护盘和科技修复。"
+    )
+    return [
+        f"- 前排强度：{scope}前排={_sector_strength_line(rows, limit=5)}。",
+        financial_line,
+        tech_line,
+        rotation_line,
+    ]
 
 
 def _wechat_abandon_lines(
     dashboard: dict[str, Any],
     snapshot: dict[str, Any],
+    shell: dict[str, Any],
+    selected_action: list[dict[str, Any]],
+    selected_watch: list[dict[str, Any]],
     selected_risk: list[dict[str, Any]],
 ) -> list[str]:
     theme = _primary_theme(dashboard, snapshot)
+    weak = _weak_index_labels(shell)
+    weak_text = "、".join(weak) if weak else "指数"
+    rows = _dedupe(selected_action + selected_watch + selected_risk)
+    missing = [row for row in rows if _missing_daily_weekly(row)]
     lines = [
-        "- 指数关键位不能收回或继续走弱，先降级观察。",
-        f"- 主线{theme}失效、扩散不足或冲高回落，不扩散新对象。",
-        "- 复核对象的5m/15m/30m触发消失，或上级周期转弱，直接放弃。",
+        f"- {weak_text}午后仍不能修复30m结构，上午结论降级为弱反抽。",
+        f"- 金融/保险继续独拉，但{theme}、半导体、创业板或恒科代理不扩散，不把盘面升级。",
     ]
+    if missing:
+        lines.append(f"- {_compact_row_names(missing, limit=3)}仍缺日/周买点，只看分钟级反抽。")
+    else:
+        lines.append("- 复核对象若只剩5m/15m触发、上级周期转弱，直接移出午后复核。")
     if selected_risk:
-        lines.append("- 风险池新增或既有风险未解除，相关对象按忽略处理。")
+        lines.append(f"- 风险池{_compact_row_names(selected_risk, limit=3)}未解除前，相关方向按排雷处理。")
     return lines
 
 
 def _wechat_backtest_line(
+    window: str,
     dashboard: dict[str, Any],
+    shell: dict[str, Any],
     snapshot: dict[str, Any],
     action_rows: list[dict[str, Any]],
     watch_rows: list[dict[str, Any]],
@@ -1399,9 +1715,26 @@ def _wechat_backtest_line(
     watch_chains = {_get_chain(row) for row in watch_rows if _get_chain(row)}
     common = sorted(action_chains & watch_chains)
     if common:
-        return f"- 盘后只回测“{common[0]} + 今日触发信号”是否真的有承接，不在盘中展开研究。"
-    theme = _primary_theme(dashboard, snapshot)
-    return f"- 盘后只复盘{theme}是否维持、关键盘面事件是否修复；候选分散时不扩散回测。"
+        target = f"“{common[0]} + 今日触发信号”是否真的有承接"
+    else:
+        theme = _primary_theme(dashboard, snapshot)
+        target = f"{theme}是否维持、关键盘面事件是否修复"
+    weak = _weak_index_labels(shell)
+    weak_text = "、".join(weak) if weak else "指数"
+    if window == "preopen":
+        return f"- 开盘后只验预设主线、四大指数承接和候选对象，不因为竞价单点异动临时扩散；盘后再复盘{target}。"
+    if window == "ten":
+        return f"- 10:00前只验{weak_text}能否修复30m、前排板块能否继续扩散；盘后只回测{target}。"
+    if window == "midday":
+        return (
+            "- 午后只验三件事：大金融护盘能否稳住上证；半导体/芯片能否保持前排且链主不回落；"
+            "创业板、科创50、恒科代理能否从分钟反抽转成30m修复。任一环节断，上午科技修复降级。"
+        )
+    if window == "two":
+        return f"- 14:00前只验变盘方向有没有链主确认、{weak_text}有没有修复；尾盘不新增研究对象，盘后只复盘{target}。"
+    if window == "close":
+        return f"- 收盘前先处理风险和隔夜资格；盘后只回测{target}。"
+    return f"- 盘后只复盘{target}；候选分散时不扩散回测。"
 
 
 def _next_step(window: str, notify: bool) -> str:
@@ -1495,20 +1828,20 @@ def build_wechat_summary(
     lines = [
         status,
         f"1) {market_heading}",
-        *_wechat_market_lines(dashboard, shell, snapshot, event_lines=event_lines),
-        _wechat_sector_role_line(dashboard, shell, window=window),
+        *_wechat_market_lines(dashboard, shell, snapshot, window=window, event_lines=event_lines),
         "",
-        "2) 三池共性",
-        _wechat_common_line(dashboard, snapshot, selected_action, selected_watch),
+        "2) 板块卡位",
+        *_wechat_sector_role_lines(dashboard, shell, window=window),
         "",
         f"3) {review_heading}",
+        *_wechat_pool_structure_lines(selected_action, selected_watch, selected_risk),
         *_format_wechat_review_rows(selected_action, selected_watch, selected_risk, limit=max(1, min(max_items, 3))),
         "",
-        "4) 放弃条件",
-        *_wechat_abandon_lines(dashboard, snapshot, selected_risk),
+        "4) 降级条件",
+        *_wechat_abandon_lines(dashboard, snapshot, shell, selected_action, selected_watch, selected_risk),
         "",
         f"5) {backtest_heading}",
-        _wechat_backtest_line(dashboard, snapshot, selected_action, selected_watch),
+        _wechat_backtest_line(window, dashboard, shell, snapshot, selected_action, selected_watch),
     ]
     return SummaryResult(status=status, text="\n".join(lines), notify=notify, reason=reason)
 
