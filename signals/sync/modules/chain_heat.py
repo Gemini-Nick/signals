@@ -10,7 +10,7 @@ from pymongo import UpdateOne
 from pymongo.database import Database
 
 from signals.core.chain_mapping_rules import filter_mapping_matches as _filter_mapping_matches
-from signals.core.concept_carriers import match_industry_chains, non_chain_reason
+from signals.core.concept_carriers import load_industry_chains, match_industry_chains, non_chain_reason
 from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import (
     a_share_realtime_day_key,
@@ -22,6 +22,7 @@ from ..retry import sync_retry
 logger = logging.getLogger("signals.sync.chain_heat")
 
 PHASES = {"warming", "accelerating", "diverging", "consensus_climax", "cooling", "risk_off"}
+MIN_MARKET_LOGIC_OVERLAY_CHANGE = 0.8
 
 
 def _text(value: Any) -> str:
@@ -232,6 +233,463 @@ def _representatives(match: dict[str, Any]) -> list[dict[str, Any]]:
     return reps
 
 
+def _pure_a_code(value: Any) -> str:
+    raw = _text(value).upper()
+    if not raw:
+        return ""
+    pure = raw.split(".", 1)[-1] if "." in raw else raw
+    pure = pure.replace("SH", "").replace("SZ", "").replace("BJ", "")
+    return pure if pure.isdigit() and len(pure) == 6 else ""
+
+
+def _prefixed_a_symbol(code: str) -> str:
+    if code.startswith(("6", "9")):
+        return f"SH.{code}"
+    if code.startswith(("4", "8")):
+        return f"BJ.{code}"
+    return f"SZ.{code}"
+
+
+def _constituent_symbols(doc: dict[str, Any]) -> list[str]:
+    output: list[str] = []
+    for raw in doc.get("symbols") or doc.get("stocks") or doc.get("constituents") or []:
+        code = _pure_a_code(raw)
+        if code and code not in output:
+            output.append(code)
+    return output
+
+
+def _stock_name(doc: dict[str, Any], code: str, quote: dict[str, Any] | None = None) -> str:
+    names = doc.get("stock_names") or {}
+    symbol = _prefixed_a_symbol(code)
+    return _text(
+        names.get(code)
+        or names.get(symbol)
+        or names.get(symbol.upper())
+        or (quote or {}).get("name")
+        or code
+    )
+
+
+def _source_constituent_doc(db: Database, *, kind: str, name: str) -> dict[str, Any]:
+    collection_name = "concept_constituents" if kind == "concept" else "board_constituents"
+    try:
+        return db[collection_name].find_one(
+            {"$or": [{"_id": name}, {"concept_name": name}, {"board_name": name}, {"name": name}]},
+            {"_id": 0, "symbols": 1, "stocks": 1, "constituents": 1, "stock_names": 1, "source": 1, "updated_at": 1, "status": 1},
+            sort=[("updated_at", -1)],
+        ) or {}
+    except Exception:
+        return {}
+
+
+def _latest_quote_context_by_code(db: Database) -> dict[str, dict[str, Any]]:
+    try:
+        latest = db["quote_snapshots"].find_one(
+            {"trade_date": {"$exists": True}},
+            {"trade_date": 1},
+            sort=[("trade_date", -1), ("snapshot_at", -1)],
+        ) or {}
+        trade_date = _text(latest.get("trade_date"))
+        if not trade_date:
+            return {}
+        rows = db["quote_snapshots"].find(
+            {"trade_date": trade_date},
+            {
+                "_id": 0,
+                "code": 1,
+                "symbol": 1,
+                "name": 1,
+                "change_pct": 1,
+                "turnover_pct": 1,
+                "amount": 1,
+                "price": 1,
+                "trade_date": 1,
+                "snapshot_at": 1,
+                "freshness": 1,
+                "is_stale": 1,
+            },
+        )
+    except Exception:
+        return {}
+    output: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        code = _pure_a_code(row.get("code") or row.get("symbol"))
+        if not code:
+            continue
+        existing = output.get(code)
+        snapshot_at = row.get("snapshot_at")
+        if existing and existing.get("snapshot_at") and snapshot_at and snapshot_at < existing["snapshot_at"]:
+            continue
+        output[code] = {
+            "symbol": _text(row.get("symbol")) or _prefixed_a_symbol(code),
+            "name": _text(row.get("name")),
+            "change_pct": _float(row.get("change_pct")),
+            "turnover_pct": _float(row.get("turnover_pct")),
+            "amount": _float(row.get("amount")),
+            "price": _float(row.get("price")),
+            "trade_date": trade_date,
+            "snapshot_at": snapshot_at,
+            "freshness": _text(row.get("freshness")),
+            "is_stale": bool(row.get("is_stale")),
+        }
+    return output
+
+
+def _source_constituent_representatives(
+    db: Database,
+    source: dict[str, Any],
+    quote_by_code: dict[str, dict[str, Any]],
+    *,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    kind = _text(source.get("kind"))
+    name = _text(source.get("name"))
+    if not kind or not name:
+        return []
+    doc = _source_constituent_doc(db, kind=kind, name=name)
+    codes = _constituent_symbols(doc)
+    if not codes:
+        return []
+    leader_name = _text(source.get("leader_name"))
+    source_change = _float(source.get("change_pct"))
+    require_positive = source_change > 0
+    rows: list[dict[str, Any]] = []
+    for code in codes:
+        quote = quote_by_code.get(code, {})
+        stock_name = _stock_name(doc, code, quote)
+        quote_change = _float(quote.get("change_pct"), default=None)
+        is_leader = bool(leader_name and stock_name == leader_name)
+        if quote_change is None and is_leader:
+            quote_change = _float(source.get("leader_change_pct"))
+        if require_positive and (quote_change is None or quote_change <= 0):
+            continue
+        if quote_change is None:
+            continue
+        rep_type = "source_leader" if is_leader else f"{kind}_constituent"
+        rows.append({
+            "symbol": quote.get("symbol") or _prefixed_a_symbol(code),
+            "name": stock_name,
+            "relation": f"{name}真实涨幅成分",
+            "source_note": f"{_SOURCE_KIND_LABELS.get(kind, kind)}成分 + 当日涨幅",
+            "representative_type": rep_type,
+            "priority": int((220 if is_leader else 160) + max(0.0, quote_change) * 10),
+            "source": "source_board_constituents",
+            "source_board_name": name,
+            "source_board_kind": kind,
+            "day_change_pct": quote_change,
+            "turnover_pct": _float(quote.get("turnover_pct")),
+            "amount": _float(quote.get("amount")),
+            "price": quote.get("price"),
+            "quote_trade_date": quote.get("trade_date"),
+        })
+    rows.sort(
+        key=lambda item: (
+            1 if item.get("representative_type") == "source_leader" else 0,
+            _float(item.get("day_change_pct")),
+            _float(item.get("amount")),
+            _int(item.get("priority")),
+        ),
+        reverse=True,
+    )
+    return rows[:limit]
+
+
+def _latest_concept_heat(db: Database, name: str) -> dict[str, Any]:
+    try:
+        return db["board_heat_ticks"].find_one(
+            {"kind": "concept", "name": name},
+            {
+                "_id": 0,
+                "kind": 1,
+                "name": 1,
+                "code": 1,
+                "change_pct": 1,
+                "up_count": 1,
+                "down_count": 1,
+                "leader_name": 1,
+                "leader_symbol": 1,
+                "leader_change_pct": 1,
+                "rank_idx": 1,
+                "trade_date": 1,
+                "trade_minute": 1,
+            },
+            sort=[("trade_minute", -1)],
+        ) or {}
+    except Exception:
+        return {}
+
+
+def _overlay_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        1 if item.get("primary_source") else 0,
+        1 if item.get("matched_source_leader") else 0,
+        1 if item.get("matched_overlay_leader") else 0,
+        _float(item.get("change_pct")),
+        _int(item.get("matched_count")),
+        _float(item.get("leader_change_pct")),
+        -_int(item.get("source_order"), 999),
+    )
+
+
+def _source_market_overlays(
+    db: Database,
+    source_events: list[dict[str, Any]],
+    *,
+    limit: int = 8,
+    only_non_chain: bool = False,
+) -> list[dict[str, Any]]:
+    overlays_by_name: dict[str, dict[str, Any]] = {}
+    for source_order, source in enumerate(source_events[:5]):
+        source_name = _text(source.get("name"))
+        source_kind = _text(source.get("kind"))
+        if not source_name or not source_kind:
+            continue
+        source_doc = _source_constituent_doc(db, kind=source_kind, name=source_name)
+        source_codes = _constituent_symbols(source_doc)
+        if not source_codes:
+            continue
+        try:
+            cursor = db["concept_constituents"].find(
+                {"symbols": {"$in": [_prefixed_a_symbol(code) for code in source_codes] + source_codes}},
+                {"_id": 0, "concept_name": 1, "board_name": 1, "name": 1, "symbols": 1, "stock_names": 1},
+            )
+        except Exception:
+            continue
+        source_code_set = set(source_codes)
+        source_stock_names = source_doc.get("stock_names") or {}
+        for doc in cursor:
+            concept_name = _text(doc.get("concept_name") or doc.get("board_name") or doc.get("name"))
+            if not concept_name or concept_name == source_name:
+                continue
+            reason = non_chain_reason(concept_name)
+            if only_non_chain:
+                if not reason:
+                    continue
+            elif reason:
+                continue
+            concept_codes = set(_constituent_symbols(doc))
+            matched_codes = sorted(source_code_set.intersection(concept_codes))
+            if not matched_codes:
+                continue
+            heat = _latest_concept_heat(db, concept_name)
+            change_pct = _float(heat.get("change_pct"), default=None)
+            if change_pct is None or change_pct <= 0:
+                continue
+            concept_stock_names = doc.get("stock_names") or {}
+            source_leader_name = _text(source.get("leader_name"))
+            overlay_leader_name = _text(heat.get("leader_name"))
+            matched_names = [
+                _text(concept_stock_names.get(code) or concept_stock_names.get(_prefixed_a_symbol(code)) or source_stock_names.get(code) or source_stock_names.get(_prefixed_a_symbol(code)) or code)
+                for code in matched_codes
+            ]
+            matched_source_leader = bool(source_leader_name and source_leader_name in matched_names)
+            matched_overlay_leader = bool(overlay_leader_name and overlay_leader_name in matched_names)
+            current = overlays_by_name.get(concept_name) or {
+                "kind": "theme" if reason else "concept",
+                "kind_label": "主题" if reason else "概念",
+                "name": concept_name,
+                "change_pct": change_pct,
+                "leader_name": _text(heat.get("leader_name")),
+                "leader_symbol": _text(heat.get("leader_symbol")),
+                "leader_change_pct": _float(heat.get("leader_change_pct")),
+                "up_count": _int(heat.get("up_count")),
+                "down_count": _int(heat.get("down_count")),
+                "rank": _int(heat.get("rank_idx")),
+                "non_chain_reason": reason,
+                "matched_symbols": [],
+                "matched_names": [],
+                "source_boards": [],
+                "source_order": source_order,
+                "primary_source": source_order == 0,
+                "matched_source_leader": False,
+                "matched_overlay_leader": False,
+                "matched_source_leaders": [],
+                "matched_overlay_leaders": [],
+            }
+            current_source_order = current.get("source_order")
+            current["source_order"] = min(
+                _int(current_source_order, source_order),
+                source_order,
+            )
+            current["primary_source"] = bool(current.get("primary_source")) or source_order == 0
+            current["matched_source_leader"] = bool(current.get("matched_source_leader")) or matched_source_leader
+            current["matched_overlay_leader"] = bool(current.get("matched_overlay_leader")) or matched_overlay_leader
+            if matched_source_leader:
+                current["matched_source_leaders"] = list(dict.fromkeys([*current.get("matched_source_leaders", []), source_leader_name]))
+            if matched_overlay_leader:
+                current["matched_overlay_leaders"] = list(dict.fromkeys([*current.get("matched_overlay_leaders", []), overlay_leader_name]))
+            current["change_pct"] = max(_float(current.get("change_pct")), change_pct)
+            current["source_boards"] = list(dict.fromkeys([*current.get("source_boards", []), source_name]))
+            current["matched_symbols"] = list(dict.fromkeys([*current.get("matched_symbols", []), *matched_codes]))[:8]
+            current["matched_names"] = list(dict.fromkeys([*current.get("matched_names", []), *matched_names]))[:8]
+            current["matched_count"] = len(current["matched_symbols"])
+            overlays_by_name[concept_name] = current
+    overlays = list(overlays_by_name.values())
+    overlays.sort(key=_overlay_sort_key, reverse=True)
+    return overlays[:limit]
+
+
+def _source_concept_overlays(db: Database, source_events: list[dict[str, Any]], *, limit: int = 8) -> list[dict[str, Any]]:
+    return _source_market_overlays(db, source_events, limit=limit, only_non_chain=False)
+
+
+def _source_theme_overlays(db: Database, source_events: list[dict[str, Any]], *, limit: int = 6) -> list[dict[str, Any]]:
+    return _source_market_overlays(db, source_events, limit=limit, only_non_chain=True)
+
+
+def _unique_overlays(items: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    by_name: dict[str, dict[str, Any]] = {}
+    for item in items:
+        name = _text(item.get("name"))
+        if not name:
+            continue
+        existing = by_name.get(name)
+        if not existing or _overlay_sort_key(item) > _overlay_sort_key(existing):
+            by_name[name] = item
+    rows = list(by_name.values())
+    rows.sort(key=_overlay_sort_key, reverse=True)
+    return rows[:limit]
+
+
+def _primary_overlay_for_top(top: dict[str, Any], overlays: list[dict[str, Any]]) -> dict[str, Any]:
+    top_name = _text(top.get("name"))
+    if not top_name:
+        return {}
+    anchored = [
+        overlay
+        for overlay in overlays
+        if top_name in {_text(name) for name in overlay.get("source_boards") or []}
+        and _float(overlay.get("change_pct")) >= MIN_MARKET_LOGIC_OVERLAY_CHANGE
+    ]
+    if not anchored:
+        return {}
+    anchored.sort(key=_overlay_sort_key, reverse=True)
+    return anchored[0]
+
+
+def _market_logic_payload(top: dict[str, Any], overlays: list[dict[str, Any]], themes: list[dict[str, Any]]) -> dict[str, Any]:
+    primary_overlay = _primary_overlay_for_top(top, overlays)
+    if primary_overlay:
+        primary = primary_overlay
+        return {
+            "status": "hot_concept_overlay",
+            "logic_name": primary.get("name"),
+            "logic_kind": primary.get("kind"),
+            "change_pct": primary.get("change_pct"),
+            "leader_name": primary.get("leader_name"),
+            "matched_names": primary.get("matched_names") or [],
+            "source_boards": primary.get("source_boards") or [],
+            "evidence": "source_board_constituents+concept_heat",
+        }
+    primary_theme = _primary_overlay_for_top(top, themes)
+    if primary_theme:
+        primary = primary_theme
+        return {
+            "status": "hot_theme_overlay",
+            "logic_name": primary.get("name"),
+            "logic_kind": primary.get("kind"),
+            "change_pct": primary.get("change_pct"),
+            "leader_name": primary.get("leader_name"),
+            "matched_names": primary.get("matched_names") or [],
+            "source_boards": primary.get("source_boards") or [],
+            "evidence": "source_board_constituents+theme_heat",
+        }
+    return {
+        "status": "source_board",
+        "logic_name": top.get("name"),
+        "logic_kind": top.get("kind"),
+        "change_pct": top.get("change_pct"),
+        "leader_name": top.get("leader_name"),
+        "evidence": "board_heat_ticks",
+    }
+
+
+def _node_representative_codes(node: dict[str, Any]) -> set[str]:
+    codes: set[str] = set()
+    for key in (
+        "core_representatives",
+        "elastic_representatives",
+        "upstream_representatives",
+        "downstream_representatives",
+    ):
+        for rep in node.get(key) or []:
+            code = _pure_a_code(rep.get("symbol"))
+            if code:
+                codes.add(code)
+    return codes
+
+
+def _market_logic_node_override(top: dict[str, Any], overlays: list[dict[str, Any]]) -> dict[str, Any]:
+    """Promote display routing when hot overlays and real constituents imply a more specific node.
+
+    The source board taxonomy is still retained in node_id. This only creates a
+    display/logic node so broad boards like 半导体材料 can surface the current
+    traded sub-logic, e.g. 工业气体/氟化工概念 -> 半导体特气/前驱体.
+    """
+
+    chain_id = _text(top.get("chain_id"))
+    current_node_id = _text(top.get("node_id"))
+    top_name = _text(top.get("name"))
+    if not chain_id or not top_name:
+        return {}
+    anchored = [
+        overlay
+        for overlay in overlays
+        if top_name in {_text(name) for name in overlay.get("source_boards") or []}
+        and _float(overlay.get("change_pct")) >= MIN_MARKET_LOGIC_OVERLAY_CHANGE
+    ]
+    if not anchored:
+        return {}
+    overlay_codes: set[str] = set()
+    overlay_names: list[str] = []
+    for overlay in anchored:
+        overlay_names.append(_text(overlay.get("name")))
+        for raw in overlay.get("matched_symbols") or []:
+            code = _pure_a_code(raw)
+            if code:
+                overlay_codes.add(code)
+    if not overlay_codes:
+        return {}
+    chain = load_industry_chains().get(chain_id) or {}
+    candidates: list[tuple[int, float, dict[str, Any], list[str]]] = []
+    for node in chain.get("nodes") or []:
+        node_id = _text(node.get("node_id"))
+        if not node_id or node_id == current_node_id:
+            continue
+        node_codes = _node_representative_codes(node)
+        overlap = sorted(overlay_codes.intersection(node_codes))
+        if not overlap:
+            continue
+        overlay_strength = max(
+            _float(overlay.get("change_pct"))
+            for overlay in anchored
+            if overlay_codes.intersection({_pure_a_code(raw) for raw in overlay.get("matched_symbols") or []})
+        )
+        candidates.append((len(overlap), overlay_strength, node, overlap))
+    if not candidates:
+        return {}
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    overlap_count, overlay_strength, node, overlap = candidates[0]
+    return {
+        "chain_id": chain_id,
+        "chain_name": chain.get("name") or top.get("chain_name"),
+        "node_id": node.get("node_id"),
+        "node_name": node.get("name"),
+        "layer": node.get("layer"),
+        "stage": node.get("stage"),
+        "status": "hot_overlay_constituent_route",
+        "evidence": "source_concept_overlays+industry_chains.yaml",
+        "source_board": top_name,
+        "overlay_names": [name for name in dict.fromkeys(overlay_names) if name],
+        "matched_symbols": overlap[:8],
+        "matched_count": overlap_count,
+        "overlay_change_pct": overlay_strength,
+        "taxonomy_node_id": current_node_id,
+        "taxonomy_node_name": top.get("node_name"),
+    }
+
+
 def _mapped_items(db: Database) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     docs_by_kind = {
         "industry": _latest_heat_docs(db, "industry"),
@@ -244,6 +702,7 @@ def _mapped_items(db: Database) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         for kind, docs in docs_by_kind.items()
     }
     history = _history_by_name(db, latest_minute, names_by_kind)
+    quote_by_code = _latest_quote_context_by_code(db)
 
     mapped: list[dict[str, Any]] = []
     unmapped = 0
@@ -277,7 +736,7 @@ def _mapped_items(db: Database) -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     continue
                 change = _float(doc.get("change_pct"))
                 hist = history.get((kind, name), [])
-                mapped.append({
+                item = {
                     "kind": kind,
                     "name": name,
                     "code": _text(doc.get("code")),
@@ -306,7 +765,13 @@ def _mapped_items(db: Database) -> tuple[list[dict[str, Any]], dict[str, Any]]:
                     "hit_terms": match.get("hit_terms") or [],
                     "evidence_sources": match.get("evidence_sources") or [],
                     "representatives": _representatives(match),
-                })
+                }
+                if change > 0 and _int(doc.get("rank_idx"), 999) <= 300:
+                    item["source_representatives"] = _source_constituent_representatives(db, item, quote_by_code)
+                if change > 0 and (_int(doc.get("rank_idx"), 999) <= 120 or _float(item.get("heat_score")) >= 10):
+                    item["source_concept_overlays"] = _source_concept_overlays(db, [item], limit=6)
+                    item["source_theme_overlays"] = _source_theme_overlays(db, [item], limit=4)
+                mapped.append(item)
     meta = {
         "latest_minute": latest_minute,
         "input_counts": {kind: len(docs) for kind, docs in docs_by_kind.items()},
@@ -343,19 +808,54 @@ def _aggregate(mapped: list[dict[str, Any]], latest_minute: Any) -> list[dict[st
         signal = _trading_signal(phase)
         reps: dict[str, dict[str, Any]] = {}
         for item in items:
-            for rep in item.get("representatives") or []:
+            for rep in [*(item.get("source_representatives") or []), *(item.get("representatives") or [])]:
                 symbol = _text(rep.get("symbol")).upper()
                 if symbol and (symbol not in reps or _int(rep.get("priority")) > _int(reps[symbol].get("priority"))):
                     reps[symbol] = dict(rep)
         representatives = sorted(
             reps.values(),
             key=lambda item: (
-                {"core": 4, "upstream": 3, "downstream": 2, "elastic": 1}.get(_text(item.get("representative_type")), 0),
+                {
+                    "source_leader": 7,
+                    "concept_constituent": 6,
+                    "industry_constituent": 5,
+                    "core": 4,
+                    "upstream": 3,
+                    "downstream": 2,
+                    "elastic": 1,
+                }.get(_text(item.get("representative_type")), 0),
                 _int(item.get("priority")),
+                _float(item.get("day_change_pct")),
             ),
             reverse=True,
         )[:12]
         source_events = [_source_event_payload(item) for item in items[:10]]
+        source_concept_overlays = _unique_overlays(
+            [overlay for item in items[:10] for overlay in item.get("source_concept_overlays") or []],
+            limit=8,
+        )
+        source_theme_overlays = _unique_overlays(
+            [overlay for item in items[:10] for overlay in item.get("source_theme_overlays") or []],
+            limit=6,
+        )
+        source_event_concept_overlays = [
+            {"source": _source_event_payload(item), "concepts": (item.get("source_concept_overlays") or [])[:3]}
+            for item in items[:10]
+            if item.get("source_concept_overlays")
+        ][:6]
+        source_event_theme_overlays = [
+            {"source": _source_event_payload(item), "themes": (item.get("source_theme_overlays") or [])[:2]}
+            for item in items[:10]
+            if item.get("source_theme_overlays")
+        ][:6]
+        market_logic_node = _market_logic_node_override(top, source_concept_overlays)
+        market_logic = _market_logic_payload(top, source_concept_overlays, source_theme_overlays)
+        if market_logic_node:
+            market_logic["route_node_id"] = market_logic_node.get("node_id")
+            market_logic["route_node_name"] = market_logic_node.get("node_name")
+            market_logic["route_status"] = market_logic_node.get("status")
+            market_logic["route_evidence"] = market_logic_node.get("evidence")
+            market_logic["route_overlay_names"] = market_logic_node.get("overlay_names") or []
         source_kind_mix = {
             kind: sum(1 for item in items if _text(item.get("kind")) == kind)
             for kind in ("industry", "concept")
@@ -399,6 +899,12 @@ def _aggregate(mapped: list[dict[str, Any]], latest_minute: Any) -> list[dict[st
             "integrated_domains": items[:10],
             "source_driver": source_events[0] if source_events else {},
             "source_events": source_events,
+            "source_concept_overlays": source_concept_overlays,
+            "source_event_concept_overlays": source_event_concept_overlays,
+            "source_theme_overlays": source_theme_overlays,
+            "source_event_theme_overlays": source_event_theme_overlays,
+            "market_logic": market_logic,
+            "market_logic_node": market_logic_node,
             "source_kind_mix": source_kind_mix,
             "route_explain": _route_explain(top),
             "route_confidence": _int(top.get("mapping_confidence")),

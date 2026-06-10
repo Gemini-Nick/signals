@@ -448,8 +448,30 @@ def _refresh_shell_payload_quote_overlays(payload: dict[str, Any]) -> dict[str, 
     return updated
 
 
-def _payload_from_shell_cache(cached_payload: dict[str, Any], status: str, now: float, quote_watermark: str) -> dict[str, Any]:
+def _payload_from_shell_cache(
+    cached_payload: dict[str, Any],
+    status: str,
+    now: float,
+    quote_watermark: str,
+    *,
+    current_session: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     payload = dict(cached_payload)
+    if current_session is not None:
+        payload["session"] = current_session
+        if current_session.get("ready"):
+            notices = payload.get("notices")
+            if isinstance(notices, list):
+                payload["notices"] = [
+                    item
+                    for item in notices
+                    if "正在启动" not in str(item) and "正在构建" not in str(item)
+                ]
+            cluster = payload.get("cluster_summary")
+            if isinstance(cluster, dict) and "正在构建" in str(cluster.get("data_warning") or ""):
+                refreshed_cluster = dict(cluster)
+                refreshed_cluster["data_warning"] = ""
+                payload["cluster_summary"] = refreshed_cluster
     cache_quote_watermark = str(_SHELL_CACHE.get("quote_watermark") or "")
     cache_status = status
     if quote_watermark != cache_quote_watermark:
@@ -4015,6 +4037,9 @@ def _slim_shell_sector_row(row: dict[str, Any]) -> dict[str, Any]:
         "chain_name",
         "node_id",
         "node_name",
+        "taxonomy_node_id",
+        "taxonomy_node_name",
+        "market_logic_node",
         "layer",
         "stage",
         "source_driver",
@@ -6417,7 +6442,7 @@ def _candidate_groups(
 
 
 def _flatten_candidate_groups(groups: dict[str, list[dict[str, Any]]], limit: int = 20) -> list[dict[str, Any]]:
-    ordered_keys = ["leaders", "upstream", "weighted", "elastic", "downstream", "source_leaders", "constituents"]
+    ordered_keys = ["leaders", "source_leaders", "upstream", "weighted", "constituents", "elastic", "downstream"]
     output: list[dict[str, Any]] = []
     seen: set[str] = set()
     for key in ordered_keys:
@@ -6857,6 +6882,7 @@ def _candidate_groups_from_representatives(row: dict[str, Any], *, lightweight: 
             core_rank += 1
             leader_rank = core_rank
         item = {
+            **rep,
             "symbol": rep.get("symbol"),
             "name": rep.get("name"),
             "relation": rep.get("relation"),
@@ -6886,6 +6912,10 @@ def _candidate_groups_from_representatives(row: dict[str, Any], *, lightweight: 
         elif representative_type == "core":
             groups["leaders"].append(payload)
             groups["weighted"].append(payload)
+        elif representative_type == "source_leader":
+            groups["source_leaders"].append(payload)
+        elif representative_type in {"concept_constituent", "industry_constituent", "industry_candidate"}:
+            groups["constituents"].append(payload)
         else:
             groups["elastic"].append(payload)
     for key, rows in groups.items():
@@ -6895,6 +6925,16 @@ def _candidate_groups_from_representatives(row: dict[str, Any], *, lightweight: 
                 tier_order.get(_text(item.get("leader_tier")), 9),
                 -(_float(item.get("attention_score"), 0) or 0),
             ))
+        elif key == "source_leaders":
+            rows.sort(key=lambda item: (
+                _float(item.get("day_change_pct"), 0) or 0,
+                _float(item.get("attention_score"), 0) or 0,
+            ), reverse=True)
+        elif key == "constituents":
+            rows.sort(key=lambda item: (
+                _float(item.get("day_change_pct"), 0) or 0,
+                _float(item.get("attention_score"), 0) or 0,
+            ), reverse=True)
         else:
             rows.sort(key=lambda item: _float(item.get("attention_score"), 0) or 0, reverse=True)
         groups[key] = rows[:8 if key != "leaders" else 3]
@@ -7030,6 +7070,12 @@ _CHAIN_HEAT_SHELL_PROJECTION = {
     "representatives": 1,
     "source_driver": 1,
     "source_events": 1,
+    "source_concept_overlays": 1,
+    "source_event_concept_overlays": 1,
+    "source_theme_overlays": 1,
+    "source_event_theme_overlays": 1,
+    "market_logic": 1,
+    "market_logic_node": 1,
     "source_kind_mix": 1,
     "route_explain": 1,
     "mapping_status": 1,
@@ -7837,21 +7883,35 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         primary = integrated[0] if integrated and isinstance(integrated[0], dict) else {}
         target_kind = _text(primary.get("kind")) or "industry"
         target_label = _text(primary.get("name")) or _text(doc.get("node_name") or doc.get("chain_name"))
-        label = " · ".join([item for item in [_text(doc.get("chain_name")), _text(doc.get("node_name"))] if item])
+        market_logic_node = doc.get("market_logic_node") if isinstance(doc.get("market_logic_node"), dict) else {}
+        display_chain_name = _text(market_logic_node.get("chain_name") or doc.get("chain_name"))
+        display_node_id = _text(market_logic_node.get("node_id") or doc.get("node_id"))
+        display_node_name = _text(market_logic_node.get("node_name") or doc.get("node_name"))
+        display_layer = _text(market_logic_node.get("layer") or doc.get("layer"))
+        display_stage = _text(market_logic_node.get("stage") or doc.get("stage"))
+        display_doc = dict(doc)
+        display_doc.update({
+            "taxonomy_node_id": doc.get("node_id"),
+            "taxonomy_node_name": doc.get("node_name"),
+            "chain_name": display_chain_name or doc.get("chain_name"),
+            "node_id": display_node_id or doc.get("node_id"),
+            "node_name": display_node_name or doc.get("node_name"),
+            "layer": display_layer or doc.get("layer"),
+            "stage": display_stage or doc.get("stage"),
+        })
+        label = " · ".join([item for item in [display_chain_name, display_node_name] if item])
         candidate_groups = _candidate_groups_from_representatives(doc, lightweight=True)
-        display_context = _chain_heat_display_context(doc, candidate_groups)
-        # Detail-only source overlays are expensive per-board Mongo lookups; keep
-        # the shell rebuild on the critical path and let richer views load them separately.
-        concept_overlays: list[dict[str, Any]] = []
-        source_event_overlays: list[dict[str, Any]] = []
-        theme_overlays: list[dict[str, Any]] = []
-        source_event_theme_overlays: list[dict[str, Any]] = []
+        display_context = _chain_heat_display_context(display_doc, candidate_groups)
+        concept_overlays = doc.get("source_concept_overlays") if isinstance(doc.get("source_concept_overlays"), list) else []
+        source_event_overlays = doc.get("source_event_concept_overlays") if isinstance(doc.get("source_event_concept_overlays"), list) else []
+        theme_overlays = doc.get("source_theme_overlays") if isinstance(doc.get("source_theme_overlays"), list) else []
+        source_event_theme_overlays = doc.get("source_event_theme_overlays") if isinstance(doc.get("source_event_theme_overlays"), list) else []
         display_context["source_concept_overlays"] = concept_overlays
         display_context["source_event_concept_overlays"] = source_event_overlays
         display_context["source_theme_overlays"] = theme_overlays
         display_context["source_event_theme_overlays"] = source_event_theme_overlays
-        display_rank_score = _chain_heat_display_rank_score(doc, display_context)
-        graph = _chain_graph_doc(doc.get("chain_id"), doc.get("node_id")) if _chain_heat_shell_graph_enabled() else {}
+        display_rank_score = _chain_heat_display_rank_score(display_doc, display_context)
+        graph = _chain_graph_doc(doc.get("chain_id"), display_node_id or doc.get("node_id")) if _chain_heat_shell_graph_enabled() else {}
         viewpoint_context = _viewpoint_context_from_graph(graph) if graph else {}
         doc_trade_day = _date_text(doc.get("trade_date") or doc.get("dt") or doc.get("trade_minute"))
         data_truth = _data_truth_payload(
@@ -7881,6 +7941,13 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
         row = {
             **doc,
             **display_context,
+            "taxonomy_node_id": doc.get("node_id"),
+            "taxonomy_node_name": doc.get("node_name"),
+            "chain_name": display_chain_name or doc.get("chain_name"),
+            "node_id": display_node_id or doc.get("node_id"),
+            "node_name": display_node_name or doc.get("node_name"),
+            "layer": display_layer or doc.get("layer"),
+            "stage": display_stage or doc.get("stage"),
             "group": "sector_boards",
             "domain": "chain_heat",
             "kind": target_kind,
@@ -7923,7 +7990,7 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             "target_freq": DEFAULT_TERMINAL_FREQ,
             "display_label": label or target_label,
             "chain_key": _text(doc.get("chain_id")),
-            "node_key": _text(doc.get("node_id")),
+            "node_key": display_node_id or _text(doc.get("node_id")),
             "chart_mode_default": "chain_heat",
             "heat_target_label": target_label,
             "heat_resolution_status": "chain_primary_domain",
@@ -7952,11 +8019,13 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             "mapping_chain": {
                 "query": label or target_label,
                 "chain_id": doc.get("chain_id"),
-                "chain_name": doc.get("chain_name"),
-                "node_id": doc.get("node_id"),
-                "node_name": doc.get("node_name"),
-                "layer": doc.get("layer"),
-                "stage": doc.get("stage"),
+                "chain_name": display_chain_name or doc.get("chain_name"),
+                "node_id": display_node_id or doc.get("node_id"),
+                "node_name": display_node_name or doc.get("node_name"),
+                "layer": display_layer or doc.get("layer"),
+                "stage": display_stage or doc.get("stage"),
+                "taxonomy_node_id": doc.get("node_id"),
+                "taxonomy_node_name": doc.get("node_name"),
                 "mapping_status": "mapped",
                 "evidence_sources": doc.get("evidence_sources") or [],
             },
@@ -9301,8 +9370,19 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
     now = time.monotonic()
     cached_payload = _SHELL_CACHE.get("payload")
     cached_quote_watermark = str(_SHELL_CACHE.get("quote_watermark") or "")
+    current_session: Optional[dict[str, Any]] = None
+    try:
+        current_session = _serialize_session(engine.get_status())
+    except Exception:
+        current_session = None
     if _shell_cache_usable(cached_payload, engine) and now < float(_SHELL_CACHE.get("expires_at") or 0):
-        return _payload_from_shell_cache(cached_payload, "hit", now, cached_quote_watermark)
+        return _payload_from_shell_cache(
+            cached_payload,
+            "hit",
+            now,
+            cached_quote_watermark,
+            current_session=current_session,
+        )
 
     current_quote_watermark = _quote_snapshot_watermark() or cached_quote_watermark
     quote_watermark = _quote_overlay_watermark(current_quote_watermark, cached_quote_watermark)
@@ -9313,7 +9393,13 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
             if _shell_cache_usable(cached_payload, engine, quote_watermark=current_quote_watermark)
             else "stale_refreshing_watermark"
         )
-        return _payload_from_shell_cache(cached_payload, cache_status, now, quote_watermark)
+        return _payload_from_shell_cache(
+            cached_payload,
+            cache_status,
+            now,
+            quote_watermark,
+            current_session=current_session,
+        )
     return _build_shell_placeholder_payload(engine, "building", now, quote_watermark)
 
 

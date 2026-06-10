@@ -4,7 +4,9 @@ CZSC 对象 → JSON 序列化工具
 
 将 czsc 库的 BI / FX / RawBar 等 C/Rust 加速对象转换为可 JSON 序列化的 dict。
 """
-from typing import List, Optional
+import math
+from numbers import Real
+from typing import Any, List, Optional
 
 from czsc import Direction
 from signals.core.market_time import infer_market, to_unix_seconds
@@ -37,6 +39,18 @@ def _dt_to_str(dt) -> str:
     if hasattr(dt, 'strftime'):
         return dt.strftime("%Y-%m-%d %H:%M")
     return str(dt)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Real) and not isinstance(value, bool):
+        return value if math.isfinite(float(value)) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def serialize_bars(analyzer, *, market: str = "", symbol: str = "", source: str = "") -> list:
@@ -149,7 +163,7 @@ def serialize_zhongshu(analyzer, *, market: str = "", symbol: str = "", source: 
             i = end_idx + 1
         else:
             i += 1
-    return result
+    return _json_safe(result)
 
 
 def serialize_signal_change(sc, *, market: str = "", symbol: str = "", source: str = "") -> dict:
@@ -295,7 +309,7 @@ def serialize_index_report(report) -> dict:
         # P3-5: 近5日收益率
         "recent_5d_return": getattr(report, 'recent_5d_return', None),
     }
-    return result
+    return _json_safe(result)
 
 
 def _serialize_scenarios(branches) -> list:

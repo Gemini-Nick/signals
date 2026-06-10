@@ -753,12 +753,24 @@ def test_wechat_summary_preserves_signals_candidate_order():
             "day_change_pct": 2.45,
             "trader_action": "源强链弱：等链主确认后再当主线",
         },
+        {
+            "name": "光伏产业链 · 硅料/硅片/组件",
+            "day_change_pct": 7.56,
+            "trader_action": "链内分化：只看强分支，不当整链共振",
+            "source_driver": {"kind": "industry", "name": "光伏主材", "change_pct": 7.56},
+            "representatives": {"core": [{"name": "隆基绿能", "symbol": "SH.601012"}]},
+        },
     ]
 
+    dashboard = _dashboard()
+    dashboard["daily_brief"]["primary_theme"] = "大金融产业链"
+    snapshot = _snapshot()
+    snapshot["market_regime"]["primary_theme"] = "大金融产业链"
+
     result = build_wechat_summary(
-        _dashboard(),
+        dashboard,
         shell,
-        _snapshot(),
+        snapshot,
         window="midday",
         max_items=5,
         event_lines=["创业板11:15日内修复强于上证，但30m仍待确认"],
@@ -766,33 +778,72 @@ def test_wechat_summary_preserves_signals_candidate_order():
 
     assert result.status == "NOTIFY"
     assert "1) 上午盘面总结" in result.text
-    assert "2) 板块卡位" in result.text
+    assert "2) 板块主次" in result.text
     assert "3) 下午复核清单" in result.text
     assert "4) 降级条件" in result.text
-    assert "指数结构" in result.text
+    assert "指数：" in result.text
     assert "上证-0.58%" in result.text
     assert "创业板-2.29%" in result.text
     assert "科创50-0.02%" in result.text
+    assert "AI判断" in result.text
+    assert "大金融产业链主线" in result.text
+    assert "半导体产业链修复/扩散" in result.text
+    assert "光伏产业链次日验证" in result.text
     assert "恒科代理" in result.text
     assert "恒生科技ETF SH.513130" in result.text
     assert "关键盘面事件" in result.text
     assert "盘面含义" in result.text
-    assert "前排强度" in result.text
-    assert "金融护盘" in result.text
-    assert "科技修复" in result.text
+    assert "主次排序" in result.text
+    assert "第一主线" in result.text
+    assert "第二梯队" in result.text
+    assert "次日验证" in result.text
+    assert "大金融产业链/银行/券商/保险" in result.text
+    assert "半导体产业链/材料/光刻胶" in result.text
+    assert "光伏产业链/硅料/硅片/组件" in result.text
+    assert "隆基绿能" in result.text
     assert "上海新阳、北方华创" in result.text
-    assert "日/周有买点" in result.text
-    assert "只有分钟反抽/缺日周" in result.text
+    assert "上级周期可用" in result.text
+    assert "仅分钟反抽" in result.text
+    assert "均线策略" in result.text
+    assert "不追冲高" in result.text
     assert "交易含义" not in result.text
     assert "角色拆分" not in result.text
+    assert "金融护盘 + 科技局部修复 + 尾盘新线试探" not in result.text
+    assert "护盘主线" not in result.text
+    assert "科技修复线" not in result.text
+    assert "硅线验证" not in result.text
+    assert "前排强度" not in result.text
+    assert "触发：" not in result.text
     assert "截至当前窗口" in result.text
     review_block = result.text.split("4) 降级条件", 1)[0].split("3) 下午复核清单", 1)[1]
     assert review_block.rindex("利通电子 SH.603629") < review_block.rindex("环旭电子 SH.601231")
     assert review_block.rindex("环旭电子 SH.601231") < review_block.rindex("立昂微 SH.605358")
     assert "特力A SZ.000025(日线一买)" in result.text
-    assert "特力A SZ.000025 | 触发" not in review_block
+    assert "特力A SZ.000025：" not in review_block
     assert "Mongo" not in result.text
     assert "runtime" not in result.text
+
+
+def test_wechat_summary_sector_roles_are_signal_driven_not_fixed_names():
+    result = build_wechat_summary(
+        _dashboard(),
+        _june5_shell(),
+        _snapshot(),
+        window="midday",
+        max_items=5,
+        event_lines=["机器人分支继续扩散，传媒旅游尾盘异动"],
+    )
+
+    assert result.status == "NOTIFY"
+    assert "军工装备产业链主线" in result.text
+    assert "机器人/自动化产业链修复/扩散" in result.text
+    assert "传媒旅游产业链次日验证" in result.text
+    assert "第一主线" in result.text
+    assert "第二梯队" in result.text
+    assert "次日验证" in result.text
+    assert "金融护盘" not in result.text
+    assert "半导体材料/设备" not in result.text
+    assert "硅线" not in result.text
 
 
 def test_market_event_lines_trigger_notify_without_stock_candidates():

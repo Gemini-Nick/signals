@@ -168,7 +168,7 @@ chains:
 
   - chain_id: semiconductor
     name: 半导体产业链
-    aliases: [半导体, 芯片, 集成电路, 华为海思, 中芯概念, 高带宽内存, HBM, AI芯片, 汽车芯片, 国产芯片, EDA, EDA概念, IGBT, IGBT概念, 功率半导体, 分立器件, 玻璃基板]
+    aliases: [半导体, 芯片, 集成电路, 华为海思, 中芯概念, 高带宽内存, HBM, AI芯片, 汽车芯片, 国产芯片, EDA, EDA概念, IGBT, IGBT概念, 功率半导体, 分立器件, 玻璃基板, 半导体特气, 电子特气, 六氟化钨, WF6]
     industries: [半导体, 元件, 电子化学品, 消费电子, 其他电子]
     default_node_id: wafer_foundry
     nodes:
@@ -221,6 +221,16 @@ chains:
         core_representatives:
           - {symbol: SZ.300236, name: 上海新阳, relation: 光刻胶/电子化学品链主, source_note: 半导体材料链主代表, priority: 100}
         elastic_representatives: []
+      - node_id: specialty_gas_precursor
+        name: 半导体特气/前驱体
+        layer: upstream
+        keywords: [半导体特气, 电子特气, 特种气体, 六氟化钨, WF6, 钨氟化物, CVD钨, 半导体前驱体, 前驱体材料]
+        core_representatives:
+          - {symbol: SH.688146, name: 中船特气, relation: 半导体特气/前驱体链主, source_note: 半导体特气链主代表, priority: 100}
+          - {symbol: SH.688268, name: 华特气体, relation: 电子特气链主, source_note: 半导体特气链主代表, priority: 96}
+          - {symbol: SZ.300346, name: 南大光电, relation: 电子特气/MO源链主, source_note: 半导体材料链主代表, priority: 92}
+        elastic_representatives:
+          - {symbol: SZ.002409, name: 雅克科技, relation: 半导体前驱体/电子材料弹性标的, source_note: 半导体前驱体弹性代表, priority: 88}
       - node_id: compound_semiconductor
         name: 第三代半导体
         layer: upstream
@@ -301,6 +311,15 @@ chains:
           - {symbol: SH.600050, name: 中国联通, relation: 数据中心/通信运营弹性标的, source_note: AI算力弹性代表, priority: 76}
           - {symbol: SZ.002261, name: 拓维信息, relation: 国产算力/服务器弹性标的, source_note: AI算力弹性代表, priority: 72}
           - {symbol: SZ.002335, name: 科华数据, relation: 数据中心电源/算力基础设施弹性标的, source_note: AI算力弹性代表, priority: 70}
+      - node_id: data_center_power
+        name: AIDC电源/配套供能
+        layer: midstream
+        keywords: [AIDC电源, 数据中心电源, 数据中心供能, 配套电源, 服务器电源, UPS, 柴油发电机组, 燃气轮机, 电力模块, 备用电源]
+        core_representatives:
+          - {symbol: SZ.002335, name: 科华数据, relation: 数据中心电源链主, source_note: AIDC电源链主代表, priority: 100}
+          - {symbol: SZ.002518, name: 科士达, relation: UPS/数据中心电源链主, source_note: AIDC电源链主代表, priority: 96}
+        elastic_representatives:
+          - {symbol: SZ.002353, name: 杰瑞股份, relation: AIDC配套电源供应弹性标的, source_note: 用户复核的AIDC供能交易逻辑, priority: 92}
       - node_id: compute_service_operator
         name: 算力租赁/智算云服务
         layer: downstream

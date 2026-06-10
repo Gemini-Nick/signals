@@ -57,6 +57,15 @@ def test_segment_concepts_prefer_matching_chain_stage():
         matches = match_industry_chains(concept)
         assert matches
         assert matches[0]["node_id"] == "lipf6_lithium_salt"
+    wf6 = preferred_concept_carriers("六氟化钨")
+    assert wf6
+    assert wf6[0]["chain_id"] == "semiconductor"
+    assert wf6[0]["node_id"] == "specialty_gas_precursor"
+    assert not any(row["node_id"] == "lipf6_lithium_salt" for row in wf6[:5])
+    for concept in ["WF6", "半导体特气", "电子特气"]:
+        matches = match_industry_chains(concept)
+        assert matches
+        assert (matches[0]["chain_id"], matches[0]["node_id"]) == ("semiconductor", "specialty_gas_precursor")
     pvdf = preferred_concept_carriers("PVDF")
     assert pvdf
     assert pvdf[0]["node_id"] == "pvdf_binder"
@@ -270,6 +279,9 @@ def test_hot_terminal_chip_medical_and_material_concepts_map_explicitly():
         "电子身份证": ("ai_compute", "ai_server"),
         "腾讯云": ("ai_compute", "compute_service_operator"),
         "英伟达概念": ("ai_compute", "ai_server"),
+        "AIDC电源": ("ai_compute", "data_center_power"),
+        "数据中心电源": ("ai_compute", "data_center_power"),
+        "燃气轮机": ("ai_compute", "data_center_power"),
         "虚拟数字人": ("ai_compute", "ai_application"),
         "虚拟现实": ("consumer_electronics", "electronics"),
         "空间计算": ("consumer_electronics", "electronics"),

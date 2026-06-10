@@ -1,0 +1,12 @@
+version: 1
+overrides:
+  - symbol: SZ.002353
+    name: 杰瑞股份
+    chain_id: ai_compute
+    node_id: data_center_power
+    role: AIDC配套电源供应弹性标的
+    confidence: 98
+    concept_name: AIDC电源/数据中心配套供能
+    source_note: 用户复核：表层燃气轮机/油气设备标签下，当前交易逻辑按AIDC数据中心配套电源供应处理。
+    reviewed_by: user
+    effective_from: "2026-06-10"

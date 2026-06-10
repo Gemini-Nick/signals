@@ -52,7 +52,7 @@ WECHAT_HEADINGS = {
     "ten": ("9:45 盘面先判", "10:00前复核清单", "下一窗口验证"),
     "midday": ("上午盘面总结", "下午复核清单", "午后验证"),
     "two": ("13:45 盘面再判", "14:00前复核清单", "收盘前验证"),
-    "close": ("全天盘面归纳", "收盘前复核清单", "盘后验证"),
+    "close": ("全天盘面归纳", "盘后复核清单", "盘后验证"),
     "postmarket": ("今日大盘/行业归因", "明日观察", "回测入口"),
     "weekly": ("本周大盘/行业", "候选/板块", "回测入口"),
     "manual": ("盘面结论", "打开图复核", "回测入口"),
@@ -188,7 +188,7 @@ def _fetch_error_message(exc: BaseException) -> str:
     return label
 
 
-def fetch_inputs_safe(base_url: str = "http://127.0.0.1:8011", *, timeout: float = 6.0) -> InputFetchResult:
+def fetch_inputs_safe(base_url: str = "http://127.0.0.1:8011", *, timeout: float = 20.0) -> InputFetchResult:
     bounded_timeout = max(0.5, float(timeout))
     jobs = {
         "dashboard": ("/api/pack/dashboard", bounded_timeout),
@@ -1319,6 +1319,15 @@ def _wechat_action_label(row: dict[str, Any]) -> str:
     return "等"
 
 
+def _wechat_strategy_action_text(row: dict[str, Any]) -> str:
+    label = _wechat_action_label(row)
+    if label == "忽略":
+        return "处理：排雷，不参与。"
+    if label == "看":
+        return "处理：板块延续、指数不拖累时继续复核。"
+    return "处理：先等30m和均线补确认。"
+
+
 def _compact_trigger(row: dict[str, Any]) -> str:
     trigger = _get_trigger(row)
     parts = [part.strip() for part in trigger.split("；") if part.strip()]
@@ -1346,6 +1355,63 @@ def _format_wechat_review_rows(
         f"- {_symbol_name(row)} | 触发：{_compact_trigger(row)}。{_wechat_action_label(row)}"
         for row in rows
     ]
+
+
+def _trigger_has_30m_confirm(row: dict[str, Any]) -> bool:
+    trigger = _get_trigger(row)
+    return "30分钟" in trigger and "30m未确认" not in trigger and "30分钟未确认" not in trigger
+
+
+def _trigger_has_short_confirm(row: dict[str, Any]) -> bool:
+    trigger = _get_trigger(row)
+    if "5m/15m未确认" in trigger or "缺5m/15m" in trigger:
+        return False
+    return any(marker in trigger for marker in ("5分钟", "15分钟"))
+
+
+def _ma_strategy_text(row: dict[str, Any]) -> str:
+    trigger = _get_trigger(row)
+    daily_parts = _daily_weekly_parts(row)
+    has_30m = _trigger_has_30m_confirm(row)
+    has_short = _trigger_has_short_confirm(row)
+    missing_upper = _missing_daily_weekly(row)
+    risk_like = _wechat_action_label(row) == "忽略" or "风险" in _get_action(row) or "卖点" in trigger or "冲突" in trigger
+
+    if risk_like:
+        return "有卖点/冲突，先排雷；均线策略是等重新站回关键均线并走出30m修复，不把分钟反弹当机会。"
+    if missing_upper:
+        return "日/周背景还不够，只能当分钟反抽；均线策略是看10/20日线能否重新承接，不能用5m/15m信号外推。"
+    if daily_parts and has_30m and not has_short:
+        return "日/周背景有、30m已给方向，但5/15m还没补确认；均线策略是等10/20日线承接后的分钟确认，不追冲高。"
+    if daily_parts and has_30m and has_short:
+        return "日/周背景和30m方向共振，短周期也有确认；均线策略是看回踩不破10/20日线，确认强度能否延续。"
+    if daily_parts:
+        return "日/周背景较好，但30m还没完全转强；均线策略是先看10/20日线承接，不追冲高，等30m补确认后再提高优先级。"
+    if "200日新高" in trigger:
+        return "有趋势加速背景；均线策略是不追高位脉冲，只看回踩后能否守住突破位和中短均线。"
+    return "信号还偏短周期；均线策略是先看10/20日线承接和30m结构，证据不够就留在观察。"
+
+
+def _format_wechat_strategy_rows(
+    action_rows: list[dict[str, Any]],
+    watch_rows: list[dict[str, Any]],
+    risk_rows: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[str]:
+    rows = _ordered_review_rows(action_rows, watch_rows, risk_rows, limit=limit)
+    if not rows:
+        return ["- 暂无明确复核对象；先看板块和指数验证。"]
+    lines: list[str] = []
+    for row in rows:
+        chain = _get_chain(row)
+        chain_text = f" | {chain}" if chain else ""
+        parts = _daily_weekly_parts(row)
+        upper = "、".join(parts[:2]) if parts else ("缺日/周" if _missing_daily_weekly(row) else "上级背景待确认")
+        lines.append(
+            f"- {_symbol_name(row)}{chain_text}：{upper}。{_ma_strategy_text(row)}{_wechat_strategy_action_text(row)}"
+        )
+    return lines
 
 
 def _primary_theme(dashboard: dict[str, Any], snapshot: dict[str, Any]) -> str:
@@ -1389,11 +1455,13 @@ def _index_structure_text(row: dict[str, Any], label: str) -> str:
     daily = _text(row.get("daily_trend") or row.get("daily_stage"))
     f30 = _text(row.get("f30_trend") or row.get("m30_trend") or row.get("thirty_trend"))
     f15 = _text(row.get("f15_trend") or row.get("m15_trend") or row.get("fifteen_trend"))
-    structure = [f"日:{daily}" for daily in [daily] if daily]
+    structure = []
+    if daily:
+        structure.append(f"日线{daily}")
     if f30:
-        structure.append(f"30m:{f30}")
+        structure.append(f"30m{f30}")
     if f15:
-        structure.append(f"15m:{f15}")
+        structure.append(f"15m{f15}")
     signal = _text(row.get("latest_signal") or row.get("f15_latest_signal") or row.get("signal"))
     ma_context = row.get("ma_context") if isinstance(row.get("ma_context"), dict) else {}
     ma_summary = _text(ma_context.get("trend_summary"))
@@ -1422,7 +1490,7 @@ def _weak_index_labels(shell: dict[str, Any]) -> list[str]:
     return labels
 
 
-def _wechat_index_structure_lines(shell: dict[str, Any]) -> list[str]:
+def _wechat_index_structure_lines(shell: dict[str, Any], sector_roles: dict[str, Any] | None = None) -> list[str]:
     rows = _major_index_rows(shell)
     parts = []
     for name, label in INDEX_DISPLAY_ORDER:
@@ -1436,9 +1504,10 @@ def _wechat_index_structure_lines(shell: dict[str, Any]) -> list[str]:
         read = f"{'、'.join(weak)}仍偏弱，先按指数压力处理"
     else:
         read = "四大指数未同时转弱，但仍要看30m结构能否延续"
+    framework = _sector_framework_text(sector_roles or {})
     return [
-        f"- 指数结构：{'；'.join(parts)}。",
-        f"- 指数结论：{read}；金融拉升只能托指数，成长线要看创业板、科创50和恒科代理是否同步修复。",
+        f"- 指数：{'；'.join(parts)}。",
+        f"- AI判断：{read}。今天不是全面进攻，先按“{framework}”拆开观察。",
     ]
 
 
@@ -1470,8 +1539,8 @@ def _wechat_hstech_line(shell: dict[str, Any]) -> str | None:
         return None
     pool_name, row = found
     return (
-        f"- 恒科代理：{_symbol_name(row)}在{pool_name}，触发：{_compact_trigger(row)}；"
-        f"未脱离{pool_name}前，只按反抽观察。"
+        f"- 恒科代理：{_symbol_name(row)}在{pool_name}。30m有修复信号，但日/周还没有确认；"
+        f"未脱离{pool_name}前，只当港股科技反抽观察。"
     )
 
 
@@ -1507,16 +1576,303 @@ def _sector_representatives(row: dict[str, Any], *, limit: int = 3) -> str:
     return "、".join(names[:limit]) if names else "代表未明"
 
 
-def _sector_representatives_for_rows(rows: list[dict[str, Any]], *, limit: int = 4) -> str:
+def _cluster_leader_map(dashboard: dict[str, Any]) -> dict[str, str]:
+    overview = dashboard.get("overview") if isinstance(dashboard.get("overview"), dict) else {}
+    cluster = overview.get("cluster_summary") if isinstance(overview.get("cluster_summary"), dict) else {}
+    leaders: dict[str, str] = {}
+    for key in ("industry_top", "concept_top"):
+        for item in _as_list(cluster.get(key)):
+            label = _text(item.get("label"))
+            leader = _text(item.get("leader"))
+            if label and leader:
+                leaders[label] = leader
+    return leaders
+
+
+def _theme_leader_map(snapshot: dict[str, Any]) -> dict[str, str]:
+    leaders: dict[str, str] = {}
+    for item in _as_list(snapshot.get("themes")):
+        name = _text(item.get("name"))
+        leader = _text(item.get("leader"))
+        if name and leader:
+            leaders[name] = leader
+    return leaders
+
+
+def _row_leader_names(row: dict[str, Any], dashboard: dict[str, Any], snapshot: dict[str, Any], *, limit: int = 3) -> list[str]:
+    names: list[str] = []
+    driver = row.get("source_driver") if isinstance(row.get("source_driver"), dict) else {}
+    primary = row.get("primary_domain") if isinstance(row.get("primary_domain"), dict) else {}
+    for key in ("leader_name", "leader"):
+        value = _text(driver.get(key) or primary.get(key))
+        if value and value not in names:
+            names.append(value)
+            if len(names) >= limit:
+                return names[:limit]
+
+    leader_map = {**_cluster_leader_map(dashboard), **_theme_leader_map(snapshot)}
+    candidate_labels = [
+        _sector_name(row),
+        _text(driver.get("name")),
+        _text(primary.get("name")),
+    ]
+    for label in candidate_labels:
+        if not label:
+            continue
+        for key, leader in leader_map.items():
+            if key and (key in label or label in key) and leader not in names:
+                names.append(leader)
+                if len(names) >= limit:
+                    return names[:limit]
+
+    for item in _representative_summary(row, limit=limit):
+        name = _text(item.get("name"))
+        if name and name not in names:
+            names.append(name)
+            if len(names) >= limit:
+                return names[:limit]
+
+    for value in (_text(driver.get("name")), _text(primary.get("name"))):
+        if value and value not in names:
+            names.append(value)
+            if len(names) >= limit:
+                break
+    return names[:limit]
+
+
+def _sector_leaders(row: dict[str, Any], dashboard: dict[str, Any], snapshot: dict[str, Any], *, limit: int = 3) -> str:
+    names = _row_leader_names(row, dashboard, snapshot, limit=limit)
+    return "、".join(names) if names else "代表待补"
+
+
+def _looks_like_board_label(name: str) -> bool:
+    return any(
+        marker in name
+        for marker in (
+            "产业链",
+            "材料",
+            "设备",
+            "主材",
+            "概念",
+            "板块",
+            "行业",
+            "指数",
+            "ETF",
+            "Ⅰ",
+            "Ⅱ",
+            "Ⅲ",
+        )
+    )
+
+
+def _sector_stock_leaders_for_rows(
+    rows: list[dict[str, Any]],
+    dashboard: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    limit: int = 4,
+) -> str:
     names: list[str] = []
     for row in rows:
-        for item in _representative_summary(row, limit=limit):
-            name = _text(item.get("name"))
+        for name in _row_leader_names(row, dashboard, snapshot, limit=limit):
+            if _looks_like_board_label(name):
+                continue
             if name and name not in names:
                 names.append(name)
             if len(names) >= limit:
                 return "、".join(names)
-    return "、".join(names) if names else "代表未明"
+    return "、".join(names)
+
+
+def _sector_representatives_for_rows(
+    rows: list[dict[str, Any]],
+    dashboard: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    limit: int = 4,
+) -> str:
+    names: list[str] = []
+    for row in rows:
+        for name in _row_leader_names(row, dashboard, snapshot, limit=limit):
+            if name and name not in names:
+                names.append(name)
+            if len(names) >= limit:
+                return "、".join(names)
+    return "、".join(names) if names else "代表待补"
+
+
+def _sector_group_key(row: dict[str, Any]) -> str:
+    raw_name = _text(row.get("name") or row.get("label") or row.get("title"))
+    if " · " in raw_name:
+        left, _right = raw_name.split(" · ", 1)
+        if left:
+            return left
+    name = _sector_name(row)
+    if "/" in name:
+        left, _right = name.split("/", 1)
+        if left:
+            return left
+    driver = row.get("source_driver") if isinstance(row.get("source_driver"), dict) else {}
+    primary = row.get("primary_domain") if isinstance(row.get("primary_domain"), dict) else {}
+    return _text(primary.get("name") or driver.get("name") or name, "未知板块")
+
+
+def _selected_chain_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        chain = _get_chain(row)
+        if chain:
+            counts[chain] = counts.get(chain, 0) + 1
+    return counts
+
+
+def _group_matches_label(group: dict[str, Any], label: str) -> bool:
+    if not label:
+        return False
+    text = " ".join([_text(group.get("key")), _text(group.get("name")), _text(group.get("search_text"))])
+    return label in text or text in label
+
+
+def _sector_group_signal_text(group: dict[str, Any]) -> str:
+    reasons: list[str] = []
+    chain_hits = int(group.get("chain_hits") or 0)
+    branch_count = len(_as_list(group.get("rows")))
+    top_change = group.get("top_change")
+    if chain_hits:
+        reasons.append(f"三池出现{chain_hits}次")
+    if branch_count > 1:
+        reasons.append(f"同链{branch_count}个分支进前排")
+    if top_change is not None:
+        reasons.append(f"最高{_fmt_pct(_float_value(top_change), signed=False)}")
+    if group.get("confirmed"):
+        reasons.append("链主/扩散信号确认")
+    return "，".join(reasons[:3]) if reasons else "来自板块前排排序"
+
+
+def _sector_role_groups(
+    dashboard: dict[str, Any],
+    shell: dict[str, Any],
+    snapshot: dict[str, Any],
+    selected_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rows = _sector_board_rows(shell, dashboard, limit=8)
+    chain_counts = _selected_chain_counts(selected_rows)
+    groups: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for position, row in enumerate(rows):
+        key = _sector_group_key(row)
+        if key not in groups:
+            groups[key] = {
+                "key": key,
+                "name": key,
+                "rows": [],
+                "first_position": position,
+                "top_change": None,
+                "chain_hits": 0,
+                "confirmed": False,
+                "search_text": "",
+            }
+            order.append(key)
+        group = groups[key]
+        group["rows"].append(row)
+        change = _sector_change(row)
+        if change is not None and (group["top_change"] is None or change > group["top_change"]):
+            group["top_change"] = change
+        action_text = _text(row.get("trader_action") or row.get("rank_reason") or row.get("trace_summary"))
+        if any(marker in action_text for marker in ("确认", "链主", "扩散", "前排")):
+            group["confirmed"] = True
+        group["search_text"] = " ".join([_text(group.get("search_text")), _sector_search_text(row)]).strip()
+
+    for group in groups.values():
+        hits = 0
+        for chain, count in chain_counts.items():
+            if _group_matches_label(group, chain):
+                hits += count
+        group["chain_hits"] = hits
+        change_score = _float_value(group.get("top_change")) or 0.0
+        group["score"] = (
+            hits * 3.0
+            + change_score
+            + (1.0 if group.get("confirmed") else 0.0)
+            - float(group.get("first_position") or 0) * 0.15
+        )
+
+    ordered_groups = [groups[key] for key in order]
+    if not ordered_groups:
+        return {"rows": rows, "groups": [], "primary": None, "secondary": None, "validation": None, "rotation": []}
+
+    theme = _primary_theme(dashboard, snapshot)
+    primary = next((group for group in ordered_groups if _group_matches_label(group, theme)), None)
+    if primary is None:
+        primary = ordered_groups[0]
+
+    remaining = [group for group in ordered_groups if group is not primary]
+    secondary = None
+    if remaining:
+        secondary = max(
+            remaining,
+            key=lambda group: (
+                int(group.get("chain_hits") or 0),
+                len(_as_list(group.get("rows"))),
+                _float_value(group.get("top_change")) or 0.0,
+                -int(group.get("first_position") or 0),
+            ),
+        )
+
+    remaining = [group for group in remaining if group is not secondary]
+    validation = None
+    if remaining:
+        validation = max(
+            remaining,
+            key=lambda group: (
+                _float_value(group.get("top_change")) or 0.0,
+                float(group.get("score") or 0.0),
+                -int(group.get("first_position") or 0),
+            ),
+        )
+
+    used = {id(group) for group in (primary, secondary, validation) if group}
+    rotation = [group for group in ordered_groups if id(group) not in used][:2]
+    return {
+        "rows": rows,
+        "groups": ordered_groups,
+        "primary": primary,
+        "secondary": secondary,
+        "validation": validation,
+        "rotation": rotation,
+    }
+
+
+def _sector_group_brief(group: dict[str, Any] | None, *, limit: int = 2) -> str:
+    if not group:
+        return "未形成"
+    return _sector_brief_list(_as_list(group.get("rows")), limit=limit)
+
+
+def _sector_group_name(group: dict[str, Any] | None) -> str:
+    if not group:
+        return "未形成"
+    return _text(group.get("name") or group.get("key"), "未知板块")
+
+
+def _sector_group_leaders(group: dict[str, Any] | None, dashboard: dict[str, Any], snapshot: dict[str, Any]) -> str:
+    if not group:
+        return ""
+    return _sector_stock_leaders_for_rows(_as_list(group.get("rows")), dashboard, snapshot)
+
+
+def _sector_framework_text(sector_roles: dict[str, Any]) -> str:
+    primary = sector_roles.get("primary") if isinstance(sector_roles, dict) else None
+    secondary = sector_roles.get("secondary") if isinstance(sector_roles, dict) else None
+    validation = sector_roles.get("validation") if isinstance(sector_roles, dict) else None
+    if not primary:
+        return "前排主线 + 第二梯队 + 次日验证"
+    parts = [f"{_sector_group_name(primary)}主线"]
+    if secondary:
+        parts.append(f"{_sector_group_name(secondary)}修复/扩散")
+    if validation:
+        parts.append(f"{_sector_group_name(validation)}次日验证")
+    return " + ".join(parts)
 
 
 def _sector_brief(row: dict[str, Any]) -> str:
@@ -1527,6 +1883,19 @@ def _sector_brief(row: dict[str, Any]) -> str:
 
 def _sector_brief_list(rows: list[dict[str, Any]], *, limit: int = 2) -> str:
     return "、".join(_sector_brief(row) for row in rows[:limit]) if rows else "未进前排"
+
+
+def _sector_driver_names(rows: list[dict[str, Any]], *, limit: int = 3) -> str:
+    names: list[str] = []
+    for row in rows:
+        driver = row.get("source_driver") if isinstance(row.get("source_driver"), dict) else {}
+        primary = row.get("primary_domain") if isinstance(row.get("primary_domain"), dict) else {}
+        for value in (_text(driver.get("name")), _text(primary.get("name")), _sector_name(row)):
+            if value and value not in names:
+                names.append(value)
+            if len(names) >= limit:
+                return "、".join(names)
+    return "、".join(names) if names else "方向未明"
 
 
 def _daily_weekly_parts(row: dict[str, Any]) -> list[str]:
@@ -1571,20 +1940,20 @@ def _wechat_pool_structure_lines(
             chain_counts[chain] = chain_counts.get(chain, 0) + 1
     if chain_counts:
         top_chain, top_count = max(chain_counts.items(), key=lambda item: item[1])
-        common_line = f"- 三池共性：{top_chain}出现{top_count}次；先分清日/周确认和分钟反抽，不把同板块全部升级。"
+        common_line = f"- 三池共性：{top_chain}出现{top_count}次；只说明资金在这个方向反复出现，还要看日/周背景和均线承接。"
     else:
-        common_line = "- 三池共性：当前候选未形成稳定同板块合力，按单票证据分层复核。"
+        common_line = "- 三池共性：当前候选没有稳定合力，先按板块主线和均线结构分层。"
 
     positive = [(row, parts) for row in rows if (parts := _daily_weekly_parts(row))]
     missing = [row for row in rows if not _daily_weekly_parts(row) and _missing_daily_weekly(row)]
     if positive:
-        positive_line = "- 日/周有买点：" + "、".join(_signal_object(row, parts) for row, parts in positive[:4]) + "。"
+        positive_line = "- 上级周期可用：" + "、".join(_signal_object(row, parts) for row, parts in positive[:4]) + "。"
     else:
-        positive_line = "- 日/周有买点：当前复核池未给出明确日线/周线买点。"
+        positive_line = "- 上级周期可用：当前复核池未给出明确日线/周线背景。"
     if missing:
-        missing_line = "- 只有分钟反抽/缺日周：" + "、".join(_symbol_name(row) for row in missing[:4]) + "；午后不按进攻主线处理。"
+        missing_line = "- 仅分钟反抽：" + "、".join(_symbol_name(row) for row in missing[:4]) + "；不按主线进攻处理。"
     else:
-        missing_line = "- 只有分钟反抽/缺日周：当前入选对象未集中暴露该问题。"
+        missing_line = "- 仅分钟反抽：当前入选对象未集中暴露该问题。"
     return [common_line, positive_line, missing_line]
 
 
@@ -1600,19 +1969,22 @@ def _window_check_text(window: str) -> str:
     }.get(window, "下一窗口")
 
 
-def _wechat_market_read_line(window: str, shell: dict[str, Any]) -> str:
+def _wechat_market_read_line(window: str, shell: dict[str, Any], sector_roles: dict[str, Any]) -> str:
     check = _window_check_text(window)
     weak = _weak_index_labels(shell)
     weak_text = "、".join(weak) if weak else "指数"
+    primary = _sector_group_name(sector_roles.get("primary"))
+    secondary = _sector_group_name(sector_roles.get("secondary"))
+    validation = _sector_group_name(sector_roles.get("validation"))
     if window == "preopen":
         return f"- 盘面含义：先定今日观察框架，{check}只看指数承接和强板块扩散，不临盘扩散新题材。"
     if window in {"ten", "two"}:
         deadline = check.removesuffix("前")
         return f"- 盘面含义：{weak_text}若到{deadline}仍未修复30m结构，强板块也只能按局部修复看。"
     if window == "midday":
-        return f"- 盘面含义：{weak_text}上午仍有压力，下午先验证金融护盘能否传导到科技修复；传导失败就只算反抽。"
+        return f"- 盘面含义：{weak_text}上午仍有压力，下午先验证{primary}能否传导到{secondary}；传导失败就只算局部反抽。"
     if window == "close":
-        return "- 盘面含义：先分清全天是主线延续、链内轮动还是尾盘退潮，再决定哪些对象进入盘后回测。"
+        return f"- 盘面含义：全天先按{primary}、{secondary}、{validation}三层拆开复盘；明天只验证扩散，不把单线冲高当主线。"
     return "- 盘面含义：先看方向、节奏和证据质量，再决定是否进入下一轮复核。"
 
 
@@ -1623,11 +1995,12 @@ def _wechat_market_lines(
     *,
     window: str,
     event_lines: list[str],
+    sector_roles: dict[str, Any],
 ) -> list[str]:
     brief = dashboard.get("daily_brief") if isinstance(dashboard.get("daily_brief"), dict) else {}
     as_of = _text(brief.get("as_of") or snapshot.get("as_of") or dashboard.get("status"), "unknown")
     lines = [f"- 交易日：{as_of}。"]
-    lines.extend(_wechat_index_structure_lines(shell))
+    lines.extend(_wechat_index_structure_lines(shell, sector_roles))
     hstech_line = _wechat_hstech_line(shell)
     if hstech_line:
         lines.append(hstech_line)
@@ -1635,44 +2008,65 @@ def _wechat_market_lines(
         lines.append(f"- 关键盘面事件：{'；'.join(event_lines[:2])}。")
     else:
         lines.append("- 关键盘面事件：暂未看到新的指数/风格异常，继续按主线和候选触发复核。")
-    lines.append(_wechat_market_read_line(window, shell))
+    lines.append(_wechat_market_read_line(window, shell, sector_roles))
     return lines
 
 
-def _wechat_sector_role_lines(dashboard: dict[str, Any], shell: dict[str, Any], *, window: str) -> list[str]:
-    rows = _sector_board_rows(shell, dashboard, limit=8)
+def _wechat_sector_role_lines(
+    dashboard: dict[str, Any],
+    shell: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    window: str,
+    sector_roles: dict[str, Any],
+) -> list[str]:
+    rows = _as_list(sector_roles.get("rows"))
     scope = "截至当前窗口" if window in {"ten", "midday", "two", "close"} else "当前"
     if not rows:
         return [f"- 板块卡位：{scope}缺少板块15排序，不写主线判断，只按候选触发复核。"]
-    financial = _sector_rows_matching(rows, ("大金融", "银行", "保险", "券商"), limit=2)
-    tech = _sector_rows_matching(
-        rows,
-        ("半导体", "芯片", "光刻", "科创", "AI", "算力", "数据中心", "PCB", "通信", "消费电子", "机器人", "软件"),
-        limit=3,
+    primary = sector_roles.get("primary")
+    secondary = sector_roles.get("secondary")
+    validation = sector_roles.get("validation")
+    rotation = _as_list(sector_roles.get("rotation"))
+    primary_leaders = _sector_group_leaders(primary, dashboard, snapshot)
+    secondary_leaders = _sector_group_leaders(secondary, dashboard, snapshot)
+    validation_leaders = _sector_group_leaders(validation, dashboard, snapshot)
+    primary_line = (
+        f"- 第一主线：{_sector_group_brief(primary)}"
+        f"{'；代表看' + primary_leaders if primary_leaders else ''}。"
+        f"信号依据：{_sector_group_signal_text(primary)}。先看它能否稳住盘面，并向其它强板块扩散。"
+        if primary
+        else f"- 第一主线：{scope}暂未形成，指数判断以四大指数结构为准。"
     )
-    used = {id(row) for row in [*financial, *tech]}
-    rotation = [row for row in rows if id(row) not in used][:2]
-    financial_line = (
-        f"- 金融护盘：{scope}{_sector_brief_list(financial)}；代表{_sector_representatives(financial[0])}。"
-        "这条线负责托指数，不等于成长线确认。"
-        if financial
-        else f"- 金融护盘：{scope}大金融未进板块前排，指数判断以四大指数结构为准。"
+    secondary_line = (
+        f"- 第二梯队：{_sector_group_brief(secondary, limit=3)}"
+        f"{'；代表看' + secondary_leaders if secondary_leaders else ''}。"
+        f"信号依据：{_sector_group_signal_text(secondary)}。只在指数不拖累、链内分支继续扩散时提高优先级。"
+        if secondary
+        else "- 第二梯队：未形成稳定共振，不把单票反弹外推为主线。"
     )
-    tech_line = (
-        f"- 科技修复：{_sector_brief_list(tech, limit=3)}；代表{_sector_representatives_for_rows(tech)}。"
-        "需要创业板、科创50和恒科代理同步修复，否则按局部反抽。"
-        if tech
-        else "- 科技修复：半导体/芯片/成长线未进前排，不把单票反弹外推为主线。"
+    validation_line = (
+        f"- 次日验证：{_sector_group_brief(validation)}"
+        f"{'；代表看' + validation_leaders if validation_leaders else ''}。"
+        f"信号依据：{_sector_group_signal_text(validation)}。这是候选新线，要看同链分支是否继续扩散，不能只看单分支冲高。"
+        if validation
+        else "- 次日验证：当前没有新的强分支进入前排，暂不新增主线。"
     )
     rotation_line = (
-        f"- 轮动补充：{_sector_brief_list(rotation)}；只做卡位观察，不覆盖金融护盘和科技修复这两条主判断。"
+        f"- 陪衬轮动：{'、'.join(_sector_group_brief(group, limit=1) for group in rotation)}；只做情绪和轮动观察，不覆盖前三层判断。"
         if rotation
-        else "- 轮动补充：暂无第三类强轮动，午后重点仍在金融护盘和科技修复。"
+        else "- 轮动补充：暂无第三类强轮动，重点仍在第一主线和第二梯队。"
     )
+    order_parts = [f"先看{_sector_group_name(primary)}"]
+    if secondary:
+        order_parts.append(f"其次看{_sector_group_name(secondary)}")
+    if validation:
+        order_parts.append(f"再看{_sector_group_name(validation)}是否扩散")
     return [
-        f"- 前排强度：{scope}前排={_sector_strength_line(rows, limit=5)}。",
-        financial_line,
-        tech_line,
+        f"- 主次排序：{scope}{'，'.join(order_parts)}。",
+        primary_line,
+        secondary_line,
+        validation_line,
         rotation_line,
     ]
 
@@ -1684,18 +2078,39 @@ def _wechat_abandon_lines(
     selected_action: list[dict[str, Any]],
     selected_watch: list[dict[str, Any]],
     selected_risk: list[dict[str, Any]],
+    *,
+    window: str,
+    sector_roles: dict[str, Any],
 ) -> list[str]:
     theme = _primary_theme(dashboard, snapshot)
     weak = _weak_index_labels(shell)
     weak_text = "、".join(weak) if weak else "指数"
     rows = _dedupe(selected_action + selected_watch + selected_risk)
     missing = [row for row in rows if _missing_daily_weekly(row)]
-    lines = [
-        f"- {weak_text}午后仍不能修复30m结构，上午结论降级为弱反抽。",
-        f"- 金融/保险继续独拉，但{theme}、半导体、创业板或恒科代理不扩散，不把盘面升级。",
-    ]
+    primary = _sector_group_name(sector_roles.get("primary"))
+    secondary = _sector_group_name(sector_roles.get("secondary"))
+    validation = _sector_group_name(sector_roles.get("validation"))
+    if window == "close":
+        lines = [
+            f"- 明天{primary}若只剩单线拉升，但关键指数和第二梯队不跟，今天仍按局部反抽复盘。",
+            f"- {secondary}若前排掉队，只算轮动修复，不作为连续主线。",
+            f"- {validation}若不能扩散到同链分支，不升级为新主线。",
+        ]
+    elif window == "midday":
+        lines = [
+            f"- {weak_text}下午不能收回30m弱势，{primary}只按局部强，不升级为全面进攻。",
+            f"- {secondary}若不能继续在前排，关键指数或风格代理不跟，第二梯队降级为反抽。",
+            f"- {validation}若只有单分支冲高、同链分支不扩散，明天不单列主线。",
+        ]
+    else:
+        lines = [
+            f"- {weak_text}不能修复30m结构，强板块只按局部修复看。",
+            f"- {theme}继续独拉，但第二梯队、关键指数或风格代理不扩散，不把盘面升级。",
+        ]
     if missing:
         lines.append(f"- {_compact_row_names(missing, limit=3)}仍缺日/周买点，只看分钟级反抽。")
+    elif window == "close":
+        lines.append("- 复核对象若只剩5m/15m触发、上级周期转弱，不纳入明日复核。")
     else:
         lines.append("- 复核对象若只剩5m/15m触发、上级周期转弱，直接移出午后复核。")
     if selected_risk:
@@ -1710,6 +2125,7 @@ def _wechat_backtest_line(
     snapshot: dict[str, Any],
     action_rows: list[dict[str, Any]],
     watch_rows: list[dict[str, Any]],
+    sector_roles: dict[str, Any],
 ) -> str:
     action_chains = {_get_chain(row) for row in action_rows if _get_chain(row)}
     watch_chains = {_get_chain(row) for row in watch_rows if _get_chain(row)}
@@ -1721,19 +2137,25 @@ def _wechat_backtest_line(
         target = f"{theme}是否维持、关键盘面事件是否修复"
     weak = _weak_index_labels(shell)
     weak_text = "、".join(weak) if weak else "指数"
+    primary = _sector_group_name(sector_roles.get("primary"))
+    secondary = _sector_group_name(sector_roles.get("secondary"))
+    validation = _sector_group_name(sector_roles.get("validation"))
     if window == "preopen":
         return f"- 开盘后只验预设主线、四大指数承接和候选对象，不因为竞价单点异动临时扩散；盘后再复盘{target}。"
     if window == "ten":
         return f"- 10:00前只验{weak_text}能否修复30m、前排板块能否继续扩散；盘后只回测{target}。"
     if window == "midday":
         return (
-            "- 午后只验三件事：大金融护盘能否稳住上证；半导体/芯片能否保持前排且链主不回落；"
-            "创业板、科创50、恒科代理能否从分钟反抽转成30m修复。任一环节断，上午科技修复降级。"
+            f"- 午后只验三件事：{primary}能否稳住盘面；{secondary}能否保持前排且链主不回落；"
+            f"{validation}能否继续扩散。若第三条继续扩散，单列为次日验证，不和第二梯队混在一起。"
         )
     if window == "two":
         return f"- 14:00前只验变盘方向有没有链主确认、{weak_text}有没有修复；尾盘不新增研究对象，盘后只复盘{target}。"
     if window == "close":
-        return f"- 收盘前先处理风险和隔夜资格；盘后只回测{target}。"
+        return (
+            f"- 盘后/明日验证三件事：{primary}能否延续；{secondary}能否从局部修复走向扩散；"
+            f"{validation}能否扩散到同链分支。三条都断，就把今天定性为局部反抽。"
+        )
     return f"- 盘后只复盘{target}；候选分散时不扩散回测。"
 
 
@@ -1811,6 +2233,8 @@ def build_wechat_summary(
 ) -> SummaryResult:
     selected_action, selected_watch, selected_risk = _selected_rows(window, shell, max_items=max_items)
     event_lines = event_lines or []
+    selected_rows = _dedupe(selected_action + selected_watch + selected_risk)
+    sector_roles = _sector_role_groups(dashboard, shell, snapshot, selected_rows)
 
     actionable_count = sum(1 for row in selected_action if _is_actionable(row))
     notify = bool(actionable_count or event_lines or (window == "close" and selected_risk))
@@ -1828,20 +2252,29 @@ def build_wechat_summary(
     lines = [
         status,
         f"1) {market_heading}",
-        *_wechat_market_lines(dashboard, shell, snapshot, window=window, event_lines=event_lines),
+        *_wechat_market_lines(dashboard, shell, snapshot, window=window, event_lines=event_lines, sector_roles=sector_roles),
         "",
-        "2) 板块卡位",
-        *_wechat_sector_role_lines(dashboard, shell, window=window),
+        "2) 板块主次",
+        *_wechat_sector_role_lines(dashboard, shell, snapshot, window=window, sector_roles=sector_roles),
         "",
         f"3) {review_heading}",
         *_wechat_pool_structure_lines(selected_action, selected_watch, selected_risk),
-        *_format_wechat_review_rows(selected_action, selected_watch, selected_risk, limit=max(1, min(max_items, 3))),
+        *_format_wechat_strategy_rows(selected_action, selected_watch, selected_risk, limit=max(1, min(max_items, 3))),
         "",
         "4) 降级条件",
-        *_wechat_abandon_lines(dashboard, snapshot, shell, selected_action, selected_watch, selected_risk),
+        *_wechat_abandon_lines(
+            dashboard,
+            snapshot,
+            shell,
+            selected_action,
+            selected_watch,
+            selected_risk,
+            window=window,
+            sector_roles=sector_roles,
+        ),
         "",
         f"5) {backtest_heading}",
-        _wechat_backtest_line(window, dashboard, shell, snapshot, selected_action, selected_watch),
+        _wechat_backtest_line(window, dashboard, shell, snapshot, selected_action, selected_watch, sector_roles),
     ]
     return SummaryResult(status=status, text="\n".join(lines), notify=notify, reason=reason)
 
@@ -1857,7 +2290,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Use bounded parallel API fetches and emit a gate even when optional workbench inputs time out.",
     )
-    parser.add_argument("--input-timeout", type=float, default=6.0, help="Per-run input budget in seconds for --safe-inputs.")
+    parser.add_argument("--input-timeout", type=float, default=20.0, help="Per-run input budget in seconds for --safe-inputs.")
     parser.add_argument("--send", action="store_true", help="Send to configured notification channels when result is NOTIFY.")
     parser.add_argument("--send-all", action="store_true", help="Send even when result is DONT_NOTIFY.")
     parser.add_argument("--ignore-time", action="store_true", help="Bypass A-share day/window gating for dry-run review.")

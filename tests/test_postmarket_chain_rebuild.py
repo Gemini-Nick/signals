@@ -387,6 +387,31 @@ def test_primary_chain_prefers_core_industry_over_elastic_theme_representative()
     assert primary is hotel_core
 
 
+def test_primary_chain_uses_hot_market_logic_over_stale_traditional_label():
+    oilgas_label = {
+        "chain_id": "coal_oil_gas",
+        "node_id": "fossil_energy",
+        "membership_type": "theme",
+        "chain_specificity_score": 3,
+        "confidence": 96,
+        "exposure_score": 104,
+        "market_driver_score": 1.2,
+    }
+    aidc_power_logic = {
+        "chain_id": "ai_compute",
+        "node_id": "data_center_power",
+        "membership_type": "theme",
+        "chain_specificity_score": 3,
+        "confidence": 92,
+        "exposure_score": 98,
+        "market_driver_score": 15.0,
+    }
+
+    primary = max([oilgas_label, aidc_power_logic], key=rebuild._primary_membership_sort_key)
+
+    assert primary is aidc_power_logic
+
+
 def test_specific_industry_source_counts_as_core_membership(monkeypatch):
     class _Collection:
         def find_one(self, query=None, projection=None, sort=None):

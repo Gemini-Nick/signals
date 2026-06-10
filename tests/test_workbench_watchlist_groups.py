@@ -584,6 +584,68 @@ def test_shell_payload_reuses_fresh_ttl_cache_when_board_watermark_changes(monke
         workbench._invalidate_shell_cache()
 
 
+def test_shell_payload_overlays_cached_session_with_current_ready(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Engine:
+        def is_ready(self):
+            return True
+
+        def get_status(self):
+            return {
+                "ready": True,
+                "running": False,
+                "session_label": "A+H盘中",
+                "session_mode": "ah_intraday",
+                "active_markets": ["A", "HK"],
+                "a_live": True,
+                "hk_live": True,
+                "data_as_of": "14:27",
+            }
+
+    try:
+        cached_payload = {
+            "session": {"ready": False, "running": True, "label": "启动中"},
+            "notices": ["分析引擎正在启动，首屏数据会逐步填充。"],
+            "cluster_summary": {
+                "industry_top": [],
+                "concept_top": [],
+                "market_status": {},
+                "data_warning": "Signals shell 正在构建，稍后自动刷新。",
+            },
+            "watchlist_groups": {
+                "sector_boards": [{"name": "cached-board", "target_kind": "sector"}],
+            },
+        }
+        workbench._SHELL_CACHE.update({
+            "expires_at": workbench.time.monotonic() + 60,
+            "payload": cached_payload,
+            "refreshed_at": workbench.time.monotonic(),
+            "quote_watermark": "quote_snapshots:old|board_heat_ticks:old",
+        })
+        monkeypatch.setattr(
+            workbench,
+            "_quote_snapshot_watermark",
+            lambda: (_ for _ in ()).throw(AssertionError("fresh ttl shell cache should not read watermarks")),
+        )
+        monkeypatch.setattr(
+            workbench,
+            "_build_shell_payload_uncached",
+            lambda engine: (_ for _ in ()).throw(AssertionError("fresh shell cache should not rebuild")),
+        )
+
+        payload = workbench._build_shell_payload(_Engine())
+
+        assert payload["session"]["ready"] is True
+        assert payload["session"]["label"] == "A+H盘中"
+        assert payload["notices"] == []
+        assert payload["cluster_summary"]["data_warning"] == ""
+        assert payload["watchlist_groups"]["sector_boards"][0]["name"] == "cached-board"
+        assert payload["cache"]["status"] == "hit"
+    finally:
+        workbench._invalidate_shell_cache()
+
+
 def test_shell_payload_returns_placeholder_when_cache_miss_and_lock_busy(monkeypatch):
     from signals.web.api import workbench
 
@@ -3271,6 +3333,57 @@ def test_chain_heat_representatives_preserve_upstream_downstream_groups(monkeypa
     assert [row["symbol"] for row in groups["upstream"]] == ["SZ.002407"]
     assert [row["symbol"] for row in groups["downstream"]] == ["SZ.300750"]
     assert [row["symbol"] for row in groups["elastic"]] == ["SZ.002759"]
+
+
+def test_chain_heat_representatives_show_source_leaders_before_static_elastic(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (pd.DataFrame(), ""))
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {})
+
+    groups = workbench._candidate_groups_from_representatives({
+        "heat_score": 13.72,
+        "chain_id": "lithium_battery",
+        "chain_name": "电新/锂电池产业链",
+        "node_id": "pvdf_binder",
+        "node_name": "PVDF/锂电氟材料",
+        "representatives": [
+            {
+                "symbol": "SH.600673",
+                "name": "东阳光",
+                "relation": "氟材料/PVDF弹性标的",
+                "representative_type": "elastic",
+                "priority": 78,
+                "day_change_pct": -3.6,
+            },
+            {
+                "symbol": "SH.600378",
+                "name": "昊华科技",
+                "relation": "PVDF概念真实涨幅成分",
+                "representative_type": "source_leader",
+                "priority": 320,
+                "day_change_pct": 10.0,
+                "source_board_name": "PVDF概念",
+            },
+            {
+                "symbol": "SZ.002407",
+                "name": "多氟多",
+                "relation": "PVDF概念真实涨幅成分",
+                "representative_type": "concept_constituent",
+                "priority": 180,
+                "day_change_pct": 2.0,
+                "source_board_name": "PVDF概念",
+            },
+        ],
+    }, lightweight=True)
+
+    assert [row["symbol"] for row in groups["source_leaders"]] == ["SH.600378"]
+    assert [row["symbol"] for row in groups["constituents"]] == ["SZ.002407"]
+    assert [row["symbol"] for row in groups["elastic"]] == ["SH.600673"]
+
+    preview = workbench._flatten_candidate_groups(groups, limit=3)
+
+    assert [row["symbol"] for row in preview] == ["SH.600378", "SZ.002407", "SH.600673"]
 
 
 def test_related_custom_signals_round_robin_symbols(monkeypatch):

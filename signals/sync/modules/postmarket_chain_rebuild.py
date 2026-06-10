@@ -38,6 +38,7 @@ REQUIRED_BOARD_SOURCES = {"ths", "em"}
 
 MAPPING_CONFIDENCE_THRESHOLD = 60
 ROLLUP_TOP_SECURITY_LIMIT = 30
+HOT_MARKET_DRIVER_SCORE = 8.0
 REPRESENTATIVE_TYPE_RANK = {"core": 2, "elastic": 1}
 SECURITY_CHAIN_OVERRIDES_PATH = Path(__file__).resolve().parents[2] / "core" / "security_chain_overrides.yaml"
 SECURITY_CONCEPT_EVIDENCE_COLLECTION = "security_concept_evidence"
@@ -131,8 +132,11 @@ def _membership_sort_key(row: dict[str, Any]) -> tuple[float, ...]:
 
 
 def _primary_membership_sort_key(row: dict[str, Any]) -> tuple[float, ...]:
+    hot_market_logic = _float(row.get("market_driver_score")) >= HOT_MARKET_DRIVER_SCORE
     return (
         1.0 if row.get("reviewed_override") else 0.0,
+        1.0 if hot_market_logic else 0.0,
+        _float(row.get("market_driver_score")),
         float(_membership_type_rank(row.get("membership_type"))),
         _float(row.get("chain_specificity_score")),
         1.0 if row.get("taxonomy_representative") else 0.0,
@@ -1144,6 +1148,7 @@ def _build_memberships(
                 "confidence": confidence,
                 "chain_specificity_score": specificity,
                 "exposure_score": _exposure_score(kind=kind, confidence=confidence, source_count=1),
+                "market_driver_score": _float(evidence.get("volume_driver_score")),
                 "is_primary_chain": False,
                 "source_boards": [],
                 "evidence_sources": [],
@@ -1200,6 +1205,10 @@ def _build_memberships(
         row["exposure_score"] = max(
             _float(row.get("exposure_score")),
             _exposure_score(kind=kind, confidence=int(row["confidence"]), source_count=source_count),
+        )
+        row["market_driver_score"] = max(
+            _float(row.get("market_driver_score")),
+            _float(evidence.get("volume_driver_score")),
         )
         _apply_taxonomy_representative(row, reps_by_node.get(node_key, {}).get(code))
 
@@ -1293,6 +1302,7 @@ def _rollup_docs(
                     "source_note": row.get("source_note"),
                     "confidence": row.get("confidence"),
                     "exposure_score": row.get("exposure_score"),
+                    "market_driver_score": row.get("market_driver_score"),
                     "is_primary_chain": row.get("is_primary_chain"),
                     "evidence_sources": row.get("evidence_sources") or [],
                     "evidence_layers": row.get("evidence_layers") or [],
