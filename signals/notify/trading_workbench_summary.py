@@ -10,8 +10,10 @@ import argparse
 import copy
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, time
+from time import monotonic
 from typing import Any
 from urllib.parse import quote
 from urllib.request import urlopen
@@ -63,6 +65,14 @@ class SummaryResult:
     text: str
     notify: bool
     reason: str
+
+
+@dataclass
+class InputFetchResult:
+    dashboard: dict[str, Any]
+    shell: dict[str, Any]
+    snapshot: dict[str, Any]
+    errors: dict[str, str]
 
 
 def _text(value: Any, default: str = "") -> str:
@@ -167,6 +177,49 @@ def fetch_inputs(base_url: str = "http://127.0.0.1:8011") -> tuple[dict[str, Any
         fetch_json(base_url, "/api/pack/dashboard"),
         fetch_json(base_url, "/api/workbench/shell", timeout=45.0),
         fetch_json(base_url, "/api/strategy/snapshot", timeout=30.0),
+    )
+
+
+def _fetch_error_message(exc: BaseException) -> str:
+    detail = str(exc).strip()
+    label = type(exc).__name__
+    if detail:
+        return f"{label}: {detail}"[:180]
+    return label
+
+
+def fetch_inputs_safe(base_url: str = "http://127.0.0.1:8011", *, timeout: float = 6.0) -> InputFetchResult:
+    bounded_timeout = max(0.5, float(timeout))
+    jobs = {
+        "dashboard": ("/api/pack/dashboard", bounded_timeout),
+        "shell": ("/api/workbench/shell", bounded_timeout),
+        "snapshot": ("/api/strategy/snapshot", bounded_timeout),
+    }
+    results: dict[str, dict[str, Any]] = {}
+    errors: dict[str, str] = {}
+    started_at = monotonic()
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        futures = {
+            executor.submit(fetch_json, base_url, path, timeout=path_timeout): name
+            for name, (path, path_timeout) in jobs.items()
+        }
+        done, pending = wait(futures, timeout=bounded_timeout)
+        for future in done:
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as exc:
+                errors[name] = _fetch_error_message(exc)
+        for future in pending:
+            name = futures[future]
+            future.cancel()
+            elapsed = monotonic() - started_at
+            errors[name] = f"TimeoutError: exceeded {bounded_timeout:g}s input budget after {elapsed:.1f}s"
+    return InputFetchResult(
+        dashboard=results.get("dashboard", {}),
+        shell=results.get("shell", {}),
+        snapshot=results.get("snapshot", {}),
+        errors=errors,
     )
 
 
@@ -1019,6 +1072,9 @@ def build_narrative_review(
         sector_rows,
         event_lines,
     )
+    if not notify and market_replay_sections and window in {"postmarket", "weekly", "manual"}:
+        notify = True
+        reason = "market_replay_sections"
     status = "NOTIFY" if notify else "DONT_NOTIFY"
     as_of = _as_of_date(dashboard, snapshot)
     counts = _pool_counts(shell)
@@ -1463,6 +1519,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--window", choices=sorted(WINDOW_LABELS), default="manual")
     parser.add_argument("--trade-date", default="", help="Historical YYYY-MM-DD trade date for narrative replay.")
     parser.add_argument("--max-items", type=int, default=3)
+    parser.add_argument(
+        "--safe-inputs",
+        action="store_true",
+        help="Use bounded parallel API fetches and emit a gate even when optional workbench inputs time out.",
+    )
+    parser.add_argument("--input-timeout", type=float, default=6.0, help="Per-run input budget in seconds for --safe-inputs.")
     parser.add_argument("--send", action="store_true", help="Send to configured notification channels when result is NOTIFY.")
     parser.add_argument("--send-all", action="store_true", help="Send even when result is DONT_NOTIFY.")
     parser.add_argument("--ignore-time", action="store_true", help="Bypass A-share day/window gating for dry-run review.")
@@ -1507,7 +1569,17 @@ def main(argv: list[str] | None = None) -> int:
             reason="training_sample" if args.allow_training_sample_send else "training_sample_send_blocked",
         )
     else:
-        dashboard, shell, snapshot = fetch_inputs(args.base_url)
+        if args.safe_inputs:
+            fetched = fetch_inputs_safe(args.base_url, timeout=args.input_timeout)
+            dashboard, shell, snapshot = fetched.dashboard, fetched.shell, fetched.snapshot
+            if not (dashboard or shell or snapshot):
+                title = WINDOW_LABELS.get(args.window, WINDOW_LABELS["manual"])
+                details = ";".join(f"{name}={error}" for name, error in sorted(fetched.errors.items()))
+                reason = f"input_unavailable:{details}" if details else "input_unavailable"
+                print(f"DONT_NOTIFY\n[Signals 工作台 | {title}]\n原因：{reason}")
+                return 0
+        else:
+            dashboard, shell, snapshot = fetch_inputs(args.base_url)
         source_trade_date = _as_of_date(dashboard, snapshot)
         requested_trade_date = _text(args.trade_date)
         event_lines = (
@@ -1522,7 +1594,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             builder = build_summary
         market_replay_sections: list[str] = []
-        if args.format == "narrative":
+        replay_trade_date = requested_trade_date or source_trade_date
+        if args.format == "narrative" and replay_trade_date != "unknown":
             try:
                 from signals.replay.market_replay import build_market_replay_context, format_market_replay_sections
                 from signals.sync.db import get_db
@@ -1532,7 +1605,7 @@ def main(argv: list[str] | None = None) -> int:
                 historical_requested = bool(requested_trade_date and requested_trade_date != source_trade_date)
                 replay_context = build_market_replay_context(
                     get_db(),
-                    trade_date=requested_trade_date or source_trade_date,
+                    trade_date=replay_trade_date,
                     sector_boards=[] if historical_requested else sector_boards,
                     representative_limit=max(20, args.max_items * 4),
                     include_external_fund_flows=args.window in {"postmarket", "manual", "weekly"},

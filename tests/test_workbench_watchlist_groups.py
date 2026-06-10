@@ -336,6 +336,27 @@ def test_lightweight_stock_row_requires_fresh_range_returns(monkeypatch):
     assert row["range_return_source"] == "test_daily_bars"
 
 
+def test_shell_stock_row_marks_incomplete_range_returns_without_raising(monkeypatch):
+    from signals.web.api import workbench
+
+    def _raise_incomplete(symbol, columns):
+        raise RuntimeError(f"range_returns_incomplete:{symbol}:1w")
+
+    monkeypatch.setattr(workbench, "_compute_stock_range_returns_required", _raise_incomplete)
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {"quote_status": "missing"})
+    monkeypatch.setattr(workbench, "_shortest_realtime_day_change", lambda kind, symbol: {})
+
+    row = workbench._enrich_shell_stock_row(
+        {"symbol": "SH.562590", "name": "测试ETF", "day_change_pct": 1.23},
+        [{"key": "1w", "label": "最近一周", "start_date": "2026-06-01"}],
+        require_range_returns=True,
+    )
+
+    assert row["symbol"] == "SH.562590"
+    assert row["range_return_status"] == "range_returns_incomplete"
+    assert row["range_return_error"] == "range_returns_incomplete:SH.562590:1w"
+
+
 def test_lightweight_stock_row_computes_no_trade_current_range(monkeypatch):
     from signals.web.api import workbench
 
@@ -447,6 +468,80 @@ def test_shell_cache_rebuilds_when_board_watermark_changes():
         ) is False
     finally:
         workbench._invalidate_shell_cache()
+
+
+def test_shell_payload_overlays_stale_cache_with_current_quote_watermark(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Engine:
+        def is_ready(self):
+            return True
+
+    try:
+        cached_payload = {
+            "session": {"ready": True},
+            "buy_candidates": [
+                {
+                    "kind": "stock",
+                    "symbol": "SH.600487",
+                    "latest_price": 95.47,
+                    "day_change_pct": -0.6762,
+                    "day_change_as_of": "2026-06-08",
+                }
+            ],
+        }
+        workbench._SHELL_CACHE.update({
+            "expires_at": 0.0,
+            "payload": cached_payload,
+            "refreshed_at": workbench.time.monotonic() - 3600,
+            "quote_watermark": "quote_snapshots:old|fullmarket_spot_snapshots:old|terminal_stock_pool:same",
+        })
+        monkeypatch.setattr(
+            workbench,
+            "_quote_snapshot_watermark",
+            lambda: "quote_snapshots:new|fullmarket_spot_snapshots:new|terminal_stock_pool:same",
+        )
+        monkeypatch.setattr(workbench, "_schedule_shell_cache_refresh", lambda engine: None)
+        monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {
+            "day_change_mode": "daily_close",
+            "quote_status": "closed",
+            "latest_price": 105.02,
+            "realtime_price": 105.02,
+            "quote_price": 105.02,
+            "day_change_pct": 10.0031,
+            "daily_change_pct": 10.0031,
+            "today_change_pct": 10.0031,
+            "gain_pct": 10.0031,
+            "day_change_source": "fullmarket_spot_snapshots",
+            "day_change_as_of": "2026-06-09",
+            "quote_as_of": "2026-06-09",
+        })
+
+        payload = workbench._build_shell_payload(_Engine())
+
+        assert payload["cache"]["status"] == "stale_refreshing_quote_overlay"
+        assert payload["buy_candidates"][0]["latest_price"] == 105.02
+        assert payload["buy_candidates"][0]["day_change_pct"] == 10.0031
+        assert payload["buy_candidates"][0]["day_change_as_of"] == "2026-06-09"
+        assert workbench._SHELL_CACHE["quote_watermark"] == (
+            "quote_snapshots:new|fullmarket_spot_snapshots:new|terminal_stock_pool:same"
+        )
+    finally:
+        workbench._invalidate_shell_cache()
+
+
+def test_quote_overlay_watermark_keeps_rebuild_keys_from_cached_payload():
+    from signals.web.api import workbench
+
+    cached = "quote_snapshots:old|fullmarket_spot_snapshots:old|terminal_stock_pool:old|board_heat_ticks:old"
+    current = "quote_snapshots:new|fullmarket_spot_snapshots:new|terminal_stock_pool:new|board_heat_ticks:new"
+
+    overlay_watermark = workbench._quote_overlay_watermark(current, cached)
+
+    assert overlay_watermark == (
+        "quote_snapshots:new|fullmarket_spot_snapshots:new|terminal_stock_pool:old|board_heat_ticks:old"
+    )
+    assert workbench._shell_watermark_requires_rebuild(current, overlay_watermark) is True
 
 
 def test_shell_payload_reuses_fresh_ttl_cache_when_board_watermark_changes(monkeypatch):

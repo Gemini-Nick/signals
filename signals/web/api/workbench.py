@@ -343,6 +343,25 @@ def _watermark_parts(value: Any) -> dict[str, str]:
     return parts
 
 
+def _watermark_from_parts(parts: dict[str, str]) -> str:
+    return "|".join(f"{key}:{value}" for key, value in parts.items() if key and value)
+
+
+def _quote_overlay_watermark(current: Any, cached: Any) -> str:
+    current_parts = _watermark_parts(current)
+    if not current_parts:
+        return str(cached or "")
+    cached_parts = _watermark_parts(cached)
+    merged = dict(cached_parts)
+    for key, value in current_parts.items():
+        if key not in _SHELL_REBUILD_WATERMARK_KEYS:
+            merged[key] = value
+    for key, value in current_parts.items():
+        if key in _SHELL_REBUILD_WATERMARK_KEYS and key not in merged:
+            merged[key] = value
+    return _watermark_from_parts(merged)
+
+
 def _shell_watermark_requires_rebuild(current: Any, cached: Any) -> bool:
     current_parts = _watermark_parts(current)
     cached_parts = _watermark_parts(cached)
@@ -3000,7 +3019,9 @@ def _enrich_shell_stock_row(
             lightweight=True,
             require_range_returns=False,
         )
-        enriched["range_return_status"] = _text(enriched.get("range_return_status")) or message.split(":", 1)[0]
+        current_status = _text(enriched.get("range_return_status"))
+        if not current_status or current_status == "lazy":
+            enriched["range_return_status"] = message.split(":", 1)[0]
         enriched["range_return_error"] = message
         return enriched
 
@@ -9041,9 +9062,14 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         _refresh_realtime_quotes_for_rows(_mongo_db(), warning_rows, refresh_key="sell_warnings", limit=len(warning_rows) or 1)
     except Exception:
         pass
+    sell_warning_range_return_limit = _shell_stock_range_return_limit("sell_warnings")
     sell_warnings = [
-        _enrich_stock_row(dict(item), range_columns, lightweight=True) if isinstance(item, dict) and item.get("symbol") else dict(item)
-        for item in warning_rows
+        _enrich_shell_stock_row(
+            dict(item),
+            range_columns,
+            require_range_returns=index < sell_warning_range_return_limit,
+        ) if isinstance(item, dict) and item.get("symbol") else dict(item)
+        for index, item in enumerate(warning_rows)
     ]
     decision_rows_raw = [
         dict(item)
@@ -9278,10 +9304,15 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
     if _shell_cache_usable(cached_payload, engine) and now < float(_SHELL_CACHE.get("expires_at") or 0):
         return _payload_from_shell_cache(cached_payload, "hit", now, cached_quote_watermark)
 
-    quote_watermark = cached_quote_watermark
+    current_quote_watermark = _quote_snapshot_watermark() or cached_quote_watermark
+    quote_watermark = _quote_overlay_watermark(current_quote_watermark, cached_quote_watermark)
     _schedule_shell_cache_refresh(engine)
     if _shell_cache_usable(cached_payload, engine):
-        cache_status = "stale_refreshing" if _shell_cache_usable(cached_payload, engine, quote_watermark=quote_watermark) else "stale_refreshing_watermark"
+        cache_status = (
+            "stale_refreshing"
+            if _shell_cache_usable(cached_payload, engine, quote_watermark=current_quote_watermark)
+            else "stale_refreshing_watermark"
+        )
         return _payload_from_shell_cache(cached_payload, cache_status, now, quote_watermark)
     return _build_shell_placeholder_payload(engine, "building", now, quote_watermark)
 

@@ -5,10 +5,12 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from signals.notify.trading_workbench_summary import (
+    InputFetchResult,
     build_summary,
     build_narrative_review,
     build_wechat_summary,
     collect_replay_context,
+    fetch_inputs_safe,
     main,
     window_gate,
     _breakpoint_watch_lines,
@@ -316,6 +318,109 @@ def test_narrative_cli_same_trade_date_keeps_live_sector_and_indices(monkeypatch
     assert output.startswith("NOTIFY\n2026年6月5日复盘")
     assert "机器人和航天装备" in output
     assert "上证-0.74%" in output
+
+
+def test_fetch_inputs_safe_returns_partial_inputs_when_snapshot_fails(monkeypatch):
+    def fake_fetch_json(base_url: str, path: str, *, timeout: float = 8.0):
+        if path == "/api/strategy/snapshot":
+            raise TimeoutError("timed out")
+        return {"path": path, "timeout": timeout}
+
+    monkeypatch.setattr("signals.notify.trading_workbench_summary.fetch_json", fake_fetch_json)
+
+    result = fetch_inputs_safe("http://example.test", timeout=1.0)
+
+    assert result.dashboard["path"] == "/api/pack/dashboard"
+    assert result.shell["path"] == "/api/workbench/shell"
+    assert result.snapshot == {}
+    assert "snapshot" in result.errors
+    assert "timed out" in result.errors["snapshot"]
+
+
+def test_narrative_cli_safe_inputs_notifies_from_replay_when_snapshot_times_out(monkeypatch, capsys):
+    dashboard = _dashboard()
+    dashboard["daily_brief"]["as_of"] = "2026-06-05"
+    dashboard["daily_brief"]["primary_theme"] = "科技高成交链"
+
+    def fake_fetch_inputs_safe(base_url: str, *, timeout: float):
+        return InputFetchResult(
+            dashboard=dashboard,
+            shell={"watchlist_groups": {}},
+            snapshot={},
+            errors={"snapshot": "TimeoutError: timed out"},
+        )
+
+    monkeypatch.setattr("signals.notify.trading_workbench_summary.fetch_inputs_safe", fake_fetch_inputs_safe)
+    monkeypatch.setattr(
+        "signals.notify.trading_workbench_summary.fetch_inputs",
+        lambda base_url: (_ for _ in ()).throw(AssertionError("unsafe fetch should not run")),
+    )
+    monkeypatch.setattr("signals.sync.db.get_db", lambda: object())
+    monkeypatch.setattr(
+        "signals.replay.market_replay.build_market_replay_context",
+        lambda db, **kwargs: {"trade_date": kwargs["trade_date"]},
+    )
+    monkeypatch.setattr(
+        "signals.replay.market_replay.format_market_replay_sections",
+        lambda context: ["科技链先集中恐慌，之后中天科技最先翻红，工业富联承接修复。"],
+    )
+
+    exit_code = main(
+        [
+            "--window",
+            "postmarket",
+            "--format",
+            "narrative",
+            "--safe-inputs",
+            "--input-timeout",
+            "0.1",
+            "--ignore-time",
+            "--allow-ignore-time-notify",
+        ]
+    )
+
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert output.startswith("NOTIFY\n2026年6月5日复盘")
+    assert "早盘恐慌、盘中局部抄底反弹、午后承接失败" in output
+    assert "中天科技最先翻红" in output
+
+
+def test_narrative_cli_safe_inputs_emits_gate_when_all_inputs_fail(monkeypatch, capsys):
+    def fake_fetch_inputs_safe(base_url: str, *, timeout: float):
+        return InputFetchResult(
+            dashboard={},
+            shell={},
+            snapshot={},
+            errors={
+                "dashboard": "TimeoutError: timed out",
+                "shell": "TimeoutError: timed out",
+                "snapshot": "TimeoutError: timed out",
+            },
+        )
+
+    monkeypatch.setattr("signals.notify.trading_workbench_summary.fetch_inputs_safe", fake_fetch_inputs_safe)
+
+    exit_code = main(
+        [
+            "--window",
+            "postmarket",
+            "--format",
+            "narrative",
+            "--safe-inputs",
+            "--input-timeout",
+            "0.1",
+            "--ignore-time",
+        ]
+    )
+
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert output.startswith("DONT_NOTIFY\n[Signals 工作台 | 20:30 盘后复盘]\n原因：input_unavailable:")
+    assert "dashboard=TimeoutError" in output
+    assert "snapshot=TimeoutError" in output
 
 
 def test_send_body_strips_notify_gate_for_wechat_delivery():
