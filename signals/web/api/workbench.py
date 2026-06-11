@@ -4064,6 +4064,7 @@ def _slim_shell_sector_row(row: dict[str, Any]) -> dict[str, Any]:
         "node_name",
         "taxonomy_node_id",
         "taxonomy_node_name",
+        "market_logic",
         "market_logic_node",
         "layer",
         "stage",

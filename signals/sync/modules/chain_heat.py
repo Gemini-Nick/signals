@@ -621,11 +621,11 @@ def _node_representative_codes(node: dict[str, Any]) -> set[str]:
 
 
 def _market_logic_node_override(top: dict[str, Any], overlays: list[dict[str, Any]]) -> dict[str, Any]:
-    """Promote display routing when hot overlays and real constituents imply a more specific node.
+    """Promote display routing when hot evidence implies a more specific node.
 
     The source board taxonomy is still retained in node_id. This only creates a
     display/logic node so broad boards like 半导体材料 can surface the current
-    traded sub-logic, e.g. 工业气体/氟化工概念 -> 半导体特气/前驱体.
+    traded sub-logic, e.g. 半导体材料成分 + 热门交叉概念 -> 半导体特气/前驱体.
     """
 
     chain_id = _text(top.get("chain_id"))
@@ -641,36 +641,73 @@ def _market_logic_node_override(top: dict[str, Any], overlays: list[dict[str, An
     ]
     if not anchored:
         return {}
-    overlay_codes: set[str] = set()
+    source_codes = {
+        code
+        for rep in top.get("source_representatives") or []
+        for code in [_pure_a_code(rep.get("symbol"))]
+        if code
+    }
     overlay_names: list[str] = []
     for overlay in anchored:
         overlay_names.append(_text(overlay.get("name")))
-        for raw in overlay.get("matched_symbols") or []:
-            code = _pure_a_code(raw)
-            if code:
-                overlay_codes.add(code)
-    if not overlay_codes:
+    if not source_codes and not any(overlay.get("matched_symbols") for overlay in anchored):
         return {}
     chain = load_industry_chains().get(chain_id) or {}
-    candidates: list[tuple[int, float, dict[str, Any], list[str]]] = []
+    candidates: list[tuple[int, int, int, float, dict[str, Any], list[str], list[str]]] = []
     for node in chain.get("nodes") or []:
         node_id = _text(node.get("node_id"))
         if not node_id or node_id == current_node_id:
             continue
         node_codes = _node_representative_codes(node)
-        overlap = sorted(overlay_codes.intersection(node_codes))
+        source_overlap = sorted(source_codes.intersection(node_codes))
+        contributing_overlays = []
+        overlay_overlap_codes: set[str] = set()
+        direct_semantic_overlay = False
+        for overlay in anchored:
+            matched_codes = {
+                code
+                for raw in overlay.get("matched_symbols") or []
+                for code in [_pure_a_code(raw)]
+                if code
+            }
+            overlap = matched_codes.intersection(node_codes)
+            if not overlap:
+                continue
+            contributing_overlays.append(overlay)
+            overlay_overlap_codes.update(overlap)
+            overlay_name = _text(overlay.get("name"))
+            for match in match_industry_chains(overlay_name):
+                if (
+                    _text(match.get("chain_id")) == chain_id
+                    and _text(match.get("node_id")) == node_id
+                    and _int(match.get("confidence")) >= 80
+                ):
+                    direct_semantic_overlay = True
+                    break
+        overlap = sorted(set(source_overlap).union(overlay_overlap_codes))
         if not overlap:
             continue
-        overlay_strength = max(
-            _float(overlay.get("change_pct"))
-            for overlay in anchored
-            if overlay_codes.intersection({_pure_a_code(raw) for raw in overlay.get("matched_symbols") or []})
-        )
-        candidates.append((len(overlap), overlay_strength, node, overlap))
+        if len(overlap) < 2 and not direct_semantic_overlay:
+            continue
+        overlay_strength = max((_float(overlay.get("change_pct")) for overlay in contributing_overlays), default=0.0)
+        candidates.append((
+            len(source_overlap),
+            len(overlay_overlap_codes),
+            len(overlap),
+            overlay_strength,
+            node,
+            overlap,
+            [_text(overlay.get("name")) for overlay in contributing_overlays],
+        ))
     if not candidates:
         return {}
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    overlap_count, overlay_strength, node, overlap = candidates[0]
+    candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+    source_overlap_count, overlay_overlap_count, overlap_count, overlay_strength, node, overlap, contributing_names = candidates[0]
+    evidence_parts = ["industry_chains.yaml"]
+    if source_overlap_count:
+        evidence_parts.insert(0, "source_board_constituents")
+    if overlay_overlap_count:
+        evidence_parts.insert(-1, "source_concept_overlays")
     return {
         "chain_id": chain_id,
         "chain_name": chain.get("name") or top.get("chain_name"),
@@ -679,9 +716,9 @@ def _market_logic_node_override(top: dict[str, Any], overlays: list[dict[str, An
         "layer": node.get("layer"),
         "stage": node.get("stage"),
         "status": "hot_overlay_constituent_route",
-        "evidence": "source_concept_overlays+industry_chains.yaml",
+        "evidence": "+".join(evidence_parts),
         "source_board": top_name,
-        "overlay_names": [name for name in dict.fromkeys(overlay_names) if name],
+        "overlay_names": [name for name in dict.fromkeys(contributing_names or overlay_names) if name],
         "matched_symbols": overlap[:8],
         "matched_count": overlap_count,
         "overlay_change_pct": overlay_strength,

@@ -294,6 +294,83 @@ def test_chain_heat_promotes_semiconductor_gas_logic_from_hot_overlays():
     assert node["market_logic"]["route_status"] == "hot_overlay_constituent_route"
 
 
+def test_chain_heat_does_not_route_pvdf_to_lipf6_from_one_shared_constituent():
+    latest = datetime(2026, 6, 10, 10, 30)
+    rows = [{
+        "kind": "concept",
+        "name": "PVDF概念",
+        "source": "eastmoney_push2delay",
+        "rank": 180,
+        "change_pct": 1.2,
+        "up_count": 9,
+        "down_count": 7,
+        "leader_name": "昊华科技",
+        "leader_change_pct": 10.0,
+        "trade_minute": latest,
+        "heat_score": 18.0,
+        "momentum_5m": 0.1,
+        "momentum_15m": 0.2,
+        "momentum_30m": 0.3,
+        "chain_id": "lithium_battery",
+        "chain_name": "电新/锂电池产业链",
+        "node_id": "pvdf_binder",
+        "node_name": "PVDF/锂电氟材料",
+        "mapping_confidence": 96,
+        "source_representatives": [
+            {
+                "symbol": "SH.600378",
+                "name": "昊华科技",
+                "representative_type": "source_leader",
+                "priority": 320,
+                "day_change_pct": 10.0,
+                "source_board_name": "PVDF概念",
+            },
+            {
+                "symbol": "SZ.002407",
+                "name": "多氟多",
+                "representative_type": "concept_constituent",
+                "priority": 260,
+                "day_change_pct": 10.0,
+                "source_board_name": "PVDF概念",
+            },
+        ],
+        "representatives": [
+            {"symbol": "SZ.002407", "name": "多氟多", "representative_type": "core", "priority": 94},
+            {"symbol": "SZ.300343", "name": "ST联创", "representative_type": "elastic", "priority": 82},
+        ],
+        "source_concept_overlays": [
+            {
+                "kind": "concept",
+                "name": "工业气体",
+                "change_pct": 4.8,
+                "leader_name": "和远气体",
+                "matched_symbols": ["600378", "600160"],
+                "matched_names": ["昊华科技", "巨化股份"],
+                "source_boards": ["PVDF概念"],
+                "matched_count": 2,
+                "matched_source_leader": True,
+            },
+            {
+                "kind": "concept",
+                "name": "氟化工概念",
+                "change_pct": 3.6,
+                "leader_name": "兴发集团",
+                "matched_symbols": ["002407", "300343", "600673", "600378"],
+                "matched_names": ["多氟多", "ST联创", "东阳光", "昊华科技"],
+                "source_boards": ["PVDF概念"],
+                "matched_count": 4,
+                "matched_source_leader": True,
+            },
+        ],
+    }]
+
+    node = _aggregate(rows, latest)[0]
+
+    assert node["node_id"] == "pvdf_binder"
+    assert node["market_logic_node"] == {}
+    assert "route_node_id" not in node["market_logic"]
+
+
 def test_chain_heat_market_logic_stays_anchored_to_top_source_board():
     latest = datetime(2026, 6, 10, 10, 30)
     rows = [

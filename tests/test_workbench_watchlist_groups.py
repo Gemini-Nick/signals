@@ -3489,6 +3489,7 @@ def test_slim_sector_row_preserves_chain_change_truth_fields():
         "reference_domain": {"kind": "industry", "name": "基础化工", "change_pct": 0.21},
         "representative_confirmation": {"status": "not_confirmed", "label": "代表股未跟随"},
         "source_driver": {"kind": "concept", "kind_label": "概念", "name": "超导概念", "change_pct": 3.48},
+        "market_logic": {"status": "hot_concept_overlay", "logic_name": "机器人执行器"},
         "chain_confirmation": {"status": "not_confirmed", "label": "链主未确认"},
         "source_concept_overlays": [{"kind": "concept", "name": "机器人执行器", "change_pct": 5.28}],
         "source_event_concept_overlays": [{"source": {"name": "印染"}, "concepts": [{"name": "机器人执行器"}]}],
@@ -3503,6 +3504,7 @@ def test_slim_sector_row_preserves_chain_change_truth_fields():
     assert slim["primary_domain"]["name"] == "超导概念"
     assert slim["reference_domain"]["change_pct"] == 0.21
     assert slim["source_driver"]["kind_label"] == "概念"
+    assert slim["market_logic"]["logic_name"] == "机器人执行器"
     assert slim["chain_confirmation"]["label"] == "链主未确认"
     assert slim["source_concept_overlays"][0]["name"] == "机器人执行器"
     assert slim["source_event_concept_overlays"][0]["source"]["name"] == "印染"
