@@ -310,6 +310,18 @@ def test_board_heat_range_returns_use_watchlist_column_keys(monkeypatch):
     assert meta["partial_keys"] == ["ytd"]
 
 
+def test_chain_heat_shell_range_returns_enabled_by_default(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.delenv("WORKBENCH_CHAIN_HEAT_SHELL_RANGE_RETURNS", raising=False)
+
+    assert workbench._chain_heat_shell_range_returns_enabled() is True
+
+    monkeypatch.setenv("WORKBENCH_CHAIN_HEAT_SHELL_RANGE_RETURNS", "off")
+
+    assert workbench._chain_heat_shell_range_returns_enabled() is False
+
+
 def test_lightweight_stock_row_requires_fresh_range_returns(monkeypatch):
     from signals.web.api import workbench
 
@@ -355,6 +367,96 @@ def test_shell_stock_row_marks_incomplete_range_returns_without_raising(monkeypa
     assert row["symbol"] == "SH.562590"
     assert row["range_return_status"] == "range_returns_incomplete"
     assert row["range_return_error"] == "range_returns_incomplete:SH.562590:1w"
+
+
+def test_fill_lazy_stock_range_returns_uses_batch_partial_history(monkeypatch):
+    from signals.web.api import workbench
+
+    columns = workbench._watchlist_range_columns(date(2026, 6, 10))
+    rows = [
+        {
+            "symbol": "SH.688146",
+            "name": "中船特气",
+            "range_returns": {},
+            "range_return_status": "lazy",
+        },
+        {
+            "symbol": "SH.600487",
+            "name": "亨通光电",
+            "range_returns": {"ytd": 330.97},
+            "range_return_status": "lazy",
+        }
+    ]
+
+    monkeypatch.setattr(workbench, "_batch_stock_range_returns", lambda input_rows, input_columns: {
+        "SH.688146": ({"ytd": 128.4, "1w": None}, "bars_batch:tencent", "partial_history")
+    })
+
+    workbench._fill_lazy_stock_range_returns(rows, columns)
+
+    assert rows[0]["range_returns"]["ytd"] == 128.4
+    assert rows[0]["range_return_source"] == "bars_batch:tencent"
+    assert rows[0]["range_return_status"] == "partial_history"
+    assert rows[1]["range_return_status"] == "partial_history"
+
+
+def test_fill_lazy_stock_range_returns_marks_all_etf_spot_only_when_batch_empty(monkeypatch):
+    from signals.web.api import workbench
+
+    columns = workbench._watchlist_range_columns(date(2026, 6, 10))
+    rows = [
+        {
+            "symbol": "SH.511880",
+            "name": "银华日利ETF",
+            "macro_group": "all_etfs",
+            "source_collection": "strategy_snapshots.etf_analysis",
+            "range_returns": {},
+            "range_return_status": "lazy",
+        },
+        {
+            "symbol": "SH.688146",
+            "name": "中船特气",
+            "range_returns": {},
+            "range_return_status": "lazy",
+        },
+    ]
+
+    monkeypatch.setattr(workbench, "_batch_stock_range_returns", lambda input_rows, input_columns: {})
+
+    workbench._fill_lazy_stock_range_returns(rows, columns)
+
+    assert rows[0]["range_return_status"] == "spot_only"
+    assert rows[0]["range_return_source"] == "strategy_snapshots.etf_analysis.spot"
+    assert rows[1]["range_return_status"] == "lazy"
+
+
+def test_symbol_payload_cache_skips_loading_and_spot_fallbacks():
+    from signals.web.api import workbench
+
+    assert not workbench._symbol_payload_cacheable({
+        "chart": {
+            "ohlcv": [],
+            "meta": {"load_status": "running"},
+        },
+    })
+    assert not workbench._symbol_payload_cacheable({
+        "chart": {
+            "ohlcv": [],
+            "meta": {"cache_status": "not_ready", "not_ready_reason": "daily_cache_missing"},
+        },
+    })
+    assert not workbench._symbol_payload_cacheable({
+        "chart": {
+            "ohlcv": [{"time": 1, "close": 1}],
+            "meta": {"cache_status": "spot_only"},
+        },
+    })
+    assert workbench._symbol_payload_cacheable({
+        "chart": {
+            "ohlcv": [{"time": 1, "close": 1}],
+            "meta": {"cache_status": "ready"},
+        },
+    })
 
 
 def test_lightweight_stock_row_computes_no_trade_current_range(monkeypatch):
@@ -947,6 +1049,98 @@ def test_shell_etf_review_rows_expose_all_etf_universe_shape():
     assert rows[0]["latest_signal"] == "货币ETF"
     assert rows[0]["quote_source"] == "eastmoney_etf_spot"
     assert rows[0]["source_collection"] == "strategy_snapshots.etf_analysis"
+
+
+def test_etf_spot_snapshot_df_builds_daily_fallback(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_latest_etf_review_snapshot_item", lambda symbol: ({
+        "symbol": "SH.511880",
+        "name": "银华日利ETF",
+        "price": 101.23,
+        "change_pct": 0.12,
+        "amount": 123456789,
+        "vol": 456789,
+    }, "2026-06-10"))
+
+    df, source = workbench._etf_spot_snapshot_df("SH.511880")
+
+    assert source == "strategy_snapshots.etf_analysis.spot"
+    assert len(df) == 1
+    assert df.attrs["spot_snapshot_only"] is True
+    assert df.attrs["time_semantics"] == "spot_snapshot_daily_close"
+    assert float(df.iloc[0]["close"]) == 101.23
+    assert round(float(df.iloc[0]["open"]), 6) == round(101.23 / (1 + 0.12 / 100.0), 6)
+
+
+def test_latest_etf_review_snapshot_item_reads_nested_strategy_snapshot(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Collection:
+        def find_one(self, query=None, projection=None, sort=None):
+            assert query == {"snapshot.etf_analysis.review_universe": {"$exists": True}}
+            return {
+                "as_of": "2026-06-10",
+                "snapshot": {
+                    "as_of": "2026-06-10",
+                    "etf_analysis": {
+                        "universe": {"as_of": "2026-06-10"},
+                        "review_universe": [
+                            {
+                                "symbol": "SH.513310",
+                                "name": "中韩半导体ETF华泰柏瑞",
+                                "price": 5.525,
+                                "change_pct": -4.4,
+                            }
+                        ],
+                    },
+                },
+            }
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: {"strategy_snapshots": _Collection()})
+
+    item, as_of = workbench._latest_etf_review_snapshot_item("513310")
+
+    assert as_of == "2026-06-10"
+    assert item["symbol"] == "SH.513310"
+    assert item["price"] == 5.525
+
+
+def test_etf_spot_snapshot_df_uses_shell_cache_when_snapshot_missing(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_latest_etf_review_snapshot_item", lambda symbol: ({}, ""))
+    previous_cache = dict(workbench._SHELL_CACHE)
+    try:
+        workbench._SHELL_CACHE.update({
+            "payload": {
+                "watchlist_groups": {
+                    "all_etfs": [
+                        {
+                            "symbol": "SH.513310",
+                            "name": "中韩半导体ETF华泰柏瑞",
+                            "latest_price": 5.525,
+                            "day_change_pct": -4.4,
+                            "amount": 987654321,
+                        }
+                    ]
+                },
+                "watchlist_groups_meta": {
+                    "all_etfs": {"as_of": "2026-06-10"}
+                },
+            }
+        })
+
+        df, source = workbench._etf_spot_snapshot_df("513310")
+    finally:
+        workbench._SHELL_CACHE.clear()
+        workbench._SHELL_CACHE.update(previous_cache)
+
+    assert source == "strategy_snapshots.etf_analysis.spot"
+    assert len(df) == 1
+    assert df.attrs["spot_snapshot_only"] is True
+    assert float(df.iloc[0]["close"]) == 5.525
+    assert round(float(df.iloc[0]["open"]), 6) == round(5.525 / (1 - 4.4 / 100.0), 6)
 
 
 def test_static_index_alias_resolves_shanghai_composite():
@@ -3031,6 +3225,7 @@ def test_chain_representative_quote_rows_collects_nested_reps():
                 {
                     "leader_symbol": "SH.688498",
                     "leader_name": "源杰科技",
+                    "source_representatives": [{"symbol": "SH.688146", "name": "中船特气"}],
                     "representatives": [{"symbol": "SZ.300502", "name": "新易盛"}],
                 }
             ],
@@ -3041,8 +3236,71 @@ def test_chain_representative_quote_rows_collects_nested_reps():
         "SZ.300308",
         "SZ.002281",
         "SH.688498",
+        "SH.688146",
         "SZ.300502",
     ]
+
+
+def test_chain_candidate_groups_include_nested_market_representatives(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(workbench, "_stock_df", lambda symbol, freq: (pd.DataFrame(), ""))
+    monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {})
+
+    groups = workbench._candidate_groups_from_representatives({
+        "heat_score": 72.0,
+        "chain_id": "photovoltaic",
+        "chain_name": "光伏产业链",
+        "node_id": "pv_material",
+        "node_name": "硅料/硅片/组件",
+        "representatives": [
+            {
+                "symbol": "SZ.300274",
+                "name": "阳光电源",
+                "relation": "逆变器/储能弹性标的",
+                "representative_type": "elastic",
+                "priority": 86,
+                "day_change_pct": -5.87,
+            }
+        ],
+        "integrated_domains": [
+            {
+                "kind": "industry",
+                "name": "光伏主材",
+                "source_representatives": [
+                    {
+                        "symbol": "SH.600732",
+                        "name": "爱旭股份",
+                        "representative_type": "source_leader",
+                        "priority": 310,
+                        "day_change_pct": 10.03,
+                    },
+                    {
+                        "symbol": "SZ.002459",
+                        "name": "晶澳科技",
+                        "representative_type": "industry_constituent",
+                        "priority": 260,
+                        "day_change_pct": 9.98,
+                    },
+                    {
+                        "symbol": "SH.601012",
+                        "name": "隆基绿能",
+                        "representative_type": "industry_constituent",
+                        "priority": 250,
+                        "day_change_pct": 8.81,
+                    },
+                ],
+            }
+        ],
+    }, lightweight=True)
+
+    assert [row["symbol"] for row in groups["source_leaders"]] == ["SH.600732"]
+    assert [row["symbol"] for row in groups["constituents"][:2]] == ["SZ.002459", "SH.601012"]
+    assert groups["source_leaders"][0]["leader_tier"] == "当日领涨"
+    assert groups["constituents"][0]["leader_tier"] == "成分候选"
+    assert groups["constituents"][0]["source_note"] == "光伏主材真实涨幅成分"
+    assert groups["constituents"][0]["source_board_name"] == "光伏主材"
+    assert [row["symbol"] for row in groups["elastic"]] == ["SZ.300274"]
 
 
 def test_chain_heat_display_context_explains_driver_reference_and_representatives():
@@ -3384,6 +3642,101 @@ def test_chain_heat_representatives_show_source_leaders_before_static_elastic(mo
     preview = workbench._flatten_candidate_groups(groups, limit=3)
 
     assert [row["symbol"] for row in preview] == ["SH.600378", "SZ.002407", "SH.600673"]
+
+
+def test_chain_candidate_groups_apply_recent_new_high_badges():
+    from signals.web.api import workbench
+
+    class _Cursor(list):
+        def sort(self, *args, **kwargs):
+            return self
+
+        def limit(self, n):
+            return _Cursor(self[:n])
+
+    class _Collection:
+        def find(self, query=None, projection=None):
+            return _Cursor([
+                {
+                    "symbol": "SH.601963",
+                    "raw_code": "601963",
+                    "signal_type": "200日新高突破",
+                    "signal_side": "buy",
+                    "freq": "日线",
+                    "dt": datetime(2026, 6, 10),
+                    "score": 46.7,
+                    "confidence": 0.54,
+                }
+            ])
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    groups = {
+        "leaders": [],
+        "source_leaders": [],
+        "upstream": [],
+        "weighted": [],
+        "constituents": [
+            {
+                "symbol": "SH.601963",
+                "raw_code": "601963",
+                "name": "重庆银行",
+                "latest_signal": "待观察",
+                "why_watch": "成分候选",
+                "attention_score": 52,
+            }
+        ],
+        "elastic": [],
+        "downstream": [],
+    }
+
+    signals = workbench._latest_candidate_new_high_signals(_Db({"terminal_technical_signals": _Collection()}), groups)
+    enriched = workbench._apply_candidate_new_high_signals(groups, signals)
+    item = enriched["constituents"][0]
+
+    assert item["latest_signal"] == "200日新高"
+    assert item["new_high_signal"] == "200日新高"
+    assert "200日新高" in item["why_watch"]
+
+
+def test_new_high_candidate_probes_are_hidden_without_signal():
+    from signals.web.api import workbench
+
+    groups = {
+        "leaders": [],
+        "source_leaders": [],
+        "upstream": [],
+        "weighted": [],
+        "constituents": [
+            {
+                "symbol": "SH.601939",
+                "raw_code": "601939",
+                "name": "建设银行",
+                "latest_signal": "待观察",
+                "new_high_candidate_probe": True,
+            }
+        ],
+        "elastic": [],
+        "downstream": [],
+    }
+
+    assert workbench._apply_candidate_new_high_signals(groups, {})["constituents"] == []
+
+
+def test_late_session_momentum_label_uses_existing_intraday_momentum():
+    from signals.web.api import workbench
+
+    label = workbench._late_session_momentum_label({
+        "momentum_5m": 0.28,
+        "momentum_15m": 2.51,
+        "momentum_30m": 4.07,
+    })
+
+    assert label.startswith("尾盘拉升")
+    assert "30m +4.07%" in label
+    assert "15m +2.51%" in label
 
 
 def test_related_custom_signals_round_robin_symbols(monkeypatch):

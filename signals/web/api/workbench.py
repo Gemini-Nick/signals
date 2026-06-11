@@ -226,6 +226,29 @@ def _set_symbol_payload_cache(key: str, payload: Dict[str, Any]) -> None:
             _SYMBOL_PAYLOAD_CACHE.pop(oldest_key, None)
 
 
+def _clear_symbol_payload_cache(symbol: str, kind: str, freq: str) -> None:
+    key = _symbol_payload_cache_key(symbol, kind, freq)
+    with _SYMBOL_PAYLOAD_CACHE_LOCK:
+        _SYMBOL_PAYLOAD_CACHE.pop(key, None)
+
+
+def _symbol_payload_cacheable(payload: Dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    chart = payload.get("chart")
+    if not isinstance(chart, dict):
+        return True
+    meta = chart.get("meta") if isinstance(chart.get("meta"), dict) else {}
+    load_status = _text(meta.get("load_status"))
+    if load_status in {"triggered", "running"}:
+        return False
+    if _text(meta.get("cache_status")) in {"not_ready", "spot_only"}:
+        return False
+    if not _chart_has_ohlcv(chart) and _text(meta.get("not_ready_reason")):
+        return False
+    return True
+
+
 def _cached_build_workbench_symbol_payload(symbol: str, kind: str, freq: str) -> Dict[str, Any] | JSONResponse:
     key = _symbol_payload_cache_key(symbol, kind, freq)
     cached = _get_symbol_payload_cache(key)
@@ -236,7 +259,7 @@ def _cached_build_workbench_symbol_payload(symbol: str, kind: str, freq: str) ->
         if cached is not None:
             return cached
         payload = _build_workbench_symbol_payload(symbol, kind, freq)
-        if isinstance(payload, dict):
+        if isinstance(payload, dict) and _symbol_payload_cacheable(payload):
             _set_symbol_payload_cache(key, payload)
         return payload
 
@@ -4013,6 +4036,8 @@ def _slim_shell_sector_row(row: dict[str, Any]) -> dict[str, Any]:
         "range_return_status",
         "range_return_meta",
         "intraday_momentum_returns",
+        "late_session_signal",
+        "late_session_reason",
         "target_kind",
         "target_label",
         "target_symbol",
@@ -6055,6 +6080,148 @@ def _shell_etf_review_rows(strategy_snapshot: dict[str, Any], *, limit: int = 80
     return rows
 
 
+def _latest_etf_review_snapshot_item(symbol: str) -> tuple[dict[str, Any], str]:
+    normalized, raw_code = _normalize_stock_symbol(symbol)
+    keys = {
+        _text(symbol).upper(),
+        _text(normalized).upper(),
+        _text(raw_code),
+    }
+    keys = {key for key in keys if key}
+    if not keys:
+        return {}, ""
+    try:
+        doc = _mongo_db()["strategy_snapshots"].find_one(
+            {"snapshot.etf_analysis.review_universe": {"$exists": True}},
+            {
+                "_id": 0,
+                "updated_at": 1,
+                "as_of": 1,
+                "snapshot.as_of": 1,
+                "snapshot.etf_analysis.universe.as_of": 1,
+                "snapshot.etf_analysis.review_universe": 1,
+            },
+            sort=[("updated_at", -1), ("as_of", -1)],
+        ) or {}
+    except Exception:
+        return {}, ""
+    snapshot = doc.get("snapshot") if isinstance(doc.get("snapshot"), dict) else {}
+    etf_analysis = snapshot.get("etf_analysis") if isinstance(snapshot.get("etf_analysis"), dict) else {}
+    universe = etf_analysis.get("universe") if isinstance(etf_analysis.get("universe"), dict) else {}
+    as_of = _date_text(universe.get("as_of") or snapshot.get("as_of") or doc.get("as_of") or doc.get("updated_at") or _market_today("A"))
+    for item in etf_analysis.get("review_universe") or []:
+        if not isinstance(item, dict):
+            continue
+        item_symbol = _text(item.get("symbol") or item.get("code"))
+        item_normalized, item_raw_code = _normalize_stock_symbol(item_symbol)
+        item_keys = {
+            _text(item_symbol).upper(),
+            _text(item_normalized).upper(),
+            _text(item_raw_code),
+        }
+        if keys.intersection(key for key in item_keys if key):
+            return item, as_of
+    return {}, ""
+
+
+def _latest_etf_review_shell_item(symbol: str) -> tuple[dict[str, Any], str]:
+    normalized, raw_code = _normalize_stock_symbol(symbol)
+    keys = {
+        _text(symbol).upper(),
+        _text(normalized).upper(),
+        _text(raw_code),
+    }
+    keys = {key for key in keys if key}
+    if not keys:
+        return {}, ""
+    payload = _SHELL_CACHE.get("payload")
+    if not isinstance(payload, dict):
+        return {}, ""
+    groups = payload.get("watchlist_groups") if isinstance(payload.get("watchlist_groups"), dict) else {}
+    rows = groups.get("all_etfs") if isinstance(groups.get("all_etfs"), list) else []
+    meta = payload.get("watchlist_groups_meta") if isinstance(payload.get("watchlist_groups_meta"), dict) else {}
+    etf_meta = meta.get("all_etfs") if isinstance(meta.get("all_etfs"), dict) else {}
+    as_of = _date_text(etf_meta.get("as_of") or _market_today("A"))
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_keys: set[str] = set()
+        for key in ("symbol", "code", "raw_code", "target_symbol", "target_label", "label"):
+            value = _text(row.get(key))
+            if not value:
+                continue
+            row_symbol, row_raw_code = _normalize_stock_symbol(value)
+            row_keys.update({
+                value.upper(),
+                _text(row_symbol).upper(),
+                _text(row_raw_code),
+            })
+        if keys.intersection(key for key in row_keys if key):
+            return row, as_of
+    return {}, ""
+
+
+def _etf_spot_snapshot_df(symbol: str) -> tuple[pd.DataFrame, str]:
+    item, as_of = _latest_etf_review_snapshot_item(symbol)
+    if not item:
+        item, as_of = _latest_etf_review_shell_item(symbol)
+    if not item:
+        return pd.DataFrame(), ""
+    close = _first_numeric(item.get("price"), item.get("latest_price"), item.get("close"))
+    if close is None or close <= 0:
+        return pd.DataFrame(), ""
+    change_pct = _first_numeric(
+        item.get("change_pct"),
+        item.get("day_change_pct"),
+        item.get("daily_change_pct"),
+        item.get("today_change_pct"),
+        item.get("gain_pct"),
+    )
+    previous_close = close
+    if change_pct is not None and change_pct > -99.9:
+        previous_close = close / (1 + change_pct / 100.0)
+    open_price = _first_numeric(item.get("open"), previous_close, close) or close
+    high = _first_numeric(item.get("high"), max(open_price, close)) or max(open_price, close)
+    low = _first_numeric(item.get("low"), min(open_price, close)) or min(open_price, close)
+    trade_day = _date_text(item.get("trade_date") or item.get("dt") or item.get("date") or as_of or _market_today("A"))
+    try:
+        index = pd.DatetimeIndex([pd.Timestamp(trade_day)])
+    except Exception:
+        index = pd.DatetimeIndex([pd.Timestamp(_market_today("A"))])
+        trade_day = _market_today("A").isoformat()
+    df = pd.DataFrame(
+        [{
+            "open": open_price,
+            "high": max(high, open_price, close),
+            "low": min(low, open_price, close),
+            "close": close,
+            "vol": _float(item.get("vol") or item.get("volume"), 0) or 0,
+            "amount": _float(item.get("amount") or item.get("turnover"), 0) or 0,
+        }],
+        index=index,
+    )
+    df.attrs.update({
+        "collection": "strategy_snapshots.etf_analysis",
+        "as_of": trade_day,
+        "data_as_of": trade_day,
+        "latest_bar_time": pd.Timestamp(trade_day).isoformat(),
+        "freshness": "spot",
+        "gateway_freshness": "spot",
+        "gateway_is_stale": False,
+        "time_semantics": "spot_snapshot_daily_close",
+        "spot_snapshot_only": True,
+    })
+    return df, "strategy_snapshots.etf_analysis.spot"
+
+
+def _is_all_etf_review_row(row: dict[str, Any]) -> bool:
+    return (
+        _text(row.get("macro_group")) == "all_etfs"
+        or _text(row.get("source_collection")) == "strategy_snapshots.etf_analysis"
+        or _text(row.get("second_screen_role")) == "all_market_etf_review"
+    )
+
+
 def _split_macro_watchlist_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     major_indices: list[dict[str, Any]] = []
     industry_etfs: list[dict[str, Any]] = []
@@ -6164,6 +6331,8 @@ def _source_confidence_score(item: dict[str, Any]) -> float:
     relation_type = _text(item.get("chain_relation_type"))
     if source == "semantic_industry_chain" or rep_type in {"core", "elastic", "upstream", "downstream"} or relation_type in {"upstream", "downstream"}:
         return 90
+    if source in {"source_board_constituents", "chain_source_representatives"} or rep_type in {"source_leader", "concept_constituent", "industry_constituent", "new_high_constituent"}:
+        return 82
     if source in {"concept_rank", "concept_sina", "concept_em", "concept_ths", "strategy_snapshot"}:
         return 78
     if source in {"industry_leader_map", "industry_candidates"}:
@@ -6185,7 +6354,7 @@ def _role_score(item: dict[str, Any], leader_rank: int = 0) -> float:
         return 74
     if rep_type == "source_leader":
         return 80
-    if rep_type in {"industry_constituent", "industry_candidate"}:
+    if rep_type in {"concept_constituent", "industry_constituent", "industry_candidate", "new_high_constituent"}:
         return 48
     return 55
 
@@ -6250,7 +6419,9 @@ def _candidate_leader_tier(item: dict[str, Any], leader_rank: int) -> str:
         return "弹性"
     if rep_type == "source_leader":
         return "当日领涨"
-    if rep_type in {"industry_constituent", "industry_candidate"}:
+    if rep_type == "new_high_constituent":
+        return "新高"
+    if rep_type in {"concept_constituent", "industry_constituent", "industry_candidate"}:
         return "成分候选"
     return "观察"
 
@@ -6455,6 +6626,205 @@ def _flatten_candidate_groups(groups: dict[str, list[dict[str, Any]]], limit: in
             if len(output) >= limit:
                 return output
     return output
+
+
+def _candidate_group_symbol_keys(item: dict[str, Any]) -> tuple[str, str]:
+    for key in ("symbol", "code", "raw_code"):
+        symbol, raw_code = _normalize_stock_symbol(_text(item.get(key)))
+        if symbol or raw_code:
+            return _text(symbol).upper(), _text(raw_code)
+    return "", ""
+
+
+def _latest_candidate_new_high_signals(db: Any, groups: dict[str, list[dict[str, Any]]]) -> dict[str, dict[str, Any]]:
+    raw_codes: set[str] = set()
+    symbols: set[str] = set()
+    for rows in groups.values():
+        for item in rows or []:
+            if not isinstance(item, dict):
+                continue
+            symbol, raw_code = _candidate_group_symbol_keys(item)
+            if symbol:
+                symbols.add(symbol)
+            if raw_code:
+                raw_codes.add(raw_code)
+    if not raw_codes and not symbols:
+        return {}
+    try:
+        expected_day = _day_change_expected_day()
+        window_start = datetime.fromisoformat(expected_day) - timedelta(days=35)
+    except Exception:
+        window_start = datetime.utcnow() - timedelta(days=35)
+    query_or = []
+    if raw_codes:
+        query_or.extend([
+            {"raw_code": {"$in": sorted(raw_codes)}},
+            {"code": {"$in": sorted(raw_codes)}},
+        ])
+    if symbols:
+        query_or.append({"symbol": {"$in": sorted(symbols)}})
+    if not query_or:
+        return {}
+    try:
+        cursor = db["terminal_technical_signals"].find(
+            {
+                "$and": [
+                    {"$or": query_or},
+                    {
+                        "$or": [
+                            {"signal_type": {"$regex": "200日新高|新高突破"}},
+                            {"evidence.entry_factor.group": "200d_new_high_breakout"},
+                            {"entry_factor.group": "200d_new_high_breakout"},
+                        ],
+                    },
+                    {"signal_side": {"$in": ["buy", "left", "right", ""]}},
+                    {
+                        "$or": [
+                            {"dt": {"$gte": window_start}},
+                            {"signal_date": {"$gte": window_start}},
+                            {"event_dt": {"$gte": window_start}},
+                        ],
+                    },
+                ]
+            },
+            {
+                "_id": 0,
+                "symbol": 1,
+                "raw_code": 1,
+                "code": 1,
+                "signal_type": 1,
+                "freq": 1,
+                "score": 1,
+                "confidence": 1,
+                "dt": 1,
+                "signal_date": 1,
+                "event_dt": 1,
+                "evidence.entry_factor": 1,
+                "entry_factor": 1,
+            },
+        ).sort([("dt", -1), ("signal_date", -1), ("event_dt", -1)]).limit(max(24, len(raw_codes) * 4))
+        docs = list(cursor)
+    except Exception:
+        return {}
+    lookup: dict[str, dict[str, Any]] = {}
+    for doc in docs:
+        symbol, raw_code = _candidate_group_symbol_keys(doc)
+        entry_factor = doc.get("entry_factor") if isinstance(doc.get("entry_factor"), dict) else {}
+        evidence = doc.get("evidence") if isinstance(doc.get("evidence"), dict) else {}
+        if not entry_factor and isinstance(evidence.get("entry_factor"), dict):
+            entry_factor = evidence.get("entry_factor") or {}
+        raw_signal = _text(doc.get("signal_type"))
+        signal_label = _shell_stock_breakout_summary(entry_factor) or (
+            "200日新高" if any(token in raw_signal for token in ("200日新高", "新高突破")) else raw_signal
+        ) or "200日新高"
+        payload = {
+            "new_high_signal": "200日新高",
+            "new_high_label": signal_label,
+            "new_high_freq": doc.get("freq"),
+            "new_high_as_of": _date_text(doc.get("dt") or doc.get("signal_date") or doc.get("event_dt")),
+            "new_high_score": _float(doc.get("score")),
+            "new_high_confidence": _float(doc.get("confidence")),
+        }
+        for key in (symbol, raw_code):
+            if key and key not in lookup:
+                lookup[key] = payload
+    return lookup
+
+
+def _apply_candidate_new_high_signals(groups: dict[str, list[dict[str, Any]]], signals: dict[str, dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    if not signals:
+        return {
+            key: [row for row in rows if not row.get("new_high_candidate_probe")]
+            for key, rows in groups.items()
+        }
+    enriched: dict[str, list[dict[str, Any]]] = {}
+    for key, rows in groups.items():
+        updated_rows: list[dict[str, Any]] = []
+        for row in rows:
+            symbol, raw_code = _candidate_group_symbol_keys(row)
+            signal = signals.get(symbol) or signals.get(raw_code)
+            if not signal:
+                if row.get("new_high_candidate_probe"):
+                    continue
+                updated_rows.append(row)
+                continue
+            updated = dict(row)
+            badge = _text(signal.get("new_high_label") or signal.get("new_high_signal")) or "200日新高"
+            current_signal = _text(updated.get("latest_signal"))
+            if not current_signal or current_signal == "待观察":
+                updated["latest_signal"] = badge
+            elif badge not in current_signal:
+                updated["latest_signal"] = f"{badge} / {current_signal}"
+            signal_badges = [item for item in updated.get("signal_badges") or [] if _text(item)]
+            if badge not in signal_badges:
+                signal_badges.insert(0, badge)
+            updated["signal_badges"] = signal_badges[:4]
+            updated["new_high_signal"] = signal.get("new_high_signal")
+            updated["new_high_label"] = badge
+            updated["new_high_freq"] = signal.get("new_high_freq")
+            updated["new_high_as_of"] = signal.get("new_high_as_of")
+            updated["attention_score"] = round((_float(updated.get("attention_score"), 0) or 0) + 8.0, 2)
+            why_watch = _text(updated.get("why_watch"))
+            if badge not in why_watch:
+                updated["why_watch"] = " · ".join(part for part in [why_watch, badge] if part)
+            updated_rows.append(updated)
+        if key == "leaders":
+            tier_order = {"龙头": 0, "龙二": 1, "龙三": 2}
+            updated_rows.sort(key=lambda item: (
+                tier_order.get(_text(item.get("leader_tier")), 9),
+                -(_float(item.get("attention_score"), 0) or 0),
+            ))
+        else:
+            updated_rows.sort(key=lambda item: (
+                1 if item.get("new_high_signal") else 0,
+                _float(item.get("day_change_pct"), 0) or 0,
+                _float(item.get("attention_score"), 0) or 0,
+            ), reverse=True)
+        enriched[key] = updated_rows
+    return enriched
+
+
+def _new_high_probe_rows_for_chain_sources(db: Any, doc: dict[str, Any], *, limit: int = 80) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    source_driver = doc.get("source_driver") if isinstance(doc.get("source_driver"), dict) else {}
+    if source_driver:
+        sources.append(source_driver)
+    for domain in doc.get("integrated_domains") or []:
+        if isinstance(domain, dict):
+            sources.append(domain)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source in sources[:5]:
+        source_name = _text(source.get("name"))
+        if not source_name:
+            continue
+        try:
+            symbols, stock_names = _constituent_symbols_for_source(db, source)
+        except Exception:
+            continue
+        for raw in symbols:
+            symbol, raw_code = _normalize_stock_symbol(_text(raw))
+            if not symbol or not raw_code or raw_code in seen:
+                continue
+            seen.add(raw_code)
+            rows.append({
+                "symbol": symbol,
+                "raw_code": raw_code,
+                "code": symbol,
+                "name": stock_names.get(raw_code) or stock_names.get(symbol) or _stock_name(symbol) or raw_code,
+                "leader_tier": "新高",
+                "chain_role": f"{source_name}成分",
+                "representative_type": "new_high_constituent",
+                "source": "terminal_technical_signals",
+                "source_note": f"{source_name}新高成分",
+                "latest_signal": "待观察",
+                "why_watch": f"{source_name} · 新高待确认",
+                "attention_score": 50.0,
+                "new_high_candidate_probe": True,
+            })
+            if len(rows) >= limit:
+                return rows
+    return rows
 
 
 def _mapping_chain_from_carrier(name: str, carrier: Optional[dict[str, Any]], *, kind: str) -> dict[str, Any]:
@@ -6860,6 +7230,78 @@ def _chain_risk_flags(row: dict[str, Any], data_truth: dict[str, Any]) -> list[s
     return flags
 
 
+_CHAIN_REPRESENTATIVE_TYPE_RANK = {
+    "source_leader": 90,
+    "new_high_constituent": 84,
+    "concept_constituent": 80,
+    "industry_constituent": 78,
+    "industry_candidate": 72,
+    "core": 70,
+    "industry_leader": 68,
+    "upstream": 64,
+    "downstream": 62,
+    "elastic": 58,
+}
+
+
+def _chain_representative_market_rank(rep: dict[str, Any]) -> tuple[float, float, float, float]:
+    rep_type = _text(rep.get("representative_type"))
+    return (
+        _CHAIN_REPRESENTATIVE_TYPE_RANK.get(rep_type, 50),
+        _float(rep.get("day_change_pct"), -999) or -999,
+        _float(rep.get("priority"), 0) or 0,
+        _float(rep.get("amount"), 0) or 0,
+    )
+
+
+def _chain_candidate_representatives(row: dict[str, Any]) -> list[dict[str, Any]]:
+    representatives: dict[tuple[str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str]] = []
+
+    def add(rep: dict[str, Any], domain: Optional[dict[str, Any]] = None, *, source_rep: bool = False) -> None:
+        if not isinstance(rep, dict):
+            return
+        symbol = _text(rep.get("symbol") or rep.get("code") or rep.get("raw_code")).upper()
+        name = _text(rep.get("name"))
+        if not symbol and not name:
+            return
+        rep_type = _text(rep.get("representative_type")) or ("industry_constituent" if source_rep else "elastic")
+        source_board_name = _text(rep.get("source_board_name"))
+        source_board_kind = _text(rep.get("source_board_kind"))
+        if domain:
+            source_board_name = source_board_name or _text(domain.get("name"))
+            source_board_kind = source_board_kind or _text(domain.get("kind"))
+        item = {
+            **rep,
+            "representative_type": rep_type,
+            "source": rep.get("source") or ("chain_source_representatives" if source_rep else "chain_heat_snapshots"),
+            "source_board_name": source_board_name or rep.get("source_board_name"),
+            "source_board_kind": source_board_kind or rep.get("source_board_kind"),
+        }
+        if source_rep and source_board_name and not _text(item.get("source_note")):
+            item["source_note"] = f"{source_board_name}真实涨幅成分"
+        if source_board_name and not _text(item.get("relation")):
+            item["relation"] = f"{source_board_name}真实涨幅成分" if source_rep else source_board_name
+        key = (symbol or name, rep_type)
+        if key not in representatives:
+            representatives[key] = item
+            order.append(key)
+            return
+        if _chain_representative_market_rank(item) > _chain_representative_market_rank(representatives[key]):
+            representatives[key] = item
+
+    for rep in row.get("representatives") or []:
+        add(rep)
+    for domain in row.get("integrated_domains") or []:
+        if not isinstance(domain, dict):
+            continue
+        for rep in domain.get("source_representatives") or []:
+            add(rep, domain, source_rep=True)
+        for rep in domain.get("representatives") or []:
+            add(rep, domain)
+    return [representatives[key] for key in order]
+
+
 def _candidate_groups_from_representatives(row: dict[str, Any], *, lightweight: bool = False) -> dict[str, list[dict[str, Any]]]:
     groups: dict[str, list[dict[str, Any]]] = {
         "upstream": [],
@@ -6873,7 +7315,7 @@ def _candidate_groups_from_representatives(row: dict[str, Any], *, lightweight: 
     heat_score = _float(row.get("heat_score"), 0) or 0
     daily_cache: dict[str, tuple[pd.DataFrame, str]] = {}
     core_rank = 0
-    for rep in row.get("representatives") or []:
+    for rep in _chain_candidate_representatives(row):
         if not isinstance(rep, dict):
             continue
         representative_type = _text(rep.get("representative_type"))
@@ -6886,7 +7328,7 @@ def _candidate_groups_from_representatives(row: dict[str, Any], *, lightweight: 
             "symbol": rep.get("symbol"),
             "name": rep.get("name"),
             "relation": rep.get("relation"),
-            "source": "chain_heat_snapshots",
+            "source": rep.get("source") or "chain_heat_snapshots",
             "representative_type": representative_type,
             "attention_score": heat_score + _float(rep.get("priority"), 0) * 0.1,
             "chain_id": row.get("chain_id"),
@@ -6914,7 +7356,7 @@ def _candidate_groups_from_representatives(row: dict[str, Any], *, lightweight: 
             groups["weighted"].append(payload)
         elif representative_type == "source_leader":
             groups["source_leaders"].append(payload)
-        elif representative_type in {"concept_constituent", "industry_constituent", "industry_candidate"}:
+        elif representative_type in {"concept_constituent", "industry_constituent", "industry_candidate", "new_high_constituent"}:
             groups["constituents"].append(payload)
         else:
             groups["elastic"].append(payload)
@@ -6937,7 +7379,16 @@ def _candidate_groups_from_representatives(row: dict[str, Any], *, lightweight: 
             ), reverse=True)
         else:
             rows.sort(key=lambda item: _float(item.get("attention_score"), 0) or 0, reverse=True)
-        groups[key] = rows[:8 if key != "leaders" else 3]
+        limit_by_key = {
+            "leaders": 6,
+            "source_leaders": 12,
+            "constituents": 12,
+            "weighted": 8,
+            "upstream": 8,
+            "elastic": 8,
+            "downstream": 8,
+        }
+        groups[key] = rows[:limit_by_key.get(key, 8)]
     return groups
 
 
@@ -6953,7 +7404,10 @@ def _chain_heat_shell_graph_enabled() -> bool:
 
 
 def _chain_heat_shell_range_returns_enabled() -> bool:
-    return _text(os.getenv("WORKBENCH_CHAIN_HEAT_SHELL_RANGE_RETURNS")).lower() in {"1", "true", "yes", "on"}
+    value = _text(os.getenv("WORKBENCH_CHAIN_HEAT_SHELL_RANGE_RETURNS")).lower()
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return True
 
 
 def _chain_heat_shell_theme_rows_enabled() -> bool:
@@ -6984,6 +7438,9 @@ def _chain_representative_quote_rows(docs: list[dict[str, Any]]) -> list[dict[st
             leader_symbol = _text(domain.get("leader_symbol"))
             if leader_symbol:
                 add({"symbol": leader_symbol, "name": domain.get("leader_name")})
+            for rep in domain.get("source_representatives") or []:
+                if isinstance(rep, dict):
+                    add(rep)
             for rep in domain.get("representatives") or []:
                 if isinstance(rep, dict):
                     add(rep)
@@ -7307,6 +7764,24 @@ def _standalone_theme_rank_bonus(name: str, reason: str) -> float:
 def _format_signed_pct(value: Any) -> str:
     numeric = _float(value)
     return f"{numeric:+.2f}%" if numeric is not None else ""
+
+
+def _late_session_momentum_label(doc: dict[str, Any]) -> str:
+    m5 = _float(doc.get("momentum_5m"))
+    m15 = _float(doc.get("momentum_15m"))
+    m30 = _float(doc.get("momentum_30m"))
+    if not ((m30 is not None and m30 >= 2.0) or (m15 is not None and m15 >= 1.2)):
+        return ""
+    if m5 is not None and m5 < -1.0 and (m15 is None or m15 < 1.8):
+        return ""
+    parts = []
+    if m30 is not None:
+        parts.append(f"30m {_format_signed_pct(m30)}")
+    if m15 is not None:
+        parts.append(f"15m {_format_signed_pct(m15)}")
+    if m5 is not None:
+        parts.append(f"5m {_format_signed_pct(m5)}")
+    return "尾盘拉升" + (f" {' / '.join(parts)}" if parts else "")
 
 
 def _chain_reference_domain(doc: dict[str, Any], domains: list[dict[str, Any]]) -> dict[str, Any]:
@@ -7878,7 +8353,33 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             target_label = _text(primary.get("name")) or _text(doc.get("node_name") or doc.get("chain_name"))
             range_targets.append((target_kind, target_label))
     range_lookup = _board_heat_range_returns_batch(range_targets, range_columns) if range_targets else {}
+    candidate_groups_by_doc: list[dict[str, list[dict[str, Any]]]] = []
+    candidate_signal_pool: dict[str, list[dict[str, Any]]] = {
+        "upstream": [],
+        "leaders": [],
+        "weighted": [],
+        "elastic": [],
+        "downstream": [],
+        "source_leaders": [],
+        "constituents": [],
+    }
     for doc in docs:
+        groups = _candidate_groups_from_representatives(doc, lightweight=True)
+        existing_codes = {
+            _candidate_group_symbol_keys(item)[1]
+            for item in _flatten_candidate_groups(groups, limit=64)
+            if _candidate_group_symbol_keys(item)[1]
+        }
+        for probe in _new_high_probe_rows_for_chain_sources(db, doc):
+            _, raw_code = _candidate_group_symbol_keys(probe)
+            if raw_code and raw_code not in existing_codes:
+                groups.setdefault("constituents", []).append(probe)
+                existing_codes.add(raw_code)
+        candidate_groups_by_doc.append(groups)
+        for key, group_rows in groups.items():
+            candidate_signal_pool.setdefault(key, []).extend(group_rows)
+    candidate_new_high_signals = _latest_candidate_new_high_signals(db, candidate_signal_pool)
+    for doc, base_candidate_groups in zip(docs, candidate_groups_by_doc):
         integrated = doc.get("integrated_domains") if isinstance(doc.get("integrated_domains"), list) else []
         primary = integrated[0] if integrated and isinstance(integrated[0], dict) else {}
         target_kind = _text(primary.get("kind")) or "industry"
@@ -7900,8 +8401,13 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
             "stage": display_stage or doc.get("stage"),
         })
         label = " · ".join([item for item in [display_chain_name, display_node_name] if item])
-        candidate_groups = _candidate_groups_from_representatives(doc, lightweight=True)
+        candidate_groups = _apply_candidate_new_high_signals(base_candidate_groups, candidate_new_high_signals)
         display_context = _chain_heat_display_context(display_doc, candidate_groups)
+        late_session_signal = _late_session_momentum_label(doc)
+        if late_session_signal:
+            change_explain = _text(display_context.get("change_explain"))
+            if late_session_signal not in change_explain:
+                display_context["change_explain"] = "；".join(part for part in [change_explain, late_session_signal] if part)
         concept_overlays = doc.get("source_concept_overlays") if isinstance(doc.get("source_concept_overlays"), list) else []
         source_event_overlays = doc.get("source_event_concept_overlays") if isinstance(doc.get("source_event_concept_overlays"), list) else []
         theme_overlays = doc.get("source_theme_overlays") if isinstance(doc.get("source_theme_overlays"), list) else []
@@ -7966,6 +8472,8 @@ def _chain_heat_sector_rows(limit: int = 16) -> list[dict[str, Any]]:
                 "momentum_15m": doc.get("momentum_15m"),
                 "momentum_30m": doc.get("momentum_30m"),
             },
+            "late_session_signal": late_session_signal,
+            "late_session_reason": late_session_signal,
             "range_return_source": range_source or "chain_heat_snapshots",
             "range_return_status": range_meta.get("status") or ("board_heat_price" if range_returns else "board_heat_kline_missing"),
             "range_return_meta": range_meta,
@@ -8114,6 +8622,116 @@ def _shell_stock_range_return_limit(group: str) -> int:
         return max(0, int(os.getenv(env_name, str(defaults.get(group, 12)))))
     except (TypeError, ValueError):
         return defaults.get(group, 12)
+
+
+def _batch_stock_range_returns(
+    rows: list[dict[str, Any]],
+    range_columns: list[dict[str, Any]],
+) -> dict[str, tuple[dict[str, Optional[float]], str, str]]:
+    if not rows or not _range_return_column_keys(range_columns):
+        return {}
+    code_to_symbol: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("range_returns"):
+            continue
+        symbol = _text(row.get("symbol") or row.get("code") or row.get("target_symbol") or row.get("label"))
+        normalized, raw_code = _normalize_stock_symbol(symbol)
+        raw = raw_code or _text(row.get("raw_code")) or (normalized or symbol).split(".")[-1]
+        raw = raw.strip()
+        if raw:
+            code_to_symbol.setdefault(raw, normalized or symbol)
+    if not code_to_symbol:
+        return {}
+    start_dates = [
+        pd.Timestamp(_text(column.get("start_date")))
+        for column in range_columns
+        if _text(column.get("start_date"))
+    ]
+    start_dates = [item for item in start_dates if not pd.isna(item)]
+    min_start = min(start_dates) if start_dates else None
+    query: dict[str, Any] = {
+        "meta.symbol": {"$in": sorted(code_to_symbol)},
+        "meta.freq": "日线",
+    }
+    if min_start is not None:
+        query["dt"] = {"$gte": min_start.to_pydatetime()}
+    try:
+        cursor = _mongo_db()["bars"].find(
+            query,
+            {"_id": 0, "dt": 1, "close": 1, "meta.symbol": 1, "meta.source": 1},
+        ).sort([("meta.symbol", 1), ("dt", 1)])
+        docs = list(cursor)
+    except Exception:
+        return {}
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    sources: dict[str, set[str]] = {}
+    for doc in docs:
+        meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+        raw = _text(meta.get("symbol"))
+        if not raw:
+            continue
+        grouped.setdefault(raw, []).append(doc)
+        source = _text(meta.get("source"))
+        if source:
+            sources.setdefault(raw, set()).add(source)
+    output: dict[str, tuple[dict[str, Optional[float]], str, str]] = {}
+    for raw, symbol in code_to_symbol.items():
+        records = [
+            {
+                "dt": pd.to_datetime(doc.get("dt"), errors="coerce"),
+                "close": _float(doc.get("close")),
+            }
+            for doc in grouped.get(raw, [])
+        ]
+        records = [
+            item for item in records
+            if not pd.isna(item["dt"]) and item["close"] is not None
+        ]
+        if not records:
+            continue
+        df = pd.DataFrame(records).sort_values("dt").drop_duplicates(subset=["dt"], keep="last").set_index("dt")
+        returns = _compute_range_returns(df, range_columns)
+        if not returns:
+            continue
+        status = _range_return_status_from_returns(returns, range_columns)
+        source_label = "+".join(sorted(sources.get(raw) or [])) or "bars"
+        output[_text(symbol).upper()] = (returns, f"bars_batch:{source_label}", status)
+    return output
+
+
+def _fill_lazy_stock_range_returns(
+    rows: list[dict[str, Any]],
+    range_columns: list[dict[str, Any]],
+) -> None:
+    lookup = _batch_stock_range_returns(rows, range_columns)
+    if not lookup and not any(isinstance(row, dict) and _is_all_etf_review_row(row) for row in rows):
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        existing_returns = row.get("range_returns") if isinstance(row.get("range_returns"), dict) else {}
+        if existing_returns:
+            if _text(row.get("range_return_status")) in {"", "lazy"}:
+                row["range_return_status"] = _range_return_status_from_returns(existing_returns, range_columns)
+            continue
+        symbol = _text(row.get("symbol") or row.get("code") or row.get("target_symbol") or row.get("label"))
+        normalized, _ = _normalize_stock_symbol(symbol)
+        key = _text(normalized or symbol).upper()
+        payload = lookup.get(key) if lookup else None
+        if not payload:
+            if _text(row.get("range_return_status")) in {"", "lazy"}:
+                if _is_all_etf_review_row(row):
+                    row["range_return_status"] = "spot_only"
+                    row["range_return_source"] = row.get("range_return_source") or "strategy_snapshots.etf_analysis.spot"
+                elif lookup:
+                    row["range_return_status"] = "unsupported_market" if key.startswith(("HK.", "US.")) else "range_returns_kline_empty"
+            continue
+        returns, source, status = payload
+        row["range_returns"] = returns
+        row["range_return_source"] = source
+        row["range_return_status"] = status
 
 
 def _shell_stock_group_display_cap(group: str) -> int:
@@ -9180,6 +9798,17 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     remaining_manual_clues = _remaining_manual_clues_after_attack_focus(manual_clues, manual_attack_focus)
     scored_raw = _merge_stock_rows_by_symbol(remaining_manual_clues + (clue_stocks or strategy_clues))
     scored = _enrich_scored_stock_rows(scored_raw, range_columns)
+    for stock_rows in (
+        all_etfs,
+        focus_stocks,
+        risk_stocks,
+        watch_stocks,
+        clue_stocks,
+        manual_clues,
+        scored,
+        sell_warnings,
+    ):
+        _fill_lazy_stock_range_returns(stock_rows, range_columns)
     focus_stocks_meta = _focus_stock_pool_meta(len(focus_stocks))
     if manual_focus_count:
         focus_stocks_meta["manual_attack_count"] = manual_focus_count
@@ -10424,6 +11053,8 @@ def _trigger_stock_chart_load(symbol: str, raw_code: str, freq: str) -> dict[str
                 "monotonic_started_at": started,
             })
             _CHART_LOAD_JOBS[key] = current
+        if ok:
+            _clear_symbol_payload_cache(symbol, "stock", canonical)
 
     threading.Thread(target=_runner, name=f"stock-chart-load-{key}", daemon=True).start()
     return _stock_chart_load_meta(symbol, canonical, job, triggered=True)
@@ -10747,6 +11378,8 @@ def _representative_payload(item: dict[str, Any]) -> dict[str, Any]:
         "relation": item.get("relation"),
         "source": item.get("source"),
         "source_note": item.get("source_note"),
+        "source_board_name": item.get("source_board_name"),
+        "source_board_kind": item.get("source_board_kind"),
         "representative_type": item.get("representative_type"),
         "representative_priority": item.get("representative_priority"),
         "representative_relation": item.get("representative_relation"),
@@ -10760,6 +11393,8 @@ def _representative_payload(item: dict[str, Any]) -> dict[str, Any]:
         "layer": item.get("layer"),
         "stage": item.get("stage"),
         "confidence": item.get("confidence"),
+        "amount": item.get("amount"),
+        "turnover_pct": item.get("turnover_pct"),
         "hit_terms": item.get("hit_terms") or [],
         "evidence_sources": item.get("evidence_sources") or [],
         "bar_source": item.get("bar_source"),
@@ -11874,7 +12509,40 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
         if load_status in {"ready", "failed"} and not _chart_has_ohlcv(chart):
             _clear_stock_chart_load_job(symbol, requested_freq)
             chart = _attach_chart_load_meta(chart, _trigger_stock_chart_load(symbol, raw_code, requested_freq))
+    spot_snapshot_fallback = False
+    if requested_freq == "daily" and not _chart_has_ohlcv(chart):
+        spot_df, spot_source = _etf_spot_snapshot_df(symbol)
+        if not spot_df.empty:
+            load_meta = {
+                key: value
+                for key, value in (chart.get("meta") or {}).items()
+                if key.startswith("load_")
+            }
+            chart = _chart_from_df(spot_df, symbol=symbol, freq="daily", source=spot_source, live_render=False)
+            meta = dict(chart.get("meta") or {})
+            meta.update(load_meta)
+            meta.update({
+                "cache_status": "spot_only",
+                "fallback_reason": "spot_snapshot_fallback",
+                "not_ready_reason": "history_cache_missing",
+                "history_cache_status": "missing",
+                "spot_snapshot_only": True,
+                "requested_freq": requested_freq,
+                "effective_freq": "daily",
+            })
+            chart["meta"] = meta
+            spot_snapshot_fallback = True
     chart = _mark_chart_readiness(chart, kind="stock", requested_freq=requested_freq)
+    if spot_snapshot_fallback:
+        meta = dict(chart.get("meta") or {})
+        meta.update({
+            "cache_status": "spot_only",
+            "fallback_reason": "spot_snapshot_fallback",
+            "not_ready_reason": "history_cache_missing",
+            "history_cache_status": "missing",
+            "spot_snapshot_only": True,
+        })
+        chart["meta"] = meta
     chart = _merge_signal_pool_into_chart(chart, symbol, chart.get("meta", {}).get("freq", requested_freq))
     custom_signal_diagnostics = _custom_signal_diagnostics(symbol, requested_freq, chart.get("signals", []))
     try:
@@ -11904,7 +12572,7 @@ async def _build_stock_target(symbol: str, raw_code: str, freq: str) -> Dict[str
             "requested_freq": requested_freq,
             "effective_freq": requested_freq,
             "available_freqs": UI_FREQS,
-            "fallback_reason": "",
+            "fallback_reason": chart.get("meta", {}).get("fallback_reason", ""),
             "not_ready_reason": chart.get("meta", {}).get("not_ready_reason", ""),
             **_target_diagnostics("stock", symbol, requested_freq),
         },

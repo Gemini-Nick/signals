@@ -154,7 +154,27 @@ INTRADAY_DROP_FOCUS_BLOCK_PCT = -5.0
 INTRADAY_DROP_SCORE_PENALTY_START_PCT = -2.0
 BUY_POINT_POOL_ANCHOR_MAX_AGE_DAYS = 2
 RIGHT_SIDE_FREQS = {"5分钟", "5min", "5m", "F5", "f5", "15分钟", "15min", "15m", "F15", "f15"}
-BUY_FREQ_BONUS = {"30分钟": 120, "30min": 120, "30m": 120, "15分钟": 110, "15min": 110, "15m": 110, "5分钟": 80, "5min": 80, "5m": 80}
+BUY_FREQ_BONUS = {
+    "日线": 145,
+    "daily": 145,
+    "1d": 145,
+    "D": 145,
+    "d": 145,
+    "周线": 140,
+    "weekly": 140,
+    "1w": 140,
+    "W": 140,
+    "w": 140,
+    "30分钟": 100,
+    "30min": 100,
+    "30m": 100,
+    "15分钟": 80,
+    "15min": 80,
+    "15m": 80,
+    "5分钟": 70,
+    "5min": 70,
+    "5m": 70,
+}
 ENTRY_30M_FREQS = {"30分钟", "30min", "30m", "F30", "f30"}
 ENTRY_UPPER_FREQS = {"日线", "daily", "1d", "D", "d", "周线", "weekly", "1w", "W", "w"}
 DEFAULT_CANDIDATE_ANCHOR_FREQS = ENTRY_30M_FREQS | ENTRY_UPPER_FREQS
@@ -163,7 +183,7 @@ PRIMARY_MA_PERIODS = (5, 10, 20)
 ENTRY_PARTNER_FREQS = ENTRY_UPPER_FREQS | RIGHT_SIDE_FREQS
 ENTRY_QUEUE_LANES = {"entry_ready", "entry_waiting_confirm", "entry_waiting_upper_context", "entry_waiting_right_side_confirm"}
 RISK_ACTION_STATUSES = {"risk_review", "chain_risk_review", "knowledge_blocked", "knowledge_conflict"}
-POOL_RANKING_VERSION = "tech_ma_hot_sector_v13_upper_primary"
+POOL_RANKING_VERSION = "tech_ma_hot_sector_v14_upper_proximity"
 SETUP_RANK_TIERS = {
     "right_executable": 300,
     "right_attack": 200,
@@ -2414,11 +2434,11 @@ def _default_opportunity_candidate_rows(
 def _timeframe_priority_for_freq(freq: Any) -> float:
     text = _text(freq)
     if text in {"日线", "daily", "1d", "D", "d"}:
+        return 36.0
+    if text in {"周线", "weekly", "1w", "W", "w"}:
         return 34.0
     if _is_30m_freq(text):
-        return 28.0
-    if text in {"周线", "weekly", "1w", "W", "w"}:
-        return 20.0
+        return 22.0
     if _is_right_side_freq(text):
         return 12.0
     return 0.0
@@ -2580,6 +2600,59 @@ def _fib_ma_support_score(
     include_row_level: bool = True,
 ) -> float:
     return _fib_ma_support_score_from_alignment(_best_ma_alignment(row, reasons, include_row_level=include_row_level))
+
+
+def _best_abs_ma_distance_pct(ma: dict[str, Any]) -> float | None:
+    values: list[float] = []
+    for period in KEY_MA_PERIODS:
+        for prefix in ("distance_ma", "low_distance_ma", "touch_distance_ma"):
+            value = _float(ma.get(f"{prefix}{period}_pct"))
+            if value is not None:
+                values.append(abs(value))
+    array = ma.get("fib_ma_array")
+    if isinstance(array, list):
+        for item in array:
+            if not isinstance(item, dict):
+                continue
+            for key in ("distance_pct", "low_distance_pct", "touch_distance_pct"):
+                value = _float(item.get(key))
+                if value is not None:
+                    values.append(abs(value))
+    return min(values) if values else None
+
+
+def _upper_buy_proximity_score(row: dict[str, Any], buy_reasons: list[dict[str, Any]] | None = None) -> float:
+    reasons = _current_buy_technical_reasons(row) if buy_reasons is None else buy_reasons
+    upper_reasons = [
+        reason
+        for reason in reasons
+        if _is_upper_freq(reason.get("freq")) and _technical_opportunity_side(reason) in {"left", "right"}
+    ]
+    if not upper_reasons:
+        return 0.0
+    ma = _best_ma_alignment(row, upper_reasons, include_row_level=False)
+    score = 24.0
+    best_distance = _best_abs_ma_distance_pct(ma)
+    if best_distance is not None:
+        if best_distance <= 0.8:
+            score += 28.0
+        elif best_distance <= 1.5:
+            score += 22.0
+        elif best_distance <= 2.5:
+            score += 15.0
+        elif best_distance <= 4.0:
+            score += 8.0
+    elif any(
+        _truthy_bool(ma.get(key))
+        for period in (8, 10, 13, 20, 21)
+        for key in (f"near_ma{period}", f"reclaim_ma{period}")
+    ):
+        score += 14.0
+    elif any(_truthy_bool(ma.get(f"above_ma{period}")) for period in PRIMARY_MA_PERIODS):
+        score += 6.0
+    score += min(10.0, _ma_alignment_score_from_alignment(ma) * 0.22)
+    score += min(10.0, _fib_ma_support_score_from_alignment(ma) * 0.6)
+    return round(min(68.0, score), 3)
 
 
 def _ma_left_attack_confirmed(ma: dict[str, Any]) -> bool:
@@ -3715,6 +3788,7 @@ def _entry_components(row: dict[str, Any], top_buy: dict[str, Any]) -> dict[str,
         "multi_period_bonus": _multi_period_score(buy_reasons),
         "indicator_breadth": _indicator_breadth_score(buy_reasons),
         "buy_point_quality": _buy_point_quality(row, buy_reasons),
+        "upper_buy_proximity": _upper_buy_proximity_score(row, buy_reasons),
         "breakout_momentum": _new_high_breakout_score(row, buy_reasons),
         "relative_resilience": _refusal_pullback_score(row, buy_reasons),
         "ma_alignment": _ma_alignment_score(row, buy_reasons, include_row_level=False),
@@ -3746,6 +3820,7 @@ def _rank_reason(score_components: dict[str, float]) -> str:
         "entry_readiness": "买点确认",
         "focus_review": "买点复核",
         "buy_point_quality": "买点质量",
+        "upper_buy_proximity": "日/周近买点",
         "breakout_momentum": "新高动量",
         "relative_resilience": "拒绝回调",
         "ma_alignment": "均线确认",
@@ -3787,6 +3862,8 @@ def _rank_reason(score_components: dict[str, float]) -> str:
         selected.append(("relative_resilience", score_components["relative_resilience"]))
     if _float(score_components.get("fib_ma_acceptance")) and not any(key == "fib_ma_acceptance" for key, _ in selected):
         selected.append(("fib_ma_acceptance", score_components["fib_ma_acceptance"]))
+    if _float(score_components.get("upper_buy_proximity")) and not any(key == "upper_buy_proximity" for key, _ in selected):
+        selected.append(("upper_buy_proximity", score_components["upper_buy_proximity"]))
     parts = []
     for key, value in selected:
         numeric = _float(value)
@@ -3817,6 +3894,7 @@ def _watch_components(row: dict[str, Any], gate_status: str) -> dict[str, float]
         "multi_period_bonus": _multi_period_score(buy_reasons),
         "indicator_breadth": _indicator_breadth_score(buy_reasons),
         "buy_point_quality": _buy_point_quality(row, buy_reasons),
+        "upper_buy_proximity": _upper_buy_proximity_score(row, buy_reasons),
         "breakout_momentum": _new_high_breakout_score(row, buy_reasons),
         "relative_resilience": _refusal_pullback_score(row, buy_reasons),
         "ma_alignment": _ma_alignment_score(row, buy_reasons, include_row_level=False),
@@ -5224,6 +5302,8 @@ def _split_pool_rows(
         key=lambda item: (
             _float(item.get("setup_rank_tier")),
             _float(item.get("mainline_rank_tier")),
+            _float((item.get("score_components") or {}).get("upper_buy_proximity")),
+            _float((item.get("score_components") or {}).get("timeframe_priority")),
             _float(item.get("rank_score")),
             _float(item.get("score")),
         ),
@@ -5234,13 +5314,15 @@ def _split_pool_rows(
         _assign_pool_ranks(bucket)
     watch.sort(
         key=lambda item: (
-            _float(item.get("rank_score")),
+            _float((item.get("score_components") or {}).get("upper_buy_proximity")),
             _float((item.get("score_components") or {}).get("timeframe_priority")),
             _float((item.get("score_components") or {}).get("multi_period_bonus")),
             _float((item.get("score_components") or {}).get("indicator_breadth")),
+            _float((item.get("score_components") or {}).get("relative_resilience")),
             _float((item.get("score_components") or {}).get("buy_point_quality")),
             _float((item.get("score_components") or {}).get("ma_alignment")),
             _float((item.get("score_components") or {}).get("fib_ma_acceptance")),
+            _float(item.get("rank_score")),
             _float((item.get("score_components") or {}).get("hot_sector")),
             _float(item.get("score")),
         ),

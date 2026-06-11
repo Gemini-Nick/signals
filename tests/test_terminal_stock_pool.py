@@ -1620,8 +1620,50 @@ def test_terminal_stock_pool_watch_rank_prefers_daily_then_30m_weekly_execution(
 
     split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
 
-    assert [row["raw_code"] for row in split["watch"][:4]] == ["300401", "300402", "300403", "300404"]
-    assert [row["score_components"]["timeframe_priority"] for row in split["watch"][:4]] == [34.0, 28.0, 20.0, 12.0]
+    assert [row["raw_code"] for row in split["watch"][:4]] == ["300401", "300403", "300402", "300404"]
+    assert [row["score_components"]["timeframe_priority"] for row in split["watch"][:4]] == [36.0, 34.0, 22.0, 12.0]
+
+
+def test_terminal_stock_pool_watch_rank_prioritizes_near_upper_buy_point():
+    rows = {}
+    near_upper_ma = _ma_alignment(above5=False, above10=True, above20=True, near20=True, score=32)
+    near_upper_ma.update({
+        "distance_ma20_pct": 0.7,
+        "low_distance_ma20_pct": 0.25,
+    })
+    _add_reason(rows, "300441", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "near-daily-buy",
+        "signal_type": "一买",
+        "signal_side": "buy",
+        "freq": "日线",
+        "score": 78,
+        "confidence": 0.72,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": near_upper_ma,
+    }, index_codes=set(), name="日线近买点股")
+    _add_reason(rows, "300442", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "plain-30m-buy",
+        "signal_type": "三买",
+        "signal_side": "buy",
+        "freq": "30分钟",
+        "score": 100,
+        "confidence": 0.86,
+        "event_dt": "2026-05-08",
+        "as_of": "2026-05-08",
+        "ma_alignment": _ma_alignment(),
+    }, index_codes=set(), name="短线强但缺日周股")
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert [row["raw_code"] for row in split["watch"][:2]] == ["300441", "300442"]
+    assert split["watch"][0]["score_components"]["upper_buy_proximity"] > 0
+    assert split["watch"][1]["score_components"]["upper_buy_proximity"] == 0
+    assert "日/周近买点" in split["watch"][0]["rank_reason"]
 
 
 def test_terminal_stock_pool_scores_fibonacci_ma_acceptance_separately():
