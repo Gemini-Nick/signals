@@ -143,10 +143,86 @@ def test_strategy_snapshot_prefers_chain_heat_as_primary_theme():
         journal_summary={"total": 1, "evaluated": 0, "pending": 1},
     )
 
-    assert snapshot["daily_brief"]["primary_theme"] == "半导体产业链"
-    assert snapshot["market_regime"]["primary_theme"] == "半导体产业链"
+    assert snapshot["daily_brief"]["primary_theme"] == "半导体产业链 · 晶圆制造"
+    assert snapshot["market_regime"]["primary_theme"] == "半导体产业链 · 晶圆制造"
     assert snapshot["themes"][0]["domain"] == "chain_heat"
     assert snapshot["themes"][0]["representative_symbols"]
+
+
+def test_strategy_snapshot_surfaces_specific_lithium_chain_node():
+    from signals.strategy.snapshot import build_strategy_snapshot
+
+    snapshot = build_strategy_snapshot(
+        responses={
+            "chain_heat": Resp([
+                {
+                    "chain_name": "有色金属产业链",
+                    "node_name": "稀土/小金属",
+                    "node_id": "rare_earth_minor",
+                    "heat_score": 70.0,
+                    "change_pct": 10.0,
+                    "rank": 1,
+                    "phase": "warming",
+                    "integrated_domains": [{"name": "钼", "change_pct": 10.0, "leader_name": "金钼股份"}],
+                },
+                {
+                    "chain_name": "半导体产业链",
+                    "node_name": "材料/光刻胶",
+                    "node_id": "material_photoresist",
+                    "heat_score": 65.0,
+                    "change_pct": 6.5,
+                    "rank": 2,
+                    "phase": "warming",
+                    "integrated_domains": [{"name": "半导体材料", "change_pct": 6.5, "leader_name": "康强电子"}],
+                },
+                {
+                    "chain_name": "基础化工产业链",
+                    "node_name": "化工材料",
+                    "node_id": "chemical_material",
+                    "heat_score": 50.0,
+                    "change_pct": 5.8,
+                    "rank": 3,
+                    "phase": "warming",
+                    "integrated_domains": [{"name": "磷肥及磷化工", "change_pct": 5.8, "leader_name": "兴发集团"}],
+                },
+                {
+                    "chain_name": "半导体产业链",
+                    "node_name": "半导体设备",
+                    "node_id": "semiconductor_equipment",
+                    "heat_score": 45.0,
+                    "change_pct": 3.5,
+                    "rank": 4,
+                    "phase": "warming",
+                    "integrated_domains": [{"name": "半导体设备", "change_pct": 3.5, "leader_name": "耐科装备"}],
+                },
+                {
+                    "chain_name": "电新/锂电池产业链",
+                    "node_name": "锂资源",
+                    "node_id": "lithium_resource",
+                    "heat_score": 33.0,
+                    "change_pct": 6.0,
+                    "rank": 5,
+                    "phase": "diverging",
+                    "representatives": [{"symbol": "SZ.002213", "name": "大为股份"}],
+                    "integrated_domains": [
+                        {"name": "锂", "change_pct": 6.0, "leader_name": "永杉锂业"},
+                        {"name": "锂矿概念", "change_pct": 2.6, "leader_name": "大为股份"},
+                    ],
+                },
+            ], "chain_heat_snapshots", as_of="2026-06-11"),
+            "board": Resp([], "board_ranking"),
+            "concept": Resp([], "concept_ranking"),
+            "market_pool": Resp({"symbols": []}, "market_pools"),
+            "quote": Resp([], "quote_snapshots"),
+            "signal": Resp([], "signals"),
+        },
+        journal_summary={"total": 0, "evaluated": 0, "pending": 0},
+    )
+
+    lithium = next(item for item in snapshot["themes"] if item["chain_name"] == "电新/锂电池产业链")
+    assert lithium["name"] == "电新/锂电池产业链 · 锂矿/锂资源"
+    assert lithium["node_name"] == "锂资源"
+    assert lithium["leader"] == "永杉锂业"
 
 
 def test_strategy_snapshot_filters_backtest_and_stale_signals_from_candidates():

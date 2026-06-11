@@ -599,6 +599,17 @@ def _latest_terminal_pool_response(db: Any) -> dict[str, Any]:
 
 
 def _chain_leader_name(row: Mapping[str, Any]) -> str:
+    domains = row.get("integrated_domains")
+    if isinstance(domains, list):
+        ranked_domains = sorted(
+            (item for item in domains if isinstance(item, Mapping)),
+            key=lambda item: _float(item.get("change_pct") or item.get("leader_change_pct"), 0.0),
+            reverse=True,
+        )
+        for item in ranked_domains:
+            leader = str(item.get("leader_name") or item.get("leader_symbol") or "").strip()
+            if leader:
+                return leader
     representatives = row.get("representatives")
     if isinstance(representatives, list):
         for item in representatives:
@@ -606,14 +617,31 @@ def _chain_leader_name(row: Mapping[str, Any]) -> str:
                 name = str(item.get("name") or "").strip()
                 if name:
                     return name
-    domains = row.get("integrated_domains")
-    if isinstance(domains, list):
-        for item in domains:
-            if isinstance(item, Mapping):
-                leader = str(item.get("leader_name") or item.get("leader_symbol") or "").strip()
-                if leader:
-                    return leader
     return ""
+
+
+def _chain_node_display_name(row: Mapping[str, Any]) -> str:
+    node = str(row.get("node_name") or "").strip()
+    node_id = str(row.get("node_id") or "").strip()
+    domains = row.get("integrated_domains")
+    domain_names: list[str] = []
+    if isinstance(domains, list):
+        domain_names = [
+            str(item.get("name") or "").strip()
+            for item in domains
+            if isinstance(item, Mapping)
+        ]
+    if node_id == "lithium_resource" or "锂资源" in node or any("锂矿" in name for name in domain_names):
+        return "锂矿/锂资源"
+    return node
+
+
+def _chain_theme_display_name(row: Mapping[str, Any]) -> str:
+    chain = str(row.get("chain_name") or row.get("name") or "").strip()
+    node = _chain_node_display_name(row)
+    if chain and node and node not in chain:
+        return f"{chain} · {node}"
+    return chain or node
 
 
 def _chain_theme_symbols(row: Mapping[str, Any]) -> list[str]:
@@ -652,11 +680,12 @@ def _build_chain_themes(chain_resp: Any) -> list[dict[str, Any]]:
     themes: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in rows:
-        name = str(row.get("chain_name") or row.get("name") or "").strip()
-        if not name or name in seen:
+        chain_name = str(row.get("chain_name") or row.get("name") or "").strip()
+        if not chain_name or chain_name in seen:
             continue
-        seen.add(name)
+        seen.add(chain_name)
         node = str(row.get("node_name") or "").strip()
+        name = _chain_theme_display_name(row)
         heat_score = _float(row.get("heat_score"))
         change_pct = _float(row.get("change_pct"))
         strength = heat_score if heat_score is not None else (change_pct if change_pct is not None else 0.0)
@@ -664,8 +693,11 @@ def _build_chain_themes(chain_resp: Any) -> list[dict[str, Any]]:
         risk = "一致高潮风险" if phase in {"consensus_climax", "risk_off"} else ("产业链退潮观察" if phase == "cooling" else "")
         symbols = _chain_theme_symbols(row)
         themes.append({
-            "theme_id": f"chain_heat:{name}",
+            "theme_id": f"chain_heat:{chain_name}:{row.get('node_id') or node or name}",
             "name": name,
+            "chain_name": chain_name,
+            "node_name": node,
+            "node_id": str(row.get("node_id") or ""),
             "domain": "chain_heat",
             "rank": len(themes) + 1,
             "strength": round(strength, 3),
