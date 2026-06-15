@@ -682,6 +682,24 @@ def _fmt_pct(value: Any, *, signed: bool = True) -> str:
     return f"{sign}{pct:.2f}%"
 
 
+def _fmt_index_move(value: Any) -> str:
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    if abs(pct) < 0.005:
+        return "平盘"
+    verb = "涨" if pct > 0 else "跌"
+    return f"{verb}{abs(pct):.2f}%"
+
+
+def _sentence(text: str) -> str:
+    text = _text(text)
+    if not text or text.endswith(("。", "！", "？")):
+        return text
+    return text + "。"
+
+
 def _market_line(dashboard: dict[str, Any], shell: dict[str, Any], snapshot: dict[str, Any]) -> str:
     brief = dashboard.get("daily_brief") if isinstance(dashboard.get("daily_brief"), dict) else {}
     market = shell.get("market") if isinstance(shell.get("market"), dict) else {}
@@ -727,7 +745,7 @@ def _index_kill_line(shell: dict[str, Any]) -> str:
         ("创业板指", "创业板"),
         ("科创50", "科创50"),
     ]
-    parts = [f"{label}{_fmt_pct(changes[name], signed=False)}" for name, label in ordered if name in changes]
+    parts = [f"{label}{_fmt_index_move(changes[name])}" for name, label in ordered if name in changes]
     if not parts:
         return "指数结构缺少可直接引用的涨跌幅，先以板块强弱和三池变化复盘。"
     return "，".join(parts)
@@ -917,14 +935,14 @@ def _generic_replay_paragraphs(
     extra_facts: list[str],
     market_replay_sections: list[str] | None = None,
 ) -> list[str]:
-    board_line = _sector_strength_line(sector_rows, limit=8)
+    board_line = _replay_strength_names(sector_rows, limit=2)
+    index_sentence = _sentence(index_line)
     validation_line = (
-        "明日验证点要落到这些数据："
-        f"板块前排={board_line}；"
-        f"三池数量=板块{counts['sectors']}、盯盘{counts['watch']}、买点/机会{counts['focus']}、风险{counts['risk']}；"
-        f"买点池={action_names}；继续观察={watch_names}；风险/排雷={risk_names}；"
-        f"指数线={index_line if index_line.endswith('。') else index_line + '。'}"
-        "下一交易日只验证这些数据是否延续、修复或恶化，不再单独写没有证据支撑的方向判断。"
+        "明天只盯三点：\n"
+        f"1. 强方向：{board_line}能不能继续扩散。\n"
+        f"2. 前排个股：{action_names}能不能跟着板块走出来。\n"
+        f"3. 风险线：{risk_names}有没有继续扩散。\n"
+        f"指数参考：{index_sentence}"
     )
     confirmed = _sector_names_by_action(sector_rows, "产业链确认")
     source_weak = _sector_names_by_action(sector_rows, "源强链弱")
@@ -932,15 +950,13 @@ def _generic_replay_paragraphs(
     factual_lines = [line for line in [*event_lines[:4], *extra_facts[:6]] if _text(line)]
     if factual_lines:
         flow_paragraph = (
-            f"先说资金流动链条。盘中可引用的转折线和补充事实是：{'；'.join(factual_lines)}。"
-            "没有事实覆盖的时间段不编具体时间和价位，而是把资金切换写成可验证的结构："
-            "指数是否继续杀、强板块是否扩散、弱链条是否拖累高位核心，以及尾盘是否还有承接。"
+            f"盘中能引用的转折是：{'；'.join(factual_lines)}。"
+            "没有事实覆盖的时间段不补故事，明天只验证指数、前排板块、高成交核心和尾盘承接是否继续同向。"
         )
     else:
         flow_paragraph = (
-            "先说资金流动链条。当前没有传入可验证的分钟级转折线，所以不编具体时间和价位；"
-            "资金切换先按指数损伤、板块15强弱和三池变化来复盘：指数是否继续杀、强板块是否扩散、"
-            "弱链条是否拖累高位核心，以及尾盘是否还有承接。"
+            "当前没有传入可验证的分钟级转折线，所以不编具体时间和价位。"
+            "复盘先按指数、板块强弱和三池变化来落点：前排能否扩散，高成交核心是否承接，尾盘是否继续转弱。"
         )
     has_tech_replay = bool(
         market_replay_sections
@@ -948,20 +964,18 @@ def _generic_replay_paragraphs(
     )
     if has_tech_replay:
         opening = (
-            "今天复盘先定两个坐标：方向和节奏。方向上，涨幅榜前排不能直接代表主线；"
-            "真正决定账户体感和明日验证的是科技高成交链的压力测试，CPO/通信线缆、半导体、PCB/算力同时承担"
-            "“受伤主线”和“验证锚”。节奏上，是早盘恐慌、盘中局部抄底反弹、午后承接失败。"
-            f"{index_line if index_line.endswith('。') else index_line + '。'}"
-            "所以今天不能写成“某两个板块最强”，而要判断这轮下跌是主线换挡，还是修复前的二次压力测试。"
+            "今天先看结论：指数不差，但科技高成交的体感偏分歧。"
+            f"{index_sentence}"
+            "CPO/通信线缆、半导体、PCB/算力里有先修的票，也有继续拖的核心。"
+            "明天先看高成交前排能不能停止放量回落，尾盘承接能不能回来。"
         )
     else:
         opening = (
-            "今天市场的真实结构是：盘面看着热闹，尾盘一锅端。"
-            f"给你一个最直接的结论—最终强度更集中在{_replay_strength_names(sector_rows, limit=2)}，"
-            "但其他交易量前排仍有复盘价值，关键要看它们是主线确认、受伤主线，还是压力锚。"
-            f"{index_line if index_line.endswith('。') else index_line + '。'}"
-            "但数字掩盖了真实杀伤力—高成交核心冲高回落无承接，会直接拖累尾盘情绪。"
-            "这类盘面不能只看最终涨幅，要同时看强度、链主确认、弹性跟随、炸板回落和尾盘承接。"
+            "今天先看结论：指数收红，但盘面不是普涨。"
+            f"{index_sentence}"
+            f"强度主要在{_replay_strength_names(sector_rows, limit=2)}，"
+            "分歧主要看高成交核心。"
+            "明天先看强方向能不能扩散，以及高成交科技股能不能止住回落。"
         )
     sections = [
         opening,

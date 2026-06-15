@@ -209,7 +209,7 @@ def _fmt_pct_points(value: Any) -> str:
     number = _float(value)
     if number is None:
         return "N/A"
-    return f"{number:.2f}pct"
+    return f"{number:.2f}个百分点"
 
 
 def _fmt_number(value: Any) -> str:
@@ -217,6 +217,15 @@ def _fmt_number(value: Any) -> str:
     if number is None:
         return "N/A"
     return f"{number:.2f}".rstrip("0").rstrip(".")
+
+
+def _fmt_intraday_time(value: Any) -> str:
+    text = _text(value)
+    if len(text) == 6 and text.isdigit():
+        return f"{text[:2]}:{text[2:4]}:{text[4:]}"
+    if len(text) == 4 and text.isdigit():
+        return f"{text[:2]}:{text[2:]}"
+    return text
 
 
 def _fmt_amount_yi_for_prose(value: Any) -> str:
@@ -1891,7 +1900,7 @@ def _event_chain_for_snapshot(
         phrase += f"，单日成交{_fmt_number(amount_yi)}亿"
     first_limit_time = _text(limit_meta.get("first_limit_up_time"))
     if first_limit_time:
-        phrase += f"，首封{first_limit_time}"
+        phrase += f"，首封{_fmt_intraday_time(first_limit_time)}"
     if limit_meta.get("open_count") is not None:
         phrase += f"，开板/炸板{_fmt_number(limit_meta.get('open_count'))}次"
     if limit_meta.get("seal_amount") is not None:
@@ -2280,16 +2289,40 @@ def _board_role_map_section(context: dict[str, Any]) -> str:
     if not role_map:
         return ""
 
-    def row_phrase(row: dict[str, Any], *, evidence_limit: int = 2) -> str:
+    def evidence_prose(text: str) -> str:
+        text = _text(text)
+        text = re.sub(r"，状态[^，]+", "", text)
+        text = re.sub(r"，板块成交额缺失.*$", "", text)
+        text = text.replace("板块前排第", "板块排第")
+        replacements = (
+            ("高成交压力=", ""),
+            ("压力核心=", ""),
+            ("动态核心=", "高成交核心是"),
+            ("弹性确认=", "弹性票是"),
+            ("涨跌", "收盘"),
+        )
+        for old, new in replacements:
+            text = text.replace(old, new)
+        text = text.replace("(", "（").replace(")", "）").replace(",", "，")
+        text = re.sub(r"收盘\+([0-9.]+)%", r"收盘涨\1%", text)
+        text = re.sub(r"收盘-([0-9.]+)%", r"收盘跌\1%", text)
+        text = re.sub(r"开盘压力\+([0-9.]+)%", r"开盘涨\1%", text)
+        text = re.sub(r"开盘压力-([0-9.]+)%", r"开盘跌\1%", text)
+        return text
+
+    def row_phrase(row: dict[str, Any], *, evidence_limit: int = 2, prefer_pressure: bool = False) -> str:
         name = _text(row.get("name"))
-        roles = row.get("roles") if isinstance(row.get("roles"), list) else []
         evidence = row.get("evidence") if isinstance(row.get("evidence"), list) else []
         if not name:
             return ""
-        brief = "、".join(_text(item) for item in evidence[:evidence_limit] if _text(item))
-        return f"{name}({brief})" if brief else name
+        evidence_rows = evidence
+        if prefer_pressure:
+            pressure_evidence = [item for item in evidence if "压力" in _text(item)]
+            evidence_rows = pressure_evidence or evidence
+        brief = "、".join(evidence_prose(item) for item in evidence_rows[:evidence_limit] if _text(item))
+        return f"{name}（{brief}）" if brief else name
 
-    wounded = []
+    pressure: list[tuple[bool, str]] = []
     repair = []
     front = []
     focus_tokens = ("机器人", "通信", "线缆", "CPO", "光模块", "半导体", "集成电路", "PCB", "印制电路", "算力")
@@ -2301,30 +2334,38 @@ def _board_role_map_section(context: dict[str, Any]) -> str:
     for row in role_map[:10]:
         roles = row.get("roles") if isinstance(row.get("roles"), list) else []
         role_text = "/".join(_text(role) for role in roles)
-        phrase = row_phrase(row)
+        evidence_text = "/".join(_text(item) for item in row.get("evidence", []) if _text(item))
+        has_front = "主线/前排观察" in roles
+        has_pressure_evidence = "压力" in evidence_text
+        has_hard_pressure = (
+            ("受伤主线" in role_text or "高成交压力" in role_text or ("压力锚" in role_text and not has_front))
+            and has_pressure_evidence
+        )
+        phrase = row_phrase(row, prefer_pressure=has_hard_pressure)
         if not phrase:
             continue
-        if "受伤主线" in role_text:
-            wounded.append(phrase)
+        if has_hard_pressure:
+            pressure.append((is_focus_board(row), phrase))
         elif is_focus_board(row) and ("修复锚" in role_text or "弹性锚" in role_text):
             repair.append(phrase)
-        elif is_focus_board(row) and "主线/前排观察" in roles:
+        elif is_focus_board(row) and has_front:
             front.append(phrase)
 
     parts = []
-    if wounded:
-        parts.append("受伤主线/压力锚=" + "、".join(wounded[:4]))
+    if pressure:
+        focus_pressure = [phrase for is_focus, phrase in pressure if is_focus]
+        pressure_phrases = focus_pressure or [phrase for _, phrase in pressure]
+        parts.append("压力主要在" + "、".join(pressure_phrases[:2]))
     if repair:
-        parts.append("修复锚=" + "、".join(repair[:3]))
+        parts.append("有修复尝试的是" + "、".join(repair[:2]))
     if front:
-        parts.append("涨幅卡位/前排=" + "、".join(front[:3]))
+        parts.append("涨幅前排的" + "、".join(front[:2]) + "先按观察")
     if not parts:
         return ""
     return (
-        "板块选择先按角色分层，不按涨幅榜平铺。"
+        "板块上，先把强方向和压力线分开看。"
         + "；".join(parts)
-        + "。这对应“先定方向再定节奏”：强板块如果只是卡位，不直接升级为主线；"
-        "受伤主线如果仍有成交和修复锚，明日反而要继续验证承接。"
+        + "。明天如果压力线止跌、修复线能扩散，盘面才算真正好转。"
     )
 
 
@@ -2357,17 +2398,17 @@ def _turnover_representative_section(context: dict[str, Any]) -> str:
         name = _text(row.get("name"))
         if not name:
             return ""
-        parts = [
-            f"第{_fmt_number(row.get('rank'))}",
-            f"{_fmt_number(row.get('amount_yi'))}亿",
-            _fmt_pct(row.get("change_pct")),
-        ]
-        first_red = row.get("first_red") if isinstance(row.get("first_red"), dict) else {}
-        status = _text(first_red.get("status"))
-        first_time = _text(first_red.get("first_close_above_time") or first_red.get("first_touch_time"))
-        if status == "confirmed" and first_time:
-            parts.append(f"{first_time}翻红")
-        return f"{name}({','.join(part for part in parts if part)})"
+        amount = _fmt_amount_yi_for_prose(row.get("amount_yi"))
+        change = _float(row.get("change_pct"))
+        if change is None:
+            change_text = "涨跌待核"
+        elif change > 0:
+            change_text = f"收涨{abs(change):.2f}%"
+        elif change < 0:
+            change_text = f"收跌{abs(change):.2f}%"
+        else:
+            change_text = "基本收平"
+        return f"{name}{amount}亿{change_text}"
 
     pressure_rows = []
     repair_rows = []
@@ -2378,25 +2419,24 @@ def _turnover_representative_section(context: dict[str, Any]) -> str:
         has_first_red = _text(first_red.get("status")) == "confirmed"
         if "压力" in role or change < 0:
             pressure_rows.append(row)
-        if "修复" in role or has_first_red or change > 0:
+        if change >= 0 and ("修复" in role or has_first_red or change > 0):
             repair_rows.append(row)
 
-    pressure = [concise_phrase(row) for row in pressure_rows[:9]]
-    repair = [concise_phrase(row) for row in repair_rows[:6]]
+    pressure = [concise_phrase(row) for row in pressure_rows[:3]]
+    repair = [concise_phrase(row) for row in repair_rows[:3]]
     pressure = [item for item in pressure if item]
     repair = [item for item in repair if item]
     if not pressure and not repair:
         return ""
     parts = []
-    if pressure:
-        parts.append("压力锚=" + "、".join(pressure))
     if repair:
-        parts.append("修复/翻红锚=" + "、".join(repair))
+        parts.append("收红的是" + "、".join(repair))
+    if pressure:
+        parts.append("拖累的是" + "、".join(pressure))
     return (
-        "成交额代表篮子只回答两个问题：谁在拖累，谁先修复。"
+        "高成交前排分化很明显。"
         + "；".join(parts)
-        + "。这就是为什么不能只写CPO或中际旭创：同一条科技主线内部同时有压力、翻红和承接失败，"
-        "要用成交额排名、涨跌、开盘缺口和分钟路径一起定角色。"
+        + "。这里不能简单写成科技线修复，明天要看收跌的高成交票能不能止住。"
     )
 
 
@@ -2411,7 +2451,7 @@ def _stock_phrase(row: dict[str, Any]) -> str:
     limit_pool = row.get("limit_pool") if isinstance(row.get("limit_pool"), dict) else {}
     first_time = _text(limit_pool.get("first_limit_up_time"))
     if first_time:
-        phrase += f"，首封{first_time}"
+        phrase += f"，首封{_fmt_intraday_time(first_time)}"
     if limit_pool.get("open_count") is not None:
         phrase += f"，开板/炸板{_fmt_number(limit_pool.get('open_count'))}次"
     if limit_pool.get("seal_amount") is not None:
@@ -2464,9 +2504,9 @@ def _carding_section(context: dict[str, Any]) -> str:
     if not cards:
         return ""
     return (
-        f"看一下今天盘面的卡位结构。全天至少有{len(cards)}次明显切换："
+        f"今天有{len(cards)}次比较明显的方向切换："
         + "；".join(cards)
-        + "。这些切换说明资金在不同方向之间反复试错，真正要等的是某个方向在强度、链主和弹性上同时压住其他方向。"
+        + "。这些切换只能说明资金还在试错，明天要看哪条线能持续排在前面，并且高成交核心不再拖后腿。"
     )
 
 
@@ -2485,6 +2525,7 @@ def _stock_event_section(context: dict[str, Any]) -> str:
     parts = [part for part in parts if part]
     first_window = next(iter(context.get("rotation_windows") or []), {})
     top_boards = first_window.get("top_boards") if isinstance(first_window, dict) else []
+    top_boards = top_boards if isinstance(top_boards, list) else []
     opening_tokens = _tokenize_board_text(*[_text(row.get("name")) for row in top_boards[:4]])
 
     def event_is_opening_relevant(row: dict[str, Any]) -> bool:
@@ -2507,13 +2548,22 @@ def _stock_event_section(context: dict[str, Any]) -> str:
     opening = ""
     opening_pressure = context.get("opening_pressure_boards") if isinstance(context.get("opening_pressure_boards"), list) else []
     pressure_names = [_text(row.get("name")) for row in opening_pressure[:4] if _text(row.get("name"))]
-    if any(name in {"CPO概念", "光模块", "通信线缆及配套"} or "CPO" in name or "光模块" in name for name in pressure_names):
+    low_open = [row for row in events if "低开承压" in row.get("labels", [])]
+    if low_open:
+        low_open_label = _event_theme_label(low_open[0])
+        if any(name in {"CPO概念", "光模块", "通信线缆及配套"} or "CPO" in name or "光模块" in name for name in pressure_names) or low_open_label == "光模块":
+            opening += "开盘后光模块方向直接低开。"
+        elif low_open_label:
+            opening += f"开盘后{low_open_label}方向直接承压。"
+        elif pressure_names and any(event_is_opening_relevant(row) for row in low_open[:3]):
+            opening += f"开盘后{pressure_names[0]}方向直接承压。"
+        else:
+            opening += "开盘后高成交核心直接承压。"
+        opening += "承压个股包括" + "，".join(_text(row.get("name")) for row in low_open[:3] if _text(row.get("name"))) + "。"
+    elif any(name in {"CPO概念", "光模块", "通信线缆及配套"} or "CPO" in name or "光模块" in name for name in pressure_names):
         opening += "开盘后光模块方向直接低开。"
     elif pressure_names:
         opening += f"开盘后{pressure_names[0]}方向直接承压。"
-    low_open = [row for row in events if "低开承压" in row.get("labels", [])]
-    if low_open:
-        opening += "高成交核心直接承压—" + "，".join(_text(row.get("name")) for row in low_open[:3] if _text(row.get("name"))) + "。"
     if limit_parts:
         opening += "资金随后攻击早盘强势分支。" + "，".join(limit_parts[:5]) + "。"
     collapse = ""
@@ -2592,7 +2642,7 @@ def _emotion_temperature_section(context: dict[str, Any]) -> str:
     tail = ""
     if failed:
         names = "、".join(_text(row.get("name")) for row in failed[:4] if _text(row.get("name")))
-        tail = f"冲高回落/炸板样本{len(failed)}个，前排是{names}。"
+        tail = f"冲高回落样本不少，前排是{names}。"
     pressure_line = ""
     if pressure:
         pressure_line = (
@@ -2600,10 +2650,10 @@ def _emotion_temperature_section(context: dict[str, Any]) -> str:
             f"跌幅{_fmt_pct(pressure.get('change_pct'))}，说明高成交核心还没有形成价格承接。"
         )
     return (
-        "关于情绪温度，只按可量化样本判断。"
+        "情绪上，今天的问题不在指数，而在高位和高成交的回落。"
         + tail
         + pressure_line
-        + "明日只验证两件事：这些回落样本是否继续扩大，以及高成交核心是否停止放量收跌。"
+        + "明天只看两件事：回落样本有没有继续扩大，高成交核心能不能停止放量收跌。"
     )
 
 
@@ -2624,11 +2674,10 @@ def _index_cycle_section(context: dict[str, Any]) -> str:
     close_label = "最新收盘"
     days = cycle.get("trading_days_since")
     return (
-        "最后说一个重要的时间周期维度。"
-        f"距离{pivot_label}的高点{high}已经过去了{days}个交易日，"
-        f"上证从{high}跌到{close_label}{close}，跌了约{drop_text}。"
-        "这个周期维度只作为验证条件：下一交易日要看指数是否继续脱离这个回撤区间，"
-        "以及高成交负反馈是否还在扩散，不能单独把它写成企稳判断。"
+        "周期上，"
+        f"上证离{pivot_label}高点{high}已经{days}个交易日，"
+        f"现在收在{close_label}{close}，回撤约{drop_text}。"
+        "这里还不能直接写企稳，明天要看指数能不能脱离回撤区间，同时高成交负反馈有没有收住。"
     )
 
 
@@ -2680,10 +2729,15 @@ def _pressure_event(context: dict[str, Any]) -> dict[str, Any] | None:
     return max(events, key=lambda row: _float(row.get("amount_yi")) or 0.0, default=None)
 
 
+def _is_telecom_pressure_event(row: dict[str, Any]) -> bool:
+    haystack = _event_haystack(row)
+    return any(token in haystack for token in ("通信", "CPO", "光模块", "光通信", "线缆"))
+
+
 def _telecom_pressure_events(context: dict[str, Any]) -> list[dict[str, Any]]:
     pressure = _pressure_event(context)
     rows = []
-    if pressure:
+    if pressure and _is_telecom_pressure_event(pressure):
         rows.append(pressure)
     explicit_name_rows: list[dict[str, Any]] = []
     for row in _event_rows(context):
@@ -2691,10 +2745,9 @@ def _telecom_pressure_events(context: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         if (_float(row.get("amount_yi")) or 0.0) < 100:
             continue
-        haystack = _event_haystack(row)
         if "通信" in _text(row.get("name")):
             explicit_name_rows.append(row)
-        if "通信" in haystack or "CPO" in haystack or "光模块" in haystack:
+        if _is_telecom_pressure_event(row):
             rows.append(row)
     rows.sort(key=lambda row: _float(row.get("amount_yi")) or 0.0, reverse=True)
     deduped: list[dict[str, Any]] = []
@@ -2802,21 +2855,21 @@ def _opening_flow_section(context: dict[str, Any]) -> str:
         pressure_label = "光模块"
     else:
         pressure_label = event_label or board_label or "高成交核心"
-    pressure_text = "，".join(_open_to_text(row) for row in pressure_rows[:3] if _text(row.get("name")))
+    pressure_names_text = "、".join(_text(row.get("name")) for row in pressure_rows[:3] if _text(row.get("name")))
     attack_text = "，".join(_event_phrase(row) for row in attack if _event_phrase(row))
-    if not pressure_text and not attack_text:
+    if not pressure_names_text and not attack_text:
         return ""
     attack_label = _event_theme_label(attack[0]) if attack else ""
     attack_sentence = ""
     if attack_text:
-        attack_sentence = f"资金随后攻击{attack_label or '早盘强势'}方向。{attack_text}。"
-    elif pressure_text:
-        attack_sentence = "但没有看到同方向马上形成有效修复，早盘只能按资金切换观察。"
+        attack_sentence = f"随后资金去试{attack_label or '早盘强势'}方向。{attack_text}。"
+    elif pressure_names_text:
+        attack_sentence = "同方向没有马上形成有效扩散，早盘只能先按压力线观察。"
     return (
-        f"先说资金流动的完整链条。开盘后{pressure_label}方向直接承压"
-        + (f"—{pressure_text}。" if pressure_text else "。")
+        f"早盘先看{pressure_label}承接。"
+        + (f"{pressure_names_text}有回拉，但没带出持续修复。" if pressure_names_text else "")
         + attack_sentence
-        + "早盘强度不是最终结论，关键是封住的数量、炸板的数量，以及这些进攻线能否在尾盘继续承接。"
+        + "这类早盘回拉只算试探，能不能变成修复，要看午后和尾盘有没有继续承接。"
     )
 
 
@@ -3059,7 +3112,7 @@ def _external_flow_line(context: dict[str, Any], event: dict[str, Any]) -> str:
             )
         gap = _float(em.get("amount_coverage_gap_yi"))
         if gap is not None and abs(gap) >= 1:
-            line += f"。这套订单资金覆盖成交额还差约{_fmt_amount_yi_for_prose(abs(gap))}亿，说明不能把它当成完整分账户流水"
+            line += "。这个口径只适合辅助判断订单大小迁移，不能当成完整分账户流水"
         else:
             line += "。这套数据能证明订单大小迁移，但还不是账户级 L2 主力/散户流水"
         return line + "。"
@@ -3105,13 +3158,12 @@ def _collapse_section(context: dict[str, Any]) -> str:
             if not flow.get("participant_flow_available")
             else "分账户资金流需要继续核对主力和散户买卖拆分。"
         )
-    prefix = "下午1点30分是整个盘面的崩塌点。" if is_broad_breakdown else "午后高成交核心的承接压力开始暴露。"
+    prefix = "午后盘面开始转弱。" if is_broad_breakdown else "午后高成交核心的承接压力开始暴露。"
     return (
         prefix +
-        f"{_text(pressure.get('name'))}日内反复尝试承接，但抛压越来越大，"
-        f"{_fmt_amount_yi_for_prose(pressure.get('amount_yi'))}亿成交没有换来足够的价格推进。"
-        "这不是成交量的问题—成交巨大说明有人在接，但接不住就是最大的问题。"
-        f"{_fmt_amount_yi_for_prose(pressure.get('amount_yi'))}亿成交无承接，这个信号比单纯跌幅更严重。"
+        f"{_text(pressure.get('name'))}{_fmt_amount_yi_for_prose(pressure.get('amount_yi'))}亿成交，"
+        "盘中有回拉，但收盘没有接住。"
+        "这比单纯跌幅更影响科技线情绪。"
         + flow_line
     )
 
@@ -3121,7 +3173,7 @@ def _tail_consumer_section(context: dict[str, Any]) -> str:
     failed = [row for row in attack if "炸板回落" in row.get("labels", [])]
     fallback_failed = []
     if not failed and not repair:
-        for row in context.get("failed_boards", [])[:4]:
+        for row in context.get("failed_boards", [])[:3]:
             name = _text(row.get("name"))
             if not name:
                 continue
@@ -3138,12 +3190,12 @@ def _tail_consumer_section(context: dict[str, Any]) -> str:
     repair_line = "。".join(_event_phrase(row) for row in repair[:2] if _event_phrase(row))
     pressure = _pressure_event(context)
     is_breakdown = bool(failed and pressure) or len(fallback_failed) >= 3
-    prefix = "尾盘情绪彻底崩溃。" if is_breakdown else "尾盘情绪转弱。"
+    prefix = "尾盘的问题是冲高回落扩散。" if is_breakdown else "尾盘情绪转弱。"
     return (
         prefix
         + (failed_line + "。" if failed_line else "")
         + (f"但{repair_line}。" if repair_line else "")
-        + "要区分追高进攻型资金和超跌修复型资金；前者炸板质量更伤情绪，后者即使封住也不一定代表整条链确认。"
+        + "这类回落会压住次日接力，明天先看这些票能不能停止负反馈。"
     )
 
 
@@ -3169,10 +3221,10 @@ def _sample_style_carding_section(context: dict[str, Any]) -> str:
     if not cards:
         return _carding_section(context)
     return (
-        f"看一下今天盘面的卡位结构。全天至少有{len(cards)}次明显卡位："
+        f"今天有{len(cards)}次比较明显的方向切换："
         + "，".join(cards[:4])
         + "。这些窗口只能证明资金发生切换，不能直接证明胜方。"
-        "明日验证要回到数据：增强方向是否继续排在板块前列，走弱方向是否停止拖累，链主和弹性是否同步。"
+        "明天重点看增强方向能不能继续排在前列，走弱方向会不会继续拖累高成交核心。"
     )
 
 
@@ -3356,7 +3408,7 @@ def format_market_replay_sections(context: dict[str, Any], *, max_sections: int 
                     f"{shift.get('from_time')}到{shift.get('to_time')}增强：{up or '无'}，走弱：{down or '无'}"
                 )
         sections.append(
-            "先说资金流动的完整链条。"
+            "盘中资金切换大致是这样："
             + "；".join(rotation_parts)
             + "。"
             + (("窗口差分显示：" + "；".join(shift_parts) + "。") if shift_parts else "")

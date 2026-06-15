@@ -64,7 +64,25 @@ def test_index_kill_line_reads_major_indices_from_watchlist_groups():
         }
     }
 
-    assert _index_kill_line(shell) == "上证-1.70%，深成指-3.22%，创业板-3.69%，科创50-4.30%"
+    assert _index_kill_line(shell) == "上证跌1.70%，深成指跌3.22%，创业板跌3.69%，科创50跌4.30%"
+
+
+def test_index_kill_line_keeps_positive_kechuang50_readable():
+    shell = {
+        "watchlist_groups": {
+            "major_indices": [
+                {"name": "上证指数", "day_change_pct": 1.125},
+                {"name": "深证成指", "day_change_pct": 0.812},
+                {"name": "创业板指", "day_change_pct": 0.551},
+                {"name": "科创50", "day_change_pct": 0.056},
+            ]
+        }
+    }
+
+    line = _index_kill_line(shell)
+
+    assert line == "上证涨1.12%，深成指涨0.81%，创业板涨0.55%，科创50涨0.06%"
+    assert "科创500.06%" not in line
 
 
 def _shell():
@@ -181,17 +199,17 @@ def test_narrative_review_uses_sector_board_without_date_hardcoding():
     assert result.status == "NOTIFY"
     assert result.text.splitlines()[1] == "2026年6月5日复盘"
     assert "[Signals 复盘助手" not in result.text
-    assert "板块15" in result.text
-    assert "上证-0.74%" in result.text
-    assert "创业板-3.20%" in result.text
-    assert "最终强度更集中在机器人和航天装备" in result.text
-    assert "受伤主线" in result.text
+    assert "指数收红，但盘面不是普涨" in result.text
+    assert "上证跌0.74%" in result.text
+    assert "创业板跌3.20%" in result.text
+    assert "强度主要在机器人和航天装备" in result.text
+    assert "受伤主线" not in result.text
     assert "产业链确认的方向主要是：机器人/自动化产业链/自动化/机器人、军工装备产业链/商业航天/卫星互联网" in result.text
-    assert "资金流动链条" in result.text
+    assert "没有传入可验证的分钟级转折线" in result.text
     assert "产业链确认" in result.text
-    assert "明日验证点" in result.text
-    assert "三池数量=板块" in result.text
-    assert "不再单独写没有证据支撑的方向判断" in result.text
+    assert "明天只盯三点" in result.text
+    assert "三池数量=板块" not in result.text
+    assert "不再单独写没有证据支撑的方向判断" not in result.text
     assert "中际旭创" not in result.text
     assert "9点33分" not in result.text
     assert "谁能在竞价阶段就赢出来" not in result.text
@@ -259,7 +277,7 @@ def test_narrative_cli_trade_date_uses_historical_replay_context(monkeypatch, ca
     assert "硅料硅片" in output
     assert "工业富联承压" in output
     assert "机器人和航天装备" not in output
-    assert "上证-0.74%" not in output
+    assert "上证跌0.74%" not in output
 
 
 def test_narrative_cli_same_trade_date_keeps_live_sector_and_indices(monkeypatch, capsys):
@@ -317,7 +335,7 @@ def test_narrative_cli_same_trade_date_keeps_live_sector_and_indices(monkeypatch
     assert seen["sector_boards_count"] == 3
     assert output.startswith("NOTIFY\n2026年6月5日复盘")
     assert "机器人和航天装备" in output
-    assert "上证-0.74%" in output
+    assert "上证跌0.74%" in output
 
 
 def test_fetch_inputs_safe_returns_partial_inputs_when_snapshot_fails(monkeypatch):
@@ -383,7 +401,7 @@ def test_narrative_cli_safe_inputs_notifies_from_replay_when_snapshot_times_out(
 
     assert exit_code == 0
     assert output.startswith("NOTIFY\n2026年6月5日复盘")
-    assert "早盘恐慌、盘中局部抄底反弹、午后承接失败" in output
+    assert "科技高成交的体感偏分歧" in output
     assert "中天科技最先翻红" in output
 
 

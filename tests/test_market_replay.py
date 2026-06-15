@@ -428,12 +428,13 @@ def test_market_replay_context_extracts_event_graph():
     sections = format_market_replay_sections(context)
     assert any("东财订单资金口径显示" in section for section in sections)
     assert any("涨幅回吐" in section for section in sections)
+    assert "pct" not in "\n".join(sections)
     assert "当日市场认可" in dynamic["selection_note"]
-    assert any("看一下今天盘面的卡位结构" in section for section in sections)
+    assert any("方向切换" in section for section in sections)
     assert any("机器人增强" in section for section in sections)
-    assert any("下午1点30分" in section for section in sections)
-    assert any("关于情绪温度" in section for section in sections)
-    assert any("时间周期维度" in section for section in sections)
+    assert any("午后盘面开始转弱" in section for section in sections)
+    assert any("情绪上，今天的问题不在指数" in section for section in sections)
+    assert any("周期上，" in section for section in sections)
     assert not any("从高点回落+" in section for section in sections)
     text = "\n".join(sections)
     assert "盘中最正确的策略就是不动" not in text
@@ -636,10 +637,10 @@ def test_market_replay_sections_summarize_opening_panic_and_partial_tech_rebound
     assert "机器人增强+5.43%" in first
     assert "半导体设备增强+1.37%" in first
     text = "\n".join(sections)
-    assert "板块选择先按角色分层，不按涨幅榜平铺" in text
-    assert "受伤主线/压力锚=通信线缆及配套" in text
+    assert "板块上，先把强方向和压力线分开看" in text
+    assert "压力主要在通信线缆及配套" in text
     assert "半导体材料" in text
-    assert "先定方向再定节奏" in text
+    assert "明天如果压力线止跌、修复线能扩散" in text
     assert "非主线" not in text
 
 
@@ -684,8 +685,50 @@ def test_market_replay_turnover_representatives_are_programmatic():
 
     text = "\n".join(format_market_replay_sections(context))
 
-    assert "成交额代表篮子只回答两个问题：谁在拖累，谁先修复" in text
-    assert "压力锚=工业富联(第12,140.14亿,-4.83%)" in text
-    assert "修复/翻红锚=中天科技(第3,252.05亿,+7.51%)" in text
-    assert "沪电股份(第9,155.45亿,+2.84%,10:15翻红)" in text
+    assert "高成交前排分化很明显" in text
+    assert "拖累的是工业富联140亿收跌4.83%" in text
+    assert "收红的是中天科技252亿收涨7.51%" in text
+    assert "沪电股份155亿收涨2.84%" in text
+    assert "压力锚=" not in text
+    assert "修复/翻红锚=" not in text
     assert "最先翻红" not in text
+
+
+def test_market_replay_does_not_mix_unrelated_pressure_board_with_cpo_stocks():
+    context = {
+        "opening_pressure_boards": [{"name": "油气开采", "change_pct": -2.5}],
+        "turnover_representatives": [],
+        "rotation_windows": [],
+        "rotation_shifts": [],
+        "high_turnover_cores": [],
+        "failed_boards": [],
+        "flow_availability": {"participant_flow_available": False},
+        "stock_event_chains": [
+            {
+                "name": "杰瑞股份",
+                "labels": ["低开承压", "高成交负反馈"],
+                "open": 41.1,
+                "prev_close": 42.0,
+                "amount_yi": 180.0,
+                "close_change_pct": -3.2,
+                "phrase": "杰瑞股份低开后承压",
+                "limit_pool": {"industry": "油气开采"},
+            },
+            {
+                "name": "新易盛",
+                "labels": ["低开承压", "高成交负反馈"],
+                "open": 120.0,
+                "prev_close": 124.0,
+                "amount_yi": 130.0,
+                "close_change_pct": -3.5,
+                "phrase": "新易盛低开后承压",
+                "limit_pool": {"industry": "CPO概念"},
+            },
+        ],
+    }
+
+    text = "\n".join(format_market_replay_sections(context))
+
+    assert "新易盛" in text
+    assert "开盘后油气开采方向直接承压。承压个股包括杰瑞股份，新易盛" not in text
+    assert "开盘后油气开采方向直接承压—新易盛" not in text
