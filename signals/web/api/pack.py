@@ -30,3 +30,8 @@ async def pack_dashboard(
 @router.get("/descriptor")
 def pack_descriptor():
     return SignalsPack().describe()
+
+
+@router.get("/cache-status")
+def pack_cache_status():
+    return SignalsPack().cache_status()

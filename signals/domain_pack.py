@@ -266,6 +266,9 @@ class SignalsPack:
             "ai_factor_factory": self._ai_factor_factory() if include_ai_factor_factory else self._ai_factor_factory_stub(strategy_snapshot),
         }
 
+    def cache_status(self) -> Dict[str, Any]:
+        return self._cache_status()
+
     def _operator_actions(self) -> List[Dict[str, Any]]:
         actions = [
             {
@@ -800,14 +803,14 @@ class SignalsPack:
             "low": {"$gt": 0},
         }
         try:
-            valid_codes = set(db["fullmarket_spot_snapshots"].distinct("code", valid_query))
-            if not valid_codes:
+            valid_count = self._distinct_count(db, "fullmarket_spot_snapshots", "code", valid_query)
+            if not valid_count:
                 return {}
-            cached_codes = set(db["bars"].distinct("meta.symbol", {"meta.freq": "日线", "dt": trade_dt}))
-            invalid_rows = self._count(db, "fullmarket_spot_snapshots", {"date_key": date_key}) - len(valid_codes)
+            cached_count = self._distinct_count(db, "bars", "meta.symbol", {"meta.freq": "日线", "dt": trade_dt})
+            invalid_rows = self._count(db, "fullmarket_spot_snapshots", {"date_key": date_key}) - valid_count
             return {
-                "valid_universe": len(valid_codes),
-                "cached_today": len(valid_codes.intersection(cached_codes)),
+                "valid_universe": valid_count,
+                "cached_today": min(cached_count, valid_count),
                 "invalid_rows": max(0, invalid_rows),
                 "source": "fullmarket_spot_snapshots.valid_universe + bars.daily",
             }
@@ -858,7 +861,7 @@ class SignalsPack:
             rows.append({
                 "collection": collection,
                 "generated": bool(latest),
-                "count": self._count(db, collection, {}),
+                "count": self._estimated_count(db, collection),
                 "latest_at": self._iso((latest or {}).get(sort_field) or (latest or {}).get("updated_at")),
                 "ready_date": self._terminal_doc_date(latest or {}),
                 "status": (latest or {}).get("status") or ("ok" if latest else "missing"),
@@ -1390,6 +1393,17 @@ class SignalsPack:
         except TypeError:
             try:
                 return int(db[collection].count_documents(dict(query)))
+            except Exception:
+                return 0
+        except Exception:
+            return 0
+
+    def _estimated_count(self, db, collection: str) -> int:
+        try:
+            return int(db[collection].estimated_document_count(maxTimeMS=250))
+        except TypeError:
+            try:
+                return int(db[collection].estimated_document_count())
             except Exception:
                 return 0
         except Exception:

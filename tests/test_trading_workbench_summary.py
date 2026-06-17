@@ -795,35 +795,40 @@ def test_wechat_summary_preserves_signals_candidate_order():
     )
 
     assert result.status == "NOTIFY"
-    assert "1) 上午盘面总结" in result.text
-    assert "2) 板块主次" in result.text
-    assert "3) 下午复核清单" in result.text
-    assert "4) 降级条件" in result.text
+    assert "1) 上午盘面总结" not in result.text
+    assert "交易日：" not in result.text
+    assert "【2026-05-08｜11:15 午间重规划】" in result.text
+    assert "盘面：" in result.text
+    assert "证据：" in result.text
+    assert "复核：下午只看主线承接和跟随扩散。" in result.text
+    assert "失效：" in result.text
+    assert "回看：" in result.text
     assert "指数：" in result.text
     assert "上证-0.58%" in result.text
     assert "创业板-2.29%" in result.text
     assert "科创50-0.02%" in result.text
-    assert "AI判断" in result.text
-    assert "大金融产业链主线" in result.text
-    assert "半导体产业链修复/扩散" in result.text
-    assert "光伏产业链次日验证" in result.text
-    assert "恒科代理" in result.text
+    assert "AI判断" not in result.text
+    assert "半导体产业链先当主线" in result.text
+    assert "光伏产业链看跟随" in result.text
+    assert "大金融产业链先列观察" in result.text
+    assert "港股科技观察" in result.text
     assert "恒生科技ETF SH.513130" in result.text
-    assert "关键盘面事件" in result.text
-    assert "盘面含义" in result.text
-    assert "主次排序" in result.text
-    assert "第一主线" in result.text
-    assert "第二梯队" in result.text
-    assert "次日验证" in result.text
+    assert "事件：创业板11:15日内修复强于上证" in result.text
+    assert "盘面含义" not in result.text
+    assert "主次排序" not in result.text
+    assert "第一主线" not in result.text
+    assert "第二梯队：" not in result.text
+    assert "次日验证" not in result.text
+    assert "验证线" not in result.text
     assert "大金融产业链/银行/券商/保险" in result.text
     assert "半导体产业链/材料/光刻胶" in result.text
     assert "光伏产业链/硅料/硅片/组件" in result.text
     assert "隆基绿能" in result.text
-    assert "上海新阳、北方华创" in result.text
-    assert "上级周期可用" in result.text
-    assert "仅分钟反抽" in result.text
-    assert "均线策略" in result.text
-    assert "不追冲高" in result.text
+    assert "半导体产业链/半导体设备" in result.text
+    assert "先看" in result.text
+    assert "暂不动" in result.text
+    assert "均线策略" not in result.text
+    assert "不追" in result.text
     assert "交易含义" not in result.text
     assert "角色拆分" not in result.text
     assert "金融护盘 + 科技局部修复 + 尾盘新线试探" not in result.text
@@ -832,8 +837,8 @@ def test_wechat_summary_preserves_signals_candidate_order():
     assert "硅线验证" not in result.text
     assert "前排强度" not in result.text
     assert "触发：" not in result.text
-    assert "截至当前窗口" in result.text
-    review_block = result.text.split("4) 降级条件", 1)[0].split("3) 下午复核清单", 1)[1]
+    assert "截至当前窗口" not in result.text
+    review_block = result.text.split("失效：", 1)[0].split("复核：", 1)[1]
     assert review_block.rindex("利通电子 SH.603629") < review_block.rindex("环旭电子 SH.601231")
     assert review_block.rindex("环旭电子 SH.601231") < review_block.rindex("立昂微 SH.605358")
     assert "特力A SZ.000025(日线一买)" in result.text
@@ -853,15 +858,64 @@ def test_wechat_summary_sector_roles_are_signal_driven_not_fixed_names():
     )
 
     assert result.status == "NOTIFY"
-    assert "军工装备产业链主线" in result.text
-    assert "机器人/自动化产业链修复/扩散" in result.text
-    assert "传媒旅游产业链次日验证" in result.text
-    assert "第一主线" in result.text
-    assert "第二梯队" in result.text
-    assert "次日验证" in result.text
+    assert "机器人/自动化产业链先当主线" in result.text
+    assert "军工装备产业链看跟随" in result.text
+    assert "传媒旅游产业链先列观察" in result.text
+    assert "主线机器人/自动化产业链/自动化/机器人" in result.text
+    assert "跟随军工装备产业链/商业航天/卫星互联网" in result.text
+    assert "观察传媒旅游产业链/游戏/影视/文旅" in result.text
+    assert "第一主线" not in result.text
+    assert "第二梯队：" not in result.text
+    assert "次日验证" not in result.text
+    assert "验证线" not in result.text
     assert "金融护盘" not in result.text
     assert "半导体材料/设备" not in result.text
     assert "硅线" not in result.text
+
+
+def test_wechat_intraday_windows_use_trader_note_voice():
+    old_or_engineering_terms = (
+        "1) 上午盘面总结",
+        "2) 板块主次",
+        "3) 下午复核清单",
+        "交易日：",
+        "AI判断",
+        "盘面含义",
+        "主次排序",
+        "第一主线",
+        "第二梯队：",
+        "次日验证",
+        "验证线",
+        "均线策略",
+        "候选共性",
+        "复核对象",
+        "今日触发信号",
+        "回测",
+    )
+    for window in ("preopen", "ten", "midday", "two", "close"):
+        result = build_wechat_summary(
+            _dashboard(),
+            _june5_shell(),
+            _snapshot(),
+            window=window,
+            max_items=3,
+            event_lines=["指数分歧，主线待承接"],
+        )
+
+        assert result.status == "NOTIFY"
+        assert "盘面：" in result.text
+        assert "证据：" in result.text
+        assert "复核：" in result.text
+        assert "失效：" in result.text
+        assert "回看：" in result.text
+        assert "先当主线" in result.text
+        assert "看跟随" in result.text
+        assert "先列观察" in result.text
+        assert "票池共性" in result.text
+        assert "先看：" in result.text
+        assert "暂不动：" in result.text
+        for term in old_or_engineering_terms:
+            assert term not in result.text
 
 
 def test_market_event_lines_trigger_notify_without_stock_candidates():
