@@ -530,7 +530,8 @@ class PostmarketRunner:
     def __init__(self, engine, *, max_workers: int | None = None):
         self.engine = engine
         self.db = engine.db
-        self.max_workers = max_workers or _env_int("SIGNALS_POSTMARKET_WORKERS", 8, minimum=1)
+        default_workers = min(16, max(8, (os.cpu_count() or 8)))
+        self.max_workers = max_workers or _env_int("SIGNALS_POSTMARKET_WORKERS", default_workers, minimum=1)
         self.module_semaphores = {
             "stock_daily": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_STOCK_DAILY_WORKERS", 2, minimum=1)),
             "hk_stock_daily": threading.BoundedSemaphore(_env_int("SIGNALS_POSTMARKET_HK_STOCK_DAILY_WORKERS", 2, minimum=1)),
@@ -1199,8 +1200,8 @@ class PostmarketRunner:
             return start <= current <= end
         return current >= start or current <= end
 
-    def catchup_target(self, now: datetime | None = None) -> tuple[str, str, str] | None:
-        if not self.should_catchup_now(now):
+    def catchup_target(self, now: datetime | None = None, *, force: bool = False) -> tuple[str, str, str] | None:
+        if not force and not self.should_catchup_now(now):
             return None
         trade_date = _previous_trading_date(now)
         run_id = default_run_id(trade_date)

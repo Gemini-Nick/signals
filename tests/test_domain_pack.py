@@ -46,6 +46,20 @@ class _Db(dict):
         return self[key]
 
 
+def _reset_pack_refresh_state(domain_pack):
+    with domain_pack._PACK_REFRESH_LOCK:
+        domain_pack._PACK_REFRESH_STATE.update({
+            "status": "idle",
+            "thread": None,
+            "started_at": None,
+            "finished_at": None,
+            "last_requested_at": None,
+            "last_reason": "",
+            "last_result": {},
+            "last_error": "",
+        })
+
+
 def test_signals_pack_dashboard_matches_electron_contract(tmp_path, monkeypatch):
     from signals.domain_pack import SignalsPack
 
@@ -103,8 +117,73 @@ def test_signals_pack_dashboard_matches_electron_contract(tmp_path, monkeypatch)
     assert dashboard["recent_runs"][0]["capability"] == "strategy_snapshot"
     assert isinstance(dashboard["backtest_jobs"], list)
     assert isinstance(dashboard["deep_links"], list)
-    assert dashboard["operator_actions"][0]["metadata"] == {}
+    assert any(action["action_id"] == "pack:signals:refresh" for action in dashboard["operator_actions"])
+    assert any(action["metadata"] == {} for action in dashboard["operator_actions"])
     assert dashboard["cache_status"]["mode"] == "test"
+
+
+def test_pack_refresh_endpoint_triggers_pack_refresh(monkeypatch):
+    from signals.web.app import create_app
+    from signals import domain_pack
+
+    calls = []
+
+    def fake_trigger(self, **kwargs):
+        calls.append(kwargs)
+        return {"triggered": True, "status": "running", "message": "refresh_started"}
+
+    monkeypatch.setattr(domain_pack.SignalsPack, "trigger_refresh", fake_trigger)
+    client = TestClient(create_app())
+
+    response = client.post("/api/pack/refresh", json={"reason": "manual", "force_live": True, "wait": False})
+
+    assert response.status_code == 200
+    assert response.json()["triggered"] is True
+    assert calls == [{
+        "reason": "manual",
+        "force_live": True,
+        "force_postmarket": False,
+        "run_optional_tasks": True,
+        "wait": False,
+    }]
+
+
+def test_pack_trigger_refresh_wait_records_result(monkeypatch):
+    from signals import domain_pack
+    from signals.domain_pack import SignalsPack
+
+    _reset_pack_refresh_state(domain_pack)
+    pack = SignalsPack()
+
+    def fake_run(**kwargs):
+        return {"status": "ok", "reason": kwargs["reason"], "live_result_count": 3}
+
+    monkeypatch.setattr(pack, "_run_refresh_job", fake_run)
+
+    result = pack.trigger_refresh(reason="manual", force_live=True, wait=True)
+
+    assert result["triggered"] is True
+    assert result["message"] == "refresh_completed"
+    assert result["status"] == "completed"
+    assert result["last_result"]["live_result_count"] == 3
+    assert result["last_error"] == ""
+
+
+def test_pack_trigger_refresh_throttles_auto_requests(monkeypatch):
+    from signals import domain_pack
+    from signals.domain_pack import SignalsPack
+
+    _reset_pack_refresh_state(domain_pack)
+    monkeypatch.setenv("SIGNALS_PACK_AUTO_REFRESH_MIN_SECONDS", "300")
+    pack = SignalsPack()
+    monkeypatch.setattr(pack, "_run_refresh_job", lambda **kwargs: {"status": "ok"})
+
+    first = pack.trigger_refresh(reason="watchdog", wait=True)
+    second = pack.trigger_refresh(reason="watchdog", wait=True)
+
+    assert first["triggered"] is True
+    assert second["triggered"] is False
+    assert second["message"] == "refresh_throttled"
 
 
 def test_pack_dashboard_endpoint_smoke():

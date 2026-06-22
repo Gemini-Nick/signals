@@ -57,3 +57,22 @@ def test_storage_model_indexes_board_heat_tick_runtime_queries(monkeypatch):
         ("change_pct", DESCENDING),
         ("rank_idx", ASCENDING),
     ) in board_heat_indexes
+
+
+def test_storage_model_indexes_terminal_status_latest_queries(monkeypatch):
+    from signals.sync import storage
+
+    db = FakeDB()
+    monkeypatch.setattr(storage, "naive_market_now", lambda market: datetime(2026, 6, 8, 15, 0))
+    monkeypatch.setattr(storage, "trading_day_key", lambda market, now=None: "2026-06-08")
+
+    storage.ensure_storage_model(db)
+
+    for collection_name in (
+        "terminal_stock_pool",
+        "terminal_technical_signals",
+        "knowledge_market_views",
+        "chain_heat_snapshots",
+    ):
+        indexes = {keys for keys, _kwargs in db[collection_name].created_indexes}
+        assert (("updated_at", DESCENDING),) in indexes

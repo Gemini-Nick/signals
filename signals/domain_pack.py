@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import uuid
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
@@ -15,6 +16,51 @@ from signals.core.market_time import market_timezone, naive_market_now
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+_PACK_REFRESH_LOCK = threading.Lock()
+_PACK_REFRESH_STATE: Dict[str, Any] = {
+    "status": "idle",
+    "thread": None,
+    "started_at": None,
+    "finished_at": None,
+    "last_requested_at": None,
+    "last_reason": "",
+    "last_result": {},
+    "last_error": "",
+}
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0, maximum: int = 24 * 60 * 60) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return min(max(value, minimum), maximum)
+
+
+def _state_dt(value: Any) -> str:
+    return value.isoformat() if isinstance(value, datetime) else ""
+
+
+def _pack_refresh_running_locked() -> bool:
+    thread = _PACK_REFRESH_STATE.get("thread")
+    return (
+        _PACK_REFRESH_STATE.get("status") == "running"
+        or (thread is not None and getattr(thread, "is_alive", lambda: False)())
+    )
+
+
+def _pack_refresh_state_payload() -> Dict[str, Any]:
+    return {
+        "status": str(_PACK_REFRESH_STATE.get("status") or "idle"),
+        "started_at": _state_dt(_PACK_REFRESH_STATE.get("started_at")),
+        "finished_at": _state_dt(_PACK_REFRESH_STATE.get("finished_at")),
+        "last_requested_at": _state_dt(_PACK_REFRESH_STATE.get("last_requested_at")),
+        "last_reason": str(_PACK_REFRESH_STATE.get("last_reason") or ""),
+        "last_result": dict(_PACK_REFRESH_STATE.get("last_result") or {}),
+        "last_error": str(_PACK_REFRESH_STATE.get("last_error") or ""),
+    }
 
 
 def _json_safe(value: Any) -> Any:
@@ -269,8 +315,194 @@ class SignalsPack:
     def cache_status(self) -> Dict[str, Any]:
         return self._cache_status()
 
+    def trigger_refresh(
+        self,
+        *,
+        reason: str = "manual",
+        force_live: bool = False,
+        force_postmarket: bool = False,
+        run_optional_tasks: bool = True,
+        wait: bool = False,
+    ) -> Dict[str, Any]:
+        reason = str(reason or "manual")[:64]
+        requested_at = utc_now()
+        min_interval = _env_int(
+            "SIGNALS_PACK_MANUAL_REFRESH_MIN_SECONDS" if reason == "manual" else "SIGNALS_PACK_AUTO_REFRESH_MIN_SECONDS",
+            20 if reason == "manual" else 180,
+            minimum=0,
+        )
+        with _PACK_REFRESH_LOCK:
+            if _pack_refresh_running_locked():
+                return {
+                    "triggered": False,
+                    "reason": reason,
+                    "message": "refresh_already_running",
+                    **_pack_refresh_state_payload(),
+                }
+            last_requested_at = _PACK_REFRESH_STATE.get("last_requested_at")
+            if (
+                isinstance(last_requested_at, datetime)
+                and min_interval > 0
+                and (requested_at - last_requested_at).total_seconds() < min_interval
+            ):
+                return {
+                    "triggered": False,
+                    "reason": reason,
+                    "message": "refresh_throttled",
+                    "min_interval_seconds": min_interval,
+                    **_pack_refresh_state_payload(),
+                }
+            _PACK_REFRESH_STATE.update({
+                "status": "running",
+                "thread": None,
+                "started_at": requested_at,
+                "finished_at": None,
+                "last_requested_at": requested_at,
+                "last_reason": reason,
+                "last_result": {},
+                "last_error": "",
+            })
+
+        if wait:
+            try:
+                result = self._run_refresh_job(
+                    reason=reason,
+                    force_live=force_live,
+                    force_postmarket=force_postmarket,
+                    run_optional_tasks=run_optional_tasks,
+                )
+                self._finish_refresh_job(result=result)
+            except Exception as exc:
+                self._finish_refresh_job(error=f"{exc.__class__.__name__}: {exc}")
+            with _PACK_REFRESH_LOCK:
+                return {
+                    "triggered": True,
+                    "reason": reason,
+                    "message": "refresh_failed" if _PACK_REFRESH_STATE.get("last_error") else "refresh_completed",
+                    **_pack_refresh_state_payload(),
+                }
+
+        thread = threading.Thread(
+            target=self._run_refresh_job_guarded,
+            kwargs={
+                "reason": reason,
+                "force_live": force_live,
+                "force_postmarket": force_postmarket,
+                "run_optional_tasks": run_optional_tasks,
+            },
+            name="signals-pack-refresh",
+            daemon=True,
+        )
+        with _PACK_REFRESH_LOCK:
+            _PACK_REFRESH_STATE["thread"] = thread
+        thread.start()
+        with _PACK_REFRESH_LOCK:
+            return {
+                "triggered": True,
+                "reason": reason,
+                "message": "refresh_started",
+                **_pack_refresh_state_payload(),
+            }
+
+    def _run_refresh_job_guarded(
+        self,
+        *,
+        reason: str,
+        force_live: bool,
+        force_postmarket: bool,
+        run_optional_tasks: bool,
+    ) -> None:
+        try:
+            result = self._run_refresh_job(
+                reason=reason,
+                force_live=force_live,
+                force_postmarket=force_postmarket,
+                run_optional_tasks=run_optional_tasks,
+            )
+            self._finish_refresh_job(result=result)
+        except Exception as exc:
+            self._finish_refresh_job(error=f"{exc.__class__.__name__}: {exc}")
+
+    def _finish_refresh_job(self, *, result: Dict[str, Any] | None = None, error: str = "") -> None:
+        with _PACK_REFRESH_LOCK:
+            _PACK_REFRESH_STATE.update({
+                "status": "failed" if error else "completed",
+                "finished_at": utc_now(),
+                "last_result": _json_safe(result or {}),
+                "last_error": error,
+                "thread": None,
+            })
+
+    def _run_refresh_job(
+        self,
+        *,
+        reason: str,
+        force_live: bool,
+        force_postmarket: bool,
+        run_optional_tasks: bool,
+    ) -> Dict[str, Any]:
+        if not config.MONGO_URL:
+            return {"status": "skipped", "reason": "mongo_not_configured", "live_results": [], "postmarket": None}
+
+        from signals.sync.engine import SyncEngine
+        from signals.sync.postmarket import PostmarketRunner, _postmarket_trade_date, default_run_id
+
+        default_workers = min(16, max(4, (os.cpu_count() or 4)))
+        workers = _env_int("SIGNALS_PACK_REFRESH_WORKERS", default_workers, minimum=1, maximum=32)
+        engine = SyncEngine(
+            mongo_url=config.MONGO_URL,
+            proxy_url=config.EM_PROXY_URL if config.EM_PROXY_ENABLED else None,
+            max_workers=workers,
+        )
+        released_modules = engine.mark_stale_running_modules()
+        live_results = engine.run_live_once(force=force_live)
+
+        runner = PostmarketRunner(engine, max_workers=workers)
+        target = runner.catchup_target(force=force_postmarket)
+        postmarket_result: Dict[str, Any] | None = None
+        postmarket_target: Dict[str, str] | None = None
+        if target:
+            run_id, trade_date, previous_status = target
+            postmarket_target = {"run_id": run_id, "trade_date": trade_date, "previous_status": previous_status}
+            postmarket_result = runner.run_once(
+                resume_run_id=run_id,
+                trade_date=trade_date,
+                force=force_postmarket,
+                run_optional_tasks=run_optional_tasks,
+            )
+        elif PostmarketRunner.should_run_now():
+            trade_date = _postmarket_trade_date()
+            run_id = default_run_id(trade_date)
+            postmarket_target = {"run_id": run_id, "trade_date": trade_date, "previous_status": "scheduled"}
+            postmarket_result = runner.run_once(
+                trade_date=trade_date,
+                force=force_postmarket,
+                run_optional_tasks=run_optional_tasks,
+            )
+
+        return {
+            "status": "ok",
+            "reason": reason,
+            "force_live": force_live,
+            "force_postmarket": force_postmarket,
+            "run_optional_tasks": run_optional_tasks,
+            "released_stale_modules": released_modules,
+            "live_results": [_json_safe(item) for item in live_results],
+            "live_result_count": len(live_results),
+            "postmarket_target": postmarket_target,
+            "postmarket": _json_safe(postmarket_result),
+        }
+
     def _operator_actions(self) -> List[Dict[str, Any]]:
         actions = [
+            {
+                "action_id": "pack:signals:refresh",
+                "run_id": "signals:dashboard",
+                "kind": "signals_api",
+                "label": "Refresh Signals Data",
+                "payload": {"reason": "manual", "force_live": True, "force_postmarket": True, "run_optional_tasks": True},
+                "metadata": {"workspace": "strategy"},
+            },
             {
                 "action_id": "pack:signals:run:review",
                 "run_id": "signals:dashboard",
@@ -849,10 +1081,10 @@ class SignalsPack:
 
     def _cache_terminal_outputs(self, db) -> List[Dict[str, Any]]:
         outputs = [
-            ("terminal_technical_signals", "generated_at"),
-            ("knowledge_market_views", "generated_at"),
-            ("terminal_stock_pool", "generated_at"),
-            ("strategy_snapshots", "generated_at"),
+            ("terminal_technical_signals", "updated_at"),
+            ("knowledge_market_views", "updated_at"),
+            ("terminal_stock_pool", "updated_at"),
+            ("strategy_snapshots", "updated_at"),
             ("chain_heat_snapshots", "updated_at"),
         ]
         rows: List[Dict[str, Any]] = []

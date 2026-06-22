@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """Signals domain-pack contract endpoints."""
 import asyncio
+from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Body, Query
 from starlette.concurrency import run_in_threadpool
 
 from signals.domain_pack import SignalsPack
@@ -35,3 +36,14 @@ def pack_descriptor():
 @router.get("/cache-status")
 def pack_cache_status():
     return SignalsPack().cache_status()
+
+
+@router.post("/refresh")
+def pack_refresh(payload: dict[str, Any] = Body(default_factory=dict)):
+    return SignalsPack().trigger_refresh(
+        reason=str(payload.get("reason") or "manual"),
+        force_live=bool(payload.get("force_live", False)),
+        force_postmarket=bool(payload.get("force_postmarket", False)),
+        run_optional_tasks=bool(payload.get("run_optional_tasks", True)),
+        wait=bool(payload.get("wait", False)),
+    )

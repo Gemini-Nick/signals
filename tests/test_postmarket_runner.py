@@ -1080,6 +1080,17 @@ def test_postmarket_catchup_target_starts_missing_previous_trading_day():
     assert target == ("postmarket:2026-05-07", "2026-05-07", "missing")
 
 
+def test_postmarket_catchup_target_force_bypasses_catchup_window(monkeypatch):
+    monkeypatch.setattr(pm.PostmarketRunner, "should_catchup_now", staticmethod(lambda now=None: False))
+    monkeypatch.setattr(pm, "_previous_trading_date", lambda now=None: "2026-05-07")
+    runner = pm.PostmarketRunner(_Engine(_Db(), {}), max_workers=1)
+
+    assert runner.catchup_target(datetime(2026, 5, 8, 16, 10)) is None
+    target = runner.catchup_target(datetime(2026, 5, 8, 16, 10), force=True)
+
+    assert target == ("postmarket:2026-05-07", "2026-05-07", "missing")
+
+
 def test_postmarket_catchup_target_ignores_ok_previous_trading_day():
     db = _Db()
     db["sync_runs"].docs["postmarket:2026-05-07"] = {

@@ -15,6 +15,7 @@ from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import trading_day_key
 from signals.sync.eastmoney_observer import observe_eastmoney
 from signals.sync.provider_limits import ProviderCoolingDown, provider_call
+from signals.sync.task_context import get_task_env
 from signals.sync.volume_units import CANONICAL_STOCK_VOLUME_UNIT, normalize_stock_volume
 
 logger = logging.getLogger("signals.sync.quote_snapshots")
@@ -185,7 +186,7 @@ def _write_provider_health(
 
 def _write_data_freshness(db: Database, count: int, latest_dt: str | None, live_count: int, stale_count: int) -> None:
     now = naive_market_now("A")
-    lane = os.getenv("SIGNALS_CURRENT_SYNC_LANE", "quote_lane")
+    lane = str(get_task_env("SIGNALS_CURRENT_SYNC_LANE", "quote_lane") or "quote_lane")
     date_key = str(latest_dt or "").replace("-", "")[:8]
     if count <= 0:
         freshness = "empty"

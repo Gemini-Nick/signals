@@ -10014,23 +10014,16 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
             current_session=current_session,
         )
 
-    current_quote_watermark = _quote_snapshot_watermark() or cached_quote_watermark
-    quote_watermark = _quote_overlay_watermark(current_quote_watermark, cached_quote_watermark)
     _schedule_shell_cache_refresh(engine)
     if _shell_cache_usable(cached_payload, engine):
-        cache_status = (
-            "stale_refreshing"
-            if _shell_cache_usable(cached_payload, engine, quote_watermark=current_quote_watermark)
-            else "stale_refreshing_watermark"
-        )
         return _payload_from_shell_cache(
             cached_payload,
-            cache_status,
+            "stale_refreshing",
             now,
-            quote_watermark,
+            cached_quote_watermark,
             current_session=current_session,
         )
-    return _build_shell_placeholder_payload(engine, "building", now, quote_watermark)
+    return _build_shell_placeholder_payload(engine, "building", now, cached_quote_watermark)
 
 
 def _strategy_snapshot_has_etf_analysis(snapshot: dict[str, Any]) -> bool:

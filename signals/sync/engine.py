@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 
 from signals.core.market_hours import Market, TZ_BEIJING, TZ_US_EAST, TZ_UTC, get_active_markets, next_live_check_seconds
 from .db import get_db, close as close_db
+from .task_context import task_env
 
 logger = logging.getLogger("signals.sync")
 
@@ -201,6 +202,23 @@ LIVE_SYNC_PLANS = {
     # can be plugged in here without affecting the A-share live bundle.
     Market.HK: (),
     Market.US: (),
+}
+
+LIVE_SYNC_STAGE_BY_MODULE = {
+    "eastmoney_ulist_quote": 0,
+    "fullmarket_spot_snapshot": 0,
+    "quote_snapshots": 0,
+    "index_minute": 0,
+    "stock_minute": 0,
+    "market_pools": 0,
+    "market_limit_pools": 0,
+    "board_heat_minute": 0,
+    "concept_heat_minute": 0,
+    "chain_heat_snapshots": 0,
+    "minute_readiness_probe": 1,
+    "intraday_technical_signal_scan": 1,
+    "terminal_realtime_pool": 1,
+    "strategy_snapshot": 2,
 }
 
 INTRADAY_BUNDLES = {
@@ -427,16 +445,14 @@ class SyncEngine:
             upsert=True,
         )
 
-        env_before = {
-            "SIGNALS_CURRENT_SYNC_LANE": os.environ.get("SIGNALS_CURRENT_SYNC_LANE"),
-            "SIGNALS_CURRENT_SYNC_MARKET": os.environ.get("SIGNALS_CURRENT_SYNC_MARKET"),
-        }
+        env_values = {}
         if lane:
-            os.environ["SIGNALS_CURRENT_SYNC_LANE"] = lane
+            env_values["SIGNALS_CURRENT_SYNC_LANE"] = lane
         if market:
-            os.environ["SIGNALS_CURRENT_SYNC_MARKET"] = market
+            env_values["SIGNALS_CURRENT_SYNC_MARKET"] = market
         try:
-            result = module_fn(self.db, proxy_url=self.proxy_url)
+            with task_env(env_values):
+                result = module_fn(self.db, proxy_url=self.proxy_url)
             elapsed = (self._now() - start_time).total_seconds()
 
             status, error_msg = self._classify_result(name, result)
@@ -509,13 +525,6 @@ class SyncEngine:
             logger.error("✗ %s%s 失败 (%.1fs): %s", name, f"[{market}]" if market else "", elapsed, e)
             return {"module": name, "status": "error", "elapsed": elapsed,
                     "market": market or "", "lane": lane, "error": str(e)}
-        finally:
-            for key, value in env_before.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
-
     def run_all(self) -> list:
         """
         一次性执行所有模块（--once 模式）。
@@ -756,7 +765,25 @@ class SyncEngine:
             upsert=True,
         )
 
-    def _run_intraday_bundle(self, active_markets: set[Market], now: datetime) -> list[dict]:
+    def _module_running_recent(
+        self,
+        module_name: str,
+        market: str,
+        now: datetime,
+        stale_seconds: int,
+    ) -> bool:
+        """True when a live module is already owned by a fresh worker."""
+        sync_log = self.db["sync_log"]
+        for meta_id in (self._meta_id(module_name, market), self._meta_id(module_name)):
+            doc = sync_log.find_one({"_id": meta_id}, {"last_run": 1, "status": 1})
+            if not doc or doc.get("status") != "running":
+                continue
+            last_run = self._coerce_local_datetime(doc.get("last_run"))
+            if last_run and (now - last_run).total_seconds() < stale_seconds:
+                return True
+        return False
+
+    def _run_intraday_bundle(self, active_markets: set[Market], now: datetime, *, force: bool = False) -> list[dict]:
         results: list[dict] = []
         for market in sorted(active_markets, key=lambda item: item.value):
             market_key = market.value
@@ -773,13 +800,16 @@ class SyncEngine:
                     self._mark_market_unavailable(market_key, reason, now, module=unavailable_id)
                 continue
 
+            runnable: list[tuple[int, LiveSyncPlan, object]] = []
             for plan in sorted(plans, key=lambda item: item.priority):
                 module_name = plan.module
                 if module_name not in self.module_map:
                     results.append({"module": module_name, "market": market_key, "status": "missing"})
                     logger.warning("live bundle module missing: %s[%s]", module_name, market_key)
                     continue
-                if self._has_run_recent(
+                if self._module_running_recent(module_name, market_key, now, plan.stale_seconds):
+                    continue
+                if not force and self._has_run_recent(
                     module_name,
                     market_key,
                     now,
@@ -788,9 +818,51 @@ class SyncEngine:
                 ):
                     continue
                 fn, _ = self.module_map[module_name]
-                logger.info("⏱ %s trigger %s[%s]", plan.lane, module_name, market_key)
-                results.append(self.run_module(module_name, fn, market=market_key, plan=plan))
+                runnable.append((LIVE_SYNC_STAGE_BY_MODULE.get(module_name, plan.priority), plan, fn))
+            for stage in sorted({item[0] for item in runnable}):
+                stage_items = [item for item in runnable if item[0] == stage]
+                if not stage_items:
+                    continue
+                workers = min(self.max_workers, max(1, len(stage_items)))
+                logger.info(
+                    "⏱ live stage=%s market=%s modules=%s workers=%d",
+                    stage,
+                    market_key,
+                    [item[1].module for item in stage_items],
+                    workers,
+                )
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=f"live-{market_key}-s{stage}") as executor:
+                    future_map = {
+                        executor.submit(self.run_module, plan.module, fn, market=market_key, plan=plan): plan
+                        for _stage, plan, fn in stage_items
+                    }
+                    for future in as_completed(future_map):
+                        plan = future_map[future]
+                        try:
+                            results.append(future.result())
+                        except Exception as exc:
+                            logger.error("✗ live %s[%s] unexpected error: %s", plan.module, market_key, exc)
+                            results.append({
+                                "module": plan.module,
+                                "market": market_key,
+                                "lane": plan.lane,
+                                "status": "error",
+                                "error": str(exc),
+                            })
         return results
+
+    def run_live_once(self, *, force: bool = False) -> list[dict]:
+        """Run one live-lane pass for currently active markets."""
+        now = self._now()
+        active_markets = get_active_markets(self._now_utc())
+        quote_preopen = self._quote_preopen_enabled() and self._a_quote_preopen_active(now)
+        if not active_markets and quote_preopen:
+            active_markets = {Market.A}
+        if not active_markets and force:
+            active_markets = {Market.A}
+        if not active_markets:
+            return []
+        return self._run_intraday_bundle(active_markets, now, force=force)
 
     def _run_scheduled_modules(self, now: datetime, today: str) -> list[dict]:
         results: list[dict] = []

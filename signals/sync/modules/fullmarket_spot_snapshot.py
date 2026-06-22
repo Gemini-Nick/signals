@@ -16,6 +16,7 @@ from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import trading_day_key
 from signals.sync.eastmoney_observer import observe_eastmoney
 from signals.sync.provider_limits import provider_call
+from signals.sync.task_context import get_task_env
 from signals.sync.volume_units import CANONICAL_STOCK_VOLUME_UNIT, normalize_stock_volume
 
 logger = logging.getLogger("signals.sync.fullmarket_spot_snapshot")
@@ -184,8 +185,8 @@ def _write_data_freshness(
     error: str = "",
 ) -> None:
     now = naive_market_now("A")
-    lane = os.getenv("SIGNALS_CURRENT_SYNC_LANE", "")
-    mode = "realtime" if os.getenv("SIGNALS_CURRENT_SYNC_MARKET") or lane else "postmarket"
+    lane = str(get_task_env("SIGNALS_CURRENT_SYNC_LANE", "") or "")
+    mode = "realtime" if get_task_env("SIGNALS_CURRENT_SYNC_MARKET") or lane else "postmarket"
     status = "fresh" if count > 0 else "empty"
     db["data_freshness"].update_one(
         {"domain": "spot", "market": "A", "mode": mode, "collection": "fullmarket_spot_snapshots"},

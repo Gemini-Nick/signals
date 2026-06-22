@@ -572,7 +572,7 @@ def test_shell_cache_rebuilds_when_board_watermark_changes():
         workbench._invalidate_shell_cache()
 
 
-def test_shell_payload_overlays_stale_cache_with_current_quote_watermark(monkeypatch):
+def test_shell_payload_returns_stale_cache_without_blocking_on_watermark(monkeypatch):
     from signals.web.api import workbench
 
     class _Engine:
@@ -601,7 +601,7 @@ def test_shell_payload_overlays_stale_cache_with_current_quote_watermark(monkeyp
         monkeypatch.setattr(
             workbench,
             "_quote_snapshot_watermark",
-            lambda: "quote_snapshots:new|fullmarket_spot_snapshots:new|terminal_stock_pool:same",
+            lambda: (_ for _ in ()).throw(AssertionError("stale shell request should not read watermarks")),
         )
         monkeypatch.setattr(workbench, "_schedule_shell_cache_refresh", lambda engine: None)
         monkeypatch.setattr(workbench, "_quote_overlay_for_symbol", lambda symbol: {
@@ -621,12 +621,12 @@ def test_shell_payload_overlays_stale_cache_with_current_quote_watermark(monkeyp
 
         payload = workbench._build_shell_payload(_Engine())
 
-        assert payload["cache"]["status"] == "stale_refreshing_quote_overlay"
-        assert payload["buy_candidates"][0]["latest_price"] == 105.02
-        assert payload["buy_candidates"][0]["day_change_pct"] == 10.0031
-        assert payload["buy_candidates"][0]["day_change_as_of"] == "2026-06-09"
+        assert payload["cache"]["status"] == "stale_refreshing"
+        assert payload["buy_candidates"][0]["latest_price"] == 95.47
+        assert payload["buy_candidates"][0]["day_change_pct"] == -0.6762
+        assert payload["buy_candidates"][0]["day_change_as_of"] == "2026-06-08"
         assert workbench._SHELL_CACHE["quote_watermark"] == (
-            "quote_snapshots:new|fullmarket_spot_snapshots:new|terminal_stock_pool:same"
+            "quote_snapshots:old|fullmarket_spot_snapshots:old|terminal_stock_pool:same"
         )
     finally:
         workbench._invalidate_shell_cache()
@@ -770,7 +770,11 @@ def test_shell_payload_returns_placeholder_when_cache_miss_and_lock_busy(monkeyp
             "quote_watermark": "",
         })
         monkeypatch.setattr(workbench, "_SHELL_CACHE_LOCK", _BusyLock())
-        monkeypatch.setattr(workbench, "_quote_snapshot_watermark", lambda: "quote_snapshots:new")
+        monkeypatch.setattr(
+            workbench,
+            "_quote_snapshot_watermark",
+            lambda: (_ for _ in ()).throw(AssertionError("cache miss shell request should not read watermarks")),
+        )
         monkeypatch.setattr(
             workbench,
             "_build_shell_payload_uncached",

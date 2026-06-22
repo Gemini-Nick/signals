@@ -9,6 +9,8 @@ from typing import Any, Callable
 
 from pymongo.database import Database
 
+from signals.sync.task_context import get_task_env
+
 logger = logging.getLogger(__name__)
 
 ALERT_COLLECTION = "notification_events"
@@ -118,7 +120,7 @@ def _alert_runtime_enabled(pool_doc: dict[str, Any], *, require_channel: bool = 
     if not _env_bool("SIGNALS_INTRADAY_POOL_ALERT_ENABLED", True):
         return False, "disabled_by_env"
     if _env_bool("SIGNALS_INTRADAY_POOL_ALERT_REQUIRE_LIVE_LANE", True):
-        lane = _text(os.getenv("SIGNALS_CURRENT_SYNC_LANE"))
+        lane = _text(get_task_env("SIGNALS_CURRENT_SYNC_LANE", ""))
         if lane != "workbench_lane":
             return False, f"not_live_workbench_lane:{lane or 'empty'}"
     if not _within_intraday_window(pool_doc.get("updated_at")):
