@@ -2352,6 +2352,20 @@ def _normalize_hk_code_text(raw: str) -> Optional[str]:
     return None
 
 
+def _canonical_a_share_symbol(raw: str) -> Tuple[Optional[str], Optional[str]]:
+    value = str(raw or "").strip().upper()
+    code = value.split(".", 1)[1] if "." in value else value
+    if not (code.isdigit() and len(code) == 6):
+        return None, None
+    if code.startswith(("5", "6", "9")):
+        return f"SH.{code}", code
+    if code.startswith(("0", "1", "2", "3")):
+        return f"SZ.{code}", code
+    if code.startswith(("8", "4")):
+        return f"BJ.{code}", code
+    return None, None
+
+
 def _normalize_stock_symbol(raw: str) -> Tuple[Optional[str], Optional[str]]:
     resolver = get_resolver()
     value = raw.strip().upper()
@@ -2363,7 +2377,8 @@ def _normalize_stock_symbol(raw: str) -> Tuple[Optional[str], Optional[str]]:
         return macro_symbol, macro_symbol.split(".", 1)[1]
 
     if value.startswith(("SH.", "SZ.", "BJ.")):
-        return value, value.split(".", 1)[1]
+        canonical, raw_code = _canonical_a_share_symbol(value)
+        return canonical or value, raw_code or value.split(".", 1)[1]
 
     hk_code = _normalize_hk_code_text(value)
     if hk_code:
@@ -2371,12 +2386,9 @@ def _normalize_stock_symbol(raw: str) -> Tuple[Optional[str], Optional[str]]:
 
     if value.isdigit():
         if len(value) == 6:
-            if value.startswith(("5", "6", "9")):
-                return f"SH.{value}", value
-            if value.startswith(("0", "1", "2", "3")):
-                return f"SZ.{value}", value
-            if value.startswith(("8", "4")):
-                return f"BJ.{value}", value
+            canonical, raw_code = _canonical_a_share_symbol(value)
+            if canonical:
+                return canonical, raw_code
 
     code = resolver.get_code(raw.strip())
     if code:
@@ -2507,7 +2519,11 @@ def _top_candidate_symbol(engine) -> str:
 def _stock_name(symbol: str, row: Optional[dict[str, Any]] = None) -> str:
     row = row or {}
     explicit = str(row.get("name") or row.get("stock_name") or "").strip()
-    if explicit:
+    symbol_text = _text(symbol).upper()
+    symbol_suffix = symbol_text.split(".")[-1]
+    explicit_upper = explicit.upper()
+    explicit_suffix = explicit_upper.split(".")[-1]
+    if explicit and explicit_upper not in {symbol_text, symbol_suffix} and explicit_suffix != symbol_suffix:
         return explicit
     macro_name = macro_industry_etf_name(symbol)
     if macro_name:
@@ -8767,7 +8783,7 @@ def _raw_shell_stock_row(item: dict[str, Any], *, group: str) -> dict[str, Any]:
         "symbol": normalized,
         "code": normalized,
         "raw_code": raw_code or normalized.split(".")[-1],
-        "name": _text(item.get("name")) or normalized,
+        "name": _text(item.get("name")) or _stock_name(normalized, item),
         "pool_type": _text(item.get("pool_type")) or pool_type,
         "trade_stage": _text(item.get("trade_stage")) or trade_stage,
         "stage_label": _text(item.get("stage_label")) or stage_label,

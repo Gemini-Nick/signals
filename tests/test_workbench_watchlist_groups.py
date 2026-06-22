@@ -4467,6 +4467,25 @@ def test_stock_minute_request_does_not_fallback_to_daily(monkeypatch):
     assert payload["chart"]["meta"]["load_eta_seconds"] == 10
 
 
+def test_prefixed_a_share_etf_symbol_is_canonicalized_for_watchlist_name(monkeypatch):
+    from signals.web.api import workbench
+
+    monkeypatch.setattr(
+        workbench,
+        "_stock_name",
+        lambda symbol, row=None: "科创半导体ETF华夏" if symbol == "SH.588170" else "",
+    )
+
+    symbol, raw_code = workbench._normalize_stock_symbol("SZ.588170")
+    row = workbench._raw_shell_stock_row({"symbol": "SZ.588170", "name": ""}, group="watch_stocks")
+
+    assert (symbol, raw_code) == ("SH.588170", "588170")
+    assert row["symbol"] == "SH.588170"
+    assert row["code"] == "SH.588170"
+    assert row["target_label"] == "SH.588170"
+    assert row["name"] == "科创半导体ETF华夏"
+
+
 def test_workbench_symbol_route_offloads_blocking_builder(monkeypatch):
     from signals.web.api import workbench
 

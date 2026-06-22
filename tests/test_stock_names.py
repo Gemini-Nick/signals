@@ -65,3 +65,23 @@ def test_macro_industry_etf_names_resolve_even_with_wrong_prefix(monkeypatch):
     assert resolver.get_name("SH.562590") == "半导体设备ETF"
     assert resolver.get_name("SZ.562590") == "半导体设备ETF"
     assert resolver.get_code("半导体设备ETF") == "SH.562590"
+
+
+def test_mongo_same_code_name_resolves_even_with_wrong_prefix(monkeypatch):
+    from signals.core.stock_names import StockNameResolver
+
+    resolver = StockNameResolver()
+    monkeypatch.setattr(resolver, "_lazy_load_fallback", lambda: None)
+    monkeypatch.setattr(
+        resolver,
+        "_mongo_name_row",
+        lambda _query: {
+            "code": "588170",
+            "symbol": "588170",
+            "futu_symbol": "SH.588170",
+            "name": "科创半导体ETF华夏",
+        },
+    )
+
+    assert resolver.get_name("SZ.588170") == "科创半导体ETF华夏"
+    assert resolver.get_name("SZ.588170") == "科创半导体ETF华夏"

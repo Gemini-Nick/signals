@@ -81,6 +81,19 @@ class StockNameResolver:
             return futu_code
         return ""
 
+    def _remember_requested_alias(self, requested_code: str, row: dict) -> str:
+        """Return the Mongo name for same-code aliases, even if SH/SZ prefix differs."""
+        requested_code = str(requested_code or "").strip()
+        name = str(row.get("name") or "").strip()
+        if not requested_code or not name:
+            return ""
+        requested_suffix = requested_code.split(".")[-1]
+        row_suffix = str(row.get("code") or row.get("symbol") or "").strip().zfill(6)
+        if row_suffix != requested_suffix:
+            return ""
+        self._remember_name(requested_code, name, override_code_name=True)
+        return name
+
     def _load_default_aliases(self):
         for futu_code, payload in _DEFAULT_STOCK_ALIASES.items():
             display_name = str(payload.get("name") or "").strip()
@@ -168,6 +181,9 @@ class StockNameResolver:
             self._remember_mongo_row(row)
             if futu_code in self._code_to_name:
                 return self._code_to_name[futu_code]
+            alias_name = self._remember_requested_alias(futu_code, row)
+            if alias_name:
+                return alias_name
         return self._code_to_name.get(futu_code, futu_code.split(".")[-1])
 
     def get_code(self, name: str) -> str:
