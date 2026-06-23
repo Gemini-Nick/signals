@@ -26,6 +26,29 @@ RETRYABLE_TASK_STATUSES = {"pending", "running", "stale", "partial", "degraded",
 FULLMARKET_SPOT_TASK_KEY = "fullmarket_spot_snapshot:all"
 SOURCE_FALLBACK_MODULES = {"quote_snapshots", "stock_daily"}
 SOURCE_BLOCKED_STATUSES = {"degraded", "error", "stale"}
+RUNTIME_USABLE_DEGRADED_MODULES = {
+    "market_pools",
+    "stock_minute",
+    "index_minute",
+    "chain_heat_snapshots",
+    "board_ranking",
+    "board_cons",
+}
+RUNTIME_USABLE_OUTPUT_KEYS = (
+    "count",
+    "written",
+    "modified",
+    "inserted",
+    "updated",
+    "compat_written",
+    "refreshed",
+    "deleted",
+    "ticks",
+    "nodes",
+    "checked",
+    "processed",
+    "processed_groups",
+)
 
 
 @dataclass(frozen=True)
@@ -180,15 +203,25 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
             "STOCK_MINUTE_CALL_INTERVAL": "0.15",
         },
     ),
-    PostmarketTaskSpec("weekly_rollup", "derived", depends_on=(*_STOCK_DAILY_DEPS, "index_daily:all")),
+    PostmarketTaskSpec(
+        "weekly_rollup",
+        "derived",
+        depends_on=(*_STOCK_DAILY_DEPS, "index_daily:all"),
+        env={
+            "WEEKLY_ROLLUP_SCOPE": "postmarket_candidates",
+            "WEEKLY_ROLLUP_MAX_SYMBOLS": "300",
+        },
+    ),
     PostmarketTaskSpec(
         "technical_signal_scan",
         "derived",
         depends_on=(*_STOCK_DAILY_DEPS, "weekly_rollup:all"),
         env={
+            "TECHNICAL_SIGNAL_SCAN_SCOPE": "postmarket_candidates",
             "TECHNICAL_SIGNAL_SCAN_MARKETS": "A",
             "TECHNICAL_SIGNAL_SCAN_REQUIRED_FREQS": "日线,周线",
             "TECHNICAL_SIGNAL_SCAN_OPTIONAL_FREQS": "30分钟,15分钟,5分钟",
+            "TECHNICAL_SIGNAL_POSTMARKET_MAX_SYMBOLS": "300",
         },
     ),
     PostmarketTaskSpec("knowledge_market_views", "derived"),
@@ -223,6 +256,7 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
         "minute_readiness_probe",
         "minute_preheat",
         depends_on=("stock_minute:all", "index_minute:all"),
+        env={"MINUTE_READINESS_SELECTION_META_ID": "stock_minute:postmarket_selection:_meta"},
         blocks_run=False,
     ),
     *_STOCK_30M_TASKS,
@@ -348,7 +382,12 @@ def _summarize_result(result: Any) -> dict[str, Any]:
         "market",
         "lane",
         "inserted",
+        "modified",
         "updated",
+        "written",
+        "compat_written",
+        "refreshed",
+        "deleted",
         "count",
         "stocks",
         "symbols",
@@ -371,6 +410,11 @@ def _summarize_result(result: Any) -> dict[str, Any]:
         "processed_groups",
         "sample_errors",
         "sample_deferred",
+        "planned_calls",
+        "empty",
+        "empty_calls",
+        "failed_calls",
+        "not_ready",
         "source_counts",
         "markets",
         "unmapped",
@@ -462,17 +506,56 @@ def _quote_snapshots_dependency_ok(task_doc: dict[str, Any]) -> bool:
     return coverage_pct >= min_coverage and error_pct <= max_error_pct
 
 
-def _dependency_status_ok(task_doc: dict[str, Any]) -> bool:
-    status = str(task_doc.get("status") or "pending")
-    if status in TASK_OK_STATUSES:
-        return True
-    if status not in {"partial", "degraded"}:
+def _runtime_degraded_result_usable(task_doc: dict[str, Any]) -> bool:
+    module = str(task_doc.get("module") or "")
+    if module not in RUNTIME_USABLE_DEGRADED_MODULES:
+        return False
+    if _result_number(task_doc, "failed_calls") > 0 or _result_number(task_doc, "errors") > 0:
+        return False
+    if _result_number(task_doc, "not_ready") > 0:
+        return False
+    planned = _result_number(task_doc, "planned_calls")
+    empty = _result_number(task_doc, "empty_calls") or _result_number(task_doc, "empty")
+    if planned > 0 and empty >= planned:
+        return False
+    return any(_result_number(task_doc, key) > 0 for key in RUNTIME_USABLE_OUTPUT_KEYS)
+
+
+def _stale_finished_result_usable(task_doc: dict[str, Any]) -> bool:
+    if str(task_doc.get("status") or "") != "stale":
         return False
     module = str(task_doc.get("module") or "")
     if module in {"stock_daily", "hk_stock_daily"}:
-        return _stock_daily_dependency_ok(task_doc)
+        return _stock_daily_dependency_ok({**task_doc, "status": "partial"})
+    summary, nested = _result_sources(task_doc)
+    result_status = str(nested.get("status") or summary.get("status") or "").lower()
+    if result_status not in TASK_OK_STATUSES:
+        return False
+    processed = _result_number(task_doc, "processed")
+    total = _result_number(task_doc, "total")
+    progress_pct = _result_number(task_doc, "progress_pct")
+    coverage_pct = _result_number(task_doc, "coverage_pct")
+    output_seen = any(_result_number(task_doc, key) > 0 for key in RUNTIME_USABLE_OUTPUT_KEYS)
+    done = bool((total > 0 and processed >= total) or progress_pct >= 99.9 or coverage_pct >= 99.9)
+    return output_seen and done
+
+
+def _dependency_status_ok(task_doc: dict[str, Any]) -> bool:
+    status = str(task_doc.get("status") or "pending")
+    module = str(task_doc.get("module") or "")
+    if module in {"stock_daily", "hk_stock_daily"} and status in {"partial", "degraded", "stale", "running"}:
+        effective_status = status if status in {"partial", "degraded"} else "partial"
+        return _stock_daily_dependency_ok({**task_doc, "status": effective_status})
+    if status in TASK_OK_STATUSES:
+        return True
+    if _stale_finished_result_usable(task_doc):
+        return True
+    if status not in {"partial", "degraded"}:
+        return False
     if module == "quote_snapshots":
         return _quote_snapshots_dependency_ok(task_doc)
+    if _runtime_degraded_result_usable(task_doc):
+        return True
     return False
 
 
@@ -738,6 +821,8 @@ class PostmarketRunner:
         progress_pct = _number(progress.get("progress_pct"))
         if progress_pct <= 0 and total > 0:
             progress_pct = processed / total * 100.0
+        elif total > 0 and processed > 0:
+            progress_pct = max(progress_pct, processed / total * 100.0)
         coverage_pct = _number(global_coverage.get("coverage_pct") or progress.get("coverage_pct"))
         has_explicit_coverage = bool(global_coverage or progress.get("coverage_pct") or progress.get("covered_codes"))
         if coverage_pct <= 0 and total > 0 and (has_explicit_coverage or _number(progress.get("deferred") or progress.get("deferred_symbols")) <= 0):
@@ -939,7 +1024,12 @@ class PostmarketRunner:
         fn, _schedule = self.engine.module_map[spec.module]
         plan = LANE_MAINTENANCE_PLANS.get(spec.module)
         semaphore = self.module_semaphores.get(spec.module)
-        with self._with_env(spec.env):
+        task_values = {
+            "SIGNALS_POSTMARKET_RUN_ID": run_id,
+            "SIGNALS_POSTMARKET_TRADE_DATE": run_id.split(":", 1)[1] if ":" in run_id else "",
+            **spec.env,
+        }
+        with self._with_env(task_values):
             if semaphore is None:
                 self._mark_task_started(run_id, spec)
                 result = self.engine.run_module(spec.module, fn, plan=plan)

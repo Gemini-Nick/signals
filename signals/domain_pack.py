@@ -464,12 +464,22 @@ class SignalsPack:
         if target:
             run_id, trade_date, previous_status = target
             postmarket_target = {"run_id": run_id, "trade_date": trade_date, "previous_status": previous_status}
-            postmarket_result = runner.run_once(
-                resume_run_id=run_id,
-                trade_date=trade_date,
-                force=force_postmarket,
-                run_optional_tasks=run_optional_tasks,
-            )
+            live_owner_pid = self._postmarket_live_owner_pid(engine.db, run_id)
+            if live_owner_pid:
+                postmarket_result = {
+                    "status": "skipped",
+                    "reason": "postmarket_already_running",
+                    "run_id": run_id,
+                    "trade_date": trade_date,
+                    "owner_pid": live_owner_pid,
+                }
+            else:
+                postmarket_result = runner.run_once(
+                    resume_run_id=run_id,
+                    trade_date=trade_date,
+                    force=force_postmarket,
+                    run_optional_tasks=run_optional_tasks,
+                )
         elif PostmarketRunner.should_run_now():
             trade_date = _postmarket_trade_date()
             run_id = default_run_id(trade_date)
@@ -492,6 +502,23 @@ class SignalsPack:
             "postmarket_target": postmarket_target,
             "postmarket": _json_safe(postmarket_result),
         }
+
+    def _postmarket_live_owner_pid(self, db: Any, run_id: str) -> int:
+        try:
+            run = db["sync_runs"].find_one({"_id": run_id}, {"owner_pid": 1}) or {}
+        except Exception:
+            return 0
+        try:
+            owner_pid = int(run.get("owner_pid") or 0)
+        except (TypeError, ValueError):
+            return 0
+        if owner_pid <= 0 or owner_pid == os.getpid():
+            return 0
+        try:
+            os.kill(owner_pid, 0)
+        except OSError:
+            return 0
+        return owner_pid
 
     def _operator_actions(self) -> List[Dict[str, Any]]:
         actions = [
@@ -672,7 +699,7 @@ class SignalsPack:
         ]
         modules: List[Dict[str, Any]] = []
         for module, lane, label in specs:
-            doc = self._latest_sync_doc(db, module)
+            doc = self._latest_sync_doc(db, module, market="A")
             if module == "stock_minute":
                 selection = self._find_one(db, "sync_log", {"_id": "stock_minute:selection:_meta"}) or {}
                 doc = self._merge_stock_minute_selection(doc, selection)
@@ -683,6 +710,7 @@ class SignalsPack:
         minute = next((item for item in modules if item.get("module") == "minute_readiness_probe"), {})
         stock_minute = next((item for item in modules if item.get("module") == "stock_minute"), {})
         minute_not_ready = self._int_from_result(minute, "not_ready")
+        minute_not_ready_samples = [] if minute_not_ready == 0 else self._cache_minute_not_ready_samples(db)
         problem_modules = [
             item.get("module")
             for item in modules
@@ -698,7 +726,7 @@ class SignalsPack:
                 "freshness_seconds_max": max(freshness) if freshness else None,
                 "minute_checked": self._int_from_result(minute, "checked"),
                 "minute_not_ready": minute_not_ready,
-                "minute_not_ready_samples": self._cache_minute_not_ready_samples(db),
+                "minute_not_ready_samples": minute_not_ready_samples,
                 "selected_symbols": len(stock_minute.get("selected_symbols") or []),
                 "skipped_symbols": int(stock_minute.get("skipped_count") or self._int_from_result(stock_minute, "skipped") or 0),
             },
@@ -758,11 +786,8 @@ class SignalsPack:
         sample_errors: List[Any] = []
         for task in tasks:
             module = str(task.get("module") or "")
-            status = str(task.get("status") or "pending")
+            raw_status = str(task.get("status") or "pending")
             blocks_run = bool(task.get("blocks_run", True))
-            status_counts[status] = status_counts.get(status, 0) + 1
-            if status == "ok":
-                completed += 1
             summary = dict(task.get("result_summary") or {})
             cursor = dict(task.get("cursor") or {})
             shard_key = str(task.get("shard_key") or "all")
@@ -788,7 +813,7 @@ class SignalsPack:
                         "total_groups", "sample_errors", "unmapped", "source_counts",
                     ]))
                     cursor.update(self._project_fields(shard_progress, ["next_cursor", "remaining", "total_groups"]))
-            progress_pct = self._task_progress_pct(status, summary, cursor)
+            progress_pct = self._task_progress_pct(raw_status, summary, cursor)
             eta_seconds = self._task_eta_seconds(task, progress_pct)
             if progress_pct is not None:
                 progress_values.append(progress_pct)
@@ -796,9 +821,11 @@ class SignalsPack:
                     critical_progress_values.append(progress_pct)
                 else:
                     optional_progress_values.append(progress_pct)
-            task_done = status == "ok" or (
-                status in {"partial", "degraded"} and progress_pct is not None and progress_pct >= 99.9
-            )
+            task_done = self._postmarket_task_effectively_done(module, raw_status, summary, cursor, progress_pct)
+            status = "ok" if task_done else raw_status
+            status_counts[status] = status_counts.get(status, 0) + 1
+            if task_done:
+                completed += 1
             if blocks_run:
                 critical_task_count += 1
                 critical_status_counts[status] = critical_status_counts.get(status, 0) + 1
@@ -818,6 +845,7 @@ class SignalsPack:
                 "phase": task.get("phase") or "",
                 "shard_key": task.get("shard_key") or "all",
                 "status": status,
+                "raw_status": raw_status if raw_status != status else "",
                 "blocks_run": blocks_run,
                 "attempts": int(task.get("attempts") or 0),
                 "depends_on": task.get("depends_on") or [],
@@ -854,11 +882,14 @@ class SignalsPack:
                 else (round(critical_completed / critical_task_count * 100, 2) if critical_task_count else 100.0)
             )
             critical_status = run_status or "pending"
-        optional_progress_pct = (
-            round(sum(optional_progress_values) / optional_task_count, 2)
-            if optional_task_count and optional_progress_values
-            else (round(optional_completed / optional_task_count * 100, 2) if optional_task_count else 100.0)
-        )
+        if optional_task_count and optional_completed == optional_task_count:
+            optional_progress_pct = 100.0
+        else:
+            optional_progress_pct = (
+                round(sum(optional_progress_values) / optional_task_count, 2)
+                if optional_task_count and optional_progress_values
+                else (round(optional_completed / optional_task_count * 100, 2) if optional_task_count else 100.0)
+            )
         return {
             "run": {
                 "run_id": run_id,
@@ -1246,10 +1277,11 @@ class SignalsPack:
             return run_state if run_state in {"waiting_for_source", "partial/source_blocked"} else "source_blocked"
         run = postmarket.get("run") if isinstance(postmarket.get("run"), Mapping) else {}
         run_status = str(run.get("status") or "")
+        expected_daily_coverage_date = self._cache_expected_daily_coverage_date(trade_date)
         if (
-            str(trade_date or "")[:10]
+            expected_daily_coverage_date
             and str(daily_coverage_date or "")[:10]
-            and str(daily_coverage_date or "")[:10] != str(trade_date or "")[:10]
+            and str(daily_coverage_date or "")[:10] < expected_daily_coverage_date
         ):
             return "old_cache_readable"
         if str(trade_date or "")[:10] and terminal_ready_date and terminal_ready_date == str(trade_date or "")[:10]:
@@ -1259,6 +1291,20 @@ class SignalsPack:
         if run_status == "ok":
             return "ok"
         return run_status or "unknown"
+
+    def _cache_expected_daily_coverage_date(self, trade_date: str) -> str:
+        trade_day = str(trade_date or "")[:10]
+        if not trade_day:
+            return ""
+        now = naive_market_now("A")
+        if trade_day != now.date().isoformat():
+            return trade_day
+        try:
+            from signals.core.trading_dates import trading_day_key
+
+            return trading_day_key("A", now=now, open_time=datetime_time(15, 0))
+        except Exception:
+            return trade_day if now.time() >= datetime_time(15, 0) else ""
 
     def _cache_blockers(self, live: Dict[str, Any], postmarket: Dict[str, Any], provider_health: List[Dict[str, Any]] | None = None) -> List[Dict[str, Any]]:
         blockers: List[Dict[str, Any]] = []
@@ -1272,7 +1318,7 @@ class SignalsPack:
                 status in {"error", "degraded", "missing", "partial", "running", "stale"}
                 or failed_calls > 0
                 or minute_not_ready > 0
-                or "orphaned_running_module" in error_msg
+                or (status != "ok" and "orphaned_running_module" in error_msg)
             ):
                 blockers.append({
                     "scope": "live_low_latency",
@@ -1346,7 +1392,12 @@ class SignalsPack:
             return "cooldown_expired"
         return status
 
-    def _latest_sync_doc(self, db, module: str) -> Dict[str, Any]:
+    def _latest_sync_doc(self, db, module: str, market: str | None = None) -> Dict[str, Any]:
+        if market:
+            doc = self._find_one(db, "sync_log", {"_id": f"{module}:{market}:_meta"})
+            if doc:
+                return doc
+
         candidates: List[Dict[str, Any]] = []
         for doc_id in (f"{module}:A:_meta", f"{module}:_meta"):
             doc = self._find_one(db, "sync_log", {"_id": doc_id})
@@ -1410,7 +1461,9 @@ class SignalsPack:
             return "ok"
         if pause_ok and status == "ok" and row.get("freshness") == "stale":
             return "ok"
-        if status == "degraded" and self._cache_runtime_exceeded_but_usable(row):
+        if status == "degraded" and self._cache_degraded_result_usable(row):
+            return "ok"
+        if status == "running" and self._cache_low_latency_result_usable(row):
             return "ok"
         if status != "ok":
             return status
@@ -1431,9 +1484,14 @@ class SignalsPack:
             return "stale"
         return "ok"
 
-    def _cache_runtime_exceeded_but_usable(self, row: Mapping[str, Any]) -> bool:
+    def _cache_degraded_result_usable(self, row: Mapping[str, Any]) -> bool:
         reason = str(row.get("error_msg") or row.get("degraded_reason") or "").lower()
-        if "runtime_exceeded_" not in reason:
+        if "runtime_exceeded_" not in reason and "orphaned_running_module" not in reason:
+            return False
+        return self._cache_low_latency_result_usable(row)
+
+    def _cache_low_latency_result_usable(self, row: Mapping[str, Any]) -> bool:
+        if not self._cache_row_touched_current_market_day(row):
             return False
         if self._int_from_result(row, "failed_calls") > 0 or self._int_from_result(row, "errors") > 0:
             return False
@@ -1559,6 +1617,182 @@ class SignalsPack:
         if status == "ok":
             return 100.0
         return None
+
+    def _postmarket_task_effectively_done(
+        self,
+        module: str,
+        status: str,
+        summary: Mapping[str, Any],
+        cursor: Mapping[str, Any],
+        progress_pct: Optional[float],
+    ) -> bool:
+        if status == "ok":
+            return True
+        if status in {"partial", "degraded"} and progress_pct is not None and progress_pct >= 99.9:
+            return True
+        if module in {"stock_daily", "hk_stock_daily"} and status in {"partial", "degraded", "stale", "running"}:
+            return self._postmarket_stock_daily_usable(status, summary, cursor)
+        if status == "stale" and not self._postmarket_stale_finished_result_usable(module, summary, cursor):
+            return False
+        if module == "quote_snapshots" and status in {"partial", "degraded"}:
+            return self._postmarket_quote_snapshots_usable(summary, cursor)
+        if module == "minute_readiness_probe" and status == "partial":
+            return self._postmarket_minute_readiness_finished(summary, cursor)
+        if status in {"partial", "degraded"}:
+            return self._postmarket_runtime_degraded_result_usable(module, summary, cursor)
+        return status == "stale" and self._postmarket_stale_finished_result_usable(module, summary, cursor)
+
+    def _postmarket_result_number(
+        self,
+        summary: Mapping[str, Any],
+        cursor: Mapping[str, Any],
+        key: str,
+        default: float = 0.0,
+    ) -> float:
+        nested = summary.get("result") if isinstance(summary.get("result"), Mapping) else {}
+        for source in (nested, summary, cursor):
+            value = source.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return default
+
+    def _number_from_mapping(self, source: Mapping[str, Any], key: str, default: float = 0.0) -> float:
+        value = source.get(key)
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _postmarket_stock_daily_usable(
+        self,
+        status: str,
+        summary: Mapping[str, Any],
+        cursor: Mapping[str, Any],
+    ) -> bool:
+        nested = summary.get("result") if isinstance(summary.get("result"), Mapping) else {}
+        result_status = str(nested.get("status") or summary.get("status") or "").lower()
+        sources = [source for source in (nested, summary, cursor) if isinstance(source, Mapping)]
+        processed_total_pairs = [
+            (
+                self._number_from_mapping(source, "processed"),
+                self._number_from_mapping(source, "total"),
+            )
+            for source in sources
+        ]
+        progress_values = [self._number_from_mapping(source, "progress_pct") for source in sources]
+        errors = self._postmarket_result_number(summary, cursor, "errors")
+        deferred = self._postmarket_result_number(summary, cursor, "deferred")
+        coverage_pct = self._postmarket_result_number(summary, cursor, "coverage_pct")
+        min_coverage = float(os.getenv("SIGNALS_POSTMARKET_STOCK_DAILY_PARTIAL_MIN_COVERAGE", "40") or 40)
+        max_errors = float(os.getenv("SIGNALS_POSTMARKET_STOCK_DAILY_PARTIAL_MAX_ERRORS", "25") or 25)
+        max_error_pct = float(os.getenv("SIGNALS_POSTMARKET_STOCK_DAILY_PARTIAL_MAX_ERROR_PCT", "6") or 6)
+        processed_all = any(total > 0 and processed >= total for processed, total in processed_total_pairs)
+        progress_done = any(progress_pct >= 99.9 for progress_pct in progress_values)
+        total = max((total for _processed, total in processed_total_pairs), default=0.0)
+        error_pct = (errors / total * 100.0) if total > 0 else 0.0
+        sparse_errors_ok = bool(errors <= max_errors and error_pct <= max_error_pct)
+        if status == "degraded" and (result_status != "ok" or deferred > 0):
+            return False
+        return sparse_errors_ok and (processed_all or progress_done) and coverage_pct >= min_coverage
+
+    def _postmarket_quote_snapshots_usable(
+        self,
+        summary: Mapping[str, Any],
+        cursor: Mapping[str, Any],
+    ) -> bool:
+        count = self._postmarket_result_number(summary, cursor, "count")
+        live = self._postmarket_result_number(summary, cursor, "live")
+        errors = self._postmarket_result_number(summary, cursor, "errors")
+        if count <= 0:
+            return False
+        coverage_pct = live / count * 100.0
+        error_pct = errors / count * 100.0
+        min_coverage = float(os.getenv("SIGNALS_POSTMARKET_QUOTE_PARTIAL_MIN_COVERAGE", "50") or 50)
+        max_error_pct = float(os.getenv("SIGNALS_POSTMARKET_QUOTE_PARTIAL_MAX_ERROR_PCT", "50") or 50)
+        return coverage_pct >= min_coverage and error_pct <= max_error_pct
+
+    def _postmarket_minute_readiness_finished(
+        self,
+        summary: Mapping[str, Any],
+        cursor: Mapping[str, Any],
+    ) -> bool:
+        checked = self._postmarket_result_number(summary, cursor, "checked")
+        inserted = self._postmarket_result_number(summary, cursor, "inserted")
+        return checked > 0 and inserted >= checked
+
+    def _postmarket_runtime_degraded_result_usable(
+        self,
+        module: str,
+        summary: Mapping[str, Any],
+        cursor: Mapping[str, Any],
+    ) -> bool:
+        if module not in {
+            "market_pools",
+            "stock_minute",
+            "index_minute",
+            "chain_heat_snapshots",
+            "board_ranking",
+            "board_cons",
+        }:
+            return False
+        if (
+            self._postmarket_result_number(summary, cursor, "failed_calls") > 0
+            or self._postmarket_result_number(summary, cursor, "errors") > 0
+            or self._postmarket_result_number(summary, cursor, "not_ready") > 0
+        ):
+            return False
+        planned = self._postmarket_result_number(summary, cursor, "planned_calls")
+        empty = (
+            self._postmarket_result_number(summary, cursor, "empty_calls")
+            or self._postmarket_result_number(summary, cursor, "empty")
+        )
+        if planned > 0 and empty >= planned:
+            return False
+        return any(
+            self._postmarket_result_number(summary, cursor, key) > 0
+            for key in (
+                "count",
+                "written",
+                "modified",
+                "inserted",
+                "updated",
+                "compat_written",
+                "refreshed",
+                "deleted",
+                "ticks",
+                "nodes",
+                "checked",
+                "processed",
+                "processed_groups",
+            )
+        )
+
+    def _postmarket_stale_finished_result_usable(
+        self,
+        module: str,
+        summary: Mapping[str, Any],
+        cursor: Mapping[str, Any],
+    ) -> bool:
+        nested = summary.get("result") if isinstance(summary.get("result"), Mapping) else {}
+        result_status = str(nested.get("status") or summary.get("status") or "").lower()
+        if result_status != "ok":
+            return False
+        if module in {"stock_daily", "hk_stock_daily"}:
+            return self._postmarket_stock_daily_usable("partial", summary, cursor)
+        processed = self._postmarket_result_number(summary, cursor, "processed")
+        total = self._postmarket_result_number(summary, cursor, "total")
+        progress_pct = self._postmarket_result_number(summary, cursor, "progress_pct")
+        coverage_pct = self._postmarket_result_number(summary, cursor, "coverage_pct")
+        output_seen = self._postmarket_runtime_degraded_result_usable(module, summary, cursor) or bool(
+            processed > 0 or coverage_pct > 0
+        )
+        return output_seen and bool((total > 0 and processed >= total) or progress_pct >= 99.9 or coverage_pct >= 99.9)
 
     def _task_eta_seconds(self, task: Mapping[str, Any], progress_pct: Optional[float]) -> Optional[int]:
         if progress_pct is None or progress_pct <= 0 or progress_pct >= 100:

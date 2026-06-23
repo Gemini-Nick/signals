@@ -186,6 +186,28 @@ def test_pack_trigger_refresh_throttles_auto_requests(monkeypatch):
     assert second["message"] == "refresh_throttled"
 
 
+def test_pack_postmarket_live_owner_guard(monkeypatch):
+    from signals import domain_pack
+    from signals.domain_pack import SignalsPack
+
+    db = _Db({
+        "sync_runs": _Collection([
+            {"_id": "postmarket:2026-06-22", "owner_pid": 12345},
+        ]),
+    })
+    pack = SignalsPack()
+    monkeypatch.setattr(domain_pack.os, "getpid", lambda: 999)
+    monkeypatch.setattr(domain_pack.os, "kill", lambda pid, sig: None)
+
+    assert pack._postmarket_live_owner_pid(db, "postmarket:2026-06-22") == 12345
+
+    def dead_process(pid, sig):
+        raise OSError("no such process")
+
+    monkeypatch.setattr(domain_pack.os, "kill", dead_process)
+    assert pack._postmarket_live_owner_pid(db, "postmarket:2026-06-22") == 0
+
+
 def test_pack_dashboard_endpoint_smoke():
     from signals.web.app import create_app
 
@@ -441,6 +463,151 @@ def test_live_low_latency_treats_runtime_exceeded_with_outputs_as_usable(monkeyp
     assert live["summary"]["problem_modules"] == []
 
 
+def test_live_low_latency_prefers_a_market_meta_over_postmarket_generic(monkeypatch):
+    from signals import domain_pack
+    from signals.domain_pack import SignalsPack
+
+    now = datetime(2026, 4, 29, 10, 0)
+    later = datetime(2026, 4, 29, 10, 5)
+    monkeypatch.setattr(domain_pack, "naive_market_now", lambda _market: now)
+    db = _Db({
+        "sync_log": _Collection([
+            {"_id": "quote_snapshots:A:_meta", "module": "quote_snapshots", "status": "ok", "last_run": now},
+            {"_id": "stock_minute:A:_meta", "module": "stock_minute", "status": "ok", "last_run": now},
+            {
+                "_id": "stock_minute:_meta",
+                "module": "stock_minute",
+                "status": "running",
+                "last_run": later,
+                "result": {"selected": 240},
+            },
+            {
+                "_id": "stock_minute:selection:_meta",
+                "module": "stock_minute",
+                "selected_symbols": ["688802", "300575"],
+                "minute_scope": "terminal_stock_pool",
+            },
+            {"_id": "index_minute:A:_meta", "module": "index_minute", "status": "ok", "last_run": now},
+            {
+                "_id": "minute_readiness_probe:A:_meta",
+                "module": "minute_readiness_probe",
+                "status": "ok",
+                "last_run": now,
+                "result": {"checked": 36, "not_ready": 0},
+            },
+            {
+                "_id": "minute_readiness_probe:_meta",
+                "module": "minute_readiness_probe",
+                "status": "partial",
+                "last_run": later,
+                "result": {"checked": 500, "not_ready": 3},
+            },
+            {"_id": "market_pools:A:_meta", "module": "market_pools", "status": "ok", "last_run": now},
+            {"_id": "board_heat_minute:A:_meta", "module": "board_heat_minute", "status": "ok", "last_run": now},
+            {"_id": "concept_heat_minute:A:_meta", "module": "concept_heat_minute", "status": "ok", "last_run": now},
+            {"_id": "chain_heat_snapshots:A:_meta", "module": "chain_heat_snapshots", "status": "ok", "last_run": now},
+        ]),
+    })
+
+    live = SignalsPack()._cache_live_low_latency(db)
+
+    stock = next(item for item in live["modules"] if item["module"] == "stock_minute")
+    minute = next(item for item in live["modules"] if item["module"] == "minute_readiness_probe")
+    assert stock["status"] == "ok"
+    assert stock["raw_status"] == "ok"
+    assert stock["selected_symbols"] == ["688802", "300575"]
+    assert minute["status"] == "ok"
+    assert live["summary"]["strict_status"] == "ok"
+    assert live["summary"]["problem_modules"] == []
+
+
+def test_live_low_latency_treats_orphaned_result_with_outputs_as_usable(monkeypatch):
+    from signals import domain_pack
+    from signals.domain_pack import SignalsPack
+
+    now = datetime(2026, 4, 29, 10, 0)
+    monkeypatch.setattr(domain_pack, "naive_market_now", lambda _market: now)
+    db = _Db({
+        "sync_log": _Collection([
+            {"_id": "quote_snapshots:A:_meta", "module": "quote_snapshots", "status": "ok", "last_run": now},
+            {"_id": "stock_minute:A:_meta", "module": "stock_minute", "status": "ok", "last_run": now},
+            {"_id": "index_minute:A:_meta", "module": "index_minute", "status": "ok", "last_run": now},
+            {
+                "_id": "minute_readiness_probe:A:_meta",
+                "module": "minute_readiness_probe",
+                "status": "ok",
+                "last_run": now,
+                "result": {"checked": 492, "not_ready": 0},
+            },
+            {
+                "_id": "market_pools:A:_meta",
+                "module": "market_pools",
+                "status": "degraded",
+                "last_run": now,
+                "error_msg": "orphaned_running_module",
+                "result": {"count": 50, "modified": 1},
+            },
+            {"_id": "board_heat_minute:A:_meta", "module": "board_heat_minute", "status": "ok", "last_run": now},
+            {"_id": "concept_heat_minute:A:_meta", "module": "concept_heat_minute", "status": "ok", "last_run": now},
+            {"_id": "chain_heat_snapshots:A:_meta", "module": "chain_heat_snapshots", "status": "ok", "last_run": now},
+        ]),
+    })
+
+    live = SignalsPack()._cache_live_low_latency(db)
+
+    statuses = {item["module"]: item["status"] for item in live["modules"]}
+    assert statuses["market_pools"] == "ok"
+    assert live["summary"]["strict_status"] == "ok"
+    assert live["summary"]["problem_modules"] == []
+    assert SignalsPack()._cache_blockers(live, {"tasks": []}, []) == []
+
+
+def test_live_low_latency_treats_running_result_with_outputs_as_usable(monkeypatch):
+    from signals import domain_pack
+    from signals.domain_pack import SignalsPack
+
+    now = datetime(2026, 4, 29, 10, 0)
+    monkeypatch.setattr(domain_pack, "naive_market_now", lambda _market: now)
+    db = _Db({
+        "sync_log": _Collection([
+            {"_id": "quote_snapshots:A:_meta", "module": "quote_snapshots", "status": "ok", "last_run": now},
+            {"_id": "stock_minute:A:_meta", "module": "stock_minute", "status": "ok", "last_run": now},
+            {
+                "_id": "index_minute:A:_meta",
+                "module": "index_minute",
+                "status": "running",
+                "last_run": now,
+                "result": {"written": 29, "planned_calls": 36, "empty": 15, "errors": 0},
+            },
+            {
+                "_id": "minute_readiness_probe:A:_meta",
+                "module": "minute_readiness_probe",
+                "status": "ok",
+                "last_run": now,
+                "result": {"checked": 492, "not_ready": 0},
+            },
+            {"_id": "market_pools:A:_meta", "module": "market_pools", "status": "ok", "last_run": now},
+            {"_id": "board_heat_minute:A:_meta", "module": "board_heat_minute", "status": "ok", "last_run": now},
+            {"_id": "concept_heat_minute:A:_meta", "module": "concept_heat_minute", "status": "ok", "last_run": now},
+            {
+                "_id": "chain_heat_snapshots:A:_meta",
+                "module": "chain_heat_snapshots",
+                "status": "running",
+                "last_run": now,
+                "result": {"status": "ok", "nodes": 45, "latest_minute": "2026-04-29 09:59:00"},
+            },
+        ]),
+    })
+
+    live = SignalsPack()._cache_live_low_latency(db)
+
+    statuses = {item["module"]: item["status"] for item in live["modules"]}
+    assert statuses["index_minute"] == "ok"
+    assert statuses["chain_heat_snapshots"] == "ok"
+    assert live["summary"]["strict_status"] == "ok"
+    assert live["summary"]["problem_modules"] == []
+
+
 def test_live_low_latency_uses_effective_trade_day_on_holiday(monkeypatch):
     from signals import domain_pack
     from signals.data import mongo_fallback
@@ -551,6 +718,23 @@ def test_cache_recovery_state_reports_old_daily_cache():
     )
 
     assert state == "old_cache_readable"
+
+
+def test_cache_recovery_state_accepts_previous_daily_cache_intraday(monkeypatch):
+    from signals import domain_pack
+    from signals.domain_pack import SignalsPack
+
+    monkeypatch.setattr(domain_pack, "naive_market_now", lambda _market: datetime(2026, 5, 13, 10, 0))
+
+    state = SignalsPack()._cache_recovery_state(
+        trade_date="2026-05-13",
+        daily_coverage_date="2026-05-12",
+        terminal_ready_date="2026-05-13",
+        postmarket={"run": {"status": "ok"}},
+        critical_blocker={},
+    )
+
+    assert state == "terminal_ready"
 
 
 def test_fullmarket_provider_blocker_is_prioritized():
@@ -666,6 +850,151 @@ def test_completed_postmarket_progress_is_done_even_with_stale_task_progress():
     assert postmarket["summary"]["critical_progress_pct"] == 100.0
     assert postmarket["summary"]["critical_status"] == "ok"
     assert postmarket["summary"]["eta_seconds"] == 0
+
+
+def test_postmarket_effective_done_tasks_are_done_and_not_blockers():
+    from signals.domain_pack import SignalsPack
+
+    db = _Db({
+        "sync_runs": _Collection([
+            {
+                "_id": "postmarket:2026-06-22",
+                "run_id": "postmarket:2026-06-22",
+                "trade_date": "2026-06-22",
+                "status": "running",
+                "started_at": datetime(2026, 6, 22, 16, 10),
+            }
+        ]),
+        "sync_tasks": _Collection([
+            {
+                "_id": "postmarket:2026-06-22:quote_snapshots:all",
+                "run_id": "postmarket:2026-06-22",
+                "module": "quote_snapshots",
+                "phase": "market_data",
+                "task_key": "quote_snapshots:all",
+                "shard_key": "all",
+                "blocks_run": True,
+                "status": "degraded",
+                "order": 1,
+                "result_summary": {"status": "degraded", "result": {"count": 363, "live": 362, "errors": 1}},
+            },
+            {
+                "_id": "postmarket:2026-06-22:stock_minute:all",
+                "run_id": "postmarket:2026-06-22",
+                "module": "stock_minute",
+                "phase": "minute_preheat",
+                "task_key": "stock_minute:all",
+                "shard_key": "all",
+                "blocks_run": True,
+                "status": "degraded",
+                "order": 2,
+                "result_summary": {
+                    "status": "degraded",
+                    "result": {"written": 28427, "planned_calls": 320, "empty": 91, "errors": 0},
+                },
+            },
+            {
+                "_id": "postmarket:2026-06-22:hk_stock_daily:shard_00",
+                "run_id": "postmarket:2026-06-22",
+                "module": "hk_stock_daily",
+                "phase": "hk_market_data",
+                "task_key": "hk_stock_daily:shard_00",
+                "shard_key": "shard_00",
+                "blocks_run": False,
+                "status": "stale",
+                "order": 3,
+                "result_summary": {
+                    "status": "ok",
+                    "result": {
+                        "status": "ok",
+                        "processed": 347,
+                        "total": 347,
+                        "coverage_pct": 100.0,
+                        "errors": 0,
+                    },
+                },
+            },
+            {
+                "_id": "postmarket:2026-06-22:stock_daily:shard_01",
+                "run_id": "postmarket:2026-06-22",
+                "module": "stock_daily",
+                "phase": "market_data",
+                "task_key": "stock_daily:shard_01",
+                "shard_key": "shard_01",
+                "blocks_run": True,
+                "status": "stale",
+                "order": 4,
+                "error_msg": "running_owner_dead",
+                "result_summary": {
+                    "status": "partial",
+                    "processed": 348,
+                    "total": 348,
+                    "covered_codes": 5482,
+                    "errors": 2,
+                    "deferred": 239,
+                    "progress_pct": 100.0,
+                    "coverage_pct": 99.49,
+                    "source": "fullmarket_spot_snapshots.valid_universe + bars.daily",
+                },
+            },
+            {
+                "_id": "postmarket:2026-06-22:stock_daily:shard_02",
+                "run_id": "postmarket:2026-06-22",
+                "module": "stock_daily",
+                "phase": "market_data",
+                "task_key": "stock_daily:shard_02",
+                "shard_key": "shard_02",
+                "blocks_run": True,
+                "status": "running",
+                "order": 5,
+                "result_summary": {
+                    "status": "partial",
+                    "processed": 5510,
+                    "total": 5510,
+                    "covered_codes": 5482,
+                    "errors": 16,
+                    "deferred": 3504,
+                    "progress_pct": 81.19,
+                    "coverage_pct": 99.49,
+                    "source": "fullmarket_spot_snapshots.valid_universe + bars.daily",
+                },
+                "cursor": {"processed": 5510, "total": 5510, "progress_pct": 81.19},
+            },
+            {
+                "_id": "postmarket:2026-06-22:minute_readiness_probe:all",
+                "run_id": "postmarket:2026-06-22",
+                "module": "minute_readiness_probe",
+                "phase": "minute_preheat",
+                "task_key": "minute_readiness_probe:all",
+                "shard_key": "all",
+                "blocks_run": False,
+                "status": "partial",
+                "order": 6,
+                "result_summary": {
+                    "status": "partial",
+                    "result": {"checked": 516, "not_ready": 3, "inserted": 516},
+                },
+            },
+        ]),
+    })
+    pack = SignalsPack()
+
+    postmarket = pack._cache_postmarket_backfill(db)
+    rows = {row["task_id"]: row for row in postmarket["tasks"]}
+
+    assert postmarket["summary"]["completed"] == 6
+    assert postmarket["summary"]["critical_completed"] == 4
+    assert postmarket["summary"]["critical_status"] == "ok"
+    assert postmarket["summary"]["optional_completed"] == 2
+    assert postmarket["summary"]["optional_progress_pct"] == 100.0
+    assert postmarket["summary"]["status_counts"] == {"ok": 6}
+    assert rows["postmarket:2026-06-22:quote_snapshots:all"]["status"] == "ok"
+    assert rows["postmarket:2026-06-22:quote_snapshots:all"]["raw_status"] == "degraded"
+    assert rows["postmarket:2026-06-22:stock_daily:shard_01"]["raw_status"] == "stale"
+    assert rows["postmarket:2026-06-22:stock_daily:shard_02"]["raw_status"] == "running"
+    assert rows["postmarket:2026-06-22:hk_stock_daily:shard_00"]["raw_status"] == "stale"
+    assert rows["postmarket:2026-06-22:minute_readiness_probe:all"]["raw_status"] == "partial"
+    assert pack._cache_blockers({"modules": []}, postmarket, []) == []
 
 
 def test_postmarket_critical_progress_ignores_optional_hk_tail():

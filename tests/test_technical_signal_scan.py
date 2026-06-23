@@ -9,6 +9,7 @@ from czsc import Freq
 
 from signals.sync.modules.technical_signal_scan import (
     INTRADAY_SCAN_SCOPE,
+    POSTMARKET_CANDIDATE_SCAN_SCOPE,
     POSTMARKET_SCAN_SCOPE,
     _coverage_by_freq,
     _doc_to_rawbar,
@@ -439,9 +440,12 @@ class _Bars:
 
     def distinct(self, field, query=None):
         freqs = set(((query or {}).get("meta.freq") or {}).get("$in") or [])
+        symbols = set(((query or {}).get("meta.symbol") or {}).get("$in") or [])
         values = []
         for doc in self.docs:
             if freqs and doc.get("meta", {}).get("freq") not in freqs:
+                continue
+            if symbols and doc.get("meta", {}).get("symbol") not in symbols:
                 continue
             value = doc.get("meta", {}).get("symbol")
             if value not in values:
@@ -450,7 +454,12 @@ class _Bars:
 
     def find_one(self, query=None, projection=None, sort=None):
         freqs = set(((query or {}).get("meta.freq") or {}).get("$in") or [])
-        rows = [doc for doc in self.docs if not freqs or doc.get("meta", {}).get("freq") in freqs]
+        symbols = set(((query or {}).get("meta.symbol") or {}).get("$in") or [])
+        rows = [
+            doc for doc in self.docs
+            if (not freqs or doc.get("meta", {}).get("freq") in freqs)
+            and (not symbols or doc.get("meta", {}).get("symbol") in symbols)
+        ]
         rows.sort(key=lambda item: item.get("dt"), reverse=True)
         return rows[0] if rows else None
 
@@ -557,6 +566,25 @@ def test_intraday_scope_uses_stock_minute_selection_then_terminal_pool():
     symbols, source = _symbols_for_scope(db, INTRADAY_SCAN_SCOPE)
 
     assert symbols == ["300002", "300001", "300003", "300004"]
+    assert source == "stock_minute_selection+terminal_stock_pool"
+
+
+def test_postmarket_candidate_scope_uses_active_terminal_universe(monkeypatch):
+    monkeypatch.setenv("TECHNICAL_SIGNAL_POSTMARKET_MAX_SYMBOLS", "3")
+    db = _Db({
+        "sync_log": _Collection(doc={
+            "selected_symbols": ["300001", "300002"],
+            "priority_symbols": ["300002"],
+        }),
+        "terminal_stock_pool": _Collection(doc={
+            "focus_stocks": [{"raw_code": "300003"}],
+            "watch_stocks": [{"symbol": "SZ.300004"}],
+        }),
+    })
+
+    symbols, source = _symbols_for_scope(db, POSTMARKET_CANDIDATE_SCAN_SCOPE)
+
+    assert symbols == ["300002", "300001", "300003"]
     assert source == "stock_minute_selection+terminal_stock_pool"
 
 

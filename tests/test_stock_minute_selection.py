@@ -363,6 +363,14 @@ def test_postmarket_minute_cap_reads_task_env(monkeypatch):
         assert stock_minute._selection_cap() == 120
 
 
+def test_postmarket_minute_scope_uses_separate_selection_meta_id(monkeypatch):
+    monkeypatch.delenv("STOCK_MINUTE_SCOPE", raising=False)
+
+    assert stock_minute._selection_meta_id() == "stock_minute:selection:_meta"
+    with task_env({"STOCK_MINUTE_SCOPE": "postmarket_candidates"}):
+        assert stock_minute._selection_meta_id() == "stock_minute:postmarket_selection:_meta"
+
+
 def test_postmarket_minute_selection_consumes_pending_universe_before_cached():
     selected, skipped = stock_minute._select_postmarket_minute_symbols(
         ["300001", "300002", "300003", "300004"],

@@ -11,6 +11,7 @@ from pymongo.database import Database
 
 from signals.core.macro_universe import macro_a_index_symbols
 from signals.core.market_time import naive_market_now
+from signals.sync.task_context import get_task_env
 
 logger = logging.getLogger("signals.sync.minute_readiness")
 
@@ -74,7 +75,7 @@ def _normalize_minute_freqs(values: Any) -> list[str]:
 
 def _stock_selection_meta(db: Database) -> dict[str, Any]:
     return db["sync_log"].find_one(
-        {"_id": "stock_minute:selection:_meta"},
+        {"_id": str(get_task_env("MINUTE_READINESS_SELECTION_META_ID", "stock_minute:selection:_meta") or "stock_minute:selection:_meta")},
         {
             "selected_symbols": 1,
             "priority_symbols": 1,

@@ -284,6 +284,10 @@ def _postmarket_minute_scope() -> bool:
     return str(get_task_env("SIGNALS_POSTMARKET_MINUTE_PREHEAT", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _selection_meta_id() -> str:
+    return "stock_minute:postmarket_selection:_meta" if _postmarket_minute_scope() else "stock_minute:selection:_meta"
+
+
 def _add_candidate(
     symbols: list[str],
     source_counts: dict[str, int],
@@ -1340,12 +1344,14 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
     universe_result = _mark_minute_universe_results(db, per_symbol, minute_freqs) if postmarket_scope else {}
     universe_summary = _minute_universe_summary(db) if postmarket_scope else {}
     skipped_symbols = selection_meta.get("skipped_symbols") or []
+    selection_meta_id = _selection_meta_id()
     sync_col.update_one(
-        {"_id": "stock_minute:selection:_meta"},
+        {"_id": selection_meta_id},
         {"$set": {
             "module": "stock_minute",
             "status": "ok" if not errors else "partial",
             "last_run": naive_market_now("A"),
+            "selection_meta_id": selection_meta_id,
             "selected_symbols": symbols,
             "priority_symbols": selection_meta.get("priority_symbols") or [],
             "pinned_symbols": selection_meta.get("pinned_symbols") or [],
@@ -1410,6 +1416,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
                 "requested_calls": len(tasks),
                 "incremental": True,
                 "write_mode": _minute_write_mode(),
+                "selection_meta_id": selection_meta_id,
             },
             "error_msg": "" if not errors else f"{len(errors)} minute fetch errors",
             "degraded_reason": "" if not errors else f"{len(errors)} minute fetch errors",
@@ -1450,6 +1457,7 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
         "skipped": len(skipped_symbols),
         "skipped_symbols": skipped_symbols[:20],
         "minute_scope": selection_meta.get("minute_scope", ""),
+        "selection_meta_id": selection_meta_id,
         "source_counts": selection_meta.get("source_counts") or {},
         "universe_total": universe_summary.get("total") or selection_meta.get("universe_total"),
         "universe_cached": universe_summary.get("cached", 0),

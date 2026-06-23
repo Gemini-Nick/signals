@@ -44,8 +44,12 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert all(task.depends_on == ("board_ranking:all",) for task in board_cons)
     assert set(task.task_key for task in stock_daily).issubset(set(weekly.depends_on))
     assert not (set(task.task_key for task in hk_stock_daily) & set(weekly.depends_on))
+    assert weekly.env["WEEKLY_ROLLUP_SCOPE"] == "postmarket_candidates"
+    assert weekly.env["WEEKLY_ROLLUP_MAX_SYMBOLS"] == "300"
+    assert technical_scan.env["TECHNICAL_SIGNAL_SCAN_SCOPE"] == "postmarket_candidates"
     assert technical_scan.env["TECHNICAL_SIGNAL_SCAN_MARKETS"] == "A"
     assert technical_scan.env["TECHNICAL_SIGNAL_SCAN_REQUIRED_FREQS"] == "日线,周线"
+    assert technical_scan.env["TECHNICAL_SIGNAL_POSTMARKET_MAX_SYMBOLS"] == "300"
     assert not (set(task.task_key for task in board_cons) & set(chain.depends_on))
     assert chain.phase == "chain_context"
     assert chain.depends_on == ("board_ranking:all",)
@@ -76,6 +80,7 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert terminal_minute.env["STOCK_MINUTE_POSTMARKET_MAX_CODES"] == "240"
     assert terminal_minute.env["STOCK_MINUTE_WORKERS"] == "6"
     assert terminal_minute.env["STOCK_MINUTE_CALL_INTERVAL"] == "0.15"
+    assert readiness.env["MINUTE_READINESS_SELECTION_META_ID"] == "stock_minute:postmarket_selection:_meta"
     assert readiness.blocks_run is False
 
 
@@ -631,6 +636,116 @@ def test_postmarket_quote_degraded_with_high_coverage_unblocks_index_daily(monke
     assert result["status"] == "ok"
     assert calls == ["quote_snapshots", "index_daily"]
     assert db["sync_tasks"].docs["postmarket:2026-04-28:index_daily:all"]["status"] == "ok"
+
+
+def test_postmarket_runtime_degraded_stock_minute_with_outputs_unblocks_downstream(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("stock_minute", "minute_preheat"),
+        pm.PostmarketTaskSpec("minute_readiness_probe", "minute_preheat", depends_on=("stock_minute:all",)),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("minute_preheat",))
+
+    calls = []
+
+    def stock_minute(db, proxy_url=None):
+        calls.append("stock_minute")
+        return {
+            "status": "degraded",
+            "written": 28427,
+            "planned_calls": 320,
+            "empty": 91,
+            "errors": 0,
+        }
+
+    def minute_readiness_probe(db, proxy_url=None):
+        calls.append("minute_readiness_probe")
+        return {"status": "ok"}
+
+    db = _Db()
+    engine = _Engine(db, {
+        "stock_minute": (stock_minute, ""),
+        "minute_readiness_probe": (minute_readiness_probe, ""),
+    })
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(trade_date="2026-04-28")
+
+    assert result["status"] == "ok"
+    assert calls == ["stock_minute", "minute_readiness_probe"]
+    assert db["sync_tasks"].docs["postmarket:2026-04-28:stock_minute:all"]["status"] == "degraded"
+
+
+def test_postmarket_runtime_degraded_market_pools_with_outputs_completes_run(monkeypatch):
+    tasks = (pm.PostmarketTaskSpec("market_pools", "market_data"),)
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data",))
+
+    def market_pools(db, proxy_url=None):
+        return {"status": "degraded", "count": 50, "modified": 1, "errors": 0}
+
+    db = _Db()
+    engine = _Engine(db, {"market_pools": (market_pools, "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(trade_date="2026-04-28")
+
+    assert result["status"] == "ok"
+    assert db["sync_tasks"].docs["postmarket:2026-04-28:market_pools:all"]["status"] == "degraded"
+
+
+def test_postmarket_stale_task_with_finished_ok_result_is_effectively_done():
+    assert pm._task_effectively_done({
+        "module": "hk_stock_daily",
+        "status": "stale",
+        "result_summary": {
+            "status": "ok",
+            "result": {
+                "status": "ok",
+                "processed": 347,
+                "total": 347,
+                "coverage_pct": 100.0,
+                "errors": 0,
+            },
+        },
+    })
+
+
+def test_postmarket_stale_stock_daily_with_high_global_coverage_is_effectively_done():
+    assert pm._task_effectively_done({
+        "module": "stock_daily",
+        "status": "stale",
+        "result_summary": {
+            "status": "partial",
+            "processed": 348,
+            "total": 348,
+            "covered_codes": 5482,
+            "errors": 2,
+            "deferred": 239,
+            "progress_pct": 100.0,
+            "coverage_pct": 99.49,
+            "source": "fullmarket_spot_snapshots.valid_universe + bars.daily",
+        },
+    })
+
+
+def test_postmarket_running_stock_daily_with_high_global_coverage_is_effectively_done():
+    assert pm._task_effectively_done({
+        "module": "stock_daily",
+        "status": "running",
+        "result_summary": {
+            "status": "partial",
+            "processed": 5510,
+            "total": 5510,
+            "covered_codes": 5482,
+            "errors": 16,
+            "deferred": 3504,
+            "progress_pct": 100.0,
+            "coverage_pct": 99.49,
+            "source": "fullmarket_spot_snapshots.valid_universe + bars.daily",
+        },
+        "cursor": {"processed": 5510, "total": 5510, "progress_pct": 100.0},
+    })
 
 
 def test_postmarket_init_run_clears_stale_terminal_blocker_fields():

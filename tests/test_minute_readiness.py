@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from signals.sync.modules import minute_readiness
+from signals.sync.task_context import task_env
 
 
 class _Cursor(list):
@@ -92,3 +93,39 @@ def test_minute_readiness_uses_current_stock_minute_freq_scope(monkeypatch):
     readiness_rows = [doc for doc in db["minute_readiness"].docs if doc.get("domain") == "stock"]
     assert result["not_ready"] == 0
     assert [row["freq"] for row in readiness_rows] == ["5分钟"]
+
+
+def test_minute_readiness_can_read_postmarket_selection_meta(monkeypatch):
+    now = datetime(2026, 4, 30, 10, 45)
+    monkeypatch.setattr(minute_readiness, "naive_market_now", lambda _market: now)
+    monkeypatch.setattr(minute_readiness, "_index_symbols", lambda: [])
+    monkeypatch.setattr(minute_readiness, "_heat_names", lambda _db, _kind: [])
+    db = _Db({
+        "sync_log": _Collection([
+            {
+                "_id": "stock_minute:selection:_meta",
+                "selected_symbols": ["688379"],
+                "minute_freqs": ["5分钟"],
+                "last_run": now,
+            },
+            {
+                "_id": "stock_minute:postmarket_selection:_meta",
+                "selected_symbols": ["300604"],
+                "minute_freqs": ["15分钟"],
+                "last_run": now,
+            },
+        ]),
+        "terminal_stock_pool": _Collection(),
+        "bars": _Collection([
+            {"meta": {"symbol": "300604", "freq": "15分钟", "source": "eastmoney"}, "dt": now}
+        ]),
+        "minute_readiness": _Collection(),
+        "data_freshness": _Collection(),
+    })
+
+    with task_env({"MINUTE_READINESS_SELECTION_META_ID": "stock_minute:postmarket_selection:_meta"}):
+        result = minute_readiness.sync_minute_readiness_probe(db)
+
+    readiness_rows = [doc for doc in db["minute_readiness"].docs if doc.get("domain") == "stock"]
+    assert result["not_ready"] == 0
+    assert [(row["symbol"], row["freq"]) for row in readiness_rows] == [("300604", "15分钟")]

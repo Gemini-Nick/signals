@@ -29,6 +29,7 @@ REQUIRED_FULL_FREQS = ("日线", "周线", "30分钟")
 OPTIONAL_ON_DEMAND_FREQS = ("15分钟", "5分钟")
 INTRADAY_SCAN_SCOPE = "intraday_active"
 POSTMARKET_SCAN_SCOPE = "postmarket"
+POSTMARKET_CANDIDATE_SCAN_SCOPE = "postmarket_candidates"
 KEY_MA_PERIODS = (5, 8, 10, 13, 20, 21)
 PRIMARY_MA_PERIODS = (5, 10, 20)
 FIB_MA_TOUCH_UNDERSHOOT_PCT = 1.5
@@ -172,7 +173,7 @@ def _symbol_query_values(symbol: str) -> list[str]:
 
 
 def _scan_markets(scan_scope: str | None = None) -> tuple[str, ...]:
-    default = ("A",) if scan_scope == INTRADAY_SCAN_SCOPE else ("A", "HK")
+    default = ("A",) if scan_scope in {INTRADAY_SCAN_SCOPE, POSTMARKET_CANDIDATE_SCAN_SCOPE} else ("A", "HK")
     markets = tuple(value.upper() for value in _env_list("TECHNICAL_SIGNAL_SCAN_MARKETS", default))
     normalized = tuple("HK" if value in {"H", "HK"} else "A" for value in markets if value in {"A", "CN", "SH", "SZ", "BJ", "H", "HK"})
     return tuple(dict.fromkeys(normalized)) or default
@@ -199,14 +200,29 @@ def _append_symbol(out: list[str], value: Any, *, allowed_markets: tuple[str, ..
         out.append(symbol)
 
 
-def _symbols_from_stock_minute_selection(db: Database) -> list[str]:
-    try:
-        doc = db["sync_log"].find_one(
-            {"_id": "stock_minute:selection:_meta"},
-            {"selected_symbols": 1, "priority_symbols": 1, "pinned_symbols": 1},
-        ) or {}
-    except Exception:
-        return []
+def _selection_meta_ids_for_scope(scope: str) -> list[str]:
+    configured = _env_text("TECHNICAL_SIGNAL_SELECTION_META_ID")
+    if configured:
+        return [configured]
+    ids: list[str] = []
+    if scope == POSTMARKET_CANDIDATE_SCAN_SCOPE:
+        ids.append("stock_minute:postmarket_selection:_meta")
+    ids.append("stock_minute:selection:_meta")
+    return list(dict.fromkeys(ids))
+
+
+def _symbols_from_stock_minute_selection(db: Database, *, scope: str = INTRADAY_SCAN_SCOPE) -> list[str]:
+    doc: dict[str, Any] = {}
+    for meta_id in _selection_meta_ids_for_scope(scope):
+        try:
+            doc = db["sync_log"].find_one(
+                {"_id": meta_id},
+                {"selected_symbols": 1, "priority_symbols": 1, "pinned_symbols": 1},
+            ) or {}
+        except Exception:
+            doc = {}
+        if doc.get("selected_symbols") or doc.get("priority_symbols") or doc.get("pinned_symbols"):
+            break
     symbols: list[str] = []
     for key in ("pinned_symbols", "priority_symbols", "selected_symbols"):
         for value in doc.get(key) or []:
@@ -245,13 +261,15 @@ def _scan_scope(scope: str | None = None) -> str:
 
 
 def _symbols_for_scope(db: Database, scope: str) -> tuple[list[str], str]:
-    if scope == INTRADAY_SCAN_SCOPE:
+    if scope in {INTRADAY_SCAN_SCOPE, POSTMARKET_CANDIDATE_SCAN_SCOPE}:
         symbols: list[str] = []
-        for value in _symbols_from_stock_minute_selection(db):
+        for value in _symbols_from_stock_minute_selection(db, scope=scope):
             _append_symbol(symbols, value)
         for value in _symbols_from_terminal_pool(db):
             _append_symbol(symbols, value)
-        limit = _env_int("TECHNICAL_SIGNAL_INTRADAY_MAX_SYMBOLS", 120, minimum=1, maximum=500)
+        env_name = "TECHNICAL_SIGNAL_INTRADAY_MAX_SYMBOLS" if scope == INTRADAY_SCAN_SCOPE else "TECHNICAL_SIGNAL_POSTMARKET_MAX_SYMBOLS"
+        default = 120 if scope == INTRADAY_SCAN_SCOPE else 300
+        limit = _env_int(env_name, default, minimum=1, maximum=500)
         return symbols[:limit], "stock_minute_selection+terminal_stock_pool"
     markets = _scan_markets(scope)
     return _symbols_with_daily(db, markets=markets), f"daily_bars:{'+'.join(markets)}"
@@ -279,14 +297,23 @@ def _coverage_by_freq(
     for label in (*required_freqs, *optional_freqs):
         aliases = _freq_aliases(label)
         try:
-            raw_symbols = db["bars"].distinct("meta.symbol", {"meta.freq": {"$in": aliases}})
+            query: dict[str, Any] = {"meta.freq": {"$in": aliases}}
+            symbol_values = list({
+                value
+                for symbol in symbol_set
+                for value in _symbol_query_values(symbol)
+                if value
+            })
+            if symbol_values:
+                query["meta.symbol"] = {"$in": symbol_values}
+            raw_symbols = db["bars"].distinct("meta.symbol", query)
             covered = {
                 _canonical_symbol(symbol)
                 for symbol in raw_symbols
                 if _canonical_symbol(symbol) in symbol_set
             }
             latest = db["bars"].find_one(
-                {"meta.freq": {"$in": aliases}},
+                query,
                 {"dt": 1},
                 sort=[("dt", -1)],
             ) or {}
@@ -1266,8 +1293,8 @@ def _sync_technical_signal_scan(db: Database, proxy_url: str = None, *, scope: s
         coverage_by_freq.get(freq, {}).get("status") == "complete"
         for freq in required_freqs
     )
-    is_full_market_complete = bool(scan_scope != INTRADAY_SCAN_SCOPE and required_complete)
-    if scan_scope == INTRADAY_SCAN_SCOPE:
+    is_full_market_complete = bool(scan_scope not in {INTRADAY_SCAN_SCOPE, POSTMARKET_CANDIDATE_SCAN_SCOPE} and required_complete)
+    if scan_scope in {INTRADAY_SCAN_SCOPE, POSTMARKET_CANDIDATE_SCAN_SCOPE}:
         coverage_status = "active_universe_complete" if required_complete else "active_universe_incomplete"
     else:
         coverage_status = "full_market_complete" if required_complete else "coverage_incomplete"
