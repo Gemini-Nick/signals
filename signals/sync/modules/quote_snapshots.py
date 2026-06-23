@@ -254,7 +254,7 @@ def _mark_non_current_quotes_stale(db: Database, trading_day: str, now: datetime
 
 
 def _secid_for_symbol(symbol: str) -> str:
-    raw = str(symbol or "").strip().upper()
+    raw = _normalize_quote_symbol(symbol)
     if "." in raw:
         market, code = raw.split(".", 1)
         market_id = "1" if market == "SH" else "0"
@@ -271,11 +271,25 @@ def _normalize_quote_symbol(value: object) -> str:
     if "." in raw:
         prefix, code = raw.split(".", 1)
         if prefix in {"SH", "SZ", "BJ"} and code:
+            if code.isdigit() and len(code) == 6:
+                if prefix == "BJ":
+                    return f"{prefix}.{code}"
+                if prefix == "SH" and code.startswith("000"):
+                    return f"{prefix}.{code}"
+                if prefix == "SZ" and code.startswith("399"):
+                    return f"{prefix}.{code}"
+                if code.startswith(("5", "6", "9")):
+                    return f"SH.{code}"
+                if code.startswith(("4", "8")):
+                    return f"BJ.{code}"
+                return f"SZ.{code}"
             return f"{prefix}.{code}"
     if len(raw) >= 8 and raw[:2] in {"SH", "SZ", "BJ"}:
         return f"{raw[:2]}.{raw[2:]}"
     code = raw.replace("SH", "").replace("SZ", "").replace("BJ", "")
     if code.isdigit() and len(code) == 6:
+        if code.startswith("920"):
+            return f"BJ.{code}"
         if code.startswith(("5", "6", "9")):
             return f"SH.{code}"
         if code.startswith(("4", "8")):
@@ -806,6 +820,63 @@ def _read_fullmarket_no_price_symbols(db: Database, symbols: list[str], trading_
     return no_price
 
 
+def _current_quote_snapshot_fallback_allowed(now: datetime) -> bool:
+    current = now.time()
+    return not (
+        dt_time(9, 30) <= current < dt_time(11, 30)
+        or dt_time(13, 0) <= current < dt_time(15, 0)
+    )
+
+
+def _current_quote_snapshot_doc(row: dict, symbol: str, trading_day: str, now: datetime) -> dict | None:
+    day_text = str(trading_day or "")[:10]
+    compact_day = day_text.replace("-", "")
+    row_day = str(row.get("trade_date") or row.get("dt") or "")[:10]
+    if row_day not in {day_text, compact_day}:
+        return None
+    price = _float_or_none(row.get("price", row.get("close")))
+    if price is None or price <= 0:
+        return None
+    doc = dict(row)
+    doc.update({
+        "_id": f"{symbol}:latest",
+        "symbol": symbol,
+        "code": doc.get("code") or _code_for_symbol(symbol),
+        "dt": day_text,
+        "trade_date": day_text,
+        "snapshot_at": doc.get("snapshot_at") or now,
+        "freshness": "fresh",
+        "is_stale": False,
+        "stale_reason": "",
+        "price": price,
+        "close": doc.get("close", price),
+        "expires_at": now + timedelta(days=3),
+    })
+    return doc
+
+
+def _read_current_quote_snapshot_docs(
+    db: Database,
+    symbols: list[str],
+    trading_day: str,
+    now: datetime,
+) -> dict[str, dict]:
+    if not _current_quote_snapshot_fallback_allowed(now):
+        return {}
+    docs: dict[str, dict] = {}
+    for symbol in _a_quote_symbols(symbols):
+        try:
+            row = db["quote_snapshots"].find_one({"_id": f"{symbol}:latest"}, {"_id": 0})
+        except Exception:
+            row = None
+        if not row:
+            continue
+        doc = _current_quote_snapshot_doc(row, symbol, trading_day, now)
+        if doc:
+            docs[symbol] = doc
+    return docs
+
+
 def _fetch_em_quote(db: Database, symbol: str, timeout: float = 5.0) -> tuple[dict | None, float, str]:
     symbol = _normalize_quote_symbol(symbol)
     if not _is_a_quote_symbol(symbol):
@@ -909,12 +980,22 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
     request_symbols = [symbol for symbol in symbols if symbol not in spot_docs]
     ulist_docs, observations = _fetch_eastmoney_ulist_docs(db, request_symbols, now, trading_day)
     errors.extend((item.get("endpoint") or "push2delay.ulist.quote", item.get("error")) for item in observations if item.get("error"))
-    missing_symbols = [symbol for symbol in request_symbols if symbol not in ulist_docs]
+    current_snapshot_docs = _read_current_quote_snapshot_docs(
+        db,
+        [symbol for symbol in request_symbols if symbol not in ulist_docs],
+        trading_day,
+        now,
+    )
+    missing_symbols = [
+        symbol
+        for symbol in request_symbols
+        if symbol not in ulist_docs and symbol not in current_snapshot_docs
+    ]
     no_current_price_symbols = _read_fullmarket_no_price_symbols(db, request_symbols, trading_day)
 
     ops = []
     for symbol in symbols:
-        doc = spot_docs.get(symbol) or ulist_docs.get(symbol)
+        doc = spot_docs.get(symbol) or ulist_docs.get(symbol) or current_snapshot_docs.get(symbol)
         if doc:
             live_count += 1
             latest_dt = max(latest_dt or trading_day, trading_day)
@@ -967,6 +1048,7 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
         "stale": stale_count,
         "spot_snapshot": len(spot_docs),
         "ulist": len(ulist_docs),
+        "current_snapshot_fallback": len(current_snapshot_docs),
         "requested": len(request_symbols),
         "missing_current": len(missing_symbols),
         "no_current_price": len(no_current_price_symbols),

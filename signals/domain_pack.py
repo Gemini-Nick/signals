@@ -1410,6 +1410,8 @@ class SignalsPack:
             return "ok"
         if pause_ok and status == "ok" and row.get("freshness") == "stale":
             return "ok"
+        if status == "degraded" and self._cache_runtime_exceeded_but_usable(row):
+            return "ok"
         if status != "ok":
             return status
         error_msg = str(row.get("error_msg") or "").lower()
@@ -1428,6 +1430,32 @@ class SignalsPack:
                 return "ok"
             return "stale"
         return "ok"
+
+    def _cache_runtime_exceeded_but_usable(self, row: Mapping[str, Any]) -> bool:
+        reason = str(row.get("error_msg") or row.get("degraded_reason") or "").lower()
+        if "runtime_exceeded_" not in reason:
+            return False
+        if self._int_from_result(row, "failed_calls") > 0 or self._int_from_result(row, "errors") > 0:
+            return False
+        if self._int_from_result(row, "not_ready") > 0:
+            return False
+        planned = self._int_from_result(row, "planned_calls")
+        empty = self._int_from_result(row, "empty_calls") or self._int_from_result(row, "empty")
+        if planned > 0 and empty >= planned:
+            return False
+        for key in (
+            "count",
+            "written",
+            "modified",
+            "inserted",
+            "compat_written",
+            "ticks",
+            "nodes",
+            "checked",
+        ):
+            if self._int_from_result(row, key) > 0:
+                return True
+        return False
 
     def _cache_a_share_low_latency_pause_ok(self, row: Mapping[str, Any]) -> bool:
         module = str(row.get("module") or "")

@@ -450,8 +450,6 @@ def _stock_daily_dependency_ok(task_doc: dict[str, Any]) -> bool:
 
 def _quote_snapshots_dependency_ok(task_doc: dict[str, Any]) -> bool:
     summary, nested = _result_sources(task_doc)
-    if not (summary.get("partial_usable") or nested.get("partial_usable")):
-        return False
     count = _result_number(task_doc, "count")
     live = _result_number(task_doc, "live")
     errors = _result_number(task_doc, "errors")
@@ -684,7 +682,46 @@ class PostmarketRunner:
                 }},
             )
 
-    def _stock_daily_aggregate_summary(self) -> dict[str, Any]:
+    def _stock_daily_global_coverage_summary(self, trade_date: str | None) -> dict[str, Any]:
+        date_key = str(trade_date or "").replace("-", "")[:8]
+        if not date_key:
+            return {}
+        try:
+            trade_dt = datetime.strptime(date_key, "%Y%m%d")
+        except ValueError:
+            return {}
+        valid_query = {
+            "date_key": date_key,
+            "code": {"$regex": r"^\d{6}$"},
+            "price": {"$gt": 0},
+            "open": {"$gt": 0},
+            "high": {"$gt": 0},
+            "low": {"$gt": 0},
+        }
+        try:
+            valid_count = len(self.db["fullmarket_spot_snapshots"].distinct("code", valid_query, maxTimeMS=3000))
+            cached_count = len(self.db["bars"].distinct("meta.symbol", {"meta.freq": "日线", "dt": trade_dt}, maxTimeMS=3000))
+        except TypeError:
+            try:
+                valid_count = len(self.db["fullmarket_spot_snapshots"].distinct("code", valid_query))
+                cached_count = len(self.db["bars"].distinct("meta.symbol", {"meta.freq": "日线", "dt": trade_dt}))
+            except Exception:
+                return {}
+        except Exception:
+            return {}
+        if valid_count <= 0:
+            return {}
+        coverage_pct = cached_count / valid_count * 100.0
+        return {
+            "total": int(valid_count),
+            "processed": int(valid_count),
+            "covered_codes": int(cached_count),
+            "missing_symbols": max(0, int(valid_count) - int(cached_count)),
+            "coverage_pct": round(coverage_pct, 2),
+            "source": "fullmarket_spot_snapshots.valid_universe + bars.daily",
+        }
+
+    def _stock_daily_aggregate_summary(self, trade_date: str | None = None) -> dict[str, Any]:
         try:
             progress = self.db["sync_log"].find_one({"_id": "stock_daily:progress:_meta"}) or {}
         except Exception:
@@ -692,17 +729,21 @@ class PostmarketRunner:
         if not isinstance(progress, dict) or not progress:
             return {}
 
-        total = _number(progress.get("total") or progress.get("expected_codes") or progress.get("global_total"))
+        global_coverage = self._stock_daily_global_coverage_summary(trade_date)
+        total = _number(global_coverage.get("total") or progress.get("total") or progress.get("expected_codes") or progress.get("global_total"))
         processed = _number(progress.get("processed"))
-        inserted = _number(progress.get("inserted") or progress.get("covered_codes") or processed)
+        inserted = _number(global_coverage.get("covered_codes") or progress.get("covered_codes") or progress.get("inserted") or processed)
+        if global_coverage.get("processed"):
+            processed = _number(global_coverage.get("processed"))
         progress_pct = _number(progress.get("progress_pct"))
         if progress_pct <= 0 and total > 0:
             progress_pct = processed / total * 100.0
-        coverage_pct = _number(progress.get("coverage_pct"))
-        if coverage_pct <= 0 and total > 0:
-            coverage_pct = inserted / total * 100.0
+        coverage_pct = _number(global_coverage.get("coverage_pct") or progress.get("coverage_pct"))
+        has_explicit_coverage = bool(global_coverage or progress.get("coverage_pct") or progress.get("covered_codes"))
+        if coverage_pct <= 0 and total > 0 and (has_explicit_coverage or _number(progress.get("deferred") or progress.get("deferred_symbols")) <= 0):
+            coverage_pct = min(100.0, inserted / total * 100.0)
         errors = _number(progress.get("errors"))
-        missing = _number(progress.get("missing_symbols"))
+        missing = _number(global_coverage.get("missing_symbols") if global_coverage else progress.get("missing_symbols"))
         deferred_symbols = _number(progress.get("deferred_symbols"))
         deferred = _number(progress.get("deferred") or deferred_symbols)
 
@@ -715,25 +756,26 @@ class PostmarketRunner:
         sparse_errors_ok = bool(errors <= max_errors and error_pct <= max_error_pct)
         if not ((processed_all or progress_done) and sparse_errors_ok and coverage_pct >= min_coverage):
             return {}
-        if missing > 0 or deferred > 0 or deferred_symbols > 0:
+        if (deferred > 0 or deferred_symbols > 0) and not has_explicit_coverage:
             return {}
 
         return {
-            "status": str(progress.get("status") or ("partial" if errors else "ok")),
+            "status": str(progress.get("status") or ("partial" if errors or missing or deferred else "ok")),
             "processed": int(processed),
             "total": int(total),
             "inserted": int(inserted),
+            "covered_codes": int(global_coverage.get("covered_codes") or progress.get("covered_codes") or inserted),
             "errors": int(errors),
             "deferred": int(deferred),
             "missing_symbols": int(missing),
             "deferred_symbols": int(deferred_symbols),
             "progress_pct": round(progress_pct, 2),
             "coverage_pct": round(coverage_pct, 2),
-            "source": "sync_log:stock_daily:progress:_meta",
+            "source": str(global_coverage.get("source") or "sync_log:stock_daily:progress:_meta"),
         }
 
-    def _repair_effective_stock_daily_tasks(self, run_id: str) -> int:
-        aggregate_summary = self._stock_daily_aggregate_summary()
+    def _repair_effective_stock_daily_tasks(self, run_id: str, trade_date: str | None = None) -> int:
+        aggregate_summary = self._stock_daily_aggregate_summary(trade_date)
         if not aggregate_summary:
             return 0
         repaired = 0
@@ -829,6 +871,9 @@ class PostmarketRunner:
                     "heartbeat_at": now,
                     "updated_at": now,
                     "error_msg": "",
+                    "finished_at": None,
+                    "cursor": {},
+                    "result_summary": {},
                 },
                 "$inc": {"attempts": 1},
             },
@@ -1041,7 +1086,7 @@ class PostmarketRunner:
 
         self._init_run(run_id, trade_date)
         self._init_tasks(run_id, trade_date)
-        repaired = self._repair_effective_stock_daily_tasks(run_id)
+        repaired = self._repair_effective_stock_daily_tasks(run_id, trade_date)
         if repaired:
             logger.info("postmarket repaired effective stock_daily task summaries: run=%s repaired=%d", run_id, repaired)
         released = self._release_stale_running_tasks(run_id)

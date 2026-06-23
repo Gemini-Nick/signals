@@ -604,6 +604,35 @@ def test_postmarket_fullmarket_degraded_sets_source_blocker_and_fallback_tasks(m
     assert db["sync_tasks"].docs["postmarket:2026-04-28:weekly_rollup:all"]["status"] == "ok"
 
 
+def test_postmarket_quote_degraded_with_high_coverage_unblocks_index_daily(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("quote_snapshots", "market_data"),
+        pm.PostmarketTaskSpec("index_daily", "market_data", depends_on=("quote_snapshots:all",)),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data",))
+
+    calls = []
+
+    def quote_snapshots(db, proxy_url=None):
+        calls.append("quote_snapshots")
+        return {"status": "degraded", "count": 363, "live": 362, "errors": 1}
+
+    def index_daily(db, proxy_url=None):
+        calls.append("index_daily")
+        return {"status": "ok"}
+
+    db = _Db()
+    engine = _Engine(db, {"quote_snapshots": (quote_snapshots, ""), "index_daily": (index_daily, "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(trade_date="2026-04-28")
+
+    assert result["status"] == "ok"
+    assert calls == ["quote_snapshots", "index_daily"]
+    assert db["sync_tasks"].docs["postmarket:2026-04-28:index_daily:all"]["status"] == "ok"
+
+
 def test_postmarket_init_run_clears_stale_terminal_blocker_fields():
     db = _Db()
     db["sync_runs"].docs["postmarket:2026-04-28"] = {
@@ -763,6 +792,60 @@ def test_postmarket_repairs_stock_daily_aggregate_progress_on_resume(monkeypatch
     assert stock_doc["result_summary"]["source"] == "sync_log:stock_daily:progress:_meta"
     assert stock_doc["cursor"]["progress_pct"] == 100.0
     assert db["sync_tasks"].docs["postmarket:2026-04-28:weekly_rollup:all"]["status"] == "ok"
+
+
+def test_postmarket_repairs_stock_daily_shards_from_high_global_coverage(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00"),
+        pm.PostmarketTaskSpec("weekly_rollup", "derived", depends_on=("stock_daily:shard_00",)),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data", "derived"))
+
+    calls = []
+
+    def weekly_rollup(db, proxy_url=None):
+        calls.append("weekly_rollup")
+        return {"status": "ok"}
+
+    db = _Db()
+    db["sync_log"].docs["stock_daily:progress:_meta"] = {
+        "_id": "stock_daily:progress:_meta",
+        "status": "partial",
+        "processed": 5510,
+        "total": 5510,
+        "covered_codes": 5478,
+        "progress_pct": 100.0,
+        "coverage_pct": 99.42,
+        "errors": 14,
+        "missing_symbols": 32,
+        "deferred_symbols": 3672,
+    }
+    task_id = "postmarket:2026-04-28:stock_daily:shard_00"
+    db["sync_tasks"].docs[task_id] = {
+        "_id": task_id,
+        "run_id": "postmarket:2026-04-28",
+        "trade_date": "2026-04-28",
+        "module": "stock_daily",
+        "task_key": "stock_daily:shard_00",
+        "phase": "market_data",
+        "shard_key": "shard_00",
+        "depends_on": [],
+        "blocks_run": True,
+        "status": "partial",
+        "attempts": 1,
+        "result_summary": {"coverage_pct": 13.01, "errors": 2, "deferred": 299},
+    }
+    engine = _Engine(db, {"weekly_rollup": (weekly_rollup, "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+
+    result = runner.run_once(resume_run_id="postmarket:2026-04-28")
+
+    assert result["status"] == "ok"
+    assert calls == ["weekly_rollup"]
+    stock_doc = db["sync_tasks"].docs[task_id]
+    assert stock_doc["result_summary"]["coverage_pct"] == 99.42
+    assert stock_doc["result_summary"]["covered_codes"] == 5478
 
 
 def test_postmarket_stock_daily_many_errors_blocks_downstream(monkeypatch):
@@ -1022,6 +1105,35 @@ def test_postmarket_semaphore_waiting_task_is_not_marked_running(monkeypatch):
             sem.release()
         except ValueError:
             pass
+
+
+def test_postmarket_mark_task_started_clears_stale_finished_payload(monkeypatch):
+    task = pm.PostmarketTaskSpec("alpha", "market_data")
+    db = _Db()
+    task_id = "postmarket:2026-04-28:alpha:all"
+    db["sync_tasks"].docs[task_id] = {
+        "_id": task_id,
+        "run_id": "postmarket:2026-04-28",
+        "module": "alpha",
+        "task_key": "alpha:all",
+        "phase": "market_data",
+        "shard_key": "all",
+        "status": "ok",
+        "attempts": 1,
+        "finished_at": datetime(2026, 4, 28, 18, 0),
+        "cursor": {"processed": 10},
+        "result_summary": {"status": "ok"},
+    }
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+
+    runner._mark_task_started("postmarket:2026-04-28", task)
+
+    row = db["sync_tasks"].docs[task_id]
+    assert row["status"] == "running"
+    assert row["finished_at"] is None
+    assert row["cursor"] == {}
+    assert row["result_summary"] == {}
+    assert row["attempts"] == 2
 
 
 def test_postmarket_heartbeats_running_tasks_during_long_phase(monkeypatch):

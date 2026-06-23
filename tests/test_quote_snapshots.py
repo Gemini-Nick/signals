@@ -8,6 +8,7 @@ from signals.sync.modules.quote_snapshots import (
     _hot_quote_symbols,
     _quote_doc_from_em,
     _quote_doc_from_ulist_row,
+    _read_current_quote_snapshot_docs,
     _read_fullmarket_no_price_symbols,
     _read_fullmarket_spot_quotes,
     _secid_for_symbol,
@@ -19,12 +20,20 @@ def test_eastmoney_secid_for_prefixed_symbols():
     assert _secid_for_symbol("SZ.000001") == "0.000001"
     assert _secid_for_symbol("SH.000300") == "1.000300"
     assert _secid_for_symbol("SZ.399001") == "0.399001"
+    assert _secid_for_symbol("SZ.588170") == "1.588170"
+    assert _secid_for_symbol("920118") == "0.920118"
 
 
 def test_a_quote_symbols_filters_non_a_symbols_before_eastmoney():
     symbols = ["SH.600000", "600001", "BJ.920118", "HK.00050", "US.AAPL", "SZ.399001"]
 
     assert _a_quote_symbols(symbols) == ["SH.600000", "SH.600001", "BJ.920118", "SZ.399001"]
+
+
+def test_a_quote_symbols_canonicalizes_wrong_exchange_prefixes():
+    symbols = ["SZ.588170", "SH.588170", "SH.000300", "SZ.399001"]
+
+    assert _a_quote_symbols(symbols) == ["SH.588170", "SH.000300", "SZ.399001"]
 
 
 def test_quote_doc_from_eastmoney_payload_scales_fields():
@@ -490,3 +499,54 @@ def test_quote_snapshots_classifies_current_no_price_rows():
     )
 
     assert no_price == {"SH.600193", "SH.600421"}
+
+
+def test_quote_snapshots_reuses_current_day_snapshot_when_market_paused():
+    class _QuoteCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            if query == {"_id": "SH.588170:latest"}:
+                return {
+                    "symbol": "SH.588170",
+                    "code": "588170",
+                    "dt": "2026-06-22",
+                    "trade_date": "2026-06-22",
+                    "price": 3.214,
+                    "freshness": "stale",
+                    "stale_reason": "eastmoney_current_quote_missing",
+                }
+            return None
+
+    db = _Db({"quote_snapshots": _QuoteCollection()})
+
+    docs = _read_current_quote_snapshot_docs(
+        db,
+        ["SH.588170"],
+        "2026-06-22",
+        datetime(2026, 6, 23, 9, 3),
+    )
+
+    assert docs["SH.588170"]["freshness"] == "fresh"
+    assert docs["SH.588170"]["stale_reason"] == ""
+    assert docs["SH.588170"]["price"] == 3.214
+
+
+def test_quote_snapshots_does_not_reuse_current_day_snapshot_during_continuous_trading():
+    class _QuoteCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "symbol": "SH.588170",
+                "dt": "2026-06-22",
+                "trade_date": "2026-06-22",
+                "price": 3.214,
+            }
+
+    db = _Db({"quote_snapshots": _QuoteCollection()})
+
+    docs = _read_current_quote_snapshot_docs(
+        db,
+        ["SH.588170"],
+        "2026-06-22",
+        datetime(2026, 6, 23, 10, 3),
+    )
+
+    assert docs == {}
