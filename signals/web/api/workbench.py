@@ -511,20 +511,22 @@ def _payload_from_shell_cache(
     return payload
 
 
-def _build_shell_placeholder_payload(engine: Any, status: str, now: float, quote_watermark: str) -> dict[str, Any]:
-    try:
-        session = _serialize_session(engine.get_status())
-    except Exception:
-        session = {"ready": False}
+def _build_shell_placeholder_payload(status: str, now: float, quote_watermark: str) -> dict[str, Any]:
+    session = _serialize_session({
+        "ready": False,
+        "running": True,
+        "loading_phase": "building",
+        "session_label": "启动中",
+        "session_mode": "startup",
+        "active_markets": ["A"],
+    })
     range_columns = _watchlist_range_columns()
     major_indices = _macro_shell_raw_rows(MACRO_GROUP_MAJOR_INDICES)
     industry_etfs = _macro_shell_raw_rows(MACRO_GROUP_INDUSTRY_ETFS)
-    focus_stocks = _terminal_stock_pool_raw_group_rows("focus_stocks", _shell_stock_group_display_cap("focus_stocks"))
-    risk_stocks = _terminal_stock_pool_raw_group_rows("risk_stocks", _shell_stock_group_display_cap("risk_stocks"))
-    watch_stocks = _terminal_stock_pool_raw_group_rows("watch_stocks", _shell_stock_group_display_cap("watch_stocks"))
-    clue_stocks = _terminal_stock_pool_raw_group_rows("clue_stocks", _shell_stock_group_display_cap("clue_stocks"))
-    manual_clues = _manual_clue_raw_rows(_shell_manual_clue_limit())
-    buy_candidates = _merge_stock_rows_by_symbol(manual_clues + clue_stocks)
+    focus_stocks: list[dict[str, Any]] = []
+    risk_stocks: list[dict[str, Any]] = []
+    watch_stocks: list[dict[str, Any]] = []
+    buy_candidates: list[dict[str, Any]] = []
     trade_map = _build_trade_map(
         sector_boards=[],
         focus_stocks=focus_stocks,
@@ -10016,12 +10018,12 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
     now = time.monotonic()
     cached_payload = _SHELL_CACHE.get("payload")
     cached_quote_watermark = str(_SHELL_CACHE.get("quote_watermark") or "")
-    current_session: Optional[dict[str, Any]] = None
-    try:
-        current_session = _serialize_session(engine.get_status())
-    except Exception:
-        current_session = None
     if _shell_cache_usable(cached_payload, engine) and now < float(_SHELL_CACHE.get("expires_at") or 0):
+        current_session: Optional[dict[str, Any]] = None
+        try:
+            current_session = _serialize_session(engine.get_status())
+        except Exception:
+            current_session = None
         return _payload_from_shell_cache(
             cached_payload,
             "hit",
@@ -10032,6 +10034,11 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
 
     _schedule_shell_cache_refresh(engine)
     if _shell_cache_usable(cached_payload, engine):
+        current_session = None
+        try:
+            current_session = _serialize_session(engine.get_status())
+        except Exception:
+            current_session = None
         return _payload_from_shell_cache(
             cached_payload,
             "stale_refreshing",
@@ -10039,7 +10046,7 @@ def _build_shell_payload(engine) -> Dict[str, Any]:
             cached_quote_watermark,
             current_session=current_session,
         )
-    return _build_shell_placeholder_payload(engine, "building", now, cached_quote_watermark)
+    return _build_shell_placeholder_payload("building", now, cached_quote_watermark)
 
 
 def _strategy_snapshot_has_etf_analysis(snapshot: dict[str, Any]) -> bool:

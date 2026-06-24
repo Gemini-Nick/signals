@@ -111,6 +111,20 @@ def test_market_replay_context_extracts_event_graph():
                     {
                         "date_key": day,
                         "trade_date": day,
+                        "symbol": "SZ.300059",
+                        "code": "300059",
+                        "name": "东方财富",
+                        "open": None,
+                        "high": None,
+                        "low": None,
+                        "close": None,
+                        "change_pct": None,
+                        "amount": 99900000000,
+                        "turnover_pct": 0.0,
+                    },
+                    {
+                        "date_key": day,
+                        "trade_date": day,
                         "symbol": "SZ.300308",
                         "code": "300308",
                         "name": "中际旭创",
@@ -191,7 +205,7 @@ def test_market_replay_context_extracts_event_graph():
                         "board_name": "机器人",
                         "concept_name": "机器人",
                         "updated_at": datetime(2026, 6, 5, 15),
-                        "symbols": ["300308", "688017"],
+                        "symbols": ["300059", "300308", "688017"],
                     }
                 ]
             ),
@@ -361,6 +375,7 @@ def test_market_replay_context_extracts_event_graph():
     )
 
     assert context["high_turnover_cores"][0]["name"] == "中际旭创"
+    assert all(row["name"] != "东方财富" for row in context["high_turnover_cores"])
     assert context["high_turnover_cores"][0]["amount_yi"] == 583.25
     assert context["failed_boards"][0]["name"] == "茂业商业"
     assert all(row["name"] != "N新睿高" for row in context["failed_boards"])
@@ -373,6 +388,7 @@ def test_market_replay_context_extracts_event_graph():
     assert context["representative_paths"][0]["intraday_path"]["high_bar"]["time"] == "10:25"
     dynamic = context["dynamic_market_representatives"][0]
     assert dynamic["static_representatives"][0]["name"] == "中际旭创"
+    assert all(row["name"] != "东方财富" for bucket in ("market_core", "market_elastic", "pressure_core") for row in dynamic[bucket])
     assert any(row["name"] == "绿的谐波" for row in dynamic["market_core"])
     assert dynamic["market_elastic"][0]["name"] == "机器人新星"
     assert dynamic["market_elastic"][0]["limit_pool"]["first_limit_up_time"] == "095012"
@@ -391,6 +407,7 @@ def test_market_replay_context_extracts_event_graph():
     structured = context["structured_daily_review"]
     assert structured["contract_version"] == "stock-daily-review-v2.1"
     assert structured["key_stock_pool"]["top_amount_50"][0]["name"] == "中际旭创"
+    assert all(row["name"] != "东方财富" for row in structured["key_stock_pool"]["top_amount_50"])
     assert structured["top_turnover_boards"]["rows"][0]["state"] == "轮动"
     assert structured["trend_20d_boards"]["status"] == "missing"
     assert structured["fixed_time_slices"][0]["slice"] == "竞价"

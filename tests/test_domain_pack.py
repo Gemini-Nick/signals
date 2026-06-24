@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import datetime
 
 from fastapi.testclient import TestClient
@@ -122,6 +123,53 @@ def test_signals_pack_dashboard_matches_electron_contract(tmp_path, monkeypatch)
     assert dashboard["cache_status"]["mode"] == "test"
 
 
+def test_signals_pack_dashboard_runs_independent_modules_concurrently(tmp_path, monkeypatch):
+    from signals.domain_pack import SignalsPack
+
+    pack = SignalsPack(repo_root=tmp_path, state_root=tmp_path / "state")
+    strategy_started = threading.Event()
+    cache_started = threading.Event()
+
+    def strategy_snapshot():
+        strategy_started.set()
+        assert cache_started.wait(1)
+        return {
+            "as_of": "2026-04-24",
+            "generated_at": "2026-04-24T16:00:00",
+            "themes": [{"name": "半导体", "domain": "board", "strength": 2.3}],
+            "candidates": [],
+            "warnings": [],
+            "daily_brief": {"summary": "并发 dashboard"},
+            "decision_queue": [],
+            "strategy_kpis": {},
+            "source_confidence": {"overall": 0.9, "sources": []},
+        }
+
+    def cache_status():
+        cache_started.set()
+        assert strategy_started.wait(1)
+        return {
+            "available": True,
+            "mode": "test",
+            "live_low_latency": {"modules": [], "summary": {}},
+            "postmarket_backfill": {"run": None, "tasks": [], "summary": {}},
+            "mongo_stock_cache": {"freqs": [], "summary": {}},
+            "terminal_outputs": [],
+            "blockers": [],
+        }
+
+    monkeypatch.setattr(pack, "_strategy_snapshot", strategy_snapshot)
+    monkeypatch.setattr(pack, "_cache_status", cache_status)
+    monkeypatch.setattr(pack, "_connector_health", lambda: [])
+    monkeypatch.setattr(pack, "_backtest_summary", lambda: {"total": 0, "evaluated": 0, "pending": 0})
+    monkeypatch.setattr(pack, "_pending_backlog_preview", lambda _limit: [])
+
+    dashboard = asyncio.run(pack.dashboard())
+
+    assert dashboard["daily_brief"]["summary"] == "并发 dashboard"
+    assert dashboard["cache_status"]["available"] is True
+
+
 def test_pack_refresh_endpoint_triggers_pack_refresh(monkeypatch):
     from signals.web.app import create_app
     from signals import domain_pack
@@ -184,6 +232,24 @@ def test_pack_trigger_refresh_throttles_auto_requests(monkeypatch):
     assert first["triggered"] is True
     assert second["triggered"] is False
     assert second["message"] == "refresh_throttled"
+
+
+def test_pack_trigger_refresh_startup_uses_dedicated_throttle(monkeypatch):
+    from signals import domain_pack
+    from signals.domain_pack import SignalsPack
+
+    _reset_pack_refresh_state(domain_pack)
+    monkeypatch.setenv("SIGNALS_PACK_AUTO_REFRESH_MIN_SECONDS", "300")
+    monkeypatch.setenv("SIGNALS_PACK_STARTUP_REFRESH_MIN_SECONDS", "0")
+    pack = SignalsPack()
+    monkeypatch.setattr(pack, "_run_refresh_job", lambda **kwargs: {"status": "ok"})
+
+    first = pack.trigger_refresh(reason="startup", wait=True)
+    second = pack.trigger_refresh(reason="startup", wait=True)
+
+    assert first["triggered"] is True
+    assert second["triggered"] is True
+    assert second["message"] == "refresh_completed"
 
 
 def test_pack_postmarket_live_owner_guard(monkeypatch):

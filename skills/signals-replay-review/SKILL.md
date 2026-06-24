@@ -48,16 +48,18 @@ asks for a manual out-of-window send.
 For intraday Codex WeChat automations, the preferred path is now AI-native:
 collect the structured evidence package, let the automation agent write a short
 review from that package, then send the generated body once through WeClaw.
-Use `--format wechat` only as the deterministic fallback when the evidence MCP
-or AI synthesis fails:
+Use `--format wechat` only as the deterministic gate and emergency evidence
+preview. It is not an allowed send body for recurring review automations. If
+MCP context collection or AI synthesis fails after a `NOTIFY` gate, stop and
+report `context_failed_no_send` rather than sending the script body:
 
 ```bash
 bash scripts/python.sh -m signals.notify.trading_workbench_summary --window <preopen|ten|midday|two|close> --max-items 5 --format wechat
 ```
 
-For daily postmarket WeChat automation, use narrative output, then send only
-the body after the first gate line if the first line is `NOTIFY` and no replay
-evaluator blocked the run:
+For daily postmarket WeChat automation, use narrative output only as the local
+gate/evidence preview. A `NOTIFY` gate still requires MCP context collection and
+AI synthesis before any WeChat send:
 
 ```bash
 bash scripts/python.sh -m signals.notify.trading_workbench_summary --window postmarket --max-items 5 --format narrative
@@ -104,7 +106,7 @@ Use these instead of rewriting `/api/pack/dashboard`, `/api/workbench/shell`,
 `/api/strategy/snapshot`, or Mongo queries by hand. The first output line
 remains the gate for generated review text:
 
-- `NOTIFY`: send or reuse the body after the first line.
+- `NOTIFY`: continue to MCP context collection and AI synthesis before sending.
 - `DONT_NOTIFY`: stop and report the reason.
 - `[replay-eval] send blocked`: stop and report the similarity/missing phrases; do not send.
 
@@ -122,19 +124,87 @@ contract for gate commands, MCP arguments, synthesis boundaries, and send rules.
   `get_market_replay_context` or direct local commands to obtain
   `market_replay.structured_daily_review`, `rotation_windows`,
   `rotation_shifts`, `sector_boards`, and pool rows. Write a concise AI-native
-  review using only available evidence. If context collection fails, fall back to
-  `--format wechat` and send that script body.
+  review using only available evidence. If context collection or AI synthesis
+  fails, do not send a deterministic script body.
 - Postmarket daily review (`postmarket`): use `--format narrative`; first line
-  is still the fallback gate. Preferred automation output is AI-written from
-  the structured evidence package plus `format_market_replay_sections`; after
-  AI synthesis, send exactly once if the generated body does not violate the
-  evidence boundaries. Do not add `--ignore-time` in recurring postmarket sends.
+  is still the fallback gate, not the final body. Automation output must be
+  AI-written from the structured evidence package plus
+  `format_market_replay_sections`; after AI synthesis, send exactly once if the
+  generated body does not violate the evidence boundaries. If AI synthesis is
+  unavailable, stop without sending. Do not add `--ignore-time` in recurring
+  postmarket sends.
 - Golden screenshot evaluator: report-only unless the user explicitly asks for
   a manual sample send. Never use `--training-sample` in recurring daily sends.
-- Final automation status should state only gate result, send outcome, and
-  whether the body came from AI-native context or fallback script output. Do
-  not include runtime/Mongo/lane health boilerplate in the user-facing WeChat
-  result.
+- Final automation status should state only gate result, context/synthesis
+  result, send outcome, and `body_source=ai_native`. Do not include
+  runtime/Mongo/lane health boilerplate in the user-facing WeChat result.
+
+## AI Synthesis Contract
+
+Every recurring replay send must include a real model synthesis pass after MCP
+context collection. The model is not a paraphraser for the script body. It must
+use the evidence package to decide what mattered, what did not matter, and what
+must be verified next.
+
+Before writing the WeChat body, the automation agent must build these internal
+working notes from `signals_context`, `market_replay`,
+`market_replay.structured_daily_review`, and `analysis_framework`:
+
+1. `data_boundary`: which required data is `available`, `partial`, `missing`,
+   or `unknown`; missing stock daily/minute data must downgrade stock-specific
+   claims.
+2. `board_heat_order`: the current `板块15` / `sector_boards` order, plus
+   `source_driver`, `board_timeline`, `rotation_windows`, and
+   `rotation_shifts`. This is the primary sector truth.
+3. `direction_state`: for each important board, classify it as confirmed
+   main line, hidden/secondary line, temporary carding, false main line,
+   weakening line, or evidence-insufficient line. The reason must come from
+   board order, intraday rotation, breadth, amount, and representative paths.
+4. `representative_selection`: choose same-day representatives from
+   `dynamic_market_representatives`, `high_turnover_cores`,
+   `representative_paths`, limit/failed-limit pools, and three-pool rows.
+   Static industry-chain representatives are background only and cannot replace
+   same-day market representatives.
+5. `pressure_acceptance`: identify high-turnover pressure, failed boards,
+   high-to-close drawdown, close position, pullback amount share, and tail
+   emotion when those fields exist.
+6. `switch_explanation`: explain whether capital switched, repaired, split, or
+   failed to choose a direction. This must compare at least two evidence
+   surfaces, not only final涨幅.
+7. `next_validation`: convert the judgment into 2-4 validation points with
+   negation conditions. Do not output buy/sell/target/stop instructions.
+
+The final WeChat body must be the model's compressed conclusion from these
+notes. It should not expose the full internal table unless the user asks for a
+manual full report.
+
+## Pre-send Self Check
+
+Before sending, the automation agent must read the draft body once and fix it
+until all checks pass:
+
+- First sentence names the real structure: pressure center, strongest confirmed
+  board, failed/dragging board, and next validation point. Vague openings such
+  as `指数不差`, `科技高成交`, `先修的票`, or `继续拖的核心` are not acceptable unless
+  the sentence immediately names the exact board/stock and evidence.
+- Every sector judgment follows `sector_boards` / Agent OS `板块15` unless that
+  surface is missing; if missing, say so and downgrade confidence.
+- Every named representative stock is justified by same-day evidence:
+  dynamic representative bucket, high turnover, limit/failed-limit state,
+  representative 5-minute path, or pool membership.
+- Every numeric claim is present in the MCP payload, script gate output, user
+  attachment, or `extra_facts[]`. If the value is absent, write `待确认/unknown`
+  or remove it.
+- Direction-switch language must cite rotation evidence:
+  `rotation_windows`, `rotation_shifts`, `board_timeline`, tail pressure, or
+  representative acceptance. Do not infer switching from final涨幅 alone.
+- Eastmoney/THS 大中小单 is order-size flow only. Do not call it account-level
+  主力/散户 unless that participant-flow field is explicitly available.
+- The body is a trading review, not a system status summary. It must not include
+  runtime, Mongo, lane, or API health boilerplate.
+- If any check cannot be fixed because evidence is missing or AI synthesis is
+  unavailable, stop and record `context_failed_no_send`; do not send a fallback
+  script body.
 
 ## AI-Native Process
 
@@ -306,7 +376,7 @@ MCP tools:
 - `get_signals_replay_context`: fetches local Signals endpoints and returns a structured, date-agnostic data package for the agent to write from.
 - `get_market_replay_context`: fetches local endpoints plus Mongo and returns the full-market event graph.
 - `get_replay_analysis_framework`: returns the AI-native thinking framework for writing the replay.
-- `generate_signals_replay_review`: fetches local Signals endpoints and returns the long narrative review.
+- `generate_signals_replay_review`: renders a deterministic evidence preview. Do not use this tool output as the final WeChat body for recurring automations.
 - `list_signals_replay_data_requirements`: returns the data checklist this skill expects.
 
 The review/context tools accept `extra_facts[]` for screenshot, news, or exported market facts. This is the supported way to restore a specific sample without hardcoding a date.

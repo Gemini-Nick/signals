@@ -40,7 +40,7 @@ def _tool_schema() -> list[dict[str, Any]]:
     return [
         {
             "name": "generate_signals_replay_review",
-            "description": "Generate a screenshot-style A-share postmarket replay review from local Signals endpoints.",
+            "description": "Render a deterministic evidence preview from local Signals endpoints. Do not use this tool output as the final WeChat body; delivery must use get_market_replay_context plus AI synthesis.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

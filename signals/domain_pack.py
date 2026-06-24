@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -273,19 +274,28 @@ class SignalsPack:
         backlog_limit: int = 10,
         include_ai_factor_factory: bool = False,
     ) -> Dict[str, Any]:
-        strategy_snapshot = self._strategy_snapshot()
-        self._record_strategy_snapshot_run(strategy_snapshot)
-        runs = await self.list_runs()
+        strategy_snapshot_task = asyncio.create_task(asyncio.to_thread(self._strategy_snapshot))
+        connector_health_task = asyncio.create_task(asyncio.to_thread(self._connector_health))
+        backtest_summary_task = asyncio.create_task(asyncio.to_thread(self._backtest_summary))
+        pending_backlog_task = asyncio.create_task(asyncio.to_thread(self._pending_backlog_preview, backlog_limit))
+        cache_status_task = asyncio.create_task(asyncio.to_thread(self._cache_status))
+
+        strategy_snapshot = await strategy_snapshot_task
+        await asyncio.to_thread(self._record_strategy_snapshot_run, strategy_snapshot)
+        runs_task = asyncio.create_task(self.list_runs())
+        connector_health, backtest_summary, pending_backlog, cache_status, runs = await asyncio.gather(
+            connector_health_task,
+            backtest_summary_task,
+            pending_backlog_task,
+            cache_status_task,
+            runs_task,
+        )
         recent_runs = runs[:recent_limit]
         review_runs = [run for run in recent_runs if run.get("capability") == "review"][:10]
-        connector_health = self._connector_health()
         diagnostics = self._diagnostics(connector_health)
-        backtest_summary = self._backtest_summary()
-        pending_backlog = self._pending_backlog_preview(backlog_limit)
         backtest_jobs = self._backtest_jobs(recent_runs)
         status = self._dashboard_status(connector_health)
         overview = self._overview(backtest_summary, strategy_snapshot)
-        cache_status = self._cache_status()
         return {
             "pack_id": "signals",
             "title": "Signals",
@@ -326,9 +336,17 @@ class SignalsPack:
     ) -> Dict[str, Any]:
         reason = str(reason or "manual")[:64]
         requested_at = utc_now()
+        interval_env = (
+            "SIGNALS_PACK_MANUAL_REFRESH_MIN_SECONDS"
+            if reason == "manual"
+            else "SIGNALS_PACK_STARTUP_REFRESH_MIN_SECONDS"
+            if reason == "startup"
+            else "SIGNALS_PACK_AUTO_REFRESH_MIN_SECONDS"
+        )
+        default_min_interval = 20 if reason in {"manual", "startup"} else 180
         min_interval = _env_int(
-            "SIGNALS_PACK_MANUAL_REFRESH_MIN_SECONDS" if reason == "manual" else "SIGNALS_PACK_AUTO_REFRESH_MIN_SECONDS",
-            20 if reason == "manual" else 180,
+            interval_env,
+            default_min_interval,
             minimum=0,
         )
         with _PACK_REFRESH_LOCK:

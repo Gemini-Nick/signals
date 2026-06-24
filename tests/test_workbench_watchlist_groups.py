@@ -753,10 +753,10 @@ def test_shell_payload_returns_placeholder_when_cache_miss_and_lock_busy(monkeyp
 
     class _Engine:
         def is_ready(self):
-            return True
+            raise AssertionError("cache miss placeholder should not query engine readiness")
 
         def get_status(self):
-            return {"ready": True, "active_markets": ["A"]}
+            raise AssertionError("cache miss placeholder should not query engine status")
 
     class _BusyLock:
         def acquire(self, blocking=True):
@@ -780,12 +780,30 @@ def test_shell_payload_returns_placeholder_when_cache_miss_and_lock_busy(monkeyp
             "_build_shell_payload_uncached",
             lambda engine: (_ for _ in ()).throw(AssertionError("busy shell request should not build")),
         )
+        monkeypatch.setattr(
+            workbench,
+            "_terminal_stock_pool_raw_group_rows",
+            lambda group, limit: (_ for _ in ()).throw(
+                AssertionError("cache miss placeholder should not read terminal stock pool")
+            ),
+        )
+        monkeypatch.setattr(
+            workbench,
+            "_manual_clue_raw_rows",
+            lambda limit: (_ for _ in ()).throw(
+                AssertionError("cache miss placeholder should not read manual clues")
+            ),
+        )
 
         payload = workbench._build_shell_payload(_Engine())
 
+        assert payload["session"]["ready"] is False
         assert payload["cache"]["status"] == "building"
         assert payload["cache"]["building"] is True
         assert payload["watchlist_groups"]["sector_boards"] == []
+        assert payload["watchlist_groups"]["focus_stocks"] == []
+        assert payload["watchlist_groups"]["watch_stocks"] == []
+        assert payload["buy_candidates"] == []
     finally:
         workbench._SHELL_CACHE.update({
             "expires_at": 0.0,

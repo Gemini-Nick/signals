@@ -176,6 +176,13 @@ def _stock_snapshot(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_usable_daily_snapshot(snapshot: dict[str, Any]) -> bool:
+    amount = _float(snapshot.get("amount"))
+    close = _float(snapshot.get("close") if snapshot.get("close") is not None else snapshot.get("price"))
+    change_pct = _float(snapshot.get("change_pct"))
+    return bool(amount and amount > 0 and close is not None and change_pct is not None)
+
+
 def _amount_yi(value: Any) -> float | None:
     amount = _float(value)
     if amount is None:
@@ -314,6 +321,8 @@ def _symbol_evidence(db: Any, trade_date: str, symbols: list[str], *, limit: int
         if not doc:
             continue
         snapshot = _stock_snapshot(doc)
+        if not _is_usable_daily_snapshot(snapshot):
+            continue
         result.append(
             {
                 **snapshot,
@@ -410,11 +419,15 @@ def _high_turnover_cores(db: Any, trade_date: str, *, limit: int = 20) -> list[d
     cursor = db["fullmarket_spot_snapshots"].find(
         _snapshot_query(trade_date),
         _snapshot_projection(),
-    ).sort("amount", -1).limit(limit)
+    ).sort("amount", -1).limit(max(limit * 8, 120))
     result = []
     for row in cursor:
         snapshot = _stock_snapshot(row)
+        if not _is_usable_daily_snapshot(snapshot):
+            continue
         result.append({**snapshot, "amount_yi": _amount_yi(snapshot.get("amount"))})
+        if len(result) >= limit:
+            break
     return result
 
 
@@ -573,6 +586,8 @@ def _snapshot_by_symbol(db: Any, trade_date: str, symbols: list[str]) -> dict[st
     result: dict[str, dict[str, Any]] = {}
     for row in cursor:
         snapshot = _stock_snapshot(row)
+        if not _is_usable_daily_snapshot(snapshot):
+            continue
         result[_pure_code(snapshot["symbol"])] = snapshot
     return result
 
@@ -1295,6 +1310,16 @@ def _has_collection_rows(db: Any, collection_name: str, query: dict[str, Any] | 
         return False
 
 
+def _has_usable_daily_snapshots(db: Any, trade_date: str) -> bool:
+    if "fullmarket_spot_snapshots" not in _collection_names(db):
+        return False
+    try:
+        cursor = db["fullmarket_spot_snapshots"].find(_snapshot_query(trade_date), _snapshot_projection()).sort("amount", -1).limit(200)
+        return any(_is_usable_daily_snapshot(_stock_snapshot(row)) for row in cursor)
+    except Exception:
+        return False
+
+
 def _data_completeness(db: Any, trade_date: str, flow: dict[str, Any]) -> list[dict[str, Any]]:
     start, end = _date_range(trade_date)
     prior_start = start - timedelta(days=30)
@@ -1334,7 +1359,7 @@ def _data_completeness(db: Any, trade_date: str, flow: dict[str, Any]) -> list[d
         },
         {
             "item": "个股日线",
-            "status": "available" if _has_collection_rows(db, "fullmarket_spot_snapshots", stock_query()) else "missing",
+            "status": "available" if _has_usable_daily_snapshots(db, trade_date) else "missing",
             "source": "fullmarket_spot_snapshots",
             "impact": "Top50、涨跌幅、成交额、承接",
         },
@@ -1417,6 +1442,8 @@ def _stock_pool_cursor_rows(
     cursor = db["fullmarket_spot_snapshots"].find(_snapshot_query(trade_date), _snapshot_projection()).sort(sort_field, direction).limit(limit * 4)
     for raw in cursor:
         snapshot = _stock_snapshot(raw)
+        if not _is_usable_daily_snapshot(snapshot):
+            continue
         if not _is_valid_stock_name(snapshot.get("name")):
             continue
         amount = _float(snapshot.get("amount")) or 0.0
