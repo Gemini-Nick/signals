@@ -71,6 +71,24 @@ def _date_key(trade_date: str | None) -> tuple[str, str]:
     return compact, dashed
 
 
+def _snapshot_at_for_trade_date(day: str, now: datetime, *, explicit_trade_date: bool = False) -> datetime:
+    """Use a stable close timestamp for historical pool backfills."""
+    if explicit_trade_date:
+        try:
+            parsed = datetime.fromisoformat(day)
+        except ValueError:
+            parsed = None
+        if parsed is not None and parsed.date() != now.date():
+            return parsed.replace(hour=15, minute=0, second=0, microsecond=0)
+    realtime_day = a_share_realtime_day_key(now=now)
+    if day == realtime_day:
+        return now
+    try:
+        return datetime.fromisoformat(day).replace(hour=15, minute=0, second=0, microsecond=0)
+    except ValueError:
+        return now
+
+
 def _prefixed_symbol(code: str) -> str:
     value = _text(code).zfill(6)
     if value.startswith(("6", "9")):
@@ -142,7 +160,8 @@ def sync_market_limit_pools(db: Database, trade_date: str | None = None, proxy_u
     import akshare as ak
 
     date_compact, day = _date_key(trade_date)
-    snapshot_at = naive_market_now("A")
+    now = naive_market_now("A")
+    snapshot_at = _snapshot_at_for_trade_date(day, now, explicit_trade_date=trade_date is not None)
     docs: list[dict[str, Any]] = []
     errors: dict[str, str] = {}
     with em_proxy(proxy_url):

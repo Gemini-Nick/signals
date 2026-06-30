@@ -957,6 +957,12 @@ def _generic_replay_paragraphs(
             "CPO/通信线缆、半导体、PCB/算力里有先修的票，也有继续拖的核心。"
             "明天先看高成交前排能不能停止放量回落，尾盘承接能不能回来。"
         )
+    elif primary_theme == "历史回放证据不足":
+        opening = (
+            "今天先看结论：历史回放证据不足，不能复用实时盘面。"
+            f"{index_sentence}"
+            "后续只输出可验证的板块回放、事件段和数据缺口；缺少证据的方向不升级为结论。"
+        )
     else:
         opening = (
             "今天先看结论：指数收红，但盘面不是普涨。"
@@ -968,6 +974,8 @@ def _generic_replay_paragraphs(
     sections = [
         opening,
     ]
+    if primary_theme == "历史回放证据不足":
+        sections.append("数据完整性：历史回放证据不足；不复用实时指数、板块、票池或旧日期结论。")
     if market_replay_sections:
         sections.extend(market_replay_sections)
         sections.extend(
@@ -1205,6 +1213,11 @@ def _historical_replay_inputs(
         sector_rows = _market_replay_sector_rows(replay_context)
         if sector_rows:
             brief["primary_theme"] = _sector_name(sector_rows[0])
+        else:
+            brief["primary_theme"] = "历史回放证据不足"
+    overview = adjusted_dashboard.get("overview")
+    if isinstance(overview, dict):
+        overview["cluster_summary"] = {}
     adjusted_snapshot["as_of"] = trade_date
     regime = adjusted_snapshot.setdefault("market_regime", {})
     if isinstance(regime, dict):
@@ -1212,10 +1225,14 @@ def _historical_replay_inputs(
 
     groups = adjusted_shell.setdefault("watchlist_groups", {})
     if isinstance(groups, dict):
+        for key in ("major_indices", "focus_stocks", "watch_stocks", "risk_stocks", "buy_candidates"):
+            groups[key] = []
         sector_rows = _market_replay_sector_rows(replay_context)
-        if sector_rows:
-            groups["sector_boards"] = sector_rows
+        groups["sector_boards"] = sector_rows
     adjusted_shell["indices"] = []
+    adjusted_shell["decision_queue"] = []
+    adjusted_shell["buy_candidates"] = []
+    adjusted_shell["market"] = {}
     return adjusted_dashboard, adjusted_shell, adjusted_snapshot
 
 
@@ -2264,7 +2281,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Allow --ignore-time dry-runs to keep a NOTIFY gate. Normal automation must leave this off.",
     )
-    parser.add_argument("--format", choices=["workbench", "wechat", "narrative"], default="workbench")
+    parser.add_argument("--format", choices=["workbench", "wechat", "narrative", "word"], default="workbench")
     parser.add_argument("--training-sample", default="", help="Render a structured replay training sample; normal daily runs leave this empty.")
     parser.add_argument(
         "--allow-training-sample-send",
@@ -2322,11 +2339,14 @@ def main(argv: list[str] | None = None) -> int:
             builder = build_wechat_summary
         elif args.format == "narrative":
             builder = build_narrative_review
+        elif args.format == "word":
+            builder = None
         else:
             builder = build_summary
         market_replay_sections: list[str] = []
+        replay_context: dict[str, Any] = {}
         replay_trade_date = requested_trade_date or source_trade_date
-        if args.format == "narrative" and replay_trade_date != "unknown":
+        if args.format in {"narrative", "word"} and replay_trade_date != "unknown":
             try:
                 from signals.replay.market_replay import build_market_replay_context, format_market_replay_sections
                 from signals.sync.db import get_db
@@ -2341,7 +2361,8 @@ def main(argv: list[str] | None = None) -> int:
                     representative_limit=max(20, args.max_items * 4),
                     include_external_fund_flows=args.window in {"postmarket", "manual", "weekly"},
                 )
-                market_replay_sections = format_market_replay_sections(replay_context)
+                if args.format == "narrative":
+                    market_replay_sections = format_market_replay_sections(replay_context)
                 if historical_requested:
                     dashboard, shell, snapshot = _historical_replay_inputs(
                         dashboard,
@@ -2352,6 +2373,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
             except Exception:
                 market_replay_sections = []
+                replay_context = {}
         builder_kwargs: dict[str, Any] = {
             "window": args.window,
             "max_items": max(1, args.max_items),
@@ -2360,7 +2382,35 @@ def main(argv: list[str] | None = None) -> int:
         if args.format == "narrative":
             builder_kwargs["extra_facts"] = args.extra_fact
             builder_kwargs["market_replay_sections"] = market_replay_sections
-        result = builder(dashboard, shell, snapshot, **builder_kwargs)
+        if args.format == "word":
+            from signals.replay.word_style_renderer import render_word_style_review
+
+            signals_context = collect_replay_context(
+                dashboard,
+                shell,
+                snapshot,
+                window=args.window,
+                max_items=max(1, args.max_items),
+                event_lines=event_lines,
+                extra_facts=args.extra_fact,
+            )
+            body = render_word_style_review(signals_context, replay_context)
+            ranking = replay_context.get("daily_board_rankings") if isinstance(replay_context.get("daily_board_rankings"), dict) else {}
+            notify = bool(
+                replay_context.get("major_indices")
+                or replay_context.get("high_turnover_cores")
+                or _as_list(ranking.get("rows"))
+                or signals_context.get("sector_boards")
+            )
+            status = "NOTIFY" if notify else "DONT_NOTIFY"
+            result = SummaryResult(
+                status=status,
+                text=f"{status}\n{body}",
+                notify=notify,
+                reason="word_style_replay" if notify else "word_style_replay_no_context",
+            )
+        else:
+            result = builder(dashboard, shell, snapshot, **builder_kwargs)
 
     if (
         args.ignore_time
@@ -2380,9 +2430,13 @@ def main(argv: list[str] | None = None) -> int:
     eval_failed = False
     eval_report: dict[str, Any] | None = None
     if args.eval_target:
-        from signals.replay.evaluate import evaluate_text, load_text
+        from signals.replay.evaluate import evaluate_text, load_key_phrases, load_text
 
-        eval_report = evaluate_text(_send_body(result.text), load_text(args.eval_target))
+        eval_report = evaluate_text(
+            _send_body(result.text),
+            load_text(args.eval_target),
+            key_phrases=load_key_phrases(args.eval_target),
+        )
         eval_failed = eval_report["char_similarity"] < args.min_similarity
         if args.require_eval_phrases and eval_report["phrase_coverage"]["missing"]:
             eval_failed = True

@@ -165,6 +165,9 @@ working notes from `signals_context`, `market_replay`,
    `representative_paths`, limit/failed-limit pools, and three-pool rows.
    Static industry-chain representatives are background only and cannot replace
    same-day market representatives.
+   Do not assign preset higher weights to any specific industry or board; rank
+   candidates only by same-day evidence such as amount, change, turnover,
+   limit-pool state, board linkage, and acceptance/pressure.
 5. `pressure_acceptance`: identify high-turnover pressure, failed boards,
    high-to-close drawdown, close position, pullback amount share, and tail
    emotion when those fields exist.
@@ -277,6 +280,72 @@ Write like the sample screenshot:
 8. Do not write a short system summary when the user asks for screenshot
    restoration; use the sample as style guidance, not as runtime hardcoded
    content.
+
+### Word-Style Daily Note Shape
+
+For manual daily notes and Word-style postmarket reports, restore the user's
+report shape instead of compressing into the normal WeChat brief. The 2026-06-29
+Word target is the current full-note reference:
+
+- `signals/replay/references/2026-06-29-word.txt`
+- `signals/replay/references/2026-06-29-word-phrases.json`
+
+Use that target for structure and tone, not as hardcoded runtime content. A
+high-restoration daily note should keep these blocks in order:
+
+1. Title and date: `A股盘后复盘报告 | YYYY年M月D日（周X）`.
+2. `昨日观察点校准`: if a previous daily note exists, check each prior
+   validation point before today's conclusion. For every item, state the
+   observed object, trigger condition, whether it triggered, what actually
+   happened, and whether the prior judgment was calibrated or missed. If no
+   previous note is available, write `昨日观察点暂无可校准样本`. If the same type of
+   judgment misses three consecutive times, explicitly mark it as a recurring
+   deviation and name the weak assumption.
+3. `核心结论`: one dense conclusion paragraph naming market split, main inflow,
+   main outflow, breadth/emotion, and where money was made or lost.
+4. `一、市场整体状态`: index table, intraday structure, technical table, and a
+   market-state sentence. Do not replace this with a single index summary.
+5. `二、市场情绪`: limit-up/limit-down/封板率/连板 table, then microstructure and
+   emotion-stage paragraphs.
+6. `三、板块深度拆解`: strongest Top10 table, weakest-direction table, then
+   separate directional paragraphs for the active main line, candidate main
+   line, retreating line, and defensive/补涨 line.
+7. `四、个股精选`: capacity/core stocks and unusual observation stocks, each with
+   same-day structure and next-day observation.
+8. `五、强趋势股启动回溯`: select from the strongest Top10/Top15 boards and
+   write 3-5 high-value cases when data permits. Include at least one trend
+   continuation winner and at least one same-board failed or weakening sample;
+   if no valid failed sample exists, state `本板块无有效失败对比样本`. For each
+   winner, write startup recognition, board linkage, a daily replay table
+   (`日期 / 涨跌幅 / 成交额 / 换手率 / 盘中低点 / 当日关键事件`),
+   retrospective entry-and-drawdown review, style fit, next validation, and a
+   success-vs-failure comparison. The comparison must conclude which dimension
+   made the failed sample weaker; do not write `各有优劣`.
+9. `六、风险提示`: numbered risks tied to observable market structure. Cover at
+   least three relevant risks from the menu when evidence exists: 放量滞涨,
+   高位股负反馈, 板块冲高回落, 指数与个股背离, 缩量反弹, 情绪高潮后分歧,
+   连板断层, 尾盘跳水/抢跑, 科创/北交所超买乖离.
+10. `七、明日观察清单`: each item must include observed object, key metric, strong
+   condition, and weak/negation condition.
+
+Acceptance for this Word-style path:
+
+- Preserve the long report hierarchy; do not collapse to `明天只盯三点`.
+- If prior validation points are available, include the calibration block before
+  `核心结论`; do not bury it at the end.
+- Keep tables for repeated comparable records: index performance, emotion
+  metrics, Top10 strong boards, weak boards, daily trend replay, and comparison
+  rows.
+- Do not cherry-pick only successful trend stocks. Pair winners with failed or
+  weakening same-board samples when the data supports it.
+- Style-fit and entry/stop-loss language is retrospective review only. Do not
+  output direct buy/sell/target/stop instructions.
+- Include exact figures only when they come from local evidence, user
+  attachment, or `extra_facts[]`; otherwise write `待确认/unknown` and keep the
+  section shape.
+- Run the evaluator against `2026-06-29-word` when the task asks for high
+  restoration. Phrase coverage must use the sample-specific phrase file, not
+  the older 2026-06-05 screenshot phrases.
 
 ## Evidence Levels
 

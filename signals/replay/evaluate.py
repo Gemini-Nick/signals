@@ -32,6 +32,20 @@ KEY_PHRASES = [
 ]
 
 
+def load_key_phrases(path_or_name: str) -> list[str]:
+    path = Path(path_or_name)
+    if not path.exists():
+        path = REFERENCE_DIR / f"{path_or_name}-phrases.json"
+    elif path.suffix == ".txt":
+        path = path.with_name(f"{path.stem}-phrases.json")
+    if not path.exists():
+        return KEY_PHRASES
+    phrases = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(phrases, list) or not all(isinstance(item, str) for item in phrases):
+        raise ValueError(f"Invalid replay phrase file: {path}")
+    return phrases
+
+
 def load_text(path_or_name: str) -> str:
     if path_or_name == "-":
         return sys.stdin.read().strip()
@@ -56,12 +70,13 @@ def _similarity(a: str, b: str) -> float:
     return round(difflib.SequenceMatcher(a=a, b=b).ratio(), 6)
 
 
-def evaluate_text(generated: str, target: str) -> dict[str, Any]:
+def evaluate_text(generated: str, target: str, *, key_phrases: list[str] | None = None) -> dict[str, Any]:
     generated = normalize_generated_text(generated)
     target = target.strip()
+    phrases = key_phrases if key_phrases is not None else KEY_PHRASES
     target_paragraphs = _paragraphs(target)
     generated_paragraphs = _paragraphs(generated)
-    phrase_hits = {phrase: phrase in generated for phrase in KEY_PHRASES}
+    phrase_hits = {phrase: phrase in generated for phrase in phrases}
     paragraph_scores = []
     for index, paragraph in enumerate(target_paragraphs):
         best = max((_similarity(paragraph, candidate) for candidate in generated_paragraphs), default=0.0)
@@ -105,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
 
     target = load_text(args.target)
     generated = load_text(args.generated)
-    result = evaluate_text(generated, target)
+    result = evaluate_text(generated, target, key_phrases=load_key_phrases(args.target))
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if args.diff:
         print("\n--- diff ---")

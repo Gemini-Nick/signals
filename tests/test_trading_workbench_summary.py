@@ -280,6 +280,50 @@ def test_narrative_cli_trade_date_uses_historical_replay_context(monkeypatch, ca
     assert "上证跌0.74%" not in output
 
 
+def test_narrative_cli_historical_trade_date_clears_stale_live_inputs(monkeypatch, capsys):
+    dashboard = _dashboard()
+    dashboard["daily_brief"]["as_of"] = "2026-06-05"
+    dashboard["daily_brief"]["primary_theme"] = "机器人/自动化产业链"
+    shell = _june5_shell()
+    snapshot = _snapshot()
+    snapshot["as_of"] = "2026-06-05"
+
+    def fake_fetch_inputs(base_url: str):
+        return dashboard, shell, snapshot
+
+    monkeypatch.setattr("signals.notify.trading_workbench_summary.fetch_inputs", fake_fetch_inputs)
+    monkeypatch.setattr("signals.sync.db.get_db", lambda: object())
+    monkeypatch.setattr(
+        "signals.replay.market_replay.build_market_replay_context",
+        lambda db, *, trade_date, **kwargs: {"trade_date": trade_date, "board_timeline": [], "rotation_windows": []},
+    )
+    monkeypatch.setattr("signals.replay.market_replay.format_market_replay_sections", lambda context: [])
+
+    exit_code = main(
+        [
+            "--window",
+            "postmarket",
+            "--format",
+            "narrative",
+            "--trade-date",
+            "2026-06-04",
+            "--ignore-time",
+            "--allow-ignore-time-notify",
+        ]
+    )
+
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert output.startswith("DONT_NOTIFY\n2026年6月4日复盘")
+    assert "历史回放证据不足" in output
+    assert "指数结构缺少可直接引用的涨跌幅" in output
+    assert "指数收红" not in output
+    assert "机器人和航天装备" not in output
+    assert "上证跌0.74%" not in output
+    assert "绿的谐波" not in output
+
+
 def test_narrative_cli_same_trade_date_keeps_live_sector_and_indices(monkeypatch, capsys):
     dashboard = _dashboard()
     dashboard["daily_brief"]["as_of"] = "2026-06-05"
@@ -336,6 +380,113 @@ def test_narrative_cli_same_trade_date_keeps_live_sector_and_indices(monkeypatch
     assert output.startswith("NOTIFY\n2026年6月5日复盘")
     assert "机器人和航天装备" in output
     assert "上证跌0.74%" in output
+
+
+def test_word_cli_trade_date_renders_word_style_from_replay_context(monkeypatch, capsys):
+    dashboard = _dashboard()
+    dashboard["daily_brief"]["as_of"] = "2026-06-26"
+    shell = _june5_shell()
+    snapshot = _snapshot()
+    snapshot["as_of"] = "2026-06-26"
+    seen: dict[str, str] = {}
+
+    def fake_fetch_inputs(base_url: str):
+        return dashboard, shell, snapshot
+
+    def fake_build_market_replay_context(db, *, trade_date: str, **kwargs):
+        seen["trade_date"] = trade_date
+        return {
+            "trade_date": trade_date,
+            "major_indices": [
+                {
+                    "name": "上证指数",
+                    "close": 4073.9,
+                    "change_pct": 1.20,
+                    "amount_yi": 16662.2,
+                    "amount_change_pct": 4.5,
+                    "amplitude_pct": 2.05,
+                }
+            ],
+            "market_breadth": {
+                "status": "available",
+                "up": 3520,
+                "down": 1630,
+                "limit_like_count": 92,
+                "down_limit_like_count": 4,
+                "evidence_level": "confirmed",
+            },
+            "daily_board_rankings": {
+                "rows": [
+                    {
+                        "name": "生物制品",
+                        "kind": "industry",
+                        "change_pct": 7.43,
+                        "amount_yi": 185.77,
+                        "leader_name": "禾元生物",
+                        "leader_change_pct": 20.0,
+                        "source": "board_ths:ths",
+                    }
+                ],
+                "weak_rows": [
+                    {
+                        "name": "CPO概念",
+                        "kind": "concept",
+                        "change_pct": -3.21,
+                        "leader_name": "unknown",
+                        "source": "concept_ranking:canonical",
+                    }
+                ],
+            },
+            "high_turnover_cores": [
+                {
+                    "symbol": "SH.603986",
+                    "code": "603986",
+                    "name": "兆易创新",
+                    "change_pct": 9.09,
+                    "amount_yi": 431.5,
+                    "open": 779,
+                    "high": 846.66,
+                    "low": 750,
+                    "close": 840,
+                }
+            ],
+            "structured_daily_review": {
+                "data_completeness": [
+                    {"item": "指数分钟线", "status": "missing", "source": "index_bars", "impact": "指数日内时间轴"},
+                    {"item": "板块分钟线", "status": "missing", "source": "board_heat_ticks", "impact": "资金切换"},
+                ],
+                "key_stock_pool": {"gainers_top20": [], "limit_pool_counts": {}},
+            },
+            "flow_availability": {"participant_flow_available": False},
+        }
+
+    monkeypatch.setattr("signals.notify.trading_workbench_summary.fetch_inputs", fake_fetch_inputs)
+    monkeypatch.setattr("signals.sync.db.get_db", lambda: object())
+    monkeypatch.setattr("signals.replay.market_replay.build_market_replay_context", fake_build_market_replay_context)
+
+    exit_code = main(
+        [
+            "--window",
+            "postmarket",
+            "--format",
+            "word",
+            "--trade-date",
+            "2026-06-29",
+            "--ignore-time",
+            "--allow-ignore-time-notify",
+        ]
+    )
+
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert seen["trade_date"] == "2026-06-29"
+    assert output.startswith("NOTIFY\n6月29日A股盘后复盘报告（Signals组装版）")
+    assert "A股盘后复盘报告 | 2026年6月29日（周一）" in output
+    assert "4073.9" in output
+    assert "生物制品" in output
+    assert "兆易创新" in output
+    assert "极度分化，科创单骑救主" not in output
 
 
 def test_fetch_inputs_safe_returns_partial_inputs_when_snapshot_fails(monkeypatch):

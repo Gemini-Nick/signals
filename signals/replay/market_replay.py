@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta
-from math import log10
+from math import isfinite, log10
 from typing import Any
 
 
@@ -58,6 +58,9 @@ _EXCLUDED_BOARD_PATTERN = re.compile(
     r"昨日|连板|涨停|次新|ST|破净|高股息|转债|宽基|指数)",
     re.IGNORECASE,
 )
+_BOARD_HEAT_REALTIME_SOURCE = "eastmoney_push2delay"
+_BOARD_HEAT_EOD_BACKFILL_SOURCE = "daily_board_ranking_backfill"
+_BOARD_HEAT_ALLOWED_SOURCES = (_BOARD_HEAT_REALTIME_SOURCE, _BOARD_HEAT_EOD_BACKFILL_SOURCE)
 
 
 def _board_display_name(name: str) -> str:
@@ -71,9 +74,10 @@ def _text(value: Any, default: str = "") -> str:
 
 def _float(value: Any) -> float | None:
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    return number if isfinite(number) else None
 
 
 def _first_present(*values: Any) -> Any:
@@ -119,8 +123,23 @@ def _collection_names(db: Any) -> set[str]:
         return set()
 
 
+def _board_heat_source_filter() -> dict[str, Any]:
+    return {"source": {"$in": list(_BOARD_HEAT_ALLOWED_SOURCES)}}
+
+
 def _snapshot_query(trade_date: str) -> dict[str, Any]:
-    return {"$or": [{"date_key": trade_date}, {"trade_date": trade_date}, {"dt": trade_date}]}
+    start, end = _date_range(trade_date)
+    compact = trade_date.replace("-", "")
+    return {
+        "$or": [
+            {"date_key": trade_date},
+            {"date_key": compact},
+            {"trade_date": trade_date},
+            {"dt": trade_date},
+            {"dt": compact},
+            {"dt": {"$gte": start, "$lt": end}},
+        ]
+    }
 
 
 def _snapshot_projection() -> dict[str, int]:
@@ -380,7 +399,7 @@ def _intraday_delta_board_symbols(
     start, end = _date_range(trade_date)
     stats: dict[str, dict[str, Any]] = {}
     cursor = db["board_heat_ticks"].find(
-        {"source": "eastmoney_push2delay", "trade_minute": {"$gte": start, "$lt": end}},
+        {**_board_heat_source_filter(), "trade_minute": {"$gte": start, "$lt": end}},
         {"_id": 0, "name": 1, "change_pct": 1, "rank_idx": 1},
     )
     for row in cursor:
@@ -1040,7 +1059,7 @@ def _market_board_snapshot(db: Any, trade_date: str, checkpoint: str, *, limit: 
     target = _time_at(trade_date, checkpoint)
     day_start, _ = _date_range(trade_date)
     latest = db["board_heat_ticks"].find_one(
-        {"source": "eastmoney_push2delay", "trade_minute": {"$gte": day_start, "$lte": target}},
+        {**_board_heat_source_filter(), "trade_minute": {"$gte": day_start, "$lte": target}},
         {"trade_minute": 1, "_id": 0},
         sort=[("trade_minute", -1)],
     )
@@ -1051,7 +1070,7 @@ def _market_board_snapshot(db: Any, trade_date: str, checkpoint: str, *, limit: 
         row
         for row in list(
             db["board_heat_ticks"].find(
-                {"source": "eastmoney_push2delay", "trade_minute": minute},
+                {**_board_heat_source_filter(), "trade_minute": minute},
                 {
                     "_id": 0,
                     "kind": 1,
@@ -1069,7 +1088,7 @@ def _market_board_snapshot(db: Any, trade_date: str, checkpoint: str, *, limit: 
         row
         for row in list(
             db["board_heat_ticks"].find(
-                {"source": "eastmoney_push2delay", "trade_minute": minute},
+                {**_board_heat_source_filter(), "trade_minute": minute},
                 {
                     "_id": 0,
                     "kind": 1,
@@ -1123,7 +1142,7 @@ def _board_rows_for_checkpoint(db: Any, trade_date: str, checkpoint: str) -> tup
     target = _time_at(trade_date, checkpoint)
     day_start, _ = _date_range(trade_date)
     latest = db["board_heat_ticks"].find_one(
-        {"source": "eastmoney_push2delay", "trade_minute": {"$gte": day_start, "$lte": target}},
+        {**_board_heat_source_filter(), "trade_minute": {"$gte": day_start, "$lte": target}},
         {"trade_minute": 1, "_id": 0},
         sort=[("trade_minute", -1)],
     )
@@ -1132,7 +1151,7 @@ def _board_rows_for_checkpoint(db: Any, trade_date: str, checkpoint: str) -> tup
     minute = latest["trade_minute"]
     rows = list(
         db["board_heat_ticks"].find(
-            {"source": "eastmoney_push2delay", "trade_minute": minute},
+            {**_board_heat_source_filter(), "trade_minute": minute},
             {"_id": 0, "kind": 1, "name": 1, "change_pct": 1, "rank_idx": 1, "leader_name": 1, "leader_change_pct": 1},
         )
     )
@@ -1199,7 +1218,7 @@ def _opening_pressure_boards(db: Any, trade_date: str, *, limit: int = 20) -> li
     end = _time_at(trade_date, "09:35")
     weakest: dict[tuple[str, str], dict[str, Any]] = {}
     cursor = db["board_heat_ticks"].find(
-        {"source": "eastmoney_push2delay", "trade_minute": {"$gte": start, "$lte": end}},
+        {**_board_heat_source_filter(), "trade_minute": {"$gte": start, "$lte": end}},
         {"_id": 0, "trade_minute": 1, "kind": 1, "name": 1, "change_pct": 1, "rank_idx": 1, "leader_name": 1},
     )
     for row in cursor:
@@ -1320,9 +1339,46 @@ def _has_usable_daily_snapshots(db: Any, trade_date: str) -> bool:
         return False
 
 
+def _ranking_history_days(db: Any, trade_date: str, *, lookback_days: int = 35) -> set[datetime]:
+    names = _collection_names(db)
+    end, _ = _date_range(trade_date)
+    start = end - timedelta(days=lookback_days)
+    days: set[datetime] = set()
+    for collection in ("board_ranking", "concept_ranking"):
+        if collection not in names:
+            continue
+        try:
+            cursor = db[collection].find(
+                {"dt": {"$gte": start, "$lte": end}, "source": "canonical"},
+                {"_id": 0, "dt": 1},
+            )
+            for row in cursor:
+                dt = row.get("dt")
+                if isinstance(dt, datetime):
+                    days.add(dt.replace(hour=0, minute=0, second=0, microsecond=0))
+        except Exception:
+            continue
+    return days
+
+
+def _board_heat_status(db: Any, trade_date: str) -> tuple[str, str]:
+    if "board_heat_ticks" not in _collection_names(db):
+        return "missing", "board_heat_ticks"
+    start, end = _date_range(trade_date)
+    day_query = {"trade_minute": {"$gte": start, "$lt": end}}
+    if _has_collection_rows(db, "board_heat_ticks", {**day_query, "source": _BOARD_HEAT_REALTIME_SOURCE}):
+        return "available", _BOARD_HEAT_REALTIME_SOURCE
+    if _has_collection_rows(db, "board_heat_ticks", {**day_query, "source": _BOARD_HEAT_EOD_BACKFILL_SOURCE}):
+        return "partial", _BOARD_HEAT_EOD_BACKFILL_SOURCE
+    if _has_collection_rows(db, "board_heat_ticks", day_query):
+        return "partial", "board_heat_ticks(nonstandard_source)"
+    return "missing", "board_heat_ticks"
+
+
 def _data_completeness(db: Any, trade_date: str, flow: dict[str, Any]) -> list[dict[str, Any]]:
     start, end = _date_range(trade_date)
     prior_start = start - timedelta(days=30)
+    board_heat_status, board_heat_source = _board_heat_status(db, trade_date)
 
     def stock_query() -> dict[str, Any]:
         return _snapshot_query(trade_date)
@@ -1344,6 +1400,9 @@ def _data_completeness(db: Any, trade_date: str, flow: dict[str, Any]) -> list[d
         "chain_heat_snapshots",
     ]
     trend_source = next((name for name in candidate_trend_collections if _has_collection_rows(db, name)), "")
+    ranking_history_days = _ranking_history_days(db, trade_date)
+    ranking_history_status = "partial" if len(ranking_history_days) >= 2 else "missing"
+    ranking_history_source = "board_ranking/concept_ranking(daily_pct)" if ranking_history_status == "partial" else ""
     rows = [
         {
             "item": "指数日线",
@@ -1371,14 +1430,14 @@ def _data_completeness(db: Any, trade_date: str, flow: dict[str, Any]) -> list[d
         },
         {
             "item": "板块分钟线",
-            "status": "available" if _has_collection_rows(db, "board_heat_ticks", board_query()) else "missing",
-            "source": "board_heat_ticks",
+            "status": board_heat_status,
+            "source": board_heat_source,
             "impact": "固定半小时切片、资金切换、卡位",
         },
         {
             "item": "板块20日历史",
-            "status": "available" if trend_source else ("partial" if _has_collection_rows(db, "board_heat_ticks", board_query(prior_start, start)) else "missing"),
-            "source": trend_source or "board_heat_ticks(current-day/minute only)",
+            "status": "available" if trend_source else ranking_history_status,
+            "source": trend_source or ranking_history_source or "none",
             "impact": "近20日趋势Top7；partial 时不得 confirmed",
         },
         {
@@ -1405,6 +1464,250 @@ def _data_completeness(db: Any, trade_date: str, flow: dict[str, Any]) -> list[d
     return rows
 
 
+_MAJOR_INDEX_TARGETS = (
+    ("上证指数", "sh000001"),
+    ("深证成指", "sz399001"),
+    ("创业板指", "sz399006"),
+    ("科创50", "sh000688"),
+)
+
+
+def _amount_like_yi(value: Any) -> float | None:
+    number = _float(value)
+    if number is None:
+        return None
+    if abs(number) > 1_000_000:
+        return _amount_yi(number)
+    return round(number, 2)
+
+
+def _major_index_daily_rows(db: Any, trade_date: str) -> list[dict[str, Any]]:
+    if "index_bars" not in _collection_names(db):
+        return []
+    start, end = _date_range(trade_date)
+    rows: list[dict[str, Any]] = []
+    for name, symbol in _MAJOR_INDEX_TARGETS:
+        row = db["index_bars"].find_one(
+            {"meta.symbol": symbol, "meta.freq": "日线", "dt": {"$gte": start, "$lt": end}},
+            {"_id": 0, "dt": 1, "open": 1, "high": 1, "low": 1, "close": 1, "amount": 1},
+        )
+        if not row:
+            continue
+        prev = db["index_bars"].find_one(
+            {"meta.symbol": symbol, "meta.freq": "日线", "dt": {"$lt": start}},
+            {"_id": 0, "dt": 1, "close": 1, "amount": 1},
+            sort=[("dt", -1)],
+        )
+        open_value = _float(row.get("open"))
+        high = _float(row.get("high"))
+        low = _float(row.get("low"))
+        close = _float(row.get("close"))
+        amount = _float(row.get("amount"))
+        prev_close = _float(prev.get("close")) if prev else None
+        prev_amount = _float(prev.get("amount")) if prev else None
+        change_pct = (close / prev_close - 1) * 100 if close is not None and prev_close else None
+        amount_change_pct = (amount / prev_amount - 1) * 100 if amount is not None and prev_amount else None
+        amplitude_pct = (high - low) / prev_close * 100 if high is not None and low is not None and prev_close else None
+        dt = row.get("dt")
+        rows.append(
+            {
+                "name": name,
+                "symbol": symbol,
+                "date": dt.strftime("%Y-%m-%d") if isinstance(dt, datetime) else _text(dt, trade_date),
+                "open": open_value,
+                "high": high,
+                "low": low,
+                "close": close,
+                "prev_close": prev_close,
+                "change_pct": round(change_pct, 4) if change_pct is not None else None,
+                "amount_yi": _amount_like_yi(amount),
+                "amount_change_pct": round(amount_change_pct, 2) if amount_change_pct is not None else None,
+                "amplitude_pct": round(amplitude_pct, 2) if amplitude_pct is not None else None,
+                "evidence_level": "confirmed",
+                "source": "index_bars",
+            }
+        )
+    return rows
+
+
+def _market_breadth(db: Any, trade_date: str) -> dict[str, Any]:
+    if "fullmarket_spot_snapshots" not in _collection_names(db):
+        return {
+            "status": "missing",
+            "source": "fullmarket_spot_snapshots",
+            "evidence_level": "unknown",
+            "note": "缺少全市场日线快照，不能统计涨跌家数和近似涨跌停。",
+        }
+    up = down = flat = limit_like = down_limit_like = 0
+    total_amount = 0.0
+    total = 0
+    cursor = db["fullmarket_spot_snapshots"].find(_snapshot_query(trade_date), _snapshot_projection())
+    for raw in cursor:
+        snapshot = _stock_snapshot(raw)
+        if not _is_usable_daily_snapshot(snapshot):
+            continue
+        total += 1
+        change = _float(snapshot.get("change_pct")) or 0.0
+        if change > 0:
+            up += 1
+        elif change < 0:
+            down += 1
+        else:
+            flat += 1
+        symbol = _text(snapshot.get("symbol"))
+        threshold = _limit_threshold(symbol)
+        if change >= threshold:
+            limit_like += 1
+        if change <= -threshold:
+            down_limit_like += 1
+        total_amount += _float(snapshot.get("amount")) or 0.0
+    if total == 0:
+        return {
+            "status": "missing",
+            "source": "fullmarket_spot_snapshots",
+            "evidence_level": "unknown",
+            "note": "全市场日线快照存在但没有可用 OHLC/涨跌幅/成交额记录。",
+        }
+    return {
+        "status": "available",
+        "source": "fullmarket_spot_snapshots",
+        "evidence_level": "confirmed",
+        "total": total,
+        "up": up,
+        "down": down,
+        "flat": flat,
+        "up_ratio_pct": round(up / total * 100, 2) if total else None,
+        "down_ratio_pct": round(down / total * 100, 2) if total else None,
+        "limit_like_count": limit_like,
+        "down_limit_like_count": down_limit_like,
+        "total_amount_yi": _amount_like_yi(total_amount),
+        "note": "涨停/跌停为日线涨跌幅阈值近似，不等同 market_limit_pools 精确封板池。",
+    }
+
+
+def _daily_doc_query(trade_date: str, *, source: str | None = None) -> dict[str, Any]:
+    query = _snapshot_query(trade_date)
+    if source:
+        return {"$and": [query, {"source": source}]}
+    return query
+
+
+def _daily_board_row(row: dict[str, Any], *, collection: str, kind: str) -> dict[str, Any] | None:
+    name = _text(_first_present(row.get("board_name"), row.get("concept"), row.get("name"), row.get("label")))
+    change = _float(row.get("change_pct"))
+    if not name or change is None or not _is_analysis_board(name):
+        return None
+    up_count = _float(row.get("up_count"))
+    down_count = _float(row.get("down_count"))
+    breadth_pct = None
+    if up_count is not None and down_count is not None and up_count + down_count > 0:
+        breadth_pct = round(up_count / (up_count + down_count) * 100, 2)
+    source = _text(row.get("source"))
+    return {
+        "name": _board_display_name(name),
+        "kind": kind,
+        "change_pct": round(change, 2),
+        "amount_yi": _amount_like_yi(row.get("amount")),
+        "turnover_pct": _float(row.get("turnover_pct")),
+        "net_inflow_yi": _amount_like_yi(row.get("net_inflow")),
+        "up_count": int(up_count) if up_count is not None else None,
+        "down_count": int(down_count) if down_count is not None else None,
+        "breadth_pct": breadth_pct,
+        "leader_name": _text(row.get("leader_name") or row.get("领涨股") or row.get("leader")),
+        "leader_change_pct": _float(row.get("leader_change_pct") or row.get("领涨股-涨跌幅")),
+        "rank": row.get("rank_idx"),
+        "source": f"{collection}:{source}" if source else collection,
+        "evidence_level": "confirmed",
+    }
+
+
+def _daily_board_rankings(db: Any, trade_date: str, *, limit: int = 30) -> dict[str, Any]:
+    primary_specs = (
+        ("board_ranking", "canonical", "industry"),
+        ("concept_ranking", "canonical", "concept"),
+        ("board_ths", None, "industry"),
+        ("board_em", None, "industry"),
+        ("concept_em", None, "concept"),
+        ("concept_ths", None, "concept"),
+    )
+    fallback_specs = (
+        ("concept_sina", None, "concept"),
+        ("board_sina", None, "industry"),
+    )
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    names = _collection_names(db)
+
+    def collect(specs: tuple[tuple[str, str | None, str], ...]) -> None:
+        for collection, source, kind in specs:
+            if collection not in names:
+                continue
+            cursor = db[collection].find(_daily_doc_query(trade_date, source=source), {"_id": 0}).sort(
+                [("change_pct", -1)]
+            ).limit(max(limit * 3, 80))
+            for raw in cursor:
+                row = _daily_board_row(raw, collection=collection, kind=kind)
+                if not row:
+                    continue
+                key = (row["kind"], row["name"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(row)
+
+    collect(primary_specs)
+    if len(rows) < limit:
+        collect(fallback_specs)
+    rows.sort(key=lambda item: _float(item.get("change_pct")) or -10**12, reverse=True)
+    weak_rows = sorted(rows, key=lambda item: _float(item.get("change_pct")) or 10**12)
+    return {
+        "status": "available" if rows else "missing",
+        "source": "board_ranking/concept_ranking and source snapshots",
+        "evidence_level": "confirmed" if rows else "unknown",
+        "rows": rows[:limit],
+        "weak_rows": weak_rows[:limit],
+        "note": (
+            "这是日度行业/概念排行；如果 board_heat_ticks 缺失，只能说明收盘强弱，"
+            "不能还原分钟级卡位顺序。"
+        ),
+    }
+
+
+def _sector_boards_from_daily_rankings(rankings: dict[str, Any], *, limit: int = 15) -> list[dict[str, Any]]:
+    rows = rankings.get("rows") if isinstance(rankings.get("rows"), list) else []
+    result: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows[:limit], start=1):
+        name = _text(row.get("name"))
+        kind = _text(row.get("kind"), "board")
+        if not name:
+            continue
+        result.append(
+            {
+                "name": name,
+                "change_pct": _float(row.get("change_pct")),
+                "rank": idx,
+                "source": _text(row.get("source"), "daily_board_rankings"),
+                "trader_action": "历史回放 fallback：来自日度板块排行，只能证明收盘强弱，不能证明盘中卡位。",
+                "source_driver": {
+                    "kind": kind,
+                    "kind_label": "概念" if kind == "concept" else "行业",
+                    "name": name,
+                    "code": _text(row.get("code")),
+                    "change_pct": _float(row.get("change_pct")),
+                    "rank": row.get("rank"),
+                    "leader_name": _text(row.get("leader_name")),
+                    "leader_change_pct": _float(row.get("leader_change_pct")),
+                    "source": _text(row.get("source"), "daily_board_rankings"),
+                    "label": f"{kind}:{name}",
+                },
+                "representatives": {},
+                "evidence_level": _text(row.get("evidence_level"), "confirmed"),
+                "fallback_source": "daily_board_rankings",
+            }
+        )
+    return result
+
+
 def _is_valid_stock_name(name: Any) -> bool:
     text = _text(name)
     if not text:
@@ -1419,6 +1722,11 @@ def _stock_pool_row(snapshot: dict[str, Any]) -> dict[str, Any]:
         "symbol": snapshot.get("symbol"),
         "code": snapshot.get("code"),
         "name": snapshot.get("name"),
+        "open": snapshot.get("open"),
+        "high": snapshot.get("high"),
+        "low": snapshot.get("low"),
+        "close": snapshot.get("close"),
+        "prev_close": snapshot.get("prev_close"),
         "change_pct": snapshot.get("change_pct"),
         "amount_yi": _amount_yi(snapshot.get("amount")),
         "turnover_pct": snapshot.get("turnover_pct"),
@@ -1473,9 +1781,12 @@ def _key_stock_pool(db: Any, trade_date: str, limit_lookup: dict[str, dict[str, 
     losers = _stock_pool_cursor_rows(db, trade_date, sort_field="change_pct", direction=1, limit=20, min_amount=200000000)
     pool_counts: dict[str, int] = {}
     limit_samples: list[dict[str, Any]] = []
+    linked_limit_count = 0
     for code, meta in limit_lookup.items():
         pool = _text(meta.get("pool"), "unknown")
         pool_counts[pool] = pool_counts.get(pool, 0) + 1
+        if pool in {"limit_up", "zt", "涨停"} and (_float(meta.get("consecutive_limit_count")) or 0) >= 2:
+            linked_limit_count += 1
         if len(limit_samples) < 20:
             limit_samples.append(
                 {
@@ -1496,6 +1807,13 @@ def _key_stock_pool(db: Any, trade_date: str, limit_lookup: dict[str, dict[str, 
         for row in bucket
         if _pure_code(_text(row.get("symbol") or row.get("code")))
     }
+    limit_up_count = sum(pool_counts.get(key, 0) for key in ("limit_up", "zt", "涨停"))
+    failed_limit_count = sum(pool_counts.get(key, 0) for key in ("failed_limit", "zbgc", "炸板"))
+    limit_down_count = sum(pool_counts.get(key, 0) for key in ("limit_down", "dtgc", "跌停"))
+    strong_pool_count = sum(pool_counts.get(key, 0) for key in ("strong", "qsgc", "强势"))
+    denominator = limit_up_count + failed_limit_count
+    seal_success_rate_pct = round(limit_up_count / denominator * 100, 2) if denominator else None
+    failed_rate_pct = round(failed_limit_count / denominator * 100, 2) if denominator else None
     return {
         "status": "available",
         "source": "fullmarket_spot_snapshots + market_limit_pools",
@@ -1507,6 +1825,13 @@ def _key_stock_pool(db: Any, trade_date: str, limit_lookup: dict[str, dict[str, 
         "gainers_top20": gainers,
         "losers_top20": losers,
         "limit_pool_counts": pool_counts,
+        "limit_up_count": limit_up_count,
+        "failed_limit_count": failed_limit_count,
+        "limit_down_count": limit_down_count,
+        "strong_pool_count": strong_pool_count,
+        "linked_limit_count": linked_limit_count,
+        "seal_success_rate_pct": seal_success_rate_pct,
+        "failed_rate_pct": failed_rate_pct,
         "limit_pool_sample": limit_samples,
     }
 
@@ -1661,6 +1986,104 @@ def _top_turnover_boards(db: Any, trade_date: str, sector_boards: list[dict[str,
 def _trend_20d_boards(db: Any, trade_date: str) -> dict[str, Any]:
     names = _collection_names(db)
     candidate_sources = [name for name in ("board_daily", "board_daily_bars", "board_index_daily", "board_history") if name in names]
+    if not candidate_sources:
+        ranking_days = sorted(_ranking_history_days(db, trade_date))
+        if len(ranking_days) < 2:
+            return {
+                "status": "missing",
+                "source": "none",
+                "evidence_level": "unknown",
+                "rows": [],
+                "excluded_high_gain_low_liquidity": [],
+                "note": "缺少板块日线/20日成交额历史，不能输出 confirmed 的近20日趋势Top7。",
+            }
+        end_day = datetime.fromisoformat(trade_date)
+        start_day = ranking_days[max(0, len(ranking_days) - 24)]
+        latest_day = ranking_days[-1]
+        day20 = set(ranking_days[-20:])
+        day5 = set(ranking_days[-5:])
+        latest_rows: dict[tuple[str, str], dict[str, Any]] = {}
+        series: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for collection, kind in (("board_ranking", "industry"), ("concept_ranking", "concept")):
+            if collection not in names:
+                continue
+            cursor = db[collection].find(
+                {"dt": {"$gte": start_day, "$lte": end_day}, "source": "canonical"},
+                {"_id": 0},
+            )
+            for raw in cursor:
+                row = _daily_board_row(raw, collection=collection, kind=kind)
+                if not row:
+                    continue
+                dt = raw.get("dt")
+                if not isinstance(dt, datetime):
+                    continue
+                day = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                key = (kind, row["name"])
+                point = {**row, "dt": day}
+                series.setdefault(key, []).append(point)
+                if day == latest_day:
+                    latest_rows[key] = point
+
+        def compound(points: list[dict[str, Any]]) -> float | None:
+            value = 1.0
+            used = 0
+            for item in points:
+                change = _float(item.get("change_pct"))
+                if change is None:
+                    continue
+                value *= 1 + change / 100
+                used += 1
+            if used == 0:
+                return None
+            return round((value - 1) * 100, 2)
+
+        rows: list[dict[str, Any]] = []
+        for key, latest in latest_rows.items():
+            points = sorted(series.get(key, []), key=lambda item: item["dt"])
+            points20 = [item for item in points if item["dt"] in day20]
+            points5 = [item for item in points if item["dt"] in day5]
+            if len(points20) < 2:
+                continue
+            rows.append(
+                {
+                    "name": latest["name"],
+                    "kind": latest["kind"],
+                    "change_pct": latest.get("change_pct"),
+                    "change_5d_pct": compound(points5),
+                    "change_20d_pct": compound(points20),
+                    "samples_5d": len(points5),
+                    "samples_20d": len(points20),
+                    "amount_yi": latest.get("amount_yi"),
+                    "turnover_pct": latest.get("turnover_pct"),
+                    "leader_name": latest.get("leader_name"),
+                    "leader_change_pct": latest.get("leader_change_pct"),
+                    "rank": latest.get("rank"),
+                    "source": "board_ranking/concept_ranking:canonical",
+                    "evidence_level": "inferred",
+                    "liquidity_status": "partial" if latest.get("amount_yi") is None else "available",
+                }
+            )
+        rows.sort(
+            key=lambda item: (
+                _float(item.get("change_20d_pct")) if _float(item.get("change_20d_pct")) is not None else -10**12,
+                _float(item.get("change_5d_pct")) if _float(item.get("change_5d_pct")) is not None else -10**12,
+                _float(item.get("change_pct")) if _float(item.get("change_pct")) is not None else -10**12,
+            ),
+            reverse=True,
+        )
+        return {
+            "status": "partial" if rows else "missing",
+            "source": "board_ranking/concept_ranking:canonical",
+            "evidence_level": "inferred" if rows else "unknown",
+            "rows": rows[:20],
+            "excluded_high_gain_low_liquidity": [],
+            "trade_days": [day.strftime("%Y-%m-%d") for day in ranking_days[-20:]],
+            "note": (
+                "由日度行业/概念排名涨跌幅复合计算，缺少完整板块成交额历史；"
+                "可用于趋势强弱排序，但不能替代完整20日成交额过滤。"
+            ),
+        }
     if not candidate_sources:
         return {
             "status": "missing",
@@ -2054,11 +2477,14 @@ def build_market_replay_context(
 ) -> dict[str, Any]:
     checkpoints = checkpoints or ["09:35", "10:30", "11:30", "13:30", "14:58"]
     boards = sector_boards or []
-    representative_symbols = _representative_symbols(boards, limit=representative_limit)
     limit_lookup = _limit_pool_lookup(db, trade_date)
+    daily_board_rankings = _daily_board_rankings(db, trade_date)
+    fallback_boards = _sector_boards_from_daily_rankings(daily_board_rankings) if not boards else []
+    analysis_boards = boards or fallback_boards
+    representative_symbols = _representative_symbols(analysis_boards, limit=representative_limit)
     high_turnover = _high_turnover_cores(db, trade_date, limit=high_turnover_limit)
     failed_boards = _failed_board_rows(db, trade_date, limit=20)
-    board_timeline = _board_timeline(db, trade_date, boards, checkpoints=checkpoints)
+    board_timeline = _board_timeline(db, trade_date, analysis_boards, checkpoints=checkpoints)
     rotation_windows = _rotation_windows(db, trade_date, checkpoints=checkpoints)
     rotation_shifts = _rotation_shifts(db, trade_date, checkpoints=checkpoints, limit=10)
     rotation_symbols = _symbols_from_rotation_boards(db, rotation_windows, rotation_shifts)
@@ -2094,18 +2520,30 @@ def build_market_replay_context(
             "dynamic_market_representatives": "board_constituents + fullmarket_spot_snapshots + optional market_limit_pools",
             "external_fund_flows": "optional Eastmoney/THS public order-size flow evidence",
             "index_cycle": "index_bars",
+            "major_indices": "index_bars",
+            "market_breadth": "fullmarket_spot_snapshots",
+            "daily_board_rankings": "board_ranking/concept_ranking + source snapshots",
         },
         "analysis_framework": replay_analysis_framework(),
         "structured_daily_review": _structured_daily_review(
             db,
             trade_date,
-            sector_boards=boards,
+            sector_boards=analysis_boards,
             high_turnover=high_turnover,
             failed_boards=failed_boards,
             limit_lookup=limit_lookup,
             flow=flow_availability,
         ),
+        "sector_board_fallback": {
+            "used": not bool(boards) and bool(fallback_boards),
+            "source": "daily_board_rankings" if fallback_boards else "",
+            "rows": fallback_boards,
+            "note": "历史回放缺 Agent OS 板块15 时使用日度板块排行派生，只能说明收盘强弱。",
+        },
         "high_turnover_cores": high_turnover,
+        "major_indices": _major_index_daily_rows(db, trade_date),
+        "market_breadth": _market_breadth(db, trade_date),
+        "daily_board_rankings": daily_board_rankings,
         "turnover_representatives": _turnover_representatives(db, trade_date, high_turnover, limit=15),
         "failed_boards": failed_boards,
         "board_timeline": board_timeline,
@@ -2121,7 +2559,7 @@ def build_market_replay_context(
             limit=max(240, representative_limit),
         ),
         "external_fund_flows": external_fund_flows,
-        "dynamic_market_representatives": _dynamic_market_representatives(db, trade_date, boards),
+        "dynamic_market_representatives": _dynamic_market_representatives(db, trade_date, analysis_boards),
         "index_cycle": _index_cycle_context(db, trade_date),
         "flow_availability": flow_availability,
         "interpretation_contract": [

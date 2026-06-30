@@ -316,6 +316,43 @@ def test_market_replay_context_extracts_event_graph():
                     },
                 ]
             ),
+            "board_ranking": FakeCollection(
+                [
+                    {
+                        "dt": datetime(2026, 6, 5),
+                        "source": "canonical",
+                        "board_name": "机器人",
+                        "change_pct": 6.03,
+                        "rank_idx": 0,
+                        "turnover_pct": 3.2,
+                        "up_count": 20,
+                        "down_count": 2,
+                        "leader_name": "机器人新星",
+                        "leader_change_pct": 20.0,
+                    },
+                    {
+                        "dt": datetime(2026, 6, 5),
+                        "source": "canonical",
+                        "board_name": "煤炭开采",
+                        "change_pct": -2.5,
+                        "rank_idx": 88,
+                        "leader_name": "测试煤炭",
+                    },
+                ]
+            ),
+            "concept_ranking": FakeCollection(
+                [
+                    {
+                        "dt": datetime(2026, 6, 5),
+                        "source": "canonical",
+                        "board_name": "减速器",
+                        "change_pct": 5.4,
+                        "rank_idx": 1,
+                        "leader_name": "绿的谐波",
+                        "leader_change_pct": 20.0,
+                    }
+                ]
+            ),
             "index_bars": FakeCollection(
                 [
                     {
@@ -403,6 +440,15 @@ def test_market_replay_context_extracts_event_graph():
     assert context["index_cycle"]["pivot_date"] == "2026-05-29"
     assert context["index_cycle"]["trading_days_since"] == 5
     assert context["index_cycle"]["drop_pct"] == -2.07
+    assert context["major_indices"][0]["name"] == "上证指数"
+    assert context["major_indices"][0]["change_pct"] == -0.7404
+    assert context["market_breadth"]["total"] == 5
+    assert context["market_breadth"]["up"] == 4
+    assert context["market_breadth"]["down"] == 1
+    assert context["market_breadth"]["limit_like_count"] == 3
+    assert context["daily_board_rankings"]["rows"][0]["name"] == "机器人"
+    assert context["daily_board_rankings"]["rows"][1]["name"] == "减速器"
+    assert context["daily_board_rankings"]["weak_rows"][0]["name"] == "煤炭开采"
     assert context["flow_availability"]["participant_flow_available"] is False
     structured = context["structured_daily_review"]
     assert structured["contract_version"] == "stock-daily-review-v2.1"
@@ -459,6 +505,126 @@ def test_market_replay_context_extracts_event_graph():
     assert "冲锋号" not in text
     assert "N/A" not in text
     assert "周五收盘" not in text
+
+
+def test_market_replay_uses_daily_rankings_fallback_and_eod_backfill():
+    day = "2026-06-29"
+    db = FakeDB(
+        {
+            "fullmarket_spot_snapshots": FakeCollection(
+                [
+                    {
+                        "date_key": day,
+                        "trade_date": day,
+                        "symbol": "SH.600001",
+                        "code": "600001",
+                        "name": "样本设备A",
+                        "open": 264.93,
+                        "high": 316.32,
+                        "low": 264.2,
+                        "close": 316.32,
+                        "prev_close": 263.6,
+                        "change_pct": 20.0,
+                        "amount": 5261000000,
+                        "turnover_pct": 8.1,
+                    },
+                    {
+                        "date_key": day,
+                        "trade_date": day,
+                        "symbol": "SZ.300001",
+                        "code": "300001",
+                        "name": "样本材料B",
+                        "open": 76.8,
+                        "high": 91.91,
+                        "low": 74.95,
+                        "close": 91.88,
+                        "prev_close": 77.18,
+                        "change_pct": 19.06,
+                        "amount": 2819000000,
+                        "turnover_pct": 30.0,
+                    },
+                ]
+            ),
+            "board_ranking": FakeCollection(
+                [
+                    {
+                        "dt": datetime(2026, 6, 29),
+                        "source": "canonical",
+                        "board_name": "强势设备",
+                        "change_pct": 7.41,
+                        "rank_idx": 2,
+                        "leader_name": "样本设备A",
+                        "leader_change_pct": 20.0,
+                    },
+                    {
+                        "dt": datetime(2026, 6, 29),
+                        "source": "canonical",
+                        "board_name": "高景气材料",
+                        "change_pct": 6.94,
+                        "rank_idx": 4,
+                        "leader_name": "样本材料B",
+                        "leader_change_pct": 19.06,
+                    },
+                ]
+            ),
+            "concept_ranking": FakeCollection([]),
+            "board_constituents": FakeCollection(
+                [
+                    {"board_name": "强势设备", "symbols": ["600001"], "updated_at": datetime(2026, 6, 29, 15)},
+                    {"board_name": "高景气材料", "symbols": ["300001"], "updated_at": datetime(2026, 6, 29, 15)},
+                ]
+            ),
+            "market_limit_pools": FakeCollection(
+                [
+                    {
+                        "trade_date": day,
+                        "pool": "limit_up",
+                        "code": "600001",
+                        "name": "样本设备A",
+                        "first_limit_up_time": "145044",
+                        "seal_amount": 175000000,
+                        "industry": "强势设备",
+                        "consecutive_limit_count": 1,
+                    },
+                    {
+                        "trade_date": day,
+                        "pool": "failed_limit",
+                        "code": "300001",
+                        "name": "样本材料B",
+                        "open_count": 2,
+                        "industry": "高景气材料",
+                    },
+                ]
+            ),
+            "board_heat_ticks": FakeCollection(
+                [
+                    {
+                        "source": "daily_board_ranking_backfill",
+                        "kind": "industry",
+                        "name": "强势设备",
+                        "trade_date": day,
+                        "trade_minute": datetime(2026, 6, 29, 14, 58),
+                        "change_pct": 7.41,
+                        "rank_idx": 2,
+                        "leader_name": "样本设备A",
+                        "leader_change_pct": 20.0,
+                    }
+                ]
+            ),
+            "bars": FakeCollection([]),
+        }
+    )
+
+    context = build_market_replay_context(db, trade_date=day, sector_boards=[], checkpoints=["09:35", "14:58"])
+
+    assert context["sector_board_fallback"]["used"] is True
+    assert context["rotation_windows"][0]["actual_time"] == "14:58"
+    structured = context["structured_daily_review"]
+    assert any(row["item"] == "板块分钟线" and row["status"] == "partial" for row in structured["data_completeness"])
+    assert structured["key_stock_pool"]["limit_up_count"] == 1
+    assert structured["key_stock_pool"]["failed_limit_count"] == 1
+    assert structured["key_stock_pool"]["seal_success_rate_pct"] == 50.0
+    assert context["dynamic_market_representatives"][0]["market_core"][0]["name"] == "样本设备A"
 
 
 def test_market_replay_sections_do_not_leak_june5_theme_template():
