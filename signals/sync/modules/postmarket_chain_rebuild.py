@@ -387,9 +387,16 @@ def _latest_value(db: Database, collection: str, field: str) -> Any:
     return doc.get(field)
 
 
-def _latest_source_docs(db: Database, collection: str) -> list[dict[str, Any]]:
-    latest_dt = _latest_value(db, collection, "dt")
-    query: dict[str, Any] = {"dt": latest_dt} if latest_dt else {}
+def _latest_source_docs(db: Database, collection: str, trade_date: str | None = None) -> list[dict[str, Any]]:
+    query: dict[str, Any] = {}
+    if trade_date:
+        day_start = datetime.strptime(trade_date[:10], "%Y-%m-%d")
+        day_end = day_start.replace(hour=23, minute=59, second=59, microsecond=999999)
+        if db[collection].count_documents({"dt": {"$gte": day_start, "$lte": day_end}}, limit=1):
+            query = {"dt": {"$gte": day_start, "$lte": day_end}}
+    if not query:
+        latest_dt = _latest_value(db, collection, "dt")
+        query = {"dt": latest_dt} if latest_dt else {}
     return list(db[collection].find(query, {"_id": 0}).limit(5000))
 
 
@@ -413,7 +420,7 @@ def _catalog_docs(db: Database, *, trade_date: str, now: datetime) -> list[dict[
     docs: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str, str]] = set()
     for collection, source, kind in CATALOG_SOURCES:
-        for idx, raw in enumerate(_latest_source_docs(db, collection)):
+        for idx, raw in enumerate(_latest_source_docs(db, collection, trade_date=trade_date)):
             raw_name = _board_name(raw)
             source_name = _text(raw.get("source")) or source
             key = (collection, source_name, kind, raw_name or f"invalid:{idx}")
@@ -448,9 +455,17 @@ def _catalog_docs(db: Database, *, trade_date: str, now: datetime) -> list[dict[
     return docs
 
 
-def _latest_spot_docs(db: Database) -> tuple[str, str, list[dict[str, Any]]]:
+def _latest_spot_docs(db: Database, trade_date: str | None = None) -> tuple[str, str, list[dict[str, Any]]]:
+    query: dict[str, Any] = {"date_key": {"$exists": True}}
+    if trade_date:
+        query = {
+            "$or": [
+                {"trade_date": trade_date},
+                {"date_key": trade_date.replace("-", "")},
+            ]
+        }
     latest = db["fullmarket_spot_snapshots"].find_one(
-        {"date_key": {"$exists": True}},
+        query,
         {"date_key": 1, "trade_date": 1},
         sort=[("date_key", -1), ("snapshot_at", -1)],
     ) or {}
@@ -465,8 +480,8 @@ def _latest_spot_docs(db: Database) -> tuple[str, str, list[dict[str, Any]]]:
     return date_key, trade_date, docs
 
 
-def _security_master_docs(db: Database, *, now: datetime) -> tuple[dict[str, dict[str, Any]], dict[str, str], str]:
-    _, spot_trade_date, spot_docs = _latest_spot_docs(db)
+def _security_master_docs(db: Database, *, now: datetime, trade_date: str | None = None) -> tuple[dict[str, dict[str, Any]], dict[str, str], str]:
+    _, spot_trade_date, spot_docs = _latest_spot_docs(db, trade_date=trade_date)
     by_code: dict[str, dict[str, Any]] = {}
     names: dict[str, str] = {}
     for doc in spot_docs:
@@ -513,9 +528,20 @@ def _constituent_doc(db: Database, *, kind: str, name: str) -> dict[str, Any]:
     ) or {}
 
 
-def _latest_board_heat_context(db: Database) -> dict[tuple[str, str], dict[str, Any]]:
+def _latest_board_heat_context(db: Database, trade_date: str | None = None) -> dict[tuple[str, str], dict[str, Any]]:
+    query: dict[str, Any] = {"trade_minute": {"$exists": True}}
+    if trade_date:
+        day_start = datetime.strptime(trade_date[:10], "%Y-%m-%d")
+        day_end = day_start.replace(hour=23, minute=59, second=59, microsecond=999999)
+        query = {
+            "$or": [
+                {"trade_date": trade_date},
+                {"dt": {"$gte": day_start, "$lte": day_end}},
+                {"trade_minute": {"$gte": day_start, "$lte": day_end}},
+            ]
+        }
     latest = db["board_heat_ticks"].find_one(
-        {"trade_minute": {"$exists": True}},
+        query,
         {"trade_minute": 1},
         sort=[("trade_minute", -1)],
     ) or {}
@@ -565,9 +591,12 @@ def _latest_board_heat_context(db: Database) -> dict[tuple[str, str], dict[str, 
     return output
 
 
-def _latest_quote_context_by_code(db: Database) -> dict[str, dict[str, Any]]:
+def _latest_quote_context_by_code(db: Database, trade_date: str | None = None) -> dict[str, dict[str, Any]]:
+    query: dict[str, Any] = {"trade_date": {"$exists": True}}
+    if trade_date:
+        query = {"trade_date": trade_date}
     latest = db["quote_snapshots"].find_one(
-        {"trade_date": {"$exists": True}},
+        query,
         {"trade_date": 1},
         sort=[("trade_date", -1), ("snapshot_at", -1)],
     ) or {}
@@ -693,8 +722,8 @@ def _build_security_concept_evidence(
         for item in mapping_docs
         if _text(item.get("source_board_id"))
     }
-    heat_by_board = _latest_board_heat_context(db) if include_market_context else {}
-    quote_by_code = _latest_quote_context_by_code(db) if include_market_context else {}
+    heat_by_board = _latest_board_heat_context(db, trade_date=trade_date) if include_market_context else {}
+    quote_by_code = _latest_quote_context_by_code(db, trade_date=trade_date) if include_market_context else {}
     docs: list[dict[str, Any]] = []
     for source in catalog:
         name = _text(source.get("canonical_name") or source.get("raw_name"))
@@ -1243,8 +1272,20 @@ def _build_memberships(
     return list(grouped.values())
 
 
-def _latest_chain_heat(db: Database) -> dict[tuple[str, str], dict[str, Any]]:
-    latest = db["chain_heat_snapshots"].find_one({"market": "A"}, {"trade_minute": 1}, sort=[("trade_minute", -1)]) or {}
+def _latest_chain_heat(db: Database, trade_date: str | None = None) -> dict[tuple[str, str], dict[str, Any]]:
+    query: dict[str, Any] = {"market": "A"}
+    if trade_date:
+        day_start = datetime.strptime(trade_date[:10], "%Y-%m-%d")
+        day_end = day_start.replace(hour=23, minute=59, second=59, microsecond=999999)
+        query = {
+            "market": "A",
+            "$or": [
+                {"trade_date": trade_date},
+                {"dt": {"$gte": day_start, "$lte": day_end}},
+                {"trade_minute": {"$gte": day_start, "$lte": day_end}},
+            ],
+        }
+    latest = db["chain_heat_snapshots"].find_one(query, {"trade_minute": 1}, sort=[("trade_minute", -1)]) or {}
     trade_minute = latest.get("trade_minute")
     if not trade_minute:
         return {}
@@ -1348,13 +1389,13 @@ def _write_security_master(db: Database, docs_by_code: dict[str, dict[str, Any]]
     return int(result.upserted_count), int(result.modified_count)
 
 
-def sync_postmarket_chain_rebuild(db: Database, proxy_url: str = None) -> dict[str, Any]:
+def sync_postmarket_chain_rebuild(db: Database, proxy_url: str = None, trade_date: str | None = None) -> dict[str, Any]:
     del proxy_url
     started = time.monotonic()
     now = naive_market_now("A")
-    trade_date = trading_day_key("A", now=now)
+    trade_date = trade_date or trading_day_key("A", now=now)
 
-    security_master, security_names, spot_trade_date = _security_master_docs(db, now=now)
+    security_master, security_names, spot_trade_date = _security_master_docs(db, now=now, trade_date=trade_date)
     security_inserted, security_modified = _write_security_master(db, security_master)
 
     catalog = _catalog_docs(db, trade_date=trade_date, now=now)
@@ -1400,7 +1441,7 @@ def sync_postmarket_chain_rebuild(db: Database, proxy_url: str = None) -> dict[s
         memberships,
         trade_date=trade_date,
         now=now,
-        heat_by_node=_latest_chain_heat(db),
+        heat_by_node=_latest_chain_heat(db, trade_date=trade_date),
     )
     rollup_inserted, rollup_modified = _write_many_replace(db, "chain_node_security_rollups", rollups, trade_date=trade_date)
 

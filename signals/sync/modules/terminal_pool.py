@@ -329,8 +329,10 @@ REASON_WEIGHTS = {
     "fallback_watch": 160,
     "review_sector_bullish": 420,
     "review_sector_bearish": 0,
+    "hot_rank_clue": 390,
 }
 REVIEW_CLUE_REASON_TYPES = {"review_sector_bullish", "review_sector_bearish"}
+HOT_RANK_CLUE_REASON_TYPES = {"hot_rank_clue"}
 
 
 def _text(value: Any) -> str:
@@ -1709,12 +1711,71 @@ def _add_review_clue_rows(rows: dict[str, dict[str, Any]], db: Database, index_c
                     }, index_codes=index_codes, name=name)
 
 
+def _hot_rank_clue_since_date() -> date:
+    lookback_days = max(1, int(os.getenv("TERMINAL_HOT_RANK_CLUE_LOOKBACK_DAYS", "2")))
+    return naive_market_now("A").date() - timedelta(days=lookback_days)
+
+
+def _add_hot_rank_clue_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str], now: datetime) -> None:
+    limit = max(1, int(os.getenv("TERMINAL_HOT_RANK_CLUE_SOURCE_LIMIT", "60")))
+    since = _hot_rank_clue_since_date().isoformat()
+    docs = db["hot_rank_clues"].find(
+        {"active": True, "as_of": {"$gte": since}},
+        {
+            "_id": 1,
+            "raw_code": 1,
+            "code": 1,
+            "symbol": 1,
+            "name": 1,
+            "sources": 1,
+            "source_count": 1,
+            "ranks": 1,
+            "score": 1,
+            "tier": 1,
+            "strategy_tags": 1,
+            "reason_summary": 1,
+            "shape_details": 1,
+            "as_of": 1,
+            "topics": 1,
+        },
+    ).sort([("score", -1), ("source_count", -1), ("updated_at", -1)]).limit(limit)
+    for doc in docs:
+        code = doc.get("raw_code") or doc.get("code") or doc.get("symbol")
+        sources = [str(source) for source in (doc.get("sources") or []) if source]
+        ranks = doc.get("ranks") if isinstance(doc.get("ranks"), dict) else {}
+        tags = [str(tag) for tag in (doc.get("strategy_tags") or []) if tag]
+        _add_reason(rows, code, {
+            "reason_type": "hot_rank_clue",
+            "source_collection": "hot_rank_clues",
+            "source_doc_id": doc.get("_id") or code,
+            "signal_type": _text(doc.get("reason_summary")) or "热榜启动/均线攀爬线索",
+            "signal_side": "buy",
+            "source_role": "review_clue",
+            "decision_effect": "context_only",
+            "can_create_candidate": True,
+            "score": _float(doc.get("score")),
+            "heat_score": _float(doc.get("score")),
+            "event_dt": doc.get("as_of"),
+            "as_of": now.date().isoformat(),
+            "board_or_concept": "热榜",
+            "evidence": {
+                "sources": sources,
+                "ranks": ranks,
+                "tier": _text(doc.get("tier")),
+                "score": _float(doc.get("score")),
+                "strategy_tags": tags,
+                "topics": (doc.get("topics") or [])[:5],
+                "reason_summary": _text(doc.get("reason_summary")),
+            },
+        }, index_codes=index_codes, name=_text(doc.get("name")))
+
+
 def _has_clue_source(row: dict[str, Any]) -> bool:
     for reason in row.get("inclusion_reasons") or []:
         if not isinstance(reason, dict):
             continue
         rt = _text(reason.get("reason_type"))
-        if rt in REVIEW_CLUE_REASON_TYPES or rt in {"user_pinned", "chain_core_rep", "chain_elastic_rep", "source_leader", "knowledge_confirmed", "knowledge_watch", "fallback_watch"}:
+        if rt in REVIEW_CLUE_REASON_TYPES or rt in HOT_RANK_CLUE_REASON_TYPES or rt in {"user_pinned", "chain_core_rep", "chain_elastic_rep", "source_leader", "knowledge_confirmed", "knowledge_watch", "fallback_watch"}:
             return True
     return False
 
@@ -1760,6 +1821,8 @@ def _clue_quality_score(row: dict[str, Any]) -> float:
         rt = _text(reason.get("reason_type"))
         if rt == "review_sector_bullish":
             source_score = max(source_score, 50.0)
+        elif rt == "hot_rank_clue":
+            source_score = max(source_score, min(60.0, 32.0 + _float(reason.get("score")) * 0.25))
         elif rt == "user_pinned":
             source_score = max(source_score, 30.0)
         elif rt in {"chain_core_rep", "source_leader"}:
@@ -5449,6 +5512,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     _add_chain_membership_rows(rows, db, index_codes)
     _add_knowledge_rows(rows, db, index_codes)
     _add_review_clue_rows(rows, db, index_codes)
+    _add_hot_rank_clue_rows(rows, db, index_codes, now)
     _attach_membership_context(rows, db, index_codes)
     strict_candidate_count = len(rows)
     fallback_count = 0
@@ -5519,6 +5583,11 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
             for r in row.get("inclusion_reasons", [])
             if isinstance(r, dict) and r.get("reason_type") == "review_sector_bullish" and r.get("board_or_concept")
         ]
+        row["clue_sources"].extend(
+            f"热榜:{_text((r.get('evidence') or {}).get('tier')) or _text(r.get('signal_type'))}"
+            for r in row.get("inclusion_reasons", [])
+            if isinstance(r, dict) and r.get("reason_type") == "hot_rank_clue"
+        )
         row["promotion_gates"] = blocked_by
         clue_stocks.append(row)
     for idx, row in enumerate(clue_stocks, start=1):

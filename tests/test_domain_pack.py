@@ -103,6 +103,7 @@ def test_signals_pack_dashboard_matches_electron_contract(tmp_path, monkeypatch)
         "terminal_outputs": [],
         "blockers": [],
     })
+    monkeypatch.setattr(pack, "_terminal_clue_candidates", lambda: [])
 
     dashboard = asyncio.run(pack.dashboard())
 
@@ -160,6 +161,7 @@ def test_signals_pack_dashboard_runs_independent_modules_concurrently(tmp_path, 
 
     monkeypatch.setattr(pack, "_strategy_snapshot", strategy_snapshot)
     monkeypatch.setattr(pack, "_cache_status", cache_status)
+    monkeypatch.setattr(pack, "_terminal_clue_candidates", lambda: [])
     monkeypatch.setattr(pack, "_connector_health", lambda: [])
     monkeypatch.setattr(pack, "_backtest_summary", lambda: {"total": 0, "evaluated": 0, "pending": 0})
     monkeypatch.setattr(pack, "_pending_backlog_preview", lambda _limit: [])
@@ -168,6 +170,62 @@ def test_signals_pack_dashboard_runs_independent_modules_concurrently(tmp_path, 
 
     assert dashboard["daily_brief"]["summary"] == "并发 dashboard"
     assert dashboard["cache_status"]["available"] is True
+
+
+def test_signals_pack_dashboard_prepends_terminal_clue_candidates(tmp_path, monkeypatch):
+    from signals.domain_pack import SignalsPack
+
+    pack = SignalsPack(repo_root=tmp_path, state_root=tmp_path / "state")
+    monkeypatch.setattr(pack, "_backtest_summary", lambda: {"total": 0, "evaluated": 0, "pending": 0})
+    monkeypatch.setattr(pack, "_pending_backlog_preview", lambda _limit: [])
+    monkeypatch.setattr(pack, "_cache_status", lambda: {
+        "available": True,
+        "mode": "test",
+        "live_low_latency": {"modules": [], "summary": {}},
+        "postmarket_backfill": {"run": None, "tasks": [], "summary": {}},
+        "mongo_stock_cache": {"freqs": [], "summary": {}},
+        "terminal_outputs": [],
+        "blockers": [],
+    })
+    monkeypatch.setattr(pack, "_strategy_snapshot", lambda: {
+        "as_of": "2026-06-30",
+        "generated_at": "2026-06-30T10:30:00",
+        "themes": [],
+        "candidates": [
+            {"symbol": "SH.600172", "name": "黄河旋风", "source": "strategy_snapshot"},
+            {"symbol": "SZ.300308", "name": "中际旭创", "source": "strategy_snapshot"},
+        ],
+        "warnings": [],
+        "daily_brief": {"summary": "线索池测试"},
+        "decision_queue": [],
+        "strategy_kpis": {},
+        "source_confidence": {"overall": 0.9, "sources": []},
+    })
+    monkeypatch.setattr(pack, "_terminal_clue_candidates", lambda: [
+        {
+            "symbol": "SH.600172",
+            "name": "黄河旋风",
+            "source": "terminal_stock_pool.clue_stocks",
+            "source_collections": ["hot_rank_clues"],
+            "stage_label": "线索池",
+        },
+        {
+            "symbol": "SH.603290",
+            "name": "斯达半导",
+            "source": "terminal_stock_pool.clue_stocks",
+            "source_collections": ["hot_rank_clues"],
+            "stage_label": "线索池",
+        },
+    ])
+
+    dashboard = asyncio.run(pack.dashboard())
+
+    assert [row["symbol"] for row in dashboard["buy_candidates"][:3]] == [
+        "SH.600172",
+        "SH.603290",
+        "SZ.300308",
+    ]
+    assert dashboard["buy_candidates"][0]["source"] == "terminal_stock_pool.clue_stocks"
 
 
 def test_pack_refresh_endpoint_triggers_pack_refresh(monkeypatch):

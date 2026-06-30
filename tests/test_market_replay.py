@@ -270,6 +270,33 @@ def test_market_replay_context_extracts_event_graph():
                         "close": 1203.04,
                         "amount": 2903146377,
                     },
+                    {
+                        "meta": {"symbol": "300308", "freq": "日线"},
+                        "dt": datetime(2026, 6, 3),
+                        "open": 1100,
+                        "high": 1120,
+                        "low": 1080,
+                        "close": 1110,
+                        "amount": 1200000000,
+                    },
+                    {
+                        "meta": {"symbol": "300308", "freq": "日线"},
+                        "dt": datetime(2026, 6, 4),
+                        "open": 1115,
+                        "high": 1290,
+                        "low": 1110,
+                        "close": 1280,
+                        "amount": 3000000000,
+                    },
+                    {
+                        "meta": {"symbol": "300308", "freq": "日线"},
+                        "dt": datetime(2026, 6, 5),
+                        "open": 1273.2,
+                        "high": 1301.51,
+                        "low": 1160,
+                        "close": 1180,
+                        "amount": 58324832701.61,
+                    },
                 ]
             ),
             "board_heat_ticks": FakeCollection(
@@ -391,6 +418,30 @@ def test_market_replay_context_extracts_event_graph():
                         "high": 4078.932,
                         "close": 4027.736,
                     },
+                    {
+                        "meta": {"symbol": "sh000001", "freq": "5分钟"},
+                        "dt": datetime(2026, 6, 5, 9, 35),
+                        "open": 4050,
+                        "high": 4052,
+                        "low": 4030,
+                        "close": 4040,
+                    },
+                    {
+                        "meta": {"symbol": "sh000001", "freq": "5分钟"},
+                        "dt": datetime(2026, 6, 5, 10, 15),
+                        "open": 4040,
+                        "high": 4045,
+                        "low": 4020,
+                        "close": 4030,
+                    },
+                    {
+                        "meta": {"symbol": "sh000001", "freq": "5分钟"},
+                        "dt": datetime(2026, 6, 5, 15, 0),
+                        "open": 4030,
+                        "high": 4055,
+                        "low": 4028,
+                        "close": 4050,
+                    },
                 ]
             ),
         }
@@ -437,11 +488,22 @@ def test_market_replay_context_extracts_event_graph():
     assert dynamic["pressure_core"][0]["name"] == "中际旭创"
     assert context["stock_event_chains"][0]["name"] == "中际旭创"
     assert "高成交负反馈" in context["stock_event_chains"][0]["labels"]
+    assert context["stock_daily_replays"][0]["name"] == "中际旭创"
+    assert context["stock_daily_replays"][0]["total_change_pct"] == 6.31
+    assert context["stock_daily_replays"][0]["rows"][-1]["event"] == "大幅回撤、冲高回落"
     assert context["index_cycle"]["pivot_date"] == "2026-05-29"
     assert context["index_cycle"]["trading_days_since"] == 5
     assert context["index_cycle"]["drop_pct"] == -2.07
     assert context["major_indices"][0]["name"] == "上证指数"
     assert context["major_indices"][0]["change_pct"] == -0.7404
+    assert context["major_index_technical"]["status"] == "partial"
+    assert context["major_index_technical"]["rows"][0]["name"] == "上证指数"
+    assert context["major_index_technical"]["rows"][0]["ma5"] == 4060.4666
+    assert context["major_index_technical"]["rows"][0]["evidence_level"] == "partial"
+    assert context["major_index_intraday"]["status"] == "available"
+    assert context["major_index_intraday"]["common_low_window"]["start"] == "10:15"
+    assert context["major_index_intraday"]["dominant_low_cluster"]["start"] == "10:15"
+    assert context["major_index_intraday"]["rows"][0]["low_to_close_pct"] == 0.75
     assert context["market_breadth"]["total"] == 5
     assert context["market_breadth"]["up"] == 4
     assert context["market_breadth"]["down"] == 1
@@ -625,6 +687,225 @@ def test_market_replay_uses_daily_rankings_fallback_and_eod_backfill():
     assert structured["key_stock_pool"]["failed_limit_count"] == 1
     assert structured["key_stock_pool"]["seal_success_rate_pct"] == 50.0
     assert context["dynamic_market_representatives"][0]["market_core"][0]["name"] == "样本设备A"
+
+
+def test_market_replay_adds_same_chain_pressure_peers_to_daily_replays():
+    day = "2026-06-29"
+    db = FakeDB(
+        {
+            "fullmarket_spot_snapshots": FakeCollection(
+                [
+                    {
+                        "date_key": day,
+                        "trade_date": day,
+                        "symbol": "SH.600001",
+                        "code": "600001",
+                        "name": "同链强势A",
+                        "open": 10,
+                        "high": 12,
+                        "low": 9.8,
+                        "close": 12,
+                        "prev_close": 10,
+                        "change_pct": 20.0,
+                        "amount": 5000000000,
+                        "turnover_pct": 8.0,
+                    },
+                    {
+                        "date_key": day,
+                        "trade_date": day,
+                        "symbol": "SH.600002",
+                        "code": "600002",
+                        "name": "同链弱化B",
+                        "open": 20,
+                        "high": 22,
+                        "low": 18,
+                        "close": 18.8,
+                        "prev_close": 20,
+                        "change_pct": -6.0,
+                        "amount": 6500000000,
+                        "turnover_pct": 12.0,
+                    },
+                    {
+                        "date_key": day,
+                        "trade_date": day,
+                        "symbol": "SH.600003",
+                        "code": "600003",
+                        "name": "无关弱化C",
+                        "open": 30,
+                        "high": 33,
+                        "low": 25,
+                        "close": 25.5,
+                        "prev_close": 30,
+                        "change_pct": -15.0,
+                        "amount": 9000000000,
+                        "turnover_pct": 15.0,
+                    },
+                ]
+            ),
+            "security_chain_memberships": FakeCollection(
+                [
+                    {
+                        "trade_date": day,
+                        "raw_code": "600001",
+                        "symbol": "SH.600001",
+                        "chain_id": "sample_chain",
+                        "chain_name": "样本产业链",
+                        "node_id": "sample_node",
+                        "node_name": "样本节点",
+                        "is_primary_chain": True,
+                        "membership_type": "core",
+                        "exposure_score": 110,
+                        "confidence": 96,
+                    },
+                    {
+                        "trade_date": day,
+                        "raw_code": "600002",
+                        "symbol": "SH.600002",
+                        "chain_id": "sample_chain",
+                        "chain_name": "样本产业链",
+                        "node_id": "sample_node",
+                        "node_name": "样本节点",
+                        "is_primary_chain": True,
+                        "membership_type": "core",
+                        "exposure_score": 108,
+                        "confidence": 96,
+                    },
+                    {
+                        "trade_date": day,
+                        "raw_code": "600003",
+                        "symbol": "SH.600003",
+                        "chain_id": "other_chain",
+                        "chain_name": "其他产业链",
+                        "node_id": "other_node",
+                        "node_name": "其他节点",
+                        "is_primary_chain": True,
+                        "membership_type": "core",
+                        "exposure_score": 108,
+                        "confidence": 96,
+                    },
+                ]
+            ),
+            "bars": FakeCollection(
+                [
+                    {
+                        "meta": {"symbol": "600001", "freq": "日线"},
+                        "dt": datetime(2026, 6, 26),
+                        "open": 9,
+                        "high": 10,
+                        "low": 8.8,
+                        "close": 10,
+                        "amount": 2000000000,
+                        "change_pct": 2.0,
+                    },
+                    {
+                        "meta": {"symbol": "600001", "freq": "日线"},
+                        "dt": datetime(2026, 6, 29),
+                        "open": 10,
+                        "high": 12,
+                        "low": 9.8,
+                        "close": 12,
+                        "amount": 5000000000,
+                        "change_pct": 20.0,
+                    },
+                    {
+                        "meta": {"symbol": "600002", "freq": "日线"},
+                        "dt": datetime(2026, 6, 26),
+                        "open": 19,
+                        "high": 21,
+                        "low": 18.8,
+                        "close": 20,
+                        "amount": 2000000000,
+                        "change_pct": 1.0,
+                    },
+                    {
+                        "meta": {"symbol": "600002", "freq": "日线"},
+                        "dt": datetime(2026, 6, 29),
+                        "open": 20,
+                        "high": 22,
+                        "low": 18,
+                        "close": 18.8,
+                        "amount": 0,
+                        "change_pct": -6.0,
+                    },
+                ]
+            ),
+            "board_ranking": FakeCollection([]),
+            "concept_ranking": FakeCollection([]),
+            "board_heat_ticks": FakeCollection([]),
+            "market_limit_pools": FakeCollection([]),
+        }
+    )
+
+    context = build_market_replay_context(db, trade_date=day, sector_boards=[], checkpoints=["14:58"])
+
+    assert "SH.600002" in context["chain_peer_pressure_symbols"]
+    assert "SH.600003" not in context["chain_peer_pressure_symbols"]
+    weak_replays = [row for row in context["stock_daily_replays"] if row.get("code") == "600002"]
+    assert weak_replays
+    assert weak_replays[0]["chain_name"] == "样本产业链"
+    assert weak_replays[0]["rows"][-1]["amount_yi"] == 65.0
+
+
+def test_market_replay_derives_20d_trend_from_daily_rankings():
+    day = "2026-06-29"
+    ranking_rows = [
+        {
+            "dt": datetime(2026, 6, 25),
+            "source": "canonical",
+            "board_name": "强势设备",
+            "change_pct": 1.0,
+            "rank_idx": 4,
+            "leader_name": "样本设备A",
+        },
+        {
+            "dt": datetime(2026, 6, 26),
+            "source": "canonical",
+            "board_name": "强势设备",
+            "change_pct": 2.0,
+            "rank_idx": 3,
+            "leader_name": "样本设备A",
+        },
+        {
+            "dt": datetime(2026, 6, 29),
+            "source": "canonical",
+            "board_name": "强势设备",
+            "change_pct": 3.0,
+            "rank_idx": 1,
+            "leader_name": "样本设备A",
+        },
+        {
+            "dt": datetime(2026, 6, 29),
+            "source": "canonical",
+            "board_name": "弱势材料",
+            "change_pct": -1.0,
+            "rank_idx": 60,
+            "leader_name": "样本材料B",
+        },
+    ]
+    db = FakeDB(
+        {
+            "board_ranking": FakeCollection(ranking_rows),
+            "concept_ranking": FakeCollection([]),
+            "fullmarket_spot_snapshots": FakeCollection([]),
+            "board_heat_ticks": FakeCollection([]),
+        }
+    )
+
+    context = build_market_replay_context(db, trade_date=day, sector_boards=[], checkpoints=["14:58"])
+
+    structured = context["structured_daily_review"]
+    trend = structured["trend_20d_boards"]
+    assert trend["status"] == "partial"
+    assert trend["rows"][0]["name"] == "强势设备"
+    assert trend["rows"][0]["change_5d_pct"] == 6.11
+    assert trend["rows"][0]["change_20d_pct"] == 6.11
+    assert trend["rows"][0]["evidence_level"] == "inferred"
+    assert any(
+        row["item"] == "板块20日历史"
+        and row["status"] == "partial"
+        and "board_ranking/concept_ranking" in row["source"]
+        for row in structured["data_completeness"]
+    )
 
 
 def test_market_replay_sections_do_not_leak_june5_theme_template():
@@ -814,9 +1095,10 @@ def test_market_replay_sections_summarize_opening_panic_and_partial_tech_rebound
     sections = format_market_replay_sections(context)
     first = sections[0]
 
-    assert "早盘不是普通分化，而是科技链先集中恐慌" in first
+    assert "早盘压力集中在" in first
     assert "通信线缆及配套-6.29%" in first
-    assert "部分科技分支出现抄底反弹" in first
+    assert "不预设压力板块" in first
+    assert "方向增强尝试" in first
     assert "机器人增强+5.43%" in first
     assert "半导体设备增强+1.37%" in first
     text = "\n".join(sections)
@@ -913,5 +1195,7 @@ def test_market_replay_does_not_mix_unrelated_pressure_board_with_cpo_stocks():
     text = "\n".join(format_market_replay_sections(context))
 
     assert "新易盛" in text
+    assert "开盘后油气开采方向直接承压。承压个股包括杰瑞股份。" in text
+    assert "开盘后CPO概念方向直接承压。承压个股包括新易盛。" in text
     assert "开盘后油气开采方向直接承压。承压个股包括杰瑞股份，新易盛" not in text
     assert "开盘后油气开采方向直接承压—新易盛" not in text

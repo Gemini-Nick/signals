@@ -41,6 +41,17 @@ window:
 bash scripts/python.sh -m signals.notify.trading_workbench_summary --window postmarket --max-items 5 --format narrative
 ```
 
+For a Word-style daily note or historical restoration dry-run, use the
+evidence-driven Word renderer. The Word reference is an evaluator target only;
+do not use `--training-sample` as the daily output source:
+
+```bash
+bash scripts/python.sh -m signals.notify.trading_workbench_summary \
+  --window postmarket --trade-date YYYY-MM-DD --max-items 5 --format word \
+  --safe-inputs --input-timeout 6 --ignore-time --allow-ignore-time-notify \
+  --eval-target YYYY-MM-DD-word
+```
+
 Use `--ignore-time` only for local inspection or historical dry-runs. A
 dry-run must not be used as the WeChat send gate unless the user explicitly
 asks for a manual out-of-window send.
@@ -321,6 +332,12 @@ high-restoration daily note should keep these blocks in order:
    retrospective entry-and-drawdown review, style fit, next validation, and a
    success-vs-failure comparison. The comparison must conclude which dimension
    made the failed sample weaker; do not write `各有优劣`.
+   Also include a same-chain high-turnover weakening evidence pool when
+   `security_chain_memberships` and stock daily replays support it. This pool is
+   selected generically from same-chain/same-node membership plus same-day
+   amount, change, high-to-close drawdown, close position, and failed/weakening
+   labels. It must not name or promote specific sectors or stocks through
+   hardcoded weights.
 9. `六、风险提示`: numbered risks tied to observable market structure. Cover at
    least three relevant risks from the menu when evidence exists: 放量滞涨,
    高位股负反馈, 板块冲高回落, 指数与个股背离, 缩量反弹, 情绪高潮后分歧,
@@ -338,6 +355,10 @@ Acceptance for this Word-style path:
   rows.
 - Do not cherry-pick only successful trend stocks. Pair winners with failed or
   weakening same-board samples when the data supports it.
+- Do not give any hardcoded board, concept, sector, or stock a higher ranking
+  weight. Board and stock ordering must come from same-day evidence, chain/node
+  membership, amount, change, turnover, limit-pool state, drawdown, close
+  position, and data completeness.
 - Style-fit and entry/stop-loss language is retrospective review only. Do not
   output direct buy/sell/target/stop instructions.
 - Include exact figures only when they come from local evidence, user
@@ -410,6 +431,8 @@ Primary local sources:
 - Mongo `board_heat_ticks`
 - Mongo `bars`
 - Mongo `market_limit_pools`
+- Mongo `security_chain_memberships`
+- Mongo `chain_node_security_rollups`
 
 Important fields:
 
@@ -429,6 +452,11 @@ Important fields:
 - `market_replay.failed_boards`: failed-board/high-open-fade emotion evidence.
 - `market_replay.external_fund_flows`: optional Eastmoney/THS order-size flow evidence for high-turnover cores.
 - `market_replay.flow_availability`: whether exact account-level主力/散户 flow is supported, and whether order-size flow is available.
+- `market_replay.stock_daily_replays`: stock-level daily replay rows, including
+  chain/node membership when available.
+- `market_replay.chain_peer_pressure_symbols`: same-chain high-turnover
+  weakening candidates selected from current trade-date evidence; use these for
+  observation pools, not as hardcoded failed samples.
 
 See `references/data-requirements.md` for the full checklist.
 

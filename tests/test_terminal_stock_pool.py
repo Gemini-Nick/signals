@@ -2627,6 +2627,42 @@ def test_has_clue_source_detects_review_and_legacy_sources():
     assert not _has_clue_source(rows_tech["300575"])
 
 
+def test_add_hot_rank_clue_rows_creates_terminal_clue_source():
+    from datetime import datetime
+    from signals.sync.modules.terminal_pool import _add_hot_rank_clue_rows, _clue_quality_score, _has_clue_source
+
+    db = _Db({
+        "hot_rank_clues": _Collection([
+            {
+                "_id": "600000",
+                "raw_code": "600000",
+                "symbol": "SH.600000",
+                "name": "浦发银行",
+                "sources": ["eastmoney", "ths", "wind"],
+                "source_count": 3,
+                "ranks": {"eastmoney": 12, "ths": 7, "wind": 4},
+                "score": 88,
+                "tier": "S强信号",
+                "strategy_tags": ["just_started", "daily_ma5_climb"],
+                "reason_summary": "Wind+东财+同花顺热榜 + 刚启动",
+                "as_of": "2026-04-28",
+            },
+        ]),
+    })
+    rows = {}
+
+    _add_hot_rank_clue_rows(rows, db, set(), datetime(2026, 4, 28, 21, 15))
+
+    assert "600000" in rows
+    reason = rows["600000"]["inclusion_reasons"][0]
+    assert reason["reason_type"] == "hot_rank_clue"
+    assert reason["source_role"] == "review_clue"
+    assert reason["decision_effect"] == "context_only"
+    assert reason["evidence"]["sources"] == ["eastmoney", "ths", "wind"]
+    assert _has_clue_source(rows["600000"])
+    assert _clue_quality_score(rows["600000"]) >= 50
+
+
 def test_terminal_stock_pool_clue_overflow_backfills_watch_pool():
     rows = {}
     for index in range(6):

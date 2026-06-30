@@ -275,12 +275,14 @@ class SignalsPack:
         include_ai_factor_factory: bool = False,
     ) -> Dict[str, Any]:
         strategy_snapshot_task = asyncio.create_task(asyncio.to_thread(self._strategy_snapshot))
+        terminal_clues_task = asyncio.create_task(asyncio.to_thread(self._terminal_clue_candidates))
         connector_health_task = asyncio.create_task(asyncio.to_thread(self._connector_health))
         backtest_summary_task = asyncio.create_task(asyncio.to_thread(self._backtest_summary))
         pending_backlog_task = asyncio.create_task(asyncio.to_thread(self._pending_backlog_preview, backlog_limit))
         cache_status_task = asyncio.create_task(asyncio.to_thread(self._cache_status))
 
         strategy_snapshot = await strategy_snapshot_task
+        terminal_clues = await terminal_clues_task
         await asyncio.to_thread(self._record_strategy_snapshot_run, strategy_snapshot)
         runs_task = asyncio.create_task(self.list_runs())
         connector_health, backtest_summary, pending_backlog, cache_status, runs = await asyncio.gather(
@@ -296,6 +298,9 @@ class SignalsPack:
         backtest_jobs = self._backtest_jobs(recent_runs)
         status = self._dashboard_status(connector_health)
         overview = self._overview(backtest_summary, strategy_snapshot)
+        buy_candidates = self._merge_candidate_rows(
+            terminal_clues + list(strategy_snapshot.get("candidates", []) or [])
+        )
         return {
             "pack_id": "signals",
             "title": "Signals",
@@ -305,7 +310,7 @@ class SignalsPack:
             "overview": overview,
             "recent_runs": recent_runs,
             "review_runs": review_runs,
-            "buy_candidates": strategy_snapshot.get("candidates", []),
+            "buy_candidates": buy_candidates,
             "sell_warnings": strategy_snapshot.get("warnings", []),
             "chart_context": strategy_snapshot.get("chart_context"),
             "backtest_summary": backtest_summary,
@@ -2064,6 +2069,163 @@ class SignalsPack:
                 "strategy_kpis": {},
                 "source_confidence": {"overall": 0, "sources": []},
             }
+
+    def _terminal_clue_candidates(self, limit: int = 24) -> List[Dict[str, Any]]:
+        try:
+            from signals.sync.db import get_db
+
+            db = get_db()
+            if db is None:
+                return []
+            doc = db["terminal_stock_pool"].find_one(
+                {"pool": "terminal_stock_pool", "market": "A"},
+                {"clue_stocks": 1},
+                sort=[("updated_at", -1)],
+            ) or {}
+        except Exception:
+            return []
+        rows: List[Dict[str, Any]] = []
+        for item in doc.get("clue_stocks") or []:
+            if not isinstance(item, Mapping):
+                continue
+            row = dict(item)
+            symbol = str(row.get("symbol") or row.get("target_symbol") or "")
+            raw_code = str(row.get("raw_code") or row.get("code") or "").strip()
+            if not symbol and raw_code:
+                symbol = self._prefixed_a_symbol(raw_code)
+            if not symbol:
+                continue
+            row["symbol"] = symbol
+            row.setdefault("raw_code", raw_code or symbol.split(".", 1)[-1])
+            row.setdefault("name", row.get("target_label") or row.get("code") or symbol)
+            row.setdefault("direction", "buy")
+            row.setdefault("status", "clue_pool")
+            row.setdefault("pool_type", "clue_pool")
+            row.setdefault("trade_stage", "clue_pool")
+            row.setdefault("stage_label", "线索池")
+            row.setdefault("source", "terminal_stock_pool.clue_stocks")
+            collections = [
+                str(reason.get("source_collection"))
+                for reason in row.get("inclusion_reasons", [])
+                if isinstance(reason, Mapping) and reason.get("source_collection")
+            ]
+            row["source_collections"] = list(dict.fromkeys(collections or ["terminal_stock_pool.clue_stocks"]))
+            row["metadata"] = {
+                **(row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}),
+                "source_collection": "terminal_stock_pool.clue_stocks",
+                "auto_clue": True,
+                "clue_quality_score": row.get("clue_quality_score"),
+                "clue_sources": row.get("clue_sources", []),
+            }
+            rows.append(_json_safe(row))
+            if len(rows) >= limit:
+                break
+        if len(rows) < limit:
+            rows.extend(self._hot_rank_clue_candidates(db, limit=limit - len(rows)))
+        return self._merge_candidate_rows(rows)[:limit]
+
+    def _hot_rank_clue_candidates(self, db: Any, limit: int = 24) -> List[Dict[str, Any]]:
+        try:
+            docs = list(db["hot_rank_clues"].find(
+                {"active": True},
+                {
+                    "_id": 1,
+                    "raw_code": 1,
+                    "code": 1,
+                    "symbol": 1,
+                    "name": 1,
+                    "score": 1,
+                    "tier": 1,
+                    "sources": 1,
+                    "ranks": 1,
+                    "strategy_tags": 1,
+                    "reason_summary": 1,
+                    "as_of": 1,
+                    "updated_at": 1,
+                },
+            ).sort([("score", -1), ("updated_at", -1)]).limit(limit))
+        except Exception:
+            return []
+        rows: List[Dict[str, Any]] = []
+        for doc in docs:
+            if not isinstance(doc, Mapping):
+                continue
+            raw_code = str(doc.get("raw_code") or doc.get("code") or doc.get("_id") or "").strip()
+            symbol = str(doc.get("symbol") or self._prefixed_a_symbol(raw_code)).strip()
+            if not symbol:
+                continue
+            row = {
+                "kind": "stock",
+                "symbol": symbol,
+                "code": symbol,
+                "raw_code": raw_code or symbol.split(".", 1)[-1],
+                "name": str(doc.get("name") or symbol),
+                "score": doc.get("score"),
+                "direction": "buy",
+                "status": "clue_pool",
+                "pool_type": "clue_pool",
+                "trade_stage": "clue_pool",
+                "stage_label": "线索池",
+                "latest_signal": str(doc.get("reason_summary") or "热榜启动/均线攀爬线索"),
+                "reason": str(doc.get("reason_summary") or "热榜启动/均线攀爬线索"),
+                "source": "hot_rank_clues",
+                "source_collection": "hot_rank_clues",
+                "source_collections": ["hot_rank_clues"],
+                "source_tags": ["自动热榜", str(doc.get("tier") or "线索")],
+                "metadata": {
+                    "source_collection": "hot_rank_clues",
+                    "auto_clue": True,
+                    "hot_rank_score": doc.get("score"),
+                    "hot_rank_tier": doc.get("tier"),
+                    "hot_rank_sources": list(doc.get("sources") or []),
+                    "hot_rank_ranks": dict(doc.get("ranks") or {}),
+                    "strategy_tags": list(doc.get("strategy_tags") or []),
+                    "as_of": str(doc.get("as_of") or ""),
+                },
+            }
+            rows.append(_json_safe(row))
+        return rows
+
+    @staticmethod
+    def _prefixed_a_symbol(value: Any) -> str:
+        raw = str(value or "").strip().upper()
+        if not raw:
+            return ""
+        if "." in raw and raw.split(".", 1)[0] in {"SH", "SZ", "BJ"}:
+            return raw
+        pure = raw.replace("SH", "").replace("SZ", "").replace("BJ", "").replace(".", "")
+        if not (pure.isdigit() and len(pure) == 6):
+            return raw
+        if pure.startswith(("6", "9")):
+            return f"SH.{pure}"
+        if pure.startswith(("4", "8")):
+            return f"BJ.{pure}"
+        return f"SZ.{pure}"
+
+    @classmethod
+    def _candidate_key(cls, row: Mapping[str, Any]) -> str:
+        symbol = str(row.get("symbol") or row.get("target_symbol") or "").strip().upper()
+        raw_code = str(row.get("raw_code") or row.get("code") or "").strip().upper()
+        if symbol:
+            return cls._prefixed_a_symbol(symbol)
+        if raw_code:
+            return cls._prefixed_a_symbol(raw_code)
+        return str(row.get("name") or "").strip()
+
+    @classmethod
+    def _merge_candidate_rows(cls, rows: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            key = cls._candidate_key(row)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            merged.append(_json_safe(dict(row)))
+        return merged
 
     def _ai_factor_factory(self) -> Dict[str, Any]:
         try:

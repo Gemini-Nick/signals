@@ -482,7 +482,9 @@ def _chain_membership_for_symbols(db: Any, trade_date: str, symbols: list[str]) 
             "raw_code": 1,
             "symbol": 1,
             "security_id": 1,
+            "chain_id": 1,
             "chain_name": 1,
+            "node_id": 1,
             "node_name": 1,
             "is_primary_chain": 1,
             "membership_type": 1,
@@ -497,7 +499,9 @@ def _chain_membership_for_symbols(db: Any, trade_date: str, symbols: list[str]) 
         if not code or code in result:
             continue
         result[code] = {
+            "chain_id": _text(row.get("chain_id")),
             "chain_name": _text(row.get("chain_name"), "未映射产业链"),
+            "node_id": _text(row.get("node_id")),
             "node_name": _text(row.get("node_name")),
             "is_primary_chain": bool(row.get("is_primary_chain")),
             "membership_type": _text(row.get("membership_type")),
@@ -507,6 +511,22 @@ def _chain_membership_for_symbols(db: Any, trade_date: str, symbols: list[str]) 
             "membership_trade_date": _text(row.get("trade_date")),
         }
     return result
+
+
+def _chain_context_fields(chain: dict[str, Any]) -> dict[str, Any]:
+    if not chain:
+        return {}
+    return {
+        "chain_id": _text(chain.get("chain_id")),
+        "chain_name": _text(chain.get("chain_name")),
+        "node_id": _text(chain.get("node_id")),
+        "node_name": _text(chain.get("node_name")),
+        "chain_source": _text(chain.get("source")),
+        "chain_evidence_date": _text(chain.get("membership_trade_date")),
+        "chain_membership_type": _text(chain.get("membership_type")),
+        "chain_exposure_score": _float(chain.get("exposure_score")),
+        "chain_confidence": _float(chain.get("confidence")),
+    }
 
 
 def _first_red_evidence(db: Any, symbol: str, trade_date: str, prev_close: Any) -> dict[str, Any]:
@@ -1231,10 +1251,8 @@ def _opening_pressure_boards(db: Any, trade_date: str, *, limit: int = 20) -> li
         previous = weakest.get(key)
         if previous is None or change < (_float(previous.get("change_pct")) or 0.0):
             weakest[key] = row
-    def opening_sort_key(item: dict[str, Any]) -> tuple[int, float]:
-        name = _text(item.get("name"))
-        pressure_priority = 0 if ("CPO" in name or "光模块" in name or name == "通信线缆及配套") else 1
-        return pressure_priority, _float(item.get("change_pct")) or 0.0
+    def opening_sort_key(item: dict[str, Any]) -> tuple[float, float]:
+        return _float(item.get("change_pct")) or 0.0, _float(item.get("rank_idx")) or 10**12
 
     rows = sorted(weakest.values(), key=opening_sort_key)[:limit]
     return [
@@ -1397,7 +1415,6 @@ def _data_completeness(db: Any, trade_date: str, flow: dict[str, Any]) -> list[d
         "board_daily_bars",
         "board_index_daily",
         "board_history",
-        "chain_heat_snapshots",
     ]
     trend_source = next((name for name in candidate_trend_collections if _has_collection_rows(db, name)), "")
     ranking_history_days = _ranking_history_days(db, trade_date)
@@ -1528,6 +1545,209 @@ def _major_index_daily_rows(db: Any, trade_date: str) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _index_daily_history(db: Any, trade_date: str, symbol: str, *, lookback_days: int = 120) -> list[dict[str, Any]]:
+    if "index_bars" not in _collection_names(db):
+        return []
+    end = datetime.fromisoformat(trade_date) + timedelta(days=1)
+    start = datetime.fromisoformat(trade_date) - timedelta(days=lookback_days)
+    return list(
+        db["index_bars"].find(
+            {"meta.symbol": symbol, "meta.freq": "日线", "dt": {"$gte": start, "$lt": end}},
+            {"_id": 0, "dt": 1, "open": 1, "high": 1, "low": 1, "close": 1, "amount": 1},
+        ).sort("dt", 1)
+    )
+
+
+def _moving_average(values: list[float], period: int) -> float | None:
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
+
+
+def _ema_series(values: list[float], period: int) -> list[float]:
+    if not values:
+        return []
+    alpha = 2.0 / (period + 1.0)
+    result = [values[0]]
+    for value in values[1:]:
+        result.append(value * alpha + result[-1] * (1.0 - alpha))
+    return result
+
+
+def _macd_last(values: list[float]) -> dict[str, float | None]:
+    if len(values) < 2:
+        return {"dif": None, "dea": None, "macd": None}
+    ema12 = _ema_series(values, 12)
+    ema26 = _ema_series(values, 26)
+    dif_series = [fast - slow for fast, slow in zip(ema12, ema26)]
+    dea_series = _ema_series(dif_series, 9)
+    dif = dif_series[-1] if dif_series else None
+    dea = dea_series[-1] if dea_series else None
+    macd = (dif - dea) * 2 if dif is not None and dea is not None else None
+    return {
+        "dif": round(dif, 4) if dif is not None else None,
+        "dea": round(dea, 4) if dea is not None else None,
+        "macd": round(macd, 4) if macd is not None else None,
+    }
+
+
+def _rsi_last(values: list[float], period: int = 6) -> float | None:
+    if len(values) < period + 1:
+        return None
+    deltas = [values[idx] - values[idx - 1] for idx in range(1, len(values))]
+    window = deltas[-period:]
+    gains = sum(delta for delta in window if delta > 0)
+    losses = -sum(delta for delta in window if delta < 0)
+    if gains == 0 and losses == 0:
+        return 50.0
+    if losses == 0:
+        return 100.0
+    return round(100.0 * gains / (gains + losses), 2)
+
+
+def _major_index_technical_context(db: Any, trade_date: str) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for name, symbol in _MAJOR_INDEX_TARGETS:
+        history = _index_daily_history(db, trade_date, symbol)
+        closes = [_float(row.get("close")) for row in history]
+        closes = [value for value in closes if value is not None]
+        if not closes:
+            continue
+        latest = history[-1]
+        close = closes[-1]
+        ma5 = _moving_average(closes, 5)
+        ma10 = _moving_average(closes, 10)
+        ma20 = _moving_average(closes, 20)
+        macd = _macd_last(closes)
+        rsi6 = _rsi_last(closes, period=6)
+        bias20 = (close / ma20 - 1) * 100 if ma20 else None
+        rows.append(
+            {
+                "name": name,
+                "symbol": symbol,
+                "date": latest.get("dt").strftime("%Y-%m-%d") if isinstance(latest.get("dt"), datetime) else _text(latest.get("dt"), trade_date),
+                "close": round(close, 4),
+                "ma5": round(ma5, 4) if ma5 is not None else None,
+                "ma10": round(ma10, 4) if ma10 is not None else None,
+                "ma20": round(ma20, 4) if ma20 is not None else None,
+                "macd_dif": macd["dif"],
+                "macd_dea": macd["dea"],
+                "macd_bar": macd["macd"],
+                "rsi6": rsi6,
+                "bias20_pct": round(bias20, 2) if bias20 is not None else None,
+                "history_count": len(closes),
+                "evidence_level": "confirmed" if len(closes) >= 20 else "partial",
+            }
+        )
+    if not rows:
+        return {
+            "status": "missing",
+            "source": "index_bars:日线",
+            "evidence_level": "unknown",
+            "rows": [],
+            "note": "缺少指数日线，不能计算 MA/MACD/RSI。",
+        }
+    status = "available" if all(row["history_count"] >= 20 for row in rows) else "partial"
+    return {
+        "status": status,
+        "source": "index_bars:日线",
+        "evidence_level": "confirmed" if status == "available" else "partial",
+        "rows": rows,
+        "note": "由指数日线收盘价计算 MA5/MA10/MA20、MACD(12,26,9)、RSI(6) 和 MA20 乖离。",
+    }
+
+
+def _index_minute_rows(db: Any, trade_date: str, symbol: str, *, freq: str = "5分钟") -> list[dict[str, Any]]:
+    if "index_bars" not in _collection_names(db):
+        return []
+    start, end = _date_range(trade_date)
+    return list(
+        db["index_bars"].find(
+            {"meta.symbol": symbol, "meta.freq": freq, "dt": {"$gte": start, "$lt": end}},
+            {"_id": 0, "dt": 1, "open": 1, "high": 1, "low": 1, "close": 1, "amount": 1},
+        ).sort("dt", 1)
+    )
+
+
+def _major_index_intraday_context(db: Any, trade_date: str) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for name, symbol in _MAJOR_INDEX_TARGETS:
+        bars = _index_minute_rows(db, trade_date, symbol)
+        if not bars:
+            continue
+        high_row = max(bars, key=lambda item: _float(item.get("high")) or -10**12)
+        low_row = min(bars, key=lambda item: _float(item.get("low")) or 10**12)
+        open_row = bars[0]
+        close_row = bars[-1]
+        low = _float(low_row.get("low"))
+        close = _float(close_row.get("close"))
+        high = _float(high_row.get("high"))
+        open_value = _float(open_row.get("open"))
+        rows.append(
+            {
+                "name": name,
+                "symbol": symbol,
+                "freq": "5分钟",
+                "bar_count": len(bars),
+                "open_bar": _bar_point(open_row, "open"),
+                "low_bar": _bar_point(low_row, "low"),
+                "high_bar": _bar_point(high_row, "high"),
+                "close_bar": _bar_point(close_row, "close"),
+                "low_to_close_pct": round((close / low - 1) * 100, 2) if close is not None and low else None,
+                "open_to_low_pct": round((low / open_value - 1) * 100, 2) if low is not None and open_value else None,
+                "low_to_high_pct": round((high / low - 1) * 100, 2) if high is not None and low else None,
+                "evidence_level": "confirmed",
+            }
+        )
+    low_times = []
+    for row in rows:
+        time_text = row.get("low_bar", {}).get("time") if isinstance(row.get("low_bar"), dict) else None
+        if time_text:
+            try:
+                hour, minute = [int(part) for part in time_text.split(":", 1)]
+            except (TypeError, ValueError):
+                continue
+            low_times.append((hour * 60 + minute, time_text))
+    common_window = None
+    if low_times:
+        first = min(low_times, key=lambda item: item[0])
+        last = max(low_times, key=lambda item: item[0])
+        common_window = {
+            "start": first[1],
+            "end": last[1],
+            "span_minutes": last[0] - first[0],
+            "basis": "四大指数5分钟低点时间" if len(low_times) >= 4 else "可用指数5分钟低点时间",
+        }
+    dominant_cluster = None
+    if low_times:
+        ordered = sorted(low_times, key=lambda item: item[0])
+        best = (0, -10**12, ordered[0], ordered[0])
+        for idx, start_item in enumerate(ordered):
+            cluster = [item for item in ordered[idx:] if item[0] - start_item[0] <= 30]
+            end_item = cluster[-1]
+            score = (len(cluster), -(end_item[0] - start_item[0]), start_item, end_item)
+            if score[0] > best[0] or (score[0] == best[0] and score[1] > best[1]):
+                best = score
+        if best[0] >= 1:
+            dominant_cluster = {
+                "start": best[2][1],
+                "end": best[3][1],
+                "span_minutes": best[3][0] - best[2][0],
+                "count": best[0],
+                "total": len(low_times),
+                "basis": "30分钟内指数5分钟低点聚类",
+            }
+    return {
+        "status": "available" if rows else "missing",
+        "source": "index_bars:5分钟",
+        "evidence_level": "confirmed" if rows else "unknown",
+        "rows": rows,
+        "common_low_window": common_window,
+        "dominant_low_cluster": dominant_cluster,
+        "note": "指数5分钟线可还原日内低点与低点后修复；不代表板块资金卡位证据。",
+    }
 
 
 def _market_breadth(db: Any, trade_date: str) -> dict[str, Any]:
@@ -1715,6 +1935,16 @@ def _is_valid_stock_name(name: Any) -> bool:
     return not (text.startswith("ST") or text.startswith("*ST") or text.startswith("退市"))
 
 
+def _is_regular_replay_stock(snapshot: dict[str, Any]) -> bool:
+    name = _text(snapshot.get("name"))
+    code = _pure_code(_text(snapshot.get("code") or snapshot.get("symbol")))
+    if not _is_valid_stock_name(name):
+        return False
+    if name.startswith(("N", "C")):
+        return False
+    return not code.startswith(("8", "4", "920"))
+
+
 def _stock_pool_row(snapshot: dict[str, Any]) -> dict[str, Any]:
     close_position = _close_position(snapshot)
     high_to_close = _high_to_close_pct(snapshot)
@@ -1761,6 +1991,123 @@ def _stock_pool_cursor_rows(
         if len(rows) >= limit:
             break
     return rows
+
+
+def _chain_peer_pressure_symbols(
+    db: Any,
+    trade_date: str,
+    seed_symbols: list[str],
+    *,
+    limit: int = 80,
+) -> list[str]:
+    if "security_chain_memberships" not in _collection_names(db) or "fullmarket_spot_snapshots" not in _collection_names(db):
+        return []
+    seed_lookup = _chain_membership_for_symbols(db, trade_date, seed_symbols)
+    chain_ids = sorted({_text(row.get("chain_id")) for row in seed_lookup.values() if _text(row.get("chain_id"))})
+    if not chain_ids:
+        return []
+    membership_date = _latest_chain_membership_date(db, trade_date)
+    if not membership_date:
+        return []
+    seed_codes = {_pure_code(symbol) for symbol in seed_symbols if _pure_code(symbol)}
+    membership_by_code: dict[str, dict[str, Any]] = {}
+    cursor = db["security_chain_memberships"].find(
+        {
+            "trade_date": membership_date,
+            "chain_id": {"$in": chain_ids},
+        },
+        {
+            "_id": 0,
+            "raw_code": 1,
+            "symbol": 1,
+            "chain_id": 1,
+            "chain_name": 1,
+            "node_id": 1,
+            "node_name": 1,
+            "is_primary_chain": 1,
+            "membership_type": 1,
+            "exposure_score": 1,
+            "confidence": 1,
+            "trade_date": 1,
+        },
+    ).sort([("is_primary_chain", -1), ("exposure_score", -1), ("confidence", -1)])
+    for row in cursor:
+        code = _pure_code(_text(row.get("raw_code") or row.get("symbol")))
+        if not code or code in seed_codes or code in membership_by_code:
+            continue
+        membership_by_code[code] = row
+    if not membership_by_code:
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    snapshot_limit = max(limit * 30, 600)
+    cursor = db["fullmarket_spot_snapshots"].find(
+        _snapshot_query(trade_date),
+        _snapshot_projection(),
+    ).sort("amount", -1).limit(snapshot_limit)
+    for raw in cursor:
+        snapshot = _stock_snapshot(raw)
+        if not _is_usable_daily_snapshot(snapshot) or not _is_regular_replay_stock(snapshot):
+            continue
+        code = _pure_code(_text(snapshot.get("symbol") or snapshot.get("code")))
+        if not code or code not in membership_by_code:
+            continue
+        amount_yi = _amount_yi(snapshot.get("amount")) or 0.0
+        change = _float(snapshot.get("change_pct")) or 0.0
+        high = _float(snapshot.get("high"))
+        low = _float(snapshot.get("low"))
+        close = _float(snapshot.get("close"))
+        high_to_close = (high - close) / high * 100 if high and close is not None else 0.0
+        close_position = (close - low) / (high - low) if high is not None and low is not None and close is not None and high > low else 1.0
+        has_pressure = change <= -2.0 or high_to_close >= 5.0 or (change <= 0.0 and amount_yi >= 20.0) or (
+            close_position <= 0.25 and amount_yi >= 10.0
+        )
+        if not has_pressure:
+            continue
+        score = (
+            max(-change, 0.0) * 3.0
+            + max(high_to_close - 3.0, 0.0) * 2.0
+            + max(0.25 - close_position, 0.0) * 12.0
+            + min(amount_yi, 100.0) * 0.2
+        )
+        membership = membership_by_code[code]
+        candidates.append(
+            {
+                "score": score,
+                "symbol": _text(snapshot.get("symbol")) or _prefixed_symbol(code),
+                "amount_yi": amount_yi,
+                "chain_id": _text(membership.get("chain_id")),
+                "node_id": _text(membership.get("node_id")),
+            }
+        )
+    candidates.sort(key=lambda item: _float(item.get("score")) or 0.0, reverse=True)
+    result: list[str] = []
+    seen: set[str] = set()
+
+    def add_candidate(candidate: dict[str, Any]) -> None:
+        if len(result) >= limit:
+            return
+        symbol = _text(candidate.get("symbol"))
+        code = _pure_code(symbol)
+        if not code or code in seen:
+            return
+        seen.add(code)
+        result.append(symbol)
+
+    by_node: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for candidate in candidates:
+        key = (_text(candidate.get("chain_id")), _text(candidate.get("node_id")))
+        by_node.setdefault(key, []).append(candidate)
+    for node_candidates in by_node.values():
+        best_by_score = max(node_candidates, key=lambda item: _float(item.get("score")) or 0.0)
+        add_candidate(best_by_score)
+        for candidate in sorted(node_candidates, key=lambda item: _float(item.get("amount_yi")) or 0.0, reverse=True)[:3]:
+            add_candidate(candidate)
+    for candidate in candidates:
+        add_candidate(candidate)
+        if len(result) >= limit:
+            break
+    return result
 
 
 def _key_stock_pool(db: Any, trade_date: str, limit_lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -2003,7 +2350,7 @@ def _trend_20d_boards(db: Any, trade_date: str) -> dict[str, Any]:
         day20 = set(ranking_days[-20:])
         day5 = set(ranking_days[-5:])
         latest_rows: dict[tuple[str, str], dict[str, Any]] = {}
-        series: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        series: dict[tuple[str, str], dict[datetime, dict[str, Any]]] = {}
         for collection, kind in (("board_ranking", "industry"), ("concept_ranking", "concept")):
             if collection not in names:
                 continue
@@ -2021,8 +2368,11 @@ def _trend_20d_boards(db: Any, trade_date: str) -> dict[str, Any]:
                 day = dt.replace(hour=0, minute=0, second=0, microsecond=0)
                 key = (kind, row["name"])
                 point = {**row, "dt": day}
-                series.setdefault(key, []).append(point)
-                if day == latest_day:
+                bucket = series.setdefault(key, {})
+                current = bucket.get(day)
+                if current is None or (_float(point.get("rank")) or 10**12) < (_float(current.get("rank")) or 10**12):
+                    bucket[day] = point
+                if day == latest_day and (key not in latest_rows or (_float(point.get("rank")) or 10**12) < (_float(latest_rows[key].get("rank")) or 10**12)):
                     latest_rows[key] = point
 
         def compound(points: list[dict[str, Any]]) -> float | None:
@@ -2040,7 +2390,7 @@ def _trend_20d_boards(db: Any, trade_date: str) -> dict[str, Any]:
 
         rows: list[dict[str, Any]] = []
         for key, latest in latest_rows.items():
-            points = sorted(series.get(key, []), key=lambda item: item["dt"])
+            points = sorted(series.get(key, {}).values(), key=lambda item: item["dt"])
             points20 = [item for item in points if item["dt"] in day20]
             points5 = [item for item in points if item["dt"] in day5]
             if len(points20) < 2:
@@ -2083,15 +2433,6 @@ def _trend_20d_boards(db: Any, trade_date: str) -> dict[str, Any]:
                 "由日度行业/概念排名涨跌幅复合计算，缺少完整板块成交额历史；"
                 "可用于趋势强弱排序，但不能替代完整20日成交额过滤。"
             ),
-        }
-    if not candidate_sources:
-        return {
-            "status": "missing",
-            "source": "none",
-            "evidence_level": "unknown",
-            "rows": [],
-            "excluded_high_gain_low_liquidity": [],
-            "note": "缺少板块日线/20日成交额历史，不能输出 confirmed 的近20日趋势Top7。",
         }
     return {
         "status": "partial",
@@ -2395,6 +2736,7 @@ def _stock_event_chains(
 ) -> list[dict[str, Any]]:
     limit_lookup = limit_lookup or {}
     snapshots = _snapshot_by_symbol(db, trade_date, symbols)
+    chain_lookup = _chain_membership_for_symbols(db, trade_date, symbols)
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     for symbol in symbols:
@@ -2407,7 +2749,189 @@ def _stock_event_chains(
             continue
         event = _event_chain_for_snapshot(db, trade_date, snapshot, limit_meta=limit_lookup.get(code))
         if event:
+            event.update(_chain_context_fields(chain_lookup.get(code, {})))
             rows.append(event)
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _daily_stock_rows(db: Any, symbol: str, trade_date: str, *, lookback_days: int = 45) -> list[dict[str, Any]]:
+    if "bars" not in _collection_names(db):
+        return []
+    end = datetime.fromisoformat(trade_date) + timedelta(days=1)
+    start = datetime.fromisoformat(trade_date) - timedelta(days=lookback_days)
+    code = _pure_code(symbol)
+    return list(
+        db["bars"].find(
+            {"meta.symbol": code, "meta.freq": "日线", "dt": {"$gte": start, "$lt": end}},
+            {
+                "_id": 0,
+                "dt": 1,
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "close": 1,
+                "amount": 1,
+                "vol": 1,
+                "change_pct": 1,
+                "turnover": 1,
+                "turnover_pct": 1,
+                "turnover_rate": 1,
+            },
+        ).sort("dt", 1)
+    )
+
+
+def _stock_daily_replay_for_snapshot(
+    db: Any,
+    trade_date: str,
+    snapshot: dict[str, Any],
+    *,
+    limit_meta: dict[str, Any] | None = None,
+    max_rows: int = 20,
+) -> dict[str, Any] | None:
+    limit_meta = limit_meta or {}
+    symbol = _text(snapshot.get("symbol") or snapshot.get("code"))
+    code = _pure_code(symbol)
+    if not code:
+        return None
+    rows = _daily_stock_rows(db, code, trade_date)
+    if not rows:
+        return None
+    rows = rows[-max_rows:]
+    replay_rows: list[dict[str, Any]] = []
+    prev_close: float | None = None
+    threshold = _limit_threshold(code)
+    for idx, row in enumerate(rows):
+        dt = row.get("dt")
+        close = _float(row.get("close"))
+        open_value = _float(row.get("open"))
+        high = _float(row.get("high"))
+        low = _float(row.get("low"))
+        raw_change = _float(row.get("change_pct"))
+        change_pct = raw_change
+        if change_pct is None and close is not None and prev_close:
+            change_pct = (close / prev_close - 1) * 100
+        labels: list[str] = []
+        if change_pct is not None:
+            if change_pct >= threshold:
+                labels.append("涨停/强封")
+            elif change_pct >= 9:
+                labels.append("强阳加速")
+            elif change_pct <= -7:
+                labels.append("大幅回撤")
+        if high is not None and close is not None and high > 0:
+            drawdown = (high - close) / high * 100
+            if drawdown >= 5:
+                labels.append("冲高回落")
+        if idx > 0 and close is not None:
+            previous_high = max((_float(item.get("high")) or -10**12) for item in rows[:idx])
+            if close > previous_high:
+                labels.append("突破前高")
+        replay_rows.append(
+            {
+                "date": dt.strftime("%Y-%m-%d") if isinstance(dt, datetime) else _text(dt),
+                "open": open_value,
+                "high": high,
+                "low": low,
+                "close": close,
+                "change_pct": round(change_pct, 2) if change_pct is not None else None,
+                "amount_yi": _amount_yi(row.get("amount")) if (_float(row.get("amount")) or 0.0) > 0 else None,
+                "turnover_pct": _float(
+                    _first_present(row.get("turnover_pct"), row.get("turnover_rate"), row.get("turnover"))
+                ),
+                "volume": _float(row.get("vol")),
+                "event": "、".join(labels) if labels else "普通交易日",
+            }
+        )
+        if close is not None:
+            prev_close = close
+    if not replay_rows:
+        return None
+    first = replay_rows[0]
+    latest = replay_rows[-1]
+    if _text(latest.get("date")) == trade_date:
+        if latest.get("change_pct") is None and snapshot.get("change_pct") is not None:
+            latest["change_pct"] = round(float(snapshot.get("change_pct")), 2)
+        if latest.get("amount_yi") is None:
+            latest["amount_yi"] = _amount_yi(snapshot.get("amount"))
+        if latest.get("turnover_pct") is None:
+            latest["turnover_pct"] = _float(snapshot.get("turnover_pct"))
+    first_close = _float(first.get("close"))
+    latest_close = _float(latest.get("close"))
+    total_change = (latest_close / first_close - 1) * 100 if latest_close is not None and first_close else None
+    acceleration = next(
+        (
+            row
+            for row in replay_rows
+            if "涨停/强封" in _text(row.get("event")) or "强阳加速" in _text(row.get("event"))
+        ),
+        None,
+    ) or next(
+        (
+            row
+            for row in replay_rows
+            if "突破前高" in _text(row.get("event"))
+        ),
+        None,
+    )
+    acceleration_index = replay_rows.index(acceleration) if acceleration in replay_rows else None
+    return {
+        "symbol": _text(snapshot.get("symbol")),
+        "code": code,
+        "name": _text(snapshot.get("name")),
+        "industry": _text(limit_meta.get("industry")),
+        "selected_reason": _text(limit_meta.get("selected_reason")),
+        "limit_pool": limit_meta,
+        "source": "bars:日线",
+        "evidence_level": "confirmed",
+        "rows": replay_rows,
+        "start_date": first.get("date"),
+        "end_date": latest.get("date"),
+        "total_change_pct": round(total_change, 2) if total_change is not None else None,
+        "acceleration_date": acceleration.get("date") if acceleration else None,
+        "acceleration_event": acceleration.get("event") if acceleration else "未识别出明确加速日",
+        "acceleration_index": acceleration_index,
+        "acceleration_change_pct": acceleration.get("change_pct") if acceleration else None,
+        "latest_change_pct": latest.get("change_pct"),
+        "latest_amount_yi": latest.get("amount_yi"),
+        "row_count": len(replay_rows),
+        "amount_status": "partial" if any(row.get("amount_yi") is None for row in replay_rows) else "available",
+        "note": "由个股日线 bars 派生；成交额字段为0或缺失时保留 unknown，不回填样本文案。",
+    }
+
+
+def _stock_daily_replays(
+    db: Any,
+    trade_date: str,
+    symbols: list[str],
+    *,
+    limit_lookup: dict[str, dict[str, Any]] | None = None,
+    limit: int = 80,
+) -> list[dict[str, Any]]:
+    limit_lookup = limit_lookup or {}
+    snapshots = _snapshot_by_symbol(db, trade_date, symbols)
+    chain_lookup = _chain_membership_for_symbols(db, trade_date, symbols)
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        code = _pure_code(symbol)
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        snapshot = snapshots.get(code)
+        if not snapshot:
+            continue
+        replay = _stock_daily_replay_for_snapshot(
+            db,
+            trade_date,
+            snapshot,
+            limit_meta=limit_lookup.get(code),
+        )
+        if replay:
+            replay.update(_chain_context_fields(chain_lookup.get(code, {})))
+            rows.append(replay)
         if len(rows) >= limit:
             break
     return rows
@@ -2439,7 +2963,7 @@ def replay_analysis_framework() -> dict[str, Any]:
             {
                 "dimension": "分钟级资金链条",
                 "code_fields": ["market_replay.rotation_windows", "market_replay.rotation_shifts"],
-                "ai_check": "是否按时间写出资金从消费/科技/电力/锂电/机器人/商业航天之间切换，而不是只列最终涨幅。",
+                "ai_check": "是否按时间写出资金在强弱方向之间切换，而不是只列最终涨幅。",
             },
             {
                 "dimension": "板块卡位",
@@ -2498,13 +3022,36 @@ def build_market_replay_context(
     flow_availability = _flow_availability(db, external_fund_flows)
     failed_symbols = [row["symbol"] for row in failed_boards[: min(10, len(failed_boards))] if row.get("symbol")]
     limit_pool_symbols = _top_limit_pool_symbols(limit_lookup, limit=200)
+    top_gainer_symbols = [
+        row["symbol"]
+        for row in _stock_pool_cursor_rows(db, trade_date, sort_field="change_pct", direction=-1, limit=60, min_amount=500000000)
+        if row.get("symbol") and (_float(row.get("change_pct")) or 0.0) >= 9.0
+    ]
+    chain_peer_pressure_symbols = _chain_peer_pressure_symbols(
+        db,
+        trade_date,
+        [*top_gainer_symbols, *limit_pool_symbols, *representative_symbols],
+        limit=80,
+    )
     symbols = [
         *representative_symbols,
         *high_turnover_symbols,
+        *top_gainer_symbols,
         *rotation_symbols,
         *intraday_delta_symbols,
         *failed_symbols,
         *limit_pool_symbols,
+        *chain_peer_pressure_symbols,
+    ]
+    daily_replay_symbols = [
+        *top_gainer_symbols,
+        *chain_peer_pressure_symbols,
+        *limit_pool_symbols,
+        *failed_symbols,
+        *high_turnover_symbols,
+        *representative_symbols,
+        *rotation_symbols,
+        *intraday_delta_symbols,
     ]
     context = {
         "trade_date": trade_date,
@@ -2517,12 +3064,16 @@ def build_market_replay_context(
             "opening_pressure_boards": "board_heat_ticks",
             "representative_paths": "fullmarket_spot_snapshots + bars",
             "stock_event_chains": "fullmarket_spot_snapshots + bars + optional market_limit_pools",
+            "stock_daily_replays": "fullmarket_spot_snapshots + bars:日线",
             "dynamic_market_representatives": "board_constituents + fullmarket_spot_snapshots + optional market_limit_pools",
             "external_fund_flows": "optional Eastmoney/THS public order-size flow evidence",
             "index_cycle": "index_bars",
             "major_indices": "index_bars",
+            "major_index_intraday": "index_bars:5分钟",
+            "major_index_technical": "index_bars:日线",
             "market_breadth": "fullmarket_spot_snapshots",
             "daily_board_rankings": "board_ranking/concept_ranking + source snapshots",
+            "chain_peer_pressure_symbols": "security_chain_memberships + fullmarket_spot_snapshots",
         },
         "analysis_framework": replay_analysis_framework(),
         "structured_daily_review": _structured_daily_review(
@@ -2542,6 +3093,8 @@ def build_market_replay_context(
         },
         "high_turnover_cores": high_turnover,
         "major_indices": _major_index_daily_rows(db, trade_date),
+        "major_index_intraday": _major_index_intraday_context(db, trade_date),
+        "major_index_technical": _major_index_technical_context(db, trade_date),
         "market_breadth": _market_breadth(db, trade_date),
         "daily_board_rankings": daily_board_rankings,
         "turnover_representatives": _turnover_representatives(db, trade_date, high_turnover, limit=15),
@@ -2550,6 +3103,7 @@ def build_market_replay_context(
         "rotation_windows": rotation_windows,
         "rotation_shifts": rotation_shifts,
         "opening_pressure_boards": _opening_pressure_boards(db, trade_date),
+        "chain_peer_pressure_symbols": chain_peer_pressure_symbols,
         "representative_paths": _symbol_evidence(db, trade_date, symbols, limit=max(representative_limit, 80)),
         "stock_event_chains": _stock_event_chains(
             db,
@@ -2557,6 +3111,13 @@ def build_market_replay_context(
             symbols,
             limit_lookup=limit_lookup,
             limit=max(240, representative_limit),
+        ),
+        "stock_daily_replays": _stock_daily_replays(
+            db,
+            trade_date,
+            daily_replay_symbols,
+            limit_lookup=limit_lookup,
+            limit=180,
         ),
         "external_fund_flows": external_fund_flows,
         "dynamic_market_representatives": _dynamic_market_representatives(db, trade_date, analysis_boards),
@@ -2599,25 +3160,6 @@ def _same_role_board(left: str, right: str) -> bool:
     if left == right or left in right or right in left:
         return True
     return bool(_board_role_tokens(left) & _board_role_tokens(right))
-
-
-def _is_tech_mainline_board(name: str) -> bool:
-    tokens = _board_role_tokens(name)
-    haystack = f"{name} {' '.join(tokens)}"
-    tech_tokens = (
-        "科技",
-        "CPO",
-        "光模块",
-        "通信",
-        "线缆",
-        "集成电路",
-        "半导体",
-        "芯片",
-        "PCB",
-        "印制电路",
-        "AI",
-    )
-    return any(token in haystack for token in tech_tokens)
 
 
 def _stock_role_name(row: dict[str, Any]) -> str:
@@ -2685,7 +3227,9 @@ def _board_role_map(context: dict[str, Any]) -> list[dict[str, Any]]:
         name = _board_role_name(item)
         change = _float(item.get("change_pct"))
         if name and change is not None and change < 0:
-            role = "受伤主线/压力锚" if _is_tech_mainline_board(name) else "早盘压力锚"
+            existing = ensure(name)
+            roles = existing.get("roles") if isinstance(existing, dict) and isinstance(existing.get("roles"), list) else []
+            role = "前排压力锚" if "主线/前排观察" in roles else "早盘压力锚"
             add(name, role, f"开盘压力{_fmt_pct(change)}")
 
     for shift in context.get("rotation_shifts", []) if isinstance(context.get("rotation_shifts"), list) else []:
@@ -2718,13 +3262,11 @@ def _board_role_map(context: dict[str, Any]) -> list[dict[str, Any]]:
             stocks["压力核心"] = _stock_role_names(pressure)
             add(name, "压力锚", f"压力核心={stocks['压力核心']}")
 
-    telecom_pressure = _telecom_pressure_events(context)
-    if telecom_pressure:
-        add(
-            "光模块/CPO/通信线缆",
-            "受伤主线/高成交压力锚",
-            f"高成交压力={_stock_role_names(telecom_pressure, limit=3)}",
-        )
+    pressure_event = _pressure_event(context)
+    if pressure_event:
+        pressure_board = _event_theme_label(pressure_event)
+        if pressure_board:
+            add(pressure_board, "高成交压力锚", f"高成交压力={_stock_role_names([pressure_event], limit=1)}")
 
     result = list(rows_by_name.values())
     def priority(row: dict[str, Any]) -> tuple[int, int, str]:
@@ -2787,14 +3329,9 @@ def _board_role_map_section(context: dict[str, Any]) -> str:
         brief = "、".join(evidence_prose(item) for item in evidence_rows[:evidence_limit] if _text(item))
         return f"{name}（{brief}）" if brief else name
 
-    pressure: list[tuple[bool, str]] = []
+    pressure: list[str] = []
     repair = []
     front = []
-    focus_tokens = ("机器人", "通信", "线缆", "CPO", "光模块", "半导体", "集成电路", "PCB", "印制电路", "算力")
-
-    def is_focus_board(row: dict[str, Any]) -> bool:
-        name = _text(row.get("name"))
-        return _is_tech_mainline_board(name) or any(token in name for token in focus_tokens)
 
     for row in role_map[:10]:
         roles = row.get("roles") if isinstance(row.get("roles"), list) else []
@@ -2802,25 +3339,20 @@ def _board_role_map_section(context: dict[str, Any]) -> str:
         evidence_text = "/".join(_text(item) for item in row.get("evidence", []) if _text(item))
         has_front = "主线/前排观察" in roles
         has_pressure_evidence = "压力" in evidence_text
-        has_hard_pressure = (
-            ("受伤主线" in role_text or "高成交压力" in role_text or ("压力锚" in role_text and not has_front))
-            and has_pressure_evidence
-        )
-        phrase = row_phrase(row, prefer_pressure=has_hard_pressure)
+        has_pressure = "压力锚" in role_text and has_pressure_evidence
+        phrase = row_phrase(row, prefer_pressure=has_pressure)
         if not phrase:
             continue
-        if has_hard_pressure:
-            pressure.append((is_focus_board(row), phrase))
-        elif is_focus_board(row) and ("修复锚" in role_text or "弹性锚" in role_text):
+        if has_pressure:
+            pressure.append(phrase)
+        elif "修复锚" in role_text or "弹性锚" in role_text:
             repair.append(phrase)
-        elif is_focus_board(row) and has_front:
+        elif has_front:
             front.append(phrase)
 
     parts = []
     if pressure:
-        focus_pressure = [phrase for is_focus, phrase in pressure if is_focus]
-        pressure_phrases = focus_pressure or [phrase for _, phrase in pressure]
-        parts.append("压力主要在" + "、".join(pressure_phrases[:2]))
+        parts.append("压力主要在" + "、".join(pressure[:2]))
     if repair:
         parts.append("有修复尝试的是" + "、".join(repair[:2]))
     if front:
@@ -2901,7 +3433,7 @@ def _turnover_representative_section(context: dict[str, Any]) -> str:
     return (
         "高成交前排分化很明显。"
         + "；".join(parts)
-        + "。这里不能简单写成科技线修复，明天要看收跌的高成交票能不能止住。"
+        + "。这里不能简单写成高成交方向修复，明天要看收跌的高成交票能不能止住。"
     )
 
 
@@ -3015,18 +3547,21 @@ def _stock_event_section(context: dict[str, Any]) -> str:
     pressure_names = [_text(row.get("name")) for row in opening_pressure[:4] if _text(row.get("name"))]
     low_open = [row for row in events if "低开承压" in row.get("labels", [])]
     if low_open:
-        low_open_label = _event_theme_label(low_open[0])
-        if any(name in {"CPO概念", "光模块", "通信线缆及配套"} or "CPO" in name or "光模块" in name for name in pressure_names) or low_open_label == "光模块":
-            opening += "开盘后光模块方向直接低开。"
-        elif low_open_label:
-            opening += f"开盘后{low_open_label}方向直接承压。"
-        elif pressure_names and any(event_is_opening_relevant(row) for row in low_open[:3]):
-            opening += f"开盘后{pressure_names[0]}方向直接承压。"
-        else:
-            opening += "开盘后高成交核心直接承压。"
-        opening += "承压个股包括" + "，".join(_text(row.get("name")) for row in low_open[:3] if _text(row.get("name"))) + "。"
-    elif any(name in {"CPO概念", "光模块", "通信线缆及配套"} or "CPO" in name or "光模块" in name for name in pressure_names):
-        opening += "开盘后光模块方向直接低开。"
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in low_open:
+            label = _event_theme_label(row)
+            if not label and pressure_names and event_is_opening_relevant(row):
+                label = pressure_names[0]
+            label = label or "高成交核心"
+            grouped.setdefault(label, []).append(row)
+        for label, rows in list(grouped.items())[:3]:
+            names = "，".join(_text(row.get("name")) for row in rows[:3] if _text(row.get("name")))
+            if label == "高成交核心":
+                opening += f"开盘后{label}直接承压。"
+            else:
+                opening += f"开盘后{label}方向直接承压。"
+            if names:
+                opening += f"承压个股包括{names}。"
     elif pressure_names:
         opening += f"开盘后{pressure_names[0]}方向直接承压。"
     if limit_parts:
@@ -3106,8 +3641,17 @@ def _emotion_temperature_section(context: dict[str, Any]) -> str:
         return ""
     tail = ""
     if failed:
-        names = "、".join(_text(row.get("name")) for row in failed[:4] if _text(row.get("name")))
-        tail = f"冲高回落样本不少，前排是{names}。"
+        details = []
+        for row in failed[:4]:
+            name = _text(row.get("name"))
+            if not name:
+                continue
+            failed_pct = row.get("failed_from_high_pct")
+            if failed_pct is not None:
+                details.append(f"{name}涨幅回吐{_fmt_pct_points(failed_pct)}")
+            else:
+                details.append(name)
+        tail = f"冲高回落样本不少，前排是{'、'.join(details)}。"
     pressure_line = ""
     if pressure:
         pressure_line = (
@@ -3161,30 +3705,6 @@ def _event_time_key(row: dict[str, Any]) -> str:
     return _text(meta.get("first_limit_up_time") or meta.get("last_limit_up_time") or "999999")
 
 
-def _event_haystack(row: dict[str, Any]) -> str:
-    meta = _event_limit_meta(row)
-    return " ".join(
-        [
-            _text(row.get("name")),
-            _text(meta.get("industry")),
-            _text(meta.get("selected_reason")),
-            _text(meta.get("pool")),
-        ]
-    )
-
-
-def _events_matching(context: dict[str, Any], tokens: list[str]) -> list[dict[str, Any]]:
-    if not tokens:
-        return []
-    result = [row for row in _event_rows(context) if any(token in _event_haystack(row) for token in tokens)]
-    result.sort(key=lambda row: (_event_time_key(row), -(_float(row.get("amount_yi")) or 0.0)))
-    return result
-
-
-def _event_by_name(context: dict[str, Any], name: str) -> dict[str, Any] | None:
-    return next((row for row in _event_rows(context) if _text(row.get("name")) == name), None)
-
-
 def _pressure_event(context: dict[str, Any]) -> dict[str, Any] | None:
     events = [
         row
@@ -3194,92 +3714,21 @@ def _pressure_event(context: dict[str, Any]) -> dict[str, Any] | None:
     return max(events, key=lambda row: _float(row.get("amount_yi")) or 0.0, default=None)
 
 
-def _is_telecom_pressure_event(row: dict[str, Any]) -> bool:
-    haystack = _event_haystack(row)
-    return any(token in haystack for token in ("通信", "CPO", "光模块", "光通信", "线缆"))
-
-
-def _telecom_pressure_events(context: dict[str, Any]) -> list[dict[str, Any]]:
-    pressure = _pressure_event(context)
-    rows = []
-    if pressure and _is_telecom_pressure_event(pressure):
-        rows.append(pressure)
-    explicit_name_rows: list[dict[str, Any]] = []
-    for row in _event_rows(context):
-        if row is pressure:
-            continue
-        if (_float(row.get("amount_yi")) or 0.0) < 100:
-            continue
-        if "通信" in _text(row.get("name")):
-            explicit_name_rows.append(row)
-        if _is_telecom_pressure_event(row):
-            rows.append(row)
-    rows.sort(key=lambda row: _float(row.get("amount_yi")) or 0.0, reverse=True)
-    deduped: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for row in rows:
-        name = _text(row.get("name"))
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        deduped.append(row)
-    explicit_name_rows.sort(key=lambda row: _float(row.get("amount_yi")) or 0.0, reverse=True)
-    if len(deduped) >= 3 and explicit_name_rows:
-        explicit = explicit_name_rows[0]
-        explicit_name = _text(explicit.get("name"))
-        if explicit_name and all(_text(row.get("name")) != explicit_name for row in deduped[:3]):
-            deduped[2] = explicit
-    final: list[dict[str, Any]] = []
-    seen.clear()
-    for row in deduped:
-        name = _text(row.get("name"))
-        if name and name not in seen:
-            seen.add(name)
-            final.append(row)
-    return final[:4]
-
-
-def _open_to_text(row: dict[str, Any]) -> str:
-    name = _text(row.get("name"))
-    open_bar = row.get("open_bar") if isinstance(row.get("open_bar"), dict) else {}
-    open_value = _first_present(open_bar.get("open"), row.get("open"))
-    prev_close = row.get("prev_close")
-    if prev_close is None:
-        return f"{name}开{_fmt_number(open_value)}"
-    return f"{name}从{_fmt_number(prev_close)}开到{_fmt_number(open_value)}"
-
-
-def _consumer_attack_events(context: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    consumer = _events_matching(context, ["一般零售", "零售", "超市", "百货", "消费"])
-    sealed = [row for row in consumer if "封板确认" in row.get("labels", [])]
-    failed = [row for row in consumer if "炸板回落" in row.get("labels", [])]
-    sealed.sort(key=_event_time_key)
-    failed.sort(key=_event_time_key)
-    attack: list[dict[str, Any]] = []
-    if sealed:
-        attack.append(sealed[0])
-    attack.extend(failed[:2])
-    repair = sealed[1:3]
-    return attack, repair
-
-
 def _event_phrase(row: dict[str, Any]) -> str:
     return _text(row.get("phrase"))
 
 
 def _event_theme_label(row: dict[str, Any]) -> str:
-    haystack = _event_haystack(row)
-    theme_tokens = [
-        ("消费", ["一般零售", "零售", "百货", "超市", "消费"]),
-        ("电力", ["电力", "火力发电", "能源发电", "发电"]),
-        ("锂电", ["锂", "电池", "能源金属"]),
-        ("光模块", ["CPO", "光模块", "通信设备", "通信线缆", "光通信"]),
-        ("机器人", ["机器人", "自动化"]),
-        ("商业航天", ["商业航天", "航天", "卫星"]),
-        ("半导体", ["半导体", "电子化学", "硅料", "硅片"]),
-    ]
-    for label, tokens in theme_tokens:
-        if any(token in haystack for token in tokens):
+    meta = _event_limit_meta(row)
+    candidates = (
+        meta.get("industry"),
+        row.get("node_name"),
+        row.get("chain_name"),
+        meta.get("selected_reason"),
+    )
+    for value in candidates:
+        label = _board_display_name(_text(value))
+        if label and _is_analysis_board(label):
             return label
     return ""
 
@@ -3309,226 +3758,39 @@ def _shift_leaders(shift: dict[str, Any] | None) -> tuple[dict[str, Any] | None,
     return strong, weak
 
 
-def _opening_flow_section(context: dict[str, Any]) -> str:
-    pressure_rows = _telecom_pressure_events(context)
-    attack, _ = _consumer_attack_events(context)
-    opening_pressure = context.get("opening_pressure_boards") if isinstance(context.get("opening_pressure_boards"), list) else []
-    pressure_names = [_text(row.get("name")) for row in opening_pressure[:5] if _text(row.get("name"))]
-    event_label = _event_theme_label(pressure_rows[0]) if pressure_rows else ""
-    board_label = _first_analysis_board_name(opening_pressure[:5])
-    if any("CPO" in name or "光模块" in name or "通信线缆" in name for name in pressure_names):
-        pressure_label = "光模块"
-    else:
-        pressure_label = event_label or board_label or "高成交核心"
-    pressure_names_text = "、".join(_text(row.get("name")) for row in pressure_rows[:3] if _text(row.get("name")))
-    attack_text = "，".join(_event_phrase(row) for row in attack if _event_phrase(row))
-    if not pressure_names_text and not attack_text:
-        return ""
-    attack_label = _event_theme_label(attack[0]) if attack else ""
-    attack_sentence = ""
-    if attack_text:
-        attack_sentence = f"随后资金去试{attack_label or '早盘强势'}方向。{attack_text}。"
-    elif pressure_names_text:
-        attack_sentence = "同方向没有马上形成有效扩散，早盘只能先按压力线观察。"
-    return (
-        f"早盘先看{pressure_label}承接。"
-        + (f"{pressure_names_text}有回拉，但没带出持续修复。" if pressure_names_text else "")
-        + attack_sentence
-        + "这类早盘回拉只算试探，能不能变成修复，要看午后和尾盘有没有继续承接。"
-    )
-
-
-def _board_timeline_row(context: dict[str, Any], tokens: list[str]) -> dict[str, Any] | None:
-    for row in context.get("board_timeline", []):
-        haystack = f"{_text(row.get('board'))} {_text(row.get('driver_name'))}"
-        if any(token in haystack for token in tokens):
-            return row
-    return None
-
-
-def _board_latest_pct(row: dict[str, Any] | None) -> Any:
-    latest = row.get("latest") if isinstance(row, dict) and isinstance(row.get("latest"), dict) else {}
-    return latest.get("change_pct")
-
-
-def _aerospace_section(context: dict[str, Any]) -> str:
-    board = _board_timeline_row(context, ["商业航天", "航天", "卫星"])
-    if not board:
-        return ""
-    dynamic = next(
-        (
-            row
-            for row in context.get("dynamic_market_representatives", [])
-            if any(token in f"{_text(row.get('board'))} {_text(row.get('driver_name'))}" for token in ["商业航天", "航天", "卫星"])
-        ),
-        {},
-    )
-    reps: list[dict[str, Any]] = []
-    for bucket in ("market_elastic", "market_core"):
-        rows = dynamic.get(bucket) if isinstance(dynamic.get(bucket), list) else []
-        reps.extend(rows[:3])
-    event_map = {_text(row.get("name")): row for row in _event_rows(context)}
-    parts = []
-    seen: set[str] = set()
-    for rep in reps:
-        name = _text(rep.get("name"))
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        event = event_map.get(name)
-        if event and _event_phrase(event):
-            parts.append(_event_phrase(event))
-        else:
-            parts.append(f"{name}{_fmt_pct(rep.get('change_pct'))}")
-    latest = _board_latest_pct(board)
-    return (
-        "这时有一条暗线开始露头—商业航天。"
-        f"{_text(board.get('driver_name') or board.get('board'))}全天涨了{_fmt_unsigned_pct(latest)}。"
-        + ("，".join(parts[:4]) + "。" if parts else "")
-        + "这条线的关键不是单一个股，而是内部有先后节奏；先封、后跟、再扩散，才说明板块共识在扩散。"
-    )
-
-
-def _power_events(context: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = _events_matching(context, ["电力", "火力发电", "其他能源发电", "发电"])
-    rows.sort(key=lambda row: (
-        0 if "跌停负反馈" in row.get("labels", []) else 1,
-        -(_float(row.get("amount_yi")) or 0.0),
-    ))
-    return rows[:5]
-
-
-def _turn_0933_section(context: dict[str, Any]) -> str:
-    telecom_rows = _telecom_pressure_events(context)
-    pressure = _pressure_event(context)
-    telecom = next(
-        (
-            row
-            for row in telecom_rows
-            if row is not pressure and "通信" in _text(row.get("name"))
-        ),
-        None,
-    )
-    if telecom is None:
-        telecom = next(
-            (
-                row
-                for row in telecom_rows
-                if row is not pressure and ("通信" in _event_haystack(row) or "CPO" in _event_haystack(row))
-            ),
-            telecom_rows[-1] if telecom_rows else None,
-        )
-    strong, weak = _shift_leaders(_shift_by_to_time(context, "09:35"))
-    if not telecom and not (strong or weak):
-        return ""
-    telecom_line = ""
-    if telecom:
-        low_bar = telecom.get("low_bar") if isinstance(telecom.get("low_bar"), dict) else {}
-        high_bar = telecom.get("high_bar") if isinstance(telecom.get("high_bar"), dict) else {}
-        telecom_line = (
-            f"{_text(telecom.get('name'))}从{_fmt_number(low_bar.get('low') or telecom.get('low'))}"
-            f"日内低点拉升，最高到{_fmt_number(high_bar.get('high') or telecom.get('high'))}，"
-            f"但收盘仍是{_fmt_pct(telecom.get('close_change_pct'))}。"
-        )
-    shift_line = ""
-    if not telecom_line and (strong or weak):
-        shift_line = (
-            (f"{_text(strong.get('name'))}开始增强{_fmt_pct(strong.get('delta_pct'))}，" if strong else "")
-            + (f"{_text(weak.get('name'))}同步走弱{_fmt_pct(weak.get('delta_pct'))}。" if weak else "")
-        )
-    telecom_haystack = _event_haystack(telecom) if telecom else ""
-    explicit_tech_reversal = bool(
-        telecom
-        and (
-            "通信" in _text(telecom.get("name"))
-            or any(token in telecom_haystack for token in ["通信", "CPO", "光模块"])
-        )
-    )
-    title = "9点33分附近是早盘第一个关键转折点。" if explicit_tech_reversal else "早盘第一个关键转折点。"
-    final_sentence = "这类回拉或切换如果不能带动板块扩散，就只能按资金试探处理。"
-    return (
-        title
-        + telecom_line
-        + shift_line
-        + ("这个瞬间资金被吸引回承压方向。" if telecom_line else "")
-        + final_sentence
-    )
-
-
-def _lithium_events(context: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = _events_matching(context, ["锂", "能源金属", "电池"])
-    rows = [row for row in rows if (_float(row.get("high_change_pct")) or 0.0) > 0 or (_float(row.get("close_change_pct")) or 0.0) > 0]
-    rows.sort(key=lambda row: _float(row.get("amount_yi")) or 0.0, reverse=True)
+def _early_attack_events(context: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = [
+        row
+        for row in _event_rows(context)
+        if any(label in row.get("labels", []) for label in ("封板确认", "高开进攻", "强势池", "炸板回落"))
+    ]
+    rows.sort(key=lambda row: (_event_time_key(row), -(_float(row.get("amount_yi")) or 0.0)))
     return rows[:4]
 
 
-def _turn_1030_section(context: dict[str, Any]) -> str:
-    pressure = _pressure_event(context)
-    lithium = _lithium_events(context)
-    shift = _shift_by_to_time(context, "10:30")
-    strong, weak = _shift_leaders(shift)
-    if not pressure and not lithium and not (strong or weak):
+def _opening_flow_section(context: dict[str, Any]) -> str:
+    opening_pressure = context.get("opening_pressure_boards") if isinstance(context.get("opening_pressure_boards"), list) else []
+    pressure_event = _pressure_event(context)
+    board_label = _first_analysis_board_name(opening_pressure[:5])
+    pressure_label = (_event_theme_label(pressure_event) if pressure_event else "") or board_label or "高成交核心"
+    pressure_text = _event_phrase(pressure_event) if pressure_event else ""
+    if not pressure_text and pressure_event:
+        pressure_text = _stock_role_names([pressure_event], limit=1)
+    attack = [row for row in _early_attack_events(context) if row is not pressure_event]
+    attack_text = "，".join(_event_phrase(row) for row in attack if _event_phrase(row))
+    if not pressure_text and not attack_text:
         return ""
-    pressure_line = ""
-    if pressure:
-        high_bar = pressure.get("high_bar") if isinstance(pressure.get("high_bar"), dict) else {}
-        high_value = _first_present(high_bar.get("high"), pressure.get("high"))
-        high_phrase = f"虽然拉到过{_fmt_number(high_value)}但" if high_value is not None else "盘中反复尝试但"
-        pressure_line = (
-            f"这个时候{_text(pressure.get('name'))}这类高成交核心停止回拉了—"
-            f"{_text(pressure.get('name'))}{high_phrase}打不住抛压，"
-            f"全天{_fmt_amount_yi_for_prose(pressure.get('amount_yi'))}亿成交里价格承接不足。"
-        )
-    lithium_line = "，".join(_event_phrase(row) for row in lithium if _event_phrase(row))
-    shift_line = ""
-    if not lithium_line and (strong or weak):
-        shift_line = (
-            (f"{_text(strong.get('name'))}增强{_fmt_pct(strong.get('delta_pct'))}，" if strong else "")
-            + (f"{_text(weak.get('name'))}走弱{_fmt_pct(weak.get('delta_pct'))}。" if weak else "")
-        )
+    attack_sentence = ""
+    if attack_text:
+        attack_label = _event_theme_label(attack[0]) if attack else ""
+        attack_sentence = f"随后资金去试{attack_label or '早盘强势'}方向。{attack_text}。"
+    elif pressure_text:
+        attack_sentence = "同方向没有马上形成有效扩散，早盘只能先按压力线观察。"
     return (
-        "10点半附近是第二个关键转折点。"
-        + pressure_line
-        + ("几乎同一时间，锂电和锂矿开始试盘拉升。" + lithium_line + "。" if lithium_line else "")
-        + shift_line
-        + (
-            "下一步只看这些增强方向能否继续扩散，并且弱化方向不再拖累高成交核心。"
-            if lithium_line or shift_line
-            else "这里的结论只来自高成交核心承接失败，不外推成新主线。"
-        )
-    )
-
-
-def _robot_section(context: dict[str, Any]) -> str:
-    robot = _board_timeline_row(context, ["机器人", "自动化"])
-    if not robot:
-        return ""
-    latest = _board_latest_pct(robot)
-    reps = next(
-        (
-            row
-            for row in context.get("dynamic_market_representatives", [])
-            if "机器人" in f"{_text(row.get('board'))} {_text(row.get('driver_name'))}"
-        ),
-        {},
-    )
-    elastics = reps.get("market_elastic_confirmed") if isinstance(reps.get("market_elastic_confirmed"), list) else []
-    if not elastics:
-        elastics = reps.get("market_elastic") if isinstance(reps.get("market_elastic"), list) else []
-    flag_candidates = []
-    for row in elastics:
-        meta = row.get("limit_pool") if isinstance(row.get("limit_pool"), dict) else {}
-        first_time = _text(meta.get("first_limit_up_time"))
-        amount_yi = _float(row.get("amount_yi")) or 0.0
-        if first_time and amount_yi >= 20:
-            flag_candidates.append(row)
-    focus = "、".join(_text(row.get("name")) for row in flag_candidates[:2] if _text(row.get("name")))
-    focus_line = f"，旗帜性封板焦点在{focus}" if focus else "，但缺少一个旗帜性的涨停聚焦点"
-    return (
-        "下午机器人方向被资金平铺买入。"
-        f"{_text(robot.get('driver_name') or robot.get('board'))}涨{_fmt_unsigned_pct(latest)}"
-        + focus_line
-        + "。这是前面竞价异动和午后铺开的延续，但没有持续封板焦点时，先按平铺买入而不是压倒性主线处理。"
+        f"早盘先看{pressure_label}承接。"
+        + (f"{pressure_text}。" if pressure_text else "")
+        + attack_sentence
+        + "这类早盘回拉只算试探，能不能变成修复，要看午后和尾盘有没有继续承接。"
     )
 
 
@@ -3628,16 +3890,27 @@ def _collapse_section(context: dict[str, Any]) -> str:
         prefix +
         f"{_text(pressure.get('name'))}{_fmt_amount_yi_for_prose(pressure.get('amount_yi'))}亿成交，"
         "盘中有回拉，但收盘没有接住。"
-        "这比单纯跌幅更影响科技线情绪。"
+        "这比单纯跌幅更影响高成交方向情绪。"
         + flow_line
     )
 
 
 def _tail_consumer_section(context: dict[str, Any]) -> str:
-    attack, repair = _consumer_attack_events(context)
-    failed = [row for row in attack if "炸板回落" in row.get("labels", [])]
+    events = _event_rows(context)
+    failed = [
+        row
+        for row in events
+        if "炸板回落" in row.get("labels", []) or "冲高回落" in row.get("labels", []) or "日内拉升失败" in row.get("labels", [])
+    ]
+    failed.sort(key=lambda row: (_event_time_key(row), -(_float(row.get("amount_yi")) or 0.0)))
+    repair = [
+        row
+        for row in events
+        if row not in failed and ("封板确认" in row.get("labels", []) or "强势池" in row.get("labels", []))
+    ]
+    repair.sort(key=lambda row: (_event_time_key(row), -(_float(row.get("amount_yi")) or 0.0)))
     fallback_failed = []
-    if not failed and not repair:
+    if not failed:
         for row in context.get("failed_boards", [])[:3]:
             name = _text(row.get("name"))
             if not name:
@@ -3698,37 +3971,11 @@ def _structured_intraday_summary_section(context: dict[str, Any]) -> str:
     slices = structured.get("fixed_time_slices") if isinstance(structured.get("fixed_time_slices"), list) else []
     opening_pressure = context.get("opening_pressure_boards") if isinstance(context.get("opening_pressure_boards"), list) else []
     shifts = context.get("rotation_shifts") if isinstance(context.get("rotation_shifts"), list) else []
-    tech_tokens = (
-        "科技",
-        "CPO",
-        "光模块",
-        "通信",
-        "线缆",
-        "集成电路",
-        "半导体",
-        "分立器件",
-        "被动元件",
-        "MLCC",
-        "PCB",
-        "印制电路",
-        "机器人",
-        "软件",
-        "AI",
-    )
-
-    def is_tech(row: dict[str, Any] | None) -> bool:
-        if not isinstance(row, dict):
-            return False
-        haystack = " ".join(
-            _text(row.get(key))
-            for key in ("name", "board", "driver_name")
-        )
-        return any(token in haystack for token in tech_tokens)
 
     panic_parts = [
         f"{_text(row.get('name'))}{_fmt_pct(row.get('change_pct'))}"
         for row in opening_pressure[:8]
-        if is_tech(row) and _text(row.get("name"))
+        if _text(row.get("name"))
     ]
 
     rebound_parts: list[str] = []
@@ -3737,7 +3984,7 @@ def _structured_intraday_summary_section(context: dict[str, Any]) -> str:
     def add_rebound(label: str, row: dict[str, Any]) -> None:
         name = _text(row.get("name"))
         delta = _float(row.get("delta_pct"))
-        if not name or delta is None or delta <= 0 or not is_tech(row):
+        if not name or delta is None or delta <= 0:
             return
         key = f"{label}:{name}"
         if key in seen_rebounds:
@@ -3763,13 +4010,13 @@ def _structured_intraday_summary_section(context: dict[str, Any]) -> str:
     sentences = ["对应的程序化证据如下。"]
     if panic_parts:
         sentences.append(
-            "方向上，早盘不是普通分化，而是科技链先集中恐慌："
+            "方向上，早盘压力集中在："
             + "、".join(panic_parts[:4])
-            + "；这说明CPO、通信线缆、半导体、PCB这类高成交方向当天先进入压力测试。"
+            + "；这里只按开盘阶段实际跌幅排序，不预设压力板块。"
         )
     if rebound_parts:
         sentences.append(
-            "节奏上，后续不是全面修复，而是部分科技分支出现抄底反弹："
+            "节奏上，后续出现方向增强尝试："
             + "、".join(rebound_parts[:4])
             + "；这只能证明短跌后的修复尝试，不能直接证明低点成立。"
         )
@@ -3820,10 +4067,7 @@ def format_market_replay_sections(context: dict[str, Any], *, max_sections: int 
             role_map_section,
             turnover_representative_section,
             _opening_flow_section(context),
-            _aerospace_section(context),
-            _turn_0933_section(context),
-            _turn_1030_section(context),
-            _robot_section(context),
+            _turning_point_section(context),
             _collapse_section(context),
             _tail_consumer_section(context),
             carding_section,
@@ -3938,16 +4182,8 @@ def format_market_replay_sections(context: dict[str, Any], *, max_sections: int 
             f"，变化{_fmt_pct(delta)}，领涨{_text(latest.get('leader_name'), '未知')}"
         )
     if board_parts:
-        hidden_line = ""
-        if any("商业航天" in _text(row.get("board")) or "航天" in _text(row.get("driver_name")) for _, _, row, _ in timeline_rows[:8]):
-            hidden_line = "这时有一条暗线开始露头—商业航天。"
-        robot_line = ""
-        if any("机器人" in _text(row.get("board")) or "机器人" in _text(row.get("driver_name")) for _, _, row, _ in timeline_rows[:8]):
-            robot_line = "下午机器人方向被资金平铺买入。"
         sections.append(
-            hidden_line
-            + robot_line
-            + "板块卡位不是看最终涨幅一个点，而是看全天变化。"
+            "板块卡位不是看最终涨幅一个点，而是看全天变化。"
             + "；".join(board_parts)
             + "。变化最大的方向通常就是资金切换和情绪温度的证据。"
         )

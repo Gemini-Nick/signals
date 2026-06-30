@@ -3919,6 +3919,11 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "watch_sort_priority",
         "watch_backfill_source",
         "clue_quality_score",
+        "hot_rank_tier",
+        "hot_rank_sources",
+        "hot_rank_ranks",
+        "hot_rank_strategy_tags",
+        "hot_rank_as_of",
         "promotion_gates",
         "entry_reason",
         "missing_condition",
@@ -8856,6 +8861,73 @@ def _manual_clue_raw_rows(limit: int) -> list[dict[str, Any]]:
     return rows
 
 
+def _hot_rank_clue_rows(limit: int) -> list[dict[str, Any]]:
+    try:
+        db = _mongo_db()
+        docs = list(db["hot_rank_clues"].find(
+            {"active": True},
+            {
+                "_id": 1,
+                "raw_code": 1,
+                "code": 1,
+                "symbol": 1,
+                "name": 1,
+                "score": 1,
+                "tier": 1,
+                "sources": 1,
+                "ranks": 1,
+                "strategy_tags": 1,
+                "reason_summary": 1,
+                "as_of": 1,
+                "updated_at": 1,
+            },
+        ).sort([("score", -1), ("updated_at", -1)]).limit(limit))
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        raw_code = _text(doc.get("raw_code") or doc.get("code") or doc.get("_id"))
+        symbol = _text(doc.get("symbol") or raw_code)
+        row = _raw_shell_stock_row({
+            "symbol": symbol,
+            "raw_code": raw_code,
+            "name": doc.get("name"),
+            "reason": _text(doc.get("reason_summary")) or "热榜启动/均线攀爬线索",
+            "score": doc.get("score"),
+            "latest_signal": _text(doc.get("reason_summary")) or "热榜启动/均线攀爬线索",
+            "source_collection": "hot_rank_clues",
+            "source_collections": ["hot_rank_clues"],
+            "source_tags": ["自动热榜", _text(doc.get("tier")) or "线索"],
+            "metadata": {
+                "source_collection": "hot_rank_clues",
+                "auto_clue": True,
+                "hot_rank_score": doc.get("score"),
+                "hot_rank_tier": doc.get("tier"),
+                "hot_rank_sources": list(doc.get("sources") or []),
+                "hot_rank_ranks": dict(doc.get("ranks") or {}),
+                "strategy_tags": list(doc.get("strategy_tags") or []),
+                "as_of": _text(doc.get("as_of")),
+            },
+        }, group="clue_stocks")
+        row.update({
+            "source": "hot_rank_clues",
+            "source_collection": "hot_rank_clues",
+            "source_collections": ["hot_rank_clues"],
+            "source_tags": ["自动热榜", _text(doc.get("tier")) or "线索"],
+            "trace_summary": "auto_clue:hot_rank_clues",
+            "clue_quality_score": doc.get("score"),
+            "hot_rank_tier": doc.get("tier"),
+            "hot_rank_sources": list(doc.get("sources") or []),
+            "hot_rank_ranks": dict(doc.get("ranks") or {}),
+            "hot_rank_strategy_tags": list(doc.get("strategy_tags") or []),
+            "hot_rank_as_of": _text(doc.get("as_of")),
+        })
+        rows.append(row)
+    return rows
+
+
 def _shell_manual_clue_limit() -> int:
     try:
         return max(1, int(os.getenv("TERMINAL_WORKBENCH_MANUAL_CLUE_LIMIT", "12")))
@@ -9806,6 +9878,9 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         "clue_stocks",
         limit=_shell_stock_group_display_cap("clue_stocks"),
     )
+    hot_rank_clues = _hot_rank_clue_rows(
+        limit=_shell_stock_group_display_cap("clue_stocks"),
+    )
     manual_clues = _manual_clue_rows(
         range_columns,
         limit=_shell_manual_clue_limit(),
@@ -9815,7 +9890,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     focus_stocks = _merge_stock_rows_by_symbol(manual_attack_focus + focus_stocks)
     manual_focus_count = len(manual_attack_focus)
     remaining_manual_clues = _remaining_manual_clues_after_attack_focus(manual_clues, manual_attack_focus)
-    scored_raw = _merge_stock_rows_by_symbol(remaining_manual_clues + (clue_stocks or strategy_clues))
+    scored_raw = _merge_stock_rows_by_symbol(remaining_manual_clues + hot_rank_clues + clue_stocks + strategy_clues)
     scored = _enrich_scored_stock_rows(scored_raw, range_columns)
     for stock_rows in (
         all_etfs,
@@ -9823,6 +9898,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         risk_stocks,
         watch_stocks,
         clue_stocks,
+        hot_rank_clues,
         manual_clues,
         scored,
         sell_warnings,
@@ -9840,6 +9916,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         (risk_stocks, "signal_lane"),
         (watch_stocks, "signal_lane"),
         (clue_stocks, "signal_lane"),
+        (hot_rank_clues, "signal_lane"),
         (manual_clues, "signal_lane"),
     ):
         for row in rows:
@@ -9937,10 +10014,11 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
             },
             "buy_candidates": {
                 "label": "线索池",
-                "source_collection": "terminal_manual_clues + terminal_stock_pool.clue_stocks + strategy_snapshots.strategy_candidate",
+                "source_collection": "terminal_manual_clues + hot_rank_clues + terminal_stock_pool.clue_stocks + strategy_snapshots.strategy_candidate",
                 "count": len(scored),
                 "role": "source_clue_only_not_entry",
                 "manual_clues": len(remaining_manual_clues),
+                "auto_hot_rank_clues": len(hot_rank_clues),
                 "manual_attack_promoted": manual_focus_count,
                 "empty_reason": "" if scored else "当前没有纯线索；已有硬技术的标的会进入盯盘池或买点池。",
             },

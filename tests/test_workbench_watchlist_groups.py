@@ -1945,6 +1945,55 @@ def test_terminal_stock_pool_group_rows_reads_clue_stocks_with_quote_overlay(mon
     assert refresh_calls[0]["symbols"] == ["SZ.301363"]
 
 
+def test_hot_rank_clue_rows_reads_active_auto_clues(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Cursor(list):
+        def sort(self, *args, **kwargs):
+            return self
+
+        def limit(self, n):
+            return _Cursor(self[:n])
+
+    class _HotRankCollection:
+        def find(self, query=None, projection=None):
+            assert query == {"active": True}
+            return _Cursor([
+                {
+                    "_id": "603290",
+                    "raw_code": "603290",
+                    "name": "斯达半导",
+                    "score": 62.4,
+                    "tier": "B观察",
+                    "sources": ["eastmoney"],
+                    "ranks": {"eastmoney": 97},
+                    "strategy_tags": ["just_started", "daily_ma5_climb"],
+                    "reason_summary": "东财热榜 + 刚启动、沿5日线攀爬",
+                    "as_of": "2026-06-30",
+                },
+            ])
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"hot_rank_clues": _HotRankCollection()}))
+
+    rows = workbench._hot_rank_clue_rows(limit=5)
+
+    assert rows[0]["symbol"] == "SH.603290"
+    assert rows[0]["source_collection"] == "hot_rank_clues"
+    assert rows[0]["stage_label"] == "线索池"
+    assert rows[0]["metadata"]["auto_clue"] is True
+    assert rows[0]["hot_rank_sources"] == ["eastmoney"]
+    assert rows[0]["hot_rank_ranks"] == {"eastmoney": 97}
+
+    slim = workbench._slim_shell_stock_row(rows[0])
+    assert slim["hot_rank_tier"] == "B观察"
+    assert slim["hot_rank_sources"] == ["eastmoney"]
+    assert slim["hot_rank_ranks"] == {"eastmoney": 97}
+
+
 def test_manual_clue_rows_reuse_stock_pool_decision_fields(monkeypatch):
     from signals.web.api import workbench
 
