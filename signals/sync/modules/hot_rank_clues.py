@@ -31,6 +31,16 @@ SOURCE_LABELS = {
     "wind": "Wind",
 }
 THS_HOT_RANK_URL = "https://dq.10jqka.com.cn/fuyao/hot_list_data/out/hot_list/v1/stock"
+EASTMONEY_HOT_RANK_URL = "https://emappdata.eastmoney.com/stockrank/getAllCurrentList"
+EASTMONEY_QUOTE_URLS = (
+    "https://push2delay.eastmoney.com/api/qt/ulist.np/get",
+    "http://push2.eastmoney.com/api/qt/ulist.np/get",
+)
+EASTMONEY_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Referer": "https://guba.eastmoney.com/rank/",
+}
 THS_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
     "Accept": "application/json,text/plain,*/*",
@@ -168,13 +178,96 @@ def _normalize_records(records: list[dict[str, Any]], *, source: str, limit: int
     return out
 
 
-def _fetch_eastmoney_hot_rank(limit: int) -> list[dict[str, Any]]:
-    import akshare as ak
+def _eastmoney_rank_code(value: Any) -> str:
+    text = _text(value).upper()
+    if text.startswith(("SZ", "SH", "BJ")):
+        return text[2:]
+    return _pure_a_code(text)
 
-    df = ak.stock_hot_rank_em()
-    if df is None or df.empty:
+
+def _eastmoney_secid(value: Any) -> str:
+    text = _text(value).upper()
+    code = _eastmoney_rank_code(text)
+    if len(code) != 6:
+        return ""
+    if text.startswith("SH") or code.startswith("6"):
+        return f"1.{code}"
+    return f"0.{code}"
+
+
+def _fetch_eastmoney_quote_rows(session: requests.Session, secids: list[str]) -> dict[str, dict[str, Any]]:
+    if not secids:
+        return {}
+    params = {
+        "ut": "f057cbcbce2a86e2866ab8877db1d059",
+        "fltt": "2",
+        "invt": "2",
+        "fields": "f14,f3,f12,f2",
+        "secids": ",".join(secids),
+    }
+    last_error: Exception | None = None
+    for url in EASTMONEY_QUOTE_URLS:
+        try:
+            response = session.get(url, params=params, headers=EASTMONEY_HEADERS, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+            rows = ((payload.get("data") or {}).get("diff") or []) if isinstance(payload, dict) else []
+            return {
+                _pure_a_code(row.get("f12")): row
+                for row in rows
+                if isinstance(row, dict) and _pure_a_code(row.get("f12"))
+            }
+        except Exception as exc:
+            last_error = exc
+            continue
+    if last_error:
+        logger.warning("eastmoney hot rank quote lookup failed: %s", last_error)
+    return {}
+
+
+def _fetch_eastmoney_hot_rank(limit: int) -> list[dict[str, Any]]:
+    payload = {
+        "appId": "appId01",
+        "globalId": "786e4c21-70dc-435a-93bb-38",
+        "marketType": "",
+        "pageNo": 1,
+        "pageSize": max(limit, 100),
+    }
+    with requests.Session() as session:
+        session.trust_env = False
+        response = session.post(EASTMONEY_HOT_RANK_URL, json=payload, headers=EASTMONEY_HEADERS, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        rank_rows = (data.get("data") or []) if isinstance(data, dict) else []
+        if not rank_rows:
+            return []
+        secids = [
+            secid
+            for row in rank_rows[:limit]
+            if isinstance(row, dict)
+            for secid in [_eastmoney_secid(row.get("sc"))]
+            if secid
+        ]
+        quotes = _fetch_eastmoney_quote_rows(session, secids)
+    records: list[dict[str, Any]] = []
+    for position, row in enumerate(rank_rows[:limit], start=1):
+        if not isinstance(row, dict):
+            continue
+        code = _eastmoney_rank_code(row.get("sc"))
+        if not code:
+            continue
+        quote = quotes.get(code) or {}
+        records.append({
+            "当前排名": row.get("rk") or position,
+            "代码": code,
+            "股票名称": quote.get("f14") or row.get("name") or "",
+            "最新价": quote.get("f2"),
+            "涨跌幅": quote.get("f3"),
+            "热度": row.get("rc"),
+        })
+    if not records:
         return []
-    return _normalize_records(df.head(limit).to_dict("records"), source="eastmoney", limit=limit)
+    return _normalize_records(records, source="eastmoney", limit=limit)
 
 
 def _extract_ths_rows(payload: Any) -> list[dict[str, Any]]:

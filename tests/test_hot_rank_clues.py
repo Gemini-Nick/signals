@@ -7,8 +7,10 @@ import pandas as pd
 
 from signals.sync.engine import COLLECTION_DOMAINS, MODULE_TARGETS
 from signals.sync.modules import ALL_MODULES
+from signals.sync.modules import hot_rank_clues as hot_rank_module
 from signals.sync.modules.hot_rank_clues import (
     _analyze_candidate,
+    _fetch_eastmoney_hot_rank,
     _load_wind_export_rows,
     _merge_hot_rows,
     _weekly_from_daily,
@@ -91,6 +93,81 @@ def test_load_wind_export_rows_accepts_common_chinese_columns(tmp_path):
             "pct_chg": 0.0,
             "topic": "",
         }
+    ]
+
+
+def test_fetch_eastmoney_hot_rank_uses_native_push2delay_without_bad_v_param(monkeypatch):
+    calls = []
+
+    class _Response:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class _Session:
+        def __init__(self):
+            self.trust_env = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, **kwargs):
+            calls.append(("post", url, kwargs))
+            return _Response({
+                "data": [
+                    {"sc": "SZ000725", "rk": 1, "rc": 0},
+                    {"sc": "SH600000", "rk": 2, "rc": 1},
+                ]
+            })
+
+        def get(self, url, **kwargs):
+            calls.append(("get", url, kwargs, self.trust_env))
+            return _Response({
+                "data": {
+                    "diff": [
+                        {"f12": "000725", "f14": "京东方A", "f2": 8.58, "f3": -1.15},
+                        {"f12": "600000", "f14": "浦发银行", "f2": 10.12, "f3": 0.59},
+                    ]
+                }
+            })
+
+    monkeypatch.setattr(hot_rank_module.requests, "Session", _Session)
+
+    rows = _fetch_eastmoney_hot_rank(2)
+
+    get_call = next(item for item in calls if item[0] == "get")
+    assert "push2delay.eastmoney.com" in get_call[1]
+    assert "?v=" not in get_call[2]["params"]["secids"]
+    assert get_call[3] is False
+    assert rows == [
+        {
+            "code": "000725",
+            "symbol": "SZ.000725",
+            "name": "京东方A",
+            "source": "eastmoney",
+            "rank": 1,
+            "hot_score": 0.0,
+            "pct_chg": -1.15,
+            "topic": "",
+        },
+        {
+            "code": "600000",
+            "symbol": "SH.600000",
+            "name": "浦发银行",
+            "source": "eastmoney",
+            "rank": 2,
+            "hot_score": 1.0,
+            "pct_chg": 0.59,
+            "topic": "",
+        },
     ]
 
 
