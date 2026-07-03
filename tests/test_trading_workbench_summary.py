@@ -951,7 +951,7 @@ def test_wechat_summary_preserves_signals_candidate_order():
     assert "【2026-05-08｜11:15 午间重规划】" in result.text
     assert "盘面：" in result.text
     assert "证据：" in result.text
-    assert "复核：下午只看主线承接和跟随扩散。" in result.text
+    assert "复核：午后只看主线承接、跟随扩散和弱指数能否收回。" in result.text
     assert "失效：" in result.text
     assert "回看：" in result.text
     assert "指数：" in result.text
@@ -977,7 +977,12 @@ def test_wechat_summary_preserves_signals_candidate_order():
     assert "隆基绿能" in result.text
     assert "半导体产业链/半导体设备" in result.text
     assert "先看" in result.text
-    assert "暂不动" in result.text
+    assert "只留观察" in result.text
+    assert "N/A" not in result.text
+    assert "unknown" not in result.text
+    assert "处理：" not in result.text
+    assert "暂不动" not in result.text
+    assert "排雷名单" not in result.text
     assert "均线策略" not in result.text
     assert "不追" in result.text
     assert "交易含义" not in result.text
@@ -1042,6 +1047,11 @@ def test_wechat_intraday_windows_use_trader_note_voice():
         "复核对象",
         "今日触发信号",
         "回测",
+        "N/A",
+        "unknown",
+        "处理：",
+        "暂不动",
+        "排雷名单",
     )
     for window in ("preopen", "ten", "midday", "two", "close"):
         result = build_wechat_summary(
@@ -1064,7 +1074,7 @@ def test_wechat_intraday_windows_use_trader_note_voice():
         assert "先列观察" in result.text
         assert "票池共性" in result.text
         assert "先看：" in result.text
-        assert "暂不动：" in result.text
+        assert "只留观察：" in result.text
         for term in old_or_engineering_terms:
             assert term not in result.text
 
@@ -1225,6 +1235,28 @@ def test_breakpoint_watch_lines_frame_two_oclock_confirmation():
 
     assert any("13:45变盘前" in line and "14:00后" in line for line in lines)
     assert any("已破4070" in line for line in lines)
+
+
+def test_breakpoint_watch_lines_marks_stale_two_oclock_data():
+    def ts(hour: int, minute: int) -> int:
+        return int(datetime(2026, 5, 27, hour, minute, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp())
+
+    contexts = {
+        "上证指数": {
+            "target": {"label": "上证指数", "market_timezone": "Asia/Shanghai"},
+            "summary": {"key_levels": [{"name": "20周线", "value": 4069.21}]},
+            "chart": {"ohlcv": [{"time": ts(11, 25), "low": 4068.0, "close": 4071.0}]},
+        },
+        "创业板指": {
+            "target": {"label": "创业板指", "market_timezone": "Asia/Shanghai"},
+            "chart": {"ohlcv": [{"time": ts(11, 25), "low": 4074.0, "close": 4078.0}]},
+        },
+    }
+
+    lines = _breakpoint_watch_lines(contexts, "two")
+
+    assert any("13:45变盘前（数据只到11:25）" in line for line in lines)
+    assert any("可用最新" in line for line in lines)
 
 
 def test_board_heat_event_lines_detects_generic_afternoon_reversal():

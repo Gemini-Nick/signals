@@ -213,6 +213,10 @@ def test_lane_filtered_daemon_only_runs_matching_live_plans():
         calls.append("fullmarket_spot_snapshot")
         return {"inserted": 1}
 
+    def etf_spot_fn(db, proxy_url=None):
+        calls.append("etf_spot_snapshot")
+        return {"inserted": 1}
+
     def quote_fn(db, proxy_url=None):
         calls.append("quote_snapshots")
         return {"inserted": 1}
@@ -224,6 +228,7 @@ def test_lane_filtered_daemon_only_runs_matching_live_plans():
     engine.module_map = {
         "eastmoney_ulist_quote": (ulist_fn, ""),
         "fullmarket_spot_snapshot": (fullmarket_fn, ""),
+        "etf_spot_snapshot": (etf_spot_fn, ""),
         "quote_snapshots": (quote_fn, ""),
         "index_minute": (index_fn, ""),
     }
@@ -231,8 +236,8 @@ def test_lane_filtered_daemon_only_runs_matching_live_plans():
 
     results = engine._run_intraday_bundle({Market.A}, datetime(2026, 4, 27, 10, 0))
 
-    assert calls == ["eastmoney_ulist_quote", "fullmarket_spot_snapshot", "quote_snapshots"]
-    assert [item["module"] for item in results] == calls
+    assert calls == ["eastmoney_ulist_quote", "fullmarket_spot_snapshot", "etf_spot_snapshot", "quote_snapshots"]
+    assert sorted(item["module"] for item in results) == sorted(calls)
 
 
 def test_signal_lane_intraday_runs_readiness_probe():
@@ -355,7 +360,7 @@ def test_board_lane_intraday_runs_heat_not_board_cons():
     results = engine._run_intraday_bundle({Market.A}, datetime(2026, 4, 27, 10, 0))
 
     assert calls == ["board_heat_minute", "concept_heat_minute", "chain_heat_snapshots"]
-    assert [item["module"] for item in results] == calls
+    assert sorted(item["module"] for item in results) == sorted(calls)
 
 
 def test_workbench_lane_intraday_rebuilds_terminal_stock_pool():

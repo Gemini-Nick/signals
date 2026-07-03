@@ -15,6 +15,7 @@ from .cache_preheat import sync_cache_preheat
 from .market_pools import sync_market_pools
 from .market_limit_pools import sync_market_limit_pools
 from .fullmarket_spot_snapshot import sync_fullmarket_spot_snapshot
+from .etf_spot_snapshot import sync_etf_spot_snapshot
 from .quote_snapshots import sync_eastmoney_ulist_quote, sync_quote_snapshots
 from .signal_pool import sync_signal_pool
 from .strategy_snapshot import sync_strategy_snapshot
@@ -32,6 +33,7 @@ from .security_business_facts import sync_security_business_facts
 ALL_MODULES = [
     ("calendar_validate", sync_calendar_validate, "08:30 weekday"),
     ("fullmarket_spot_snapshot", sync_fullmarket_spot_snapshot, "15:35-23:50 weekday"),
+    ("etf_spot_snapshot", sync_etf_spot_snapshot, "15:35-23:50 weekday"),
     ("market_pools",  sync_market_pools,  "09:05 weekday"),
     ("market_limit_pools", sync_market_limit_pools, "09:25-15:05 weekday"),
     ("eastmoney_ulist_quote", sync_eastmoney_ulist_quote, "09:10 weekday"),

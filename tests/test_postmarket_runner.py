@@ -12,6 +12,7 @@ from signals.sync import postmarket as pm
 
 def test_default_postmarket_tasks_split_long_market_data_tasks():
     spot = next(task for task in pm.POSTMARKET_TASKS if task.module == "fullmarket_spot_snapshot")
+    etf_spot = next(task for task in pm.POSTMARKET_TASKS if task.module == "etf_spot_snapshot")
     quote = next(task for task in pm.POSTMARKET_TASKS if task.module == "quote_snapshots")
     stock_daily = [task for task in pm.POSTMARKET_TASKS if task.module == "stock_daily"]
     hk_stock_daily = [task for task in pm.POSTMARKET_TASKS if task.module == "hk_stock_daily"]
@@ -22,8 +23,11 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     technical_scan = next(task for task in pm.POSTMARKET_TASKS if task.module == "technical_signal_scan")
     chain = next(task for task in pm.POSTMARKET_TASKS if task.module == "chain_heat_snapshots")
     chain_rebuild = next(task for task in pm.POSTMARKET_TASKS if task.module == "postmarket_chain_rebuild")
+    strategy_snapshot = next(task for task in pm.POSTMARKET_TASKS if task.module == "strategy_snapshot")
 
     assert spot.phase == "market_data"
+    assert etf_spot.phase == "market_data"
+    assert etf_spot.depends_on == ()
     assert len(stock_daily) == 16
     assert len(hk_stock_daily) == 8
     assert len(stock_30m) == 16
@@ -35,9 +39,10 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert all(task.phase == "hk_market_data" for task in hk_stock_daily)
     assert all(task.blocks_run is False for task in hk_stock_daily)
     assert all(task.blocks_run is False for task in stock_30m)
-    assert quote.depends_on == ("fullmarket_spot_snapshot:all",)
-    assert all(task.depends_on == ("fullmarket_spot_snapshot:all",) for task in stock_daily)
+    assert quote.depends_on == ("fullmarket_spot_snapshot:all", "etf_spot_snapshot:all")
+    assert all(task.depends_on == ("fullmarket_spot_snapshot:all", "etf_spot_snapshot:all") for task in stock_daily)
     assert index_daily.depends_on == ("quote_snapshots:all",)
+    assert "etf_spot_snapshot:all" in strategy_snapshot.depends_on
     assert all(task.task_key not in technical_scan.depends_on for task in stock_30m)
     assert not (set(task.task_key for task in hk_stock_daily) & set(technical_scan.depends_on))
     assert {task.shard_key for task in board_cons} == {"board", "concept"}

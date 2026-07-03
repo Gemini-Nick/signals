@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from signals.sync.modules import fullmarket_spot_snapshot
+from signals.sync.modules import etf_spot_snapshot
 from signals.sync.modules import stock_daily
 
 
@@ -68,6 +69,65 @@ def test_fullmarket_spot_doc_recomputes_stale_provider_change_fields():
 
     assert doc["change"] == 0.25
     assert doc["change_pct"] == 2.439
+
+
+def test_etf_spot_doc_maps_quote_and_daily_fields():
+    row = {
+        "f12": "562590",
+        "f13": 1,
+        "f14": "半导体设备ETF",
+        "f2": 3.82,
+        "f3": -10.0,
+        "f5": 631300,
+        "f6": 240000000,
+        "f7": 4.5,
+        "f8": 12.3,
+        "f15": 4.02,
+        "f16": 3.82,
+        "f17": 4.01,
+        "f18": 4.2444,
+        "f20": 2000000000,
+        "f21": 1900000000,
+    }
+
+    doc = etf_spot_snapshot._doc_from_row(
+        row,
+        date_key="20260702",
+        trade_date="2026-07-02",
+        snapshot_at=datetime(2026, 7, 2, 15, 30),
+    )
+
+    assert doc["_id"] == "20260702:562590"
+    assert doc["symbol"] == "SH.562590"
+    assert doc["source"] == "eastmoney_etf_spot"
+    assert doc["asset_class"] == "etf"
+    assert doc["security_type"] == "etf"
+    assert doc["price"] == 3.82
+    assert doc["open"] == 4.01
+    assert doc["high"] == 4.02
+    assert doc["low"] == 3.82
+    assert doc["prev_close"] == 4.2444
+    assert doc["change"] == -0.4244
+    assert doc["change_pct"] == -9.9991
+    assert doc["vol"] == 63130000
+    assert doc["volume_unit"] == "shares"
+    assert doc["source_volume_unit"] == "hands"
+
+
+def test_etf_spot_doc_keeps_universe_rows_when_quote_is_empty():
+    doc = etf_spot_snapshot._doc_from_row(
+        {"f12": "589990", "f13": 1, "f14": "科创综指ETF", "f2": "-"},
+        date_key="20260702",
+        trade_date="2026-07-02",
+        snapshot_at=datetime(2026, 7, 2, 15, 30),
+    )
+
+    assert doc["code"] == "589990"
+    assert doc["symbol"] == "SH.589990"
+    assert doc["price"] is None
+    assert doc["open"] is None
+    assert doc["high"] is None
+    assert doc["low"] is None
 
 
 class _Collection:

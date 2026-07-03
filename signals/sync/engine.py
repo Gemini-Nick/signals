@@ -42,6 +42,7 @@ MODULE_TARGETS = {
     "market_pools": ("market_pools",),
     "market_limit_pools": ("market_limit_pools",),
     "fullmarket_spot_snapshot": ("fullmarket_spot_snapshots",),
+    "etf_spot_snapshot": ("etf_spot_snapshots",),
     "eastmoney_ulist_quote": ("quote_snapshots",),
     "quote_snapshots": ("quote_snapshots",),
     "strategy_snapshot": ("strategy_snapshots",),
@@ -105,6 +106,7 @@ COLLECTION_DOMAINS = {
     "market_pools": "market_pool",
     "market_limit_pools": "market_limit_pool",
     "fullmarket_spot_snapshots": "spot",
+    "etf_spot_snapshots": "etf_spot",
     "signals": "signal",
     "strategy_snapshots": "strategy",
 }
@@ -113,12 +115,14 @@ WRITER_FRESHNESS_FIELDS = {
     "quote_snapshots": ("live_count", "stale_count"),
     "eastmoney_ulist_quote": ("live_count", "stale_count"),
     "fullmarket_spot_snapshot": ("elapsed_seconds", "latest_dt", "count"),
+    "etf_spot_snapshot": ("elapsed_seconds", "latest_dt", "count"),
 }
 
 REALTIME_MODULES = {
     "market_pools",
     "market_limit_pools",
     "fullmarket_spot_snapshot",
+    "etf_spot_snapshot",
     "eastmoney_ulist_quote",
     "quote_snapshots",
     "stock_minute",
@@ -163,6 +167,7 @@ INTRADAY_STALE_SECONDS = max(
 QUOTE_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_QUOTE_INTERVAL_SECONDS", 60)
 EASTMONEY_ULIST_QUOTE_INTERVAL_SECONDS = _env_seconds("SIGNALS_EASTMONEY_ULIST_QUOTE_INTERVAL_SECONDS", 10, minimum=5)
 FULLMARKET_SPOT_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_FULLMARKET_SPOT_INTERVAL_SECONDS", 90, minimum=30)
+ETF_SPOT_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_ETF_SPOT_INTERVAL_SECONDS", 180, minimum=60)
 SIGNAL_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_SIGNAL_INTERVAL_SECONDS", 5 * 60)
 WORKBENCH_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_WORKBENCH_INTERVAL_SECONDS", 10 * 60)
 BOARD_LANE_INTERVAL_SECONDS = _env_seconds("SIGNALS_LIVE_BOARD_INTERVAL_SECONDS", 60)
@@ -187,6 +192,7 @@ LIVE_SYNC_PLANS = {
     Market.A: (
         LiveSyncPlan("eastmoney_ulist_quote", "quote_lane", EASTMONEY_ULIST_QUOTE_INTERVAL_SECONDS, _lane_stale(EASTMONEY_ULIST_QUOTE_INTERVAL_SECONDS, 6), 20, 5),
         LiveSyncPlan("fullmarket_spot_snapshot", "quote_lane", FULLMARKET_SPOT_INTERVAL_SECONDS, _lane_stale(FULLMARKET_SPOT_INTERVAL_SECONDS, 3), 30, 8),
+        LiveSyncPlan("etf_spot_snapshot", "quote_lane", ETF_SPOT_INTERVAL_SECONDS, _lane_stale(ETF_SPOT_INTERVAL_SECONDS, 3), 60, 9),
         LiveSyncPlan("quote_snapshots", "quote_lane", QUOTE_LANE_INTERVAL_SECONDS, _lane_stale(QUOTE_LANE_INTERVAL_SECONDS, 3), 20, 10),
         LiveSyncPlan("index_minute", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 120, 20),
         LiveSyncPlan("stock_minute", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 240, 30),
@@ -209,6 +215,7 @@ LIVE_SYNC_PLANS = {
 LIVE_SYNC_STAGE_BY_MODULE = {
     "eastmoney_ulist_quote": 0,
     "fullmarket_spot_snapshot": 0,
+    "etf_spot_snapshot": 0,
     "quote_snapshots": 0,
     "index_minute": 0,
     "stock_minute": 0,
@@ -240,6 +247,7 @@ LANE_MAINTENANCE_PLANS = {
     "concept_heat_minute": LiveSyncPlan("concept_heat_minute", "board_lane", 24 * 60 * 60, 60 * 60, 180, 8),
     "chain_heat_snapshots": LiveSyncPlan("chain_heat_snapshots", "board_lane", 24 * 60 * 60, 60 * 60, 90, 9),
     "minute_readiness_probe": LiveSyncPlan("minute_readiness_probe", "signal_lane", 24 * 60 * 60, 60 * 60, 60, 9),
+    "etf_spot_snapshot": LiveSyncPlan("etf_spot_snapshot", "quote_lane", 24 * 60 * 60, 2 * 60 * 60, 600, 20),
     "stock_daily": LiveSyncPlan("stock_daily", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 3600, 30),
     "hk_stock_daily": LiveSyncPlan("hk_stock_daily", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 3600, 32),
     "stock_30m_fullmarket": LiveSyncPlan("stock_30m_fullmarket", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 5400, 35),
@@ -262,6 +270,7 @@ LANE_MAINTENANCE_PLANS = {
 BOOTSTRAP_LANE_MODULES = {
     "eastmoney_ulist_quote": {"quote_lane"},
     "fullmarket_spot_snapshot": {"quote_lane"},
+    "etf_spot_snapshot": {"quote_lane"},
     "quote_snapshots": {"quote_lane"},
     "market_pools": {"workbench_lane"},
     "market_limit_pools": {"workbench_lane"},
@@ -825,7 +834,7 @@ class SyncEngine:
                 stage_items = [item for item in runnable if item[0] == stage]
                 if not stage_items:
                     continue
-                workers = min(self.max_workers, max(1, len(stage_items)))
+                workers = min(getattr(self, "max_workers", 4), max(1, len(stage_items)))
                 logger.info(
                     "⏱ live stage=%s market=%s modules=%s workers=%d",
                     stage,

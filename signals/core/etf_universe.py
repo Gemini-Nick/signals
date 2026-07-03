@@ -186,7 +186,14 @@ def all_market_etf_universe(
             item["sources"].append(source)
         source_counts[source] = source_counts.get(source, 0) + 1
 
-    include_live = _truthy_env("SIGNALS_ETF_UNIVERSE_LIVE", default=True) if include_live is None else include_live
+    cached_count = 0
+    if db is not None:
+        cached_count = _add_cached_etf_spot_rows(db, add, warnings)
+
+    if include_live is None:
+        include_live = _truthy_env("SIGNALS_ETF_UNIVERSE_LIVE", default=db is None)
+        if db is not None and cached_count <= 0 and _truthy_env("SIGNALS_ETF_UNIVERSE_LIVE_FALLBACK", default=True):
+            include_live = True
     if include_live:
         try:
             for row in fetch_eastmoney_etf_spot_rows(timeout=_live_timeout()):
@@ -225,6 +232,51 @@ def all_market_etf_universe(
         "warnings": warnings,
         "elapsed_seconds": round(time.monotonic() - started, 3),
     }
+
+
+def _add_cached_etf_spot_rows(db: Any, add, warnings: list[str]) -> int:
+    try:
+        latest = db["etf_spot_snapshots"].find_one(
+            {},
+            {"_id": 0, "date_key": 1},
+            sort=[("date_key", -1), ("snapshot_at", -1)],
+        ) or {}
+        date_key = str(latest.get("date_key") or "")
+        if not date_key:
+            return 0
+        cursor = db["etf_spot_snapshots"].find(
+            {"date_key": date_key},
+            {
+                "_id": 0,
+                "code": 1,
+                "symbol": 1,
+                "name": 1,
+                "price": 1,
+                "latest": 1,
+                "change_pct": 1,
+                "vol": 1,
+                "amount": 1,
+                "amplitude_pct": 1,
+                "turnover_pct": 1,
+                "high": 1,
+                "low": 1,
+                "open": 1,
+                "prev_close": 1,
+                "market_cap": 1,
+                "float_market_cap": 1,
+                "market_id": 1,
+                "trade_date": 1,
+                "source": 1,
+            },
+        )
+        count = 0
+        for row in cursor:
+            add(row, "etf_spot_snapshots")
+            count += 1
+        return count
+    except Exception as exc:
+        warnings.append(f"etf_spot_snapshots:{exc.__class__.__name__}:{str(exc)[:120]}")
+        return 0
 
 
 def build_etf_strategy_analysis(*, db: Any = None, include_live: bool | None = None) -> dict[str, Any]:

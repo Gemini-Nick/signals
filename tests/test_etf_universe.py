@@ -89,6 +89,39 @@ def test_all_market_etf_universe_merges_live_stock_names_bars_and_static(monkeyp
     assert result["total"] >= 3
 
 
+def test_all_market_etf_universe_reads_cached_spot_before_live(monkeypatch):
+    from signals.core import etf_universe
+
+    monkeypatch.delenv("SIGNALS_ETF_UNIVERSE_LIVE", raising=False)
+    monkeypatch.setattr(
+        etf_universe,
+        "fetch_eastmoney_etf_spot_rows",
+        lambda timeout=8.0: (_ for _ in ()).throw(AssertionError("live ETF fetch should not run when cache exists")),
+    )
+    db = _DB({
+        "etf_spot_snapshots": _Collection([
+            {
+                "date_key": "20260702",
+                "code": "562590",
+                "symbol": "SH.562590",
+                "name": "半导体设备ETF",
+                "price": 3.82,
+                "change_pct": -10.0,
+                "amount": 240000000,
+                "vol": 63130000,
+                "source": "eastmoney_etf_spot",
+            },
+        ]),
+    })
+
+    result = etf_universe.all_market_etf_universe(db=db)
+    by_code = {row["code"]: row for row in result["rows"]}
+
+    assert by_code["562590"]["price"] == 3.82
+    assert "etf_spot_snapshots" in by_code["562590"]["sources"]
+    assert result["source_counts"]["etf_spot_snapshots"] >= 1
+
+
 def test_etf_strategy_analysis_projects_review_lists(monkeypatch):
     from signals.core import etf_universe
 

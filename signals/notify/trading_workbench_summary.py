@@ -338,6 +338,22 @@ def _breakpoint_watch_lines(contexts: dict[str, dict[str, Any]], window: str) ->
     return lines[:2]
 
 
+def _label_coverage(label: str, latest_dt: datetime | None) -> tuple[str, bool]:
+    if latest_dt is None:
+        return label, False
+    expected_time = None
+    for marker in ("9:45", "13:45"):
+        if label.startswith(marker):
+            hour, minute = marker.split(":", 1)
+            expected_time = time(int(hour), int(minute))
+            break
+    if label == "午盘前":
+        expected_time = time(11, 15)
+    if expected_time is None or latest_dt.time() >= expected_time:
+        return label, False
+    return f"{label}（数据只到{latest_dt.strftime('%H:%M')}）", True
+
+
 def _support_watch_line(
     payload: dict[str, Any],
     rows: list[tuple[datetime, dict[str, Any]]],
@@ -361,12 +377,14 @@ def _support_watch_line(
     if support is None:
         return None
     level_text, level_value = support
-    close_text = f"、最新{latest_close:.2f}" if latest_close is not None else ""
+    display_label, stale = _label_coverage(label, rows[-1][0] if rows else None)
+    close_prefix = "可用最新" if stale else "最新"
+    close_text = f"、{close_prefix}{latest_close:.2f}" if latest_close is not None else ""
     if low < level_value:
         condition = f"已破{level_text}，{next_check}先看能否收回，否则按风险扩散处理"
     else:
         condition = f"围绕{level_text}，{next_check}看守住还是击穿"
-    return f"{label}：上证日内低点{low:.2f}{close_text}，{condition}"
+    return f"{display_label}：上证日内低点{low:.2f}{close_text}，{condition}"
 
 
 def _style_watch_line(
@@ -392,12 +410,13 @@ def _style_watch_line(
     cy_return = _intraday_return([(dt, row) for dt, _, row in common])
     if sh_return is None or cy_return is None:
         return None
+    display_label, _ = _label_coverage(label, latest_dt)
     if cy_return >= sh_return:
         condition = "成长日内相对强，若延续才提高科技修复权重；回落则降级为反抽"
     else:
         condition = "成长日内弱于权重，科技反抽不能直接当主线"
     return (
-        f"{label}：截至{latest_dt.strftime('%H:%M')}创业板日内{_fmt_pct(cy_return)}、"
+        f"{display_label}：截至{latest_dt.strftime('%H:%M')}创业板日内{_fmt_pct(cy_return)}、"
         f"上证{_fmt_pct(sh_return)}，{condition}，{next_check}复核"
     )
 
@@ -665,7 +684,7 @@ def _fmt_pct(value: Any, *, signed: bool = True) -> str:
     try:
         pct = float(value)
     except (TypeError, ValueError):
-        return "N/A"
+        return "待确认"
     sign = "+" if signed and pct > 0 else ""
     return f"{sign}{pct:.2f}%"
 
@@ -674,7 +693,7 @@ def _fmt_index_move(value: Any) -> str:
     try:
         pct = float(value)
     except (TypeError, ValueError):
-        return "N/A"
+        return "涨跌待确认"
     if abs(pct) < 0.005:
         return "平盘"
     verb = "涨" if pct > 0 else "跌"
@@ -701,7 +720,7 @@ def _market_line(dashboard: dict[str, Any], shell: dict[str, Any], snapshot: dic
 
 def _as_of_date(dashboard: dict[str, Any], snapshot: dict[str, Any]) -> str:
     brief = dashboard.get("daily_brief") if isinstance(dashboard.get("daily_brief"), dict) else {}
-    return _text(brief.get("as_of") or snapshot.get("as_of") or dashboard.get("status"), "unknown")
+    return _text(brief.get("as_of") or snapshot.get("as_of") or dashboard.get("status"), "待确认")
 
 
 def _index_change_map(shell: dict[str, Any]) -> dict[str, float]:
@@ -1148,7 +1167,7 @@ def build_narrative_review(
 
 
 def _replay_date_title(as_of: str) -> str:
-    if as_of == "unknown":
+    if as_of in {"unknown", "待确认"}:
         return "盘后复盘"
     try:
         year, month, day = [int(part) for part in as_of.split("-", 2)]
@@ -1341,10 +1360,10 @@ def _wechat_action_label(row: dict[str, Any]) -> str:
 def _wechat_strategy_action_text(row: dict[str, Any]) -> str:
     label = _wechat_action_label(row)
     if label == "忽略":
-        return "处理：排雷，不参与。"
+        return "风险没解除，不纳入盘中复盘。"
     if label == "看":
-        return "处理：板块不断、指数不拖累再看。"
-    return "处理：等30m和均线补位。"
+        return "板块不断、指数不拖累，再留一眼。"
+    return "等30m和均线补位，没补前只观察。"
 
 
 def _compact_trigger(row: dict[str, Any]) -> str:
@@ -1470,7 +1489,7 @@ def _index_change(row: dict[str, Any]) -> float | None:
 
 def _index_structure_text(row: dict[str, Any], label: str) -> str:
     change = _index_change(row)
-    change_text = _fmt_pct(change) if change is not None else "N/A"
+    change_text = _fmt_pct(change) if change is not None else "涨跌待确认"
     daily = _text(row.get("daily_trend") or row.get("daily_stage"))
     f30 = _text(row.get("f30_trend") or row.get("m30_trend") or row.get("thirty_trend"))
     f15 = _text(row.get("f15_trend") or row.get("m15_trend") or row.get("fifteen_trend"))
@@ -1932,7 +1951,7 @@ def _wechat_pool_structure_lines(
             chain_counts[chain] = chain_counts.get(chain, 0) + 1
     if chain_counts:
         top_chain, top_count = max(chain_counts.items(), key=lambda item: item[1])
-        common_line = f"- 票池共性：{top_chain}出现{top_count}只；说明资金反复回到这条线，但还要看日/周背景和均线承接。"
+        common_line = f"- 票池共性：{top_chain}出现{top_count}只；资金反复回到这条线，但还要看日/周背景和均线承接。"
     else:
         common_line = "- 票池共性：暂时没有一条线压住全场，先按板块强弱和均线位置分层。"
 
@@ -1943,9 +1962,9 @@ def _wechat_pool_structure_lines(
     else:
         positive_line = "- 先看：当前没有明确日线/周线底子的票。"
     if missing:
-        missing_line = "- 暂不动：" + "、".join(_symbol_name(row) for row in missing[:4]) + "；不按主线进攻处理。"
+        missing_line = "- 只留观察：" + "、".join(_symbol_name(row) for row in missing[:4]) + "；没有日/周底子，不按主线进攻处理。"
     else:
-        missing_line = "- 暂不动：当前没有集中暴露纯分钟反抽。"
+        missing_line = "- 只留观察：当前没有集中暴露纯分钟反抽。"
     return [common_line, positive_line, missing_line]
 
 
@@ -2040,15 +2059,15 @@ def _wechat_event_evidence_lines(
 
 def _wechat_review_intro(window: str) -> str:
     if window == "preopen":
-        return "复核：开盘后只验预设方向和承接。"
+        return "复核：开盘只验预设方向有没有承接，没扩散就不临盘加戏。"
     if window == "ten":
-        return "复核：10点前只看强板块能否扩散。"
+        return "复核：10点前看强板块能否继续带队，带不动就降成局部修复。"
     if window == "midday":
-        return "复核：下午只看主线承接和跟随扩散。"
+        return "复核：午后只看主线承接、跟随扩散和弱指数能否收回。"
     if window == "two":
-        return "复核：14点前只看变盘方向有没有胜方。"
+        return "复核：14点前看资金是否选边，没有链主确认就不新增方向。"
     if window == "close":
-        return "复核：收盘前只处理能否隔夜和明日观察。"
+        return "复核：收盘前只分隔夜、观察、剔除，不为单点脉冲加票。"
     return "复核：只看证据最明确的票。"
 
 
@@ -2091,11 +2110,11 @@ def _wechat_abandon_lines(
     if missing:
         lines.append(f"- {_compact_row_names(missing, limit=3)}仍缺日/周买点，只看分钟级反抽。")
     elif window == "close":
-        lines.append("- 个股若只剩5m/15m脉冲、上级周期转弱，不纳入明日复盘。")
+        lines.append("- 明日只留板块承接和上级周期还在的对象，纯分钟脉冲不进复盘样本。")
     else:
-        lines.append("- 个股若只剩5m/15m脉冲、上级周期转弱，下午直接移出。")
+        lines.append("- 个股若只剩5m/15m脉冲、上级周期转弱，午后从复盘样本里剔除。")
     if selected_risk:
-        lines.append(f"- 排雷名单{_compact_row_names(selected_risk, limit=3)}未解除前，相关方向先压低仓位想象。")
+        lines.append(f"- 风险线{_compact_row_names(selected_risk, limit=3)}没解除前，只当负反馈观察，不拿来扩散相关方向。")
     return lines
 
 
@@ -2178,7 +2197,7 @@ def build_summary(
 
     title = WINDOW_LABELS.get(window, WINDOW_LABELS["manual"])
     brief = dashboard.get("daily_brief") if isinstance(dashboard.get("daily_brief"), dict) else {}
-    as_of = _text(brief.get("as_of") or snapshot.get("as_of") or dashboard.get("status"), "unknown")
+    as_of = _text(brief.get("as_of") or snapshot.get("as_of") or dashboard.get("status"), "待确认")
     quality = _source_quality(dashboard, snapshot)
 
     lines = [

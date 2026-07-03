@@ -52,6 +52,10 @@ def test_live_bundle_runs_independent_stage_in_parallel_and_snapshot_last(monkey
     from signals.core.market_hours import Market
     from signals.sync.engine import LIVE_SYNC_PLANS, LIVE_SYNC_STAGE_BY_MODULE, SyncEngine
 
+    a_share_modules = [plan.module for plan in LIVE_SYNC_PLANS[Market.A]]
+    assert "etf_spot_snapshot" in a_share_modules
+    assert LIVE_SYNC_STAGE_BY_MODULE["etf_spot_snapshot"] == 0
+
     engine = object.__new__(SyncEngine)
     engine.max_workers = 8
     engine.enabled_lanes = None

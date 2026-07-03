@@ -24,6 +24,7 @@ TASK_OK_STATUSES = {"ok"}
 RUN_TERMINAL_STATUSES = {"ok"}
 RETRYABLE_TASK_STATUSES = {"pending", "running", "stale", "partial", "degraded", "error", "deferred"}
 FULLMARKET_SPOT_TASK_KEY = "fullmarket_spot_snapshot:all"
+ETF_SPOT_TASK_KEY = "etf_spot_snapshot:all"
 SOURCE_FALLBACK_MODULES = {"quote_snapshots", "stock_daily"}
 SOURCE_BLOCKED_STATUSES = {"degraded", "error", "stale"}
 RUNTIME_USABLE_DEGRADED_MODULES = {
@@ -80,7 +81,7 @@ def _stock_daily_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
             "stock_daily",
             "market_data",
             shard_key=f"shard_{idx:02d}",
-            depends_on=("fullmarket_spot_snapshot:all",),
+            depends_on=(FULLMARKET_SPOT_TASK_KEY, ETF_SPOT_TASK_KEY),
             env={
                 "SIGNALS_SYNC_FULL_STOCK_DAILY": "true",
                 "STOCK_DAILY_SCOPE": "all",
@@ -166,8 +167,9 @@ _STOCK_30M_DEPS = tuple(task.task_key for task in _STOCK_30M_TASKS)
 
 POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     PostmarketTaskSpec("fullmarket_spot_snapshot", "market_data"),
+    PostmarketTaskSpec("etf_spot_snapshot", "market_data"),
     PostmarketTaskSpec("market_pools", "market_data"),
-    PostmarketTaskSpec("quote_snapshots", "market_data", depends_on=("fullmarket_spot_snapshot:all",)),
+    PostmarketTaskSpec("quote_snapshots", "market_data", depends_on=(FULLMARKET_SPOT_TASK_KEY, ETF_SPOT_TASK_KEY)),
     PostmarketTaskSpec("index_daily", "market_data", depends_on=("quote_snapshots:all",)),
     *_STOCK_DAILY_TASKS,
     PostmarketTaskSpec("board_ranking", "market_data"),
@@ -237,7 +239,7 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
         depends_on=("technical_signal_scan:all", "knowledge_market_views:all", "postmarket_chain_rebuild:all", "chain_heat_snapshots:all", "concept_relationship_graph:all"),
         env={"TERMINAL_POOL_STRICT_SOURCES": "true"},
     ),
-    PostmarketTaskSpec("strategy_snapshot", "terminal", depends_on=("terminal_realtime_pool:all",)),
+    PostmarketTaskSpec("strategy_snapshot", "terminal", depends_on=("terminal_realtime_pool:all", ETF_SPOT_TASK_KEY)),
     PostmarketTaskSpec("cache_preheat", "terminal", depends_on=("terminal_realtime_pool:all",)),
     PostmarketTaskSpec(
         "stock_minute",

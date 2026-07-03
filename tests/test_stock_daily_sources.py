@@ -255,3 +255,24 @@ def test_get_stock_codes_all_scope_uses_cached_universe_without_raising(monkeypa
     )
 
     assert stock_daily._get_stock_codes(db) == (["600001"], "all")
+
+
+def test_stock_daily_all_scope_merges_cached_etf_spot_codes():
+    db = _DB({
+        "fullmarket_spot_snapshots": _Collection([
+            {
+                "date_key": "20260702",
+                "code": "562590",
+                "asset_class": "etf",
+                "source": "eastmoney_etf_spot",
+                "price": 3.82,
+                "open": 4.01,
+                "high": 4.02,
+                "low": 3.82,
+            },
+        ]),
+    })
+
+    codes = stock_daily._merge_cached_spot_codes(["600001"], db)
+
+    assert codes == ["600001", "562590"]
