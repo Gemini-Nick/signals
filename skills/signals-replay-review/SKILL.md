@@ -31,8 +31,10 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"g
   | bash scripts/python.sh -m signals.mcp.review_assistant_server
 ```
 
-Then ask the AI to write from the returned `signals_context`,
-`market_replay`, and `analysis_framework`.
+For manual long reports, ask the AI to write from the returned
+`signals_context`, `market_replay`, and `analysis_framework`. Recurring WeChat
+sends should use `render_market_replay_wechat_body` instead of free-form body
+synthesis.
 
 For a direct CLI-generated long replay review during the real postmarket
 window:
@@ -56,12 +58,12 @@ Use `--ignore-time` only for local inspection or historical dry-runs. A
 dry-run must not be used as the WeChat send gate unless the user explicitly
 asks for a manual out-of-window send.
 
-For intraday Codex WeChat automations, the preferred path is now AI-native:
-collect the structured evidence package, let the automation agent write a short
-review from that package, then send the generated body once through WeClaw.
+For intraday Codex WeChat automations, the preferred path is now renderer-led:
+collect the structured evidence package through `render_market_replay_wechat_body`,
+then send only the returned `body` once through WeClaw.
 Use `--format wechat` only as the deterministic gate and emergency evidence
 preview. It is not an allowed send body for recurring review automations. If
-MCP context collection or AI synthesis fails after a `NOTIFY` gate, stop and
+MCP context collection or rendering fails after a `NOTIFY` gate, stop and
 report `context_failed_no_send` rather than sending the script body:
 
 ```bash
@@ -135,8 +137,11 @@ contract for gate commands, MCP arguments, synthesis boundaries, and send rules.
   `get_market_replay_context` or direct local commands to obtain
   `market_replay.structured_daily_review`, `rotation_windows`,
   `rotation_shifts`, `sector_boards`, and pool rows. Write a concise AI-native
-  review using only available evidence. If context collection or AI synthesis
-  fails, do not send a deterministic script body.
+  review using only available evidence. For recurring WeChat sends, prefer
+  `render_market_replay_wechat_body` and send only its returned `body`; keep
+  optional missing-field notes in automation memory, not in the WeChat body. If
+  context collection or AI synthesis fails, do not send a deterministic script
+  body.
 - Postmarket daily review (`postmarket`): use `--format narrative`; first line
   is still the fallback gate, not the final body. Automation output must be
   AI-written from the structured evidence package plus
@@ -207,15 +212,20 @@ until all checks pass:
   dynamic representative bucket, high turnover, limit/failed-limit state,
   representative 5-minute path, or pool membership.
 - Every numeric claim is present in the MCP payload, script gate output, user
-  attachment, or `extra_facts[]`. If the value is absent, write `待确认/unknown`
-  or remove it.
+  attachment, or `extra_facts[]`. For recurring WeChat sends, remove absent
+  optional facts from the body and record them only in automation memory.
 - Direction-switch language must cite rotation evidence:
-  `rotation_windows`, `rotation_shifts`, `board_timeline`, tail pressure, or
-  representative acceptance. Do not infer switching from final涨幅 alone.
+  `market_replay.rotation_windows`, `market_replay.rotation_shifts`,
+  `market_replay.board_timeline`, tail pressure, or representative acceptance.
+  Do not infer switching from final涨幅 alone, and do not mark those fields
+  missing just because they are absent from `signals_context`.
 - Eastmoney/THS 大中小单 is order-size flow only. Do not call it account-level
   主力/散户 unless that participant-flow field is explicitly available.
 - The body is a trading review, not a system status summary. It must not include
   runtime, Mongo, lane, or API health boilerplate.
+- The body must not expose implementation/data-gap tokens such as `缺失`,
+  `unknown`, `unavailable`, `数据边界`, `字段缺失`, `participant_flow`,
+  `market_replay`, or `signals_context`. Those belong in audit logs only.
 - If any check cannot be fixed because evidence is missing or AI synthesis is
   unavailable, stop and record `context_failed_no_send`; do not send a fallback
   script body.
@@ -362,8 +372,10 @@ Acceptance for this Word-style path:
 - Style-fit and entry/stop-loss language is retrospective review only. Do not
   output direct buy/sell/target/stop instructions.
 - Include exact figures only when they come from local evidence, user
-  attachment, or `extra_facts[]`; otherwise write `待确认/unknown` and keep the
-  section shape.
+  attachment, or `extra_facts[]`. In this Word-style/manual report path,
+  unsupported exact values may be marked `待确认/unknown` to preserve the
+  section shape; recurring WeChat bodies must omit those optional facts and log
+  them only in automation memory.
 - Run the evaluator against `2026-06-29-word` when the task asks for high
   restoration. Phrase coverage must use the sample-specific phrase file, not
   the older 2026-06-05 screenshot phrases.
@@ -391,14 +403,16 @@ Rules:
 
 Use this full structure for manual postmarket reviews, Obsidian-ready reviewed
 notes, or deeper non-WeChat output. The daily WeChat narrative can compress the
-same logic into paragraphs, but it must preserve the data boundaries.
+same logic into paragraphs, but recurring WeChat bodies must not expose
+missing-field tokens to the user.
 
 1. `0. 结论先行`: market state, emotion temperature, main/hidden/false lines,
    biggest risk, most important next-day validation.
 2. `1. 数据完整性`: source/status/impact table.
 3. `2. 市场状态`: index moves, turnover, breadth, limits/failed limits, tail
    drawdown, evidence level.
-4. `3. 固定半小时时间轴`: every fixed slice; mark missing slices `unknown`.
+4. `3. 固定半小时时间轴`: every fixed slice; in manual reports only, mark
+   missing slices `unknown`.
 5. `4. 精确关键节点`: only when minute data supports exact timing.
 6. `5. Top7 成交额板块`: cleaned board names, amount, amount ratio, breadth,
    limits, drawdown, strongest slice, status.

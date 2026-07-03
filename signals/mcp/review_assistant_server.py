@@ -7,6 +7,7 @@ import sys
 from typing import Any
 
 from signals.notify.trading_workbench_summary import (
+    build_market_replay_wechat_summary,
     build_narrative_review,
     collect_replay_context,
     fetch_inputs,
@@ -184,6 +185,60 @@ def _tool_schema() -> list[dict[str, Any]]:
             "name": "get_replay_analysis_framework",
             "description": "Return the AI-native thinking framework for turning the full-market event graph into a screenshot-style replay.",
             "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "render_market_replay_wechat_body",
+            "description": "Render a send-ready Chinese WeChat body from get_market_replay_context evidence. The body omits optional missing-field prose; audit.internal_gaps is for logs only.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "base_url": {
+                        "type": "string",
+                        "default": "http://127.0.0.1:8011",
+                        "description": "Signals web base URL used to get current sector boards and trade date.",
+                    },
+                    "trade_date": {
+                        "type": "string",
+                        "description": "YYYY-MM-DD. Defaults to dashboard/snapshot trade date.",
+                    },
+                    "window": {
+                        "type": "string",
+                        "default": "postmarket",
+                        "enum": ["preopen", "postmarket", "close", "midday", "two", "ten", "manual", "weekly"],
+                    },
+                    "max_items": {
+                        "type": "integer",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 12,
+                    },
+                    "include_event_lines": {
+                        "type": "boolean",
+                        "default": True,
+                    },
+                    "checkpoints": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": ["09:35", "10:30", "11:30", "13:30", "14:58"],
+                    },
+                    "high_turnover_limit": {
+                        "type": "integer",
+                        "default": 20,
+                        "minimum": 5,
+                        "maximum": 50,
+                    },
+                    "representative_limit": {
+                        "type": "integer",
+                        "default": 30,
+                        "minimum": 5,
+                        "maximum": 80,
+                    },
+                    "include_external_fund_flows": {
+                        "type": "boolean",
+                        "default": False,
+                    },
+                },
+            },
         },
         {
             "name": "list_signals_replay_data_requirements",
@@ -397,6 +452,17 @@ def _handle(message: dict[str, Any]) -> dict[str, Any] | None:
                 return _response(request_id, _text_result(json.dumps(context, ensure_ascii=False, indent=2)))
             except Exception as exc:  # pragma: no cover - defensive server boundary
                 return _response(request_id, _text_result(f"打包全市场复盘事件失败：{exc}", is_error=True))
+        if name == "render_market_replay_wechat_body":
+            try:
+                context = _collect_market_context(arguments)
+                result = build_market_replay_wechat_summary(
+                    context,
+                    window=str(arguments.get("window") or context.get("window") or "postmarket"),
+                    max_items=int(arguments.get("max_items") or 5),
+                )
+                return _response(request_id, _text_result(json.dumps(result, ensure_ascii=False, indent=2)))
+            except Exception as exc:  # pragma: no cover - defensive server boundary
+                return _response(request_id, _text_result(f"渲染微信正文失败：{exc}", is_error=True))
         if name == "generate_signals_replay_review":
             try:
                 return _response(request_id, _text_result(_generate_review(arguments)))

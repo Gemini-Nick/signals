@@ -276,3 +276,29 @@ def test_stock_daily_all_scope_merges_cached_etf_spot_codes():
     codes = stock_daily._merge_cached_spot_codes(["600001"], db)
 
     assert codes == ["600001", "562590"]
+
+
+def test_stock_daily_all_scope_merges_etf_spot_codes_without_valid_quote():
+    db = _DB({
+        "etf_spot_snapshots": _Collection([
+            {
+                "date_key": "20260703",
+                "code": "512480",
+                "price": None,
+                "open": None,
+                "high": None,
+                "low": None,
+            },
+        ]),
+    })
+
+    codes = stock_daily._merge_cached_spot_codes(["600001"], db)
+
+    assert codes == ["600001", "512480"]
+
+
+def test_get_all_stock_codes_includes_macro_industry_etfs(monkeypatch):
+    monkeypatch.setattr(stock_daily.ak, "stock_info_a_code_name", lambda: pd.DataFrame({"code": ["600001"]}))
+    monkeypatch.setattr(stock_daily, "_macro_etf_pure_codes", lambda: ["511090"])
+
+    assert stock_daily._get_all_stock_codes(_DB()) == ["600001", "511090"]

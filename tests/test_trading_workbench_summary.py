@@ -1052,6 +1052,10 @@ def test_wechat_intraday_windows_use_trader_note_voice():
         "处理：",
         "暂不动",
         "排雷名单",
+        "缺失",
+        "unavailable",
+        "数据边界",
+        "字段缺失",
     )
     for window in ("preopen", "ten", "midday", "two", "close"):
         result = build_wechat_summary(

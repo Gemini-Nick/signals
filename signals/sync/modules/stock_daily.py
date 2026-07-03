@@ -715,13 +715,13 @@ def _get_all_stock_codes(db: Database | None = None) -> list:
     try:
         with em_proxy(None):
             df = ak.stock_info_a_code_name()
-        return _merge_cached_spot_codes(df["code"].tolist(), db)
+        return _merge_cached_spot_codes([*df["code"].tolist(), *_macro_etf_pure_codes()], db)
     except Exception as e:
         logger.warning(f"获取股票列表失败: {e}，使用 stock_zh_a_spot_em 兜底")
         try:
             with em_proxy(None):
                 df = ak.stock_zh_a_spot_em()
-            return _merge_cached_spot_codes(df["代码"].tolist(), db)
+            return _merge_cached_spot_codes([*df["代码"].tolist(), *_macro_etf_pure_codes()], db)
         except Exception as spot_exc:
             cached = _cached_stock_universe(db)
             if cached:
@@ -751,22 +751,35 @@ def _merge_cached_spot_codes(codes: list, db: Database | None = None) -> list[st
     try:
         latest = db["fullmarket_spot_snapshots"].find_one({}, {"date_key": 1}, sort=[("date_key", -1)])
         date_key = str((latest or {}).get("date_key") or "")
-        if not date_key:
-            return merged
-        for row in db["fullmarket_spot_snapshots"].find(
-            {
-                "date_key": date_key,
-                "code": {"$regex": r"^\d{6}$"},
-                "price": {"$gt": 0},
-                "open": {"$gt": 0},
-                "high": {"$gt": 0},
-                "low": {"$gt": 0},
-            },
-            {"code": 1},
-        ):
-            add(row.get("code"))
+        if date_key:
+            for row in db["fullmarket_spot_snapshots"].find(
+                {
+                    "date_key": date_key,
+                    "code": {"$regex": r"^\d{6}$"},
+                    "price": {"$gt": 0},
+                    "open": {"$gt": 0},
+                    "high": {"$gt": 0},
+                    "low": {"$gt": 0},
+                },
+                {"code": 1},
+            ):
+                add(row.get("code"))
     except Exception as exc:
         logger.debug("合并 fullmarket spot universe 失败: %s", exc)
+    try:
+        latest = db["etf_spot_snapshots"].find_one({}, {"date_key": 1}, sort=[("date_key", -1), ("snapshot_at", -1)])
+        date_key = str((latest or {}).get("date_key") or "")
+        if date_key:
+            for row in db["etf_spot_snapshots"].find(
+                {
+                    "date_key": date_key,
+                    "code": {"$regex": r"^\d{6}$"},
+                },
+                {"code": 1},
+            ):
+                add(row.get("code"))
+    except Exception as exc:
+        logger.debug("合并 etf spot universe 失败: %s", exc)
     return merged
 
 

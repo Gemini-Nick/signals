@@ -1214,6 +1214,262 @@ def _market_replay_sector_rows(replay_context: dict[str, Any], *, limit: int = 8
     return rows
 
 
+WECHAT_BODY_BLOCKED_TERMS = (
+    "缺失",
+    "unknown",
+    "unavailable",
+    "数据边界",
+    "字段缺失",
+    "participant_flow",
+    "market_replay",
+    "signals_context",
+)
+
+
+def _market_payload_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _market_path_available(payload: dict[str, Any], key: str) -> bool:
+    value = payload.get(key)
+    if isinstance(value, (list, dict)):
+        return bool(value)
+    return value is not None
+
+
+def _market_board_name(row: dict[str, Any]) -> str:
+    return _text(row.get("driver_name") or row.get("board") or row.get("name") or row.get("label"), "板块")
+
+
+def _market_board_brief(row: dict[str, Any]) -> str:
+    name = _sector_name(row) if row.get("name") or row.get("label") else _market_board_name(row)
+    latest = row.get("latest") if isinstance(row.get("latest"), dict) else {}
+    change = _sector_change(row)
+    if change is None:
+        change = _float_value(latest.get("change_pct") or row.get("driver_change_pct") or row.get("top_change"))
+    return f"{name}{(' ' + _fmt_pct(change)) if change is not None else ''}"
+
+
+def _market_stock_names(rows: list[dict[str, Any]], *, limit: int = 4) -> str:
+    names: list[str] = []
+    for row in rows:
+        name = _text(row.get("name") or row.get("display_name") or row.get("symbol") or row.get("code"))
+        if name and name not in names:
+            names.append(name)
+        if len(names) >= limit:
+            break
+    return "、".join(names)
+
+
+def _market_window_top_names(window: dict[str, Any], *, limit: int = 2) -> str:
+    names: list[str] = []
+    for row in _as_list(window.get("top_boards"))[:limit]:
+        name = _text(row.get("name") or row.get("driver_name") or row.get("board"))
+        if name and name not in names:
+            names.append(name)
+    return "、".join(names)
+
+
+def _market_rotation_line(market_replay: dict[str, Any]) -> tuple[str, list[str]]:
+    used: list[str] = []
+    windows = _as_list(market_replay.get("rotation_windows"))
+    shifts = _as_list(market_replay.get("rotation_shifts"))
+    if windows:
+        used.append("market_replay.rotation_windows")
+        first = windows[0]
+        latest = windows[-1]
+        first_time = _text(first.get("actual_time") or first.get("checkpoint"))
+        latest_time = _text(latest.get("actual_time") or latest.get("checkpoint"))
+        first_names = _market_window_top_names(first)
+        latest_names = _market_window_top_names(latest)
+        line = f"轮动：{first_time}{first_names}先行，{latest_time}{latest_names}仍在前排。"
+        if shifts:
+            used.append("market_replay.rotation_shifts")
+            last_shift = shifts[-1]
+            strengthening = _market_stock_names(_as_list(last_shift.get("strengthening")), limit=2)
+            weakening = _market_stock_names(_as_list(last_shift.get("weakening")), limit=2)
+            fragments = []
+            if strengthening:
+                fragments.append(f"{strengthening}增强")
+            if weakening:
+                fragments.append(f"{weakening}转弱")
+            if fragments:
+                line = line.rstrip("。") + f"；{('，'.join(fragments))}。"
+        return line, used
+
+    timeline = _as_list(market_replay.get("board_timeline"))
+    if timeline:
+        used.append("market_replay.board_timeline")
+        boards = "、".join(_market_board_brief(row) for row in timeline[:3])
+        return f"分钟强度：{boards}保持前排，是当前复核主线。", used
+    return "", used
+
+
+def _market_representative_line(market_replay: dict[str, Any], sector_rows: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    reps = _as_list(market_replay.get("dynamic_market_representatives"))
+    if not reps:
+        return "", []
+    wanted = [_sector_group_key(row) for row in sector_rows[:3]]
+    parts: list[str] = []
+    for item in reps:
+        board = _market_board_name(item)
+        if wanted and not any(name and (name in board or board in name) for name in wanted):
+            continue
+        names = _market_stock_names(
+            _as_list(item.get("market_core"))
+            + _as_list(item.get("market_elastic_confirmed"))
+            + _as_list(item.get("market_elastic")),
+            limit=3,
+        )
+        if names:
+            parts.append(f"{board}看{names}")
+        if len(parts) >= 2:
+            break
+    if not parts:
+        for item in reps[:2]:
+            names = _market_stock_names(
+                _as_list(item.get("market_core"))
+                + _as_list(item.get("market_elastic_confirmed"))
+                + _as_list(item.get("market_elastic")),
+                limit=3,
+            )
+            if names:
+                parts.append(f"{_market_board_name(item)}看{names}")
+    if not parts:
+        return "", []
+    return f"代表股：{'；'.join(parts[:2])}。", ["market_replay.dynamic_market_representatives"]
+
+
+def _market_pressure_line(market_replay: dict[str, Any]) -> tuple[str, list[str]]:
+    used: list[str] = []
+    failed = _as_list(market_replay.get("failed_boards"))
+    high_turnover = _as_list(market_replay.get("high_turnover_cores"))
+    pressure_names = _market_stock_names(failed, limit=3)
+    turnover_names = _market_stock_names(high_turnover, limit=2)
+    parts: list[str] = []
+    if pressure_names:
+        used.append("market_replay.failed_boards")
+        parts.append(f"情绪承压看{pressure_names}")
+    if turnover_names:
+        used.append("market_replay.high_turnover_cores")
+        parts.append(f"高成交核心看{turnover_names}能否收窄回撤")
+    if not parts:
+        structured = _market_payload_dict(market_replay.get("structured_daily_review"))
+        acceptance = _market_payload_dict(structured.get("acceptance_pressure"))
+        top10 = _as_list(acceptance.get("high_turnover_top10"))
+        names = _market_stock_names(top10, limit=3)
+        if names:
+            used.append("market_replay.structured_daily_review.acceptance_pressure")
+            parts.append(f"高成交承压看{names}")
+    if not parts:
+        return "", []
+    return f"承压：{'；'.join(parts)}。", used
+
+
+def _market_internal_gaps(market_replay: dict[str, Any]) -> list[str]:
+    gaps: list[str] = []
+    for key in (
+        "rotation_windows",
+        "rotation_shifts",
+        "board_timeline",
+        "dynamic_market_representatives",
+        "failed_boards",
+        "high_turnover_cores",
+    ):
+        if not _market_path_available(market_replay, key):
+            gaps.append(f"market_replay.{key}")
+    flow = _market_payload_dict(market_replay.get("flow_availability"))
+    if flow and flow.get("participant_flow_available") is not True:
+        gaps.append("market_replay.flow_availability.participant_flow")
+    if flow and flow.get("order_size_flow_available") is not True:
+        gaps.append("market_replay.flow_availability.order_size_flow")
+    structured = _market_payload_dict(market_replay.get("structured_daily_review"))
+    acceptance = _market_payload_dict(structured.get("acceptance_pressure"))
+    if structured and not acceptance:
+        gaps.append("market_replay.structured_daily_review.acceptance_pressure")
+    return gaps
+
+
+def build_market_replay_wechat_summary(
+    payload: dict[str, Any],
+    *,
+    window: str | None = None,
+    max_items: int = 5,
+) -> dict[str, Any]:
+    """Render a send-ready WeChat body from a get_market_replay_context payload."""
+
+    signals_context = _market_payload_dict(payload.get("signals_context"))
+    market_replay = _market_payload_dict(payload.get("market_replay"))
+    window = _text(window or payload.get("window") or signals_context.get("window"), "manual")
+    trade_date = _text(payload.get("trade_date") or market_replay.get("trade_date") or signals_context.get("trade_date"))
+    limit = max(1, min(8, int(max_items or 5)))
+    used_paths: list[str] = []
+
+    sector_rows = _as_list(signals_context.get("sector_boards"))[: max(3, limit)]
+    if sector_rows:
+        used_paths.append("signals_context.sector_boards")
+    else:
+        sector_rows = _market_replay_sector_rows(market_replay, limit=max(3, limit))
+        if sector_rows:
+            used_paths.append("market_replay.board_timeline|rotation_windows")
+
+    has_rotation = bool(_as_list(market_replay.get("rotation_windows")) or _as_list(market_replay.get("board_timeline")))
+    audit = {"used_paths": used_paths[:], "internal_gaps": _market_internal_gaps(market_replay)}
+    if not sector_rows and not has_rotation:
+        return {
+            "status": "DONT_NOTIFY",
+            "body": "",
+            "reason": "core_market_replay_evidence_missing",
+            "audit": audit,
+        }
+
+    primary = _sector_name(sector_rows[0]) if sector_rows else "当前前排"
+    secondary = _sector_name(sector_rows[1]) if len(sector_rows) > 1 else "跟随线"
+    validation = _sector_name(sector_rows[2]) if len(sector_rows) > 2 else secondary
+    sector_line = "板块15：" + "、".join(_market_board_brief(row) for row in sector_rows[:5]) + "。"
+    rotation_line, rotation_used = _market_rotation_line(market_replay)
+    rep_line, rep_used = _market_representative_line(market_replay, sector_rows)
+    pressure_line, pressure_used = _market_pressure_line(market_replay)
+    used_paths.extend(rotation_used + rep_used + pressure_used)
+
+    title = WINDOW_LABELS.get(window, WINDOW_LABELS["manual"])
+    header = f"【{trade_date}｜{title}】" if trade_date else f"【{title}】"
+    lines = [
+        header,
+        f"结论：{primary}先当主线，{secondary}看跟随；接下来只看前排能否延续、代表股承接是否不断，以及高成交承压是否扩散。",
+        "证据：",
+        sector_line,
+    ]
+    lines.extend(line for line in (rotation_line, rep_line, pressure_line) if line)
+    lines.extend(
+        [
+            "验证：",
+            f"1）{primary}继续保持前排且代表股不破承接，按主线延续复核；掉出前排就降成局部修复。",
+            f"2）{secondary}要看同链分支是否跟上；只剩单分支冲高，就留观察不扩散。",
+            f"3）{validation}若能接力并带出新代表股，下一窗口再单列；否则仍按跟随线处理。",
+        ]
+    )
+    if pressure_line:
+        lines.append("4）高成交承压样本继续扩大时，先收缩复核范围，不把脉冲当成主线。")
+    body = "\n".join(lines)
+    blocked = [term for term in WECHAT_BODY_BLOCKED_TERMS if term in body]
+    audit = {"used_paths": sorted(set(used_paths)), "internal_gaps": _market_internal_gaps(market_replay)}
+    if blocked:
+        audit["blocked_terms"] = blocked
+        return {
+            "status": "DONT_NOTIFY",
+            "body": "",
+            "reason": "body_failed_banned_term_check",
+            "audit": audit,
+        }
+    return {
+        "status": "NOTIFY",
+        "body": body,
+        "reason": "rendered_market_replay_wechat_body",
+        "audit": audit,
+    }
+
+
 def _historical_replay_inputs(
     dashboard: dict[str, Any],
     shell: dict[str, Any],
