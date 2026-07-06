@@ -17,7 +17,7 @@ windows = (
     (time(9, 15), time(15, 35)),
     (time(20, 30), time(22, 30)),
 )
-in_window = now.weekday() < 5 and any(start <= now.time() <= end for start, end in windows)
+in_window = any(start <= now.time() <= end for start, end in windows)
 print("run" if in_window else f"skip:{now.isoformat(timespec='seconds')}")
 PY
 )"

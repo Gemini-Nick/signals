@@ -5,7 +5,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from signals.sync.engine import COLLECTION_DOMAINS, MODULE_TARGETS
+from signals.sync.engine import COLLECTION_DOMAINS, MODULE_TARGETS, SyncEngine
 from signals.sync.modules import ALL_MODULES
 from signals.sync.modules import hot_rank_clues as hot_rank_module
 from signals.sync.modules.hot_rank_clues import (
@@ -172,8 +172,10 @@ def test_fetch_eastmoney_hot_rank_uses_native_push2delay_without_bad_v_param(mon
 
 
 def test_hot_rank_clues_registered_for_sync_engine():
-    module_names = {name for name, _, _ in ALL_MODULES}
+    module_schedules = {name: schedule for name, _, schedule in ALL_MODULES}
 
-    assert "hot_rank_clues" in module_names
+    assert "hot_rank_clues" in module_schedules
+    assert module_schedules["hot_rank_clues"] == "21:12"
+    assert SyncEngine._schedule_due(module_schedules["hot_rank_clues"], datetime(2026, 7, 5, 21, 12)) is True
     assert MODULE_TARGETS["hot_rank_clues"] == ("hot_rank_clues",)
     assert COLLECTION_DOMAINS["hot_rank_clues"] == "hot_rank_clue"

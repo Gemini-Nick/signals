@@ -59,7 +59,7 @@ ALL_MODULES = [
     ("concept_relationship_graph", sync_concept_relationship_graph, "20:45-22:45 weekday"),
     ("signal_pool",   sync_signal_pool,   "21:00 weekday"),
     ("strategy_snapshot", sync_strategy_snapshot, "21:10 weekday"),
-    ("hot_rank_clues", sync_hot_rank_clues, "21:12 weekday"),
+    ("hot_rank_clues", sync_hot_rank_clues, "21:12"),
     ("terminal_realtime_pool", sync_terminal_realtime_pool, "21:15 weekday"),
     ("cache_preheat", sync_cache_preheat, "21:20 weekday"),
 ]
