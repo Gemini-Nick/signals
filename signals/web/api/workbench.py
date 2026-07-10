@@ -1678,11 +1678,48 @@ def _watchlist_range_columns(today: Optional[date] = None) -> list[dict[str, Any
     return columns
 
 
-def _compute_range_returns(df: pd.DataFrame, columns: list[dict[str, Any]]) -> dict[str, Optional[float]]:
-    if df is None or df.empty or "close" not in df.columns:
-        return {}
+_PRICE_REBASE_FACTORS = (0.2, 0.25, 1 / 3, 0.5, 2.0, 3.0, 4.0, 5.0)
+_PRICE_REBASE_TOLERANCE = 0.08
+
+
+def _nearest_price_rebase_factor(ratio: float) -> Optional[float]:
+    if ratio <= 0 or not math.isfinite(ratio):
+        return None
+    for factor in _PRICE_REBASE_FACTORS:
+        if abs(ratio - factor) / factor <= _PRICE_REBASE_TOLERANCE:
+            return factor
+    return None
+
+
+def _range_return_closes(df: pd.DataFrame, *, adjust_price_discontinuities: bool = False) -> pd.Series:
     working = df.copy().sort_index()
     closes = pd.to_numeric(working["close"], errors="coerce").dropna()
+    if not adjust_price_discontinuities or len(closes) < 2:
+        return closes
+
+    adjusted = closes.copy()
+    close_values = closes.to_numpy(dtype=float)
+    for index in range(1, len(close_values)):
+        previous = close_values[index - 1]
+        current = close_values[index]
+        if previous <= 0 or current <= 0:
+            continue
+        factor = _nearest_price_rebase_factor(current / previous)
+        if factor is None:
+            continue
+        adjusted.iloc[:index] = adjusted.iloc[:index] * factor
+    return adjusted
+
+
+def _compute_range_returns(
+    df: pd.DataFrame,
+    columns: list[dict[str, Any]],
+    *,
+    adjust_price_discontinuities: bool = False,
+) -> dict[str, Optional[float]]:
+    if df is None or df.empty or "close" not in df.columns:
+        return {}
+    closes = _range_return_closes(df, adjust_price_discontinuities=adjust_price_discontinuities)
     if closes.empty:
         return {}
     latest = float(closes.iloc[-1])
@@ -1908,7 +1945,7 @@ def _compute_stock_range_returns_required(
     if df is None or df.empty or "close" not in df.columns:
         raise RuntimeError(f"range_returns_kline_empty:{symbol}")
     df, carry_source = _with_current_no_trade_close(symbol, df)
-    computed = _compute_range_returns(df, range_columns)
+    computed = _compute_range_returns(df, range_columns, adjust_price_discontinuities=True)
     missing_keys = [key for key in required_keys if key not in computed or computed.get(key) is None]
     if missing_keys:
         raise RuntimeError(f"range_returns_incomplete:{symbol}:{','.join(missing_keys)}")
@@ -3044,7 +3081,7 @@ def _enrich_stock_row(
         "day_change_as_of": day_change_as_of,
         "day_change_freq": minute_change.get("day_change_freq") if minute_change else "",
         "latest_signal": latest_signal or _ma_signal_from_df(df),
-        "range_returns": _compute_range_returns(df, range_columns),
+        "range_returns": _compute_range_returns(df, range_columns, adjust_price_discontinuities=True),
         "range_return_source": source,
         "available_freqs": UI_FREQS,
         "target_kind": "stock",
@@ -6919,7 +6956,11 @@ def _sector_board_preview(row: dict[str, Any], kind: str) -> dict[str, Any]:
     carrier_range_source = ""
     if carrier_payload.get("symbol"):
         carrier_df, carrier_range_source = _stock_df(str(carrier_payload["symbol"]), "daily")
-        carrier_range_returns = _compute_range_returns(carrier_df, _watchlist_range_columns())
+        carrier_range_returns = _compute_range_returns(
+            carrier_df,
+            _watchlist_range_columns(),
+            adjust_price_discontinuities=True,
+        )
         carrier_latest_price = (
             float(carrier_df["close"].iloc[-1])
             if carrier_df is not None and not carrier_df.empty and "close" in carrier_df.columns
@@ -8716,7 +8757,7 @@ def _batch_stock_range_returns(
         if not records:
             continue
         df = pd.DataFrame(records).sort_values("dt").drop_duplicates(subset=["dt"], keep="last").set_index("dt")
-        returns = _compute_range_returns(df, range_columns)
+        returns = _compute_range_returns(df, range_columns, adjust_price_discontinuities=True)
         if not returns:
             continue
         status = _range_return_status_from_returns(returns, range_columns)

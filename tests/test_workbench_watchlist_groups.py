@@ -310,6 +310,65 @@ def test_board_heat_range_returns_use_watchlist_column_keys(monkeypatch):
     assert meta["partial_keys"] == ["ytd"]
 
 
+def test_stock_range_returns_adjust_split_rebased_history():
+    from signals.web.api import workbench
+
+    df = pd.DataFrame(
+        {
+            "open": [1.80, 3.06, 1.47, 1.52],
+            "high": [1.86, 3.07, 1.53, 1.55],
+            "low": [1.75, 2.88, 1.46, 1.50],
+            "close": [1.81, 3.009, 1.501, 1.54],
+        },
+        index=pd.to_datetime(["2026-01-05", "2026-07-06", "2026-07-07", "2026-07-09"]),
+    )
+    columns = [{"key": "ytd", "label": "2026年以来", "start_date": "2026-01-01"}]
+
+    raw_returns = workbench._compute_range_returns(df, columns)
+    adjusted_returns = workbench._compute_range_returns(
+        df,
+        columns,
+        adjust_price_discontinuities=True,
+    )
+
+    assert raw_returns["ytd"] == -14.92
+    assert adjusted_returns["ytd"] == 70.17
+
+
+def test_batch_stock_range_returns_adjusts_split_rebased_etf_history(monkeypatch):
+    from signals.web.api import workbench
+
+    class _Cursor(list):
+        def sort(self, *args, **kwargs):
+            return self
+
+    class _Collection:
+        def find(self, query=None, projection=None):
+            assert query["meta.symbol"] == {"$in": ["159995"]}
+            return _Cursor([
+                {"dt": datetime(2026, 1, 5), "close": 1.81, "meta": {"symbol": "159995", "source": "tencent"}},
+                {"dt": datetime(2026, 7, 6), "close": 3.009, "meta": {"symbol": "159995", "source": "tencent"}},
+                {"dt": datetime(2026, 7, 7), "close": 1.501, "meta": {"symbol": "159995", "source": "tencent"}},
+                {"dt": datetime(2026, 7, 9), "close": 1.54, "meta": {"symbol": "159995", "source": "tencent"}},
+            ])
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"bars": _Collection()}))
+
+    output = workbench._batch_stock_range_returns(
+        [{"symbol": "SZ.159995", "macro_group": "all_etfs", "range_returns": {}}],
+        [{"key": "ytd", "label": "2026年以来", "start_date": "2026-01-01"}],
+    )
+
+    returns, source, status = output["SZ.159995"]
+    assert returns["ytd"] == 70.17
+    assert source == "bars_batch:tencent"
+    assert status == "ok"
+
+
 def test_chain_heat_shell_range_returns_enabled_by_default(monkeypatch):
     from signals.web.api import workbench
 
