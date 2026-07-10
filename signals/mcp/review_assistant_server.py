@@ -33,7 +33,7 @@ DATA_REQUIREMENTS = """Signals 复盘助手需要这些数据：
 8. dashboard.daily_brief：交易日、主线、置信度、新增/丢失主题和候选。
 9. structured_daily_review：数据完整性、固定半小时切片、固定重点个股池、Top7板块代理、20日趋势可用性、承接/抛压表。
 10. 可选：外部订单大小口径资金流、分账户资金流、新闻/催化、用户截图或外部数据补充的精确事实。大中小单不等同于账户级主力/散户。
-自动化要求：先跑本地 window gate，再调用 get_market_replay_context，再按 skill 做 AI-native 复盘并发送；不要只凭 raw API 摘要写市场判断。
+自动化要求：先跑本地 window gate；intraday 用 render_market_replay_wechat_body 的正文，postmarket/weekly 用 get_market_replay_context 后按 skill 做 AI-native 复盘；不要只凭 raw API 摘要写市场判断。
 输出要求：首行保留 NOTIFY/DONT_NOTIFY；不要输出 runtime/Mongo/cache 日志；不要写直接买卖指令。"""
 
 
@@ -41,7 +41,7 @@ def _tool_schema() -> list[dict[str, Any]]:
     return [
         {
             "name": "generate_signals_replay_review",
-            "description": "Render a deterministic evidence preview from local Signals endpoints. Do not use this tool output as the final WeChat body; delivery must use get_market_replay_context plus AI synthesis.",
+            "description": "Render a deterministic evidence preview from local Signals endpoints. Do not use this tool output as the final WeChat body; recurring delivery follows the skill's renderer or synthesis mode.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

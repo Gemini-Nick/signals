@@ -31,10 +31,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"g
   | bash scripts/python.sh -m signals.mcp.review_assistant_server
 ```
 
-For manual long reports, ask the AI to write from the returned
-`signals_context`, `market_replay`, and `analysis_framework`. Recurring WeChat
-sends should use `render_market_replay_wechat_body` instead of free-form body
-synthesis.
+For manual long reports and free-form postmarket/weekly sends, ask the AI to
+write from the returned `signals_context`, `market_replay`, and
+`analysis_framework`. Intraday recurring WeChat sends use
+`render_market_replay_wechat_body` as the send-body renderer; the automation
+agent must not rewrite that body.
 
 For a direct CLI-generated long replay review during the real postmarket
 window:
@@ -58,9 +59,9 @@ Use `--ignore-time` only for local inspection or historical dry-runs. A
 dry-run must not be used as the WeChat send gate unless the user explicitly
 asks for a manual out-of-window send.
 
-For intraday Codex WeChat automations, the preferred path is now renderer-led:
-collect the structured evidence package through `render_market_replay_wechat_body`,
-then send only the returned `body` once through WeClaw.
+For intraday Codex WeChat automations, the required path is renderer-led:
+collect and render through `render_market_replay_wechat_body`, then send only
+the returned `body` once through WeClaw.
 Use `--format wechat` only as the deterministic gate and emergency evidence
 preview. It is not an allowed send body for recurring review automations. If
 MCP context collection or rendering fails after a `NOTIFY` gate, stop and
@@ -70,9 +71,9 @@ report `context_failed_no_send` rather than sending the script body:
 bash scripts/python.sh -m signals.notify.trading_workbench_summary --window <preopen|ten|midday|two|close> --max-items 5 --format wechat
 ```
 
-For daily postmarket WeChat automation, use narrative output only as the local
-gate/evidence preview. A `NOTIFY` gate still requires MCP context collection and
-AI synthesis before any WeChat send:
+For daily postmarket and weekly WeChat automation, use script output only as the
+local gate/evidence preview. A `NOTIFY` gate still requires MCP context
+collection and AI synthesis before any WeChat send:
 
 ```bash
 bash scripts/python.sh -m signals.notify.trading_workbench_summary --window postmarket --max-items 5 --format narrative
@@ -119,7 +120,10 @@ Use these instead of rewriting `/api/pack/dashboard`, `/api/workbench/shell`,
 `/api/strategy/snapshot`, or Mongo queries by hand. The first output line
 remains the gate for generated review text:
 
-- `NOTIFY`: continue to MCP context collection and AI synthesis before sending.
+- `NOTIFY`: continue through the delivery mode for that window. Intraday
+  windows call `render_market_replay_wechat_body` and send only its `body`;
+  postmarket/weekly windows collect `get_market_replay_context` and write an
+  AI-native body from the evidence package.
 - `DONT_NOTIFY`: stop and report the reason.
 - `[replay-eval] send blocked`: stop and report the similarity/missing phrases; do not send.
 
@@ -133,37 +137,43 @@ For recurring Codex WeChat automations, read
 `references/automation-wechat-send.md` first. That file is the canonical compact
 contract for gate commands, MCP arguments, synthesis boundaries, and send rules.
 
-- Intraday windows (`preopen`, `ten`, `midday`, `two`, `close`): call
-  `get_market_replay_context` or direct local commands to obtain
-  `market_replay.structured_daily_review`, `rotation_windows`,
-  `rotation_shifts`, `sector_boards`, and pool rows. Write a concise AI-native
-  review using only available evidence. For recurring WeChat sends, prefer
-  `render_market_replay_wechat_body` and send only its returned `body`; keep
-  optional missing-field notes in automation memory, not in the WeChat body. If
-  context collection or AI synthesis fails, do not send a deterministic script
-  body.
+- Intraday windows (`preopen`, `ten`, `midday`, `two`, `close`): after a
+  `NOTIFY` gate, call `render_market_replay_wechat_body` with the window
+  arguments in `references/automation-wechat-send.md`. The renderer collects
+  the structured market replay evidence internally. Send only its returned
+  `body` when its returned `status` is `NOTIFY`; do not rewrite, expand, or
+  replace it with the deterministic script body. Keep `audit.internal_gaps` in
+  automation memory only. If context collection or rendering fails, do not send.
 - Postmarket daily review (`postmarket`): use `--format narrative`; first line
   is still the fallback gate, not the final body. Automation output must be
   AI-written from the structured evidence package plus
   `format_market_replay_sections`; after AI synthesis, send exactly once if the
   generated body does not violate the evidence boundaries. If AI synthesis is
-  unavailable, stop without sending. Do not add `--ignore-time` in recurring
-  postmarket sends.
+  unavailable, stop without sending. Do not add `--ignore-time` or
+  `--training-sample` in recurring postmarket sends.
+- Weekly review (`weekly`): use the gate command only to decide whether to run.
+  After `NOTIFY`, collect `get_market_replay_context` and write an AI-native
+  body around weekly structure, board-15 ordering, 20-day trend availability,
+  three-pool changes, risk lines, and next-week validation. Do not send a
+  fallback script body if context or synthesis fails.
 - Golden screenshot evaluator: report-only unless the user explicitly asks for
   a manual sample send. Never use `--training-sample` in recurring daily sends.
 - Final automation status should state only gate result, context/synthesis
-  result, send outcome, and `body_source=ai_native`. Do not include
+  result, source, and send outcome. Use `MCP renderer` for renderer-led
+  intraday bodies and `AI 原生` for postmarket/weekly synthesis. Do not include
   runtime/Mongo/lane health boilerplate in the user-facing WeChat result.
 
 ## AI Synthesis Contract
 
-Every recurring replay send must include a real model synthesis pass after MCP
-context collection. The model is not a paraphraser for the script body. It must
-use the evidence package to decide what mattered, what did not matter, and what
-must be verified next.
+Free-form postmarket/weekly replay sends must include a real model synthesis
+pass after MCP context collection. The model is not a paraphraser for the script
+body. It must use the evidence package to decide what mattered, what did not
+matter, and what must be verified next. Renderer-led intraday sends use the MCP
+renderer body directly; the automation agent should not add a second synthesis
+pass.
 
-Before writing the WeChat body, the automation agent must build these internal
-working notes from `signals_context`, `market_replay`,
+Before writing a free-form WeChat body, the automation agent must build these
+internal working notes from `signals_context`, `market_replay`,
 `market_replay.structured_daily_review`, and `analysis_framework`:
 
 1. `data_boundary`: which required data is `available`, `partial`, `missing`,
@@ -226,9 +236,9 @@ until all checks pass:
 - The body must not expose implementation/data-gap tokens such as `缺失`,
   `unknown`, `unavailable`, `数据边界`, `字段缺失`, `participant_flow`,
   `market_replay`, or `signals_context`. Those belong in audit logs only.
-- If any check cannot be fixed because evidence is missing or AI synthesis is
-  unavailable, stop and record `context_failed_no_send`; do not send a fallback
-  script body.
+- If any check cannot be fixed because evidence is missing, rendering fails, or
+  AI synthesis is unavailable, stop and record `context_failed_no_send`; do not
+  send a fallback script body.
 
 ## AI-Native Process
 
