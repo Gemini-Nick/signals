@@ -328,9 +328,11 @@ AkShare field coverage:
 - `stock_zt_pool_dtgc_em(date)`: `封单资金`, `最后封板时间`, `板上成交额`, `连续跌停`, `开板次数`, `所属行业`.
 - `stock_zt_pool_strong_em(date)`: `量比`, `入选理由`, `涨停统计`, `所属行业`.
 
-## Output Checks
+## Automated Output Checks
 
-- First line must be `NOTIFY` or `DONT_NOTIFY`.
+- Automated gate output must start with `NOTIFY` or `DONT_NOTIFY`. A manual
+  report must also include the original gate reason, underlying data date, and
+  a clear `send disabled` status, but it must not collapse to a bare gate token.
 - Do not output runtime, Mongo, cache, or lane-health boilerplate.
 - Do not turn validation points into direct buy/sell instructions.
 - Do not let `daily_brief.primary_theme` hide a broader `板块15` structure.

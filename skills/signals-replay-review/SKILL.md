@@ -22,6 +22,25 @@ The output is a replay evidence package first and prose second. Every strong
 claim must be traceable to data in `signals_context`, `market_replay`, user
 attachments, or `extra_facts[]`.
 
+## Execution Modes
+
+Keep notification gating separate from information generation:
+
+- Automated/recurring execution: `DONT_NOTIFY` stops MCP synthesis, rendering,
+  and external delivery. Record the reason and return a short status only.
+- Manual execution: `DONT_NOTIFY` means "do not notify automatically", not
+  "produce no information". Use `--ignore-time --allow-ignore-time-notify`
+  only for the local dry-run, keep sending disabled, then return the requested
+  window preview, MCP context, or an explicit data-availability diagnosis.
+- A gate timeout or missing first line is `gate_failed`, not `DONT_NOTIFY`.
+  Manual execution must still explain the failed step and what data, if any,
+  was recovered.
+
+Manual output must state the requested window, underlying trade date/data
+timestamp, original gate result/reason, generation status, and that external
+delivery is disabled. See the WorkBuddy migration skill's
+`references/execution-mode-contract.md` for the compact operator contract.
+
 ## Fast Path
 
 From `/Users/zhangqilong/github代码仓库/Signals`, get the evidence graph first:
@@ -124,7 +143,9 @@ remains the gate for generated review text:
   windows call `render_market_replay_wechat_body` and send only its `body`;
   postmarket/weekly windows collect `get_market_replay_context` and write an
   AI-native body from the evidence package.
-- `DONT_NOTIFY`: stop and report the reason.
+- `DONT_NOTIFY`: automated execution stops and reports the reason. Manual
+  execution continues as a non-sending dry-run and returns preview/context or
+  an explicit diagnosis.
 - `[replay-eval] send blocked`: stop and report the similarity/missing phrases; do not send.
 
 ## Automation Contract
@@ -233,9 +254,11 @@ until all checks pass:
   主力/散户 unless that participant-flow field is explicitly available.
 - The body is a trading review, not a system status summary. It must not include
   runtime, Mongo, lane, or API health boilerplate.
-- The body must not expose implementation/data-gap tokens such as `缺失`,
+- An outgoing recurring WeChat body must not expose implementation/data-gap tokens such as `缺失`,
   `unknown`, `unavailable`, `数据边界`, `字段缺失`, `participant_flow`,
   `market_replay`, or `signals_context`. Those belong in audit logs only.
+  Manual full reports may use `待确认` inside a dedicated data-completeness
+  section, but must not leak raw internal field names into the trading conclusion.
 - If any check cannot be fixed because evidence is missing, rendering fails, or
   AI synthesis is unavailable, stop and record `context_failed_no_send`; do not
   send a fallback script body.

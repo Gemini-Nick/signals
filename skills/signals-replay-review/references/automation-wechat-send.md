@@ -1,11 +1,14 @@
 # Automation WeChat Send Contract
 
-All Signals trading-review automations start the same way:
+This contract applies to automated/recurring Signals trading-review delivery.
+Manual review requests follow the separate manual rules below.
+
+All automated Signals trading-review runs start the same way:
 
 1. Run the local `signals.notify.trading_workbench_summary` gate for the target
    window. Recurring automations must not add `--ignore-time`; that flag is
    only for local dry-run inspection.
-2. If the first line is `DONT_NOTIFY`, stop. Do not call MCP, do not send
+2. If the first line is `DONT_NOTIFY`, stop the automated path. Do not call MCP, do not send
    WeChat, and do not synthesize a replacement review.
 3. If the first line is `NOTIFY`, continue through the delivery mode in the
    table below. The deterministic gate body is fallback evidence only; it is
@@ -26,6 +29,21 @@ If MCP context collection, rendering, or AI synthesis fails, stop with
 `context_failed_no_send`. `body_source=fallback_script` is a no-send failure
 state, not a delivery path. Send exactly one WeChat message through
 `$HOME/.weclaw/bin/weclaw`.
+
+## Manual Execution
+
+When the user explicitly runs a window or asks for an out-of-window review:
+
+1. Run a local dry-run with `--ignore-time --allow-ignore-time-notify`; add
+   `--safe-inputs --input-timeout 6`.
+2. Never send from the manual dry-run. External delivery remains disabled even
+   if its first line is `NOTIFY`.
+3. If the original automatic gate would be `DONT_NOTIFY`, report that reason
+   but still return the requested preview or MCP context when data is available.
+4. State the underlying trade date/data timestamp so historical data is not
+   described as real-time.
+5. If data collection fails, return an explicit diagnostic rather than a bare
+   `DONT_NOTIFY` or `stopped` status.
 
 ## Window Arguments
 
@@ -77,7 +95,7 @@ state, not a delivery path. Send exactly one WeChat message through
 - Do not output buy/sell/target/stop commands.
 - If the pre-send self-check fails and cannot be fixed with available evidence,
   record `context_failed_no_send` and skip WeChat.
-- Before sending, reject any body containing `缺失`, `unknown`, `unavailable`,
+- Before automated sending, reject any body containing `缺失`, `unknown`, `unavailable`,
   `数据边界`, `字段缺失`, `participant_flow`, `market_replay`, or
   `signals_context`.
 - Final automation reply should only state gate result, render/context/synthesis
