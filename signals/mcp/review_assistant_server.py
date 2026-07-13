@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime
 from typing import Any
 
 from signals.notify.trading_workbench_summary import (
@@ -137,6 +138,11 @@ def _tool_schema() -> list[dict[str, Any]]:
                     "trade_date": {
                         "type": "string",
                         "description": "YYYY-MM-DD. Defaults to dashboard/snapshot trade date.",
+                    },
+                    "cutoff_time": {
+                        "type": "string",
+                        "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
+                        "description": "Optional strict Beijing market cutoff HH:MM. When set, return only point-in-time evidence at or before the cutoff.",
                     },
                     "window": {
                         "type": "string",
@@ -338,6 +344,146 @@ def _as_of_date(dashboard: dict[str, Any], snapshot: dict[str, Any]) -> str:
     return str(brief.get("as_of") or snapshot.get("as_of") or "").strip()
 
 
+_INTRADAY_INDEX_TARGETS = (
+    ("上证指数", "sh000001"),
+    ("创业板指", "sz399006"),
+    ("科创50", "sh000688"),
+    ("科创综指", "sh000680"),
+    ("中证1000", "sh000852"),
+    ("央企科技引领", "sh932038"),
+    ("央企现代产业", "sh931837"),
+)
+
+
+def _cutoff_at(trade_date: str, cutoff_time: str) -> datetime:
+    try:
+        return datetime.strptime(f"{trade_date} {cutoff_time}", "%Y-%m-%d %H:%M")
+    except ValueError as exc:
+        raise ValueError("cutoff_time must be HH:MM") from exc
+
+
+def _point_in_time_indices(db: Any, trade_date: str, cutoff_at: datetime) -> list[dict[str, Any]]:
+    day_start = datetime.fromisoformat(trade_date)
+    rows: list[dict[str, Any]] = []
+    for name, symbol in _INTRADAY_INDEX_TARGETS:
+        bars = list(
+            db["index_bars"].find(
+                {"meta.symbol": symbol, "meta.freq": "5分钟", "dt": {"$gte": day_start, "$lte": cutoff_at}},
+                {"_id": 0, "dt": 1, "open": 1, "high": 1, "low": 1, "close": 1, "amount": 1},
+            ).sort("dt", 1)
+        )
+        if not bars:
+            continue
+        first, latest = bars[0], bars[-1]
+        open_value = float(first.get("open") or 0)
+        latest_value = float(latest.get("close") or 0)
+        rows.append(
+            {
+                "name": name,
+                "symbol": symbol,
+                "latest_time": latest["dt"].strftime("%H:%M"),
+                "open": open_value,
+                "latest": latest_value,
+                "open_to_latest_pct": round((latest_value / open_value - 1) * 100, 2) if open_value else None,
+                "high": max(float(row.get("high") or 0) for row in bars),
+                "low": min(float(row.get("low") or 0) for row in bars),
+                "bar_count": len(bars),
+            }
+        )
+    return rows
+
+
+def _point_in_time_boards(db: Any, trade_date: str, cutoff_at: datetime, limit: int = 15) -> dict[str, Any]:
+    day_start = datetime.fromisoformat(trade_date)
+    latest = db["board_heat_ticks"].find_one(
+        {"source": "eastmoney_push2delay", "trade_minute": {"$gte": day_start, "$lte": cutoff_at}},
+        {"_id": 0, "trade_minute": 1},
+        sort=[("trade_minute", -1)],
+    )
+    if not latest:
+        return {"actual_time": None, "rows": []}
+    minute = latest["trade_minute"]
+    rows = list(
+        db["board_heat_ticks"].find(
+            {"source": "eastmoney_push2delay", "trade_minute": minute},
+            {"_id": 0, "kind": 1, "name": 1, "change_pct": 1, "rank_idx": 1, "leader_name": 1, "leader_change_pct": 1, "up_count": 1, "down_count": 1},
+        ).sort([("rank_idx", 1), ("change_pct", -1)]).limit(limit)
+    )
+    return {"actual_time": minute.strftime("%H:%M"), "rows": rows}
+
+
+def _point_in_time_stocks(db: Any, trade_date: str, cutoff_at: datetime, limit: int = 40) -> dict[str, Any]:
+    day_start = datetime.fromisoformat(trade_date)
+    pipeline = [
+        {"$match": {"meta.freq": "5分钟", "meta.symbol": {"$regex": "^[0-9]{6}$"}, "dt": {"$gte": day_start, "$lte": cutoff_at}}},
+        {"$sort": {"dt": 1}},
+        {"$group": {"_id": "$meta.symbol", "open": {"$first": "$open"}, "latest": {"$last": "$close"}, "latest_dt": {"$last": "$dt"}, "high": {"$max": "$high"}, "low": {"$min": "$low"}, "amount": {"$sum": "$amount"}}},
+        {"$match": {"open": {"$gt": 0}, "latest": {"$gt": 0}, "amount": {"$gt": 0}}},
+        {"$sort": {"amount": -1}},
+        {"$limit": 300},
+    ]
+    raw = list(db["bars"].aggregate(pipeline, allowDiskUse=True))
+    codes = [str(row.get("_id") or "") for row in raw]
+    identity: dict[str, dict[str, Any]] = {}
+    membership_date_doc = db["security_chain_memberships"].find_one(
+        {"trade_date": {"$lte": trade_date}}, {"_id": 0, "trade_date": 1}, sort=[("trade_date", -1)]
+    )
+    membership_date = str((membership_date_doc or {}).get("trade_date") or "")
+    if membership_date and codes:
+        for row in db["security_chain_memberships"].find(
+            {"trade_date": membership_date, "raw_code": {"$in": codes}, "is_primary_chain": True},
+            {"_id": 0, "raw_code": 1, "name": 1, "chain_id": 1, "chain_name": 1, "node_name": 1},
+        ):
+            identity.setdefault(str(row.get("raw_code") or ""), row)
+    rows: list[dict[str, Any]] = []
+    for row in raw:
+        code = str(row.get("_id") or "")
+        open_value = float(row.get("open") or 0)
+        latest_value = float(row.get("latest") or 0)
+        meta = identity.get(code, {})
+        rows.append(
+            {
+                "code": code,
+                "name": meta.get("name") or code,
+                "chain_id": meta.get("chain_id"),
+                "chain_name": meta.get("chain_name"),
+                "node_name": meta.get("node_name"),
+                "latest_time": row["latest_dt"].strftime("%H:%M"),
+                "open": open_value,
+                "latest": latest_value,
+                "open_to_latest_pct": round((latest_value / open_value - 1) * 100, 2),
+                "amount_yi": round(float(row.get("amount") or 0) / 100000000, 2),
+                "high": row.get("high"),
+                "low": row.get("low"),
+            }
+        )
+    elastic = sorted(
+        [row for row in rows if (row.get("amount_yi") or 0) >= 1],
+        key=lambda row: (row.get("open_to_latest_pct") or -999, row.get("amount_yi") or 0),
+        reverse=True,
+    )[:limit]
+    return {"turnover_leaders": rows[:limit], "elastic_candidates": elastic}
+
+
+def _build_intraday_cutoff_context(db: Any, trade_date: str, cutoff_time: str) -> dict[str, Any]:
+    cutoff_at = _cutoff_at(trade_date, cutoff_time)
+    return {
+        "trade_date": trade_date,
+        "cutoff_time": cutoff_time,
+        "cutoff_at": cutoff_at.isoformat(timespec="minutes"),
+        "evidence_policy": "strict_point_in_time",
+        "major_indices": _point_in_time_indices(db, trade_date, cutoff_at),
+        "board15_snapshot": _point_in_time_boards(db, trade_date, cutoff_at),
+        "dynamic_stock_roles": _point_in_time_stocks(db, trade_date, cutoff_at),
+        "excluded_after_cutoff": [
+            "fullmarket_spot_snapshots",
+            "daily_board_rankings",
+            "market_limit_pools",
+            "postmarket pools and summaries",
+        ],
+    }
+
+
 def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
     base_url = str(arguments.get("base_url") or "http://127.0.0.1:8011")
     dashboard, shell, snapshot = fetch_inputs(base_url)
@@ -345,6 +491,7 @@ def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
     if not trade_date:
         raise ValueError("trade_date is required when dashboard/snapshot has no as_of date")
     window = str(arguments.get("window") or "postmarket")
+    cutoff_time = str(arguments.get("cutoff_time") or "").strip()
     try:
         max_items = max(1, min(12, int(arguments.get("max_items") or 5)))
     except (TypeError, ValueError):
@@ -367,23 +514,32 @@ def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
     source_trade_date = _as_of_date(dashboard, snapshot)
     historical_requested = bool(explicit_trade_date and trade_date != source_trade_date)
     db = get_db()
-    context = build_market_replay_context(
-        db,
-        trade_date=trade_date,
-        sector_boards=[] if historical_requested else sector_boards,
-        checkpoints=checkpoints,
-        high_turnover_limit=high_turnover_limit,
-        representative_limit=representative_limit,
-        include_external_fund_flows=bool(arguments.get("include_external_fund_flows", False)),
-    )
-    base_context = collect_replay_context(
-        dashboard,
-        shell,
-        snapshot,
-        window=window,
-        max_items=max_items,
-        event_lines=fetch_market_event_lines(base_url, window=window) if include_events and window in {"ten", "midday", "two", "close"} else [],
-    )
+    if cutoff_time:
+        context = _build_intraday_cutoff_context(db, trade_date, cutoff_time)
+        base_context = {
+            "trade_date": trade_date,
+            "window": window,
+            "cutoff_time": cutoff_time,
+            "evidence_policy": "strict_point_in_time",
+        }
+    else:
+        context = build_market_replay_context(
+            db,
+            trade_date=trade_date,
+            sector_boards=[] if historical_requested else sector_boards,
+            checkpoints=checkpoints,
+            high_turnover_limit=high_turnover_limit,
+            representative_limit=representative_limit,
+            include_external_fund_flows=bool(arguments.get("include_external_fund_flows", False)),
+        )
+        base_context = collect_replay_context(
+            dashboard,
+            shell,
+            snapshot,
+            window=window,
+            max_items=max_items,
+            event_lines=fetch_market_event_lines(base_url, window=window) if include_events and window in {"ten", "midday", "two", "close"} else [],
+        )
     if historical_requested:
         base_context["source_trade_date"] = source_trade_date
         base_context["historical_context_note"] = (

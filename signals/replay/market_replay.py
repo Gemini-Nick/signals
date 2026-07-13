@@ -1483,9 +1483,12 @@ def _data_completeness(db: Any, trade_date: str, flow: dict[str, Any]) -> list[d
 
 _MAJOR_INDEX_TARGETS = (
     ("上证指数", "sh000001"),
-    ("深证成指", "sz399001"),
     ("创业板指", "sz399006"),
     ("科创50", "sh000688"),
+    ("科创综指", "sh000680"),
+    ("中证1000", "sh000852"),
+    ("央企科技引领", "sh932038"),
+    ("央企现代产业", "sh931837"),
 )
 
 
