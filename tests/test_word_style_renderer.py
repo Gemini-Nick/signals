@@ -205,7 +205,9 @@ def test_word_style_renderer_uses_evidence_and_marks_missing_fields():
     assert "2026-06-25至2026-06-29累计+20.10%" in text
     assert "涨停/强封、突破前高" in text
     assert "板块分钟线：missing" in text
-    assert "账户级主力/散户资金：missing" in text
+    assert "账户级参与者资金：missing" in text
+    assert "主力" not in text
+    assert "散户" not in text
     assert "极度分化，科创单骑救主" not in text
 
 

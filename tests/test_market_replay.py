@@ -4,7 +4,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from signals.replay.market_replay import _MAJOR_INDEX_TARGETS, _replay_coverage, build_market_replay_context, format_market_replay_sections
+from signals.replay.market_replay import (
+    _MAJOR_INDEX_TARGETS,
+    _limit_pool_lookup,
+    _replay_coverage,
+    build_market_replay_context,
+    format_market_replay_sections,
+)
 
 
 class FakeCursor:
@@ -100,6 +106,44 @@ class FakeCollection:
 class FakeDB(dict):
     def list_collection_names(self):
         return list(self.keys())
+
+
+def test_limit_pool_lookup_uses_latest_state_and_preserves_intraday_history():
+    day = "2026-07-14"
+    db = FakeDB(
+        {
+            "market_limit_pools": FakeCollection(
+                [
+                    {
+                        "trade_date": day,
+                        "code": "600001",
+                        "pool": "failed_limit",
+                        "snapshot_at": datetime(2026, 7, 14, 10, 15),
+                    },
+                    {
+                        "trade_date": day,
+                        "code": "600001",
+                        "pool": "limit_up",
+                        "snapshot_at": datetime(2026, 7, 14, 14, 59, 47),
+                    },
+                    {
+                        "trade_date": day,
+                        "code": "600002",
+                        "pool": "limit_down",
+                        "snapshot_at": datetime(2026, 7, 14, 14, 59, 47),
+                    },
+                ]
+            )
+        }
+    )
+
+    lookup = _limit_pool_lookup(db, day)
+
+    assert lookup["600001"]["pool"] == "limit_up"
+    assert lookup["600001"]["pools"] == ["failed_limit", "limit_up"]
+    assert lookup["600001"]["ever_failed_limit"] is True
+    assert [row["pool"] for row in lookup["600001"]["pool_history"]] == ["failed_limit", "limit_up"]
+    assert lookup["600002"]["pool"] == "limit_down"
 
 
 def test_stock_universe_excludes_explicit_etf_but_retains_new_stock_without_type():

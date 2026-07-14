@@ -923,11 +923,11 @@ def _flow_line(market_replay: dict[str, Any]) -> str:
     participant = bool(flow.get("participant_flow_available"))
     order_size = bool(flow.get("order_size_flow_available"))
     if participant:
-        return "账户级主力/散户资金：available，可引用对应集合。"
+        return "账户级参与者资金：available，可引用对应集合。"
     if order_size:
         sources = ", ".join(flow.get("order_size_sources") or []) or "Eastmoney/THS"
-        return f"账户级主力/散户资金：missing；可用 {sources} 大中小单订单口径，不等同主力/散户账户拆分。"
-    return "账户级主力/散户资金：missing；订单大小资金流也未形成稳定证据。"
+        return f"账户级参与者资金：missing；可用 {sources} 大中小单订单口径，但不能据此推断账户身份。"
+    return "账户级参与者资金：missing；订单大小资金流也未形成稳定证据。"
 
 
 def _technical_risk_line(market_replay: dict[str, Any]) -> str:
@@ -1060,6 +1060,7 @@ def render_word_style_review(signals_context: dict[str, Any], market_replay: dic
     limit_down_count = key_pool.get("limit_down_count")
     linked_limit_count = key_pool.get("linked_limit_count")
     seal_success_rate = key_pool.get("seal_success_rate_pct")
+    pool_snapshot_at = _text(key_pool.get("limit_pool_snapshot_at"), "unknown")
     exact_pool_level = "confirmed" if limit_counts else "unknown"
     lines.extend(
         [
@@ -1073,9 +1074,9 @@ def render_word_style_review(signals_context: dict[str, Any], market_replay: dic
             [
                 ["上涨家数", _text(breadth.get("up"), "unknown"), "fullmarket_spot_snapshots", _text(breadth.get("evidence_level"), "unknown")],
                 ["下跌家数", _text(breadth.get("down"), "unknown"), "fullmarket_spot_snapshots", _text(breadth.get("evidence_level"), "unknown")],
-                ["涨停(精确)", _text(limit_up_count, "unknown"), "market_limit_pools", exact_pool_level],
-                ["炸板(精确)", _text(failed_limit_count, "unknown"), "market_limit_pools", exact_pool_level],
-                ["跌停(精确)", _text(limit_down_count, "unknown"), "market_limit_pools", exact_pool_level],
+                ["涨停(池末快照)", _text(limit_up_count, "unknown"), "market_limit_pools latest snapshot", exact_pool_level],
+                ["炸板(池末快照)", _text(failed_limit_count, "unknown"), "market_limit_pools latest snapshot", exact_pool_level],
+                ["跌停(池末快照)", _text(limit_down_count, "unknown"), "market_limit_pools latest snapshot", exact_pool_level],
                 ["连板>=2", _text(linked_limit_count, "unknown"), "market_limit_pools.consecutive_limit_count", exact_pool_level],
                 ["封板率", f"{_fmt_num(seal_success_rate)}%" if seal_success_rate is not None else "unknown", "limit_up/(limit_up+failed_limit)", exact_pool_level],
                 ["近似涨停", _text(breadth.get("limit_like_count"), "unknown"), "日线涨跌幅阈值近似", "inferred"],
@@ -1085,7 +1086,7 @@ def render_word_style_review(signals_context: dict[str, Any], market_replay: dic
         )
     )
     pool_note = (
-        "market_limit_pools 已提供精确涨停/炸板/跌停口径。"
+        f"market_limit_pools 已提供 {pool_snapshot_at} 的本地池末快照；这是最终池状态，不等同于交易所正式涨跌停统计，盘中转池另保存在 pools/pool_history。"
         if exact_pool_level == "confirmed"
         else "market_limit_pools 缺失或样本不足时，封板率、连板高度和炸板率不能 confirmed；不从 Word 样本回填。"
     )
@@ -1246,7 +1247,7 @@ def render_word_style_review(signals_context: dict[str, Any], market_replay: dic
             "2. market_limit_pools 缺失或样本不足时，封板率、连板高度、炸板率不能 confirmed。",
             f"3. 高成交压力需要重点复核：{pressure_text}；若继续放量回落，会压制同方向扩散。",
             f"4. {technical_risk}" if technical_risk else "4. 技术面风险：major_index_technical 未显示明显过热指数，继续观察指数与个股宽度是否背离。",
-            "5. 账户级主力/散户资金缺失时，Eastmoney/THS 大中小单只能作为订单大小口径，不能写成主力/散户精确买卖。",
+            "5. 账户级参与者资金缺失时，Eastmoney/THS 大中小单只能作为订单大小口径，不能据此推断账户身份。",
             "6. 日度板块排行只能证明收盘强弱，不能单独证明盘中主线胜出。",
             "",
             "七、明日观察清单",

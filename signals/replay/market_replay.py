@@ -699,10 +699,35 @@ def _static_representatives(board: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+def _pool_event_sort_key(row: dict[str, Any], trade_date: str, sequence: int) -> tuple[int, float, int]:
+    raw = _first_present(
+        row.get("snapshot_at"), row.get("updated_at"), row.get("snapshot_minute"), row.get("trade_minute")
+    )
+    if isinstance(raw, datetime):
+        return 1, raw.timestamp(), sequence
+    text = _text(raw)
+    if text:
+        try:
+            return 1, datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp(), sequence
+        except ValueError:
+            digits = re.sub(r"\D", "", text)
+            if len(digits) >= 4:
+                hour, minute = int(digits[:2]), int(digits[2:4])
+                second = int(digits[4:6]) if len(digits) >= 6 else 0
+                if 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59:
+                    return 1, datetime.fromisoformat(trade_date).replace(
+                        hour=hour, minute=minute, second=second
+                    ).timestamp(), sequence
+    return 0, float(sequence), sequence
+
+
 def _limit_pool_lookup(db: Any, trade_date: str) -> dict[str, dict[str, Any]]:
     names = _collection_names(db)
     lookup: dict[str, dict[str, Any]] = {}
     pool_names = [name for name in ("market_limit_pools", "limit_up_pools", "market_pools") if name in names]
+    events: list[tuple[tuple[int, float, int], str, dict[str, Any]]] = []
+    latest_snapshot: dict[str, float] = {}
+    sequence = 0
     for collection_name in pool_names:
         cursor = db[collection_name].find(
             {
@@ -716,12 +741,29 @@ def _limit_pool_lookup(db: Any, trade_date: str) -> dict[str, dict[str, Any]]:
             {"_id": 0},
         ).sort([("snapshot_at", 1), ("updated_at", 1)])
         for row in cursor:
-            raw_code = _text(row.get("code") or row.get("symbol"))
-            code = _pure_code(raw_code)
-            if not code:
-                continue
-            pool_type = _text(row.get("pool") or row.get("pool_type") or row.get("type") or row.get("kind"))
-            enriched = {
+            event_key = _pool_event_sort_key(row, trade_date, sequence)
+            events.append((event_key, collection_name, row))
+            if event_key[0]:
+                latest_snapshot[collection_name] = max(
+                    latest_snapshot.get(collection_name, event_key[1]), event_key[1]
+                )
+            sequence += 1
+    final_priority = {
+        "limit_up": 0, "zt": 0, "涨停": 0,
+        "failed_limit": 1, "zbgc": 1, "炸板": 1,
+        "limit_down": 2, "dtgc": 2, "跌停": 2,
+        "strong": 10, "qsgc": 10, "强势": 10,
+    }
+    for event_key, collection_name, row in sorted(events, key=lambda item: item[0]):
+        raw_code = _text(row.get("code") or row.get("symbol"))
+        code = _pure_code(raw_code)
+        if not code:
+            continue
+        pool_type = _text(row.get("pool") or row.get("pool_type") or row.get("type") or row.get("kind"))
+        observed_at = _first_present(
+            row.get("snapshot_at"), row.get("updated_at"), row.get("snapshot_minute"), row.get("trade_minute")
+        )
+        enriched = {
                 "code": code,
                 "name": _text(_first_present(row.get("name"), row.get("名称"))),
                 "pool": pool_type,
@@ -737,33 +779,51 @@ def _limit_pool_lookup(db: Any, trade_date: str) -> dict[str, dict[str, Any]]:
                 "selected_reason": _text(_first_present(row.get("selected_reason"), row.get("入选理由"))),
                 "source_collection": collection_name,
             }
-            existing = lookup.setdefault(code, {})
-            pools = existing.setdefault("pools", [])
-            if pool_type and pool_type not in pools:
-                pools.append(pool_type)
-            if pool_type and not existing.get("pool"):
+        existing = lookup.setdefault(code, {})
+        pools = existing.setdefault("pools", [])
+        if pool_type and pool_type not in pools:
+            pools.append(pool_type)
+        if pool_type:
+            existing.setdefault("pool_history", []).append(
+                {
+                    "pool": pool_type,
+                    "observed_at": _text(observed_at) or None,
+                    "source_collection": collection_name,
+                }
+            )
+            is_final_snapshot = not event_key[0] or event_key[1] == latest_snapshot.get(collection_name)
+            current_pool = _text(existing.get("pool"))
+            if is_final_snapshot and (
+                not current_pool
+                or final_priority.get(pool_type, 20) < final_priority.get(current_pool, 20)
+            ):
                 existing["pool"] = pool_type
-            for key, value in enriched.items():
-                if value in ("", None):
-                    continue
-                if key == "first_limit_up_time":
-                    old = _text(existing.get(key))
-                    if not old or _text(value) < old:
-                        existing[key] = value
-                elif key in {"seal_amount", "open_count", "consecutive_limit_count", "volume_ratio"}:
-                    old_float = _float(existing.get(key))
-                    new_float = _float(value)
-                    if new_float is not None and (old_float is None or new_float > old_float):
-                        existing[key] = value
-                elif key in {"selected_reason", "industry"} and existing.get(key) and value != existing.get(key):
-                    merged_key = f"{key}s"
-                    merged = existing.setdefault(merged_key, [])
-                    if existing[key] not in merged:
-                        merged.append(existing[key])
-                    if value not in merged:
-                        merged.append(value)
-                else:
-                    existing.setdefault(key, value)
+                existing["final_pool_observed_at"] = _text(observed_at) or None
+                existing["final_pool_source"] = collection_name
+        for key, value in enriched.items():
+            if value in ("", None):
+                continue
+            if key == "first_limit_up_time":
+                old = _text(existing.get(key))
+                if not old or _text(value) < old:
+                    existing[key] = value
+            elif key in {"seal_amount", "open_count", "consecutive_limit_count", "volume_ratio"}:
+                old_float = _float(existing.get(key))
+                new_float = _float(value)
+                if new_float is not None and (old_float is None or new_float > old_float):
+                    existing[key] = value
+            elif key in {"selected_reason", "industry"} and existing.get(key) and value != existing.get(key):
+                merged_key = f"{key}s"
+                merged = existing.setdefault(merged_key, [])
+                if existing[key] not in merged:
+                    merged.append(existing[key])
+                if value not in merged:
+                    merged.append(value)
+            elif key != "pool":
+                existing.setdefault(key, value)
+        existing["ever_failed_limit"] = any(
+            pool in {"failed_limit", "zbgc", "炸板"} for pool in pools
+        )
     return lookup
 
 
@@ -2218,6 +2278,17 @@ def _key_stock_pool(db: Any, trade_date: str, limit_lookup: dict[str, dict[str, 
     denominator = limit_up_count + failed_limit_count
     seal_success_rate_pct = round(limit_up_count / denominator * 100, 2) if denominator else None
     failed_rate_pct = round(failed_limit_count / denominator * 100, 2) if denominator else None
+    final_snapshot_values = [
+        _text(meta.get("final_pool_observed_at"))
+        for meta in limit_lookup.values()
+        if meta.get("pool") and _text(meta.get("final_pool_observed_at"))
+    ]
+    process_failed_limit_count = sum(bool(meta.get("ever_failed_limit")) for meta in limit_lookup.values())
+    recovered_limit_up_count = sum(
+        bool(meta.get("ever_failed_limit"))
+        and _text(meta.get("pool")) in {"limit_up", "zt", "涨停"}
+        for meta in limit_lookup.values()
+    )
     return {
         "status": "available",
         "source": "fullmarket_spot_snapshots + market_limit_pools",
@@ -2236,6 +2307,10 @@ def _key_stock_pool(db: Any, trade_date: str, limit_lookup: dict[str, dict[str, 
         "linked_limit_count": linked_limit_count,
         "seal_success_rate_pct": seal_success_rate_pct,
         "failed_rate_pct": failed_rate_pct,
+        "limit_pool_snapshot_at": max(final_snapshot_values) if final_snapshot_values else None,
+        "process_failed_limit_count": process_failed_limit_count,
+        "recovered_limit_up_count": recovered_limit_up_count,
+        "limit_pool_semantics": "final counts use the latest complete local pool snapshot; pools/pool_history preserve intraday transitions",
         "limit_pool_sample": limit_samples,
     }
 
