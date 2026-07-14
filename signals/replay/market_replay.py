@@ -163,6 +163,7 @@ def _snapshot_projection() -> dict[str, int]:
         "vol": 1,
         "market_cap": 1,
         "float_market_cap": 1,
+        "security_type": 1,
     }
 
 
@@ -192,7 +193,14 @@ def _stock_snapshot(row: dict[str, Any]) -> dict[str, Any]:
         "volume": _float(row.get("vol")),
         "market_cap": _float(row.get("market_cap")),
         "float_market_cap": _float(row.get("float_market_cap")),
+        "security_type": _text(row.get("security_type")),
     }
+
+
+def _is_stock_snapshot(snapshot: dict[str, Any]) -> bool:
+    """Exclude explicit fund/ETF rows while retaining new stocks with missing type."""
+    security_type = _text(snapshot.get("security_type")).strip().lower()
+    return security_type not in {"etf", "fund", "lof", "closed_end_fund", "index_fund"}
 
 
 def _is_usable_daily_snapshot(snapshot: dict[str, Any]) -> bool:
@@ -442,6 +450,8 @@ def _high_turnover_cores(db: Any, trade_date: str, *, limit: int = 20) -> list[d
     result = []
     for row in cursor:
         snapshot = _stock_snapshot(row)
+        if not _is_stock_snapshot(snapshot):
+            continue
         if not _is_usable_daily_snapshot(snapshot):
             continue
         result.append({**snapshot, "amount_yi": _amount_yi(snapshot.get("amount"))})
@@ -625,6 +635,8 @@ def _snapshot_by_symbol(db: Any, trade_date: str, symbols: list[str]) -> dict[st
     result: dict[str, dict[str, Any]] = {}
     for row in cursor:
         snapshot = _stock_snapshot(row)
+        if not _is_stock_snapshot(snapshot):
+            continue
         if not _is_usable_daily_snapshot(snapshot):
             continue
         result[_pure_code(snapshot["symbol"])] = snapshot
@@ -949,6 +961,8 @@ def _failed_board_rows(db: Any, trade_date: str, *, limit: int = 20) -> list[dic
     cursor = db["fullmarket_spot_snapshots"].find(_snapshot_query(trade_date), _snapshot_projection())
     for row in cursor:
         snapshot = _stock_snapshot(row)
+        if not _is_stock_snapshot(snapshot):
+            continue
         name = _text(snapshot.get("name"))
         if name.startswith("N") and len(name) > 1:
             continue
@@ -1753,6 +1767,42 @@ def _major_index_intraday_context(db: Any, trade_date: str) -> dict[str, Any]:
     }
 
 
+def _replay_coverage(
+    trade_date: str,
+    report_stage: str,
+    major_indices: list[dict[str, Any]],
+    intraday: dict[str, Any],
+) -> dict[str, Any]:
+    if report_stage not in {"close_flash", "formal_postmarket"}:
+        raise ValueError(f"invalid report_stage: {report_stage}")
+    daily_dates = sorted({_text(row.get("date")) for row in major_indices if _text(row.get("date"))})
+    intraday_times = [
+        _text((row.get("close_bar") or {}).get("time"))
+        for row in intraday.get("rows", [])
+        if isinstance(row, dict) and _text((row.get("close_bar") or {}).get("time"))
+    ]
+    formal_ready = (
+        len(major_indices) == len(_MAJOR_INDEX_TARGETS)
+        and daily_dates == [trade_date]
+        and all(row.get("close") is not None for row in major_indices)
+    )
+    return {
+        "trade_date": trade_date,
+        "report_stage": report_stage,
+        "daily_coverage_date": daily_dates[-1] if daily_dates else None,
+        "official_close_source": "index_bars:日线" if formal_ready else None,
+        "official_close_as_of": trade_date if formal_ready else None,
+        "latest_intraday_time": max(intraday_times) if intraday_times else None,
+        "formal_ready": formal_ready,
+        "generation_status": "partial" if report_stage == "formal_postmarket" and not formal_ready else "success",
+        "note": (
+            "正式盘后数据完整。"
+            if formal_ready
+            else "正式日线收盘覆盖不足；分钟线只用于盘中结构，不得冒充正式收盘。"
+        ),
+    }
+
+
 def _market_breadth(db: Any, trade_date: str) -> dict[str, Any]:
     if "fullmarket_spot_snapshots" not in _collection_names(db):
         return {
@@ -1767,6 +1817,8 @@ def _market_breadth(db: Any, trade_date: str) -> dict[str, Any]:
     cursor = db["fullmarket_spot_snapshots"].find(_snapshot_query(trade_date), _snapshot_projection())
     for raw in cursor:
         snapshot = _stock_snapshot(raw)
+        if not _is_stock_snapshot(snapshot):
+            continue
         if not _is_usable_daily_snapshot(snapshot):
             continue
         total += 1
@@ -1941,7 +1993,7 @@ def _is_valid_stock_name(name: Any) -> bool:
 def _is_regular_replay_stock(snapshot: dict[str, Any]) -> bool:
     name = _text(snapshot.get("name"))
     code = _pure_code(_text(snapshot.get("code") or snapshot.get("symbol")))
-    if not _is_valid_stock_name(name):
+    if not _is_stock_snapshot(snapshot) or not _is_valid_stock_name(name):
         return False
     if name.startswith(("N", "C")):
         return False
@@ -1983,6 +2035,8 @@ def _stock_pool_cursor_rows(
     cursor = db["fullmarket_spot_snapshots"].find(_snapshot_query(trade_date), _snapshot_projection()).sort(sort_field, direction).limit(limit * 4)
     for raw in cursor:
         snapshot = _stock_snapshot(raw)
+        if not _is_stock_snapshot(snapshot):
+            continue
         if not _is_usable_daily_snapshot(snapshot):
             continue
         if not _is_valid_stock_name(snapshot.get("name")):
@@ -3001,6 +3055,7 @@ def build_market_replay_context(
     high_turnover_limit: int = 20,
     representative_limit: int = 30,
     include_external_fund_flows: bool = False,
+    report_stage: str = "formal_postmarket",
 ) -> dict[str, Any]:
     checkpoints = checkpoints or ["09:35", "10:30", "11:30", "13:30", "14:58"]
     boards = sector_boards or []
@@ -3023,6 +3078,9 @@ def build_market_replay_context(
         else []
     )
     flow_availability = _flow_availability(db, external_fund_flows)
+    major_indices = _major_index_daily_rows(db, trade_date)
+    major_index_intraday = _major_index_intraday_context(db, trade_date)
+    coverage = _replay_coverage(trade_date, report_stage, major_indices, major_index_intraday)
     failed_symbols = [row["symbol"] for row in failed_boards[: min(10, len(failed_boards))] if row.get("symbol")]
     limit_pool_symbols = _top_limit_pool_symbols(limit_lookup, limit=200)
     top_gainer_symbols = [
@@ -3058,6 +3116,9 @@ def build_market_replay_context(
     ]
     context = {
         "trade_date": trade_date,
+        "report_stage": report_stage,
+        "generation_status": coverage["generation_status"],
+        "coverage": coverage,
         "checkpoints": checkpoints,
         "data_sources": {
             "high_turnover_cores": "fullmarket_spot_snapshots",
@@ -3095,8 +3156,8 @@ def build_market_replay_context(
             "note": "历史回放缺 Agent OS 板块15 时使用日度板块排行派生，只能说明收盘强弱。",
         },
         "high_turnover_cores": high_turnover,
-        "major_indices": _major_index_daily_rows(db, trade_date),
-        "major_index_intraday": _major_index_intraday_context(db, trade_date),
+        "major_indices": major_indices,
+        "major_index_intraday": major_index_intraday,
         "major_index_technical": _major_index_technical_context(db, trade_date),
         "market_breadth": _market_breadth(db, trade_date),
         "daily_board_rankings": daily_board_rankings,

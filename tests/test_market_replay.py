@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from signals.replay.market_replay import build_market_replay_context, format_market_replay_sections
+from signals.replay.market_replay import _MAJOR_INDEX_TARGETS, _replay_coverage, build_market_replay_context, format_market_replay_sections
 
 
 class FakeCursor:
@@ -100,6 +100,60 @@ class FakeCollection:
 class FakeDB(dict):
     def list_collection_names(self):
         return list(self.keys())
+
+
+def test_stock_universe_excludes_explicit_etf_but_retains_new_stock_without_type():
+    day = "2026-07-14"
+    db = FakeDB(
+        {
+            "fullmarket_spot_snapshots": FakeCollection(
+                [
+                    {
+                        "date_key": day,
+                        "symbol": "SH.510300",
+                        "code": "510300",
+                        "name": "沪深300ETF",
+                        "close": 4.5,
+                        "change_pct": 1.0,
+                        "amount": 50000000000,
+                        "security_type": "etf",
+                    },
+                    {
+                        "date_key": day,
+                        "symbol": "SZ.301583",
+                        "code": "301583",
+                        "name": "C托伦斯",
+                        "close": 179.03,
+                        "change_pct": -19.28,
+                        "amount": 3288638460,
+                    },
+                ]
+            ),
+            "board_heat_ticks": FakeCollection([]),
+            "bars": FakeCollection([]),
+        }
+    )
+
+    context = build_market_replay_context(db, trade_date=day, high_turnover_limit=5)
+
+    assert [row["code"] for row in context["high_turnover_cores"]] == ["301583"]
+    assert context["market_breadth"]["total"] == 1
+    assert context["market_breadth"]["down"] == 1
+
+
+def test_replay_coverage_separates_official_close_from_latest_intraday_bar():
+    day = "2026-07-14"
+    daily = [{"date": day, "close": 1.0, "name": name} for name, _symbol in _MAJOR_INDEX_TARGETS]
+    intraday = {"rows": [{"close_bar": {"time": "14:55", "close": 1.0}}]}
+
+    formal = _replay_coverage(day, "formal_postmarket", daily, intraday)
+    partial = _replay_coverage(day, "formal_postmarket", daily[:1], intraday)
+
+    assert formal["formal_ready"] is True
+    assert formal["official_close_source"] == "index_bars:日线"
+    assert formal["latest_intraday_time"] == "14:55"
+    assert partial["formal_ready"] is False
+    assert partial["generation_status"] == "partial"
 
 
 def test_market_replay_context_extracts_event_graph():

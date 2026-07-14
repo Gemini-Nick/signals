@@ -146,6 +146,8 @@ def _board_name(row: dict[str, Any]) -> str:
 def _trend_board_map(market_replay: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
     structured = market_replay.get("structured_daily_review") if isinstance(market_replay.get("structured_daily_review"), dict) else {}
     trend = structured.get("trend_20d_boards") if isinstance(structured.get("trend_20d_boards"), dict) else {}
+    if trend.get("status") != "available":
+        return {}
     result: dict[tuple[str, str], dict[str, Any]] = {}
     for row in _as_list(trend.get("rows")):
         name = _text(row.get("name"))
@@ -385,7 +387,7 @@ def _index_intraday_lines(market_replay: dict[str, Any]) -> list[str]:
     ]
     lines.extend(
         _table(
-            ["指数", "低点时间", "低点", "高点时间", "收盘", "低点后修复"],
+            ["指数", "低点时间", "低点", "高点时间", "最新5分钟价", "低点后修复"],
             [
                 [
                     _text(row.get("name")),
@@ -394,6 +396,31 @@ def _index_intraday_lines(market_replay: dict[str, Any]) -> list[str]:
                     _text((row.get("high_bar") or {}).get("time")),
                     _fmt_num((row.get("close_bar") or {}).get("close")),
                     _fmt_pct(row.get("low_to_close_pct")),
+                ]
+                for row in rows
+            ],
+        )
+    )
+    return lines
+
+
+def _fixed_time_slice_lines(market_replay: dict[str, Any]) -> list[str]:
+    structured = market_replay.get("structured_daily_review") if isinstance(market_replay.get("structured_daily_review"), dict) else {}
+    rows = _as_list(structured.get("fixed_time_slices"))
+    if not rows:
+        return ["- 固定半小时时间轴：unknown。"]
+    lines = ["固定半小时时间轴"]
+    lines.extend(
+        _table(
+            ["切片", "时间", "市场行为", "增强方向", "承压方向", "证据等级"],
+            [
+                [
+                    _text(row.get("slice")),
+                    _text(row.get("actual_range") or row.get("time_range")),
+                    _text(row.get("market_behavior"), "unknown"),
+                    _text((row.get("active_direction") or {}).get("name"), "unknown"),
+                    _text((row.get("drained_direction") or {}).get("name"), "unknown"),
+                    _text(row.get("evidence_level"), "unknown"),
                 ]
                 for row in rows
             ],
@@ -500,17 +527,23 @@ def _calibration_lines(market_replay: dict[str, Any]) -> list[str]:
 
 def _dynamic_representative_stocks(market_replay: dict[str, Any]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
+    seen: set[str] = set()
     bucket_labels = [
+        ("pressure_core", "压力核心"),
+        ("failed_emotion", "失败对照"),
         ("market_core", "主线容量/动态核心"),
         ("market_elastic_confirmed", "封板弹性"),
         ("market_elastic", "强势弹性"),
-        ("failed_emotion", "失败对照"),
-        ("pressure_core", "压力核心"),
     ]
     for board in _as_list(market_replay.get("dynamic_market_representatives")):
         board_name = _text(board.get("board") or board.get("driver_name"))
         for bucket, label in bucket_labels:
             for row in _as_list(board.get(bucket))[:1]:
+                key = _stock_key(row)
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
                 result.append({**row, "_word_type": label, "_board": board_name})
     return result
 
@@ -941,6 +974,18 @@ def render_word_style_review(signals_context: dict[str, Any], market_replay: dic
     strongest = strong_boards[0] if strong_boards else {}
     weakest = weak_boards[0] if weak_boards else {}
     technical_risk = _technical_risk_line(market_replay)
+    coverage = market_replay.get("coverage") if isinstance(market_replay.get("coverage"), dict) else {}
+    report_stage = _text(market_replay.get("report_stage") or coverage.get("report_stage"), "formal_postmarket")
+    formal_ready = bool(coverage.get("formal_ready"))
+    coverage_line = (
+        f"正式收盘已确认（{_text(coverage.get('official_close_source'), 'unknown')}，as_of={_text(coverage.get('official_close_as_of'), trade_date)}）"
+        if formal_ready
+        else f"正式收盘未就绪；最新分钟时点={_text(coverage.get('latest_intraday_time'), 'unknown')}，分钟线仅作盘中结构"
+    )
+    structured_review = market_replay.get("structured_daily_review") if isinstance(market_replay.get("structured_daily_review"), dict) else {}
+    turnover_boards = structured_review.get("top_turnover_boards") if isinstance(structured_review.get("top_turnover_boards"), dict) else {}
+    board_table_title = "1. 板块强度代理 TOP7" if turnover_boards.get("status") != "available" else "1. 今日成交额板块 TOP7"
+    board_table_limit = 7
 
     pressure_text = (
         f"{_text(pressure.get('name'))}成交{_fmt_yi(pressure.get('amount_yi'))}亿、涨跌{_fmt_pct(pressure.get('change_pct'))}"
@@ -959,6 +1004,7 @@ def render_word_style_review(signals_context: dict[str, Any], market_replay: dic
     lines: list[str] = [
         f"{short_date}A股盘后复盘报告（Signals组装版）",
         f"A股盘后复盘报告 | {date_text}（{weekday_text}）",
+        f"报告阶段：{report_stage}；生成状态：{_text(market_replay.get('generation_status'), 'partial')}；{coverage_line}。",
         "",
         "昨日观察点校准",
         *_calibration_lines(market_replay),
@@ -999,6 +1045,7 @@ def render_word_style_review(signals_context: dict[str, Any], market_replay: dic
             f"- 指数分钟线：{_status_text(statuses, '指数分钟线')}。",
             f"- 板块分钟线：{board_minute_status}。",
             *_index_intraday_lines(market_replay),
+            *_fixed_time_slice_lines(market_replay),
             "- 可确认部分：本地指数日线、指数5分钟线和个股日线可确认开高低收、涨跌幅、成交额；板块资金切换节点仍以板块分钟线状态为准。",
             "",
             "3. 技术面",
@@ -1048,7 +1095,7 @@ def render_word_style_review(signals_context: dict[str, Any], market_replay: dic
             f"情绪拆解：{_flow_line(market_replay)} {pool_note}",
             "",
             "三、板块深度拆解",
-            "1. 今日最强板块 TOP10",
+            board_table_title,
         ]
     )
     lines.extend(
@@ -1066,7 +1113,7 @@ def render_word_style_review(signals_context: dict[str, Any], market_replay: dic
                     f"{_text(row.get('leader_name'), 'unknown')} {_fmt_pct(row.get('leader_change_pct'))}",
                     _text(row.get("source"), "unknown"),
                 ]
-                for idx, row in enumerate(strong_boards[:10], start=1)
+                for idx, row in enumerate(strong_boards[:board_table_limit], start=1)
             ],
         )
     )

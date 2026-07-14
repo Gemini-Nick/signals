@@ -145,6 +145,12 @@ def _tool_schema() -> list[dict[str, Any]]:
                         "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$",
                         "description": "Optional strict Beijing market cutoff HH:MM. When set, return only point-in-time evidence at or before the cutoff.",
                     },
+                    "report_stage": {
+                        "type": "string",
+                        "default": "formal_postmarket",
+                        "enum": ["close_flash", "formal_postmarket"],
+                        "description": "close_flash may use provisional intraday bars; formal_postmarket requires same-day official daily closes.",
+                    },
                     "window": {
                         "type": "string",
                         "default": "postmarket",
@@ -243,6 +249,11 @@ def _tool_schema() -> list[dict[str, Any]]:
                     "include_external_fund_flows": {
                         "type": "boolean",
                         "default": False,
+                    },
+                    "report_stage": {
+                        "type": "string",
+                        "default": "formal_postmarket",
+                        "enum": ["close_flash", "formal_postmarket"],
                     },
                 },
             },
@@ -494,6 +505,9 @@ def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
     if not trade_date:
         raise ValueError("trade_date is required when dashboard/snapshot has no as_of date")
     window = str(arguments.get("window") or "postmarket")
+    report_stage = str(arguments.get("report_stage") or "formal_postmarket")
+    if report_stage not in {"close_flash", "formal_postmarket"}:
+        raise ValueError(f"invalid report_stage: {report_stage}")
     cutoff_time = str(arguments.get("cutoff_time") or "").strip()
     try:
         max_items = max(1, min(12, int(arguments.get("max_items") or 5)))
@@ -519,6 +533,19 @@ def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
     db = get_db()
     if cutoff_time:
         context = _build_intraday_cutoff_context(db, trade_date, cutoff_time)
+        context["report_stage"] = report_stage
+        context["generation_status"] = "partial" if report_stage == "formal_postmarket" else "success"
+        context["coverage"] = {
+            "trade_date": trade_date,
+            "report_stage": report_stage,
+            "daily_coverage_date": None,
+            "official_close_source": None,
+            "official_close_as_of": None,
+            "latest_intraday_time": cutoff_time,
+            "formal_ready": False,
+            "generation_status": context["generation_status"],
+            "note": "严格点时上下文不等同正式收盘；不得用分钟线冒充正式收盘。",
+        }
         base_context = {
             "trade_date": trade_date,
             "window": window,
@@ -534,6 +561,7 @@ def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
             high_turnover_limit=high_turnover_limit,
             representative_limit=representative_limit,
             include_external_fund_flows=bool(arguments.get("include_external_fund_flows", False)),
+            report_stage=report_stage,
         )
         base_context = collect_replay_context(
             dashboard,
@@ -566,8 +594,14 @@ def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
         }
     return {
         "trade_date": trade_date,
+        "requested_trade_date": str(arguments.get("trade_date") or trade_date),
+        "data_trade_date": context.get("trade_date") or trade_date,
         "base_url": base_url,
         "window": window,
+        "report_stage": report_stage,
+        "coverage": context.get("coverage", {}),
+        "generation_status": context.get("generation_status", "success"),
+        "send_allowed": False,
         "signals_context": base_context,
         "market_replay": context,
     }

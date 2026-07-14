@@ -132,3 +132,10 @@ def test_render_market_replay_wechat_body_mcp_tool(monkeypatch):
     assert "丰光精密" in result["body"]
     for term in BANNED_BODY_TERMS:
         assert term not in result["body"]
+
+
+def test_market_replay_tool_exposes_report_stage_contract():
+    tool = next(item for item in review_assistant_server._tool_schema() if item["name"] == "get_market_replay_context")
+    report_stage = tool["inputSchema"]["properties"]["report_stage"]
+    assert report_stage["enum"] == ["close_flash", "formal_postmarket"]
+    assert report_stage["default"] == "formal_postmarket"

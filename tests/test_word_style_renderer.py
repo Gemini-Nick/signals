@@ -198,7 +198,8 @@ def test_word_style_renderer_uses_evidence_and_marks_missing_fields():
     assert "MA20乖离+1.58%" in text
     assert "科创50 RSI(6)=80.82、MA20乖离+17.91%" in text
     assert "方向定性" in text
-    assert "生物制品（industry）——强趋势延续" in text
+    assert "生物制品（industry）——强趋势延续" not in text
+    assert "5日/20日趋势 unknown" in text
     assert "归属半导体产业链/半导体设备" in text
     assert "日线加速点：2026-06-29，涨停/强封、突破前高" in text
     assert "2026-06-25至2026-06-29累计+20.10%" in text
@@ -409,3 +410,54 @@ def test_chain_pressure_pool_keeps_high_amount_same_chain_weak_samples_without_n
     )
 
     assert [row["code"] for row in pool] == ["688146", "688002"]
+
+
+def test_word_renderer_shows_fixed_slices_proxy_label_and_pressure_role_priority():
+    text = render_word_style_review(
+        {"trade_date": "2026-07-14"},
+        {
+            "trade_date": "2026-07-14",
+            "report_stage": "formal_postmarket",
+            "generation_status": "partial",
+            "coverage": {"formal_ready": False, "latest_intraday_time": "14:55"},
+            "major_indices": [],
+            "market_breadth": {"status": "missing"},
+            "daily_board_rankings": {
+                "rows": [{"name": "元件", "kind": "industry", "change_pct": 8.15, "source": "canonical"}],
+                "weak_rows": [],
+            },
+            "high_turnover_cores": [],
+            "flow_availability": {"participant_flow_available": False, "order_size_flow_available": False},
+            "dynamic_market_representatives": [
+                {
+                    "board": "元件",
+                    "market_core": [{"code": "300001", "name": "样本股", "change_pct": -5, "amount_yi": 10}],
+                    "pressure_core": [{"code": "300001", "name": "样本股", "change_pct": -5, "amount_yi": 10}],
+                }
+            ],
+            "structured_daily_review": {
+                "top_turnover_boards": {"status": "partial", "rows": []},
+                "trend_20d_boards": {"status": "partial", "rows": [{"name": "元件", "change_20d_pct": 99}]},
+                "fixed_time_slices": [
+                    {
+                        "slice": "午后第一段",
+                        "time_range": "13:00-13:30",
+                        "actual_range": "13:01-13:30",
+                        "market_behavior": "单向增强",
+                        "active_direction": {"name": "元件"},
+                        "drained_direction": {"name": "银行"},
+                        "evidence_level": "confirmed",
+                    }
+                ],
+                "key_stock_pool": {"gainers_top20": [], "limit_pool_counts": {}},
+            },
+        },
+    )
+
+    assert "板块强度代理 TOP7" in text
+    assert "固定半小时时间轴" in text
+    assert "13:01-13:30" in text
+    assert "压力核心" in text
+    assert "主线容量/动态核心 | 样本股" not in text
+    assert "20日+99.00%" not in text
+    assert "最新分钟时点=14:55" in text
