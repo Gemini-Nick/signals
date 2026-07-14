@@ -12,6 +12,7 @@ from signals.notify.trading_workbench_summary import (
     build_narrative_review,
     collect_replay_context,
     fetch_inputs,
+    fetch_inputs_safe,
     fetch_market_event_lines,
     _historical_replay_inputs,
     _market_replay_sector_rows,
@@ -320,7 +321,8 @@ def _collect_context(arguments: dict[str, Any]) -> dict[str, Any]:
     extra_facts = arguments.get("extra_facts") if isinstance(arguments.get("extra_facts"), list) else []
     extra_facts = [str(item).strip() for item in extra_facts if str(item).strip()]
 
-    dashboard, shell, snapshot = fetch_inputs(base_url)
+    _fetched = fetch_inputs_safe(base_url, timeout=20.0)
+    dashboard, shell, snapshot = _fetched.dashboard, _fetched.shell, _fetched.snapshot
     event_lines: list[str] = []
     if include_events and window in {"ten", "midday", "two", "close"}:
         event_lines = fetch_market_event_lines(base_url, window=window)
@@ -486,7 +488,8 @@ def _build_intraday_cutoff_context(db: Any, trade_date: str, cutoff_time: str) -
 
 def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
     base_url = str(arguments.get("base_url") or "http://127.0.0.1:8011")
-    dashboard, shell, snapshot = fetch_inputs(base_url)
+    _fetched = fetch_inputs_safe(base_url, timeout=20.0)
+    dashboard, shell, snapshot = _fetched.dashboard, _fetched.shell, _fetched.snapshot
     trade_date = str(arguments.get("trade_date") or _as_of_date(dashboard, snapshot)).strip()
     if not trade_date:
         raise ValueError("trade_date is required when dashboard/snapshot has no as_of date")
