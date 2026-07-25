@@ -1134,6 +1134,7 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
         "knowledge_status": _text(reason.get("knowledge_status")),
         "knowledge_effect": _text(reason.get("knowledge_effect")),
         "backtest_quality": reason.get("backtest_quality") if isinstance(reason.get("backtest_quality"), dict) else {},
+        "invalidates_when": _text(reason.get("invalidates_when")),
     }
     key = _reason_key(normalized)
     existing_keys = {_reason_key(item) for item in row["inclusion_reasons"]}
@@ -1151,6 +1152,8 @@ def _add_reason(rows: dict[str, dict[str, Any]], value: Any, reason: dict[str, A
     row["signal_family"] = top.get("signal_family") or row.get("signal_family") or ""
     if top.get("signal_type"):
         row["latest_signal"] = top["signal_type"]
+    if top.get("invalidates_when"):
+        row["invalidates_when"] = top["invalidates_when"]
     if top.get("chain_id"):
         row["chain_context"] = {
             "chain_id": top.get("chain_id"),
@@ -1403,14 +1406,18 @@ def _add_signal_rows(
 
 def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str]) -> None:
     limit = max(1, int(os.getenv("TERMINAL_POOL_TECHNICAL_SIGNAL_LIMIT", "20000")))
-    latest = db["terminal_technical_signals"].find_one(
-        {"market": "A", "as_of": {"$exists": True}},
-        {"as_of": 1},
-        sort=[("as_of", -1), ("updated_at", -1)],
-    ) or {}
-    query: dict[str, Any] = {"market": "A"}
-    if latest.get("as_of"):
-        query["as_of"] = latest.get("as_of")
+    requested_as_of = str(get_task_env("SIGNALS_POSTMARKET_TRADE_DATE", "") or "").strip()[:10]
+    query: dict[str, Any] = {"market": "A", "active": {"$ne": False}}
+    if requested_as_of:
+        query["as_of"] = requested_as_of
+    else:
+        latest = db["terminal_technical_signals"].find_one(
+            {"market": "A", "active": {"$ne": False}, "as_of": {"$exists": True}},
+            {"as_of": 1},
+            sort=[("as_of", -1), ("updated_at", -1)],
+        ) or {}
+        if latest.get("as_of"):
+            query["as_of"] = latest.get("as_of")
     cursor = db["terminal_technical_signals"].find(
         query,
         {
@@ -1431,10 +1438,17 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
             "technical_evidence": 1,
             "resonance_context": 1,
             "invalidates_when": 1,
+            "active": 1,
         },
     ).sort([("total_score", -1), ("confidence", -1), ("updated_at", -1)]).limit(limit)
     for signal in cursor:
         evidence = signal.get("technical_evidence") if isinstance(signal.get("technical_evidence"), dict) else {}
+        climb = evidence.get("ma_climb") if isinstance(evidence.get("ma_climb"), dict) else {}
+        signal_score = (
+            _float(climb.get("climb_score"))
+            if _text(signal.get("signal_family")) == "ma_climb"
+            else _float(signal.get("total_score") or signal.get("score"))
+        )
         ma_alignment = signal.get("ma_alignment") if isinstance(signal.get("ma_alignment"), dict) else {}
         if not ma_alignment and isinstance(evidence.get("ma_alignment"), dict):
             ma_alignment = evidence.get("ma_alignment") or {}
@@ -1449,7 +1463,7 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
             "signal_side": _text(signal.get("signal_side")) or _signal_side(signal),
             "signal_family": _text(signal.get("signal_family")) or "hard_technical",
             "freq": _text(signal.get("freq")),
-            "score": _float(signal.get("total_score") or signal.get("score")),
+            "score": signal_score,
             "confidence": _float(signal.get("confidence")),
             "as_of": _text(signal.get("as_of") or signal.get("updated_at"))[:10],
             "event_dt": _iso_dt(signal.get("dt")),
@@ -1457,6 +1471,7 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
             "ma_alignment": ma_alignment,
             "resonance_context": resonance_context,
             "evidence": evidence,
+            "invalidates_when": _text(signal.get("invalidates_when")),
         }, index_codes=index_codes)
 
 
@@ -2379,6 +2394,23 @@ def _is_default_candidate_anchor_reason(reason: dict[str, Any]) -> bool:
     return _is_fresh_buy_technical_reason(reason) and _text(reason.get("freq")) in DEFAULT_CANDIDATE_ANCHOR_FREQS
 
 
+def _ma_climb_evidence(reason: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(reason, dict) or _text(reason.get("signal_family")) != "ma_climb":
+        return {}
+    evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+    climb = evidence.get("ma_climb") if isinstance(evidence.get("ma_climb"), dict) else {}
+    return climb
+
+
+def _ma_climb_score(reason: dict[str, Any] | None) -> float:
+    climb = _ma_climb_evidence(reason)
+    return _float(climb.get("climb_score")) if climb.get("running") else 0.0
+
+
+def _is_buy_review_ma_climb(reason: dict[str, Any] | None) -> bool:
+    return _ma_climb_score(reason) >= 80.0
+
+
 def _is_strong_30m_anchor_reason(reason: dict[str, Any]) -> bool:
     if not _is_default_candidate_anchor_reason(reason) or not _is_30m_freq(reason.get("freq")):
         return False
@@ -2413,6 +2445,8 @@ def _is_strong_30m_anchor_reason(reason: dict[str, Any]) -> bool:
 def _is_strong_upper_anchor_reason(reason: dict[str, Any]) -> bool:
     if not _is_default_candidate_anchor_reason(reason) or not _is_upper_freq(reason.get("freq")):
         return False
+    if _ma_climb_score(reason) >= 60.0:
+        return True
     text = _reason_signal_text(reason)
     weak_tokens = (
         "MACD绿柱扩大",
@@ -3269,6 +3303,8 @@ def _right_review_allowed_in_focus(row: dict[str, Any], entry_gate_status: str, 
         return False
     if entry_gate_status == "entry_waiting_upper_context":
         return False
+    if _is_buy_review_ma_climb(top_buy):
+        return entry_gate_status == "entry_waiting_30m_confirm"
     if _focus_mainline_rank_tier(row) <= 0:
         return False
     if _sector_policy(row).get("policy") == "defensive_strict":
@@ -3369,7 +3405,12 @@ def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, An
             "details": chain_blocker,
         }
     upper_buy_priority = _has_current_upper_buy_point(row, current_buy_reasons or buy_reasons)
-    if blocking_risk and (not upper_buy_priority or _hard_risk_still_blocks_upper_buy(blocking_risk)):
+    ma_climb_priority = _ma_climb_score(top_buy) >= 60.0
+    if blocking_risk and (
+        ma_climb_priority
+        or not upper_buy_priority
+        or _hard_risk_still_blocks_upper_buy(blocking_risk)
+    ):
         return False, "blocked_by_risk", _risk_blocked_by_code(blocking_risk), top_buy, blocking_risk
     has_30m = _has_direct_reason_for_freq(buy_reasons, _is_30m_freq)
     has_upper = _has_direct_reason_for_freq(buy_reasons, _is_upper_freq)
@@ -4003,6 +4044,8 @@ def _technical_opportunity_side(reason: dict[str, Any]) -> str:
     freq = _text(reason.get("freq"))
     if signal_side == "sell":
         return "sell"
+    if _ma_climb_score(reason) >= 60.0:
+        return "right"
     if any(token in text for token in WEAK_CONTEXT_TOKENS):
         return "context"
     if "二买" in text and _is_upper_freq(freq):
@@ -4779,7 +4822,8 @@ def _finalize_pool_row(
         left_attack = entry_gate_status == "left_attack_confirmed"
         right_review = entry_gate_status in FOCUS_REVIEW_GATE_STATUSES
         row["action_status"] = "left_attack" if left_attack else "attack_entry" if attack_entry else entry_gate_status if right_review else "entry_ready"
-        row["trader_action"] = "低吸进攻复核" if left_attack else "进攻买点复核" if attack_entry else "右侧买点复核" if right_review else "确认买点复核"
+        climb_review = right_review and _is_buy_review_ma_climb(top_buy)
+        row["trader_action"] = "攀爬买点复核" if climb_review else "低吸进攻复核" if left_attack else "进攻买点复核" if attack_entry else "右侧买点复核" if right_review else "确认买点复核"
         row["next_action"] = row["trader_action"]
         row["queue_lane"] = "left_review" if left_attack else "entry_waiting_confirm" if (attack_entry or right_review) else "entry_ready"
         row["actionability"] = "left_review" if left_attack else "entry_waiting_confirm" if (attack_entry or right_review) else "entry_ready"
@@ -4790,6 +4834,8 @@ def _finalize_pool_row(
             row["invalidates_when"] = "跌回10/20日线、左侧买点失效或产业链风险升温"
         elif attack_entry:
             row["invalidates_when"] = "5m/15m转弱、30m迟迟不补、日/周转冲突或产业链高潮"
+        elif climb_review:
+            row["invalidates_when"] = _text((top_buy or {}).get("invalidates_when")) or "收盘跌破有效均线，攀爬逻辑失效"
         elif right_review:
             row["invalidates_when"] = "缺口周期迟迟不补、右侧动量转弱或产业链风险升温"
         else:

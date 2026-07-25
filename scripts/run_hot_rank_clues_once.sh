@@ -12,13 +12,21 @@ should_run="$(bash "${ROOT_DIR}/scripts/python.sh" - <<'PY'
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
+from signals.core.trading_dates import is_trading_day
+
 now = datetime.now(ZoneInfo("Asia/Shanghai"))
 windows = (
     (time(9, 15), time(15, 35)),
     (time(20, 30), time(22, 30)),
 )
-in_window = any(start <= now.time() <= end for start, end in windows)
-print("run" if in_window else f"skip:{now.isoformat(timespec='seconds')}")
+trading_day = is_trading_day("A", now.date())
+in_window = trading_day and any(start <= now.time() <= end for start, end in windows)
+reason = "run" if in_window else (
+    f"skip:non_trading_day:{now.isoformat(timespec='seconds')}"
+    if not trading_day
+    else f"skip:outside_window:{now.isoformat(timespec='seconds')}"
+)
+print(reason)
 PY
 )"
 

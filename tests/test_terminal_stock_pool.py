@@ -7,6 +7,34 @@ from signals.sync.modules.terminal_pool import _add_fallback_watch_rows, _add_re
 from signals.sync.modules.terminal_pool import _slim_pool_row_for_storage
 
 
+def _add_ma_climb(rows, code, score):
+    _add_reason(rows, code, {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": f"ma-climb-{code}",
+        "signal_type": "沿5日线攀爬",
+        "signal_side": "buy",
+        "signal_family": "ma_climb",
+        "freq": "日线",
+        "score": score,
+        "confidence": score / 100,
+        "as_of": "2026-07-24",
+        "event_dt": "2026-07-24T00:00:00",
+        "ma_alignment": _ma_alignment(score=score),
+        "resonance_context": {"aligned_freqs": ["日线"], "conflict_freqs": []},
+        "evidence": {
+            "ma_climb": {
+                "running": True,
+                "effective_ma": "MA5",
+                "period": 5,
+                "climb_score": score,
+                "climb_grade": "buy_review" if score >= 80 else "watch",
+            },
+        },
+        "invalidates_when": "收盘跌破有效5日均线，攀爬逻辑失效",
+    }, index_codes=set())
+
+
 class _Cursor(list):
     def sort(self, *args, **kwargs):
         return self
@@ -95,6 +123,55 @@ def _ma_alignment(*, above5=True, above10=True, above20=True, near10=False, near
         "summary": "站上20日线 / 站上10日线 / 站上5日线",
         "tags": ["站上20日线", "站上10日线", "站上5日线"],
     }
+
+
+def test_ma_climb_buy_review_enters_focus_without_hot_rank_or_mainline():
+    rows = {}
+    _add_ma_climb(rows, "300001", 85)
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["watch"] == []
+    assert [row["raw_code"] for row in split["focus"]] == ["300001"]
+    row = split["focus"][0]
+    assert row["entry_gate_status"] == "entry_waiting_30m_confirm"
+    assert row["trader_action"] == "攀爬买点复核"
+    assert row["can_trade_now"] is False
+    assert row["invalidates_when"] == "收盘跌破有效5日均线，攀爬逻辑失效"
+
+
+def test_ma_climb_watch_grade_stays_in_watch_pool():
+    rows = {}
+    _add_ma_climb(rows, "300002", 72)
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["focus"] == []
+    assert [row["raw_code"] for row in split["watch"]] == ["300002"]
+    assert split["watch"][0]["can_trade_now"] is False
+
+
+def test_ma_climb_buy_review_does_not_bypass_fresh_sell_risk():
+    rows = {}
+    _add_ma_climb(rows, "300003", 88)
+    _add_reason(rows, "300003", {
+        "reason_type": "technical_trigger",
+        "source_collection": "terminal_technical_signals",
+        "source_doc_id": "fresh-sell-risk",
+        "signal_type": "30分钟 二卖",
+        "signal_side": "sell",
+        "signal_family": "hard_technical",
+        "freq": "30分钟",
+        "score": 70,
+        "confidence": 0.8,
+        "as_of": "2026-07-24",
+        "event_dt": "2026-07-24T14:30:00",
+    }, index_codes=set())
+
+    split = _split_pool_rows(rows, focus_limit=72, risk_limit=72, watch_limit=72)
+
+    assert split["focus"] == []
+    assert [row["raw_code"] for row in split["risk"]] == ["300003"]
 
 
 def test_terminal_stock_pool_uses_macro_etf_symbol_and_name():

@@ -89,6 +89,10 @@ def _env_text(name: str, default: str = "") -> str:
     return str(get_task_env(name, os.getenv(name, default)) or default).strip()
 
 
+def _scan_as_of(now: datetime) -> str:
+    return _env_text("SIGNALS_POSTMARKET_TRADE_DATE")[:10] or now.date().isoformat()
+
+
 def _env_int(name: str, default: int, *, minimum: int = 0, maximum: int | None = None) -> int:
     try:
         value = int(_env_text(name, str(default)) or default)
@@ -1123,7 +1127,7 @@ def _entry_factor_docs(
             "market": market,
             "freq": "日线",
             "dt": dt_value,
-            "as_of": now.date().isoformat(),
+            "as_of": _scan_as_of(now),
             "updated_at": now,
             "signal_type": signal_type,
             "signal_side": "buy",
@@ -1222,7 +1226,7 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
             "market": market,
             "freq": event.freq,
             "dt": dt_value,
-            "as_of": now.date().isoformat(),
+            "as_of": _scan_as_of(now),
             "updated_at": now,
             "signal_type": event.signal_type,
             "signal_side": side,
@@ -1335,8 +1339,8 @@ def _sync_technical_signal_scan(db: Database, proxy_url: str = None, *, scope: s
             "lane": freshness_lane,
             "collection": "terminal_technical_signals",
             "freshness": "fresh",
-            "latest_dt": now.date().isoformat(),
-            "as_of": now.date().isoformat(),
+            "latest_dt": _scan_as_of(now),
+            "as_of": _scan_as_of(now),
             "updated_at": now,
             "stale_reason": "" if signal_count or not symbols else "no_technical_signal_detected",
             "count": signal_count,

@@ -215,6 +215,11 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
         },
     ),
     PostmarketTaskSpec(
+        "ma_climb_scan",
+        "derived",
+        depends_on=(*_STOCK_DAILY_DEPS,),
+    ),
+    PostmarketTaskSpec(
         "technical_signal_scan",
         "derived",
         depends_on=(*_STOCK_DAILY_DEPS, "weekly_rollup:all"),
@@ -236,7 +241,7 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     PostmarketTaskSpec(
         "terminal_realtime_pool",
         "terminal",
-        depends_on=("technical_signal_scan:all", "knowledge_market_views:all", "postmarket_chain_rebuild:all", "chain_heat_snapshots:all", "concept_relationship_graph:all"),
+        depends_on=("technical_signal_scan:all", "ma_climb_scan:all", "knowledge_market_views:all", "postmarket_chain_rebuild:all", "chain_heat_snapshots:all", "concept_relationship_graph:all"),
         env={"TERMINAL_POOL_STRICT_SOURCES": "true"},
     ),
     PostmarketTaskSpec("strategy_snapshot", "terminal", depends_on=("terminal_realtime_pool:all", ETF_SPOT_TASK_KEY)),

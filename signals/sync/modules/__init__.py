@@ -23,6 +23,7 @@ from .minute_readiness import sync_minute_readiness_probe
 from .weekly_rollup import sync_weekly_rollup
 from .terminal_pool import sync_terminal_realtime_pool
 from .hot_rank_clues import sync_hot_rank_clues
+from .ma_climb_scan import sync_ma_climb_scan
 from .technical_signal_scan import sync_intraday_technical_signal_scan, sync_technical_signal_scan
 from .knowledge_market_views import sync_knowledge_market_views
 from .concept_relationship_graph import sync_concept_relationship_graph
@@ -54,6 +55,7 @@ ALL_MODULES = [
     ("board_cons",    sync_board_cons,    "18:00-21:00 weekday"),
     ("security_business_facts", sync_security_business_facts, "20:00-22:00 weekday"),
     ("postmarket_chain_rebuild", sync_postmarket_chain_rebuild, "20:15-22:15 weekday"),
+    ("ma_climb_scan", sync_ma_climb_scan, "20:25-22:25 weekday"),
     ("technical_signal_scan", sync_technical_signal_scan, "20:30-22:30 weekday"),
     ("knowledge_market_views", sync_knowledge_market_views, "20:30-22:30 weekday"),
     ("concept_relationship_graph", sync_concept_relationship_graph, "20:45-22:45 weekday"),

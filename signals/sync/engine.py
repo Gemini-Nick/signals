@@ -67,6 +67,7 @@ MODULE_TARGETS = {
     ),
     "chain_heat_snapshots": ("chain_heat_snapshots",),
     "concept_relationship_graph": ("concept_relationship_graph",),
+    "ma_climb_scan": ("terminal_technical_signals",),
     "technical_signal_scan": ("terminal_technical_signals",),
     "intraday_technical_signal_scan": ("terminal_technical_signals",),
     "knowledge_market_views": ("knowledge_market_views",),
@@ -137,6 +138,7 @@ REALTIME_MODULES = {
 }
 
 EMPTY_OK_MODULES = {
+    "ma_climb_scan",
     "technical_signal_scan",
     "intraday_technical_signal_scan",
     "knowledge_market_views",
@@ -259,6 +261,7 @@ LANE_MAINTENANCE_PLANS = {
     "security_business_facts": LiveSyncPlan("security_business_facts", "workbench_lane", 24 * 60 * 60, 12 * 60 * 60, 1200, 76),
     "postmarket_chain_rebuild": LiveSyncPlan("postmarket_chain_rebuild", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 900, 78),
     "signal_pool": LiveSyncPlan("signal_pool", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 80),
+    "ma_climb_scan": LiveSyncPlan("ma_climb_scan", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 900, 81),
     "technical_signal_scan": LiveSyncPlan("technical_signal_scan", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 1800, 82),
     "knowledge_market_views": LiveSyncPlan("knowledge_market_views", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 84),
     "concept_relationship_graph": LiveSyncPlan("concept_relationship_graph", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 86),
@@ -276,6 +279,7 @@ BOOTSTRAP_LANE_MODULES = {
     "market_limit_pools": {"workbench_lane"},
     "cache_preheat": {"workbench_lane"},
     "signal_pool": {"workbench_lane"},
+    "ma_climb_scan": {"workbench_lane"},
     "technical_signal_scan": {"workbench_lane"},
     "intraday_technical_signal_scan": {"signal_lane"},
     "knowledge_market_views": {"workbench_lane"},

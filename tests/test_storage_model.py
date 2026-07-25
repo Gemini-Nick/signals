@@ -57,6 +57,11 @@ def test_storage_model_indexes_board_heat_tick_runtime_queries(monkeypatch):
         ("change_pct", DESCENDING),
         ("rank_idx", ASCENDING),
     ) in board_heat_indexes
+    assert (
+        ("trade_minute", DESCENDING),
+        ("updated_at", DESCENDING),
+        ("snapshot_at", DESCENDING),
+    ) in board_heat_indexes
 
 
 def test_storage_model_indexes_terminal_status_latest_queries(monkeypatch):
@@ -76,3 +81,13 @@ def test_storage_model_indexes_terminal_status_latest_queries(monkeypatch):
     ):
         indexes = {keys for keys, _kwargs in db[collection_name].created_indexes}
         assert (("updated_at", DESCENDING),) in indexes
+
+    technical_indexes = {keys for keys, _kwargs in db["terminal_technical_signals"].created_indexes}
+    assert (("market", ASCENDING),) in technical_indexes
+
+    chain_heat_indexes = {keys for keys, _kwargs in db["chain_heat_snapshots"].created_indexes}
+    assert (
+        ("trade_minute", DESCENDING),
+        ("updated_at", DESCENDING),
+        ("snapshot_at", DESCENDING),
+    ) in chain_heat_indexes

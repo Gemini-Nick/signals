@@ -20,10 +20,12 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     board_cons = [task for task in pm.POSTMARKET_TASKS if task.module == "board_cons"]
     index_daily = next(task for task in pm.POSTMARKET_TASKS if task.module == "index_daily")
     weekly = next(task for task in pm.POSTMARKET_TASKS if task.module == "weekly_rollup")
+    ma_climb_scan = next(task for task in pm.POSTMARKET_TASKS if task.module == "ma_climb_scan")
     technical_scan = next(task for task in pm.POSTMARKET_TASKS if task.module == "technical_signal_scan")
     chain = next(task for task in pm.POSTMARKET_TASKS if task.module == "chain_heat_snapshots")
     chain_rebuild = next(task for task in pm.POSTMARKET_TASKS if task.module == "postmarket_chain_rebuild")
     strategy_snapshot = next(task for task in pm.POSTMARKET_TASKS if task.module == "strategy_snapshot")
+    terminal_pool = next(task for task in pm.POSTMARKET_TASKS if task.module == "terminal_realtime_pool")
 
     assert spot.phase == "market_data"
     assert etf_spot.phase == "market_data"
@@ -48,6 +50,8 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert {task.shard_key for task in board_cons} == {"board", "concept"}
     assert all(task.depends_on == ("board_ranking:all",) for task in board_cons)
     assert set(task.task_key for task in stock_daily).issubset(set(weekly.depends_on))
+    assert set(task.task_key for task in stock_daily).issubset(set(ma_climb_scan.depends_on))
+    assert "weekly_rollup:all" not in ma_climb_scan.depends_on
     assert not (set(task.task_key for task in hk_stock_daily) & set(weekly.depends_on))
     assert weekly.env["WEEKLY_ROLLUP_SCOPE"] == "postmarket_candidates"
     assert weekly.env["WEEKLY_ROLLUP_MAX_SYMBOLS"] == "300"
@@ -55,6 +59,7 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert technical_scan.env["TECHNICAL_SIGNAL_SCAN_MARKETS"] == "A"
     assert technical_scan.env["TECHNICAL_SIGNAL_SCAN_REQUIRED_FREQS"] == "日线,周线"
     assert technical_scan.env["TECHNICAL_SIGNAL_POSTMARKET_MAX_SYMBOLS"] == "300"
+    assert "ma_climb_scan:all" in terminal_pool.depends_on
     assert not (set(task.task_key for task in board_cons) & set(chain.depends_on))
     assert chain.phase == "chain_context"
     assert chain.depends_on == ("board_ranking:all",)
