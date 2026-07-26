@@ -6,6 +6,7 @@ import logging
 import os
 from collections import Counter
 from datetime import date, datetime, timedelta
+from itertools import chain
 from typing import Any
 
 from pymongo.database import Database
@@ -492,11 +493,106 @@ def _prefixed_symbol(code: str) -> str:
     macro_symbol = canonical_macro_industry_etf_symbol(code)
     if macro_symbol:
         return macro_symbol
-    if code.startswith(("6", "9")):
+    if code.startswith(("5", "6", "9")):
         return f"SH.{code}"
     if code.startswith(("4", "8")):
         return f"BJ.{code}"
     return f"SZ.{code}"
+
+
+def _valid_security_name(value: Any, code: str) -> str:
+    name = _text(value)
+    if not name:
+        return ""
+    upper = name.upper()
+    symbol = _prefixed_symbol(code).upper()
+    compact_symbol = symbol.replace(".", "")
+    if upper in {code.upper(), symbol, compact_symbol, f"SH{code}", f"SZ{code}", f"BJ{code}"}:
+        return ""
+    return name
+
+
+def _attach_security_identities(rows: dict[str, dict[str, Any]], db: Database) -> None:
+    codes = {
+        _pure_a_code(row.get("raw_code") or row.get("symbol") or row.get("code") or key)
+        for key, row in rows.items()
+    }
+    codes.discard("")
+    if not codes:
+        return
+    symbols = {_prefixed_symbol(code) for code in codes}
+    compact_symbols = {symbol.replace(".", "") for symbol in symbols}
+    identities: dict[str, dict[str, str]] = {code: {} for code in codes}
+    source_specs = (
+        ("etf_spot_snapshots", ("date_key", "snapshot_at")),
+        ("fullmarket_spot_snapshots", ("date_key", "snapshot_at")),
+        ("security_master", ("updated_at",)),
+        ("stock_names", ("updated_at",)),
+    )
+    for collection_name, sort_keys in source_specs:
+        try:
+            cursor = db[collection_name].find(
+                {
+                    "$or": [
+                        {"code": {"$in": sorted(codes)}},
+                        {"raw_code": {"$in": sorted(codes)}},
+                        {"symbol": {"$in": sorted(symbols | compact_symbols)}},
+                        {"futu_symbol": {"$in": sorted(symbols)}},
+                    ],
+                },
+                {
+                    "_id": 0,
+                    "code": 1,
+                    "raw_code": 1,
+                    "symbol": 1,
+                    "futu_symbol": 1,
+                    "name": 1,
+                    "stock_name": 1,
+                    "security_type": 1,
+                    "asset_class": 1,
+                    "asset_type": 1,
+                    "date_key": 1,
+                    "snapshot_at": 1,
+                    "updated_at": 1,
+                },
+            ).sort([(key, -1) for key in sort_keys])
+        except Exception:
+            continue
+        for doc in cursor:
+            code = _pure_a_code(doc.get("raw_code") or doc.get("code") or doc.get("symbol") or doc.get("futu_symbol"))
+            if code not in identities:
+                continue
+            identity = identities[code]
+            name = _valid_security_name(doc.get("name") or doc.get("stock_name"), code)
+            if name and not identity.get("name"):
+                identity["name"] = name
+                identity["name_source"] = collection_name
+            security_type = _text(doc.get("security_type") or doc.get("asset_class") or doc.get("asset_type")).lower()
+            if security_type and (not identity.get("security_type") or security_type != "stock"):
+                identity["security_type"] = security_type
+
+    for key, row in rows.items():
+        code = _pure_a_code(row.get("raw_code") or row.get("symbol") or row.get("code") or key)
+        if not code:
+            continue
+        symbol = _prefixed_symbol(code)
+        identity = identities.get(code) or {}
+        existing_name = _valid_security_name(row.get("name"), code)
+        resolved_name = existing_name or identity.get("name") or macro_industry_etf_name(symbol)
+        row.update({
+            "symbol": symbol,
+            "code": symbol,
+            "raw_code": code,
+            "target_label": symbol,
+            "target_symbol": symbol,
+            "display_symbol": symbol,
+            "name": resolved_name,
+            "name_status": "resolved" if resolved_name else "missing",
+        })
+        if resolved_name and not existing_name:
+            row["name_source"] = identity.get("name_source") or "macro_industry_etf"
+        if identity.get("security_type"):
+            row["security_type"] = identity["security_type"]
 
 
 def _add_stock(stocks: list[str], value: Any, *, index_codes: set[str]) -> None:
@@ -645,6 +741,10 @@ def _attach_stock_quote_context(rows: dict[str, dict[str, Any]], db: Database, t
         row["gain_pct"] = round(pct, 4)
         row["day_change_source"] = "fullmarket_spot_snapshots"
         row["day_change_as_of"] = _doc_date_text(doc)
+        quote_name = _text(doc.get("name"))
+        if quote_name and not row.get("name"):
+            row["name"] = quote_name
+            row["name_source"] = "fullmarket_spot_snapshots"
         if price > 0:
             row["latest_price"] = price
 
@@ -1418,30 +1518,37 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
         ) or {}
         if latest.get("as_of"):
             query["as_of"] = latest.get("as_of")
-    cursor = db["terminal_technical_signals"].find(
-        query,
-        {
-            "symbol": 1,
-            "raw_code": 1,
-            "freq": 1,
-            "signal_type": 1,
-            "signal_side": 1,
-            "signal_family": 1,
-            "score": 1,
-            "total_score": 1,
-            "confidence": 1,
-            "dt": 1,
-            "as_of": 1,
-            "updated_at": 1,
-            "dedupe_key": 1,
-            "ma_alignment": 1,
-            "technical_evidence": 1,
-            "resonance_context": 1,
-            "invalidates_when": 1,
-            "active": 1,
-        },
+    projection = {
+        "symbol": 1,
+        "raw_code": 1,
+        "name": 1,
+        "security_type": 1,
+        "freq": 1,
+        "signal_type": 1,
+        "signal_side": 1,
+        "signal_family": 1,
+        "score": 1,
+        "total_score": 1,
+        "confidence": 1,
+        "dt": 1,
+        "as_of": 1,
+        "updated_at": 1,
+        "dedupe_key": 1,
+        "ma_alignment": 1,
+        "technical_evidence": 1,
+        "resonance_context": 1,
+        "invalidates_when": 1,
+        "active": 1,
+    }
+    climb_cursor = db["terminal_technical_signals"].find(
+        {**query, "signal_family": "ma_climb"},
+        projection,
+    ).sort([("total_score", -1), ("updated_at", -1)]).limit(limit)
+    regular_cursor = db["terminal_technical_signals"].find(
+        {**query, "signal_family": {"$ne": "ma_climb"}},
+        projection,
     ).sort([("total_score", -1), ("confidence", -1), ("updated_at", -1)]).limit(limit)
-    for signal in cursor:
+    for signal in chain(climb_cursor, regular_cursor):
         evidence = signal.get("technical_evidence") if isinstance(signal.get("technical_evidence"), dict) else {}
         climb = evidence.get("ma_climb") if isinstance(evidence.get("ma_climb"), dict) else {}
         signal_score = (
@@ -1472,7 +1579,7 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
             "resonance_context": resonance_context,
             "evidence": evidence,
             "invalidates_when": _text(signal.get("invalidates_when")),
-        }, index_codes=index_codes)
+        }, index_codes=index_codes, name=_text(signal.get("name")))
 
 
 def _knowledge_status_for(sentiment: str, tech_side: str) -> tuple[str, str]:
@@ -5129,13 +5236,8 @@ def _badge_label_for_signal(reason: dict[str, Any], *, fallback: str) -> str:
 
 
 def _badge_label_for_ma_climb(reason: dict[str, Any]) -> str:
-    climb = _ma_climb_evidence(reason)
-    ma_name = _text(climb.get("effective_ma_name"))
-    if not ma_name:
-        period = _text(climb.get("ma_period") or climb.get("period"))
-        ma_name = f"MA{period}" if period else "MA"
     prefix = _badge_timeframe_label(reason.get("freq") or reason.get("timeframe"))
-    return f"{prefix}{ma_name}攀爬" if prefix else f"{ma_name}攀爬"
+    return f"{prefix}线攀爬" if prefix in {"日", "周"} else "均线攀爬"
 
 
 def _display_badge_for_reason(reason: dict[str, Any]) -> dict[str, Any]:
@@ -5151,35 +5253,96 @@ def _display_badge_for_reason(reason: dict[str, Any]) -> dict[str, Any]:
         "priority": 0,
     }
     if _text(reason.get("signal_family")) == "ma_climb" and _ma_climb_score(reason) >= 60.0:
-        return {**base, "kind": "ma_climb", "label": _badge_label_for_ma_climb(reason), "priority": 700 + min(80, int(_ma_climb_score(reason)))}
+        return {**base, "kind": "ma_climb", "label": _badge_label_for_ma_climb(reason), "tone": "hot", "priority": 900 + min(80, int(_ma_climb_score(reason)))}
     if any(token in text for token in ("200d_new_high_breakout", "200日新高", "新高突破")):
-        return {**base, "kind": "new_high", "label": "200日新高", "priority": 800 + min(80, int(score))}
+        return {**base, "kind": "new_high", "label": "200日新高", "tone": "hot", "priority": 850 + min(80, int(score))}
     if any(token in text for token in ("缺口买:持续", "缺口买:突破", "持续缺口", "突破缺口")):
         entry_factor = _reason_entry_factor(reason)
         volume_ratio = max(_float(entry_factor.get("volume_ratio")), _float(entry_factor.get("recent_volume_ratio")))
         volume_bonus = min(60, int(max(0.0, volume_ratio - 1.0) * 30))
-        return {**base, "kind": "gap_volume_price", "label": f"{_badge_timeframe_label(timeframe)}强缺口量价".strip(), "priority": 600 + volume_bonus + min(40, int(score))}
+        return {**base, "kind": "gap_volume_price", "label": f"{_badge_timeframe_label(timeframe)}强缺口量价".strip(), "tone": "hot", "priority": 700 + volume_bonus + min(40, int(score))}
     if signal_side == "buy" and any(token in text for token in ("一买", "二买", "三买", "背驰买", "底背离", "趋势买")):
-        return {**base, "kind": "buy_point", "label": _badge_label_for_signal(reason, fallback="买点"), "priority": 900 + min(80, int(score))}
+        return {**base, "kind": "buy_point", "label": _badge_label_for_signal(reason, fallback="买点"), "tone": "buy", "priority": 950 + min(80, int(score))}
     if signal_side == "sell" and any(token in text for token in ("一卖", "二卖", "三卖", "顶背离", "跌破", "死叉")):
-        return {**base, "kind": "sell_point", "label": _badge_label_for_signal(reason, fallback="卖点"), "priority": 900 + min(80, int(score))}
+        return {**base, "kind": "sell_point", "label": _badge_label_for_signal(reason, fallback="卖点"), "tone": "risk", "priority": 1000 + min(80, int(score))}
     return {}
+
+
+def _select_display_badges(badges: list[dict[str, Any]], limit: int = 3) -> list[dict[str, Any]]:
+    climb_rows = [item for item in badges if item.get("kind") == "ma_climb"]
+    climb_freqs = {_badge_timeframe_label(item.get("timeframe")) for item in climb_rows}
+    if {"日", "周"}.issubset(climb_freqs):
+        strongest = max(climb_rows, key=lambda item: _float(item.get("priority")))
+        badges = [item for item in badges if item.get("kind") != "ma_climb"]
+        badges.append({
+            **strongest,
+            "label": "日周攀爬",
+            "timeframe": "日线/周线",
+            "signal_type": "日周攀爬共振",
+            "priority": int(_float(strongest.get("priority"))) + 20,
+        })
+    ordered = sorted(badges, key=lambda item: (_float(item.get("priority")), _freq_sort_key(_text(item.get("timeframe")))), reverse=True)
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[tuple[str, str, str]] = set()
+
+    def add(item: dict[str, Any] | None) -> None:
+        if not item or len(selected) >= limit:
+            return
+        identity = (_text(item.get("kind")), _text(item.get("timeframe")), _text(item.get("label")))
+        if identity in selected_ids:
+            return
+        selected_ids.add(identity)
+        selected.append(item)
+
+    add(next((item for item in ordered if item.get("kind") == "sell_point"), None))
+    add(next((item for item in ordered if item.get("kind") == "buy_point"), None))
+    add(next((item for item in ordered if item.get("kind") == "ma_climb"), None))
+    climb_timeframes = {
+        _text(item.get("timeframe"))
+        for item in selected
+        if item.get("kind") == "ma_climb"
+    }
+    for item in ordered:
+        if item.get("kind") == "ma_climb" and _text(item.get("timeframe")) in climb_timeframes:
+            continue
+        add(item)
+        if item.get("kind") == "ma_climb":
+            climb_timeframes.add(_text(item.get("timeframe")))
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def _display_badges_for_pool(row: dict[str, Any]) -> list[dict[str, Any]]:
     badges: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for reason in row.get("inclusion_reasons") or []:
         badge = _display_badge_for_reason(reason)
         if not badge:
             continue
-        key = (_text(badge.get("kind")), _text(badge.get("timeframe")))
+        key = (_text(badge.get("kind")), _text(badge.get("timeframe")), _text(badge.get("label")))
         if key in seen:
             continue
         seen.add(key)
         badges.append({key: value for key, value in badge.items() if value not in (None, "", [], {})})
-    badges.sort(key=lambda item: (_float(item.get("priority")), _freq_sort_key(_text(item.get("timeframe")))), reverse=True)
-    return badges[:3]
+    return _select_display_badges(badges)
+
+
+def _retain_ma_climb_reasons(reasons: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    climbs_by_freq: dict[str, dict[str, Any]] = {}
+    others: list[dict[str, Any]] = []
+    for reason in reasons:
+        if _text(reason.get("signal_family")) != "ma_climb":
+            others.append(reason)
+            continue
+        freq = _text(reason.get("freq"))
+        existing = climbs_by_freq.get(freq)
+        if existing is None or _ma_climb_score(reason) > _ma_climb_score(existing):
+            climbs_by_freq[freq] = reason
+    climbs = list(climbs_by_freq.values())
+    climbs.sort(key=_ma_climb_score, reverse=True)
+    retained = [*climbs[:2], *others[:max(0, limit - min(2, len(climbs)))]]
+    return retained[:limit]
 
 
 def _slim_evidence_for_pool(value: Any) -> dict[str, Any]:
@@ -5339,9 +5502,12 @@ def _slim_pool_row_for_storage(row: dict[str, Any]) -> dict[str, Any]:
     out = dict(row)
     out["inclusion_reasons"] = [
         slim
-        for slim in (_slim_reason_for_pool(reason, include_analysis=False) for reason in row.get("inclusion_reasons") or [])
+        for slim in (
+            _slim_reason_for_pool(reason, include_analysis=False)
+            for reason in _retain_ma_climb_reasons(row.get("inclusion_reasons") or [], 6)
+        )
         if slim
-    ][:6]
+    ]
     for key in ("top_buy_reason", "top_risk_reason", "technical_evidence"):
         slim = _slim_reason_for_pool(row.get(key))
         if slim:
@@ -5367,7 +5533,7 @@ def _slim_pool_row_for_storage(row: dict[str, Any]) -> dict[str, Any]:
     out["display_badges"] = [
         {
             key: badge.get(key)
-            for key in ("kind", "label", "timeframe", "priority", "signal_type")
+            for key in ("kind", "label", "tone", "timeframe", "priority", "signal_type")
             if badge.get(key) not in (None, "", [], {})
         }
         for badge in row.get("display_badges") or []
@@ -5417,7 +5583,8 @@ def _slim_skipped_row_for_storage(row: dict[str, Any]) -> dict[str, Any]:
 def _prepare_pool_rows(rows: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     ordered = list(rows.values())
     for row in ordered:
-        row["inclusion_reasons"] = sorted(row.get("inclusion_reasons") or [], key=lambda item: _float(item.get("weight")), reverse=True)[:12]
+        sorted_reasons = sorted(row.get("inclusion_reasons") or [], key=lambda item: _float(item.get("weight")), reverse=True)
+        row["inclusion_reasons"] = _retain_ma_climb_reasons(sorted_reasons, 12)
         row["exit_condition"] = row.get("invalidates_when")
         row["next_action"] = row.get("next_action") or row.get("trader_action") or "观察"
         row["queue_lane"] = row.get("queue_lane") or "context_only"
@@ -5715,6 +5882,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
             now=now,
         )
 
+    _attach_security_identities(rows, db)
     broad_market_context = _load_broad_market_context(db, trade_date)
     _attach_broad_market_context(rows, broad_market_context)
     raw_candidate_count = len(rows)

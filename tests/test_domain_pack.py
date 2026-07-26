@@ -411,6 +411,50 @@ def test_mongo_stock_cache_uses_latest_daily_bar_date_for_daily_coverage(monkeyp
     assert result["freqs"][0]["coverage_date"] == "2026-05-12"
 
 
+def test_mongo_stock_cache_exposes_weekly_monthly_freshness(monkeypatch):
+    from signals.domain_pack import SignalsPack
+
+    pack = SignalsPack()
+
+    def fake_find_one(db, collection, query, projection=None, sort=None):
+        freq = query.get("meta.freq") or query.get("freq")
+        if collection == "bars" and freq == "日线":
+            return {"dt": datetime(2026, 5, 15), "meta": {"symbol": "SH.600000"}}
+        if collection == "bars" and freq in {"周线", "月线"}:
+            return {
+                "dt": datetime(2026, 5, 15),
+                "meta": {"symbol": "SH.600000", "is_partial_period": True},
+            }
+        if collection == "data_freshness" and freq in {"周线", "月线"}:
+            return {
+                "freq": freq,
+                "symbol_count": 5490,
+                "count": 5490,
+                "latest_dt": "2026-05-15",
+                "data_as_of": "2026-05-15",
+                "quality": "provisional_close",
+                "is_partial_period": True,
+            }
+        return None
+
+    monkeypatch.setattr(pack, "_find_one", fake_find_one)
+    monkeypatch.setattr(
+        pack,
+        "_cache_daily_snapshot_coverage",
+        lambda db, trade_date: {"valid_universe": 5490, "cached_today": 5490},
+    )
+    monkeypatch.setattr(pack, "_cache_minute_universe", lambda db, trade_date: {})
+
+    result = pack._cache_mongo_stock_cache(_Db(), "2026-05-15")
+    by_freq = {row["freq"]: row for row in result["freqs"]}
+
+    assert by_freq["周线"]["symbols"] == 5490
+    assert by_freq["周线"]["quality"] == "provisional_close"
+    assert by_freq["周线"]["is_partial_period"] is True
+    assert by_freq["月线"]["coverage_date"] == "2026-05-15"
+    assert by_freq["月线"]["source"] == "data_freshness"
+
+
 def test_live_low_latency_strict_status_and_stock_selection_merge(monkeypatch):
     from signals import domain_pack
     from signals.domain_pack import SignalsPack

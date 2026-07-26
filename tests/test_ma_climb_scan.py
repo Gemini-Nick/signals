@@ -22,14 +22,39 @@ def _rising_frame(*, step: float = 0.1, spread: float = 0.8, count: int = 90) ->
     return pd.DataFrame(rows)
 
 
-def test_ma_climb_accepts_smooth_close_above_effective_ma():
+def _staircase_frame(*, count: int = 140) -> pd.DataFrame:
+    wave = (0.8, 0.55, 0.3, 0.05, 0.2, 0.45, 0.7, 0.95)
+    rows = []
+    for index in range(count):
+        close = 10.0 + 0.1 * index + 0.6 * wave[index % len(wave)]
+        rows.append({
+            "dt": pd.Timestamp("2025-01-06") + pd.offsets.BDay(index),
+            "open": close - 0.05,
+            "high": close + 0.25,
+            "low": close - 0.30,
+            "close": close,
+        })
+    return pd.DataFrame(rows)
+
+
+def test_ma_climb_rejects_smooth_trend_without_pullback_rebound_cycles():
     result = climb._evaluate_ma_climb(_rising_frame(), 5)
 
     assert result is not None
+    assert result["running"] is False
+    assert result["pullback_cycle_count"] < climb.MIN_PULLBACK_CYCLES
+
+
+def test_ma_climb_accepts_staircase_pullbacks_with_higher_lows():
+    result = climb._evaluate_ma_climb(_staircase_frame(), 10)
+
+    assert result is not None
     assert result["running"] is True
-    assert result["hold_count"] == 5
-    assert result["climb_score"] >= climb.BUY_REVIEW_SCORE
-    assert result["climb_grade"] == "buy_review"
+    assert result["hold_count"] == climb.CLIMB_WINDOW
+    assert result["pullback_cycle_count"] >= climb.MIN_PULLBACK_CYCLES
+    assert result["higher_pullback_low"] is True
+    assert result["ma5_rising"] is True
+    assert result["ma10_rising"] is True
 
 
 def test_ma_climb_rejects_any_recent_close_below_effective_ma():
@@ -47,14 +72,14 @@ def test_ma_climb_rejects_any_recent_close_below_effective_ma():
 
 
 def test_ma_climb_selects_only_one_effective_ma_per_timeframe():
-    frame = _rising_frame()
+    frame = _staircase_frame()
 
     best, alternates = climb._best_climb(frame)
 
     assert best is not None
     assert best["period"] in {5, 10}
-    assert len(alternates) == 1
-    assert alternates[0]["period"] != best["period"]
+    assert len(alternates) <= 1
+    assert all(item["period"] != best["period"] for item in alternates)
 
 
 def test_completed_weekly_frame_excludes_open_week(monkeypatch):
@@ -69,17 +94,21 @@ def test_completed_weekly_frame_excludes_open_week(monkeypatch):
 
 
 def test_signal_doc_exposes_explicit_climb_contract():
-    frame = _rising_frame()
+    frame = _staircase_frame()
 
     docs = climb._scan_symbol("300001", frame, datetime(2026, 5, 8, 20, 30), as_of="2026-05-08")
-    daily = next(doc for doc in docs if doc["freq"] == "日线")
+    daily_docs = [doc for doc in docs if doc["freq"] == "日线"]
+    assert len(daily_docs) == 1
+    daily = daily_docs[0]
     evidence = daily["technical_evidence"]["ma_climb"]
 
     assert daily["signal_family"] == "ma_climb"
+    assert daily["signal_type"] == "日线攀爬"
     assert daily["producer"] == "ma_climb_scan"
     assert daily["active"] is True
     assert evidence["running"] is True
     assert evidence["effective_ma"] in {"MA5", "MA10"}
+    assert evidence["pullback_cycle_count"] >= 2
     assert "收盘跌破有效" in daily["invalidates_when"]
 
 

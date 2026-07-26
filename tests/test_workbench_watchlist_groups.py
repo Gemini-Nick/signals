@@ -1553,7 +1553,7 @@ def test_slim_stock_row_passthroughs_structured_hard_display_badges_only():
         "display_badges": [
             {"kind": "ma_climb", "label": "日MA5攀爬", "timeframe": "日线", "priority": 760, "signal_type": "MA攀爬"},
             {"kind": "new_high", "label": "200日新高", "timeframe": "日线", "priority": 840, "signal_type": "200日新高"},
-            {"kind": "buy_point", "label": "周一买", "timeframe": "周线", "priority": 950, "signal_type": "一买"},
+            {"kind": "buy_point", "label": "买点", "timeframe": "周线", "priority": 950, "signal_type": "一买"},
             {"kind": "trade_role", "label": "主线机会", "timeframe": "日线", "priority": 999},
             {"label": "风险复核", "tone": "risk"},
         ],
@@ -1565,11 +1565,11 @@ def test_slim_stock_row_passthroughs_structured_hard_display_badges_only():
 
     slim = workbench._slim_shell_stock_row(row)
 
-    assert [item["kind"] for item in slim["display_badges"]] == ["buy_point", "new_high", "ma_climb"]
-    assert [item["label"] for item in slim["display_badges"]] == ["周一买", "200日新高", "日MA5攀爬"]
+    assert [item["kind"] for item in slim["display_badges"]] == ["buy_point", "ma_climb", "new_high"]
+    assert [item["label"] for item in slim["display_badges"]] == ["周一买", "日MA5攀爬", "200日新高"]
     assert all({"kind", "timeframe", "priority"} <= set(item) for item in slim["display_badges"])
+    assert all(item["tone"] in {"buy", "hot"} for item in slim["display_badges"])
     assert len(slim["display_badges"]) == 3
-    assert len(slim["display_summary"]) <= 64
     assert all(token not in slim["display_summary"] for token in ("风险", "主线", "产业链"))
 
 
@@ -1627,13 +1627,68 @@ def test_slim_stock_row_falls_back_to_hard_technical_reason_badges():
 
     slim = workbench._slim_shell_stock_row(row)
 
-    assert [item["kind"] for item in slim["display_badges"]] == ["buy_point", "new_high", "ma_climb"]
-    assert [item["label"] for item in slim["display_badges"]] == ["30m二买", "200日新高", "周MA10攀爬"]
+    assert [item["kind"] for item in slim["display_badges"]] == ["buy_point", "ma_climb", "new_high"]
+    assert [item["label"] for item in slim["display_badges"]] == ["30m二买", "周线攀爬", "200日新高"]
     assert all(item["label"] not in {"旧阶段", "风险复核", "主线机会"} for item in slim["display_badges"])
     assert len(slim["display_badges"]) == 3
     assert "等5m确认" in slim["display_summary"]
-    assert len(slim["display_summary"]) <= 64
     assert all(token not in slim["display_summary"] for token in ("风险", "主线", "产业链", "普通缩量"))
+
+
+def test_slim_stock_row_merges_climb_evidence_into_existing_structured_badges():
+    from signals.web.api import workbench
+
+    slim = workbench._slim_shell_stock_row({
+        "symbol": "SZ.300674",
+        "name": "宇信科技",
+        "display_badges": [
+            {"kind": "sell_point", "label": "卖点", "timeframe": "5分钟", "priority": 780, "signal_type": "二卖"},
+            {"kind": "buy_point", "label": "买点", "timeframe": "周线", "priority": 780, "signal_type": "一买"},
+            {"kind": "new_high", "label": "200日新高", "timeframe": "日线", "priority": 840, "signal_type": "200日新高"},
+        ],
+        "inclusion_reasons": [{
+            "reason_type": "technical_trigger",
+            "signal_side": "buy",
+            "signal_type": "沿10周线攀爬",
+            "signal_family": "ma_climb",
+            "freq": "周线",
+            "evidence": {"ma_climb": {"running": True, "period": 10, "climb_score": 84}},
+        }],
+    })
+
+    assert [item["kind"] for item in slim["display_badges"]] == ["sell_point", "buy_point", "ma_climb"]
+    assert [item["label"] for item in slim["display_badges"]] == ["5m二卖", "周一买", "周线攀爬"]
+
+
+def test_slim_stock_row_keeps_selected_summary_condition_complete():
+    from signals.web.api import workbench
+
+    condition = "等待30分钟买点确认，并观察5分钟和15分钟下单周期是否同步转强"
+    slim = workbench._slim_shell_stock_row({
+        "symbol": "SZ.300542",
+        "name": "新晨科技",
+        "display_badges": [
+            {"kind": "buy_point", "label": "周一买", "timeframe": "周线", "priority": 950, "signal_type": "一买"},
+        ],
+        "missing_condition": condition,
+    })
+
+    assert slim["display_summary"] == f"周一买；{condition}"
+
+
+def test_slim_stock_row_rewrites_trade_role_jargon_in_summary_condition():
+    from signals.web.api import workbench
+
+    slim = workbench._slim_shell_stock_row({
+        "symbol": "SZ.300968",
+        "name": "格林精密",
+        "display_badges": [
+            {"kind": "buy_point", "label": "周一买", "timeframe": "周线", "priority": 950, "signal_type": "一买"},
+        ],
+        "missing_condition": "左侧买点叠加10/20日线承接，按低吸进攻复核",
+    })
+
+    assert slim["display_summary"] == "周一买；等10/20日线承接"
 
 
 def test_index_report_chart_signals_add_multi_timeframe_context():

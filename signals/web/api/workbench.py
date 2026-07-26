@@ -3789,7 +3789,13 @@ def _shell_summary_clean_condition(value: Any) -> str:
     blocked = ("风险", "主线", "产业链", "角色", "普通缩量", "缩量")
     if any(token in text for token in blocked):
         return ""
-    return text[:32]
+    text = re.sub(
+        r"左侧买点叠加([0-9/]+日线)承接，?按低吸进攻复核",
+        r"等\1承接",
+        text,
+    )
+    text = re.sub(r"缺([0-9]+m(?:/[0-9]+m)?)下单周期", r"等\1确认", text)
+    return text
 
 
 def _shell_stock_trade_summary(
@@ -3808,7 +3814,7 @@ def _shell_stock_trade_summary(
     parts = [lead]
     if missing and missing not in lead:
         parts.append(missing)
-    return "；".join(parts)[:64]
+    return "；".join(parts)
 
 
 def _shell_stock_display_action(row: dict[str, Any]) -> str:
@@ -3873,16 +3879,18 @@ def _shell_badge_freq_label(freq: Any) -> str:
 
 
 def _shell_badge_priority(kind: str, score: Any = None, *, ma_score: Any = None, volume_ratio: Any = None) -> int:
-    if kind in {"buy_point", "sell_point"}:
-        return 900 + min(80, int(_float(score) or 0))
+    if kind == "sell_point":
+        return 1000 + min(80, int(_float(score) or 0))
+    if kind == "buy_point":
+        return 950 + min(80, int(_float(score) or 0))
     if kind == "new_high":
-        return 800 + min(80, int(_float(score) or 0))
+        return 850 + min(80, int(_float(score) or 0))
     if kind == "ma_climb":
-        return 700 + min(80, int(_float(ma_score) or _float(score) or 0))
+        return 900 + min(80, int(_float(ma_score) or _float(score) or 0))
     if kind == "gap_volume_price":
         ratio = _float(volume_ratio) or 0.0
         volume_bonus = min(60, int(max(0.0, ratio - 1.0) * 30))
-        return 600 + volume_bonus + min(40, int(_float(score) or 0))
+        return 700 + volume_bonus + min(40, int(_float(score) or 0))
     return 0
 
 
@@ -3892,22 +3900,38 @@ def _normalize_shell_display_badge(value: Any) -> dict[str, Any]:
     kind = _text(value.get("kind"))
     if kind not in _SHELL_HARD_BADGE_KINDS:
         return {}
+    timeframe = _text(value.get("timeframe") or value.get("freq"))
+    signal_type = _text(value.get("signal_type"))
     label = _text(value.get("label"))
+    if kind in {"buy_point", "sell_point"} and signal_type:
+        label = _shell_badge_signal_label(
+            {"signal_type": signal_type, "timeframe": timeframe},
+            fallback="买点" if kind == "buy_point" else "卖点",
+        )
     if not label:
         return {}
-    priority = _float(value.get("priority"))
+    raw_priority = _float(value.get("priority")) or 0.0
+    inferred_ma_score = max(0.0, raw_priority - 700.0) if kind == "ma_climb" else None
+    priority = max(
+        raw_priority,
+        float(_shell_badge_priority(kind, ma_score=inferred_ma_score)),
+    )
     out: dict[str, Any] = {
         "kind": kind,
         "label": label[:14],
-        "timeframe": _text(value.get("timeframe") or value.get("freq")),
-        "priority": int(priority if priority is not None else _shell_badge_priority(kind)),
+        "timeframe": timeframe,
+        "priority": int(priority),
     }
-    signal_type = _text(value.get("signal_type"))
     if signal_type:
         out["signal_type"] = signal_type
-    tone = _text(value.get("tone"))
-    if tone:
-        out["tone"] = tone
+    tone = _text(value.get("tone")) or {
+        "sell_point": "risk",
+        "buy_point": "buy",
+        "ma_climb": "hot",
+        "new_high": "hot",
+        "gap_volume_price": "hot",
+    }.get(kind, "neutral")
+    out["tone"] = tone
     return {key: item for key, item in out.items() if item not in (None, "", [], {})}
 
 
@@ -3954,12 +3978,8 @@ def _shell_badge_signal_label(reason: dict[str, Any], *, fallback: str) -> str:
 
 
 def _shell_badge_ma_label(reason: dict[str, Any], climb: dict[str, Any]) -> str:
-    ma_name = _text(climb.get("effective_ma_name"))
-    if not ma_name:
-        period = _text(climb.get("ma_period") or climb.get("period"))
-        ma_name = f"MA{period}" if period else "MA"
     prefix = _shell_badge_freq_label(reason.get("freq") or reason.get("timeframe"))
-    return f"{prefix}{ma_name}攀爬" if prefix else f"{ma_name}攀爬"
+    return f"{prefix}线攀爬" if prefix in {"日", "周"} else "均线攀爬"
 
 
 def _shell_display_badge_from_reason(reason: dict[str, Any]) -> dict[str, Any]:
@@ -3993,13 +4013,11 @@ def _shell_stock_display_badges(row: dict[str, Any], *, entry_factor: dict[str, 
         for item in row.get("display_badges") or []
         if isinstance(item, dict)
     ]
-    structured = [item for item in structured if item]
-    if structured:
-        structured.sort(key=lambda item: int(item.get("priority") or 0), reverse=True)
-        return structured[:3]
-
-    badges: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    badges = [item for item in structured if item]
+    seen: set[tuple[str, str, str]] = {
+        (_text(item.get("kind")), _text(item.get("timeframe")), _text(item.get("label")))
+        for item in badges
+    }
     reason_candidates = [
         row.get("top_buy_reason"),
         row.get("technical_evidence"),
@@ -4010,12 +4028,12 @@ def _shell_stock_display_badges(row: dict[str, Any], *, entry_factor: dict[str, 
         badge = _normalize_shell_display_badge(badge)
         if not badge:
             continue
-        key = (_text(badge.get("kind")), _text(badge.get("timeframe")))
+        key = (_text(badge.get("kind")), _text(badge.get("timeframe")), _text(badge.get("label")))
         if key in seen:
             continue
         seen.add(key)
         badges.append(badge)
-    if not badges and entry_factor:
+    if entry_factor and not any(item.get("kind") == "new_high" for item in badges):
         badges.append(_normalize_shell_display_badge({
             "kind": "new_high",
             "label": "200日新高",
@@ -4023,9 +4041,52 @@ def _shell_stock_display_badges(row: dict[str, Any], *, entry_factor: dict[str, 
             "priority": _shell_badge_priority("new_high"),
             "signal_type": "200日新高",
         }))
-    badges = [item for item in badges if item]
-    badges.sort(key=lambda item: int(item.get("priority") or 0), reverse=True)
-    return badges[:3]
+    return _shell_select_display_badges([item for item in badges if item])
+
+
+def _shell_select_display_badges(badges: list[dict[str, Any]], limit: int = 3) -> list[dict[str, Any]]:
+    climb_rows = [item for item in badges if item.get("kind") == "ma_climb"]
+    climb_freqs = {_shell_badge_freq_label(item.get("timeframe")) for item in climb_rows}
+    if {"日", "周"}.issubset(climb_freqs):
+        strongest = max(climb_rows, key=lambda item: int(item.get("priority") or 0))
+        badges = [item for item in badges if item.get("kind") != "ma_climb"]
+        badges.append({
+            **strongest,
+            "label": "日周攀爬",
+            "timeframe": "日线/周线",
+            "signal_type": "日周攀爬共振",
+            "priority": int(strongest.get("priority") or 0) + 20,
+        })
+    ordered = sorted(badges, key=lambda item: int(item.get("priority") or 0), reverse=True)
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[tuple[str, str, str]] = set()
+
+    def add(item: dict[str, Any] | None) -> None:
+        if not item or len(selected) >= limit:
+            return
+        identity = (_text(item.get("kind")), _text(item.get("timeframe")), _text(item.get("label")))
+        if identity in selected_ids:
+            return
+        selected_ids.add(identity)
+        selected.append(item)
+
+    add(next((item for item in ordered if item.get("kind") == "sell_point"), None))
+    add(next((item for item in ordered if item.get("kind") == "buy_point"), None))
+    add(next((item for item in ordered if item.get("kind") == "ma_climb"), None))
+    climb_timeframes = {
+        _text(item.get("timeframe"))
+        for item in selected
+        if item.get("kind") == "ma_climb"
+    }
+    for item in ordered:
+        if item.get("kind") == "ma_climb" and _text(item.get("timeframe")) in climb_timeframes:
+            continue
+        add(item)
+        if item.get("kind") == "ma_climb":
+            climb_timeframes.add(_text(item.get("timeframe")))
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:

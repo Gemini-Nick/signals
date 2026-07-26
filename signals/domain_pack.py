@@ -987,7 +987,7 @@ class SignalsPack:
         return str(run.get("trade_date") or fallback)[:10]
 
     def _cache_mongo_stock_cache(self, db, trade_date: str) -> Dict[str, Any]:
-        freqs = ["日线", "周线", "5分钟", "15分钟", "30分钟", "60分钟"]
+        freqs = ["日线", "周线", "月线", "5分钟", "15分钟", "30分钟", "60分钟"]
         rows: List[Dict[str, Any]] = []
         stock_daily_progress = self._find_one(db, "sync_log", {"_id": "stock_daily:progress:_meta"}) or {}
         daily_coverage_date = self._cache_daily_coverage_date(db, trade_date)
@@ -1004,7 +1004,30 @@ class SignalsPack:
         daily_latest = None
         for freq in freqs:
             query = {"meta.freq": freq}
-            latest = self._find_one(db, "bars", query, {"dt": 1, "meta.symbol": 1}, sort=[("dt", -1)])
+            latest = self._find_one(
+                db,
+                "bars",
+                query,
+                {
+                    "dt": 1,
+                    "meta.symbol": 1,
+                    "meta.quality": 1,
+                    "meta.source_quality": 1,
+                    "meta.is_partial_period": 1,
+                    "meta.data_as_of": 1,
+                },
+                sort=[("dt", -1)],
+            )
+            freshness = (
+                self._find_one(
+                    db,
+                    "data_freshness",
+                    {"collection": "bars", "freq": freq},
+                    sort=[("updated_at", -1)],
+                )
+                if freq in {"日线", "周线", "月线"}
+                else {}
+            ) or {}
             if freq == "日线":
                 daily_latest = latest
                 progress_total = int(stock_daily_progress.get("total") or stock_daily_progress.get("expected_codes") or 0)
@@ -1026,6 +1049,12 @@ class SignalsPack:
                 total_bars = int(minute_symbols * int(tail_counts.get(freq) or 0))
                 latest_symbol = str((latest or {}).get("meta", {}).get("symbol", ""))
                 source = "sync_log:stock_minute:selection"
+            elif freq in {"周线", "月线"}:
+                symbols = int(freshness.get("symbol_count") or (1 if latest else 0))
+                today_symbols = symbols if freshness.get("latest_dt") or latest else 0
+                total_bars = int(freshness.get("count") or 0)
+                latest_symbol = str((latest or {}).get("meta", {}).get("symbol", ""))
+                source = "data_freshness" if freshness else "latest_probe"
             else:
                 symbols = 1 if latest else 0
                 today_symbols = 0
@@ -1034,15 +1063,38 @@ class SignalsPack:
                 source = "latest_probe"
             if freq == "日线":
                 symbols = max(symbols, today_symbols)
+            latest_dt = freshness.get("latest_dt") or (latest or {}).get("dt")
+            latest_meta = (latest or {}).get("meta") if isinstance((latest or {}).get("meta"), dict) else {}
+            quality = (
+                freshness.get("quality")
+                or latest_meta.get("quality")
+                or latest_meta.get("source_quality")
+                or ""
+            )
+            data_as_of = (
+                freshness.get("data_as_of")
+                or latest_meta.get("data_as_of")
+                or latest_dt
+            )
             rows.append({
                 "freq": freq,
                 "symbols": symbols,
                 "today_symbols": today_symbols,
                 "total_bars": total_bars,
-                "latest_dt": self._iso(latest.get("dt") if latest else None),
+                "latest_dt": self._iso(latest_dt),
                 "latest_symbol": latest_symbol,
                 "source": source,
-                "coverage_date": daily_coverage_date if freq == "日线" else trade_date,
+                "coverage_date": (
+                    daily_coverage_date
+                    if freq == "日线"
+                    else str(data_as_of or trade_date)[:10]
+                ),
+                "data_as_of": self._iso(data_as_of),
+                "quality": quality,
+                "is_partial_period": bool(
+                    freshness.get("is_partial_period")
+                    or latest_meta.get("is_partial_period")
+                ),
             })
 
         daily = next((item for item in rows if item.get("freq") == "日线"), {})

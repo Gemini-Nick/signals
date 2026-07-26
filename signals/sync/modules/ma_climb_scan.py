@@ -20,14 +20,19 @@ from signals.sync.task_context import get_task_env
 logger = logging.getLogger("signals.sync.ma_climb_scan")
 
 CLIMB_PERIODS = (5, 10)
+CLIMB_SHAPE_VERSION = 3
 CLIMB_WINDOW = 5
+CLIMB_SHAPE_WINDOW = 20
 ATR_PERIOD = 14
 WATCH_SCORE = 60.0
 BUY_REVIEW_SCORE = 80.0
-MIN_SLOPE_ATR_PER_BAR = 0.03
-MIN_R_SQUARED = 0.50
+MIN_SLOPE_ATR_PER_BAR = 0.025
+MIN_R_SQUARED = 0.80
 MAX_MEDIAN_DISTANCE_ATR = 1.10
 MAX_P80_DISTANCE_ATR = 1.80
+MAX_CURRENT_DISTANCE_ATR = 1.30
+MIN_TREND_GAIN_ATR = 2.0
+MIN_PULLBACK_CYCLES = 2
 DEFAULT_LOOKBACK_DAYS = 260
 DEFAULT_MAX_BARS_PER_SYMBOL = 180
 
@@ -49,7 +54,7 @@ def _pure_a_code(value: Any) -> str:
 
 
 def _prefixed_symbol(code: str) -> str:
-    if code.startswith(("6", "9")):
+    if code.startswith(("5", "6", "9")):
         return f"SH.{code}"
     if code.startswith(("4", "8")):
         return f"BJ.{code}"
@@ -109,9 +114,49 @@ def _r_squared(values: pd.Series) -> float:
     return max(0.0, min(1.0, (covariance * covariance) / (ss_x * ss_y)))
 
 
+def _pullback_cycles(recent: pd.DataFrame) -> list[dict[str, Any]]:
+    """Return completed touch-and-rebound cycles around the effective MA."""
+    touch_mask = (
+        (recent["low_distance_atr"] >= -0.50)
+        & (recent["low_distance_atr"] <= 0.25)
+        & (recent["close"] >= recent["ma"])
+    )
+    starts: list[int] = []
+    in_touch = False
+    for index, is_touch in enumerate(touch_mask.tolist()):
+        if is_touch and not in_touch:
+            starts.append(index)
+            in_touch = True
+        elif not is_touch:
+            in_touch = False
+
+    cycles: list[dict[str, Any]] = []
+    for index in starts:
+        if cycles and index - int(cycles[-1]["index"]) < 3:
+            continue
+        prior = recent.iloc[max(0, index - 4):index]
+        following = recent.iloc[index + 1:min(len(recent), index + 6)]
+        atr = float(recent["atr"].iloc[index])
+        if atr <= 0 or prior.empty or following.empty:
+            continue
+        touch_low = float(recent["low"].iloc[index])
+        prior_advance = (float(prior["close"].max()) - touch_low) / atr
+        rebound = (float(following["high"].max()) - touch_low) / atr
+        if prior_advance < 0.70 or rebound < 0.70:
+            continue
+        cycles.append({
+            "index": index,
+            "dt": recent["dt"].iloc[index],
+            "low": touch_low,
+            "prior_advance_atr": round(prior_advance, 5),
+            "rebound_atr": round(rebound, 5),
+        })
+    return cycles
+
+
 def _evaluate_ma_climb(frame: pd.DataFrame, period: int) -> dict[str, Any] | None:
-    """Validate hold(C >= MA), ATR-normalized MA slope, log-MA R2, and ATR distance."""
-    if frame.empty or len(frame) < max(ATR_PERIOD + 1, period + CLIMB_WINDOW):
+    """Detect a repeated pullback-and-rebound climb around one effective MA."""
+    if frame.empty or len(frame) < max(ATR_PERIOD + CLIMB_SHAPE_WINDOW, period + CLIMB_SHAPE_WINDOW):
         return None
     work = frame.copy()
     previous_close = work["close"].shift(1)
@@ -125,39 +170,72 @@ def _evaluate_ma_climb(frame: pd.DataFrame, period: int) -> dict[str, Any] | Non
     ).max(axis=1)
     work["atr"] = true_range.rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean()
     work["ma"] = work["close"].rolling(period, min_periods=period).mean()
-    recent = work.tail(CLIMB_WINDOW)
-    if recent[["close", "low", "ma", "atr"]].isna().any().any():
+    work["ma5"] = work["close"].rolling(5, min_periods=5).mean()
+    work["ma10"] = work["close"].rolling(10, min_periods=10).mean()
+    recent = work.tail(CLIMB_SHAPE_WINDOW).copy().reset_index(drop=True)
+    if len(recent) < CLIMB_SHAPE_WINDOW or recent[["close", "low", "ma", "ma5", "ma10", "atr"]].isna().any().any():
         return None
     atr = float(recent["atr"].iloc[-1])
     if atr <= 0:
         return None
 
-    close_distance = (recent["close"] - recent["ma"]) / recent["atr"]
-    low_distance = (recent["low"] - recent["ma"]) / recent["atr"]
-    hold_count = int((recent["close"] >= recent["ma"]).sum())
-    slope = float(recent["ma"].iloc[-1] - recent["ma"].iloc[0]) / ((CLIMB_WINDOW - 1) * atr)
+    recent["close_distance_atr"] = (recent["close"] - recent["ma"]) / recent["atr"]
+    recent["low_distance_atr"] = (recent["low"] - recent["ma"]) / recent["atr"]
+    hold_count = int((recent.tail(CLIMB_WINDOW)["close"] >= recent.tail(CLIMB_WINDOW)["ma"]).sum())
+    slope = float(recent["ma"].iloc[-1] - recent["ma"].iloc[0]) / ((CLIMB_SHAPE_WINDOW - 1) * atr)
     r_squared = _r_squared(recent["ma"])
-    median_distance = float(close_distance.median())
-    p80_distance = float(close_distance.quantile(0.80))
-    touch_count = int(((low_distance <= 0.35) & (low_distance >= -0.75)).sum())
+    median_distance = float(recent["close_distance_atr"].median())
+    p80_distance = float(recent["close_distance_atr"].quantile(0.80))
+    current_distance = float(recent["close_distance_atr"].iloc[-1])
+    cycles = _pullback_cycles(recent)
+    cycle_count = len(cycles)
+    higher_pullback_low = bool(
+        cycle_count >= MIN_PULLBACK_CYCLES
+        and float(cycles[-1]["low"]) >= float(cycles[-2]["low"]) - 0.10 * atr
+    )
+    ma5_rising = float(recent["ma5"].iloc[-1]) > float(recent["ma5"].iloc[-5])
+    ma10_rising = float(recent["ma10"].iloc[-1]) > float(recent["ma10"].iloc[-5])
+    bullish_stack = float(recent["ma5"].iloc[-1]) >= float(recent["ma10"].iloc[-1]) * 0.995
+    trend_gain_atr = float(recent["close"].iloc[-1] - recent["close"].iloc[0]) / atr
 
     hard_valid = (
         hold_count == CLIMB_WINDOW
+        and cycle_count >= MIN_PULLBACK_CYCLES
+        and higher_pullback_low
+        and ma5_rising
+        and ma10_rising
+        and bullish_stack
         and slope >= MIN_SLOPE_ATR_PER_BAR
         and r_squared >= MIN_R_SQUARED
+        and trend_gain_atr >= MIN_TREND_GAIN_ATR
         and 0 <= median_distance <= MAX_MEDIAN_DISTANCE_ATR
         and p80_distance <= MAX_P80_DISTANCE_ATR
+        and 0 <= current_distance <= MAX_CURRENT_DISTANCE_ATR
     )
-    hold_score = 30.0 * hold_count / CLIMB_WINDOW
-    slope_score = 25.0 * min(1.0, max(0.0, slope) / 0.12)
+    hold_score = 10.0 * hold_count / CLIMB_WINDOW
+    slope_score = 15.0 * min(1.0, max(0.0, slope) / 0.12)
     linearity_score = 15.0 * r_squared
-    proximity_score = 20.0 * max(0.0, 1.0 - median_distance / MAX_P80_DISTANCE_ATR)
-    touch_score = 10.0 * min(1.0, touch_count / 2.0)
-    score = round(hold_score + slope_score + linearity_score + proximity_score + touch_score, 3)
+    proximity_score = 10.0 * max(0.0, 1.0 - median_distance / MAX_P80_DISTANCE_ATR)
+    cycle_score = 10.0 + 5.0 * min(1.0, max(0, cycle_count - MIN_PULLBACK_CYCLES))
+    higher_low_score = 10.0 if higher_pullback_low else 0.0
+    alignment_score = 5.0 if ma5_rising and ma10_rising and bullish_stack else 0.0
+    trend_gain_score = 10.0 * min(1.0, max(0.0, trend_gain_atr) / 4.0)
+    score = round(
+        hold_score
+        + slope_score
+        + linearity_score
+        + proximity_score
+        + cycle_score
+        + higher_low_score
+        + alignment_score
+        + trend_gain_score,
+        3,
+    )
     running = bool(hard_valid and score >= WATCH_SCORE)
 
     return {
         "running": running,
+        "shape_version": CLIMB_SHAPE_VERSION,
         "period": period,
         "window": CLIMB_WINDOW,
         "hold_count": hold_count,
@@ -165,7 +243,14 @@ def _evaluate_ma_climb(frame: pd.DataFrame, period: int) -> dict[str, Any] | Non
         "r_squared": round(r_squared, 5),
         "median_distance_atr": round(median_distance, 5),
         "p80_distance_atr": round(p80_distance, 5),
-        "touch_count": touch_count,
+        "current_distance_atr": round(current_distance, 5),
+        "trend_gain_atr": round(trend_gain_atr, 5),
+        "pullback_cycle_count": cycle_count,
+        "pullback_cycles": cycles[-3:],
+        "higher_pullback_low": higher_pullback_low,
+        "ma5_rising": ma5_rising,
+        "ma10_rising": ma10_rising,
+        "bullish_stack": bullish_stack,
         "latest_close": round(float(recent["close"].iloc[-1]), 4),
         "latest_ma": round(float(recent["ma"].iloc[-1]), 4),
         "climb_score": score,
@@ -223,10 +308,10 @@ def _signal_doc(
     as_of: str,
     source_last_trade_date: str,
 ) -> dict[str, Any]:
-    unit = "日" if freq == "日线" else "周"
     period = int(result["period"])
     score = float(result["climb_score"])
     ma_name = f"MA{period}"
+    signal_label = "日线攀爬" if freq == "日线" else "周线攀爬"
     climb = {
         **result,
         "state": "running",
@@ -256,20 +341,20 @@ def _signal_doc(
         "effective_period": period,
         "ma_stack": "climbing",
         "score": score,
-        "summary": f"沿{period}{unit}线攀爬",
-        "tags": [f"沿{period}{unit}线攀爬", "收盘未跌破有效均线"],
+        "summary": f"{signal_label}（有效{ma_name}）",
+        "tags": [signal_label, f"有效{ma_name}", "回踩低点抬高", "收盘未跌破有效均线"],
     }
     event_date = event_dt.date().isoformat()
     return {
         "dedupe_key": f"ma_climb_scan:A:{code}:{freq}:ma{period}:{event_date}",
-        "symbol": code,
+        "symbol": _prefixed_symbol(code),
         "raw_code": code,
         "display_symbol": _prefixed_symbol(code),
         "market": "A",
         "freq": freq,
         "dt": event_dt,
         "as_of": as_of,
-        "signal_type": f"沿{period}{unit}线攀爬",
+        "signal_type": signal_label,
         "signal_side": "buy",
         "signal_family": "ma_climb",
         "score": score,
@@ -283,14 +368,14 @@ def _signal_doc(
         "scan_run_id": str(get_task_env("SIGNALS_POSTMARKET_RUN_ID", "") or ""),
         "ma_alignment": ma_alignment,
         "technical_evidence": {
-            "signal_type": f"沿{period}{unit}线攀爬",
+            "signal_type": signal_label,
             "freq": freq,
             "ma_climb": climb,
             "ma_alignment": ma_alignment,
             "resonance_context": resonance_context,
         },
         "resonance_context": resonance_context,
-        "invalidates_when": f"收盘跌破有效{period}{unit}均线，攀爬逻辑失效",
+        "invalidates_when": f"收盘跌破有效{ma_name}，攀爬逻辑失效",
         "source": "sync.ma_climb_scan",
         "updated_at": now,
     }
@@ -308,16 +393,19 @@ def _scan_symbol(
     source_last_trade_date = daily["dt"].iloc[-1].date().isoformat() if not daily.empty else ""
     selected: dict[str, tuple[dict[str, Any], list[dict[str, Any]], datetime]] = {}
     for freq, frame in frames.items():
+        if frame.empty:
+            continue
         prior = (previous or {}).get(freq) or {}
-        best = _continue_climb(frame, prior) if prior else None
-        if prior and best is None:
+        prior_is_current = int(prior.get("shape_version") or 0) == CLIMB_SHAPE_VERSION
+        best = _continue_climb(frame, prior) if prior_is_current else None
+        if prior_is_current and best is None:
             continue
         detected, alternates = _best_climb(frame)
         if best is None:
             best = detected
         elif detected and int(detected.get("period") or 0) != int(best.get("period") or 0):
             alternates = [detected, *alternates]
-        if best and not frame.empty:
+        if best:
             selected[freq] = (best, alternates, frame["dt"].iloc[-1].to_pydatetime())
     aligned_freqs = list(selected)
     return [
@@ -413,7 +501,7 @@ def _active_climb_states(db: Database) -> dict[str, dict[str, dict[str, Any]]]:
         freq = str(doc.get("freq") or "")
         evidence = doc.get("technical_evidence") if isinstance(doc.get("technical_evidence"), dict) else {}
         climb = evidence.get("ma_climb") if isinstance(evidence.get("ma_climb"), dict) else {}
-        if code and freq in {"日线", "周线"} and climb and freq not in states.setdefault(code, {}):
+        if code and freq in {"日线", "周线"} and freq not in states.setdefault(code, {}):
             states[code][freq] = climb
     return states
 
@@ -462,14 +550,17 @@ def sync_ma_climb_scan(db: Database, proxy_url: str = None) -> dict:
     if operations:
         db["terminal_technical_signals"].bulk_write(operations, ordered=False)
 
-    invalidated = db["terminal_technical_signals"].update_many(
-        {
-            "signal_family": "ma_climb",
-            "active": {"$ne": False},
-            "dedupe_key": {"$nin": active_keys},
-        },
-        {"$set": {"active": False, "invalidated_at": now, "updated_at": now}},
-    )
+    invalidated_count = 0
+    if fullmarket_complete:
+        invalidated = db["terminal_technical_signals"].update_many(
+            {
+                "signal_family": "ma_climb",
+                "active": {"$ne": False},
+                "dedupe_key": {"$nin": active_keys},
+            },
+            {"$set": {"active": False, "invalidated_at": now, "updated_at": now}},
+        )
+        invalidated_count = int(getattr(invalidated, "modified_count", 0) or 0)
     db["data_freshness"].update_one(
         {
             "domain": "technical_signal",
@@ -492,7 +583,7 @@ def sync_ma_climb_scan(db: Database, proxy_url: str = None) -> dict:
             "scanned_symbols": len(frames),
             "buy_review_count": buy_review,
             "watch_count": watch,
-            "invalidated_count": int(getattr(invalidated, "modified_count", 0) or 0),
+            "invalidated_count": invalidated_count,
             "scan_scope": "full_market_cached_daily",
             "minimum_fullmarket_symbols": minimum_fullmarket_symbols,
             "is_full_market_complete": fullmarket_complete,
@@ -513,7 +604,7 @@ def sync_ma_climb_scan(db: Database, proxy_url: str = None) -> dict:
         "signals": signals,
         "buy_review": buy_review,
         "watch": watch,
-        "invalidated": int(getattr(invalidated, "modified_count", 0) or 0),
+        "invalidated": invalidated_count,
         "latest_dt": latest_dt,
         "scan_scope": "full_market_cached_daily",
         "is_full_market_complete": fullmarket_complete,
