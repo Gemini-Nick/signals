@@ -4949,6 +4949,7 @@ def _finalize_pool_row(
         for reason in (top_buy, top_risk)
         if isinstance(reason, dict) and _text(reason.get("signal_type") or reason.get("reason_type"))
     ) or row.get("reason")
+    row["display_badges"] = _display_badges_for_pool(row)
     return row
 
 
@@ -5058,6 +5059,129 @@ def _slim_resonance_for_pool(value: Any) -> dict[str, Any]:
     return {key: value.get(key) for key in keys if value.get(key) not in (None, "", [], {})}
 
 
+def _slim_ma_climb_for_pool(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    keys = (
+        "running",
+        "period",
+        "effective_ma",
+        "effective_ma_name",
+        "ma_period",
+        "climb_score",
+        "slope_atr",
+        "r2",
+        "distance_atr",
+        "latest_close",
+        "invalidates_when",
+    )
+    return {key: value.get(key) for key in keys if value.get(key) not in (None, "", [], {})}
+
+
+def _reason_entry_factor(reason: dict[str, Any]) -> dict[str, Any]:
+    evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+    entry_factor = evidence.get("entry_factor") if isinstance(evidence.get("entry_factor"), dict) else {}
+    if entry_factor:
+        return entry_factor
+    details = evidence.get("details") if isinstance(evidence.get("details"), dict) else {}
+    return details.get("entry_factor") if isinstance(details.get("entry_factor"), dict) else {}
+
+
+def _badge_timeframe_label(freq: Any) -> str:
+    value = _text(freq)
+    return {
+        "日线": "日",
+        "daily": "日",
+        "1d": "日",
+        "D": "日",
+        "d": "日",
+        "周线": "周",
+        "weekly": "周",
+        "1w": "周",
+        "W": "周",
+        "w": "周",
+        "月线": "月",
+        "monthly": "月",
+        "1M": "月",
+        "M": "月",
+        "30分钟": "30m",
+        "30min": "30m",
+        "30m": "30m",
+        "15分钟": "15m",
+        "15min": "15m",
+        "15m": "15m",
+        "5分钟": "5m",
+        "5min": "5m",
+        "5m": "5m",
+    }.get(value, value)
+
+
+def _badge_label_for_signal(reason: dict[str, Any], *, fallback: str) -> str:
+    signal_type = _text(reason.get("signal_type")) or fallback
+    for token in ("一买", "二买", "三买", "背驰买", "底背离", "趋势买", "一卖", "二卖", "三卖", "顶背离", "跌破", "死叉"):
+        if token in signal_type:
+            signal_type = token
+            break
+    prefix = _badge_timeframe_label(reason.get("freq") or reason.get("timeframe"))
+    if prefix and not signal_type.startswith(prefix):
+        return f"{prefix}{signal_type}"
+    return signal_type
+
+
+def _badge_label_for_ma_climb(reason: dict[str, Any]) -> str:
+    climb = _ma_climb_evidence(reason)
+    ma_name = _text(climb.get("effective_ma_name"))
+    if not ma_name:
+        period = _text(climb.get("ma_period") or climb.get("period"))
+        ma_name = f"MA{period}" if period else "MA"
+    prefix = _badge_timeframe_label(reason.get("freq") or reason.get("timeframe"))
+    return f"{prefix}{ma_name}攀爬" if prefix else f"{ma_name}攀爬"
+
+
+def _display_badge_for_reason(reason: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(reason, dict) or not _is_technical_reason(reason):
+        return {}
+    signal_side = _text(reason.get("signal_side"))
+    text = _reason_signal_text(reason)
+    timeframe = _text(reason.get("freq") or reason.get("timeframe"))
+    score = _float(reason.get("score"))
+    base: dict[str, Any] = {
+        "timeframe": timeframe,
+        "signal_type": _text(reason.get("signal_type")),
+        "priority": 0,
+    }
+    if _text(reason.get("signal_family")) == "ma_climb" and _ma_climb_score(reason) >= 60.0:
+        return {**base, "kind": "ma_climb", "label": _badge_label_for_ma_climb(reason), "priority": 700 + min(80, int(_ma_climb_score(reason)))}
+    if any(token in text for token in ("200d_new_high_breakout", "200日新高", "新高突破")):
+        return {**base, "kind": "new_high", "label": "200日新高", "priority": 800 + min(80, int(score))}
+    if any(token in text for token in ("缺口买:持续", "缺口买:突破", "持续缺口", "突破缺口")):
+        entry_factor = _reason_entry_factor(reason)
+        volume_ratio = max(_float(entry_factor.get("volume_ratio")), _float(entry_factor.get("recent_volume_ratio")))
+        volume_bonus = min(60, int(max(0.0, volume_ratio - 1.0) * 30))
+        return {**base, "kind": "gap_volume_price", "label": f"{_badge_timeframe_label(timeframe)}强缺口量价".strip(), "priority": 600 + volume_bonus + min(40, int(score))}
+    if signal_side == "buy" and any(token in text for token in ("一买", "二买", "三买", "背驰买", "底背离", "趋势买")):
+        return {**base, "kind": "buy_point", "label": _badge_label_for_signal(reason, fallback="买点"), "priority": 900 + min(80, int(score))}
+    if signal_side == "sell" and any(token in text for token in ("一卖", "二卖", "三卖", "顶背离", "跌破", "死叉")):
+        return {**base, "kind": "sell_point", "label": _badge_label_for_signal(reason, fallback="卖点"), "priority": 900 + min(80, int(score))}
+    return {}
+
+
+def _display_badges_for_pool(row: dict[str, Any]) -> list[dict[str, Any]]:
+    badges: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for reason in row.get("inclusion_reasons") or []:
+        badge = _display_badge_for_reason(reason)
+        if not badge:
+            continue
+        key = (_text(badge.get("kind")), _text(badge.get("timeframe")))
+        if key in seen:
+            continue
+        seen.add(key)
+        badges.append({key: value for key, value in badge.items() if value not in (None, "", [], {})})
+    badges.sort(key=lambda item: (_float(item.get("priority")), _freq_sort_key(_text(item.get("timeframe")))), reverse=True)
+    return badges[:3]
+
+
 def _slim_evidence_for_pool(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -5135,6 +5259,9 @@ def _slim_evidence_for_pool(value: Any) -> dict[str, Any]:
     ma_alignment = _slim_ma_alignment_for_pool(value.get("ma_alignment"))
     if ma_alignment:
         out["ma_alignment"] = ma_alignment
+    ma_climb = _slim_ma_climb_for_pool(value.get("ma_climb"))
+    if ma_climb:
+        out["ma_climb"] = ma_climb
     return out
 
 
@@ -5237,6 +5364,15 @@ def _slim_pool_row_for_storage(row: dict[str, Any]) -> dict[str, Any]:
             out[key] = context
         else:
             out.pop(key, None)
+    out["display_badges"] = [
+        {
+            key: badge.get(key)
+            for key in ("kind", "label", "timeframe", "priority", "signal_type")
+            if badge.get(key) not in (None, "", [], {})
+        }
+        for badge in row.get("display_badges") or []
+        if isinstance(badge, dict)
+    ][:3]
     return out
 
 

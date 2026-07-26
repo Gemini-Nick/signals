@@ -156,6 +156,14 @@ def test_stock_daily_active_repair_lookback_defaults_to_incremental(monkeypatch)
     assert stock_daily._repair_lookback_days_for_scope("all") == 30
 
 
+def test_stock_daily_today_only_flag_is_opt_in(monkeypatch):
+    monkeypatch.delenv("STOCK_DAILY_TODAY_ONLY", raising=False)
+    assert stock_daily._today_only_enabled() is False
+
+    monkeypatch.setenv("STOCK_DAILY_TODAY_ONLY", "true")
+    assert stock_daily._today_only_enabled() is True
+
+
 def test_active_stock_codes_include_all_terminal_stock_pool_groups():
     db = _DB({
         "terminal_stock_pool": _Collection([{

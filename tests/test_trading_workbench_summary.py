@@ -481,8 +481,10 @@ def test_word_cli_trade_date_renders_word_style_from_replay_context(monkeypatch,
 
     assert exit_code == 0
     assert seen["trade_date"] == "2026-06-29"
-    assert output.startswith("NOTIFY\n6月29日A股盘后复盘报告（Signals组装版）")
-    assert "A股盘后复盘报告 | 2026年6月29日（周一）" in output
+    assert output.startswith("NOTIFY\n# A股盘后复盘 | 2026年6月29日（周一）")
+    for heading in ("## 今日一句话", "## 市场全貌", "## 主线与资金", "## 代表信号", "## 明天看什么"):
+        assert heading in output
+    assert "# A股盘后复盘 | 2026年6月29日（周一）" in output
     assert "4073.9" in output
     assert "生物制品" in output
     assert "兆易创新" in output

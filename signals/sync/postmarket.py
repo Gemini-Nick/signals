@@ -85,6 +85,7 @@ def _stock_daily_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
             env={
                 "SIGNALS_SYNC_FULL_STOCK_DAILY": "true",
                 "STOCK_DAILY_SCOPE": "all",
+                "STOCK_DAILY_TODAY_ONLY": "true",
                 "STOCK_DAILY_SHARD_COUNT": str(shard_count),
                 "STOCK_DAILY_SHARD_INDEX": str(idx),
                 "STOCK_DAILY_SHARD_KEY": f"shard_{idx:02d}",
@@ -169,6 +170,10 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     PostmarketTaskSpec("fullmarket_spot_snapshot", "market_data"),
     PostmarketTaskSpec("etf_spot_snapshot", "market_data"),
     PostmarketTaskSpec("market_pools", "market_data"),
+    PostmarketTaskSpec("market_limit_pools", "market_data"),
+    PostmarketTaskSpec("board_heat_minute", "market_data"),
+    PostmarketTaskSpec("concept_heat_minute", "market_data"),
+    PostmarketTaskSpec("index_minute", "market_data"),
     PostmarketTaskSpec("quote_snapshots", "market_data", depends_on=(FULLMARKET_SPOT_TASK_KEY, ETF_SPOT_TASK_KEY)),
     PostmarketTaskSpec("index_daily", "market_data", depends_on=("quote_snapshots:all",)),
     *_STOCK_DAILY_TASKS,
@@ -258,7 +263,6 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
             "STOCK_MINUTE_CALL_INTERVAL": "0.15",
         },
     ),
-    PostmarketTaskSpec("index_minute", "minute_preheat", depends_on=("terminal_realtime_pool:all",)),
     PostmarketTaskSpec(
         "minute_readiness_probe",
         "minute_preheat",

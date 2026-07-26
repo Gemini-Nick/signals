@@ -312,40 +312,43 @@ can restore the timing of recognition and loss of recognition.
 
 ## Review Shape
 
-Write like the sample screenshot:
+Markdown and Word use the same five-part reader-facing structure:
 
-1. Start with conclusion first: market state, emotion temperature, real
-   pressure center, confirmed/hidden/false main lines, biggest risk, and the
-   most important next-day validation.
-2. Immediately state data completeness. Use `available`, `missing`, or
-   `partial`; explain how missing minute, board history, or flow data weakens
-   the conclusion.
-3. Name the index damage and high-volume core pressure.
-4. Reconstruct the fund-flow chain as long paragraphs for WeChat/narrative
-   output, or tables for a full manual report. Use exact times, prices,
-   turnover, and net-flow figures only when they are present in the replay
-   context, user attachments, or extra facts.
-5. Treat `板块15` as the primary sector truth. Do not collapse it into only
-   `daily_brief.primary_theme`.
-6. Compare sector ranking against `线索池 / 盯盘池 / 买点池 / 风险池`.
-7. Include carding structure, emotion temperature, time-cycle position,
-   Top7/20-day trend comparison when available, tail acceptance, and next-day
-   validation points.
-8. Do not write a short system summary when the user asks for screenshot
-   restoration; use the sample as style guidance, not as runtime hardcoded
-   content.
+1. `今日一句话`: one paragraph on what the market traded, index/breadth, and
+   the main money path.
+2. `市场全貌`: one compact index and turnover table plus one breadth sentence.
+3. `主线与资金`: `走强方向` and `转弱方向` tables with at most three rows each,
+   followed by one plain-language main-line judgment.
+4. `代表信号`: at most six stocks that represent capacity, strength, or weakness.
+5. `明天看什么`: a three-row table of object, stronger behavior, and weaker behavior.
+
+The report explains the market, not its production process. Omit a row that
+cannot be stated cleanly; never add status labels, source fields, missing-data
+notes, or model self-checks to fill the shape.
 
 ### Word-Style Daily Note Shape
 
-For manual daily notes and Word-style postmarket reports, restore the user's
-report shape instead of compressing into the normal WeChat brief. The 2026-06-29
-Word target is the current full-note reference:
+For manual daily notes and Word-style postmarket reports, use the same five-part
+body as Markdown. The 2026-06-29 Word target is a tone reference only:
 
 - `signals/replay/references/2026-06-29-word.txt`
 - `signals/replay/references/2026-06-29-word-phrases.json`
 
-Use that target for structure and tone, not as hardcoded runtime content. A
-high-restoration daily note should keep these blocks in order:
+The legacy outline below is archival only and must not be used for new daily
+reports. New reports use this exact heading hierarchy:
+
+```markdown
+# A股盘后复盘 | YYYY年M月D日（周X）
+## 今日一句话
+## 市场全貌
+## 主线与资金
+### 走强方向
+### 转弱方向
+## 代表信号
+## 明天看什么
+```
+
+The older detailed outline is retained solely for historical sample comparison:
 
 1. Title and date: `A股盘后复盘报告 | YYYY年M月D日（周X）`.
 2. `昨日观察点校准`: if a previous daily note exists, check each prior
@@ -413,7 +416,7 @@ Acceptance for this Word-style path:
   restoration. Phrase coverage must use the sample-specific phrase file, not
   the older 2026-06-05 screenshot phrases.
 
-## Evidence Levels
+## Legacy Internal Reference
 
 Every key judgment uses one of these labels:
 
@@ -432,7 +435,11 @@ Rules:
   numbers. Order-size flow must be labeled as Eastmoney/THS 大中小单口径.
 - All final actions are validation points, not buy/sell/target/stop commands.
 
-## Full Report Template
+## Legacy Full Report Template
+
+The active daily template is the five-part hierarchy above. Use a separate
+research report for a deep stock or theme study; do not append research sections
+to the daily replay.
 
 Use this full structure for manual postmarket reviews, Obsidian-ready reviewed
 notes, or deeper non-WeChat output. The daily WeChat narrative can compress the

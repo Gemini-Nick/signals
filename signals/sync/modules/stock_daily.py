@@ -166,6 +166,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _today_only_enabled() -> bool:
+    """Use the persisted close snapshot without starting historical hydration."""
+    return _env_bool("STOCK_DAILY_TODAY_ONLY", False)
+
+
 def _batch_today_min_hour() -> int:
     try:
         return max(0, min(23, int(os.getenv("STOCK_DAILY_BATCH_TODAY_MIN_HOUR", "15"))))
@@ -1663,6 +1668,60 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
             shard_key,
             batch_reason,
         )
+
+    # The close-data path only needs today's OHLC snapshot. Historical hydration
+    # can take hours when a symbol has a short cache and must never hold up the
+    # market replay feed or the next trading session's live lanes.
+    if _today_only_enabled():
+        missing_codes = len(codes) - len(batch_codes)
+        status = "ok" if missing_codes == 0 else "partial"
+        _write_progress(
+            sync_col,
+            status=status,
+            scope=scope,
+            total=len(codes),
+            processed=len(batch_codes),
+            inserted=total_inserted,
+            skipped=0,
+            errors_count=missing_codes,
+            deferred_count=0,
+            latest_symbol=next(iter(batch_codes), ""),
+            latest_status="today_snapshot_only",
+            latest_written=batch_inserted,
+            started_at=run_started_at,
+            shard_key=shard_key,
+            shard_index=shard_index,
+            shard_count=shard_count,
+            global_total=global_total,
+        )
+        return {
+            "status": status,
+            "inserted": total_inserted,
+            "skipped": 0,
+            "errors": missing_codes,
+            "deferred": 0,
+            "cooling_down": 0,
+            "scope": scope,
+            "shard_key": shard_key,
+            "shard_index": shard_index,
+            "shard_count": shard_count,
+            "global_total": global_total,
+            "codes": len(codes),
+            "processed": len(batch_codes),
+            "total": len(codes),
+            "expected_codes": len(codes),
+            "covered_codes": len(batch_codes),
+            "coverage_pct": round((len(batch_codes) / len(codes) * 100), 2) if codes else 100.0,
+            "progress_pct": round((len(batch_codes) / len(codes) * 100), 2) if codes else 100.0,
+            "sample_errors": [],
+            "sample_deferred": [],
+            "batch_today": len(batch_codes),
+            "batch_today_inserted": batch_inserted,
+            "batch_today_reason": batch_reason,
+            "repair_lookback_days": repair_lookback_days,
+            "short_history_backfill_codes": len(short_history_codes),
+            "today_snapshot_only": True,
+        }
 
     def _process(code):
         last_dt_raw = sync_docs.get(code)

@@ -37,6 +37,7 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert {task.shard_key for task in hk_stock_daily} == {f"shard_{idx:02d}" for idx in range(8)}
     assert {task.shard_key for task in stock_30m} == {f"shard_{idx:02d}" for idx in range(16)}
     assert all(task.env["STOCK_DAILY_SCOPE"] == "all" for task in stock_daily)
+    assert all(task.env["STOCK_DAILY_TODAY_ONLY"] == "true" for task in stock_daily)
     assert all(task.env["HK_STOCK_DAILY_SCOPE"] == "all" for task in hk_stock_daily)
     assert all(task.phase == "hk_market_data" for task in hk_stock_daily)
     assert all(task.blocks_run is False for task in hk_stock_daily)
@@ -79,6 +80,7 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     chain_minute = next(task for task in stock_minute_tasks if task.shard_key == "chain_representatives")
     terminal_minute = next(task for task in stock_minute_tasks if task.shard_key == "all")
     readiness = next(task for task in pm.POSTMARKET_TASKS if task.module == "minute_readiness_probe")
+    close_index_minute = next(task for task in pm.POSTMARKET_TASKS if task.module == "index_minute")
     assert chain_minute.phase == "chain_context"
     assert chain_minute.depends_on == ("chain_heat_snapshots:all", "postmarket_chain_rebuild:all")
     assert chain_minute.env["STOCK_MINUTE_POSTMARKET_MAX_CODES"] == "160"
@@ -92,6 +94,7 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert terminal_minute.env["STOCK_MINUTE_CALL_INTERVAL"] == "0.15"
     assert readiness.env["MINUTE_READINESS_SELECTION_META_ID"] == "stock_minute:postmarket_selection:_meta"
     assert readiness.blocks_run is False
+    assert close_index_minute.phase == "market_data"
 
 
 def test_postmarket_trade_date_skips_cn_labor_day_holiday():

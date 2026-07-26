@@ -4,7 +4,7 @@ from __future__ import annotations
 from signals.replay.word_style_renderer import _chain_pressure_pool, _failed_samples_for_trend, _trend_candidates, render_word_style_review
 
 
-def test_word_style_renderer_uses_evidence_and_marks_missing_fields():
+def test_word_style_renderer_keeps_a_reader_facing_five_part_structure():
     text = render_word_style_review(
         {"trade_date": "2026-06-29", "sector_boards": []},
         {
@@ -185,30 +185,16 @@ def test_word_style_renderer_uses_evidence_and_marks_missing_fields():
         },
     )
 
-    assert "A股盘后复盘报告 | 2026年6月29日（周一）" in text
-    assert "一、市场整体状态" in text
-    assert "三、板块深度拆解" in text
-    assert "七、明日观察清单" in text
+    assert "# A股盘后复盘 | 2026年6月29日（周一）" in text
+    for heading in ("## 今日一句话", "## 市场全貌", "## 主线与资金", "## 代表信号", "## 明天看什么"):
+        assert heading in text
     assert "4073.9" in text
     assert "生物制品" in text
     assert "兆易创新" in text
-    assert "主要共同拐点集中在 10:15-10:25" in text
-    assert "低点后修复" in text
-    assert "DIF=0.15，DEA=-2.01，柱=4.33" in text
-    assert "MA20乖离+1.58%" in text
-    assert "科创50 RSI(6)=80.82、MA20乖离+17.91%" in text
-    assert "方向定性" in text
-    assert "生物制品（industry）——强趋势延续" not in text
-    assert "5日/20日趋势 unknown" in text
-    assert "归属半导体产业链/半导体设备" in text
-    assert "日线加速点：2026-06-29，涨停/强封、突破前高" in text
-    assert "2026-06-25至2026-06-29累计+20.10%" in text
-    assert "涨停/强封、突破前高" in text
-    assert "板块分钟线：missing" in text
-    assert "账户级参与者资金：missing" in text
+    for internal_token in ("unknown", "missing", "confirmed", "证据", "数据完整性", "风险提示", "报告阶段", "生成状态"):
+        assert internal_token not in text
     assert "主力" not in text
     assert "散户" not in text
-    assert "极度分化，科创单骑救主" not in text
 
 
 def test_trend_candidates_use_replay_quality_without_board_bias():
@@ -414,7 +400,7 @@ def test_chain_pressure_pool_keeps_high_amount_same_chain_weak_samples_without_n
     assert [row["code"] for row in pool] == ["688146", "688002"]
 
 
-def test_word_renderer_shows_fixed_slices_proxy_label_and_pressure_role_priority():
+def test_word_renderer_omits_internal_coverage_and_fixed_slice_details():
     text = render_word_style_review(
         {"trade_date": "2026-07-14"},
         {
@@ -456,10 +442,6 @@ def test_word_renderer_shows_fixed_slices_proxy_label_and_pressure_role_priority
         },
     )
 
-    assert "板块强度代理 TOP7" in text
-    assert "固定半小时时间轴" in text
-    assert "13:01-13:30" in text
-    assert "压力核心" in text
-    assert "主线容量/动态核心 | 样本股" not in text
-    assert "20日+99.00%" not in text
-    assert "最新分钟时点=14:55" in text
+    assert "元件" in text
+    for internal_token in ("固定半小时时间轴", "13:01-13:30", "压力核心", "最新分钟时点", "unknown", "partial"):
+        assert internal_token not in text

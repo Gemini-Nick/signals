@@ -176,6 +176,92 @@ def _invalidate_shell_cache() -> None:
         _SHELL_CACHE.update({"expires_at": 0.0, "payload": None, "refreshed_at": 0.0, "quote_watermark": ""})
 
 
+def _shell_manual_clue_row_matches(row: Any, keys: set[str]) -> bool:
+    if not isinstance(row, dict) or not keys:
+        return False
+    source_collections = row.get("source_collections")
+    is_manual = bool(row.get("manual_clue") or row.get("deletable"))
+    is_manual = is_manual or _text(row.get("source_collection")) == "terminal_manual_clues"
+    is_manual = is_manual or (
+        isinstance(source_collections, list)
+        and any(_text(item) == "terminal_manual_clues" for item in source_collections)
+    )
+    if not is_manual:
+        return False
+    values = [
+        row.get("symbol"),
+        row.get("raw_code"),
+        row.get("code"),
+        row.get("target_symbol"),
+        row.get("target_label"),
+        row.get("label"),
+    ]
+    for value in values:
+        text = _text(value).strip()
+        if text and text.upper() in keys:
+            return True
+    return False
+
+
+def _remove_shell_manual_clue_rows(rows: Any, keys: set[str]) -> tuple[Any, int]:
+    if not isinstance(rows, list):
+        return rows, 0
+    kept: list[Any] = []
+    removed = 0
+    for row in rows:
+        if _shell_manual_clue_row_matches(row, keys):
+            removed += 1
+            continue
+        kept.append(row)
+    return kept, removed
+
+
+def _sync_shell_group_meta_counts(payload: dict[str, Any]) -> None:
+    groups = payload.get("watchlist_groups")
+    meta = payload.get("watchlist_groups_meta")
+    if not isinstance(groups, dict) or not isinstance(meta, dict):
+        return
+    for group_key, rows in groups.items():
+        group_meta = meta.get(group_key)
+        if isinstance(rows, list) and isinstance(group_meta, dict):
+            group_meta["count"] = len(rows)
+            if group_key == "buy_candidates":
+                group_meta["manual_clues"] = sum(1 for row in rows if isinstance(row, dict) and row.get("manual_clue"))
+
+
+def _remove_manual_clue_from_shell_cache(symbols: set[str]) -> dict[str, Any]:
+    keys = {_text(symbol).strip().upper() for symbol in symbols if _text(symbol).strip()}
+    if not keys:
+        return {"cache_updated": False, "cache_removed": 0}
+    with _SHELL_CACHE_LOCK:
+        payload = _SHELL_CACHE.get("payload")
+        if not isinstance(payload, dict):
+            return {"cache_updated": False, "cache_removed": 0}
+        updated = dict(payload)
+        removed_total = 0
+        for key in ("buy_candidates", "watchlist", "decision_queue"):
+            rows, removed = _remove_shell_manual_clue_rows(updated.get(key), keys)
+            if removed:
+                updated[key] = rows
+                removed_total += removed
+
+        groups = updated.get("watchlist_groups")
+        if isinstance(groups, dict):
+            updated_groups: dict[str, Any] = dict(groups)
+            for group_key in ("buy_candidates", "focus_stocks", "risk_stocks", "watch_stocks"):
+                rows, removed = _remove_shell_manual_clue_rows(updated_groups.get(group_key), keys)
+                if removed:
+                    updated_groups[group_key] = rows
+                    removed_total += removed
+            updated["watchlist_groups"] = updated_groups
+
+        if removed_total <= 0:
+            return {"cache_updated": False, "cache_removed": 0}
+        _sync_shell_group_meta_counts(updated)
+        _SHELL_CACHE["payload"] = updated
+        return {"cache_updated": True, "cache_removed": removed_total}
+
+
 def _symbol_payload_cache_key(symbol: str, kind: str, freq: str) -> str:
     return "|".join((
         _text(kind).strip().lower() or "auto",
@@ -3696,84 +3782,33 @@ def _shell_stock_breakout_summary(entry_factor: dict[str, Any]) -> str:
     return "200日新高" + (f"({ ' / '.join(parts) })" if parts else "")
 
 
-def _shell_stock_trade_summary(row: dict[str, Any], *, entry_factor: dict[str, Any]) -> str:
-    pool_type = _text(row.get("pool_type"))
-    gate = _text(row.get("entry_gate_status"))
-    trade_stage = _text(row.get("trade_stage"))
-    chain = _shell_stock_chain_brief(row)
-    upper_signal = _shell_stock_timeframe_labels(row, "upper", limit=2)
-    trade_signal = _shell_stock_timeframe_labels(row, "trade", limit=2)
-    execution_signal = _shell_stock_timeframe_labels(row, "execution", limit=2)
-    primary_signal = _shell_stock_reason_labels(row, side="buy", limit=2)
-    left_signal = _shell_stock_reason_labels(row, side="left", limit=1)
-    risk_signal = _shell_stock_reason_labels(row, side="risk", limit=2)
-    breakout = _shell_stock_breakout_summary(entry_factor)
-    ma = row.get("ma_alignment") if isinstance(row.get("ma_alignment"), dict) else {}
-    ma_tags = [
-        _text(item)
-        for item in ma.get("tags") or []
-        if _text(item)
-    ][:2]
-    fib_summary = _text(ma.get("fib_array_summary"))
-    detail = ""
-    top_buy = row.get("top_buy_reason") if isinstance(row.get("top_buy_reason"), dict) else {}
-    if isinstance(top_buy, dict):
-        detail = _text(top_buy.get("details"))
-    missing = _text(row.get("missing_condition") or row.get("primary_blocker"))
+def _shell_summary_clean_condition(value: Any) -> str:
+    text = _text(value)
+    if not text:
+        return ""
+    blocked = ("风险", "主线", "产业链", "角色", "普通缩量", "缩量")
+    if any(token in text for token in blocked):
+        return ""
+    return text[:32]
 
-    if pool_type == "focus" and gate == "entry_confirmed":
-        lead = "日/周买点已确认，执行链路走通"
-    elif pool_type == "focus" and (gate == "entry_attack_confirmed" or trade_stage == "attack_entry"):
-        lead = "日/周买点已确认，按进攻买点复核"
-    elif pool_type == "focus" and trade_stage == "left_attack":
-        lead = "日/周左侧买点，先复核承接位"
-    elif gate == "entry_waiting_right_side_confirm":
-        lead = "还差5m/15m下单确认"
-    elif gate == "entry_waiting_30m_confirm":
-        lead = "还差30m买点"
-    elif gate == "entry_waiting_upper_context":
-        lead = "短周期有动作，缺日/周买点"
-    elif pool_type == "watch":
-        lead = "盯盘观察，等缺口补齐"
-    elif pool_type in {"clue", "clue_pool"} or trade_stage == "clue_pool":
-        lead = "线索池观察，还不是买点"
-    elif pool_type == "risk" or trade_stage == "skip_now":
-        lead = "暂不参与"
-    else:
-        lead = _text(row.get("stage_label") or row.get("trader_action")) or "观察"
 
-    evidence = []
-    if upper_signal:
-        evidence.append("日/周 " + " / ".join(upper_signal[:2]))
-    if trade_signal:
-        evidence.append("30m " + " / ".join(trade_signal[:2]))
-    if execution_signal:
-        evidence.append("5m/15m " + " / ".join(execution_signal[:2]))
-    if primary_signal and not evidence:
-        evidence.append("短周期 " + " / ".join(primary_signal[:2]))
-    if left_signal and not evidence:
-        evidence.append("左侧 " + " / ".join(left_signal[:1]))
-    if breakout:
-        evidence.append(breakout)
-    if fib_summary:
-        evidence.append("均线 " + fib_summary)
-    elif ma_tags:
-        evidence.append("均线 " + " / ".join(ma_tags))
-    if detail:
-        evidence.append(detail)
-
-    context = []
-    if chain:
-        context.append(chain)
-    if risk_signal:
-        context.append("风险标记 " + " / ".join(risk_signal[:2]))
-    elif row.get("risk_marked"):
-        context.append("风险已标记")
+def _shell_stock_trade_summary(
+    row: dict[str, Any],
+    *,
+    entry_factor: dict[str, Any],
+    display_badges: list[dict[str, Any]] | None = None,
+) -> str:
+    labels = [
+        _text(item.get("label"))
+        for item in (display_badges or [])
+        if isinstance(item, dict) and _text(item.get("kind")) in _SHELL_HARD_BADGE_KINDS and _text(item.get("label"))
+    ][:3]
+    missing = _shell_summary_clean_condition(row.get("missing_condition") or row.get("primary_blocker"))
+    lead = " / ".join(labels[:3]) if labels else "硬信号待确认"
+    parts = [lead]
     if missing and missing not in lead:
-        context.append(missing)
-
-    text = "；".join([lead, *evidence[:3], *context[:2]])
-    return text[:180]
+        parts.append(missing)
+    return "；".join(parts)[:64]
 
 
 def _shell_stock_display_action(row: dict[str, Any]) -> str:
@@ -3805,46 +3840,192 @@ def _shell_stock_display_action(row: dict[str, Any]) -> str:
     return "复核"
 
 
-def _shell_stock_display_badges(row: dict[str, Any], *, entry_factor: dict[str, Any]) -> list[dict[str, str]]:
-    badges: list[dict[str, str]] = []
+_SHELL_HARD_BADGE_KINDS = {"buy_point", "sell_point", "new_high", "ma_climb", "gap_volume_price"}
 
-    def add(label: str, tone: str = "neutral") -> None:
-        text = _text(label)
-        if text and text not in {item["label"] for item in badges}:
-            badges.append({"label": text[:14], "tone": tone})
 
-    pool_type = _text(row.get("pool_type"))
-    gate = _text(row.get("entry_gate_status"))
-    stage = _text(row.get("stage_label") or row.get("trade_stage"))
-    setup = _text(row.get("setup_mode_label"))
-    if stage:
-        add(stage, "buy" if pool_type == "focus" else "watch" if pool_type == "watch" else "neutral")
-    if setup and setup != stage:
-        add(setup, "info")
-    if _text(row.get("sector_policy_label")):
-        add(_text(row.get("sector_policy_label")), "info")
-    if _text(row.get("index_setup_label")):
-        add(_text(row.get("index_setup_label")), "info")
-    if _text(row.get("market_volume_label")) and _text(row.get("market_volume_state")) != "unknown":
-        add(_text(row.get("market_volume_label")), "neutral")
-    breakout = _shell_stock_breakout_summary(entry_factor)
-    if breakout:
-        add("200日新高", "hot")
-    elif any("200日新高" in item for item in _shell_stock_reason_labels(row, side="buy", limit=4)):
-        add("200日新高", "hot")
-    if row.get("risk_marked"):
-        marker = _text(row.get("risk_marker")) or (_shell_stock_reason_labels(row, side="risk", limit=1) or ["风险"])[0]
-        add(marker, "risk")
-    ma = row.get("ma_alignment") if isinstance(row.get("ma_alignment"), dict) else {}
-    fib_summary = _text(ma.get("fib_array_summary"))
-    if fib_summary:
-        add(fib_summary.replace("回踩承接", "承接"), "buy")
-    if gate.startswith("entry_waiting"):
-        add(_shell_stock_display_action(row), "wait")
-    chain = _shell_stock_chain_brief(row)
-    if chain:
-        add(chain.split(" · ")[0], "neutral")
-    return badges[:5]
+def _shell_badge_freq_label(freq: Any) -> str:
+    value = _text(freq)
+    return {
+        "日线": "日",
+        "daily": "日",
+        "1d": "日",
+        "D": "日",
+        "d": "日",
+        "周线": "周",
+        "weekly": "周",
+        "1w": "周",
+        "W": "周",
+        "w": "周",
+        "月线": "月",
+        "monthly": "月",
+        "1M": "月",
+        "M": "月",
+        "30分钟": "30m",
+        "30min": "30m",
+        "30m": "30m",
+        "15分钟": "15m",
+        "15min": "15m",
+        "15m": "15m",
+        "5分钟": "5m",
+        "5min": "5m",
+        "5m": "5m",
+    }.get(value, value)
+
+
+def _shell_badge_priority(kind: str, score: Any = None, *, ma_score: Any = None, volume_ratio: Any = None) -> int:
+    if kind in {"buy_point", "sell_point"}:
+        return 900 + min(80, int(_float(score) or 0))
+    if kind == "new_high":
+        return 800 + min(80, int(_float(score) or 0))
+    if kind == "ma_climb":
+        return 700 + min(80, int(_float(ma_score) or _float(score) or 0))
+    if kind == "gap_volume_price":
+        ratio = _float(volume_ratio) or 0.0
+        volume_bonus = min(60, int(max(0.0, ratio - 1.0) * 30))
+        return 600 + volume_bonus + min(40, int(_float(score) or 0))
+    return 0
+
+
+def _normalize_shell_display_badge(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    kind = _text(value.get("kind"))
+    if kind not in _SHELL_HARD_BADGE_KINDS:
+        return {}
+    label = _text(value.get("label"))
+    if not label:
+        return {}
+    priority = _float(value.get("priority"))
+    out: dict[str, Any] = {
+        "kind": kind,
+        "label": label[:14],
+        "timeframe": _text(value.get("timeframe") or value.get("freq")),
+        "priority": int(priority if priority is not None else _shell_badge_priority(kind)),
+    }
+    signal_type = _text(value.get("signal_type"))
+    if signal_type:
+        out["signal_type"] = signal_type
+    tone = _text(value.get("tone"))
+    if tone:
+        out["tone"] = tone
+    return {key: item for key, item in out.items() if item not in (None, "", [], {})}
+
+
+def _shell_reason_text(reason: dict[str, Any]) -> str:
+    evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+    details = evidence.get("details")
+    detail_text = " ".join(_text(item) for item in details.values()) if isinstance(details, dict) else _text(details)
+    return " ".join([
+        _text(reason.get("signal_type")),
+        _text(reason.get("reason_type")),
+        detail_text,
+    ])
+
+
+def _shell_reason_is_hard_technical(reason: dict[str, Any]) -> bool:
+    return isinstance(reason, dict) and _text(reason.get("reason_type")) in {"technical_trigger", "technical_signal"}
+
+
+def _shell_reason_entry_factor(reason: dict[str, Any]) -> dict[str, Any]:
+    evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+    entry_factor = evidence.get("entry_factor") if isinstance(evidence.get("entry_factor"), dict) else reason.get("entry_factor")
+    if isinstance(entry_factor, dict):
+        return entry_factor
+    details = evidence.get("details") if isinstance(evidence.get("details"), dict) else {}
+    return details.get("entry_factor") if isinstance(details.get("entry_factor"), dict) else {}
+
+
+def _shell_reason_ma_climb(reason: dict[str, Any]) -> dict[str, Any]:
+    if _text(reason.get("signal_family")) != "ma_climb":
+        return {}
+    evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+    climb = evidence.get("ma_climb") if isinstance(evidence.get("ma_climb"), dict) else reason.get("ma_climb")
+    return climb if isinstance(climb, dict) else {}
+
+
+def _shell_badge_signal_label(reason: dict[str, Any], *, fallback: str) -> str:
+    signal_type = _text(reason.get("signal_type")) or fallback
+    for token in ("一买", "二买", "三买", "背驰买", "底背离", "趋势买", "一卖", "二卖", "三卖", "顶背离", "跌破", "死叉"):
+        if token in signal_type:
+            signal_type = token
+            break
+    prefix = _shell_badge_freq_label(reason.get("freq") or reason.get("timeframe"))
+    return f"{prefix}{signal_type}" if prefix and not signal_type.startswith(prefix) else signal_type
+
+
+def _shell_badge_ma_label(reason: dict[str, Any], climb: dict[str, Any]) -> str:
+    ma_name = _text(climb.get("effective_ma_name"))
+    if not ma_name:
+        period = _text(climb.get("ma_period") or climb.get("period"))
+        ma_name = f"MA{period}" if period else "MA"
+    prefix = _shell_badge_freq_label(reason.get("freq") or reason.get("timeframe"))
+    return f"{prefix}{ma_name}攀爬" if prefix else f"{ma_name}攀爬"
+
+
+def _shell_display_badge_from_reason(reason: dict[str, Any]) -> dict[str, Any]:
+    if not _shell_reason_is_hard_technical(reason):
+        return {}
+    signal_side = _text(reason.get("signal_side"))
+    timeframe = _text(reason.get("freq") or reason.get("timeframe"))
+    text = _shell_reason_text(reason)
+    score = _float(reason.get("score")) or 0.0
+    base = {"timeframe": timeframe, "signal_type": _text(reason.get("signal_type"))}
+    if signal_side == "buy" and any(token in text for token in ("一买", "二买", "三买", "背驰买", "底背离", "趋势买")):
+        return {**base, "kind": "buy_point", "label": _shell_badge_signal_label(reason, fallback="买点"), "priority": _shell_badge_priority("buy_point", score)}
+    if signal_side == "sell" and any(token in text for token in ("一卖", "二卖", "三卖", "顶背离", "跌破", "死叉")):
+        return {**base, "kind": "sell_point", "label": _shell_badge_signal_label(reason, fallback="卖点"), "priority": _shell_badge_priority("sell_point", score)}
+    if any(token in text for token in ("200d_new_high_breakout", "200日新高", "新高突破")):
+        return {**base, "kind": "new_high", "label": "200日新高", "priority": _shell_badge_priority("new_high", score)}
+    climb = _shell_reason_ma_climb(reason)
+    climb_score = _float(climb.get("climb_score")) or 0.0
+    if climb.get("running") and climb_score >= 60.0:
+        return {**base, "kind": "ma_climb", "label": _shell_badge_ma_label(reason, climb), "priority": _shell_badge_priority("ma_climb", ma_score=climb_score)}
+    if any(token in text for token in ("缺口买:持续", "缺口买:突破", "持续缺口", "突破缺口")):
+        entry_factor = _shell_reason_entry_factor(reason)
+        volume_ratio = max(_float(entry_factor.get("volume_ratio")) or 0.0, _float(entry_factor.get("recent_volume_ratio")) or 0.0)
+        return {**base, "kind": "gap_volume_price", "label": f"{_shell_badge_freq_label(timeframe)}强缺口量价".strip(), "priority": _shell_badge_priority("gap_volume_price", score, volume_ratio=volume_ratio)}
+    return {}
+
+
+def _shell_stock_display_badges(row: dict[str, Any], *, entry_factor: dict[str, Any]) -> list[dict[str, Any]]:
+    structured = [
+        _normalize_shell_display_badge(item)
+        for item in row.get("display_badges") or []
+        if isinstance(item, dict)
+    ]
+    structured = [item for item in structured if item]
+    if structured:
+        structured.sort(key=lambda item: int(item.get("priority") or 0), reverse=True)
+        return structured[:3]
+
+    badges: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    reason_candidates = [
+        row.get("top_buy_reason"),
+        row.get("technical_evidence"),
+        *(row.get("inclusion_reasons") or []),
+    ]
+    for reason in reason_candidates:
+        badge = _shell_display_badge_from_reason(reason) if isinstance(reason, dict) else {}
+        badge = _normalize_shell_display_badge(badge)
+        if not badge:
+            continue
+        key = (_text(badge.get("kind")), _text(badge.get("timeframe")))
+        if key in seen:
+            continue
+        seen.add(key)
+        badges.append(badge)
+    if not badges and entry_factor:
+        badges.append(_normalize_shell_display_badge({
+            "kind": "new_high",
+            "label": "200日新高",
+            "timeframe": "日线",
+            "priority": _shell_badge_priority("new_high"),
+            "signal_type": "200日新高",
+        }))
+    badges = [item for item in badges if item]
+    badges.sort(key=lambda item: int(item.get("priority") or 0), reverse=True)
+    return badges[:3]
 
 
 def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -4037,9 +4218,9 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         if slim:
             out[key] = slim
     entry_factor = _shell_stock_entry_factor(row)
-    display_summary = _shell_stock_trade_summary(row, entry_factor=entry_factor)
-    display_action = _shell_stock_display_action(row)
     display_badges = _shell_stock_display_badges(row, entry_factor=entry_factor)
+    display_summary = _shell_stock_trade_summary(row, entry_factor=entry_factor, display_badges=display_badges)
+    display_action = _shell_stock_display_action(row)
     if display_summary:
         out["display_summary"] = display_summary
     if display_action:
@@ -12901,8 +13082,13 @@ async def delete_workbench_manual_clue(symbol: str, confirm: bool = Query(False)
                 {"symbol": symbol},
             ]
         })
-        _invalidate_shell_cache()
-        return {"status": "ok", "symbol": normalized, "deleted": int(getattr(result, "deleted_count", 0) or 0)}
+        cache_result = _remove_manual_clue_from_shell_cache({normalized, raw_code, symbol})
+        return {
+            "status": "ok",
+            "symbol": normalized,
+            "deleted": int(getattr(result, "deleted_count", 0) or 0),
+            **cache_result,
+        }
 
     return await run_in_threadpool(_delete)
 

@@ -949,345 +949,168 @@ def _technical_risk_line(market_replay: dict[str, Any]) -> str:
 
 
 def render_word_style_review(signals_context: dict[str, Any], market_replay: dict[str, Any]) -> str:
-    """Return a long Word-style report body without notification gate."""
+    """Render one reader-facing body for both Markdown and Word export.
+
+    Data completeness and model checks remain upstream concerns.  This renderer
+    only presents the market story, so a reader never has to decode runtime
+    status, source fields, or evidence labels to understand the replay.
+    """
     trade_date = _text(market_replay.get("trade_date") or signals_context.get("trade_date"), "unknown")
     date_text, weekday_text = _trade_date_text(trade_date)
-    short_date = _short_date(trade_date)
-    statuses = _status_map(market_replay)
     indices = _as_list(market_replay.get("major_indices"))
     breadth = market_replay.get("market_breadth") if isinstance(market_replay.get("market_breadth"), dict) else {}
     strong_boards, weak_boards = _board_rankings(market_replay)
-    trend_map = _trend_board_map(market_replay)
     high_turnover = _as_list(market_replay.get("high_turnover_cores"))
     key_pool = _key_stock_pool(market_replay)
     gainers = _as_list(key_pool.get("gainers_top20"))
-    dynamic_stocks = [row for row in _dynamic_representative_stocks(market_replay) if not _is_unsuitable_note_stock(row)]
-    dynamic_failed = [
-        row
-        for row in dynamic_stocks
-        if _text(row.get("_word_type")) in {"失败对照", "压力核心"}
-        and (_float(row.get("amount_yi")) or 0.0) >= 1.0
-    ]
-    events = _event_chain_map(market_replay)
-    daily_replays = _stock_daily_replay_map(market_replay)
     pressure = _pressure_stock(high_turnover)
     strongest = strong_boards[0] if strong_boards else {}
     weakest = weak_boards[0] if weak_boards else {}
-    technical_risk = _technical_risk_line(market_replay)
-    coverage = market_replay.get("coverage") if isinstance(market_replay.get("coverage"), dict) else {}
-    report_stage = _text(market_replay.get("report_stage") or coverage.get("report_stage"), "formal_postmarket")
-    formal_ready = bool(coverage.get("formal_ready"))
-    coverage_line = (
-        f"正式收盘已确认（{_text(coverage.get('official_close_source'), 'unknown')}，as_of={_text(coverage.get('official_close_as_of'), trade_date)}）"
-        if formal_ready
-        else f"正式收盘未就绪；最新分钟时点={_text(coverage.get('latest_intraday_time'), 'unknown')}，分钟线仅作盘中结构"
-    )
-    structured_review = market_replay.get("structured_daily_review") if isinstance(market_replay.get("structured_daily_review"), dict) else {}
-    turnover_boards = structured_review.get("top_turnover_boards") if isinstance(structured_review.get("top_turnover_boards"), dict) else {}
-    board_table_title = "1. 板块强度代理 TOP7" if turnover_boards.get("status") != "available" else "1. 今日成交额板块 TOP7"
-    board_table_limit = 7
+    dynamic_stocks = [row for row in _dynamic_representative_stocks(market_replay) if not _is_unsuitable_note_stock(row)]
+    selected_stocks = _dedupe_stocks(dynamic_stocks, gainers[:6], high_turnover[:6], limit=6)
 
-    pressure_text = (
-        f"{_text(pressure.get('name'))}成交{_fmt_yi(pressure.get('amount_yi'))}亿、涨跌{_fmt_pct(pressure.get('change_pct'))}"
-        if pressure
-        else "高成交压力锚 unknown"
-    )
-    breadth_text = (
-        f"上涨{breadth.get('up')}家、下跌{breadth.get('down')}家、近似涨停{breadth.get('limit_like_count')}家"
-        if breadth.get("status") == "available"
-        else "涨跌家数 unknown"
-    )
-    board_minute_status = _status_text(statuses, "板块分钟线")
-    turnover_text = _turnover_sentence(indices)
-    market_state_text = _market_state_sentence(indices, breadth)
+    def board_label(row: dict[str, Any], fallback: str) -> str:
+        value = _text(row.get("name") or row.get("board"), fallback)
+        return fallback if value.lower() in {"unknown", "missing", "partial", "available"} else value
+
+    def reader_text(value: Any, default: str = "-") -> str:
+        text = _text(value, default)
+        return default if text.lower() in {"unknown", "missing", "partial", "available"} else text
+
+    def stock_reading(row: dict[str, Any]) -> str:
+        change = _float(row.get("change_pct"))
+        amount = _float(row.get("amount_yi"))
+        if change is not None and change >= 5:
+            state = "明显走强"
+        elif change is not None and change <= -3:
+            state = "明显走弱"
+        else:
+            state = "强弱分化"
+        amount_text = f"，成交{_fmt_yi(amount)}亿" if amount is not None else ""
+        return state + amount_text
+
+    breadth_parts: list[str] = []
+    if _float(breadth.get("up")) is not None and _float(breadth.get("down")) is not None:
+        breadth_parts.append(f"上涨{breadth.get('up')}家、下跌{breadth.get('down')}家")
+    if _float(breadth.get("limit_like_count")) is not None:
+        breadth_parts.append(f"涨停约{breadth.get('limit_like_count')}家")
+    turnover_rows = [row for row in indices if _float(row.get("amount_yi")) is not None]
+    turnover_text = _turnover_sentence(indices) if turnover_rows else ""
+    strongest_name = board_label(strongest, "强势方向")
+    weakest_name = board_label(weakest, "弱势方向")
+    conclusion_parts = [_index_brief(indices)] if indices else []
+    if breadth_parts:
+        conclusion_parts.append("，".join(breadth_parts))
+    if strong_boards:
+        conclusion_parts.append(f"资金集中在{strongest_name}")
+    if weak_boards:
+        conclusion_parts.append(f"{weakest_name}相对偏弱")
+    conclusion = "；".join(part for part in conclusion_parts if part)
+    if not conclusion:
+        conclusion = "今天盘面信息有限，先以指数、宽度和成交的下一次变化为主。"
 
     lines: list[str] = [
-        f"{short_date}A股盘后复盘报告（Signals组装版）",
-        f"A股盘后复盘报告 | {date_text}（{weekday_text}）",
-        f"报告阶段：{report_stage}；生成状态：{_text(market_replay.get('generation_status'), 'partial')}；{coverage_line}。",
+        f"# A股盘后复盘 | {date_text}（{weekday_text}）",
         "",
-        "昨日观察点校准",
-        *_calibration_lines(market_replay),
+        "## 今日一句话",
+        conclusion + "。",
         "",
-        "核心结论",
-        (
-            f"{short_date}复盘结论：{_index_brief(indices)}；日度板块最强为{_board_name(strongest)}"
-            f"{_fmt_pct(strongest.get('change_pct'))}，弱项为{_board_name(weakest)}{_fmt_pct(weakest.get('change_pct'))}。"
-            f"{turnover_text}，全市场宽度为{breadth_text}，高成交压力中心看{pressure_text}。"
-            f"数据边界上，{board_minute_status}，因此本报告保留 Word 式层级和表格，但不硬写分钟级卡位时间。"
-        ),
-        "",
-        "一、市场整体状态",
-        "1. 指数表现",
+        "## 市场全貌",
     ]
-    lines.extend(
-        _table(
-            ["指数", "收盘", "涨跌幅", "成交额(亿)", "较前日成交", "日内振幅"],
-            [
-                [
-                    _text(row.get("name")),
-                    _fmt_num(row.get("close")),
-                    _fmt_pct(row.get("change_pct")),
-                    _fmt_yi(row.get("amount_yi")),
-                    _fmt_pct(row.get("amount_change_pct")),
-                    _fmt_pct(row.get("amplitude_pct")),
-                ]
-                for row in indices
-            ],
-        )
-    )
-    lines.extend(
-        [
-            "",
-            f"{turnover_text}。{market_state_text}",
-            "",
-            "2. 分时结构",
-            f"- 指数分钟线：{_status_text(statuses, '指数分钟线')}。",
-            f"- 板块分钟线：{board_minute_status}。",
-            *_index_intraday_lines(market_replay),
-            *_fixed_time_slice_lines(market_replay),
-            "- 可确认部分：本地指数日线、指数5分钟线和个股日线可确认开高低收、涨跌幅、成交额；板块资金切换节点仍以板块分钟线状态为准。",
-            "",
-            "3. 技术面",
-        ]
-    )
-    cycle = market_replay.get("index_cycle") if isinstance(market_replay.get("index_cycle"), dict) else {}
-    lines.extend(_technical_lines(market_replay, cycle))
-
-    limit_counts = key_pool.get("limit_pool_counts") if isinstance(key_pool.get("limit_pool_counts"), dict) else {}
-    limit_up_count = key_pool.get("limit_up_count")
-    failed_limit_count = key_pool.get("failed_limit_count")
-    limit_down_count = key_pool.get("limit_down_count")
-    linked_limit_count = key_pool.get("linked_limit_count")
-    seal_success_rate = key_pool.get("seal_success_rate_pct")
-    pool_snapshot_at = _text(key_pool.get("limit_pool_snapshot_at"), "unknown")
-    exact_pool_level = "confirmed" if limit_counts else "unknown"
-    lines.extend(
-        [
-            "",
-            "二、市场情绪",
-        ]
-    )
-    lines.extend(
-        _table(
-            ["指标", "数值", "口径", "证据等级"],
-            [
-                ["上涨家数", _text(breadth.get("up"), "unknown"), "fullmarket_spot_snapshots", _text(breadth.get("evidence_level"), "unknown")],
-                ["下跌家数", _text(breadth.get("down"), "unknown"), "fullmarket_spot_snapshots", _text(breadth.get("evidence_level"), "unknown")],
-                ["涨停(池末快照)", _text(limit_up_count, "unknown"), "market_limit_pools latest snapshot", exact_pool_level],
-                ["炸板(池末快照)", _text(failed_limit_count, "unknown"), "market_limit_pools latest snapshot", exact_pool_level],
-                ["跌停(池末快照)", _text(limit_down_count, "unknown"), "market_limit_pools latest snapshot", exact_pool_level],
-                ["连板>=2", _text(linked_limit_count, "unknown"), "market_limit_pools.consecutive_limit_count", exact_pool_level],
-                ["封板率", f"{_fmt_num(seal_success_rate)}%" if seal_success_rate is not None else "unknown", "limit_up/(limit_up+failed_limit)", exact_pool_level],
-                ["近似涨停", _text(breadth.get("limit_like_count"), "unknown"), "日线涨跌幅阈值近似", "inferred"],
-                ["近似跌停", _text(breadth.get("down_limit_like_count"), "unknown"), "日线涨跌幅阈值近似", "inferred"],
-                ["账户级资金流", "missing" if not market_replay.get("flow_availability", {}).get("participant_flow_available") else "available", "flow_availability", "unknown"],
-            ],
-        )
-    )
-    pool_note = (
-        f"market_limit_pools 已提供 {pool_snapshot_at} 的本地池末快照；这是最终池状态，不等同于交易所正式涨跌停统计，盘中转池另保存在 pools/pool_history。"
-        if exact_pool_level == "confirmed"
-        else "market_limit_pools 缺失或样本不足时，封板率、连板高度和炸板率不能 confirmed；不从 Word 样本回填。"
-    )
-    lines.extend(
-        [
-            "",
-            f"情绪拆解：{_flow_line(market_replay)} {pool_note}",
-            "",
-            "三、板块深度拆解",
-            board_table_title,
-        ]
-    )
-    lines.extend(
-        _table(
-            ["排名", "方向", "类型", "涨跌幅", "成交额/换手", "5日", "20日", "领涨", "证据"],
-            [
-                [
-                    str(idx),
-                    _text(row.get("name")),
-                    _text(row.get("kind"), "unknown"),
-                    _fmt_pct(row.get("change_pct")),
-                    f"{_fmt_yi(row.get('amount_yi'))}亿 / {_fmt_pct(row.get('turnover_pct'))}",
-                    _fmt_pct(_trend_for_board(row, trend_map).get("change_5d_pct")),
-                    _fmt_pct(_trend_for_board(row, trend_map).get("change_20d_pct")),
-                    f"{_text(row.get('leader_name'), 'unknown')} {_fmt_pct(row.get('leader_change_pct'))}",
-                    _text(row.get("source"), "unknown"),
-                ]
-                for idx, row in enumerate(strong_boards[:board_table_limit], start=1)
-            ],
-        )
-    )
-    lines.extend(["", "2. 今日弱项/撤退方向"])
-    lines.extend(
-        _table(
-            ["排名", "方向", "类型", "涨跌幅", "领涨/抗跌", "证据"],
-            [
-                [
-                    str(idx),
-                    _text(row.get("name")),
-                    _text(row.get("kind"), "unknown"),
-                    _fmt_pct(row.get("change_pct")),
-                    _text(row.get("leader_name"), "unknown"),
-                    _text(row.get("source"), "unknown"),
-                ]
-                for idx, row in enumerate(weak_boards[:8], start=1)
-            ],
-        )
-    )
-    second = strong_boards[1] if len(strong_boards) > 1 else {}
-    third = strong_boards[2] if len(strong_boards) > 2 else {}
-    strongest_trend = _trend_for_board(strongest, trend_map)
-    trend_note = (
-        f"5日{_fmt_pct(strongest_trend.get('change_5d_pct'))}、20日{_fmt_pct(strongest_trend.get('change_20d_pct'))}"
-        if strongest_trend
-        else "5日/20日趋势 unknown"
-    )
-    lines.extend(
-        [
-            "",
-            f"主线观察：{_board_name(strongest)}是日度最强方向，{trend_note}，证据来自{_text(strongest.get('source'), 'unknown')}；分钟级启动和卡位时点仍为 unknown。",
-            f"候选主线：{_board_name(second)}排名靠前，但需要次日继续看成交额、上涨家数和领涨股扩散。",
-            f"补涨/轮动：{_board_name(third)}只按日度强度列观察，不能替代板块分钟线。",
-            f"撤退线：{_board_name(weakest)}在日度排行靠后，若次日仍弱于全市场宽度，则继续作为风险方向处理。",
-            *_direction_candidate_lines(strong_boards, weak_boards, trend_map),
-            "",
-            "四、个股精选",
-        ]
-    )
-    comparable_gainers = [row for row in gainers if not _is_unsuitable_note_stock(row)]
-    selected_stocks = _dedupe_stocks(dynamic_stocks, comparable_gainers[:12], high_turnover[:8], limit=20)
-    lines.extend(
-        _table(
-            ["类型", "个股", "涨跌幅", "成交额(亿)", "日内结构", "明日观察"],
-            [
-                [
-                    _text(row.get("_word_type")) or ("高成交核心" if row in high_turnover[:8] else "强势/异动"),
-                    _stock_display(row),
-                    _fmt_pct(row.get("change_pct")),
-                    _fmt_yi(row.get("amount_yi")),
-                    _stock_structure(row, events),
-                    "看高成交是否继续承接；若放量回落则降级为压力锚。",
-                ]
-                for row in selected_stocks
-            ],
-        )
-    )
-    lines.extend(
-        [
-            "",
-            "五、强趋势股启动回溯",
-        ]
-    )
-    trend_rows = _trend_candidates(dynamic_stocks + gainers, high_turnover[:3], daily_replays)
-    if not trend_rows:
-        lines.append("强趋势样本：unknown，缺少可用涨幅/成交额样本。")
-    trend_keys = {_stock_key(item) for item in trend_rows if _stock_key(item)}
-    for row in trend_rows:
-        name = _stock_display(row)
-        replay = _stock_daily_replay_for(row, daily_replays)
-        failed_samples = _failed_samples_for_trend(row, replay, daily_replays, dynamic_failed, exclude_keys=trend_keys)
-        acceleration_text = (
-            f"{_text(replay.get('acceleration_date'))}，{_text(replay.get('acceleration_event'))}"
-            if replay
-            else "unknown"
-        )
-        replay_summary = (
-            f"{_text(replay.get('start_date'))}至{_text(replay.get('end_date'))}累计{_fmt_pct(replay.get('total_change_pct'))}；"
-            f"成交额口径={_text(replay.get('amount_status'), 'unknown')}"
-            if replay
-            else "日线回放 unknown"
-        )
+    if indices:
         lines.extend(
-            [
-                f"### {name}",
-                *_table(
-                    ["环节", "复盘内容"],
+            _table(
+                ["指数", "收盘", "涨跌幅", "成交额(亿)"],
+                [
                     [
-                        ["启动识别", f"当日涨跌幅{_fmt_pct(row.get('change_pct'))}、成交{_fmt_yi(row.get('amount_yi'))}亿；日线加速点：{acceleration_text}。"],
-                        ["板块联动", _chain_linkage_text(row, replay)],
-                        ["区间表现", replay_summary],
-                        ["当日回放", _stock_structure(row, events)],
-                        ["交易复核", "不输出买入/卖出/目标/止损；只转换为次日验证条件。"],
-                        ["成功/失败对照", _failed_sample_text(failed_samples)],
-                    ],
-                ),
-                *_daily_replay_lines(replay),
-                "",
-            ]
+                        _text(row.get("name")),
+                        _fmt_num(row.get("close"), 2) if _float(row.get("close")) is not None else "-",
+                        _fmt_pct(row.get("change_pct")) if _float(row.get("change_pct")) is not None else "-",
+                        _fmt_yi(row.get("amount_yi")) if _float(row.get("amount_yi")) is not None else "-",
+                    ]
+                    for row in indices
+                ],
+            )
         )
+    if turnover_text or breadth_parts:
+        lines.extend(["", "；".join(part for part in (turnover_text, "，".join(breadth_parts)) if part) + "。"])
 
-    chain_pressure_pool = _chain_pressure_pool(trend_rows, daily_replays)
-    if chain_pressure_pool:
+    lines.extend(["", "## 主线与资金", "### 走强方向"])
+    if strong_boards:
         lines.extend(
-            [
-                "同链高成交弱化样本池",
-                *_table(
-                    ["样本", "产业链/节点", "涨跌幅", "成交额(亿)", "弱化证据", "复盘用途"],
+            _table(
+                ["方向", "涨跌幅", "领涨股", "盘面表现"],
+                [
                     [
-                        [
-                            _stock_display(row),
-                            "/".join(item for item in (_text(row.get("chain_name")), _text(row.get("node_name"))) if item) or "unknown",
-                            _fmt_pct(row.get("change_pct")),
-                            _fmt_yi(row.get("amount_yi")),
-                            "、".join(_text(item) for item in row.get("_weakness_reasons", []) if _text(item)),
-                            "只作为同链承接/分化观察，不替代强趋势样本。",
-                        ]
-                        for row in chain_pressure_pool
-                    ],
-                ),
-                "",
-            ]
+                        board_label(row, "-"),
+                        _fmt_pct(row.get("change_pct")) if _float(row.get("change_pct")) is not None else "-",
+                        reader_text(row.get("leader_name")),
+                        "位居前排" if index == 0 else "保持活跃",
+                    ]
+                    for index, row in enumerate(strong_boards[:3])
+                ],
+            )
         )
+    else:
+        lines.append("今天没有形成明显的集中进攻方向。")
 
-    lines.extend(
-        [
-            "六、风险提示",
-            "1. 板块分钟线缺失时，不能还原 Word 中那类精确资金切换时间，只能保留为 unknown。",
-            "2. market_limit_pools 缺失或样本不足时，封板率、连板高度、炸板率不能 confirmed。",
-            f"3. 高成交压力需要重点复核：{pressure_text}；若继续放量回落，会压制同方向扩散。",
-            f"4. {technical_risk}" if technical_risk else "4. 技术面风险：major_index_technical 未显示明显过热指数，继续观察指数与个股宽度是否背离。",
-            "5. 账户级参与者资金缺失时，Eastmoney/THS 大中小单只能作为订单大小口径，不能据此推断账户身份。",
-            "6. 日度板块排行只能证明收盘强弱，不能单独证明盘中主线胜出。",
-            "",
-            "七、明日观察清单",
-        ]
-    )
-    lines.extend(
-        _table(
-            ["观察对象", "关键指标", "走强条件", "走弱/否定条件"],
-            [
+    lines.extend(["", "### 转弱方向"])
+    if weak_boards:
+        lines.extend(
+            _table(
+                ["方向", "涨跌幅", "代表表现", "盘面含义"],
                 [
-                    _board_name(strongest),
-                    "排行、上涨家数、领涨股",
-                    "继续位居前排且领涨股不回落",
-                    "掉出前排或领涨股高开低走",
+                    [
+                        board_label(row, "-"),
+                        _fmt_pct(row.get("change_pct")) if _float(row.get("change_pct")) is not None else "-",
+                        reader_text(row.get("leader_name")),
+                        "资金回撤" if index == 0 else "仍在承压",
+                    ]
+                    for index, row in enumerate(weak_boards[:3])
                 ],
-                [
-                    _text(pressure.get("name")) if pressure else "高成交核心",
-                    "成交额、收盘位置、高点回撤",
-                    "缩量稳住或放量收高",
-                    "继续放量回落并带弱同方向",
-                ],
-                [
-                    "四大指数",
-                    "上证/创业板/科创相对强弱",
-                    "指数不拖累且强方向扩散",
-                    "指数回落同时强方向缩容",
-                ],
-                [
-                    "数据补齐",
-                    "board_heat_ticks / market_limit_pools",
-                    "分钟和封板池恢复后再提升结论等级",
-                    "仍缺失则继续以日线证据降级输出",
-                ],
-            ],
+            )
         )
+    else:
+        lines.append("弱势方向没有形成集中抛压。")
+
+    mainline_sentence = (
+        f"主线判断：{strongest_name}是今天最有辨识度的方向；是否能延续，要看领涨股和板块内部能否同步走强。"
+        if strong_boards
+        else "主线判断：市场仍以轮动为主，暂未出现清晰的集中方向。"
     )
+    lines.extend(["", mainline_sentence, "", "## 代表信号"])
+    if selected_stocks:
+        lines.extend(
+            _table(
+                ["个股", "归属方向", "涨跌幅", "成交额(亿)", "盘面表现"],
+                [
+                    [
+                        reader_text(_stock_display(row)),
+                        reader_text(row.get("_board")),
+                        _fmt_pct(row.get("change_pct")) if _float(row.get("change_pct")) is not None else "-",
+                        _fmt_yi(row.get("amount_yi")) if _float(row.get("amount_yi")) is not None else "-",
+                        stock_reading(row),
+                    ]
+                    for row in selected_stocks
+                ],
+            )
+        )
+    else:
+        lines.append("今天没有需要单独拎出的代表个股。")
+
+    pressure_name = _text(pressure.get("name"), "高成交核心") if pressure else "高成交核心"
     lines.extend(
         [
             "",
-            f"数据来源：Signals Mongo / MCP evidence package | {date_text}收盘 | Word 参考仅用于结构与评估，不作为正文数据源",
+            "## 明天看什么",
+            *_table(
+                ["观察对象", "偏强时的表现", "偏弱时的表现"],
+                [
+                    [strongest_name, "继续位居前排，领涨股带动板块扩散", "只剩少数个股走强，板块跟随减少"],
+                    [pressure_name, "成交稳定，收盘位置改善", "放量回落，并拖累同方向个股"],
+                    ["指数与宽度", "指数企稳，红盘家数同步回升", "指数走弱，或红盘家数继续收缩"],
+                ],
+            ),
         ]
     )
     return "\n".join(lines).strip()

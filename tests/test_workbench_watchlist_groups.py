@@ -1513,7 +1513,7 @@ def test_slim_signal_reason_preserves_fib_ma_acceptance():
     assert slim["ma_acceptance"]["primary"]["touch_distance_pct"] == -0.046
 
 
-def test_slim_stock_row_exposes_ma_acceptance_badge():
+def test_slim_stock_row_keeps_ma_acceptance_out_of_hard_display_badges():
     from signals.web.api import workbench
 
     row = {
@@ -1541,7 +1541,99 @@ def test_slim_stock_row_exposes_ma_acceptance_badge():
     slim = workbench._slim_shell_stock_row(row)
 
     assert slim["ma_acceptance"]["summary"] == "MA13回踩承接"
-    assert any(item["label"] == "MA13承接" for item in slim["display_badges"])
+    assert "display_badges" not in slim
+
+
+def test_slim_stock_row_passthroughs_structured_hard_display_badges_only():
+    from signals.web.api import workbench
+
+    row = {
+        "symbol": "SZ.002709",
+        "name": "天赐材料",
+        "display_badges": [
+            {"kind": "ma_climb", "label": "日MA5攀爬", "timeframe": "日线", "priority": 760, "signal_type": "MA攀爬"},
+            {"kind": "new_high", "label": "200日新高", "timeframe": "日线", "priority": 840, "signal_type": "200日新高"},
+            {"kind": "buy_point", "label": "周一买", "timeframe": "周线", "priority": 950, "signal_type": "一买"},
+            {"kind": "trade_role", "label": "主线机会", "timeframe": "日线", "priority": 999},
+            {"label": "风险复核", "tone": "risk"},
+        ],
+        "trade_stage": "attack_entry",
+        "risk_marked": True,
+        "chain_context": {"summary": "产业链观察"},
+        "missing_condition": "风险解除后再看",
+    }
+
+    slim = workbench._slim_shell_stock_row(row)
+
+    assert [item["kind"] for item in slim["display_badges"]] == ["buy_point", "new_high", "ma_climb"]
+    assert [item["label"] for item in slim["display_badges"]] == ["周一买", "200日新高", "日MA5攀爬"]
+    assert all({"kind", "timeframe", "priority"} <= set(item) for item in slim["display_badges"])
+    assert len(slim["display_badges"]) == 3
+    assert len(slim["display_summary"]) <= 64
+    assert all(token not in slim["display_summary"] for token in ("风险", "主线", "产业链"))
+
+
+def test_slim_stock_row_falls_back_to_hard_technical_reason_badges():
+    from signals.web.api import workbench
+
+    row = {
+        "symbol": "SZ.002709",
+        "name": "天赐材料",
+        "trade_stage": "attack_entry",
+        "risk_marked": True,
+        "risk_marker": "风险复核",
+        "sector_policy_label": "主线机会",
+        "display_badges": [{"label": "旧阶段"}],
+        "chain_context": {"summary": "产业链观察"},
+        "missing_condition": "等5m确认",
+        "inclusion_reasons": [
+            {
+                "reason_type": "technical_trigger",
+                "signal_side": "buy",
+                "signal_type": "30分钟二买",
+                "freq": "30分钟",
+                "score": 72,
+            },
+            {
+                "reason_type": "technical_trigger",
+                "signal_side": "buy",
+                "signal_type": "200日新高突破",
+                "freq": "日线",
+                "score": 75,
+            },
+            {
+                "reason_type": "technical_trigger",
+                "signal_side": "buy",
+                "signal_type": "MA攀爬",
+                "signal_family": "ma_climb",
+                "freq": "周线",
+                "evidence": {"ma_climb": {"running": True, "ma_period": 10, "climb_score": 82}},
+            },
+            {
+                "reason_type": "chain_context",
+                "signal_type": "主线机会",
+                "freq": "日线",
+                "score": 99,
+            },
+            {
+                "reason_type": "technical_trigger",
+                "signal_side": "buy",
+                "signal_type": "vol_contraction",
+                "freq": "日线",
+                "score": 99,
+            },
+        ],
+    }
+
+    slim = workbench._slim_shell_stock_row(row)
+
+    assert [item["kind"] for item in slim["display_badges"]] == ["buy_point", "new_high", "ma_climb"]
+    assert [item["label"] for item in slim["display_badges"]] == ["30m二买", "200日新高", "周MA10攀爬"]
+    assert all(item["label"] not in {"旧阶段", "风险复核", "主线机会"} for item in slim["display_badges"])
+    assert len(slim["display_badges"]) == 3
+    assert "等5m确认" in slim["display_summary"]
+    assert len(slim["display_summary"]) <= 64
+    assert all(token not in slim["display_summary"] for token in ("风险", "主线", "产业链", "普通缩量"))
 
 
 def test_index_report_chart_signals_add_multi_timeframe_context():
@@ -2202,12 +2294,55 @@ def test_manual_clue_delete_with_confirmation(monkeypatch):
 
     collection = _ManualClues()
     monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"terminal_manual_clues": collection}))
-    monkeypatch.setattr(workbench, "_invalidate_shell_cache", lambda: None)
+    monkeypatch.setattr(workbench, "_remove_manual_clue_from_shell_cache", lambda symbols: {"cache_updated": True, "cache_removed": 1})
 
     payload = asyncio.run(workbench.delete_workbench_manual_clue("SZ.002354", confirm=True))
 
-    assert payload == {"status": "ok", "symbol": "SZ.002354", "deleted": 1}
+    assert payload == {"status": "ok", "symbol": "SZ.002354", "deleted": 1, "cache_updated": True, "cache_removed": 1}
     assert collection.query["$or"][0]["symbol"] == "SZ.002354"
+
+
+def test_manual_clue_delete_updates_shell_cache_without_dropping_auto_rows():
+    from signals.web.api import workbench
+
+    try:
+        workbench._SHELL_CACHE.update({
+            "payload": {
+                "buy_candidates": [
+                    {"symbol": "SZ.002354", "manual_clue": True, "source_collection": "terminal_manual_clues"},
+                    {"symbol": "SZ.301363", "source_collection": "hot_rank_clues"},
+                ],
+                "watchlist_groups": {
+                    "buy_candidates": [
+                        {"symbol": "SZ.002354", "manual_clue": True, "source_collection": "terminal_manual_clues"},
+                        {"symbol": "SZ.301363", "source_collection": "hot_rank_clues"},
+                    ],
+                    "watch_stocks": [
+                        {"symbol": "SZ.002354", "source_collection": "terminal_stock_pool.watch_stocks"},
+                    ],
+                },
+                "watchlist_groups_meta": {
+                    "buy_candidates": {"count": 2, "manual_clues": 1},
+                    "watch_stocks": {"count": 1},
+                },
+            },
+            "refreshed_at": 1.0,
+            "expires_at": 999.0,
+            "quote_watermark": "same",
+        })
+
+        result = workbench._remove_manual_clue_from_shell_cache({"SZ.002354", "002354"})
+
+        assert result == {"cache_updated": True, "cache_removed": 2}
+        payload = workbench._SHELL_CACHE["payload"]
+        assert [row["symbol"] for row in payload["buy_candidates"]] == ["SZ.301363"]
+        assert [row["symbol"] for row in payload["watchlist_groups"]["buy_candidates"]] == ["SZ.301363"]
+        assert [row["symbol"] for row in payload["watchlist_groups"]["watch_stocks"]] == ["SZ.002354"]
+        assert payload["watchlist_groups_meta"]["buy_candidates"]["count"] == 1
+        assert payload["watchlist_groups_meta"]["buy_candidates"]["manual_clues"] == 0
+        assert payload["watchlist_groups_meta"]["watch_stocks"]["count"] == 1
+    finally:
+        workbench._invalidate_shell_cache()
 
 
 def test_quote_overlay_marks_non_current_quote_stale(monkeypatch):
