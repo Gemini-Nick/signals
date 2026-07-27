@@ -3810,7 +3810,12 @@ def _shell_stock_trade_summary(
         if isinstance(item, dict) and _text(item.get("kind")) in _SHELL_HARD_BADGE_KINDS and _text(item.get("label"))
     ][:3]
     missing = _shell_summary_clean_condition(row.get("missing_condition") or row.get("primary_blocker"))
-    lead = " / ".join(labels[:3]) if labels else "硬信号待确认"
+    if _text(row.get("source_collection")) == "hot_rank_clues":
+        lead = _text(row.get("latest_signal") or row.get("reason")) or " / ".join(labels[:3]) or "热榜线索待确认"
+    elif labels:
+        lead = " / ".join(labels[:3])
+    else:
+        lead = "硬信号待确认"
     parts = [lead]
     if missing and missing not in lead:
         parts.append(missing)
@@ -4787,7 +4792,7 @@ def _manual_clue_entry_summary(timeframe_sides: dict[str, dict[str, Any]], missi
     ]).strip("；")
 
 
-def _enrich_manual_clue_decision(row: dict[str, Any], symbol: str) -> dict[str, Any]:
+def _terminal_technical_signal_reasons(symbol: str, *, limit: int = 12) -> list[dict[str, Any]]:
     signals = _load_terminal_technical_signal_rows(symbol, limit=80)
     reasons: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -4805,8 +4810,13 @@ def _enrich_manual_clue_decision(row: dict[str, Any], symbol: str) -> dict[str, 
             continue
         seen.add(key)
         reasons.append(reason)
-        if len(reasons) >= 12:
+        if len(reasons) >= limit:
             break
+    return reasons
+
+
+def _enrich_manual_clue_decision(row: dict[str, Any], symbol: str) -> dict[str, Any]:
+    reasons = _terminal_technical_signal_reasons(symbol)
 
     row.setdefault("source_collections", ["terminal_manual_clues"])
     row.setdefault("source_tags", ["用户探索", "临时线索"])
@@ -9144,6 +9154,25 @@ def _manual_clue_raw_rows(limit: int) -> list[dict[str, Any]]:
     return rows
 
 
+def _hot_rank_display_badges(strategy_tags: Any) -> list[dict[str, Any]]:
+    tags = {_text(item) for item in strategy_tags or [] if _text(item)}
+    badges: list[dict[str, Any]] = []
+    for prefix, timeframe, label in (
+        ("daily_ma", "日线", "日线攀爬"),
+        ("weekly_ma", "周线", "周线攀爬"),
+    ):
+        if any(tag.startswith(prefix) and tag.endswith("_climb") for tag in tags):
+            badges.append({
+                "kind": "ma_climb",
+                "label": label,
+                "timeframe": timeframe,
+                "priority": 760,
+                "signal_type": "MA攀爬",
+                "tone": "hot",
+            })
+    return badges
+
+
 def _hot_rank_clue_rows(limit: int) -> list[dict[str, Any]]:
     try:
         db = _mongo_db()
@@ -9173,6 +9202,7 @@ def _hot_rank_clue_rows(limit: int) -> list[dict[str, Any]]:
             continue
         raw_code = _text(doc.get("raw_code") or doc.get("code") or doc.get("_id"))
         symbol = _text(doc.get("symbol") or raw_code)
+        strategy_tags = list(doc.get("strategy_tags") or [])
         row = _raw_shell_stock_row({
             "symbol": symbol,
             "raw_code": raw_code,
@@ -9180,6 +9210,7 @@ def _hot_rank_clue_rows(limit: int) -> list[dict[str, Any]]:
             "reason": _text(doc.get("reason_summary")) or "热榜启动/均线攀爬线索",
             "score": doc.get("score"),
             "latest_signal": _text(doc.get("reason_summary")) or "热榜启动/均线攀爬线索",
+            "display_badges": _hot_rank_display_badges(strategy_tags),
             "source_collection": "hot_rank_clues",
             "source_collections": ["hot_rank_clues"],
             "source_tags": ["自动热榜", _text(doc.get("tier")) or "线索"],
@@ -9190,7 +9221,7 @@ def _hot_rank_clue_rows(limit: int) -> list[dict[str, Any]]:
                 "hot_rank_tier": doc.get("tier"),
                 "hot_rank_sources": list(doc.get("sources") or []),
                 "hot_rank_ranks": dict(doc.get("ranks") or {}),
-                "strategy_tags": list(doc.get("strategy_tags") or []),
+                "strategy_tags": strategy_tags,
                 "as_of": _text(doc.get("as_of")),
             },
         }, group="clue_stocks")
@@ -9204,9 +9235,21 @@ def _hot_rank_clue_rows(limit: int) -> list[dict[str, Any]]:
             "hot_rank_tier": doc.get("tier"),
             "hot_rank_sources": list(doc.get("sources") or []),
             "hot_rank_ranks": dict(doc.get("ranks") or {}),
-            "hot_rank_strategy_tags": list(doc.get("strategy_tags") or []),
+            "hot_rank_strategy_tags": strategy_tags,
             "hot_rank_as_of": _text(doc.get("as_of")),
         })
+        technical_reasons = _terminal_technical_signal_reasons(symbol)
+        if technical_reasons:
+            buy_reasons = [item for item in technical_reasons if _text(item.get("signal_side")) == "buy"]
+            sell_reasons = [item for item in technical_reasons if _text(item.get("signal_side")) == "sell"]
+            row.update({
+                "source_collections": ["hot_rank_clues", "terminal_technical_signals"],
+                "source_tags": [*row.get("source_tags", []), "技术信号"],
+                "inclusion_reasons": technical_reasons,
+                "top_buy_reason": buy_reasons[0] if buy_reasons else {},
+                "top_risk_reason": sell_reasons[0] if sell_reasons else {},
+                "technical_evidence": (buy_reasons or sell_reasons or technical_reasons)[0],
+            })
         rows.append(row)
     return rows
 

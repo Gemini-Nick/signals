@@ -1,0 +1,158 @@
+{
+  "report_date": "2026-07-24",
+  "generated_at": "2026-07-26 20:43:09 CST",
+  "scope": "上海证券交易所普通ETF、上海证券交易所交易型货币基金、深圳证券交易所ETF",
+  "official_share_reconciliation": {
+    "unit": "亿份",
+    "2026-07-23": {
+      "sse_etf": 20338.904084,
+      "sse_traded_money_fund": 18.77699,
+      "szse_etf": 11510.256474,
+      "total": 31867.93754765
+    },
+    "2026-07-24": {
+      "sse_etf": 20394.043444,
+      "sse_traded_money_fund": 18.833604,
+      "szse_etf": 11568.731722,
+      "total": 31981.60877014,
+      "fund_rows": {
+        "sse_etf": 883,
+        "sse_traded_money_fund": 24,
+        "szse_etf": 701,
+        "total": 1608
+      }
+    },
+    "change": {
+      "sse_etf": 55.13936,
+      "sse_traded_money_fund": 0.056614,
+      "szse_etf": 58.475248,
+      "total": 113.67122249,
+      "day_over_day_percent": 0.3567
+    },
+    "screenshot_anchor": {
+      "date": "2026-04-08",
+      "official_total": 31725.893054,
+      "screenshot_display": 31725.89
+    }
+  },
+  "ifind_fund_flow": {
+    "unit": "亿元",
+    "daily": {
+      "all_etf": 205.77,
+      "equity": 135.42,
+      "bond": 54.54,
+      "broad_based": 66.11
+    },
+    "week_2026-07-20_to_2026-07-24": {
+      "all_etf": 697.01,
+      "equity": 550.99,
+      "broad_based": 533.52
+    },
+    "representative_daily": [
+      {
+        "code": "511360",
+        "name": "短融ETF海富通",
+        "net_flow": 47.4871,
+        "average_price": 113.7251,
+        "turnover": 357.5203
+      },
+      {
+        "code": "510300",
+        "name": "沪深300ETF华泰柏瑞",
+        "net_flow": 16.7209,
+        "average_price": 4.7274,
+        "turnover": 48.4448
+      },
+      {
+        "code": "510210",
+        "name": "上证指数ETF富国",
+        "net_flow": 8.4636,
+        "average_price": 0.9728,
+        "turnover": 15.615
+      },
+      {
+        "code": "588170",
+        "name": "科创半导体ETF华夏",
+        "net_flow": 6.4523,
+        "average_price": 1.005,
+        "turnover": 83.4222
+      },
+      {
+        "code": "510050",
+        "name": "上证50ETF华夏",
+        "net_flow": -11.9344,
+        "average_price": 3.0625,
+        "turnover": 29.163
+      },
+      {
+        "code": "588000",
+        "name": "科创50ETF华夏",
+        "net_flow": -11.07,
+        "average_price": 1.8923,
+        "turnover": 89.819
+      }
+    ]
+  },
+  "classic_csi300_etfs": {
+    "share_change_total": 5.661,
+    "estimated_net_flow_total": 26.86,
+    "unit_share_change": "亿份",
+    "unit_estimated_net_flow": "亿元",
+    "rows": [
+      {
+        "code": "510300",
+        "name": "华泰柏瑞沪深300ETF",
+        "share_change": 3.537,
+        "net_flow": 16.7209,
+        "last_30m_turnover_share_percent": 24.5,
+        "return_1430_to_close_percent": -0.592
+      },
+      {
+        "code": "510310",
+        "name": "易方达沪深300ETF",
+        "share_change": 0.963,
+        "net_flow": 4.4209,
+        "last_30m_turnover_share_percent": 24.95,
+        "return_1430_to_close_percent": -0.675
+      },
+      {
+        "code": "510330",
+        "name": "华夏沪深300ETF",
+        "share_change": 0.639,
+        "net_flow": 3.1464,
+        "last_30m_turnover_share_percent": 32.88,
+        "return_1430_to_close_percent": -0.649
+      },
+      {
+        "code": "159919",
+        "name": "嘉实沪深300ETF",
+        "share_change": 0.522,
+        "net_flow": 2.5718,
+        "last_30m_turnover_share_percent": 19.9,
+        "return_1430_to_close_percent": -0.629
+      }
+    ]
+  },
+  "secondary_provider_checks": {
+    "stockstar_method": "（当日ETF场内流通份额-前一交易日ETF场内流通份额）×当日ETF均价",
+    "stockstar": {
+      "stock_index_etf": 63.63,
+      "broad_index_etf": 35.01,
+      "industry_theme_etf": 29.03,
+      "cross_border_etf": -1.88
+    },
+    "eastmoney_rpt_fund_etflist": {
+      "rows": 1607,
+      "shares": 31923.0543,
+      "difference_vs_official": -58.5544,
+      "difference_percent": -0.183,
+      "limitation": "接口无明确as_of且少1只，不作为精确主证据"
+    },
+    "eastmoney_realtime_quote_universe": {
+      "rows": 1555,
+      "shares": 31687.8641,
+      "limitation": "实时行情范围更窄，不作为总量口径"
+    }
+  },
+  "identity_boundary": "日度ETF份额、净流入和分钟成交不能识别申购账户。没有席位、持有人、账户或基金公司/官方公告时，只能说与历史国家队工具重合，不能确证身份。"
+}

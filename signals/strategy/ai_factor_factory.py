@@ -2321,12 +2321,17 @@ def _summary(
 def _is_live_factor(factor: Mapping[str, Any]) -> bool:
     status = str(factor.get("status") or "").lower()
     metrics = _as_dict(factor.get("metrics"))
+    validation = _as_dict(factor.get("validation"))
+    validation_mode = str(validation.get("mode") or "").lower()
+    sample_source = str(validation.get("sample_source") or "").lower()
     return (
         status == "published"
         and str(factor.get("approval_status") or "").lower() == "approved"
         and bool(factor.get("live_enabled"))
         and bool(metrics.get("verified"))
         and int(metrics.get("sample_count") or 0) > 0
+        and validation_mode != "demo"
+        and sample_source != "demo"
     )
 
 

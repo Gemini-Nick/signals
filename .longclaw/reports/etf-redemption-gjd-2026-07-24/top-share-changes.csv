@@ -1,0 +1,16 @@
+direction,rank,code,name,market,share_change_100m,interpretation
+inflow,1,510210,上证指数ETF富国,SSE,8.700,宽基
+inflow,2,588170,科创半导体ETF华夏,SSE,6.420,科技主题
+inflow,3,512000,券商ETF华宝,SSE,4.656,非银金融
+inflow,4,159558,半导体设备ETF易方达,SZSE,4.560,科技主题
+inflow,5,563360,A500基金,SSE,4.170,宽基
+inflow,6,159338,中证A500ETF国泰,SZSE,3.630,宽基
+inflow,7,512880,证券ETF国泰,SSE,3.540,非银金融
+inflow,8,510300,沪深300ETF华泰柏瑞,SSE,3.537,宽基
+inflow,9,159352,A500ETF南方,SZSE,3.420,宽基
+outflow,1,588000,科创50ETF华夏,SSE,-5.850,宽基科技
+outflow,2,588200,科创芯片ETF嘉实,SSE,-5.445,科技主题
+outflow,3,515220,煤炭ETF国泰,SSE,-5.430,周期行业
+outflow,4,512800,银行ETF华宝,SSE,-5.364,银行
+outflow,5,512690,酒ETF鹏华,SSE,-4.356,消费
+outflow,6,510050,上证50ETF华夏,SSE,-3.897,宽基

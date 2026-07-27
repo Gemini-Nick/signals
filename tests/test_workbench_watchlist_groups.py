@@ -2184,6 +2184,26 @@ def test_hot_rank_clue_rows_reads_active_auto_clues(monkeypatch):
             return super().__getitem__(key)
 
     monkeypatch.setattr(workbench, "_mongo_db", lambda: _Db({"hot_rank_clues": _HotRankCollection()}))
+    monkeypatch.setattr(
+        workbench,
+        "_load_terminal_technical_signal_rows",
+        lambda symbol, limit=80: [
+            {
+                "symbol": symbol,
+                "freq": "5min",
+                "signal_type": "一卖",
+                "signal_side": "sell",
+                "dt": "2026-06-30T14:55:00+08:00",
+            },
+            {
+                "symbol": symbol,
+                "freq": "30min",
+                "signal_type": "趋势买",
+                "signal_side": "buy",
+                "dt": "2026-06-30T14:30:00+08:00",
+            },
+        ],
+    )
 
     rows = workbench._hot_rank_clue_rows(limit=5)
 
@@ -2198,6 +2218,26 @@ def test_hot_rank_clue_rows_reads_active_auto_clues(monkeypatch):
     assert slim["hot_rank_tier"] == "B观察"
     assert slim["hot_rank_sources"] == ["eastmoney"]
     assert slim["hot_rank_ranks"] == {"eastmoney": 97}
+    assert [item["kind"] for item in slim["display_badges"]] == ["sell_point", "buy_point", "ma_climb"]
+    assert [item["label"] for item in slim["display_badges"]] == ["5m一卖", "30m趋势买", "日线攀爬"]
+    assert slim["display_summary"] == "东财热榜 + 刚启动、沿5日线攀爬"
+
+
+def test_hot_rank_clue_without_hard_signal_keeps_its_real_clue_summary():
+    from signals.web.api import workbench
+
+    slim = workbench._slim_shell_stock_row({
+        "symbol": "SH.601179",
+        "name": "中国西电",
+        "source": "hot_rank_clues",
+        "source_collection": "hot_rank_clues",
+        "pool_type": "clue",
+        "latest_signal": "东财+同花顺热榜 + 刚启动",
+        "reason": "东财+同花顺热榜 + 刚启动",
+    })
+
+    assert "display_badges" not in slim
+    assert slim["display_summary"] == "东财+同花顺热榜 + 刚启动"
 
 
 def test_manual_clue_rows_reuse_stock_pool_decision_fields(monkeypatch):

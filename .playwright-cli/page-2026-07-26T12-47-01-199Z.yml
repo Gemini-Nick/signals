@@ -1,0 +1,414 @@
+- generic [active] [ref=e1]:
+  - banner [ref=e2]:
+    - generic [ref=e3]:
+      - generic [ref=e4]:
+        - generic [ref=e6]: ETF FLOW AUDIT
+        - generic [ref=e7]: 2026.07.24
+      - navigation "报告章节" [ref=e8]:
+        - link "官方复算" [ref=e9] [cursor=pointer]:
+          - /url: "#reconcile"
+        - link "结构流向" [ref=e10] [cursor=pointer]:
+          - /url: "#flows"
+        - link "身份审计" [ref=e11] [cursor=pointer]:
+          - /url: "#gjd"
+        - link "数据源" [ref=e12] [cursor=pointer]:
+          - /url: "#sources"
+      - button "打印 / PDF" [ref=e13] [cursor=pointer]
+  - main [ref=e14]:
+    - generic [ref=e16]:
+      - generic [ref=e17]: Multi-source verification · evidence first
+      - heading "113.67 亿份成立， 但不等于“国家队买入”" [level=1] [ref=e18]: 113.67 亿份成立，但不等于“国家队买入”
+      - generic [ref=e19]:
+        - generic [ref=e20]:
+          - paragraph [ref=e21]:
+            - text: 交易所三块官方数据精确复现截图：7 月 24 日全市场 ETF 总份额
+            - strong [ref=e22]: 31,981.61 亿份
+            - text: ，较前日净增
+            - strong [ref=e23]: 113.67 亿份
+            - text: 。但资金折算、类别结构和分钟成交共同指向：这是
+            - strong [ref=e24]: 债券＋宽基＋科技/券商主题并存的结构性申购
+            - text: ，不是单一方向的统一托举。
+          - generic "核心数据等式" [ref=e25]:
+            - generic [ref=e26]:
+              - generic [ref=e27]: 31,867.94
+              - generic [ref=e28]: 7/23 官方总份额 · 亿份
+            - generic [ref=e29]:
+              - generic [ref=e30]: "+113.67"
+              - generic [ref=e31]: 当日净增 · +0.357%
+            - generic [ref=e32]:
+              - generic [ref=e33]: 31,981.61
+              - generic [ref=e34]: 7/24 官方总份额 · 亿份
+        - complementary [ref=e35]:
+          - generic [ref=e36]: GJD / 国家队参与可能性
+          - generic [ref=e37]:
+            - strong [ref=e38]: 中低
+            - generic [ref=e39]: ●●○○○
+          - paragraph [ref=e40]: “部分经典宽基申购中可能有国家队参与”有历史工具重合与同步尾盘成交支持；但当日上证 50、科创 50 反而大额净流出，经典 300 ETF 尾盘价格继续下跌，且日度数据没有账户身份。
+          - generic [ref=e41]:
+            - generic [ref=e42]:
+              - generic [ref=e43]: 截图数据真实性
+              - generic [ref=e44]: 精确成立
+            - generic [ref=e45]:
+              - generic [ref=e46]: 结构性承接
+              - generic [ref=e47]: 有证据
+            - generic [ref=e48]:
+              - generic [ref=e49]: 国家队账户身份
+              - generic [ref=e50]: 无法确证
+      - generic [ref=e51]: ↓ 下方先看官方三块数据如何一分不差地拼回总数
+    - generic [ref=e53]:
+      - generic [ref=e54]:
+        - generic [ref=e55]:
+          - generic [ref=e56]: 01 / OFFICIAL RECONCILIATION
+          - heading "三块官方源，拼回截图总数" [level=2] [ref=e57]
+        - paragraph [ref=e58]: 总份额不是第三方估算。按上交所普通 ETF、上交所交易型货币基金、深交所 ETF 三个不重叠口径相加，7/24 与截图显示值精确一致。官方源共 1,608 行。
+      - table [ref=e60]:
+        - rowgroup [ref=e61]:
+          - row [ref=e62]:
+            - columnheader "官方口径" [ref=e63]
+            - columnheader "7/23 · 亿份" [ref=e64]
+            - columnheader "7/24 · 亿份" [ref=e65]
+            - columnheader "净变化 · 亿份" [ref=e66]
+            - columnheader "贡献" [ref=e67]
+        - rowgroup [ref=e68]:
+          - row [ref=e69]:
+            - cell "上交所普通 ETF 883 只" [ref=e70]
+            - cell "20,338.904084" [ref=e71]
+            - cell "20,394.043444" [ref=e72]
+            - cell "+55.139360" [ref=e73]
+            - cell "48.51%" [ref=e74]
+          - row [ref=e75]:
+            - cell "上交所交易型货币基金 24 只" [ref=e76]
+            - cell "18.776990" [ref=e77]
+            - cell "18.833604" [ref=e78]
+            - cell "+0.056614" [ref=e79]
+            - cell "0.05%" [ref=e80]
+          - row [ref=e81]:
+            - cell "深交所 ETF 701 只" [ref=e82]
+            - cell "11,510.256474" [ref=e83]
+            - cell "11,568.731722" [ref=e84]
+            - cell "+58.475248" [ref=e85]
+            - cell "51.44%" [ref=e86]
+          - row [ref=e87]:
+            - cell "全市场合计 1,608 只" [ref=e88]
+            - cell "31,867.937548" [ref=e89]
+            - cell "31,981.608770" [ref=e90]
+            - cell "+113.671222" [ref=e91]
+            - cell "100%" [ref=e92]
+      - generic [ref=e93]:
+        - generic [ref=e94]:
+          - generic [ref=e95]: 31,981.61
+          - text: 四舍五入后与截图 20260724 完全一致。
+        - generic [ref=e96]:
+          - generic [ref=e97]: 31,725.89
+          - text: 2026-04-08 官方三块合计 31,725.893054 亿份，也精确复现截图悬浮点。
+        - generic [ref=e98]:
+          - generic [ref=e99]: +0.357%
+          - text: 总份额单日增幅。它是份额变化，不是人民币资金流入金额。
+    - generic [ref=e101]:
+      - generic [ref=e102]:
+        - generic [ref=e103]:
+          - generic [ref=e104]: 02 / FLOW STRUCTURE
+          - heading "钱流入了，但方向并不单一" [level=2] [ref=e105]
+        - paragraph [ref=e106]: iFinD 的“资金净流入”将份额变化折算为金额；交易所的“总份额”则直接记录份数。两者单位、计算方式不同，不能互换。把两层并看，才能辨认真正的结构。
+      - generic [ref=e107]:
+        - article [ref=e108]:
+          - generic [ref=e109]:
+            - heading "7/24 全 ETF 资金净流入" [level=3] [ref=e110]
+            - generic [ref=e111]: iFinD 二次测算
+          - generic [ref=e112]: 205.77 亿元
+          - generic [ref=e113]:
+            - generic [ref=e114]:
+              - generic [ref=e115]: 股票型
+              - strong [ref=e118]: "+135.42"
+            - generic [ref=e119]:
+              - generic [ref=e120]: 债券型
+              - strong [ref=e123]: "+54.54"
+            - generic [ref=e124]:
+              - generic [ref=e125]: 宽基型
+              - strong [ref=e128]: "+66.11"
+          - generic [ref=e129]: 关键区别：+113.67 是“亿份”；+205.77 是“亿元”。高单位净值的短融/债券 ETF 会以较少份额对应更大资金金额。
+        - article [ref=e130]:
+          - generic [ref=e131]:
+            - heading "份额净增与净减 Top" [level=3] [ref=e132]
+            - generic [ref=e133]: 交易所 T 日清算后
+          - generic [ref=e134]:
+            - button "净增" [ref=e135] [cursor=pointer]
+            - button "净减" [ref=e136] [cursor=pointer]
+          - generic [ref=e137]:
+            - generic [ref=e138]:
+              - generic [ref=e139]:
+                - text: "510210"
+                - generic [ref=e140]: 上证指数 ETF
+              - generic [ref=e143]: "+8.700"
+            - generic [ref=e144]:
+              - generic [ref=e145]:
+                - text: "588170"
+                - generic [ref=e146]: 科创半导体
+              - generic [ref=e149]: "+6.420"
+            - generic [ref=e150]:
+              - generic [ref=e151]:
+                - text: "512000"
+                - generic [ref=e152]: 券商 ETF
+              - generic [ref=e155]: "+4.656"
+            - generic [ref=e156]:
+              - generic [ref=e157]:
+                - text: "159558"
+                - generic [ref=e158]: 半导体设备
+              - generic [ref=e161]: "+4.560"
+            - generic [ref=e162]:
+              - generic [ref=e163]:
+                - text: "563360"
+                - generic [ref=e164]: A500 基金
+              - generic [ref=e167]: "+4.170"
+            - generic [ref=e168]:
+              - generic [ref=e169]:
+                - text: "510300"
+                - generic [ref=e170]: 沪深300 ETF
+              - generic [ref=e173]: "+3.537"
+          - generic [ref=e174]:
+            - generic [ref=e175]:
+              - generic [ref=e176]:
+                - text: "588000"
+                - generic [ref=e177]: 科创50 ETF
+              - generic [ref=e180]: −5.850
+            - generic [ref=e181]:
+              - generic [ref=e182]:
+                - text: "588200"
+                - generic [ref=e183]: 科创芯片
+              - generic [ref=e186]: −5.445
+            - generic [ref=e187]:
+              - generic [ref=e188]:
+                - text: "515220"
+                - generic [ref=e189]: 煤炭 ETF
+              - generic [ref=e192]: −5.430
+            - generic [ref=e193]:
+              - generic [ref=e194]:
+                - text: "512800"
+                - generic [ref=e195]: 银行 ETF
+              - generic [ref=e198]: −5.364
+            - generic [ref=e199]:
+              - generic [ref=e200]:
+                - text: "512690"
+                - generic [ref=e201]: 酒 ETF
+              - generic [ref=e204]: −4.356
+            - generic [ref=e205]:
+              - generic [ref=e206]:
+                - text: "510050"
+                - generic [ref=e207]: 上证50 ETF
+              - generic [ref=e210]: −3.897
+      - generic [ref=e211]:
+        - generic [ref=e212]:
+          - heading "代表产品：一边承接，一边赎回" [level=3] [ref=e213]
+          - generic [ref=e214]: 份额变化 × 当日均价 / iFinD
+        - table [ref=e216]:
+          - rowgroup [ref=e217]:
+            - row [ref=e218]:
+              - columnheader "代码" [ref=e219]
+              - columnheader "产品" [ref=e220]
+              - columnheader "份额变化 · 亿份" [ref=e221]
+              - columnheader "资金净流入 · 亿元" [ref=e222]
+              - columnheader "当日均价" [ref=e223]
+              - columnheader "证据含义" [ref=e224]
+          - rowgroup [ref=e225]:
+            - row [ref=e226]:
+              - cell "511360" [ref=e227]
+              - cell "短融 ETF 海富通" [ref=e228]
+              - cell "—" [ref=e229]
+              - cell "+47.49" [ref=e230]
+              - cell "113.7251" [ref=e231]
+              - cell "全市场资金第一，首先是债券配置" [ref=e232]
+            - row [ref=e233]:
+              - cell "510300" [ref=e234]
+              - cell "沪深300 ETF 华泰柏瑞" [ref=e235]
+              - cell "+3.537" [ref=e236]
+              - cell "+16.72" [ref=e237]
+              - cell "4.7274" [ref=e238]
+              - cell "经典宽基承接最明确" [ref=e239]
+            - row [ref=e240]:
+              - cell "510210" [ref=e241]
+              - cell "上证指数 ETF 富国" [ref=e242]
+              - cell "+8.700" [ref=e243]
+              - cell "+8.46" [ref=e244]
+              - cell "0.9728" [ref=e245]
+              - cell "份额增量全市场第一" [ref=e246]
+            - row [ref=e247]:
+              - cell "588170" [ref=e248]
+              - cell "科创半导体 ETF 华夏" [ref=e249]
+              - cell "+6.420" [ref=e250]
+              - cell "+6.45" [ref=e251]
+              - cell "1.0050" [ref=e252]
+              - cell "科技主题同样获大额申购" [ref=e253]
+            - row [ref=e254]:
+              - cell "510050" [ref=e255]
+              - cell "上证50 ETF 华夏" [ref=e256]
+              - cell "−3.897" [ref=e257]
+              - cell "−11.93" [ref=e258]
+              - cell "3.0625" [ref=e259]
+              - cell "否定“所有国家队宽基同步托举”" [ref=e260]
+            - row [ref=e261]:
+              - cell "588000" [ref=e262]
+              - cell "科创50 ETF 华夏" [ref=e263]
+              - cell "−5.850" [ref=e264]
+              - cell "−11.07" [ref=e265]
+              - cell "1.8923" [ref=e266]
+              - cell "周内大流入后单日显著流出" [ref=e267]
+    - generic [ref=e269]:
+      - generic [ref=e270]:
+        - generic [ref=e271]:
+          - generic [ref=e272]: 03 / IDENTITY AUDIT
+          - heading "什么像国家队，什么仍然证明不了" [level=2] [ref=e273]
+        - paragraph [ref=e274]: “历史上持有同一批 ETF”能提高参与可能性，但不能把某一天的新增份额归到具体账户。这里把支持项、反证和缺失身份数据并列展示。
+      - generic [ref=e275]:
+        - article [ref=e276]:
+          - generic [ref=e277]: 支持“可能参与”
+          - heading "可观察到的同向痕迹" [level=3] [ref=e278]
+          - list [ref=e279]:
+            - listitem [ref=e280]: 四只经典沪深300 ETF 当日合计净增 5.661 亿份，估算净流入约 26.86 亿元。
+            - listitem [ref=e281]: 2025 年报显示，中央汇金明确出现在 21 只 ETF 十大持有人中，覆盖四只沪深300、两只上证50、500/1000、创业板与科创50等。
+            - listitem [ref=e282]: 四只经典沪深300 ETF 最后 30 分钟成交占全天 19.90%–32.88%，存在同步的尾盘成交集中。
+            - listitem [ref=e283]: 7/20–7/24 周内宽基 ETF 净流入 533.52 亿元，并非仅一天的孤点。
+        - article [ref=e284]:
+          - generic [ref=e285]: 反证 / 降级项
+          - heading "不像“统一护盘”的部分" [level=3] [ref=e286]
+          - list [ref=e287]:
+            - listitem [ref=e288]: 上证50 ETF（510050）与科创50 ETF（588000）当日分别净流出约 11.93 与 11.07 亿元。
+            - listitem [ref=e289]: 四只经典沪深300 ETF 14:30 至收盘均下跌 0.59%–0.68%；尾盘有量，却没有价格托升。
+            - listitem [ref=e290]: 当日资金第一名是短融 ETF（511360，+47.49 亿元），说明总流入里有显著的固收配置。
+            - listitem [ref=e291]: 科技内部同时出现半导体设备/科创半导体净增与科创50/科创芯片净减，更像调仓与套利活动。
+        - article [ref=e292]:
+          - generic [ref=e293]: 身份确认仍缺
+          - heading "缺少席位、账户与日度持有人数据" [level=3] [ref=e294]
+          - list [ref=e295]:
+            - listitem [ref=e296]: 交易所日度规模表只给基金代码、简称和总份额；不披露申购账户。
+            - listitem [ref=e297]: 二级市场成交、分钟成交占比、订单大小都不是投资者身份标签。
+            - listitem [ref=e298]: 基金年报/半年报持有人数据有披露滞后，不能用于归属 2026-07-24 当日申购。
+            - listitem [ref=e299]: 要升级为“确认”，至少需要中央汇金/诚通/国新公告、基金公司确认，或可核验的账户/持有人变动。
+      - generic "证据推理边界" [ref=e300]:
+        - generic [ref=e301]:
+          - generic [ref=e302]: 宽基集中申购
+          - generic [ref=e303]: ＋历史持仓重合
+        - generic [ref=e304]: →
+        - generic [ref=e305]:
+          - generic [ref=e306]: 提高参与可能性
+          - generic [ref=e307]: 可称“操作痕迹”
+        - generic [ref=e308]: ≠
+        - generic [ref=e309]:
+          - generic [ref=e310]: 确认国家队账户
+          - generic [ref=e311]: 身份数据缺失
+    - generic [ref=e313]:
+      - generic [ref=e314]:
+        - generic [ref=e315]:
+          - generic [ref=e316]: 04 / LAST 30 MINUTES
+          - heading "尾盘同步放量，但没有同步托升" [level=2] [ref=e317]
+        - paragraph [ref=e318]: 腾讯 1 分钟成交复算显示，经典沪深300 ETF 尾盘成交显著集中；然而从 14:30 到收盘，四只价格全部下跌。成交集中更适合解释为换仓、申赎与套利活动，不足以单独认定护盘买盘。
+      - generic [ref=e319]:
+        - article [ref=e320]:
+          - code [ref=e321]: "510300"
+          - generic [ref=e322]: 24.50%
+          - generic [ref=e323]: 最后 30 分钟 / 全天成交额
+          - generic [ref=e324]: 14:30→收盘 −0.592%
+        - article [ref=e325]:
+          - code [ref=e326]: "510310"
+          - generic [ref=e327]: 24.95%
+          - generic [ref=e328]: 最后 30 分钟 / 全天成交额
+          - generic [ref=e329]: 14:30→收盘 −0.675%
+        - article [ref=e330]:
+          - code [ref=e331]: "510330"
+          - generic [ref=e332]: 32.88%
+          - generic [ref=e333]: 最后 30 分钟 / 全天成交额
+          - generic [ref=e334]: 14:30→收盘 −0.649%
+        - article [ref=e335]:
+          - code [ref=e336]: "159919"
+          - generic [ref=e337]: 19.90%
+          - generic [ref=e338]: 最后 30 分钟 / 全天成交额
+          - generic [ref=e339]: 14:30→收盘 −0.629%
+      - generic [ref=e340]: 对照：510050 与 588000 最后 30 分钟成交占比仅 10.67% 和 11.45%。经典沪深300 组确有更强的尾盘集中，但“有量无价”使 GJD 身份证据保持在中低等级。
+    - generic [ref=e342]:
+      - generic [ref=e343]:
+        - generic [ref=e344]:
+          - generic [ref=e345]: 05 / SOURCE LEDGER
+          - heading "每个结论，落到具体源头" [level=2] [ref=e346]
+        - paragraph [ref=e347]: 主证据只采用交易所清算后份额。资金流、分钟成交与历史持有人属于二级验证。不同供应商的 ETF 覆盖范围不同，因此东方财富接口只用于偏差检查，不用于改写官方总数。
+      - generic [ref=e348]:
+        - article [ref=e349]:
+          - generic [ref=e350]: A · 官方主源
+          - heading "上交所 ETF 规模" [level=3] [ref=e351]
+          - paragraph [ref=e352]: 普通 ETF，字段 STAT_DATE / SEC_CODE / TOT_VOL；7/24 共 883 行。
+          - link "打开上交所页面 ↗" [ref=e353] [cursor=pointer]:
+            - /url: https://www.sse.com.cn/market/funddata/volumn/etfvolumn/
+        - article [ref=e354]:
+          - generic [ref=e355]: A · 官方主源
+          - heading "上交所交易型货币基金" [level=3] [ref=e356]
+          - paragraph [ref=e357]: 与普通 ETF 分表，7/24 共 24 行，避免重复或漏算。
+          - link "打开上交所页面 ↗" [ref=e358] [cursor=pointer]:
+            - /url: https://www.sse.com.cn/market/funddata/volumn/tcuvolumn/
+        - article [ref=e359]:
+          - generic [ref=e360]: A · 官方主源
+          - heading "深交所基金规模" [level=3] [ref=e361]
+          - paragraph [ref=e362]: ShowReport：CATALOGID=scsj_fund_jjgm，jjlb=ETF；7/24 共 701 行。
+          - link "打开深交所接口 ↗" [ref=e363] [cursor=pointer]:
+            - /url: https://www.szse.cn/api/report/ShowReport/data?SHOWTYPE=JSON&CATALOGID=scsj_fund_jjgm&TABKEY=tab1&txtStart=2026-07-24&txtEnd=2026-07-24&jjlb=ETF&PAGENO=1
+        - article [ref=e364]:
+          - generic [ref=e365]: B · 行情 / MCP
+          - heading "同花顺 iFinD 基金数据" [level=3] [ref=e366]
+          - paragraph [ref=e367]: 用于当日均价、成交额和资金净流入。单日全 ETF +205.77 亿元，股票型 +135.42，债券型 +54.54。
+          - link "查看公开二次发布 ↗" [ref=e368] [cursor=pointer]:
+            - /url: https://finance.sina.com.cn/jjxw/2026-07-25/doc-iniizerm1321510.shtml
+        - article [ref=e369]:
+          - generic [ref=e370]: B · 周期验证
+          - heading "iFinD 周度资金流" [level=3] [ref=e371]
+          - paragraph [ref=e372]: 7/20–7/24 全 ETF +697.01 亿元、股票型 +550.99、宽基 +533.52。
+          - link "经济观察网二次发布 ↗" [ref=e373] [cursor=pointer]:
+            - /url: https://www.eeo.com.cn/2026/0725/973260.shtml
+        - article [ref=e374]:
+          - generic [ref=e375]: B · 独立公式
+          - heading "证券之星份额×均价" [level=3] [ref=e376]
+          - paragraph [ref=e377]: 其公式明确为“份额差 × 当日均价”；行业主题当日 +29.03 亿元，为独立口径交叉。
+          - link "查看公式与榜单 ↗" [ref=e378] [cursor=pointer]:
+            - /url: https://www.sohu.com/a/1054499824_122121789
+        - article [ref=e379]:
+          - generic [ref=e380]: B · 历史身份
+          - heading "2025 年报 / Wind 二次发布" [level=3] [ref=e381]
+          - paragraph [ref=e382]: 中央汇金 2025 年末持有 21 只 ETF。它证明历史工具重合，不证明 7/24 当日买方身份。
+          - link "东方财富报道 ↗" [ref=e383] [cursor=pointer]:
+            - /url: https://finance.eastmoney.com/a/202603313690167766.html
+        - article [ref=e384]:
+          - generic [ref=e385]: B · 分钟行情
+          - heading "腾讯财经 1 分钟成交" [level=3] [ref=e386]
+          - paragraph [ref=e387]: 用于最后 30 分钟成交占比与 14:30→收盘价格变化；仅为成交行为证据。
+          - link "查看 510300 行情页 ↗" [ref=e388] [cursor=pointer]:
+            - /url: https://gu.qq.com/sh510300/gp
+        - article [ref=e389]:
+          - generic [ref=e390]: C · 覆盖检查
+          - heading "东方财富数据中心" [level=3] [ref=e391]
+          - paragraph [ref=e392]: RPT_FUND_ETFLIST 得 1,607 只、31,923.05 亿份，比官方少 58.55 亿份（−0.183%）；无明确 as_of，不能做精确主证据。
+          - link "打开数据中心接口 ↗" [ref=e393] [cursor=pointer]:
+            - /url: https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_FUND_ETFLIST&pageNumber=1&pageSize=50&columns=ALL
+    - generic [ref=e396]:
+      - generic [ref=e397]:
+        - generic [ref=e398]: FINAL VERDICT
+        - heading "更像“多路资金结构性换仓”，不是可确认的国家队单边托举" [level=2] [ref=e399]
+        - paragraph [ref=e400]: 数据足以确认 ETF 总份额扩张、沪深300经典工具获得同步申购，也足以说明这些工具与中央汇金历史持仓高度重合。但它同时显示债券 ETF 吸金居首、上证50和科创50逆向净流出、尾盘有量无价。最稳妥的结论是：国家队参与其中存在可能，但当前公开证据只能给到中低置信等级；将 113.67 亿份全部归因于 GJD，证据不成立。
+      - generic [ref=e401]:
+        - generic [ref=e402]:
+          - strong [ref=e403]: 高
+          - generic [ref=e404]: 官方公告 / 账户或持有人日度证据
+        - generic [ref=e405]:
+          - strong [ref=e406]: 中
+          - generic [ref=e407]: 多只历史工具同步申购＋逆势价格托升
+        - generic [ref=e408]:
+          - strong [ref=e409]: 中低 · 当前
+          - generic [ref=e410]: 工具重合＋尾盘量集中，但价格未托升且结构分化
+        - generic [ref=e411]:
+          - strong [ref=e412]: 低
+          - generic [ref=e413]: 只见总份额或单只 ETF 成交放大
+  - contentinfo [ref=e414]:
+    - generic [ref=e415]:
+      - generic [ref=e416]: 数据截止：2026-07-24 清算后｜生成：2026-07-26 20:43 CST这是事实核验与研究报告，不构成投资建议。
+      - generic [ref=e417]:
+        - link "下载复算 JSON" [ref=e418] [cursor=pointer]:
+          - /url: source-data.json
+        - text: ·
+        - link "下载份额变化 CSV" [ref=e419] [cursor=pointer]:
+          - /url: top-share-changes.csv
+        - text: 份额 ≠ 资金金额；成交行为 ≠ 投资者身份。

@@ -59,13 +59,13 @@ When the user explicitly runs a window or asks for an out-of-window review:
 
 ## Body Rules
 
-- Use concise Chinese trading-review prose: conclusion first, then evidence.
+- Use concise Chinese trading-review prose: conclusion first, then the market behavior that supports it.
 - Renderer windows must not be rewritten by the automation agent. Send only the
   JSON `body` returned by `render_market_replay_wechat_body`; record
   `audit.internal_gaps` in automation memory only.
 - Synthesis windows must do a real model synthesis pass before writing. The
-  draft must be based on the skill sections `AI Synthesis Contract` and
-  `Pre-send Self Check`, not on a rewrite of the deterministic gate body.
+  draft must follow the skill sections `Internal Analysis`, `Reader-Facing Daily Report`,
+  and `Pre-Send Check`, not rewrite the deterministic gate body.
 - Reference the strongest available evidence fields: `structured_daily_review`,
   `rotation_windows`, `rotation_shifts`, `board_timeline`, `sector_boards`,
   `dynamic_market_representatives`, `failed_boards`, `acceptance_pressure`, and
@@ -78,16 +78,16 @@ When the user explicitly runs a window or asks for an out-of-window review:
 - Treat `sector_boards` / Agent OS `板块15` as the primary sector ordering.
   Use `dynamic_market_representatives` for the day's representative stocks;
   static industry-chain representatives are background only.
-- First sentence must name the actual pressure center, confirmed/weakening
-  direction, and next validation point. Avoid vague phrases unless the exact
-  board/stock and evidence are named in the same sentence.
+- First sentence must name the actual pressure center, strongest/weakening
+  direction, and the most important next observation. Avoid vague phrases unless
+  the exact board or stock is named in the same sentence.
 - Direction-switch claims must cite rotation evidence from
   `rotation_windows`, `rotation_shifts`, `board_timeline`, tail pressure, or
   representative acceptance. Final涨幅 alone is not enough.
 - Named stocks must be representative for the current day through dynamic
   representative buckets, high turnover, limit/failed-limit state, 5-minute
   path, or pool membership.
-- The WeChat body should only include supported evidence. Optional missing
+- The WeChat body should only include supported facts. Optional missing
   fields go to automation memory via `audit.internal_gaps`, not into the
   user-visible body.
 - Do not invent minute times, account-level 主力/散户 flow, or catalyst/news.

@@ -331,8 +331,9 @@ AkShare field coverage:
 ## Automated Output Checks
 
 - Automated gate output must start with `NOTIFY` or `DONT_NOTIFY`. A manual
-  report must also include the original gate reason, underlying data date, and
-  a clear `send disabled` status, but it must not collapse to a bare gate token.
+  operational response may report the original gate reason and data date outside
+  the replay body; the saved replay itself always uses the same reader-facing
+  structure as automation.
 - Do not output runtime, Mongo, cache, or lane-health boilerplate.
 - Do not turn validation points into direct buy/sell instructions.
 - Do not let `daily_brief.primary_theme` hide a broader `板块15` structure.

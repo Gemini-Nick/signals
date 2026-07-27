@@ -731,6 +731,31 @@ def test_publish_gate_controls_strategy_snapshot_pollution():
     assert overlay["metadata"]["ai_factor_factory"]["factor_score_breakdown"]["industry_beta_score"] >= 0
 
 
+def test_demo_validated_factor_does_not_enter_live_strategy_candidates():
+    from signals.strategy.ai_factor_factory import (
+        build_ai_factor_strategy_candidates,
+        publish_factor,
+        run_factor_validation,
+    )
+
+    db = _Db()
+    factor_id = "us_ai_hardware_to_cn_optical_cpo_memory_v1"
+    validation = run_factor_validation(
+        factor_id=factor_id,
+        db=db,
+        demo_mode=True,
+    )
+    publication = publish_factor(
+        factor_id=factor_id,
+        db=db,
+        live_enabled=True,
+    )
+
+    assert validation["validation"]["mode"] == "demo"
+    assert publication["status"] == "published"
+    assert build_ai_factor_strategy_candidates(db=db) == []
+
+
 def test_strategy_ai_factor_factory_api_smoke():
     from fastapi.testclient import TestClient
     from signals.web.app import create_app
