@@ -13,6 +13,7 @@ import pandas as pd
 from pymongo import UpdateOne
 from pymongo.database import Database
 
+from signals.core.etf_universe import is_etf_like
 from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import is_trading_day
 from signals.sync.task_context import get_task_env
@@ -424,7 +425,31 @@ def _scan_symbol(
     ]
 
 
-def _load_daily_frames(db: Database, now: datetime) -> tuple[dict[str, pd.DataFrame], str]:
+def _etf_codes(db: Database) -> set[str]:
+    codes: set[str] = set()
+    try:
+        cursor = db["etf_spot_snapshots"].find(
+            {},
+            {
+                "_id": 0,
+                "code": 1,
+                "raw_code": 1,
+                "symbol": 1,
+                "name": 1,
+                "source": 1,
+            },
+        )
+    except Exception as exc:
+        logger.debug("load ETF exclusion universe failed: %s", exc)
+        return codes
+    for doc in cursor:
+        code = _pure_a_code(doc.get("code") or doc.get("raw_code") or doc.get("symbol"))
+        if code and is_etf_like(code, doc.get("name"), doc.get("source")):
+            codes.add(code)
+    return codes
+
+
+def _load_daily_frames(db: Database, now: datetime) -> tuple[dict[str, pd.DataFrame], str, set[str]]:
     lookback_days = _env_int(
         "MA_CLIMB_LOOKBACK_DAYS",
         DEFAULT_LOOKBACK_DAYS,
@@ -438,6 +463,7 @@ def _load_daily_frames(db: Database, now: datetime) -> tuple[dict[str, pd.DataFr
         maximum=360,
     )
     cutoff = now - timedelta(days=lookback_days)
+    excluded_etf_codes = _etf_codes(db)
     cursor = db["bars"].find(
         {
             "meta.market": "A",
@@ -462,6 +488,9 @@ def _load_daily_frames(db: Database, now: datetime) -> tuple[dict[str, pd.DataFr
         dt = pd.to_datetime(doc.get("dt"), errors="coerce")
         if not code or pd.isna(dt):
             continue
+        if code in excluded_etf_codes or is_etf_like(code):
+            excluded_etf_codes.add(code)
+            continue
         bar_date = dt.date()
         latest_date = max(latest_date, bar_date) if latest_date else bar_date
         bars = grouped.setdefault(code, OrderedDict())
@@ -475,13 +504,13 @@ def _load_daily_frames(db: Database, now: datetime) -> tuple[dict[str, pd.DataFr
         while len(bars) > max_bars:
             bars.popitem(last=False)
     if latest_date is None:
-        return {}, ""
+        return {}, "", excluded_etf_codes
     frames = {
         code: frame
         for code, bars in grouped.items()
         if bars and next(reversed(bars)) == latest_date and not (frame := _as_frame(list(bars.values()))).empty
     }
-    return frames, latest_date.isoformat()
+    return frames, latest_date.isoformat(), excluded_etf_codes
 
 
 def _active_climb_states(db: Database) -> dict[str, dict[str, dict[str, Any]]]:
@@ -511,13 +540,14 @@ def sync_ma_climb_scan(db: Database, proxy_url: str = None) -> dict:
     del proxy_url
     now = naive_market_now("A")
     as_of = str(get_task_env("SIGNALS_POSTMARKET_TRADE_DATE", "") or "").strip()[:10] or now.date().isoformat()
-    frames, latest_dt = _load_daily_frames(db, now)
+    frames, latest_dt, excluded_etf_codes = _load_daily_frames(db, now)
     if not frames:
         return {
             "status": "empty",
             "inserted": 0,
             "symbols": 0,
             "signals": 0,
+            "excluded_etfs": len(excluded_etf_codes),
             "error_msg": "daily_bar_universe_empty",
         }
 
@@ -549,6 +579,23 @@ def sync_ma_climb_scan(db: Database, proxy_url: str = None) -> dict:
                 operations.clear()
     if operations:
         db["terminal_technical_signals"].bulk_write(operations, ordered=False)
+
+    excluded_etf_signals = 0
+    if excluded_etf_codes:
+        excluded = db["terminal_technical_signals"].update_many(
+            {
+                "signal_family": "ma_climb",
+                "active": {"$ne": False},
+                "raw_code": {"$in": sorted(excluded_etf_codes)},
+            },
+            {"$set": {
+                "active": False,
+                "invalidated_at": now,
+                "invalidated_reason": "asset_scope_excluded_etf",
+                "updated_at": now,
+            }},
+        )
+        excluded_etf_signals = int(getattr(excluded, "modified_count", 0) or 0)
 
     invalidated_count = 0
     if fullmarket_complete:
@@ -584,6 +631,9 @@ def sync_ma_climb_scan(db: Database, proxy_url: str = None) -> dict:
             "buy_review_count": buy_review,
             "watch_count": watch,
             "invalidated_count": invalidated_count,
+            "excluded_etf_count": len(excluded_etf_codes),
+            "excluded_etf_signal_count": excluded_etf_signals,
+            "asset_scope": "a_share_stocks_only",
             "scan_scope": "full_market_cached_daily",
             "minimum_fullmarket_symbols": minimum_fullmarket_symbols,
             "is_full_market_complete": fullmarket_complete,
@@ -605,7 +655,10 @@ def sync_ma_climb_scan(db: Database, proxy_url: str = None) -> dict:
         "buy_review": buy_review,
         "watch": watch,
         "invalidated": invalidated_count,
+        "excluded_etfs": len(excluded_etf_codes),
+        "excluded_etf_signals": excluded_etf_signals,
         "latest_dt": latest_dt,
+        "asset_scope": "a_share_stocks_only",
         "scan_scope": "full_market_cached_daily",
         "is_full_market_complete": fullmarket_complete,
     }

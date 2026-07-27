@@ -2,10 +2,41 @@
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
 
 import pandas as pd
 
 from signals.sync.modules import ma_climb_scan as climb
+
+
+class _Cursor(list):
+    def sort(self, *args, **kwargs):
+        return self
+
+
+class _Collection:
+    def __init__(self, docs=None):
+        self.docs = docs or []
+        self.update_many_calls = []
+        self.update_one_calls = []
+
+    def find(self, query=None, projection=None):
+        return _Cursor(self.docs)
+
+    def update_many(self, query, update):
+        self.update_many_calls.append((query, update))
+        return SimpleNamespace(modified_count=1)
+
+    def update_one(self, query, update, upsert=False):
+        self.update_one_calls.append((query, update, upsert))
+        return SimpleNamespace(modified_count=1)
+
+
+class _DB(dict):
+    def __getitem__(self, name):
+        if name not in self:
+            self[name] = _Collection()
+        return dict.__getitem__(self, name)
 
 
 def _rising_frame(*, step: float = 0.1, spread: float = 0.8, count: int = 90) -> pd.DataFrame:
@@ -135,3 +166,65 @@ def test_established_climb_continues_when_slope_flattens_above_ma():
     assert result["continued"] is True
     assert result["climb_score"] == 85
     assert result["climb_grade"] == "buy_review"
+
+
+def test_load_daily_frames_excludes_etfs_from_scan_universe():
+    bars = [
+        {
+            "dt": datetime(2026, 7, 27),
+            "meta": {"market": "A", "freq": "日线", "symbol": code},
+            "open": 10.0,
+            "high": 10.5,
+            "low": 9.8,
+            "close": 10.2,
+        }
+        for code in ("600031", "526070", "159825")
+    ]
+    db = _DB({
+        "bars": _Collection(bars),
+        "etf_spot_snapshots": _Collection([
+            {
+                "code": "526070",
+                "symbol": "SH.526070",
+                "name": "恒指港股通ETF博时",
+                "security_type": "etf",
+                "source": "eastmoney_etf_spot",
+            },
+        ]),
+    })
+
+    frames, latest_dt, excluded_etf_codes = climb._load_daily_frames(
+        db,
+        datetime(2026, 7, 27, 18, 0),
+    )
+
+    assert set(frames) == {"600031"}
+    assert latest_dt == "2026-07-27"
+    assert excluded_etf_codes == {"159825", "526070"}
+
+
+def test_sync_invalidates_existing_etf_climb_signals(monkeypatch):
+    technical_signals = _Collection()
+    data_freshness = _Collection()
+    db = _DB({
+        "terminal_technical_signals": technical_signals,
+        "data_freshness": data_freshness,
+    })
+    monkeypatch.setenv("MA_CLIMB_MIN_FULLMARKET_SYMBOLS", "1")
+    monkeypatch.setattr(
+        climb,
+        "_load_daily_frames",
+        lambda db, now: ({"600031": _staircase_frame()}, "2026-07-27", {"526070"}),
+    )
+    monkeypatch.setattr(climb, "_active_climb_states", lambda db: {})
+    monkeypatch.setattr(climb, "_scan_symbol", lambda *args, **kwargs: [])
+
+    result = climb.sync_ma_climb_scan(db)
+
+    etf_query, etf_update = technical_signals.update_many_calls[0]
+    assert etf_query["raw_code"] == {"$in": ["526070"]}
+    assert etf_update["$set"]["active"] is False
+    assert etf_update["$set"]["invalidated_reason"] == "asset_scope_excluded_etf"
+    assert result["excluded_etfs"] == 1
+    assert result["excluded_etf_signals"] == 1
+    assert result["asset_scope"] == "a_share_stocks_only"

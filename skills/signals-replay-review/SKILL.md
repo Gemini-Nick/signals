@@ -96,36 +96,54 @@ Long Markdown and Word:
 
 - `/Users/zhangqilong/WorkBuddy/复盘报告/A股盘后复盘报告_YYYY-MM-DD_Signals原生.md`
 - `/Users/zhangqilong/WorkBuddy/复盘报告/A股盘后复盘报告_YYYY-MM-DD_Signals原生.docx`
+- `/Users/zhangqilong/WorkBuddy/复盘报告/A股盘后可视复盘_YYYY-MM-DD_Signals原生.html`
 
-Both versions use the same five-section hierarchy. The short version does not add level-three headings:
+Both versions answer the same five questions. The short version uses inline bold labels to reduce rendered height:
 
 ```markdown
 # A股盘后复盘 | YYYY年M月D日（周X）
-## 今日一句话
-## 市场全貌
-## 主线与资金
-## 代表信号
-## 明天看什么
+**今日一句话｜** …
+**市场全貌｜** …
+**主线与资金｜** …
+**代表信号｜** …
+**明天看什么｜**
+1. …
+2. …
+3. …
 ```
 
 ### Short Version
 
-- It must fit in the WorkBuddy reading pane without scrolling: at most 1,000 visible characters and about 16 body lines.
+- It must fit in the default WorkBuddy reading pane from the title through the third observation without scrolling: at most 800 visible characters and about 11 body lines.
+- Do not use level-two or level-three headings; keep the five bold labels inline with their text to avoid Markdown heading margins.
+- Keep each of the first four sections to one compact paragraph; allow at most two lines for `主线与资金` and merge all representative signals into one line.
 - Do not use a table. Include no more than three indices and one sentence on turnover and breadth.
 - Compress `走强` and `转弱` into one paragraph each; use no more than three directions in total.
 - Include three or four unique representative stocks, plus no more than one ETF.
-- End with exactly three one-line observations. Each states what stronger behavior and still-weak behavior would look like.
+- Retain all five labels. Only `明天看什么` is a numbered list, with exactly three one-line items; each states what stronger behavior and still-weak behavior would look like.
+- Format every item as `走强：…；仍弱：…`. Do not use confirmation, invalidation, or downgrade process language.
+- Stop output immediately after the third numbered item. Never append a parenthetical format check, skill summary, or save-status sentence.
 - Return only the report body. Do not append source, replay, save-status, file-path, or “no files changed” notes.
 
 ### Long Version
 
-- Use the same five sections and the same facts as the short version.
+- Use the same five sections and the same facts as the short version, with level-two headings.
 - Keep it within 3,800 visible characters. Level-three `走强方向` and `转弱方向` headings are allowed here.
 - Add only up to five decision-changing intraday turns, stronger/weaker comparisons, and at most two strong plus two weak cases.
 - Use no more than five directions, six representative stocks, two ETFs, and one table of at most six rows.
 - Keep the same three next-session observations as the short version.
 - Do not restore complete Top lists, data-status sections, methodology sections, or generic risk disclaimers.
 - Word uses the same body as long Markdown. Word conversion must not delay the Markdown reports.
+- When reliable breadth, MA21, new-high/new-low, concentration, session-return, or multi-period index data exists,
+  long may append a quantitative appendix. Read `references/visual-edition.md`; do not restore repeated Top lists.
+
+### Visual Version
+
+- `visual` is a deterministic HTML rendering of the same short/long facts, not another model summary.
+- The first screen carries the short conclusion; charts drill into the long analysis; the quantitative appendix is
+  collapsed by default.
+- Date, state, direction labels, representatives, key numbers, and the three observations must match short and long.
+- Missing formal close changes the whole page to `A股午后观察`; visual failure must not block Markdown.
 
 ### Language
 
@@ -140,6 +158,8 @@ Do not expose production language such as gate, evidence level, data completenes
 Do not provide direct trading instructions, target prices, stop-loss levels, automated orders, exact position sizes, or account-identity claims.
 
 If the available Signals context does not cover the formal close, title the chat output `A股午后观察`; do not save it or present it as a formal postmarket replay.
+Even then, the first visible line must be the title. Never prepend or append `formal_ready`, close-source, internal-state,
+replay-mode, or “no file written” explanations.
 
 When the user asks only to generate, replay, preview, or compare and does not explicitly ask to save, return the short report in chat only. Do not create or modify a report, memory, log, or archive. Write files only for an explicitly requested save or a formal automated run.
 
