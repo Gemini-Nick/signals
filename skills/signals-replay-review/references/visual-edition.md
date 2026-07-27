@@ -26,5 +26,17 @@ The page is short first screen, long-form chart drill-down, then a collapsed app
 the page to `A股午后观察`. Missing minute data removes sparklines. Incomparable industry turnover must not control
 arrow or Sankey width.
 
+For `schema_version: "2.0"`, render independent `markets[]` panels:
+
+- `A` remains the primary full-market panel and retains the existing quantitative groups.
+- `HK` uses HSI, HSCEI, HSTECH, market breadth when the full daily universe is fresh, internet anchors, A+H pairs,
+  and optional core-minute session structure. It never uses the A-share limit-pool vocabulary.
+- `US` uses the latest completed US session, five core index families, VIX, Mag7, AI-chain representatives, and
+  optional first/last-hour structure. Breadth and turnover are labelled as core-universe metrics unless a
+  consolidated feed supports a broader claim.
+- Display each market's session date, timezone, currency, and coverage scope. Never add CNY, HKD, and USD turnover.
+- `cross_market_links[]` may express relative strength, divergence, and representative-pair moves. It may not infer
+  customer relationships, account identity, or net fund flow.
+
 Reject known reconstruction traps: conflicting close versus intraday exact returns, swapped Top-table columns,
 new-listing returns rendered as zero, truncated "weakest" industry labels, or turnover described as net inflow.

@@ -16,6 +16,7 @@ from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
 from signals.core.macro_universe import macro_a_index_codes
+from signals.data.bar_quality import validate_ohlcv_bar
 from ..proxy import em_proxy
 from ..retry import sync_retry
 
@@ -67,8 +68,15 @@ def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict], re
     for doc in docs:
         item = dict(doc)
         item["meta"] = {**item.get("meta", {}), "symbol": symbol, "freq": freq, "asset_type": "index"}
+        if all(field in item for field in ("open", "high", "low", "close", "vol", "dt")):
+            accepted, reason = validate_ohlcv_bar(item, allow_zero_volume=False)
+            if not accepted:
+                logger.warning("reject index bar %s %s: %s", symbol, item.get("dt"), reason)
+                continue
         index_docs.append(item)
         bars_docs.append(dict(item))
+    if not index_docs:
+        return 0
 
     index_col = db["index_bars"]
     index_col.delete_many({"meta.symbol": symbol, "meta.freq": freq})
@@ -144,6 +152,11 @@ def _replace_exact_bar_docs(col, docs: list[dict]) -> int:
         dt = item.get("dt")
         if not symbol or not freq or dt is None:
             continue
+        if all(field in item for field in ("open", "high", "low", "close", "vol", "dt")):
+            accepted, reason = validate_ohlcv_bar(item, allow_zero_volume=False)
+            if not accepted:
+                logger.warning("reject exact index bar %s %s: %s", symbol, dt, reason)
+                continue
         deduped[(str(symbol), str(freq), dt)] = item
 
     prepared = list(deduped.values())
@@ -501,7 +514,7 @@ def _sync_us_index(db: Database, us_codes: dict):
             data = data.reset_index()
             docs = []
             for _, row in data.iterrows():
-                docs.append({
+                doc = {
                     "dt": pd.to_datetime(scalar(row["Date"])),
                     "meta": {"symbol": futu_code, "freq": "日线", "asset_type": "index", "market": "US", "source": "yfinance"},
                     "open": float(scalar(row["Open"])),
@@ -510,7 +523,12 @@ def _sync_us_index(db: Database, us_codes: dict):
                     "close": float(scalar(row["Close"])),
                     "vol": int(scalar(row["Volume"])) if pd.notna(scalar(row["Volume"])) else 0,
                     "amount": 0,
-                })
+                }
+                accepted, reason = validate_ohlcv_bar(doc, allow_zero_volume=False)
+                if accepted:
+                    docs.append(doc)
+                else:
+                    logger.warning("  ✗ %s %s rejected: %s", name, doc.get("dt"), reason)
 
             if docs:
                 cutoff = naive_market_now("US") - timedelta(days=365 * 5)
@@ -536,6 +554,19 @@ def _sync_us_index(db: Database, us_codes: dict):
                     upsert=True,
                 )
                 logger.info(f"  ✓ {name}: {written} bars")
+            else:
+                sync_col.update_one(
+                    {"_id": f"index_daily:{futu_code}"},
+                    {"$set": {
+                        "module": "index_daily",
+                        "symbol": futu_code,
+                        "last_run": naive_market_now("US"),
+                        "status": "unavailable",
+                        "bar_count": 0,
+                        "reason": "provider_rows_failed_ohlcv_validation",
+                    }},
+                    upsert=True,
+                )
 
         except Exception as e:
             logger.error(f"  ✗ {name}: {e}")

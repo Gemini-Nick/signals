@@ -1,0 +1,62 @@
+version: "2026.07.1"
+
+markets:
+  HK:
+    timezone: Asia/Hong_Kong
+    currency: HKD
+    coverage_scope: full_market
+    indices:
+      - {symbol: HK.800000, name: 恒生指数, exchange: HKEX, instrument_kind: index}
+      - {symbol: HK.800100, name: 恒生中国企业指数, exchange: HKEX, instrument_kind: index}
+      - {symbol: HK.800700, name: 恒生科技指数, exchange: HKEX, instrument_kind: index}
+    anchors:
+      - {symbol: HK.00700, name: 腾讯控股, exchange: HKEX, group: hk_internet}
+      - {symbol: HK.09988, name: 阿里巴巴-W, exchange: HKEX, group: hk_internet}
+      - {symbol: HK.03690, name: 美团-W, exchange: HKEX, group: hk_internet}
+      - {symbol: HK.01810, name: 小米集团-W, exchange: HKEX, group: hk_internet}
+      - {symbol: HK.09618, name: 京东集团-SW, exchange: HKEX, group: hk_internet}
+      - {symbol: HK.09999, name: 网易-S, exchange: HKEX, group: hk_internet}
+      - {symbol: HK.01024, name: 快手-W, exchange: HKEX, group: hk_internet}
+      - {symbol: HK.09888, name: 百度集团-SW, exchange: HKEX, group: hk_internet}
+
+  US:
+    timezone: America/New_York
+    currency: USD
+    coverage_scope: core_universe
+    indices:
+      - {symbol: US.SPY, name: 标普500, exchange: ARCA, instrument_kind: etf_proxy, proxy_for: S&P 500}
+      - {symbol: US.QQQ, name: 纳斯达克100, exchange: NASDAQ, instrument_kind: etf_proxy, proxy_for: Nasdaq-100}
+      - {symbol: US.DIA, name: 道琼斯工业指数, exchange: ARCA, instrument_kind: etf_proxy, proxy_for: Dow Jones Industrial Average}
+      - {symbol: US.SOXX, name: 费城半导体指数, exchange: NASDAQ, instrument_kind: etf_proxy, proxy_for: PHLX Semiconductor Sector}
+      - {symbol: US.IWM, name: 罗素2000, exchange: ARCA, instrument_kind: etf_proxy, proxy_for: Russell 2000}
+      - {symbol: US.VIXY, name: VIX风险温度, exchange: ARCA, instrument_kind: etf_proxy, proxy_for: CBOE Volatility Index, role: risk_gauge}
+    anchors:
+      - {symbol: US.AAPL, name: Apple, exchange: NASDAQ, group: mag7}
+      - {symbol: US.MSFT, name: Microsoft, exchange: NASDAQ, group: mag7}
+      - {symbol: US.NVDA, name: NVIDIA, exchange: NASDAQ, group: mag7}
+      - {symbol: US.AMZN, name: Amazon, exchange: NASDAQ, group: mag7}
+      - {symbol: US.GOOGL, name: Alphabet, exchange: NASDAQ, group: mag7}
+      - {symbol: US.META, name: Meta Platforms, exchange: NASDAQ, group: mag7}
+      - {symbol: US.TSLA, name: Tesla, exchange: NASDAQ, group: mag7}
+
+a_h_pairs:
+  - issuer_id: issuer:smic
+    name: 中芯国际
+    a_symbol: SH.688981
+    h_symbol: HK.00981
+  - issuer_id: issuer:hua_hong_semiconductor
+    name: 华虹公司
+    a_symbol: SH.688347
+    h_symbol: HK.01347
+  - issuer_id: issuer:catl
+    name: 宁德时代
+    a_symbol: SZ.300750
+    h_symbol: HK.03750
+  - issuer_id: issuer:byd
+    name: 比亚迪
+    a_symbol: SZ.002594
+    h_symbol: HK.01211
+  - issuer_id: issuer:zte
+    name: 中兴通讯
+    a_symbol: SZ.000063
+    h_symbol: HK.00763

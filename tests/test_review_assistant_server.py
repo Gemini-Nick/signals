@@ -139,3 +139,11 @@ def test_market_replay_tool_exposes_report_stage_contract():
     report_stage = tool["inputSchema"]["properties"]["report_stage"]
     assert report_stage["enum"] == ["close_flash", "formal_postmarket"]
     assert report_stage["default"] == "formal_postmarket"
+
+
+def test_market_replay_tool_exposes_backward_compatible_markets_contract():
+    tool = next(item for item in review_assistant_server._tool_schema() if item["name"] == "get_market_replay_context")
+    markets = tool["inputSchema"]["properties"]["markets"]
+
+    assert markets["default"] == ["A"]
+    assert markets["items"]["enum"] == ["A", "HK", "US"]

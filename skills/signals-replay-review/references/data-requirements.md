@@ -155,6 +155,24 @@ Evidence level:
 - MCP framework package from `get_replay_analysis_framework`, which should be treated as the reusable AI reasoning contract.
 - `extra_facts[]` in MCP or `--extra-fact` in CLI for externally verified screenshot/news facts that are not present in local Signals endpoints.
 
+## Global Visual Additions
+
+These groups extend the visual edition without enlarging the A-share short report.
+
+- Keep a versioned fixed-plus-dynamic universe. Fixed anchors include HSI/HSCEI/HSTECH, major Hong Kong internet
+  names, A+H technology pairs, US broad/technology/small-cap index anchors, VIX, Mag7, and representatives from the
+  existing cross-market AI hardware chain.
+- Hong Kong may use validated full-market daily bars for breadth; its core indices and anchors use minute bars only
+  when a reliable formal source is available.
+- US breadth, turnover, MA21, highs/lows, volatility, and drawdown are explicitly `core_universe` unless a
+  consolidated full-market feed is present. IEX coverage must not be described as the US whole market.
+- Every market snapshot carries `session_date`, `as_of`, `timezone`, `currency`, `session_state`,
+  `coverage_scope`, and `universe_id`.
+- Reject non-finite prices, invalid OHLC relationships, negative volume/amount, duplicate bars, and future session
+  dates before a snapshot can be formal.
+- HKD, USD, and CNY turnover remain separate. Price and turnover participation do not prove net inflow.
+- Do not create Hong Kong or US limit-up, failed-limit, limit-down, or consecutive-limit metrics.
+
 ## Local Coverage Notes
 
 For 2026-06-05, local sources were enough for:

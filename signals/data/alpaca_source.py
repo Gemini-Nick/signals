@@ -24,12 +24,27 @@ class AlpacaSource:
     无状态 REST API，线程安全，无需 connect/close。
     """
 
-    def __init__(self, api_key: str, secret_key: str):
+    SUPPORTED_FEEDS = {"iex", "sip", "delayed_sip", "otc", "boats", "overnight"}
+
+    def __init__(self, api_key: str, secret_key: str, *, feed: str = "iex"):
         if not api_key or not secret_key:
             raise ValueError("ALPACA_API_KEY / ALPACA_SECRET_KEY 未配置")
         self.api_key = api_key
         self.secret_key = secret_key
+        self.feed = self._normalize_feed(feed)
         self._client = None
+
+    @classmethod
+    def _normalize_feed(cls, value: str) -> str:
+        feed = str(value or "iex").strip().lower()
+        if feed not in cls.SUPPORTED_FEEDS:
+            raise ValueError(f"unsupported Alpaca data feed: {value}")
+        return feed
+
+    def _data_feed(self):
+        from alpaca.data.enums import DataFeed
+
+        return DataFeed(self.feed)
 
     def _get_client(self):
         """懒加载 Alpaca 客户端"""
@@ -82,6 +97,7 @@ class AlpacaSource:
             timeframe=timeframe,
             start=start_dt,
             end=end_dt,
+            feed=self._data_feed(),
         )
 
         bars_set = client.get_stock_bars(request)

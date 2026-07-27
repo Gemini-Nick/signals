@@ -18,6 +18,8 @@ from signals.notify.trading_workbench_summary import (
     _market_replay_sector_rows,
 )
 from signals.replay.market_replay import build_market_replay_context, replay_analysis_framework
+from signals.core.global_market_universe import market_metadata, normalize_markets
+from signals.sync.modules.global_market_foundation import latest_market_snapshot
 from signals.sync.db import get_db
 
 
@@ -139,6 +141,12 @@ def _tool_schema() -> list[dict[str, Any]]:
                     "trade_date": {
                         "type": "string",
                         "description": "YYYY-MM-DD. Defaults to dashboard/snapshot trade date.",
+                    },
+                    "markets": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["A", "HK", "US"]},
+                        "default": ["A"],
+                        "description": "Optional market set. A-only remains the backward-compatible default; HK/US use independently dated materialized snapshots.",
                     },
                     "cutoff_time": {
                         "type": "string",
@@ -531,6 +539,7 @@ def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
     source_trade_date = _as_of_date(dashboard, snapshot)
     historical_requested = bool(explicit_trade_date and trade_date != source_trade_date)
     db = get_db()
+    requested_markets = normalize_markets(arguments.get("markets") if isinstance(arguments.get("markets"), list) else None)
     if cutoff_time:
         context = _build_intraday_cutoff_context(db, trade_date, cutoff_time)
         context["report_stage"] = report_stage
@@ -592,7 +601,7 @@ def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
             "line": "历史日期请求未复用当前 dashboard 指数；指数口径以 market_replay.index_cycle 和本地 index_bars 为准。",
             "changes": {},
         }
-    return {
+    result = {
         "trade_date": trade_date,
         "requested_trade_date": str(arguments.get("trade_date") or trade_date),
         "data_trade_date": context.get("trade_date") or trade_date,
@@ -605,6 +614,36 @@ def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
         "signals_context": base_context,
         "market_replay": context,
     }
+    if "markets" in arguments:
+        global_markets: list[dict[str, Any]] = []
+        for market in requested_markets:
+            if market == "A":
+                global_markets.append(
+                    {
+                        **market_metadata("A"),
+                        "session_date": trade_date,
+                        "as_of": context.get("coverage", {}).get("official_close_as_of"),
+                        "session_state": "complete" if context.get("coverage", {}).get("formal_ready") else "partial",
+                        "source": "market_replay",
+                    }
+                )
+                continue
+            snapshot_doc = latest_market_snapshot(db, market, session_date=trade_date)
+            if snapshot_doc:
+                global_markets.append(snapshot_doc)
+            else:
+                global_markets.append(
+                    {
+                        **market_metadata(market),
+                        "session_date": None,
+                        "as_of": None,
+                        "session_state": "unavailable",
+                        "source": "market_daily_snapshots",
+                    }
+                )
+        result["requested_markets"] = requested_markets
+        result["global_markets"] = global_markets
+    return result
 
 
 def _handle(message: dict[str, Any]) -> dict[str, Any] | None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from signals.sync.modules import index_daily
+from signals.data.bar_quality import validate_ohlcv_bar
 
 
 class _DeleteResult:
@@ -130,3 +131,33 @@ def test_index_daily_quote_candidates_do_not_match_stock_code_collision():
     assert "SH.000001" in candidates
     assert "sh000001" in candidates
     assert "000001" not in candidates
+
+
+def test_us_index_nan_regression_is_rejected_before_persistence():
+    bad = {
+        "dt": datetime(2026, 7, 24),
+        "open": 620.0,
+        "high": 625.0,
+        "low": 615.0,
+        "close": float("nan"),
+        "vol": 100,
+        "amount": 0,
+    }
+
+    accepted, reason = validate_ohlcv_bar(bad)
+
+    assert accepted is False
+    assert reason == "non_finite_price"
+
+    col = _FakeCollection()
+    written = index_daily._replace_exact_bar_docs(
+        col,
+        [
+            {
+                **bad,
+                "meta": {"symbol": "US.DIA", "freq": "日线", "market": "US"},
+            }
+        ],
+    )
+    assert written == 0
+    assert col.inserted_docs == []

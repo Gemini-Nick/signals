@@ -134,6 +134,9 @@ Both versions answer the same five questions. The short version uses inline bold
 - Keep the same three next-session observations as the short version.
 - Do not restore complete Top lists, data-status sections, methodology sections, or generic risk disclaimers.
 - Word uses the same body as long Markdown. Word conversion must not delay the Markdown reports.
+- After the five A-share sections, add at most one compact `跨市场联动` paragraph. It may use the same-day
+  completed Hong Kong session and the latest completed US session to explain what changed for A-share technology
+  risk appetite. Do not copy overseas rankings into the long report.
 - When reliable breadth, MA21, new-high/new-low, concentration, session-return, or multi-period index data exists,
   long may append a quantitative appendix. Read `references/visual-edition.md`; do not restore repeated Top lists.
 
@@ -142,6 +145,10 @@ Both versions answer the same five questions. The short version uses inline bold
 - `visual` is a deterministic HTML rendering of the same short/long facts, not another model summary.
 - The first screen carries the short conclusion; charts drill into the long analysis; the quantitative appendix is
   collapsed by default.
+- The global page orders six reader chapters: global one-line view, A-share market, Hong Kong market and internet
+  leaders, US indices plus Mag7/AI chain, A+H and China-US AI-chain links, and next-session observations.
+- Each market keeps its own completed session date, timezone, currency, and coverage scope. Hong Kong and US
+  sections must not inherit A-share limit-up/failed-limit language.
 - Date, state, direction labels, representatives, key numbers, and the three observations must match short and long.
 - Missing formal close changes the whole page to `A股午后观察`; visual failure must not block Markdown.
 
@@ -189,6 +196,8 @@ Tools:
 
 - `get_signals_replay_context`: compact local Signals context.
 - `get_market_replay_context`: full-market event graph from local endpoints and Mongo.
+- `get_market_replay_context` accepts optional `markets=["A","HK","US"]`; omitting it preserves the A-share-only
+  response. At A-share postmarket, US means the latest completed US session, not the Beijing calendar date.
 - `get_replay_analysis_framework`: reusable internal reasoning framework.
 - `render_market_replay_wechat_body`: deterministic intraday WeChat body.
 - `generate_signals_replay_review`: deterministic evidence preview, not the final recurring WeChat body.

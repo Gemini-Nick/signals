@@ -650,14 +650,14 @@ class FutuSource:
         ret, data = self._ctx.subscribe(codes, sub_types)
         return ret, data
 
-    def get_index_kline(self, futu_code: str, freq: Freq,
-                        lookback_days: int = 180,
-                        start: str = None) -> List[RawBar]:
+    def get_history_kline(self, futu_code: str, freq: Freq,
+                          lookback_days: int = 180,
+                          start: str = None) -> List[RawBar]:
         """
-        HK/港股指数历史K线（用于恒生科技 HK.800700）。
+        Futu 通用历史K线，支持权限范围内的港股指数和股票。
         盘中模式：lookback_days（默认180自然日）
         盘后复盘：传 start（如 '2024-09-24'）
-        freq: Freq.D（日线）/ Freq.W（周线）
+        freq: Freq.D（日线）/ Freq.W（周线）/ 分钟线
         注意：使用 request_history_kline，每次消耗1个历史K线额度。
         """
         from futu import KLType, AuType, RET_OK
@@ -679,6 +679,17 @@ class FutuSource:
         df["amount"] = df["amount"].fillna(0)
         return _to_raw_bars(df, futu_code, freq,
                             "dt", "open", "high", "low", "close", "vol", "amount")
+
+    def get_index_kline(self, futu_code: str, freq: Freq,
+                        lookback_days: int = 180,
+                        start: str = None) -> List[RawBar]:
+        """兼容旧调用的指数历史K线入口。"""
+        return self.get_history_kline(
+            futu_code,
+            freq,
+            lookback_days=lookback_days,
+            start=start,
+        )
 
     def get_index_minute_hk(self, futu_code: str, freq: Freq,
                              num: int = 500) -> List[RawBar]:

@@ -11,7 +11,7 @@ from typing import Any
 
 import pandas as pd
 
-from signals.core.market_hours import TZ_BEIJING, TZ_US_EAST, TZ_UTC
+from signals.core.market_hours import TZ_BEIJING, TZ_HK, TZ_US_EAST, TZ_UTC
 
 MARKET_TIMEZONES = {
     "A": TZ_BEIJING,
@@ -19,8 +19,8 @@ MARKET_TIMEZONES = {
     "SH": TZ_BEIJING,
     "SZ": TZ_BEIJING,
     "BJ": TZ_BEIJING,
-    "HK": TZ_BEIJING,
-    "H": TZ_BEIJING,
+    "HK": TZ_HK,
+    "H": TZ_HK,
     "US": TZ_US_EAST,
     "NYSE": TZ_US_EAST,
     "NASDAQ": TZ_US_EAST,

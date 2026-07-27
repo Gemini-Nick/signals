@@ -30,6 +30,7 @@ from .concept_relationship_graph import sync_concept_relationship_graph
 from .calendar_validate import sync_calendar_validate
 from .postmarket_chain_rebuild import sync_postmarket_chain_rebuild
 from .security_business_facts import sync_security_business_facts
+from .global_market_foundation import sync_global_market_foundation
 
 ALL_MODULES = [
     ("calendar_validate", sync_calendar_validate, "08:30 weekday"),
@@ -50,6 +51,7 @@ ALL_MODULES = [
     ("hk_stock_daily", sync_hk_stock_daily, "16:15-19:30 weekday"),
     ("stock_30m_fullmarket", sync_stock_30m_fullmarket, "17:00-20:30 weekday"),
     ("index_daily",   sync_index_daily,   "16:00-17:30 weekday"),
+    ("global_market_foundation", sync_global_market_foundation, "after HK/US daily close"),
     ("weekly_rollup", sync_weekly_rollup, "17:30-18:00 weekday"),
     ("board_ranking", sync_board_ranking, "18:00-21:00 weekday"),
     ("board_cons",    sync_board_cons,    "18:00-21:00 weekday"),

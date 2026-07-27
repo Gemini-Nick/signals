@@ -38,6 +38,7 @@ logger = logging.getLogger("signals.market_hours")
 # ── 时区 ──────────────────────────────────────────────────
 TZ_UTC = ZoneInfo("UTC")
 TZ_BEIJING = ZoneInfo("Asia/Shanghai")
+TZ_HK = ZoneInfo("Asia/Hong_Kong")
 TZ_US_EAST = ZoneInfo("America/New_York")
 
 # ── 交易时段（本地时间）─ fallback 用 ────────────────────

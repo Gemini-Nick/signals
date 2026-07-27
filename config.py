@@ -87,13 +87,18 @@ INDEX_AK_CODES = {
 }
 # HK指数（Futu格式，AKShare超时故走Futu）
 INDEX_FUTU_CODES = {
+    "恒生指数": "HK.800000",
+    "恒生国企": "HK.800100",
     "恒生科技": "HK.800700",
 }
 # 美股指数 ETF（Futu格式，Layer 1 三级联动）
 INDEX_US_CODES = {
     "标普500":  "US.SPY",
-    "纳斯达克": "US.QQQ",
+    "纳斯达克100": "US.QQQ",
     "道琼斯":   "US.DIA",
+    "费城半导体": "US.SOXX",
+    "罗素2000": "US.IWM",
+    "VIX风险温度": "US.VIXY",
 }
 # 合并索引，供统一遍历
 INDEX_CODES = {**INDEX_AK_CODES, **INDEX_FUTU_CODES, **INDEX_US_CODES}

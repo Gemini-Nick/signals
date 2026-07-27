@@ -82,3 +82,11 @@ def test_visual_edition_is_deterministic_and_optional():
     assert "deterministic HTML rendering" in text
     assert "A股盘后可视复盘_YYYY-MM-DD_Signals原生.html" in text
     assert "visual failure must not block Markdown" in text
+
+
+def test_global_visual_keeps_market_sessions_and_scopes_distinct():
+    text = SKILL.read_text(encoding="utf-8")
+    assert "add at most one compact `跨市场联动` paragraph" in text
+    assert "global one-line view" in text
+    assert "latest completed US session" in text
+    assert 'markets=["A","HK","US"]' in text

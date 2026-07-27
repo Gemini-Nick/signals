@@ -88,6 +88,7 @@ def ensure_storage_model(db: Database) -> None:
 
     _safe_create_index(db["bars"], [("meta.symbol", ASCENDING), ("meta.freq", ASCENDING), ("dt", ASCENDING)])
     _safe_create_index(db["bars"], [("meta.freq", ASCENDING), ("dt", DESCENDING), ("meta.symbol", ASCENDING)])
+    _safe_create_index(db["bars"], [("meta.market", ASCENDING), ("meta.freq", ASCENDING), ("dt", DESCENDING)])
     _safe_create_index(db["kline_cache"], [("code", ASCENDING), ("freq", ASCENDING), ("dt", ASCENDING)])
     _safe_create_index(db["index_bars"], [("meta.symbol", ASCENDING), ("meta.freq", ASCENDING), ("dt", ASCENDING)])
     _safe_create_index(db["index_bars"], [("meta.freq", ASCENDING), ("dt", DESCENDING), ("meta.symbol", ASCENDING)])
@@ -105,6 +106,10 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["source_board_chain_mappings"], [("trade_date", ASCENDING), ("mapping_status", ASCENDING), ("chain_id", ASCENDING), ("node_id", ASCENDING)])
     _safe_create_index(db["security_master"], [("market", ASCENDING), ("symbol", ASCENDING)], unique=True, sparse=True)
     _safe_create_index(db["security_master"], [("issuer_id", ASCENDING), ("market", ASCENDING)])
+    _safe_create_index(db["market_universe_membership"], [("universe_version", ASCENDING), ("market", ASCENDING), ("symbol", ASCENDING)], unique=True)
+    _safe_create_index(db["market_universe_membership"], [("market", ASCENDING), ("role", ASCENDING), ("priority", DESCENDING)])
+    _safe_create_index(db["market_daily_snapshots"], [("market", ASCENDING), ("session_date", DESCENDING)], unique=True)
+    _safe_create_index(db["market_daily_snapshots"], [("session_state", ASCENDING), ("updated_at", DESCENDING)])
     _safe_create_index(db["security_business_facts"], [("raw_code", ASCENDING)], unique=True, sparse=True)
     _safe_create_index(db["security_business_facts"], [("status", ASCENDING), ("updated_at", DESCENDING)])
     _safe_create_index(db["security_business_facts"], [("business_terms", ASCENDING), ("status", ASCENDING)])
