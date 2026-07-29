@@ -86,6 +86,14 @@ Build the analysis from `signals_context`, `market_replay`, and `analysis_framew
 
 Minute data supports timing only when it is available up to the requested cutoff. Missing optional detail should shorten the report, not create a reader-facing system explanation.
 
+### Sector Transition Events
+
+- Consume `market_replay.sector_transitions.timeline`, `states`, and `next_checks` as Python-produced evidence.
+- Consume only: do not recalculate indicators, infer a missing state, or promote/downgrade a board in the skill.
+- Use no more than the six timeline rows returned by Signals, and select only changes that alter the daily judgment.
+- If the event package is empty, omit the transition sentence instead of rebuilding it from raw minute bars.
+- Rephrase structured next checks into trader-readable observations. Do not change notification routing, send decisions, or three-pool membership.
+
 ## Reader-Facing Daily Report
 
 Short Markdown:
@@ -134,9 +142,10 @@ Both versions answer the same five questions. The short version uses inline bold
 - Keep the same three next-session observations as the short version.
 - Do not restore complete Top lists, data-status sections, methodology sections, or generic risk disclaimers.
 - Word uses the same body as long Markdown. Word conversion must not delay the Markdown reports.
-- After the five A-share sections, add at most one compact `跨市场联动` paragraph. It may use the same-day
-  completed Hong Kong session and the latest completed US session to explain what changed for A-share technology
-  risk appetite. Do not copy overseas rankings into the long report.
+- After the five A-share sections, add at most one compact `跨市场联动` paragraph. It may use independently dated
+  completed Hong Kong/Korean sessions and the latest completed US session to explain what changed for A-share
+  technology risk appetite. Korean context is explicit-request only and cannot upgrade or downgrade the A-share
+  state. Do not copy overseas rankings into the long report.
 - When reliable breadth, MA21, new-high/new-low, concentration, session-return, or multi-period index data exists,
   long may append a quantitative appendix. Read `references/visual-edition.md`; do not restore repeated Top lists.
 
@@ -196,8 +205,10 @@ Tools:
 
 - `get_signals_replay_context`: compact local Signals context.
 - `get_market_replay_context`: full-market event graph from local endpoints and Mongo.
-- `get_market_replay_context` accepts optional `markets=["A","HK","US"]`; omitting it preserves the A-share-only
-  response. At A-share postmarket, US means the latest completed US session, not the Beijing calendar date.
+- `get_market_replay_context` accepts optional `markets=["A","HK","US","KR"]`; omitting it preserves the A-share-only
+  response. KR requires an explicit request plus `SECTOR_TRANSITION_KR_CONTEXT_ENABLED=true`; otherwise return it as
+  disabled/unavailable. It remains external context only. At A-share postmarket, US means the latest completed US
+  session, not the Beijing calendar date.
 - `get_replay_analysis_framework`: reusable internal reasoning framework.
 - `render_market_replay_wechat_body`: deterministic intraday WeChat body.
 - `generate_signals_replay_review`: deterministic evidence preview, not the final recurring WeChat body.

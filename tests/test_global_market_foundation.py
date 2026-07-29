@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
 from signals.core.global_market_universe import (
     load_global_market_universe,
     market_metadata,
@@ -34,18 +36,27 @@ def test_ohlcv_quality_rejects_nan_and_invalid_ranges():
     assert validate_ohlcv_bar(_bar(vol=0)) == (False, "invalid_volume")
 
 
-def test_global_universe_has_fixed_hk_us_anchors_and_ai_chain():
+def test_global_universe_has_fixed_hk_us_anchors_and_disabled_kr_context():
     config = load_global_market_universe()
     hk = {item["symbol"]: item for item in market_universe("HK")}
     us = {item["symbol"]: item for item in market_universe("US")}
+    kr = {item["symbol"]: item for item in market_universe("KR")}
 
-    assert config["version"] == "2026.07.1"
+    assert config["version"] == "2026.07.2"
     assert {"HK.800000", "HK.800100", "HK.800700", "HK.00700", "HK.09988"} <= hk.keys()
     assert {"US.SPY", "US.QQQ", "US.DIA", "US.SOXX", "US.IWM", "US.VIXY"} <= us.keys()
     assert {"US.AAPL", "US.MSFT", "US.NVDA", "US.AMZN", "US.GOOGL", "US.META", "US.TSLA"} <= us.keys()
     assert {"US.AVGO", "US.ANET", "US.COHR", "US.VRT", "US.MU", "US.TSM"} <= us.keys()
+    assert {"KR.KOSPI", "KR.000660"} <= kr.keys()
     assert us["US.SPY"]["proxy_for"] == "S&P 500"
     assert market_metadata("US")["coverage_scope"] == "core_universe"
+    assert market_metadata("KR") == {
+        "market": "KR",
+        "timezone": "Asia/Seoul",
+        "currency": "KRW",
+        "coverage_scope": "core_universe",
+        "enabled_by_default": False,
+    }
 
 
 def test_a_h_pairs_share_issuer_and_linked_listing():
@@ -62,7 +73,7 @@ def test_market_membership_is_versioned_and_fixed():
     docs = foundation.universe_membership_documents(effective_date="2026-07-27")
     nvda = next(doc for doc in docs if doc["symbol"] == "US.NVDA")
 
-    assert nvda["_id"].startswith("2026.07.1:US:")
+    assert nvda["_id"].startswith("2026.07.2:US:")
     assert nvda["fixed"] is True
     assert nvda["role"] == "anchor"
 
@@ -70,6 +81,28 @@ def test_market_membership_is_versioned_and_fixed():
 def test_markets_parameter_is_normalized_and_a_only_by_default():
     assert normalize_markets(None) == ["A"]
     assert normalize_markets(["cn", "HK", "us", "US"]) == ["A", "HK", "US"]
+    assert normalize_markets(["kospi", "KR"]) == ["KR"]
+
+
+def test_kr_foundation_requires_explicit_request_and_feature_flag(monkeypatch):
+    monkeypatch.delenv("SECTOR_TRANSITION_KR_CONTEXT_ENABLED", raising=False)
+
+    assert foundation._requested_foundation_markets() == ("HK", "US")
+    assert foundation._requested_foundation_markets(["KR"]) == ()
+    assert foundation.security_master_documents(as_of="2026-07-29", markets=["KR"]) == []
+    with pytest.raises(RuntimeError, match="KR context disabled"):
+        foundation.build_market_daily_snapshot(_NeverWriteDb(), "KR")
+
+    monkeypatch.setenv("SECTOR_TRANSITION_KR_CONTEXT_ENABLED", "true")
+
+    assert foundation._requested_foundation_markets() == ("HK", "US")
+    assert foundation._requested_foundation_markets(["KR"]) == ("KR",)
+    docs = {doc["symbol"]: doc for doc in foundation.security_master_documents(as_of="2026-07-29", markets=["KR"])}
+    memberships = foundation.universe_membership_documents(effective_date="2026-07-29", markets=["KR"])
+    assert set(docs) == {"KR.KOSPI", "KR.000660"}
+    assert docs["KR.000660"]["timezone"] == "Asia/Seoul"
+    assert docs["KR.000660"]["currency"] == "KRW"
+    assert {row["symbol"] for row in memberships} == {"KR.KOSPI", "KR.000660"}
 
 
 def test_hk_partial_latest_shard_falls_back_to_last_complete_session():

@@ -164,13 +164,20 @@ def sync_market_limit_pools(db: Database, trade_date: str | None = None, proxy_u
     snapshot_at = _snapshot_at_for_trade_date(day, now, explicit_trade_date=trade_date is not None)
     docs: list[dict[str, Any]] = []
     errors: dict[str, str] = {}
+    pool_status: dict[str, dict[str, Any]] = {}
     with em_proxy(proxy_url):
         for pool, spec in POOL_SPECS.items():
             try:
                 raw_rows = _fetch_pool(ak, str(spec["akshare_fn"]), date_compact)
             except Exception as exc:
                 errors[pool] = f"{exc.__class__.__name__}: {str(exc)[:160]}"
+                pool_status[pool] = {"status": "failed", "row_count": 0, "error": errors[pool]}
                 continue
+            pool_status[pool] = {
+                "status": "success_empty" if not raw_rows else "success",
+                "row_count": len(raw_rows),
+                "error": "",
+            }
             for row in raw_rows:
                 doc = _normalize_row(
                     row,
@@ -183,6 +190,10 @@ def sync_market_limit_pools(db: Database, trade_date: str | None = None, proxy_u
                     docs.append(doc)
 
     if not docs:
+        successful_pools = sorted(
+            pool for pool, item in pool_status.items()
+            if str(item.get("status") or "").startswith("success")
+        )
         db["data_freshness"].update_one(
             {"domain": "market_limit_pools", "market": "A", "trade_date": day},
             {
@@ -192,15 +203,24 @@ def sync_market_limit_pools(db: Database, trade_date: str | None = None, proxy_u
                     "trade_date": day,
                     "snapshot_at": snapshot_at,
                     "snapshot_minute": snapshot_at.strftime("%H:%M"),
-                    "freshness": "empty",
+                    "freshness": "fresh" if not errors and len(successful_pools) == len(POOL_SPECS) else "partial",
                     "updated_at": snapshot_at,
                     "count": 0,
+                    "pools": successful_pools,
+                    "pool_status": pool_status,
                     "errors": errors,
                 }
             },
             upsert=True,
         )
-        return {"status": "empty", "trade_date": day, "upserted": 0, "errors": errors}
+        return {
+            "status": "empty" if not errors else "partial",
+            "trade_date": day,
+            "upserted": 0,
+            "pools": successful_pools,
+            "pool_status": pool_status,
+            "errors": errors,
+        }
 
     ops = [
         UpdateOne(
@@ -225,10 +245,14 @@ def sync_market_limit_pools(db: Database, trade_date: str | None = None, proxy_u
                 "trade_date": day,
                 "snapshot_at": snapshot_at,
                 "snapshot_minute": snapshot_at.strftime("%H:%M"),
-                "freshness": "fresh",
+                "freshness": "fresh" if not errors else "partial",
                 "updated_at": snapshot_at,
                 "count": len(docs),
-                "pools": sorted({doc["pool"] for doc in docs}),
+                "pools": sorted(
+                    pool for pool, item in pool_status.items()
+                    if str(item.get("status") or "").startswith("success")
+                ),
+                "pool_status": pool_status,
                 "errors": errors,
             }
         },
@@ -241,6 +265,11 @@ def sync_market_limit_pools(db: Database, trade_date: str | None = None, proxy_u
         "modified": result.modified_count,
         "upserted": len(result.upserted_ids),
         "count": len(docs),
+        "pools": sorted(
+            pool for pool, item in pool_status.items()
+            if str(item.get("status") or "").startswith("success")
+        ),
+        "pool_status": pool_status,
         "errors": errors,
     }
 

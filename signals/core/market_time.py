@@ -11,7 +11,7 @@ from typing import Any
 
 import pandas as pd
 
-from signals.core.market_hours import TZ_BEIJING, TZ_HK, TZ_US_EAST, TZ_UTC
+from signals.core.market_hours import TZ_BEIJING, TZ_HK, TZ_KR, TZ_US_EAST, TZ_UTC
 
 MARKET_TIMEZONES = {
     "A": TZ_BEIJING,
@@ -21,6 +21,10 @@ MARKET_TIMEZONES = {
     "BJ": TZ_BEIJING,
     "HK": TZ_HK,
     "H": TZ_HK,
+    "KR": TZ_KR,
+    "KOREA": TZ_KR,
+    "KOSPI": TZ_KR,
+    "KOSDAQ": TZ_KR,
     "US": TZ_US_EAST,
     "NYSE": TZ_US_EAST,
     "NASDAQ": TZ_US_EAST,
@@ -29,6 +33,7 @@ MARKET_TIMEZONES = {
 
 US_SOURCE_HINTS = ("alpaca", "yfinance", "polygon", "nasdaq", "nyse")
 HK_SOURCE_HINTS = ("futu_hk", "hk", "hsi", "hang_seng")
+KR_SOURCE_HINTS = ("krx", "kospi", "kosdaq", "korea")
 A_SOURCE_HINTS = ("eastmoney", "ths", "sina", "akshare", "baostock", "tencent")
 
 
@@ -36,13 +41,21 @@ def infer_market(value: Any = "", *, symbol: Any = "", source: Any = "") -> str:
     """Infer market code from explicit value, symbol prefix, or data source hint."""
     explicit = str(value or "").strip().upper()
     if explicit in MARKET_TIMEZONES:
-        return "US" if explicit in {"US", "NYSE", "NASDAQ", "AMEX"} else "A" if explicit in {"CN", "SH", "SZ", "BJ"} else explicit
+        if explicit in {"US", "NYSE", "NASDAQ", "AMEX"}:
+            return "US"
+        if explicit in {"CN", "SH", "SZ", "BJ"}:
+            return "A"
+        if explicit in {"KR", "KOREA", "KOSPI", "KOSDAQ"}:
+            return "KR"
+        return explicit
 
     raw_symbol = str(symbol or value or "").strip().upper()
     if raw_symbol.startswith(("US.", "NYSE.", "NASDAQ.", "AMEX.")):
         return "US"
     if raw_symbol.startswith("HK.") or (raw_symbol.isdigit() and len(raw_symbol) == 5):
         return "HK"
+    if raw_symbol.startswith(("KR.", "KRX.")):
+        return "KR"
     if raw_symbol.startswith(("SH.", "SZ.", "BJ.", "SH", "SZ", "BJ")):
         return "A"
 
@@ -51,6 +64,8 @@ def infer_market(value: Any = "", *, symbol: Any = "", source: Any = "") -> str:
         return "US"
     if any(hint in source_text for hint in HK_SOURCE_HINTS):
         return "HK"
+    if any(hint in source_text for hint in KR_SOURCE_HINTS):
+        return "KR"
     if any(hint in source_text for hint in A_SOURCE_HINTS):
         return "A"
     return "A"

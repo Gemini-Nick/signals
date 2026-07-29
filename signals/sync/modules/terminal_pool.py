@@ -331,6 +331,7 @@ REASON_WEIGHTS = {
     "review_sector_bullish": 420,
     "review_sector_bearish": 0,
     "hot_rank_clue": 390,
+    "sector_transition": 0,
 }
 REVIEW_CLUE_REASON_TYPES = {"review_sector_bullish", "review_sector_bearish"}
 HOT_RANK_CLUE_REASON_TYPES = {"hot_rank_clue"}
@@ -1897,9 +1898,266 @@ def _has_clue_source(row: dict[str, Any]) -> bool:
         if not isinstance(reason, dict):
             continue
         rt = _text(reason.get("reason_type"))
-        if rt in REVIEW_CLUE_REASON_TYPES or rt in HOT_RANK_CLUE_REASON_TYPES or rt in {"user_pinned", "chain_core_rep", "chain_elastic_rep", "source_leader", "knowledge_confirmed", "knowledge_watch", "fallback_watch"}:
+        if rt in REVIEW_CLUE_REASON_TYPES or rt in HOT_RANK_CLUE_REASON_TYPES or rt in {"user_pinned", "chain_core_rep", "chain_elastic_rep", "source_leader", "knowledge_confirmed", "knowledge_watch", "fallback_watch", "sector_transition"}:
             return True
     return False
+
+
+_TRANSITION_STATE_LABELS = {
+    "panic_release": "刚释放",
+    "repairing": "修复中",
+    "confirmed_intraday": "盘中确认",
+    "stable_turn": "稳定转折",
+}
+
+
+def _transition_provenance(
+    doc: dict[str, Any],
+    *,
+    pool: str,
+    eligibility: str,
+    annotation: str,
+    next_gate: str,
+) -> dict[str, Any]:
+    return {
+        "source": "sector_transition",
+        "sector_event_id": _text(doc.get("sector_event_id")),
+        "episode_id": _text(doc.get("episode_id")),
+        "first_seen_at": doc.get("first_seen_at") or doc.get("last_changed_at") or doc.get("observed_at"),
+        "turn_state": _text(doc.get("turn_state") or doc.get("state")),
+        "sector_transition_pool": pool,
+        "sector_transition_eligibility": eligibility,
+        "sector_transition_annotation": annotation,
+        "sector_transition_next_gate": next_gate,
+        # The detector is upstream context only. Existing technical/risk gates own
+        # the actual pool assignment, so this must never imply an auto-promotion.
+        "sector_transition_promoted": False,
+    }
+
+
+def _transition_pool_annotation(turn_state: str, pool: str) -> tuple[str, str, str]:
+    state_label = _TRANSITION_STATE_LABELS.get(turn_state, turn_state)
+    if pool == "focus" and turn_state == "stable_turn":
+        return (
+            "buy_review_eligible",
+            f"板块{state_label}；个股已独立通过买点池技术、位置和风险门槛，可进入买点复核。",
+            "复核入场位置、执行周期买点和失效条件；板块信号本身不等于买点。",
+        )
+    if pool == "focus":
+        return (
+            "existing_focus_context",
+            f"板块{state_label}；该股原本已在买点池，板块信号只作背景确认，未触发晋级。",
+            "继续按原买点池门槛复核位置、执行周期和失效条件。",
+        )
+    if pool == "watch" and turn_state == "stable_turn":
+        return (
+            "buy_review_pending_individual_gates",
+            "板块稳定转折，已具备买点复核的上游资格；个股仍在盯盘池，不能当成买点。",
+            "等待个股买点、关键均线共振、位置和执行周期确认。",
+        )
+    if pool == "watch" and turn_state in {"repairing", "confirmed_intraday"}:
+        return (
+            "watch_eligible",
+            f"板块{state_label}；个股已独立通过盯盘池门槛，仍未达到买点池。",
+            "等待个股买点、关键均线共振及执行周期确认。",
+        )
+    if pool == "watch":
+        return (
+            "existing_watch_context",
+            f"板块{state_label}；该股原本已在盯盘池，早期释放不构成反转或买点。",
+            "等待板块进入修复中及个股技术条件继续确认。",
+        )
+    if turn_state == "stable_turn":
+        return (
+            "buy_review_pending_individual_gates",
+            "板块稳定转折，已具备买点复核的上游资格；个股尚未通过原有技术、位置和风险门槛，只在线索池。",
+            "等待个股先通过原有技术、位置和风险门槛，再进入买点复核。",
+        )
+    if turn_state in {"repairing", "confirmed_intraday"}:
+        return (
+            "watch_pending_individual_gates",
+            f"板块{state_label}，已具备盯盘的上游资格；个股尚未通过原有技术门槛，只在线索池。",
+            "等待个股买点或关键均线共振，满足原有盯盘池门槛。",
+        )
+    return (
+        "clue_only",
+        f"板块{state_label}；只进入线索池，不是盯盘或买点信号。",
+        "等待板块进入修复中，并等待个股通过原有技术门槛。",
+    )
+
+
+def _apply_sector_transition_context(
+    rows: dict[str, dict[str, Any]],
+    *,
+    focus_stocks: list[dict[str, Any]],
+    risk_stocks: list[dict[str, Any]],
+    watch_stocks: list[dict[str, Any]],
+    transitions: list[dict[str, Any]],
+    index_codes: set[str],
+) -> dict[str, int]:
+    """Annotate the pool decided by existing gates; sector evidence never promotes."""
+    focus_by_code = {_pure_a_code(row.get("raw_code") or row.get("symbol")): row for row in focus_stocks}
+    watch_by_code = {_pure_a_code(row.get("raw_code") or row.get("symbol")): row for row in watch_stocks}
+    risk_codes = {
+        _pure_a_code(row.get("raw_code") or row.get("symbol"))
+        for row in risk_stocks
+    }
+    processed_codes = {
+        _pure_a_code(row.get("raw_code") or row.get("symbol"))
+        for row in (*focus_stocks, *risk_stocks, *watch_stocks)
+    }
+    counts = {"clue": 0, "watch_tag": 0, "focus_tag": 0}
+    state_rank = {"panic_release": 1, "repairing": 2, "confirmed_intraday": 3, "stable_turn": 4}
+    best_by_code: dict[str, dict[str, Any]] = {}
+    for doc in transitions:
+        turn_state = _text(doc.get("turn_state") or doc.get("state"))
+        if turn_state not in state_rank or doc.get("active") is False:
+            continue
+        for value in doc.get("sentinel_symbols") or doc.get("sentinels") or []:
+            code = _pure_a_code(value)
+            if not code or code in index_codes:
+                continue
+            existing = best_by_code.get(code)
+            if existing is None or state_rank[turn_state] > state_rank[_text(existing.get("turn_state") or existing.get("state"))]:
+                best_by_code[code] = doc
+
+    for code, doc in best_by_code.items():
+        turn_state = _text(doc.get("turn_state") or doc.get("state"))
+        if code in risk_codes:
+            # Risk priority remains dominant and is not softened by sector repair.
+            continue
+        if code in focus_by_code:
+            eligibility, annotation, next_gate = _transition_pool_annotation(turn_state, "focus")
+            focus_by_code[code].update(
+                _transition_provenance(
+                    doc,
+                    pool="focus",
+                    eligibility=eligibility,
+                    annotation=annotation,
+                    next_gate=next_gate,
+                )
+            )
+            counts["focus_tag"] += 1
+        elif code in watch_by_code:
+            eligibility, annotation, next_gate = _transition_pool_annotation(turn_state, "watch")
+            watch_by_code[code].update(
+                _transition_provenance(
+                    doc,
+                    pool="watch",
+                    eligibility=eligibility,
+                    annotation=annotation,
+                    next_gate=next_gate,
+                )
+            )
+            counts["watch_tag"] += 1
+        elif code not in processed_codes:
+            eligibility, annotation, next_gate = _transition_pool_annotation(turn_state, "clue")
+            provenance = _transition_provenance(
+                doc,
+                pool="clue",
+                eligibility=eligibility,
+                annotation=annotation,
+                next_gate=next_gate,
+            )
+            _add_reason(
+                rows,
+                code,
+                {
+                    "reason_type": "sector_transition",
+                    "source_collection": "sector_transition_states",
+                    "source_doc_id": _text(doc.get("_id") or doc.get("sector_id")),
+                    "signal_type": f"板块{_TRANSITION_STATE_LABELS.get(turn_state, turn_state)}线索",
+                    "source_role": "context",
+                    "decision_effect": "context_only",
+                    "actionability": "context_only",
+                    "queue_lane": "clue_pool",
+                    "can_create_candidate": True,
+                    "event_dt": doc.get("observed_at"),
+                    "as_of": _text(doc.get("trade_date")),
+                    "board_or_concept": _text(doc.get("sector_name")),
+                    "evidence": {
+                        "episode_id": provenance["episode_id"],
+                        "sector_event_id": provenance["sector_event_id"],
+                        "turn_state": turn_state,
+                    },
+                },
+                index_codes=index_codes,
+            )
+            if code in rows:
+                rows[code].update(provenance)
+                counts["clue"] += 1
+    return counts
+
+
+def _load_sector_transition_context(db: Database) -> list[dict[str, Any]]:
+    enabled = _text(
+        get_task_env(
+            "SECTOR_TRANSITION_ENABLED",
+            os.getenv("SECTOR_TRANSITION_ENABLED", "false"),
+        )
+    ).lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return []
+    try:
+        now = naive_market_now("A")
+        trade_date = a_share_realtime_day_key(now=now)
+        freshness = db["data_freshness"].find_one(
+            {
+                "domain": "sector_transition",
+                "market": "A",
+                "as_of": trade_date,
+                "freshness": "fresh",
+            },
+            {"updated_at": 1, "stale_reason": 1, "mode": 1},
+            sort=[("updated_at", -1)],
+        ) or {}
+        updated_at = freshness.get("updated_at")
+        max_age_minutes = max(
+            5,
+            min(120, int(os.getenv("SECTOR_TRANSITION_CONTEXT_MAX_AGE_MINUTES", "20"))),
+        )
+        if (
+            not isinstance(updated_at, datetime)
+            or now - updated_at > timedelta(minutes=max_age_minutes)
+            or _text(freshness.get("stale_reason"))
+        ):
+            return []
+        states = list(
+            db["sector_transition_states"].find(
+                {
+                    "market": "A",
+                    "trade_date": trade_date,
+                    "active": True,
+                    "episode_id": {"$nin": ["", None]},
+                    "turn_state": {"$in": ["panic_release", "repairing", "confirmed_intraday", "stable_turn"]},
+                }
+            )
+        )
+        states = [
+            row
+            for row in states
+            if not (row.get("blockers") or row.get("freshness_blockers"))
+            and _text(row.get("episode_id"))
+        ]
+        episode_ids = [_text(row.get("episode_id")) for row in states if _text(row.get("episode_id"))]
+        latest_event_by_episode: dict[str, dict[str, Any]] = {}
+        if episode_ids:
+            events = db["sector_transition_events"].find(
+                {
+                    "market": "A",
+                    "trade_date": trade_date,
+                    "episode_id": {"$in": episode_ids},
+                },
+                {"_id": 1, "episode_id": 1, "observed_at": 1},
+            ).sort("observed_at", -1)
+            for event in events:
+                latest_event_by_episode.setdefault(_text(event.get("episode_id")), event)
+        for row in states:
+            event = latest_event_by_episode.get(_text(row.get("episode_id"))) or {}
+            row["sector_event_id"] = _text(event.get("_id"))
+        return states
+    except Exception:
+        return []
 
 
 def _entry_gate_passed(row: dict[str, Any]) -> bool:
@@ -5896,6 +6154,24 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     risk_stocks = split["risk"]
     watch_stocks = split["watch"]
     skipped_by_pool = split["skipped"]
+    transition_context_counts = _apply_sector_transition_context(
+        rows,
+        focus_stocks=focus_stocks,
+        risk_stocks=risk_stocks,
+        watch_stocks=watch_stocks,
+        transitions=_load_sector_transition_context(db),
+        index_codes=index_codes,
+    )
+    transition_rows = {
+        code: row
+        for code, row in rows.items()
+        if _text(row.get("source")) == "sector_transition"
+    }
+    if transition_rows:
+        # Transition-only sentinels may be created after the main identity/quote
+        # enrichment pass. Enrich this bounded subset before the clue pool is built.
+        _attach_security_identities(transition_rows, db)
+        _attach_stock_quote_context(transition_rows, db, trade_date)
     all_processed_symbols = {row.get("symbol") for row in (focus_stocks + risk_stocks + watch_stocks) if row.get("symbol")}
     clue_candidates = []
     for row in rows.values():
@@ -6016,6 +6292,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "fallback_count": fallback_count,
         "fallback_enabled": fallback_enabled,
         "pool_counts": pool_counts,
+        "sector_transition_context_counts": transition_context_counts,
         "broad_market_context": broad_market_context,
         "reason_counts": dict(focus_reason_counts),
         **candidate_meta,
@@ -6118,6 +6395,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "industries": len(legacy_doc["industries"]),
         "concepts": len(legacy_doc["concepts"]),
         "pool_counts": pool_counts,
+        "sector_transition_context_counts": transition_context_counts,
         "broad_market_context": broad_market_context,
         "reason_counts": dict(focus_reason_counts),
         **candidate_meta,

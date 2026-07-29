@@ -424,6 +424,7 @@ def _quote_snapshot_watermark() -> str:
         ("strategy_snapshots", "updated_at", {}),
         ("board_heat_ticks", "trade_minute", {}),
         ("chain_heat_snapshots", "trade_minute", {}),
+        ("sector_transition_events", "observed_at", {"market": "A"}),
     ):
         try:
             latest_doc = db[collection].find_one(
@@ -511,6 +512,8 @@ def _shell_cache_ttl_seconds(payload: dict[str, Any]) -> float:
     session = payload.get("session") if isinstance(payload.get("session"), dict) else {}
     has_read_model = _shell_payload_has_read_model(payload)
     if session.get("ready") or has_read_model:
+        if os.getenv("SECTOR_TRANSITION_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}:
+            return min(_SHELL_CACHE_TTL_SECONDS, 60.0)
         return _SHELL_CACHE_TTL_SECONDS
     return 2.0
 
@@ -4135,6 +4138,15 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "freshness",
         "lane_status",
         "source",
+        "sector_event_id",
+        "episode_id",
+        "first_seen_at",
+        "turn_state",
+        "sector_transition_pool",
+        "sector_transition_eligibility",
+        "sector_transition_annotation",
+        "sector_transition_next_gate",
+        "sector_transition_promoted",
         "source_collection",
         "source_collections",
         "source_tags",
@@ -10126,6 +10138,137 @@ def _plan_for_index(engine, name: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+_SECTOR_TRANSITION_STATES = (
+    "pressure",
+    "panic_release",
+    "repairing",
+    "confirmed_intraday",
+    "stable_turn",
+    "failed",
+)
+
+
+def _sector_transition_json_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return _serialize_dt(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _sector_transition_json_value(item)
+            for key, item in value.items()
+            if key != "_id"
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sector_transition_json_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _sector_transition_radar(*, event_limit: int = 30, state_limit: int = 120) -> dict[str, Any]:
+    """Expose the optional radar without making the shell depend on its availability."""
+    enabled = os.getenv("SECTOR_TRANSITION_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+    empty = {
+        "as_of": "",
+        "counts": {state: 0 for state in _SECTOR_TRANSITION_STATES},
+        "events": [],
+        "states": [],
+        "unread_event_ids": [],
+        "freshness": {
+            "status": "missing" if enabled else "disabled",
+            "as_of": "",
+            "blockers": ["sector_transition_not_available" if enabled else "sector_transition_disabled"],
+        },
+    }
+    if not enabled:
+        return empty
+    try:
+        db = _mongo_db()
+        trade_date = _market_today("A").isoformat()
+        freshness_doc = db["data_freshness"].find_one(
+            {
+                "domain": "sector_transition",
+                "market": "A",
+                "as_of": trade_date,
+            },
+            {"_id": 0, "freshness": 1, "updated_at": 1, "latest_dt": 1, "stale_reason": 1},
+            sort=[("updated_at", -1)],
+        ) or {}
+        states = list(
+            db["sector_transition_states"]
+            .find({"market": "A", "trade_date": trade_date}, {"_id": 0})
+            .sort([("last_changed_at", -1), ("updated_at", -1)])
+            .limit(max(1, state_limit))
+        )
+        events = list(
+            db["sector_transition_events"]
+            .find({"market": "A", "trade_date": trade_date}, {"_id": 0})
+            .sort([("observed_at", -1), ("updated_at", -1)])
+            .limit(max(1, event_limit))
+        )
+    except Exception:
+        return empty
+
+    serialized_states = [_sector_transition_json_value(row) for row in states if isinstance(row, dict)]
+    serialized_events = [_sector_transition_json_value(row) for row in events if isinstance(row, dict)]
+    counts = {state: 0 for state in _SECTOR_TRANSITION_STATES}
+    watermarks: list[str] = []
+    for row in serialized_states:
+        state = _text(row.get("turn_state") or row.get("state"))
+        if state in counts:
+            counts[state] += 1
+        watermark = _text(row.get("updated_at") or row.get("last_changed_at") or row.get("observed_at"))
+        if watermark:
+            watermarks.append(watermark)
+    for row in serialized_events:
+        watermark = _text(row.get("observed_at") or row.get("updated_at"))
+        if watermark:
+            watermarks.append(watermark)
+
+    freshness_updated_at = freshness_doc.get("updated_at")
+    freshness_age = None
+    if isinstance(freshness_updated_at, datetime):
+        freshness_age = (_sync_now() - freshness_updated_at).total_seconds()
+    freshness_value = _text(freshness_doc.get("freshness"))
+    stale_reason = _text(freshness_doc.get("stale_reason"))
+    freshness_blockers: list[str] = []
+    if not freshness_doc:
+        freshness_status = "missing"
+        freshness_blockers.append("sector_transition_freshness_missing")
+    elif freshness_value != "fresh" or stale_reason:
+        freshness_status = "blocked"
+        freshness_blockers.append(stale_reason or "sector_transition_source_incomplete")
+    elif freshness_age is None or freshness_age > 180:
+        freshness_status = "stale"
+        freshness_blockers.append("sector_transition_freshness_stale")
+    else:
+        freshness_status = "fresh"
+    freshness_as_of = _text(
+        freshness_doc.get("latest_dt")
+        or freshness_doc.get("updated_at")
+    )
+    as_of = freshness_as_of or (max(watermarks) if watermarks else "")
+    has_rows = bool(serialized_states or serialized_events)
+    if freshness_status == "fresh" and not has_rows:
+        freshness_status = "missing"
+        freshness_blockers.append("sector_transition_not_available")
+    return {
+        "as_of": as_of,
+        "counts": counts,
+        "events": serialized_events,
+        "states": serialized_states,
+        "unread_event_ids": [
+            _text(row.get("event_id"))
+            for row in serialized_events
+            if freshness_status == "fresh" and _text(row.get("event_id"))
+        ],
+        "freshness": {
+            "status": freshness_status,
+            "as_of": as_of,
+            "blockers": freshness_blockers[:12],
+        },
+    }
+
+
 def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
     status = engine.get_status()
     session = _serialize_session(status)
@@ -10281,6 +10424,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         notices.append("分析引擎正在启动，首屏数据会逐步填充。")
     if cluster.get("data_warning"):
         notices.append(cluster["data_warning"])
+    sector_transition_radar = _sector_transition_radar()
 
     return {
         "session": session,
@@ -10294,6 +10438,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
             "market_status": cluster.get("market_status") or {},
             "data_warning": cluster.get("data_warning", ""),
         },
+        "sector_transition_radar": sector_transition_radar,
         "watchlist_groups": {
             "major_indices": major_indices,
             "industry_etfs": industry_etfs,

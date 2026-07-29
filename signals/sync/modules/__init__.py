@@ -31,6 +31,7 @@ from .calendar_validate import sync_calendar_validate
 from .postmarket_chain_rebuild import sync_postmarket_chain_rebuild
 from .security_business_facts import sync_security_business_facts
 from .global_market_foundation import sync_global_market_foundation
+from .sector_transition import sync_sector_transition_rollup, sync_sector_transition_scan
 
 ALL_MODULES = [
     ("calendar_validate", sync_calendar_validate, "08:30 weekday"),
@@ -45,6 +46,7 @@ ALL_MODULES = [
     ("board_heat_minute", sync_board_heat_minute, "15:05 weekday"),
     ("concept_heat_minute", sync_concept_heat_minute, "15:05 weekday"),
     ("chain_heat_snapshots", sync_chain_heat_snapshots, "15:06 weekday"),
+    ("sector_transition_scan", sync_sector_transition_scan, "live only"),
     ("minute_readiness_probe", sync_minute_readiness_probe, "15:10 weekday"),
     ("intraday_technical_signal_scan", sync_intraday_technical_signal_scan, "live only"),
     ("stock_daily",   sync_stock_daily,   "16:00-17:30 weekday"),
@@ -59,6 +61,7 @@ ALL_MODULES = [
     ("postmarket_chain_rebuild", sync_postmarket_chain_rebuild, "20:15-22:15 weekday"),
     ("ma_climb_scan", sync_ma_climb_scan, "20:25-22:25 weekday"),
     ("technical_signal_scan", sync_technical_signal_scan, "20:30-22:30 weekday"),
+    ("sector_transition_rollup", sync_sector_transition_rollup, "after technical scans"),
     ("knowledge_market_views", sync_knowledge_market_views, "20:30-22:30 weekday"),
     ("concept_relationship_graph", sync_concept_relationship_graph, "20:45-22:45 weekday"),
     ("signal_pool",   sync_signal_pool,   "21:00 weekday"),

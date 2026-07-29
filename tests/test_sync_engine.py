@@ -327,7 +327,8 @@ def test_fullmarket_spot_preserves_writer_freshness_summary():
     assert freshness.docs["spot"]["latest_dt"] == "2026-04-30"
 
 
-def test_board_lane_intraday_runs_heat_not_board_cons():
+def test_board_lane_intraday_runs_heat_not_board_cons(monkeypatch):
+    monkeypatch.delenv("SECTOR_TRANSITION_ENABLED", raising=False)
     engine = object.__new__(SyncEngine)
     engine.enabled_lanes = {"board_lane"}
     engine.db = _FakeDb({"sync_log": _FakeCollection(), "board_heat_ticks": _FakeCollection(count=1)})
@@ -349,11 +350,16 @@ def test_board_lane_intraday_runs_heat_not_board_cons():
         calls.append("board_cons")
         return {"inserted": 1}
 
+    def sector_transition_scan(db, proxy_url=None):
+        calls.append("sector_transition_scan")
+        return {"inserted": 1}
+
     engine.module_map = {
         "board_heat_minute": (board_heat, ""),
         "concept_heat_minute": (concept_heat, ""),
         "chain_heat_snapshots": (chain_heat, ""),
         "board_cons": (board_cons, ""),
+        "sector_transition_scan": (sector_transition_scan, ""),
     }
     engine.proxy_url = None
 

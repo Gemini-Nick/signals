@@ -4,7 +4,13 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from signals.core.market_time import infer_market, timestamp_range_to_dates, to_market_naive, to_unix_seconds
+from signals.core.market_time import (
+    infer_market,
+    market_timezone_name,
+    timestamp_range_to_dates,
+    to_market_naive,
+    to_unix_seconds,
+)
 from signals.core.trading_dates import a_share_realtime_day_key, normalized_a_share_realtime_minute
 
 
@@ -15,8 +21,11 @@ def test_symbol_and_source_infer_business_market():
     assert infer_market(symbol="SH.000300") == "A"
     assert infer_market(symbol="HK.09988") == "HK"
     assert infer_market(symbol="US.QQQ") == "US"
+    assert infer_market(symbol="KR.000660") == "KR"
     assert infer_market(source="yfinance") == "US"
+    assert infer_market(source="krx") == "KR"
     assert infer_market(source="eastmoney_push2delay") == "A"
+    assert market_timezone_name("KOSPI") == "Asia/Seoul"
 
 
 def test_naive_a_share_time_is_beijing_not_host_timezone():

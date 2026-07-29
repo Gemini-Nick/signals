@@ -144,6 +144,18 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["terminal_realtime_pool"], [("pool", ASCENDING), ("market", ASCENDING), ("updated_at", ASCENDING)])
     _safe_create_index(db["terminal_stock_pool"], [("pool", ASCENDING), ("market", ASCENDING), ("updated_at", ASCENDING)])
     _safe_create_index(db["terminal_stock_pool"], [("updated_at", DESCENDING)])
+    _safe_create_index(db["sector_transition_states"], [("market", ASCENDING), ("state", ASCENDING), ("updated_at", DESCENDING)])
+    _safe_create_index(db["sector_transition_states"], [("market", ASCENDING), ("active", ASCENDING), ("trade_date", DESCENDING)])
+    _safe_create_index(db["sector_transition_events"], [("market", ASCENDING), ("trade_date", DESCENDING), ("created_at", DESCENDING)])
+    _safe_create_index(db["sector_transition_events"], [("sector_id", ASCENDING), ("created_at", DESCENDING)])
+    _safe_create_index(db["sector_transition_daily"], [("trade_date", DESCENDING), ("sector_id", ASCENDING)], unique=True)
+    _safe_create_index(db["sector_transition_daily"], [("market", ASCENDING), ("close_state", ASCENDING), ("trade_date", DESCENDING)])
+    _safe_create_index(
+        db["sector_liquidity_snapshots"],
+        [("market", ASCENDING), ("sector_id", ASCENDING), ("observed_at", ASCENDING)],
+        unique=True,
+    )
+    _safe_create_index(db["sector_liquidity_snapshots"], [("trade_date", DESCENDING), ("amount_share", DESCENDING)])
     _safe_create_index(db["terminal_technical_signals"], [("dedupe_key", ASCENDING)], unique=True, sparse=True)
     _safe_create_index(db["terminal_technical_signals"], [("symbol", ASCENDING), ("as_of", ASCENDING), ("freq", ASCENDING), ("updated_at", ASCENDING)])
     _safe_create_index(db["terminal_technical_signals"], [("market", ASCENDING)])

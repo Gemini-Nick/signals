@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from signals.mcp import review_assistant_server
 from signals.notify.trading_workbench_summary import build_market_replay_wechat_summary
@@ -35,6 +36,17 @@ def _payload() -> dict:
         },
         "market_replay": {
             "trade_date": "2026-07-03",
+            "sector_transitions": {
+                "timeline": [
+                    {
+                        "board": "机器人/自动化",
+                        "state_label": "短周期修复",
+                        "event_at": "2026-07-03T13:40:00",
+                        "next_checks": [{"text": "链主和行业ETF能否同步"}],
+                    }
+                ],
+                "next_checks": [],
+            },
             "rotation_windows": [
                 {"actual_time": "09:35", "top_boards": [{"name": "有色金属/贵金属", "change_pct": 3.4}]},
                 {"actual_time": "13:48", "top_boards": [{"name": "机器人/自动化", "change_pct": 4.2}]},
@@ -87,7 +99,10 @@ def test_market_replay_wechat_renderer_uses_market_replay_when_signals_context_l
     assert "机器人/自动化" in body
     assert "丰光精密" in body
     assert "13:48机器人/自动化仍在前排" in body
+    assert "13:40机器人/自动化进入短周期修复" in body
+    assert "接着看链主和行业ETF能否同步" in body
     assert "market_replay.rotation_windows" in result["audit"]["used_paths"]
+    assert "market_replay.sector_transitions.timeline" in result["audit"]["used_paths"]
     for term in BANNED_BODY_TERMS:
         assert term not in body
 
@@ -146,4 +161,71 @@ def test_market_replay_tool_exposes_backward_compatible_markets_contract():
     markets = tool["inputSchema"]["properties"]["markets"]
 
     assert markets["default"] == ["A"]
-    assert markets["items"]["enum"] == ["A", "HK", "US"]
+    assert markets["items"]["enum"] == ["A", "HK", "US", "KR"]
+    assert "explicit-only external context" in markets["description"]
+
+
+def test_kr_is_explicit_only_external_context_and_does_not_change_a_replay(monkeypatch):
+    day = "2026-07-29"
+    monkeypatch.delenv("SECTOR_TRANSITION_KR_CONTEXT_ENABLED", raising=False)
+    fetched = SimpleNamespace(
+        dashboard={"daily_brief": {"as_of": day}},
+        shell={"watchlist_groups": {}},
+        snapshot={"as_of": day},
+    )
+    a_replay = {
+        "trade_date": day,
+        "coverage": {"formal_ready": True, "official_close_as_of": f"{day}T15:00:00"},
+        "generation_status": "success",
+        "sector_transitions": {"timeline": [], "states": [], "next_checks": []},
+    }
+    monkeypatch.setattr(review_assistant_server, "fetch_inputs_safe", lambda *_args, **_kwargs: fetched)
+    monkeypatch.setattr(review_assistant_server, "get_db", lambda: object())
+    monkeypatch.setattr(review_assistant_server, "build_market_replay_context", lambda *_args, **_kwargs: a_replay)
+    monkeypatch.setattr(review_assistant_server, "collect_replay_context", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(review_assistant_server, "latest_market_snapshot", lambda *_args, **_kwargs: None)
+
+    default_result = review_assistant_server._collect_market_context({"trade_date": day})
+    kr_result = review_assistant_server._collect_market_context({"trade_date": day, "markets": ["KR"]})
+
+    assert "global_markets" not in default_result
+    assert default_result["market_replay"] is a_replay
+    assert kr_result["market_replay"] is a_replay
+    assert kr_result["requested_markets"] == ["KR"]
+    assert kr_result["global_markets"] == [
+        {
+            "market": "KR",
+            "timezone": "Asia/Seoul",
+            "currency": "KRW",
+            "coverage_scope": "core_universe",
+            "enabled_by_default": False,
+            "session_date": None,
+            "as_of": None,
+            "session_state": "unavailable",
+            "feature_status": "disabled",
+            "disabled_reason": "SECTOR_TRANSITION_KR_CONTEXT_ENABLED=false",
+            "source": "feature_gate",
+            "context_role": "external_context_only",
+        }
+    ]
+
+    monkeypatch.setenv("SECTOR_TRANSITION_KR_CONTEXT_ENABLED", "true")
+    monkeypatch.setattr(
+        review_assistant_server,
+        "latest_market_snapshot",
+        lambda *_args, **_kwargs: {
+            "market": "KR",
+            "timezone": "Asia/Seoul",
+            "currency": "KRW",
+            "coverage_scope": "core_universe",
+            "session_date": "2026-07-29",
+            "session_state": "complete",
+            "source": "market_daily_snapshots",
+        },
+    )
+    enabled_result = review_assistant_server._collect_market_context({"trade_date": day, "markets": ["KR"]})
+
+    assert enabled_result["market_replay"] is a_replay
+    assert enabled_result["global_markets"][0]["session_state"] == "complete"
+    assert enabled_result["global_markets"][0]["enabled_by_default"] is False
+    assert enabled_result["global_markets"][0]["context_role"] == "external_context_only"

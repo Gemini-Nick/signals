@@ -1,4 +1,4 @@
-version: "2026.07.1"
+version: "2026.07.2"
 
 markets:
   HK:
@@ -38,6 +38,16 @@ markets:
       - {symbol: US.GOOGL, name: Alphabet, exchange: NASDAQ, group: mag7}
       - {symbol: US.META, name: Meta Platforms, exchange: NASDAQ, group: mag7}
       - {symbol: US.TSLA, name: Tesla, exchange: NASDAQ, group: mag7}
+
+  KR:
+    timezone: Asia/Seoul
+    currency: KRW
+    coverage_scope: core_universe
+    enabled_by_default: false
+    indices:
+      - {symbol: KR.KOSPI, name: 韩国综合股价指数, exchange: KRX, instrument_kind: index, proxy_for: KOSPI}
+    anchors:
+      - {symbol: KR.000660, name: SK海力士, exchange: KRX, group: memory_semiconductor}
 
 a_h_pairs:
   - issuer_id: issuer:smic

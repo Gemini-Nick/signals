@@ -12,7 +12,7 @@ import os
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import akshare as ak
 import pandas as pd
@@ -802,12 +802,68 @@ def _split_current_minute_tasks(
     return pending, current
 
 
+def _sector_transition_sentinel_symbols(db: Database) -> list[str]:
+    """Return a bounded, independent minute-data quota for active sector episodes."""
+    if not _bool_env("SECTOR_TRANSITION_ENABLED", False):
+        return []
+    total_limit = _int_env("STOCK_MINUTE_SECTOR_SENTINEL_MAX_CODES", 12, min_value=1, max_value=40)
+    per_sector = _int_env("STOCK_MINUTE_SECTOR_SENTINEL_PER_SECTOR", 3, min_value=1, max_value=6)
+    try:
+        now = naive_market_now("A")
+        trade_date = now.date().isoformat()
+        freshness = db["data_freshness"].find_one(
+            {
+                "domain": "sector_transition",
+                "market": "A",
+                "as_of": trade_date,
+                "freshness": "fresh",
+            },
+            {"updated_at": 1, "stale_reason": 1},
+            sort=[("updated_at", -1)],
+        ) or {}
+        updated_at = freshness.get("updated_at")
+        if (
+            not isinstance(updated_at, datetime)
+            or now - updated_at > timedelta(minutes=20)
+            or str(freshness.get("stale_reason") or "").strip()
+        ):
+            return []
+        rows = db["sector_transition_states"].find(
+            {
+                "market": "A",
+                "trade_date": trade_date,
+                "active": True,
+                "episode_id": {"$nin": ["", None]},
+                "blockers": {"$in": [[], None]},
+                "turn_state": {"$in": ["panic_release", "repairing", "confirmed_intraday", "stable_turn"]},
+            },
+            {"sentinel_symbols": 1, "sentinels": 1, "last_changed_at": 1},
+        ).sort("last_changed_at", -1).limit(total_limit)
+    except Exception:
+        return []
+    selected: list[str] = []
+    for row in rows:
+        candidates = row.get("sentinel_symbols") or row.get("sentinels") or []
+        added = 0
+        for value in candidates:
+            code = _pure_a_code(value)
+            if not code or code in selected:
+                continue
+            selected.append(code)
+            added += 1
+            if added >= per_sector or len(selected) >= total_limit:
+                break
+        if len(selected) >= total_limit:
+            break
+    return selected
+
+
 def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
     """获取需要同步分钟线的活跃标的列表。
 
-    The trading terminal's whitebox pool is the single source of truth for
-    intraday stock minute refreshes. Other sources feed terminal_stock_pool in
-    the post-market builder instead of being read ad hoc here.
+    The terminal whitebox pool remains the main source. Active deterministic
+    sector episodes receive a small independent sentinel quota so discovery
+    does not depend on prior admission to the three-pool terminal.
     """
     priority_symbols: set[str] = set()
     pinned_symbols: set[str] = set()
@@ -883,6 +939,20 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
             "terminal_manual_clues",
             priority=True,
             pinned=True,
+            symbol_sources=symbol_sources,
+        )
+
+    for symbol in _sector_transition_sentinel_symbols(db):
+        _add_candidate(
+            symbols,
+            source_counts,
+            priority_symbols,
+            pinned_symbols,
+            index_codes,
+            symbol,
+            "sector_transition_sentinel",
+            priority=True,
+            pinned=False,
             symbol_sources=symbol_sources,
         )
 

@@ -69,8 +69,11 @@ When the user explicitly runs a window or asks for an out-of-window review:
 - Reference the strongest available evidence fields: `structured_daily_review`,
   `rotation_windows`, `rotation_shifts`, `board_timeline`, `sector_boards`,
   `dynamic_market_representatives`, `failed_boards`, `acceptance_pressure`, and
-  three-pool rows. In the MCP payload this is nested at
-  `market_replay.structured_daily_review`, not a top-level field.
+  three-pool rows. When `sector_transitions` is present, consume its `timeline`
+  and `next_checks` directly; the renderer/agent must not recalculate or upgrade
+  the Python-produced state. These fields live under `market_replay`;
+  `structured_daily_review` is specifically nested at
+  `market_replay.structured_daily_review`, not at the response top level.
 - For minute rotation, board timeline, dynamic representatives, failed boards,
   high-turnover cores, acceptance pressure, and flow availability, treat
   `market_replay.*` as canonical. Do not mark those fields missing just because

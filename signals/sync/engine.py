@@ -36,6 +36,10 @@ from .task_context import task_env
 logger = logging.getLogger("signals.sync")
 
 
+def _sector_transition_enabled() -> bool:
+    return os.getenv("SECTOR_TRANSITION_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
 MODULE_TARGETS = {
     "cache_preheat": ("bars",),
     "signal_pool": ("signals",),
@@ -76,6 +80,12 @@ MODULE_TARGETS = {
     "minute_readiness_probe": ("minute_readiness",),
     "weekly_rollup": ("bars", "index_bars"),
     "terminal_realtime_pool": ("terminal_realtime_pool", "terminal_stock_pool"),
+    "sector_transition_scan": (
+        "sector_transition_states",
+        "sector_transition_events",
+        "sector_liquidity_snapshots",
+    ),
+    "sector_transition_rollup": ("sector_transition_daily", "sector_transition_events"),
     "board_cons": ("board_constituents", "concept_constituents"),
 }
 
@@ -104,6 +114,10 @@ COLLECTION_DOMAINS = {
     "minute_readiness": "readiness",
     "terminal_realtime_pool": "terminal_pool",
     "terminal_stock_pool": "terminal_pool",
+    "sector_transition_states": "sector_transition",
+    "sector_transition_events": "sector_transition",
+    "sector_transition_daily": "sector_transition",
+    "sector_liquidity_snapshots": "sector_transition",
     "board_constituents": "constituents",
     "concept_constituents": "constituents",
     "quote_snapshots": "quote",
@@ -138,12 +152,15 @@ REALTIME_MODULES = {
     "board_ranking",
     "strategy_snapshot",
     "intraday_technical_signal_scan",
+    "sector_transition_scan",
 }
 
 EMPTY_OK_MODULES = {
     "ma_climb_scan",
     "technical_signal_scan",
     "intraday_technical_signal_scan",
+    "sector_transition_scan",
+    "sector_transition_rollup",
     "knowledge_market_views",
     "concept_relationship_graph",
 }
@@ -210,6 +227,7 @@ LIVE_SYNC_PLANS = {
         LiveSyncPlan("board_heat_minute", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 180, 60),
         LiveSyncPlan("concept_heat_minute", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 180, 65),
         LiveSyncPlan("chain_heat_snapshots", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 90, 70),
+        LiveSyncPlan("sector_transition_scan", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 120, 75),
     ),
     # HK/US slots are explicit and independently throttled. Data-source modules
     # can be plugged in here without affecting the A-share live bundle.
@@ -233,6 +251,7 @@ LIVE_SYNC_STAGE_BY_MODULE = {
     "intraday_technical_signal_scan": 1,
     "terminal_realtime_pool": 1,
     "strategy_snapshot": 2,
+    "sector_transition_scan": 1,
 }
 
 INTRADAY_BUNDLES = {
@@ -251,6 +270,7 @@ LANE_MAINTENANCE_PLANS = {
     "board_heat_minute": LiveSyncPlan("board_heat_minute", "board_lane", 24 * 60 * 60, 60 * 60, 180, 7),
     "concept_heat_minute": LiveSyncPlan("concept_heat_minute", "board_lane", 24 * 60 * 60, 60 * 60, 180, 8),
     "chain_heat_snapshots": LiveSyncPlan("chain_heat_snapshots", "board_lane", 24 * 60 * 60, 60 * 60, 90, 9),
+    "sector_transition_scan": LiveSyncPlan("sector_transition_scan", "board_lane", 24 * 60 * 60, 60 * 60, 120, 10),
     "minute_readiness_probe": LiveSyncPlan("minute_readiness_probe", "signal_lane", 24 * 60 * 60, 60 * 60, 60, 9),
     "etf_spot_snapshot": LiveSyncPlan("etf_spot_snapshot", "quote_lane", 24 * 60 * 60, 2 * 60 * 60, 600, 20),
     "stock_daily": LiveSyncPlan("stock_daily", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 3600, 30),
@@ -268,6 +288,7 @@ LANE_MAINTENANCE_PLANS = {
     "technical_signal_scan": LiveSyncPlan("technical_signal_scan", "workbench_lane", 24 * 60 * 60, 4 * 60 * 60, 1800, 82),
     "knowledge_market_views": LiveSyncPlan("knowledge_market_views", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 84),
     "concept_relationship_graph": LiveSyncPlan("concept_relationship_graph", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 86),
+    "sector_transition_rollup": LiveSyncPlan("sector_transition_rollup", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 88),
     "strategy_snapshot": LiveSyncPlan("strategy_snapshot", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 120, 90),
     "terminal_realtime_pool": LiveSyncPlan("terminal_realtime_pool", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 120, 95),
     "cache_preheat": LiveSyncPlan("cache_preheat", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 180, 100),
@@ -297,10 +318,12 @@ BOOTSTRAP_LANE_MODULES = {
     "board_heat_minute": {"board_lane"},
     "concept_heat_minute": {"board_lane"},
     "chain_heat_snapshots": {"board_lane"},
+    "sector_transition_scan": {"board_lane"},
     "minute_readiness_probe": {"signal_lane"},
     "board_cons": {"board_lane"},
     "security_business_facts": {"workbench_lane"},
     "postmarket_chain_rebuild": {"workbench_lane"},
+    "sector_transition_rollup": {"workbench_lane"},
 }
 
 
@@ -821,6 +844,8 @@ class SyncEngine:
             runnable: list[tuple[int, LiveSyncPlan, object]] = []
             for plan in sorted(plans, key=lambda item: item.priority):
                 module_name = plan.module
+                if module_name == "sector_transition_scan" and not _sector_transition_enabled():
+                    continue
                 if module_name not in self.module_map:
                     results.append({"module": module_name, "market": market_key, "status": "missing"})
                     logger.warning("live bundle module missing: %s[%s]", module_name, market_key)

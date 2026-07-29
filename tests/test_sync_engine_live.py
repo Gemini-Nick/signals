@@ -55,6 +55,7 @@ def test_live_bundle_runs_independent_stage_in_parallel_and_snapshot_last(monkey
     a_share_modules = [plan.module for plan in LIVE_SYNC_PLANS[Market.A]]
     assert "etf_spot_snapshot" in a_share_modules
     assert LIVE_SYNC_STAGE_BY_MODULE["etf_spot_snapshot"] == 0
+    monkeypatch.setenv("SECTOR_TRANSITION_ENABLED", "true")
 
     engine = object.__new__(SyncEngine)
     engine.max_workers = 8

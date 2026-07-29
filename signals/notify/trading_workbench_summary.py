@@ -1305,6 +1305,45 @@ def _market_rotation_line(market_replay: dict[str, Any]) -> tuple[str, list[str]
     return "", used
 
 
+def _market_transition_check_text(value: Any) -> str:
+    rows = value if isinstance(value, list) else []
+    for row in rows:
+        if isinstance(row, dict):
+            text = _text(row.get("text") or row.get("label") or row.get("condition"))
+        else:
+            text = _text(row)
+        if text:
+            return text
+    return ""
+
+
+def _market_sector_transition_line(market_replay: dict[str, Any]) -> tuple[str, list[str]]:
+    transitions = _market_payload_dict(market_replay.get("sector_transitions"))
+    timeline = _as_list(transitions.get("timeline"))
+    if not timeline:
+        return "", []
+    latest = timeline[-1]
+    board = _market_board_name(latest)
+    state = _text(latest.get("state_label") or latest.get("to_state") or latest.get("event_label"))
+    event_at = _text(latest.get("event_at"))
+    time_label = ""
+    if "T" in event_at:
+        time_label = event_at.split("T", 1)[1][:5]
+    elif " " in event_at:
+        time_label = event_at.split(" ", 1)[1][:5]
+    check = _market_transition_check_text(latest.get("next_checks"))
+    if not check:
+        structured_checks = _as_list(transitions.get("next_checks"))
+        matching = next((row for row in reversed(structured_checks) if _market_board_name(row) == board), {})
+        check = _market_transition_check_text(matching.get("checks"))
+    stage_text = f"进入{state}" if state else "出现新的状态变化"
+    prefix = f"{time_label}{board}" if time_label else board
+    line = f"板块转折：{prefix}{stage_text}"
+    if check:
+        line += f"；接着看{check}"
+    return line + "。", ["market_replay.sector_transitions.timeline"]
+
+
 def _market_representative_line(market_replay: dict[str, Any], sector_rows: list[dict[str, Any]]) -> tuple[str, list[str]]:
     reps = _as_list(market_replay.get("dynamic_market_representatives"))
     if not reps:
@@ -1428,9 +1467,10 @@ def build_market_replay_wechat_summary(
     validation = _sector_name(sector_rows[2]) if len(sector_rows) > 2 else secondary
     sector_line = "板块15：" + "、".join(_market_board_brief(row) for row in sector_rows[:5]) + "。"
     rotation_line, rotation_used = _market_rotation_line(market_replay)
+    transition_line, transition_used = _market_sector_transition_line(market_replay)
     rep_line, rep_used = _market_representative_line(market_replay, sector_rows)
     pressure_line, pressure_used = _market_pressure_line(market_replay)
-    used_paths.extend(rotation_used + rep_used + pressure_used)
+    used_paths.extend(rotation_used + transition_used + rep_used + pressure_used)
 
     title = WINDOW_LABELS.get(window, WINDOW_LABELS["manual"])
     header = f"【{trade_date}｜{title}】" if trade_date else f"【{title}】"
@@ -1440,7 +1480,7 @@ def build_market_replay_wechat_summary(
         "证据：",
         sector_line,
     ]
-    lines.extend(line for line in (rotation_line, rep_line, pressure_line) if line)
+    lines.extend(line for line in (rotation_line, transition_line, rep_line, pressure_line) if line)
     lines.extend(
         [
             "验证：",

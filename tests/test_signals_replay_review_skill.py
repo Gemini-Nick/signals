@@ -89,4 +89,16 @@ def test_global_visual_keeps_market_sessions_and_scopes_distinct():
     assert "add at most one compact `跨市场联动` paragraph" in text
     assert "global one-line view" in text
     assert "latest completed US session" in text
-    assert 'markets=["A","HK","US"]' in text
+    assert 'markets=["A","HK","US","KR"]' in text
+    assert "KR requires an explicit request plus `SECTOR_TRANSITION_KR_CONTEXT_ENABLED=true`" in text
+
+
+def test_sector_transition_events_are_consume_only_and_do_not_change_routing():
+    text = SKILL.read_text(encoding="utf-8")
+    for phrase in (
+        "`market_replay.sector_transitions.timeline`",
+        "Consume only: do not recalculate indicators",
+        "Use no more than the six timeline rows returned by Signals",
+        "Do not change notification routing, send decisions, or three-pool membership",
+    ):
+        assert phrase in text

@@ -244,9 +244,21 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     ),
     PostmarketTaskSpec("signal_pool", "derived", depends_on=("technical_signal_scan:all",)),
     PostmarketTaskSpec(
+        "sector_transition_rollup",
+        "derived",
+        depends_on=(
+            "technical_signal_scan:all",
+            "ma_climb_scan:all",
+            "chain_heat_snapshots:all",
+            "board_heat_minute:all",
+            "concept_heat_minute:all",
+            ETF_SPOT_TASK_KEY,
+        ),
+    ),
+    PostmarketTaskSpec(
         "terminal_realtime_pool",
         "terminal",
-        depends_on=("technical_signal_scan:all", "ma_climb_scan:all", "knowledge_market_views:all", "postmarket_chain_rebuild:all", "chain_heat_snapshots:all", "concept_relationship_graph:all"),
+        depends_on=("technical_signal_scan:all", "ma_climb_scan:all", "knowledge_market_views:all", "postmarket_chain_rebuild:all", "chain_heat_snapshots:all", "concept_relationship_graph:all", "sector_transition_rollup:all"),
         env={"TERMINAL_POOL_STRICT_SOURCES": "true"},
     ),
     PostmarketTaskSpec("strategy_snapshot", "terminal", depends_on=("terminal_realtime_pool:all", ETF_SPOT_TASK_KEY)),

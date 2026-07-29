@@ -185,6 +185,67 @@ def test_stock_universe_excludes_explicit_etf_but_retains_new_stock_without_type
     assert context["market_breadth"]["down"] == 1
 
 
+def test_market_replay_context_exposes_bounded_sector_transition_timeline_and_checks():
+    day = "2026-07-14"
+    events = [
+        {
+            "trade_date": day,
+            "event_id": f"event-{index}",
+            "sector_name": f"板块{index}",
+            "from_state": "恐慌释放",
+            "turn_state": "repairing",
+            "observed_at": datetime(2026, 7, 14, 9 + index // 4, (index * 5) % 60),
+            "last_changed_at": datetime(2026, 7, 14, 9 + index // 4, (index * 5) % 60),
+            "sentinels": [{"name": f"哨兵{index}"}],
+            "funding_path": {"role": "receiver"},
+            "source_watermarks": {"board_heat_ticks": f"wm-{index}"},
+            "blockers": [f"缺确认分支{index}"],
+            "evidence": {"breadth_ratio": 0.6},
+            "next_checks": [f"观察{index}能否扩散"],
+            "weaker_if": {"condition": f"板块{index}重新转弱"},
+        }
+        for index in range(7)
+    ]
+    db = FakeDB(
+        {
+            "sector_transition_events": FakeCollection(events),
+            "sector_transition_states": FakeCollection(
+                [
+                    {
+                        "trade_date": day,
+                        "board": "板块6",
+                        "state": "short_repair",
+                        "state_label": "短周期修复",
+                        "snapshot_at": datetime(2026, 7, 14, 10, 30),
+                    }
+                ]
+            ),
+            "fullmarket_spot_snapshots": FakeCollection([]),
+            "board_heat_ticks": FakeCollection([]),
+            "bars": FakeCollection([]),
+        }
+    )
+
+    context = build_market_replay_context(db, trade_date=day, high_turnover_limit=5)
+    transitions = context["sector_transitions"]
+
+    assert transitions["status"] == "available"
+    assert transitions["source_collections"] == ["sector_transition_events", "sector_transition_states"]
+    assert len(transitions["timeline"]) == 6
+    assert [row["event_id"] for row in transitions["timeline"]] == [f"event-{index}" for index in range(1, 7)]
+    assert transitions["timeline"][-1]["next_checks"] == [{"text": "观察6能否扩散"}]
+    assert transitions["timeline"][-1]["weaker_if"] == [{"condition": "板块6重新转弱", "text": "板块6重新转弱"}]
+    assert transitions["timeline"][-1]["turn_state"] == "repairing"
+    assert transitions["timeline"][-1]["state_label"] == "短周期修复"
+    assert transitions["timeline"][-1]["sentinels"] == [{"name": "哨兵6"}]
+    assert transitions["timeline"][-1]["funding_path"] == {"role": "receiver"}
+    assert transitions["timeline"][-1]["source_watermarks"] == {"board_heat_ticks": "wm-6"}
+    assert transitions["timeline"][-1]["blockers"] == ["缺确认分支6"]
+    assert transitions["timeline"][-1]["evidence"] == {"breadth_ratio": 0.6}
+    assert transitions["states"][0]["board"] == "板块6"
+    assert len(transitions["next_checks"]) == 6
+
+
 def test_replay_coverage_separates_official_close_from_latest_intraday_bar():
     day = "2026-07-14"
     daily = [{"date": day, "close": 1.0, "name": name} for name, _symbol in _MAJOR_INDEX_TARGETS]

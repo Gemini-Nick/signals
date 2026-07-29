@@ -61,6 +61,21 @@ _EXCLUDED_BOARD_PATTERN = re.compile(
 _BOARD_HEAT_REALTIME_SOURCE = "eastmoney_push2delay"
 _BOARD_HEAT_EOD_BACKFILL_SOURCE = "daily_board_ranking_backfill"
 _BOARD_HEAT_ALLOWED_SOURCES = (_BOARD_HEAT_REALTIME_SOURCE, _BOARD_HEAT_EOD_BACKFILL_SOURCE)
+_TRANSITION_STATE_LABELS = {
+    "pressure": "承压观察",
+    "panic_release": "恐慌释放",
+    "repairing": "短周期修复",
+    "confirmed_intraday": "分钟级确认",
+    "stable_turn": "稳定转折",
+    "failed": "转折失效",
+}
+_TRANSITION_STATE_NEXT_CHECKS = {
+    "panic_release": "上涨宽度和哨兵5分钟结构能否继续修复",
+    "repairing": "板块宽度与哨兵MA20能否同步",
+    "confirmed_intraday": "正式收盘和跨日结构能否保持",
+    "stable_turn": "回踩时板块宽度和哨兵承接能否保持",
+    "failed": "是否停止破低并重新形成分钟修复",
+}
 
 
 def _board_display_name(name: str) -> str:
@@ -1303,6 +1318,260 @@ def _rotation_shifts(db: Any, trade_date: str, *, checkpoints: list[str], limit:
             }
         )
     return shifts
+
+
+def _transition_date_query(trade_date: str) -> dict[str, Any]:
+    start, end = _date_range(trade_date)
+    compact = trade_date.replace("-", "")
+    return {
+        "$or": [
+            {"trade_date": trade_date},
+            {"date_key": trade_date},
+            {"date_key": compact},
+            {"event_date": trade_date},
+            {"dt": trade_date},
+            {"dt": compact},
+            {"dt": {"$gte": start, "$lt": end}},
+            {"observed_at": {"$gte": start, "$lt": end}},
+            {"last_changed_at": {"$gte": start, "$lt": end}},
+            {"event_at": {"$gte": start, "$lt": end}},
+            {"snapshot_at": {"$gte": start, "$lt": end}},
+        ]
+    }
+
+
+def _transition_timestamp_text(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds")
+    return _text(value)
+
+
+def _transition_json_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds")
+    if isinstance(value, dict):
+        return {str(key): _transition_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_transition_json_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return _text(value)
+
+
+def _transition_time_text(row: dict[str, Any]) -> str:
+    return _transition_timestamp_text(
+        _first_present(
+            row.get("last_changed_at"),
+            row.get("observed_at"),
+            row.get("confirmed_at"),
+            row.get("event_at"),
+            row.get("snapshot_at"),
+            row.get("updated_at"),
+            row.get("first_seen_at"),
+            row.get("dt"),
+        )
+    )
+
+
+def _transition_checks(value: Any, *, limit: int = 3) -> list[dict[str, Any]]:
+    raw = value if isinstance(value, list) else ([value] if value not in (None, "") else [])
+    checks: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            text = _text(
+                item.get("text")
+                or item.get("label")
+                or item.get("condition")
+                or item.get("description")
+            )
+            if not text:
+                continue
+            checks.append({**item, "text": text})
+        else:
+            text = _text(item)
+            if text:
+                checks.append({"text": text})
+        if len(checks) >= limit:
+            break
+    return checks
+
+
+def _normalize_sector_transition(row: dict[str, Any]) -> dict[str, Any] | None:
+    board = _text(
+        row.get("board")
+        or row.get("board_name")
+        or row.get("sector")
+        or row.get("sector_name")
+        or row.get("driver_name")
+        or row.get("name")
+    )
+    if not board:
+        return None
+    from_state = _text(row.get("from_state") or row.get("previous_state") or row.get("state_from"))
+    to_state = _text(
+        row.get("to_state")
+        or row.get("turn_state")
+        or row.get("current_state")
+        or row.get("state")
+        or row.get("state_to")
+    )
+    state_label = _text(
+        row.get("to_state_label")
+        or row.get("state_label")
+        or row.get("stage_label")
+        or _TRANSITION_STATE_LABELS.get(to_state)
+        or to_state
+    )
+    next_checks = _transition_checks(
+        _first_present(
+            row.get("next_checks"),
+            row.get("next_check"),
+            row.get("watch_next"),
+            row.get("confirm_when"),
+        )
+    )
+    weaker_if = _transition_checks(
+        _first_present(
+            row.get("weaker_if"),
+            row.get("failure_checks"),
+            row.get("invalidates_when"),
+            row.get("invalidation"),
+        )
+    )
+    if not next_checks and to_state in _TRANSITION_STATE_NEXT_CHECKS:
+        next_checks = [
+            {
+                "code": f"{to_state}_next",
+                "text": _TRANSITION_STATE_NEXT_CHECKS[to_state],
+            }
+        ]
+    event_at = _transition_time_text(row)
+    event_id = _text(row.get("event_id") or row.get("dedupe_key") or row.get("_id"))
+    if not event_id:
+        event_id = f"{board}:{event_at}:{from_state}>{to_state}"
+    sentinels = (
+        row.get("sentinels")
+        if isinstance(row.get("sentinels"), (dict, list))
+        else (row.get("sentinel_symbols") if isinstance(row.get("sentinel_symbols"), list) else {})
+    )
+    blockers = (
+        row.get("blockers")
+        if isinstance(row.get("blockers"), list)
+        else (row.get("freshness_blockers") if isinstance(row.get("freshness_blockers"), list) else [])
+    )
+    source_watermarks = row.get("source_watermarks")
+    if not isinstance(source_watermarks, (dict, list)):
+        board_watermark = _transition_timestamp_text(row.get("board_watermark"))
+        source_watermarks = {"board_heat_ticks": board_watermark} if board_watermark else {}
+    result = {
+        "event_id": event_id,
+        "sector_id": _text(row.get("sector_id")),
+        "board": board,
+        "market": _text(row.get("market"), "A"),
+        "kind": _text(row.get("kind")),
+        "event_type": _text(row.get("event_type") or row.get("kind") or row.get("transition"), "state_change"),
+        "event_label": _text(row.get("event_label") or row.get("transition_label")),
+        "from_state": from_state,
+        "to_state": to_state,
+        "turn_state": _text(row.get("turn_state") or to_state),
+        "state_label": state_label,
+        "event_at": event_at,
+        "observed_at": _transition_timestamp_text(
+            _first_present(row.get("observed_at"), row.get("snapshot_at"), row.get("event_at"), row.get("dt"))
+        ),
+        "last_changed_at": _transition_timestamp_text(
+            _first_present(row.get("last_changed_at"), row.get("confirmed_at"), row.get("event_at"), row.get("updated_at"))
+        ),
+        "first_seen_at": _text(row.get("first_seen_at")),
+        "episode_id": _text(row.get("episode_id")),
+        "confidence": _transition_json_value(row.get("confidence")),
+        "metrics": _transition_json_value(row.get("metrics")) if isinstance(row.get("metrics"), dict) else {},
+        "representatives": _transition_json_value(
+            row.get("representatives")
+            if isinstance(row.get("representatives"), (dict, list))
+            else sentinels
+        ),
+        "sentinels": _transition_json_value(sentinels),
+        "funding_path": _transition_json_value(row.get("funding_path")) if isinstance(row.get("funding_path"), dict) else {},
+        "funding_path_proxy": _transition_json_value(
+            row.get("funding_path_proxy")
+            if isinstance(row.get("funding_path_proxy"), dict)
+            else (row.get("funding_path") if isinstance(row.get("funding_path"), dict) else {})
+        ),
+        "next_checks": next_checks,
+        "weaker_if": weaker_if,
+        "source_watermarks": _transition_json_value(source_watermarks),
+        "blockers": _transition_json_value(blockers),
+        "mode": _text(row.get("mode")),
+        "source": _text(row.get("source")),
+    }
+    evidence = row.get("evidence")
+    if isinstance(evidence, dict):
+        result["evidence"] = _transition_json_value(evidence)
+    elif isinstance(evidence, list):
+        result["evidence"] = _transition_json_value(
+            [item for item in evidence[:8] if isinstance(item, (dict, str, int, float, bool))]
+        )
+    return result
+
+
+def _sector_transition_context(db: Any, trade_date: str, *, limit: int = 6) -> dict[str, Any]:
+    collection_names = _collection_names(db)
+    query = _transition_date_query(trade_date)
+    source_collections: list[str] = []
+
+    event_rows: list[dict[str, Any]] = []
+    if "sector_transition_events" in collection_names:
+        source_collections.append("sector_transition_events")
+        event_rows = list(db["sector_transition_events"].find(query, {"_id": 0}))
+    normalized_events = [
+        event
+        for row in event_rows
+        if (event := _normalize_sector_transition(row)) is not None
+    ]
+    normalized_events.sort(key=lambda item: _text(item.get("event_at")))
+    timeline = normalized_events[-max(1, min(6, limit)):]
+
+    state_rows: list[dict[str, Any]] = []
+    if "sector_transition_states" in collection_names:
+        source_collections.append("sector_transition_states")
+        state_rows = list(db["sector_transition_states"].find(query, {"_id": 0}))
+    normalized_states = [
+        state
+        for row in state_rows
+        if (state := _normalize_sector_transition(row)) is not None
+    ]
+    normalized_states.sort(key=lambda item: _text(item.get("event_at")), reverse=True)
+    states: list[dict[str, Any]] = []
+    seen_boards: set[str] = set()
+    for state in normalized_states:
+        board = _text(state.get("board"))
+        if not board or board in seen_boards:
+            continue
+        seen_boards.add(board)
+        states.append(state)
+        if len(states) >= 6:
+            break
+
+    next_checks = [
+        {
+            "board": row["board"],
+            "state": row.get("state_label") or row.get("to_state"),
+            "event_at": row.get("event_at"),
+            "checks": row.get("next_checks") or [],
+            "weaker_if": row.get("weaker_if") or [],
+        }
+        for row in timeline
+        if row.get("next_checks") or row.get("weaker_if")
+    ][:6]
+    return {
+        "status": "available" if timeline or states else "missing",
+        "source_collections": source_collections,
+        "timeline": timeline,
+        "states": states,
+        "next_checks": next_checks,
+        "timeline_limit": 6,
+    }
 
 
 def _opening_pressure_boards(db: Any, trade_date: str, *, limit: int = 20) -> list[dict[str, Any]]:
@@ -3079,6 +3348,7 @@ def replay_analysis_framework() -> dict[str, Any]:
             "先判定大盘真实伤害：指数跌幅、成交额承接、涨跌扩散，而不是只看涨幅榜。",
             "找全天高成交核心：成交额越大，越能代表当日情绪和负反馈压力。",
             "按分钟窗口看全市场板块强弱切换：谁增强、谁被抽血、谁只是财报/题材筛选噪声。",
+            "直接消费 sector_transitions 的状态变化和下一观察，不在复盘层重新计算或升级板块状态。",
             "把板块15映射回产业链：区分产业链确认、源强链弱、链内分化和临时卡位。",
             "代表股分两层：static_representatives 是知识库映射；dynamic_market_representatives 才是当日市场认可。",
             "动态核心看成交额、换手、市场共识和负反馈；动态弹性看涨停速度、连板、封单、涨幅、换手和量比。",
@@ -3101,6 +3371,11 @@ def replay_analysis_framework() -> dict[str, Any]:
                 "dimension": "板块卡位",
                 "code_fields": ["market_replay.board_timeline", "signals_context.sector_boards"],
                 "ai_check": "是否区分全天强、午后卡位、脉冲强、源强链弱和链内分化。",
+            },
+            {
+                "dimension": "板块转折",
+                "code_fields": ["market_replay.sector_transitions.timeline", "market_replay.sector_transitions.next_checks"],
+                "ai_check": "是否直接引用Python产出的状态变化和下一观察，没有事件时不自行补算。",
             },
             {
                 "dimension": "代表股验证",
@@ -3144,6 +3419,7 @@ def build_market_replay_context(
     board_timeline = _board_timeline(db, trade_date, analysis_boards, checkpoints=checkpoints)
     rotation_windows = _rotation_windows(db, trade_date, checkpoints=checkpoints)
     rotation_shifts = _rotation_shifts(db, trade_date, checkpoints=checkpoints, limit=10)
+    sector_transitions = _sector_transition_context(db, trade_date, limit=6)
     rotation_symbols = _symbols_from_rotation_boards(db, rotation_windows, rotation_shifts)
     intraday_delta_symbols = _intraday_delta_board_symbols(db, trade_date)
     high_turnover_symbols = [row["symbol"] for row in high_turnover[: min(20, len(high_turnover))]]
@@ -3200,6 +3476,7 @@ def build_market_replay_context(
             "failed_boards": "fullmarket_spot_snapshots",
             "board_timeline": "board_heat_ticks",
             "rotation_shifts": "board_heat_ticks",
+            "sector_transitions": "sector_transition_events + optional sector_transition_states",
             "opening_pressure_boards": "board_heat_ticks",
             "representative_paths": "fullmarket_spot_snapshots + bars",
             "stock_event_chains": "fullmarket_spot_snapshots + bars + optional market_limit_pools",
@@ -3241,6 +3518,7 @@ def build_market_replay_context(
         "board_timeline": board_timeline,
         "rotation_windows": rotation_windows,
         "rotation_shifts": rotation_shifts,
+        "sector_transitions": sector_transitions,
         "opening_pressure_boards": _opening_pressure_boards(db, trade_date),
         "chain_peer_pressure_symbols": chain_peer_pressure_symbols,
         "representative_paths": _symbol_evidence(db, trade_date, symbols, limit=max(representative_limit, 80)),
@@ -3264,6 +3542,7 @@ def build_market_replay_context(
         "flow_availability": flow_availability,
         "interpretation_contract": [
             "先从 rotation_windows 看全市场强板块在时间轴上的切换。",
+            "sector_transitions 是Python产出的状态事件；复盘只消费 timeline 和 next_checks，不重新计算、升级或补造事件。",
             "再用 board_timeline 判断板块是持续增强、午后卡位、还是尾盘回落。",
             "再用 high_turnover_cores 和 representative_paths 找高成交核心是否承接失败。",
             "static_representatives 只是产业链知识库代表；dynamic_market_representatives 才是当日市场认可代表。",

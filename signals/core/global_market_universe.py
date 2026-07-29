@@ -11,7 +11,7 @@ import yaml
 from signals.core.cross_market_chains import load_cross_market_chains
 
 CONFIG_PATH = Path(__file__).with_name("global_market_universe.yaml")
-SUPPORTED_MARKETS = ("A", "HK", "US")
+SUPPORTED_MARKETS = ("A", "HK", "US", "KR")
 
 
 def _text(value: Any) -> str:
@@ -20,7 +20,17 @@ def _text(value: Any) -> str:
 
 def normalize_market(value: Any) -> str:
     market = _text(value).upper()
-    aliases = {"CN": "A", "SH": "A", "SZ": "A", "H": "HK", "NYSE": "US", "NASDAQ": "US"}
+    aliases = {
+        "CN": "A",
+        "SH": "A",
+        "SZ": "A",
+        "H": "HK",
+        "NYSE": "US",
+        "NASDAQ": "US",
+        "KOREA": "KR",
+        "KOSPI": "KR",
+        "KOSDAQ": "KR",
+    }
     market = aliases.get(market, market)
     if market not in SUPPORTED_MARKETS:
         raise ValueError(f"unsupported market: {value}")
@@ -39,12 +49,13 @@ def normalize_markets(values: Iterable[Any] | None) -> list[str]:
 
 def _normalize_security(item: dict[str, Any], *, market: str, role: str) -> dict[str, Any]:
     symbol = _text(item.get("symbol")).upper()
+    default_exchange = {"HK": "HKEX", "KR": "KRX"}.get(market, "NASDAQ")
     return {
         "symbol": symbol,
         "raw_code": symbol.split(".", 1)[-1],
         "name": _text(item.get("name")) or symbol,
         "market": market,
-        "exchange": _text(item.get("exchange")) or ("HKEX" if market == "HK" else "NASDAQ"),
+        "exchange": _text(item.get("exchange")) or default_exchange,
         "role": _text(item.get("role")) or role,
         "group": _text(item.get("group")),
         "instrument_kind": _text(item.get("instrument_kind")) or ("index" if role == "index" else "stock"),
@@ -94,6 +105,7 @@ def load_global_market_universe(config_path: str | None = None) -> dict[str, Any
             "timezone": _text(config.get("timezone")),
             "currency": _text(config.get("currency")),
             "coverage_scope": _text(config.get("coverage_scope")),
+            "enabled_by_default": bool(config.get("enabled_by_default", True)),
             "indices": indices,
             "anchors": anchors,
         }
@@ -145,14 +157,21 @@ def market_universe(market: str) -> list[dict[str, Any]]:
     return list({item["symbol"]: item for item in items}.values())
 
 
-def market_metadata(market: str) -> dict[str, str]:
+def market_metadata(market: str) -> dict[str, Any]:
     market = normalize_market(market)
     if market == "A":
-        return {"market": "A", "timezone": "Asia/Shanghai", "currency": "CNY", "coverage_scope": "full_market"}
+        return {
+            "market": "A",
+            "timezone": "Asia/Shanghai",
+            "currency": "CNY",
+            "coverage_scope": "full_market",
+            "enabled_by_default": True,
+        }
     config = load_global_market_universe()["markets"].get(market) or {}
     return {
         "market": market,
         "timezone": _text(config.get("timezone")),
         "currency": _text(config.get("currency")),
         "coverage_scope": _text(config.get("coverage_scope")),
+        "enabled_by_default": bool(config.get("enabled_by_default", True)),
     }

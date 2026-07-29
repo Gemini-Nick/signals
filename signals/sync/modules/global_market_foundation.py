@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from math import isfinite
 import os
-from typing import Any
+from typing import Any, Iterable
 
 from pymongo import UpdateOne
 from pymongo.database import Database
@@ -20,6 +20,23 @@ from signals.core.market_time import naive_market_now
 from signals.data.bar_quality import validate_ohlcv_bar
 
 DAILY_FREQS = ("日线", "daily", "D", "1d")
+KR_CONTEXT_FLAG = "SECTOR_TRANSITION_KR_CONTEXT_ENABLED"
+
+
+def kr_context_enabled() -> bool:
+    return os.getenv(KR_CONTEXT_FLAG, "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _requested_foundation_markets(markets: Iterable[str] | None = None) -> tuple[str, ...]:
+    requested = ("HK", "US") if markets is None else tuple(markets)
+    output: list[str] = []
+    for value in requested:
+        market = normalize_market(value)
+        if market == "A" or (market == "KR" and not kr_context_enabled()):
+            continue
+        if market not in output:
+            output.append(market)
+    return tuple(output)
 
 
 def _security_id(symbol: str) -> str:
@@ -48,11 +65,16 @@ def _select_session_date(
     return session_date
 
 
-def security_master_documents(*, as_of: str, now: datetime | None = None) -> list[dict[str, Any]]:
+def security_master_documents(
+    *,
+    as_of: str,
+    now: datetime | None = None,
+    markets: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
     now = now or naive_market_now("A")
     pair_map = _pair_by_symbol()
     docs: list[dict[str, Any]] = []
-    for market in ("HK", "US"):
+    for market in _requested_foundation_markets(markets):
         metadata = market_metadata(market)
         for item in market_universe(market):
             symbol = item["symbol"]
@@ -88,11 +110,16 @@ def security_master_documents(*, as_of: str, now: datetime | None = None) -> lis
     return docs
 
 
-def universe_membership_documents(*, effective_date: str, now: datetime | None = None) -> list[dict[str, Any]]:
+def universe_membership_documents(
+    *,
+    effective_date: str,
+    now: datetime | None = None,
+    markets: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
     now = now or naive_market_now("A")
     version = load_global_market_universe()["version"]
     docs: list[dict[str, Any]] = []
-    for market in ("HK", "US"):
+    for market in _requested_foundation_markets(markets):
         for rank, item in enumerate(market_universe(market), start=1):
             docs.append(
                 {
@@ -115,9 +142,16 @@ def universe_membership_documents(*, effective_date: str, now: datetime | None =
     return docs
 
 
-def seed_global_market_foundation(db: Database, *, as_of: str, now: datetime | None = None) -> dict[str, int]:
-    security_docs = security_master_documents(as_of=as_of, now=now)
-    membership_docs = universe_membership_documents(effective_date=as_of, now=now)
+def seed_global_market_foundation(
+    db: Database,
+    *,
+    as_of: str,
+    now: datetime | None = None,
+    markets: Iterable[str] | None = None,
+) -> dict[str, int]:
+    requested_markets = _requested_foundation_markets(markets)
+    security_docs = security_master_documents(as_of=as_of, now=now, markets=requested_markets)
+    membership_docs = universe_membership_documents(effective_date=as_of, now=now, markets=requested_markets)
     if security_docs:
         db["security_master"].bulk_write(
             [UpdateOne({"_id": doc["_id"]}, {"$set": doc}, upsert=True) for doc in security_docs],
@@ -129,7 +163,7 @@ def seed_global_market_foundation(db: Database, *, as_of: str, now: datetime | N
             ordered=False,
         )
     pair_updates = []
-    for pair in load_global_market_universe()["a_h_pairs"]:
+    for pair in load_global_market_universe()["a_h_pairs"] if "HK" in requested_markets else []:
         pair_updates.append(
             UpdateOne(
                 {"market": "A", "symbol": pair["a_symbol"]},
@@ -371,7 +405,9 @@ def hydrate_global_core_bars(db: Database) -> dict[str, Any]:
 def build_market_daily_snapshot(db: Database, market: str, *, now: datetime | None = None) -> dict[str, Any]:
     market = normalize_market(market)
     if market == "A":
-        raise ValueError("global foundation snapshots are only materialized for HK/US")
+        raise ValueError("global foundation snapshots are only materialized for HK/US/KR")
+    if market == "KR" and not kr_context_enabled():
+        raise RuntimeError(f"KR context disabled: {KR_CONTEXT_FLAG}=false")
     now = now or naive_market_now(market)
     metadata = market_metadata(market)
     session_date, bars = _latest_valid_bars(db, market)
@@ -485,15 +521,25 @@ def latest_market_snapshot(db: Database, market: str, *, session_date: str | Non
     )
 
 
-def sync_global_market_foundation(db: Database, proxy_url: str | None = None) -> dict[str, Any]:
+def sync_global_market_foundation(
+    db: Database,
+    proxy_url: str | None = None,
+    *,
+    markets: Iterable[str] | None = None,
+) -> dict[str, Any]:
     del proxy_url
     now = naive_market_now("A")
     as_of = now.date().isoformat()
-    seeded = seed_global_market_foundation(db, as_of=as_of, now=now)
-    providers = hydrate_global_core_bars(db)
-    snapshots = [build_market_daily_snapshot(db, market, now=naive_market_now(market)) for market in ("HK", "US")]
+    requested_markets = _requested_foundation_markets(markets)
+    seeded = seed_global_market_foundation(db, as_of=as_of, now=now, markets=requested_markets)
+    providers = hydrate_global_core_bars(db) if any(market in {"HK", "US"} for market in requested_markets) else {}
+    snapshots = [
+        build_market_daily_snapshot(db, market, now=naive_market_now(market))
+        for market in requested_markets
+    ]
     return {
         **seeded,
+        "requested_markets": list(requested_markets),
         "providers": providers,
         "snapshots": snapshots,
         "inserted": sum(seeded.values()) + sum(

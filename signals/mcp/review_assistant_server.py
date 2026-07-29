@@ -19,7 +19,7 @@ from signals.notify.trading_workbench_summary import (
 )
 from signals.replay.market_replay import build_market_replay_context, replay_analysis_framework
 from signals.core.global_market_universe import market_metadata, normalize_markets
-from signals.sync.modules.global_market_foundation import latest_market_snapshot
+from signals.sync.modules.global_market_foundation import KR_CONTEXT_FLAG, kr_context_enabled, latest_market_snapshot
 from signals.sync.db import get_db
 
 
@@ -144,9 +144,9 @@ def _tool_schema() -> list[dict[str, Any]]:
                     },
                     "markets": {
                         "type": "array",
-                        "items": {"type": "string", "enum": ["A", "HK", "US"]},
+                        "items": {"type": "string", "enum": ["A", "HK", "US", "KR"]},
                         "default": ["A"],
-                        "description": "Optional market set. A-only remains the backward-compatible default; HK/US use independently dated materialized snapshots.",
+                        "description": "Optional market set. A-only remains the backward-compatible default; HK/US use independently dated materialized snapshots; KR is explicit-only external context, requires SECTOR_TRANSITION_KR_CONTEXT_ENABLED=true, and does not alter A-share state.",
                     },
                     "cutoff_time": {
                         "type": "string",
@@ -628,9 +628,29 @@ def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
                     }
                 )
                 continue
+            if market == "KR" and not kr_context_enabled():
+                global_markets.append(
+                    {
+                        **market_metadata("KR"),
+                        "session_date": None,
+                        "as_of": None,
+                        "session_state": "unavailable",
+                        "feature_status": "disabled",
+                        "disabled_reason": f"{KR_CONTEXT_FLAG}=false",
+                        "source": "feature_gate",
+                        "context_role": "external_context_only",
+                    }
+                )
+                continue
             snapshot_doc = latest_market_snapshot(db, market, session_date=trade_date)
             if snapshot_doc:
-                global_markets.append(snapshot_doc)
+                global_markets.append(
+                    {
+                        **snapshot_doc,
+                        "enabled_by_default": market_metadata(market).get("enabled_by_default", True),
+                        "context_role": "external_context_only",
+                    }
+                )
             else:
                 global_markets.append(
                     {
@@ -639,6 +659,7 @@ def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
                         "as_of": None,
                         "session_state": "unavailable",
                         "source": "market_daily_snapshots",
+                        "context_role": "external_context_only",
                     }
                 )
         result["requested_markets"] = requested_markets

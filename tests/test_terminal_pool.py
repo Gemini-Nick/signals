@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
+import signals.sync.modules.terminal_pool as terminal_pool_module
 from signals.sync.modules.terminal_pool import (
+    _apply_sector_transition_context,
     _attach_security_identities,
     _add_stock,
     _display_badges_for_pool,
+    _load_sector_transition_context,
     _prefixed_symbol,
     _retain_ma_climb_reasons,
     _slim_reason_for_pool,
@@ -27,6 +32,166 @@ class _IdentityCollection:
 class _IdentityDb(dict):
     def __getitem__(self, key):
         return super().get(key, _IdentityCollection([]))
+
+
+class _ContextCollection:
+    def __init__(self, docs=None, one=None):
+        self.docs = list(docs or [])
+        self.one = one
+        self.find_queries = []
+
+    def find_one(self, query, projection=None, sort=None):
+        self.find_queries.append(query)
+        return dict(self.one) if self.one else None
+
+    def find(self, query=None, projection=None):
+        self.find_queries.append(query or {})
+        return _IdentityCursor(dict(item) for item in self.docs)
+
+
+def test_transition_context_loader_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("SECTOR_TRANSITION_ENABLED", raising=False)
+    assert _load_sector_transition_context({}) == []
+
+
+def test_transition_context_loader_requires_current_fresh_unblocked_episode(monkeypatch):
+    now = datetime(2026, 7, 29, 15, 10)
+    monkeypatch.setenv("SECTOR_TRANSITION_ENABLED", "true")
+    monkeypatch.setattr(terminal_pool_module, "naive_market_now", lambda _market: now)
+    freshness = _ContextCollection(
+        one={
+            "updated_at": now - timedelta(minutes=1),
+            "freshness": "fresh",
+            "stale_reason": "",
+        }
+    )
+    states = _ContextCollection(
+        docs=[
+            {
+                "_id": "industry:保险",
+                "market": "A",
+                "trade_date": "2026-07-29",
+                "active": True,
+                "episode_id": "ep-ok",
+                "turn_state": "repairing",
+                "blockers": [],
+            },
+            {
+                "_id": "concept:旧线索",
+                "market": "A",
+                "trade_date": "2026-07-29",
+                "active": True,
+                "episode_id": "ep-blocked",
+                "turn_state": "panic_release",
+                "blockers": ["technical_stale"],
+            },
+        ]
+    )
+    events = _ContextCollection(
+        docs=[
+            {
+                "_id": "event-ok",
+                "episode_id": "ep-ok",
+                "trade_date": "2026-07-29",
+                "observed_at": now,
+            }
+        ]
+    )
+    db = _IdentityDb(
+        {
+            "data_freshness": freshness,
+            "sector_transition_states": states,
+            "sector_transition_events": events,
+        }
+    )
+    loaded = _load_sector_transition_context(db)
+    assert [row["episode_id"] for row in loaded] == ["ep-ok"]
+    assert loaded[0]["sector_event_id"] == "event-ok"
+    assert states.find_queries[0]["trade_date"] == "2026-07-29"
+    assert events.find_queries[0]["episode_id"] == {"$in": ["ep-ok"]}
+
+    freshness.one["updated_at"] = now - timedelta(hours=1)
+    assert _load_sector_transition_context(db) == []
+
+
+def test_sector_transition_context_never_promotes_or_changes_risk_priority():
+    focus = [{"raw_code": "000001", "rank_score": 100.0}]
+    watch = [
+        {"raw_code": "000002", "rank_score": 50.0},
+        {"raw_code": "000003", "rank_score": 40.0},
+    ]
+    risk = [{"raw_code": "000004", "rank_score": 999.0}]
+    rows = {}
+    transitions = [
+        {
+            "_id": "industry:银行",
+            "turn_state": "stable_turn",
+            "active": True,
+            "episode_id": "ep-stable",
+            "sector_event_id": "event-stable",
+            "sentinel_symbols": ["SZ.000001", "SZ.000003"],
+        },
+        {
+            "_id": "industry:保险",
+            "turn_state": "repairing",
+            "active": True,
+            "episode_id": "ep-repair",
+            "sentinel_symbols": ["SZ.000002", "SZ.000006"],
+        },
+        {
+            "_id": "concept:金融科技",
+            "turn_state": "confirmed_intraday",
+            "active": True,
+            "episode_id": "ep-confirm",
+            "sentinel_symbols": ["SZ.000004"],
+        },
+        {
+            "_id": "concept:消费",
+            "turn_state": "panic_release",
+            "active": True,
+            "episode_id": "ep-panic",
+            "sentinel_symbols": ["SZ.000005"],
+        },
+        {
+            "_id": "concept:旧转折",
+            "turn_state": "failed",
+            "active": False,
+            "episode_id": "ep-failed",
+            "sentinel_symbols": ["SZ.000007"],
+        },
+    ]
+    counts = _apply_sector_transition_context(
+        rows,
+        focus_stocks=focus,
+        risk_stocks=risk,
+        watch_stocks=watch,
+        transitions=transitions,
+        index_codes=set(),
+    )
+    assert counts == {"clue": 2, "watch_tag": 2, "focus_tag": 1}
+    assert focus[0]["source"] == "sector_transition"
+    assert focus[0]["turn_state"] == "stable_turn"
+    assert focus[0]["sector_transition_pool"] == "focus"
+    assert focus[0]["sector_transition_eligibility"] == "buy_review_eligible"
+    assert focus[0]["sector_transition_promoted"] is False
+    assert "个股已独立通过买点池" in focus[0]["sector_transition_annotation"]
+    assert watch[0]["turn_state"] == "repairing"
+    assert watch[0]["sector_transition_eligibility"] == "watch_eligible"
+    assert watch[1]["turn_state"] == "stable_turn"
+    assert watch[1]["sector_transition_pool"] == "watch"
+    assert watch[1]["sector_transition_eligibility"] == "buy_review_pending_individual_gates"
+    assert "source" not in risk[0]
+    assert focus[0]["rank_score"] == 100.0
+    assert risk[0]["rank_score"] == 999.0
+    assert rows["000005"]["source"] == "sector_transition"
+    assert rows["000005"]["sector_transition_eligibility"] == "clue_only"
+    assert "不是盯盘或买点信号" in rows["000005"]["sector_transition_annotation"]
+    assert rows["000005"]["inclusion_reasons"][0]["reason_type"] == "sector_transition"
+    assert rows["000006"]["turn_state"] == "repairing"
+    assert rows["000006"]["sector_transition_pool"] == "clue"
+    assert rows["000006"]["sector_transition_eligibility"] == "watch_pending_individual_gates"
+    assert rows["000006"]["sector_transition_promoted"] is False
+    assert "000007" not in rows
 
 
 def test_terminal_pool_does_not_add_index_code_as_stock():
