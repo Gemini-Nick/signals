@@ -98,13 +98,13 @@ Minute data supports timing only when it is available up to the requested cutoff
 
 Short Markdown:
 
-`/Users/zhangqilong/WorkBuddy/复盘报告/A股盘后简报_YYYY-MM-DD_Signals原生.md`
+`/Users/zhangqilong/WorkBuddy/WorkBuddy｜复盘工程/A股盘后复盘/A股盘后简报_YYYY-MM-DD_Signals原生.md`
 
 Long Markdown and Word:
 
-- `/Users/zhangqilong/WorkBuddy/复盘报告/A股盘后复盘报告_YYYY-MM-DD_Signals原生.md`
-- `/Users/zhangqilong/WorkBuddy/复盘报告/A股盘后复盘报告_YYYY-MM-DD_Signals原生.docx`
-- `/Users/zhangqilong/WorkBuddy/复盘报告/A股盘后可视复盘_YYYY-MM-DD_Signals原生.html`
+- `/Users/zhangqilong/WorkBuddy/WorkBuddy｜复盘工程/A股盘后复盘/A股盘后复盘报告_YYYY-MM-DD_Signals原生.md`
+- `/Users/zhangqilong/WorkBuddy/WorkBuddy｜复盘工程/A股盘后复盘/A股盘后复盘报告_YYYY-MM-DD_Signals原生.docx`
+- `/Users/zhangqilong/WorkBuddy/WorkBuddy｜复盘工程/A股盘后复盘/A股盘后可视复盘_YYYY-MM-DD_Signals原生.html`
 
 Both versions answer the same five questions. The short version uses inline bold labels to reduce rendered height:
 
