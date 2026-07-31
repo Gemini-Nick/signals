@@ -1356,7 +1356,7 @@ def _sync_technical_signal_scan(db: Database, proxy_url: str = None, *, scope: s
             "is_full_market_complete": is_full_market_complete,
             "is_scan_universe_complete": required_complete,
             "coverage_status": coverage_status,
-        }},
+        }, "$inc": {"manifest_revision": 1}},
         upsert=True,
     )
     logger.info("technical signal scan: scope=%s symbols=%d signals=%d failed=%d", scan_scope, scanned, signal_count, failed)

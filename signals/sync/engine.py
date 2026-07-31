@@ -79,7 +79,7 @@ MODULE_TARGETS = {
     "hot_rank_clues": ("hot_rank_clues",),
     "minute_readiness_probe": ("minute_readiness",),
     "weekly_rollup": ("bars", "index_bars"),
-    "terminal_realtime_pool": ("terminal_realtime_pool", "terminal_stock_pool"),
+    "terminal_realtime_pool": ("terminal_stock_pool",),
     "sector_transition_scan": (
         "sector_transition_states",
         "sector_transition_events",
@@ -112,7 +112,6 @@ COLLECTION_DOMAINS = {
     "knowledge_market_views": "knowledge",
     "hot_rank_clues": "hot_rank_clue",
     "minute_readiness": "readiness",
-    "terminal_realtime_pool": "terminal_pool",
     "terminal_stock_pool": "terminal_pool",
     "sector_transition_states": "sector_transition",
     "sector_transition_events": "sector_transition",
@@ -222,7 +221,6 @@ LIVE_SYNC_PLANS = {
         LiveSyncPlan("intraday_technical_signal_scan", "signal_lane", SIGNAL_LANE_INTERVAL_SECONDS, _lane_stale(SIGNAL_LANE_INTERVAL_SECONDS, 3), 240, 38),
         LiveSyncPlan("market_pools", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 60, 40),
         LiveSyncPlan("market_limit_pools", "workbench_lane", LIMIT_POOL_INTERVAL_SECONDS, _lane_stale(LIMIT_POOL_INTERVAL_SECONDS, 4), 90, 42),
-        LiveSyncPlan("terminal_realtime_pool", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 120, 50),
         LiveSyncPlan("strategy_snapshot", "workbench_lane", WORKBENCH_LANE_INTERVAL_SECONDS, _lane_stale(WORKBENCH_LANE_INTERVAL_SECONDS, 3), 90, 55),
         LiveSyncPlan("board_heat_minute", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 180, 60),
         LiveSyncPlan("concept_heat_minute", "board_lane", BOARD_LANE_INTERVAL_SECONDS, _lane_stale(BOARD_LANE_INTERVAL_SECONDS, 3), 180, 65),
@@ -249,7 +247,6 @@ LIVE_SYNC_STAGE_BY_MODULE = {
     "chain_heat_snapshots": 0,
     "minute_readiness_probe": 1,
     "intraday_technical_signal_scan": 1,
-    "terminal_realtime_pool": 1,
     "strategy_snapshot": 2,
     "sector_transition_scan": 1,
 }
@@ -290,7 +287,6 @@ LANE_MAINTENANCE_PLANS = {
     "concept_relationship_graph": LiveSyncPlan("concept_relationship_graph", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 86),
     "sector_transition_rollup": LiveSyncPlan("sector_transition_rollup", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 300, 88),
     "strategy_snapshot": LiveSyncPlan("strategy_snapshot", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 120, 90),
-    "terminal_realtime_pool": LiveSyncPlan("terminal_realtime_pool", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 120, 95),
     "cache_preheat": LiveSyncPlan("cache_preheat", "workbench_lane", 24 * 60 * 60, 2 * 60 * 60, 180, 100),
 }
 
@@ -312,7 +308,6 @@ BOOTSTRAP_LANE_MODULES = {
     "hk_stock_daily": {"workbench_lane"},
     "index_daily": {"workbench_lane"},
     "weekly_rollup": {"workbench_lane"},
-    "terminal_realtime_pool": {"workbench_lane"},
     "strategy_snapshot": {"workbench_lane"},
     "board_ranking": {"board_lane"},
     "board_heat_minute": {"board_lane"},
@@ -912,7 +907,7 @@ class SyncEngine:
         if self.enabled_lanes is not None:
             return results
         for name, fn, schedule in self.modules:
-            if schedule == "live only":
+            if schedule in {"live only", "postmarket only"}:
                 continue
             if not self._module_allowed_for_lanes(name):
                 continue

@@ -1985,6 +1985,71 @@ def test_terminal_stock_pool_group_rows_keep_focus_risk_watch_separate(monkeypat
     assert watch[0]["action_status"] == "entry_waiting_30m_confirm"
 
 
+def test_terminal_pool_meta_reports_single_authority_and_today_failure(monkeypatch):
+    from signals.web.api import workbench
+
+    class _TerminalCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            return {
+                "pool": "terminal_stock_pool",
+                "market": "A",
+                "revision": 8,
+                "generation_id": "generation-8",
+                "base_trade_date": "2026-07-30",
+                "policy_version": "single_fused_postmarket_v1",
+                "membership_hash": "membership",
+                "payload_hash": "payload",
+                "published_at": datetime(2026, 7, 30, 21, 30),
+                "publish_status": "published",
+                "last_successful_publish": {"published_at": datetime(2026, 7, 30, 21, 30)},
+                "last_failed_attempt": {
+                    "status": "failed",
+                    "reason": "ineligible_sources:ma_climb:partial",
+                    "generation_id": "generation-failed",
+                    "requested_trade_date": "2026-07-31",
+                    "finished_at": datetime(2026, 7, 31, 21, 10),
+                },
+                "build_control": {
+                    "last_completed_attempt": {
+                        "status": "failed",
+                        "reason": "ineligible_sources:ma_climb:partial",
+                    },
+                },
+            }
+
+    class _FreshnessCollection:
+        def find_one(self, query=None, projection=None, sort=None):
+            if query.get("$or"):
+                return {"updated_at": datetime(2026, 7, 31, 15, 0)}
+            return {"updated_at": datetime(2026, 7, 31, 15, 1)}
+
+    class _Db(dict):
+        def __getitem__(self, key):
+            return super().__getitem__(key)
+
+    monkeypatch.setattr(
+        workbench,
+        "_mongo_db",
+        lambda: _Db({
+            "terminal_stock_pool": _TerminalCollection(),
+            "data_freshness": _FreshnessCollection(),
+        }),
+    )
+    monkeypatch.setattr(workbench, "a_share_realtime_day_key", lambda now=None: "2026-07-31")
+
+    meta = workbench._terminal_pool_meta()
+
+    assert meta["label"] == "唯一融合名单"
+    assert meta["revision"] == 8
+    assert meta["base_trade_date"] == "2026-07-30"
+    assert meta["today_updated"] is False
+    assert meta["status"] == "stale"
+    assert meta["stale_reason"] == "ineligible_sources:ma_climb:partial"
+    assert meta["last_failed_reason"] == "ineligible_sources:ma_climb:partial"
+    assert meta["last_failed_generation_id"] == "generation-failed"
+    assert meta["confirmation_30m_policy"] == "display_only"
+
+
 def test_terminal_stock_pool_group_rows_refreshes_stale_chain_assignment(monkeypatch):
     from signals.web.api import workbench
 

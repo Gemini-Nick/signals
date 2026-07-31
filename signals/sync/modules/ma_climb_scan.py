@@ -637,7 +637,7 @@ def sync_ma_climb_scan(db: Database, proxy_url: str = None) -> dict:
             "scan_scope": "full_market_cached_daily",
             "minimum_fullmarket_symbols": minimum_fullmarket_symbols,
             "is_full_market_complete": fullmarket_complete,
-        }},
+        }, "$inc": {"manifest_revision": 1}},
         upsert=True,
     )
     logger.info(

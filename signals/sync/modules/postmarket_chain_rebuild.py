@@ -1512,7 +1512,7 @@ def sync_postmarket_chain_rebuild(db: Database, proxy_url: str = None, trade_dat
             "covered_security_count": report["covered_security_count"],
             "mapping_status_counts": dict(mapping_counts),
             "coverage_scope": "eastmoney_ths_required",
-        }},
+        }, "$inc": {"manifest_revision": 1}},
         upsert=True,
     )
 

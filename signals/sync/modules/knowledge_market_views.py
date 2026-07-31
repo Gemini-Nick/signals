@@ -363,7 +363,7 @@ def sync_knowledge_market_views(db: Database, proxy_url: str = None) -> dict:
             "vault_dir": str(vault_dir),
             "vault_docs": len(vault_docs),
             "vault_subdirs": list(VAULT_SUBDIRS),
-        }},
+        }, "$inc": {"manifest_revision": 1}},
         upsert=True,
     )
     logger.info(

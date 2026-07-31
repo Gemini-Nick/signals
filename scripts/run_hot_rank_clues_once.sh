@@ -37,7 +37,6 @@ fi
 
 echo "hot_rank_clues start $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 bash "${ROOT_DIR}/scripts/python.sh" -m signals.sync.engine --once --module hot_rank_clues
-bash "${ROOT_DIR}/scripts/python.sh" -m signals.sync.engine --once --module terminal_realtime_pool
 bash "${ROOT_DIR}/scripts/python.sh" -m signals.sync.engine --once --module quote_snapshots
 bash "${ROOT_DIR}/scripts/python.sh" -m signals.sync.engine --once --module strategy_snapshot
 echo "hot_rank_clues done $(date -u '+%Y-%m-%dT%H:%M:%SZ')"

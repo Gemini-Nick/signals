@@ -210,7 +210,7 @@ def sync_concept_relationship_graph(db: Database, proxy_url: str = None) -> dict
                 "updated_at": now,
                 "stale_reason": "no_chain_heat_snapshots",
                 "count": 0,
-            }},
+            }, "$inc": {"manifest_revision": 1}},
             upsert=True,
         )
         return {"status": "empty", "inserted": 0, "chains": 0}
@@ -239,7 +239,7 @@ def sync_concept_relationship_graph(db: Database, proxy_url: str = None) -> dict
             "stale_reason": "",
             "count": len(graph_docs),
             "viewpoint_docs": len(views),
-        }},
+        }, "$inc": {"manifest_revision": 1}},
         upsert=True,
     )
     logger.info("concept relationship graph: docs=%d written=%d", len(graph_docs), written)

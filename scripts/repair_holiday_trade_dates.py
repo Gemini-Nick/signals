@@ -191,23 +191,10 @@ def _replace_or_delete_doc(db, collection: str, old_id: Any, new_id: Any, update
 
 
 def _repair_derived_pool_docs(db, holiday: str, trade_day: str, apply: bool) -> int:
-    holiday_start = _day_start(holiday)
-    trade_start = _day_start(trade_day)
-    repaired_at = datetime.now()
+    # terminal_stock_pool is an event-date-fenced singleton and must never be
+    # rewritten by a calendar repair utility. A same-day postmarket rerun is the
+    # only supported way to publish a corrected authoritative list.
     total = 0
-    for collection in ("terminal_stock_pool", "terminal_realtime_pool"):
-        rows = list(db[collection].find({"dt": holiday_start}, {"_id": 1}))
-        total += len(rows)
-        if apply and rows:
-            db[collection].update_many(
-                {"_id": {"$in": [row["_id"] for row in rows]}},
-                {"$set": {
-                    "dt": trade_start,
-                    "trade_date": trade_day,
-                    "holiday_repaired_from": holiday,
-                    "holiday_repaired_at": repaired_at,
-                }},
-            )
     total += _replace_or_delete_doc(
         db,
         "market_pools",

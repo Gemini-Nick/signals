@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
+from copy import deepcopy
 from collections import Counter
 from datetime import date, datetime, timedelta
 from itertools import chain
@@ -16,6 +18,17 @@ from signals.core.macro_universe import canonical_macro_industry_etf_symbol, mac
 from signals.core.scorer import FREQ_MULTIPLIER
 from signals.core.trading_dates import a_share_realtime_day_key, trading_day
 from signals.sync.task_context import get_task_env
+from signals.sync.modules.terminal_pool_publish import (
+    POLICY_VERSION,
+    LeaseHeartbeat,
+    acquire_build_lease,
+    cleanup_staged_candidate,
+    finish_attempt,
+    pool_hashes,
+    publish_candidate,
+    stage_candidate,
+    watermark_hash,
+)
 
 logger = logging.getLogger("signals.sync.terminal_pool")
 
@@ -178,7 +191,7 @@ BUY_FREQ_BONUS = {
 }
 ENTRY_30M_FREQS = {"30分钟", "30min", "30m", "F30", "f30"}
 ENTRY_UPPER_FREQS = {"日线", "daily", "1d", "D", "d", "周线", "weekly", "1w", "W", "w"}
-DEFAULT_CANDIDATE_ANCHOR_FREQS = ENTRY_30M_FREQS | ENTRY_UPPER_FREQS
+DEFAULT_CANDIDATE_ANCHOR_FREQS = ENTRY_UPPER_FREQS
 KEY_MA_PERIODS = (5, 8, 10, 13, 20, 21)
 PRIMARY_MA_PERIODS = (5, 10, 20)
 ENTRY_PARTNER_FREQS = ENTRY_UPPER_FREQS | RIGHT_SIDE_FREQS
@@ -1508,17 +1521,23 @@ def _add_signal_rows(
 def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str]) -> None:
     limit = max(1, int(os.getenv("TERMINAL_POOL_TECHNICAL_SIGNAL_LIMIT", "20000")))
     requested_as_of = str(get_task_env("SIGNALS_POSTMARKET_TRADE_DATE", "") or "").strip()[:10]
-    query: dict[str, Any] = {"market": "A", "active": {"$ne": False}}
-    if requested_as_of:
-        query["as_of"] = requested_as_of
-    else:
+    base_query: dict[str, Any] = {"market": "A", "active": {"$ne": False}}
+
+    def family_query(family_filter: dict[str, Any]) -> dict[str, Any]:
+        query = {**base_query, **family_filter}
+        date_query = {**query, "as_of": {"$exists": True}}
+        if requested_as_of:
+            date_query["as_of"] = {"$exists": True, "$lte": requested_as_of}
         latest = db["terminal_technical_signals"].find_one(
-            {"market": "A", "active": {"$ne": False}, "as_of": {"$exists": True}},
+            date_query,
             {"as_of": 1},
             sort=[("as_of", -1), ("updated_at", -1)],
         ) or {}
         if latest.get("as_of"):
             query["as_of"] = latest.get("as_of")
+        elif requested_as_of:
+            query["as_of"] = requested_as_of
+        return query
     projection = {
         "symbol": 1,
         "raw_code": 1,
@@ -1542,11 +1561,11 @@ def _add_technical_signal_rows(rows: dict[str, dict[str, Any]], db: Database, in
         "active": 1,
     }
     climb_cursor = db["terminal_technical_signals"].find(
-        {**query, "signal_family": "ma_climb"},
+        family_query({"signal_family": "ma_climb"}),
         projection,
     ).sort([("total_score", -1), ("updated_at", -1)]).limit(limit)
     regular_cursor = db["terminal_technical_signals"].find(
-        {**query, "signal_family": {"$ne": "ma_climb"}},
+        family_query({"signal_family": {"$ne": "ma_climb"}}),
         projection,
     ).sort([("total_score", -1), ("confidence", -1), ("updated_at", -1)]).limit(limit)
     for signal in chain(climb_cursor, regular_cursor):
@@ -2100,13 +2119,16 @@ def _load_sector_transition_context(db: Database) -> list[dict[str, Any]]:
         return []
     try:
         now = naive_market_now("A")
-        trade_date = a_share_realtime_day_key(now=now)
+        requested_trade_date = _text(get_task_env("SIGNALS_POSTMARKET_TRADE_DATE", ""))[:10]
+        trade_date = requested_trade_date or a_share_realtime_day_key(now=now)
+        postmarket_mode = bool(requested_trade_date)
         freshness = db["data_freshness"].find_one(
             {
                 "domain": "sector_transition",
                 "market": "A",
                 "as_of": trade_date,
                 "freshness": "fresh",
+                **({"mode": "postmarket"} if postmarket_mode else {}),
             },
             {"updated_at": 1, "stale_reason": 1, "mode": 1},
             sort=[("updated_at", -1)],
@@ -2116,20 +2138,21 @@ def _load_sector_transition_context(db: Database) -> list[dict[str, Any]]:
             5,
             min(120, int(os.getenv("SECTOR_TRANSITION_CONTEXT_MAX_AGE_MINUTES", "20"))),
         )
-        if (
-            not isinstance(updated_at, datetime)
-            or now - updated_at > timedelta(minutes=max_age_minutes)
-            or _text(freshness.get("stale_reason"))
-        ):
+        if not isinstance(updated_at, datetime) or _text(freshness.get("stale_reason")):
             return []
+        if not postmarket_mode and now - updated_at > timedelta(minutes=max_age_minutes):
+            return []
+        collection = "sector_transition_daily" if postmarket_mode else "sector_transition_states"
         states = list(
-            db["sector_transition_states"].find(
+            db[collection].find(
                 {
                     "market": "A",
                     "trade_date": trade_date,
-                    "active": True,
-                    "episode_id": {"$nin": ["", None]},
-                    "turn_state": {"$in": ["panic_release", "repairing", "confirmed_intraday", "stable_turn"]},
+                    **({} if postmarket_mode else {
+                        "active": True,
+                        "episode_id": {"$nin": ["", None]},
+                        "turn_state": {"$in": ["panic_release", "repairing", "confirmed_intraday", "stable_turn"]},
+                    }),
                 }
             )
         )
@@ -2703,21 +2726,6 @@ def _add_recent_opened(rows: dict[str, dict[str, Any]], db: Database, index_code
         }, index_codes=index_codes)
 
 
-def _top_heat_names(db: Database, kind: str, limit: int) -> list[str]:
-    docs = list(db["board_heat_ticks"].find(
-        {"kind": kind},
-        {"name": 1, "trade_minute": 1, "rank_idx": 1},
-    ).sort([("trade_minute", -1), ("rank_idx", 1)]).limit(limit * 4))
-    names: list[str] = []
-    for doc in docs:
-        name = _text(doc.get("name"))
-        if name and name not in names:
-            names.append(name)
-        if len(names) >= limit:
-            break
-    return names
-
-
 def _reason_freqs(reason: dict[str, Any]) -> set[str]:
     freqs = {_text(reason.get("freq"))}
     context = reason.get("resonance_context") if isinstance(reason.get("resonance_context"), dict) else {}
@@ -2869,17 +2877,28 @@ def _default_opportunity_candidate_rows(
     *,
     include_st: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    """Default opportunity candidates need a fresh 30m/daily/weekly buy anchor.
+    """Default opportunity candidates need a fresh daily/weekly buy or risk anchor.
 
-    Fresh 5m/15m signals are kept only as execution-period evidence for anchored
-    symbols; stale buy technical reasons are dropped so old context cannot lift a
-    row back into the visible pools.
+    Minute signals are display/chart-only in the authoritative policy. Stale buy
+    technical reasons are dropped so old context cannot lift a row back into the
+    visible pools.
     """
     filtered: dict[str, dict[str, Any]] = {}
     for code, row in rows.items():
         if not include_st and _is_st_stock(row):
             continue
-        if not _has_default_candidate_anchor(row):
+        has_risk_anchor = (
+            _text(row.get("membership_policy_version")) == POLICY_VERSION
+            and any(
+                _is_technical_reason(reason)
+                and _text(reason.get("signal_side")) == "sell"
+                and _is_upper_freq(reason.get("freq"))
+                and _reason_is_current_for_entry(reason)
+                for reason in row.get("inclusion_reasons") or []
+                if isinstance(reason, dict)
+            )
+        )
+        if not _has_default_candidate_anchor(row) and not has_risk_anchor:
             continue
         kept_reasons = []
         for reason in row.get("inclusion_reasons") or []:
@@ -3723,6 +3742,8 @@ def _chain_entry_blocker(row: dict[str, Any]) -> str:
 
 
 def _entry_gate(row: dict[str, Any]) -> tuple[bool, str, list[str], dict[str, Any] | None, dict[str, Any] | None]:
+    if _text(row.get("membership_policy_version")) == POLICY_VERSION:
+        return _authoritative_postmarket_entry_gate(row)
     buy_reasons = _buy_technical_reasons(row)
     risk_reasons = _risk_reasons(row)
     intraday_drop_risk = _intraday_day_drop_risk_reason(row)
@@ -5314,6 +5335,29 @@ def _finalize_pool_row(
         for reason in (top_buy, top_risk)
         if isinstance(reason, dict) and _text(reason.get("signal_type") or reason.get("reason_type"))
     ) or row.get("reason")
+    if _text(row.get("membership_policy_version")) == POLICY_VERSION:
+        row["can_trade_now"] = False
+        row["can_trade_now_semantics"] = "compatibility_only_not_membership_or_order_conclusion"
+        row["confirmation_30m_policy"] = "display_only"
+        row["execution_signal_policy"] = "chart_only"
+        row["blocked_by"] = [
+            item
+            for item in row.get("blocked_by") or []
+            if not _text(item).startswith(("30m", "5m_or_15m"))
+        ]
+        row["missing_gates"] = list(row["blocked_by"])
+        if pool_type == "focus":
+            row["action_status"] = "focus_review"
+            row["trader_action"] = "买点待复核"
+            row["next_action"] = "复核日/周位置、均线与失效条件"
+            row["invalidates_when"] = _text((top_buy or {}).get("invalidates_when")) or "日/周收盘结构或硬买点失效"
+        elif pool_type == "watch":
+            row["action_status"] = "watch"
+            row["trader_action"] = "盯盘观察"
+            row["next_action"] = "等待下一次收盘融合确认；30m仅作盘中提示"
+            row["invalidates_when"] = "日/周候选结构失效或出现风险信号"
+        row["recommended_action"] = row["trader_action"]
+        row["invalidation"] = row["invalidates_when"]
     row["display_badges"] = _display_badges_for_pool(row)
     return row
 
@@ -5968,6 +6012,7 @@ def _split_pool_rows(
                     top_buy=top_buy,
                     top_risk=top_risk,
                 ))
+    focus.sort(key=lambda item: _text(item.get("symbol")))
     focus.sort(
         key=lambda item: (
             _float(item.get("setup_rank_tier")),
@@ -5979,9 +6024,11 @@ def _split_pool_rows(
         ),
         reverse=True,
     )
+    risk.sort(key=lambda item: _text(item.get("symbol")))
     risk.sort(key=lambda item: (_float(item.get("rank_score")), _float(item.get("score"))), reverse=True)
     for bucket in (focus, risk):
         _assign_pool_ranks(bucket)
+    watch.sort(key=lambda item: _text(item.get("symbol")))
     watch.sort(
         key=lambda item: (
             _float((item.get("score_components") or {}).get("upper_buy_proximity")),
@@ -6095,12 +6142,202 @@ def _selected_rows(rows: dict[str, dict[str, Any]], limit: int) -> tuple[list[di
     return ordered[:limit], ordered[limit:]
 
 
-def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
-    """Build terminal_stock_pool and mirror the selected codes to legacy terminal_realtime_pool."""
-    import config
+_POOL_ELIGIBILITY_SOURCES = {
+    "daily": {
+        "query": {"domain": "kline", "market": "A", "mode": "historical", "collection": "daily_bars", "freq": "日线"},
+        "same_trade_date": True,
+        "requires_rows": True,
+    },
+    "completed_weekly": {
+        "query": {"domain": "kline", "market": "A", "mode": "historical", "collection": "weekly_rollup", "freq": "周线"},
+        "same_trade_date": False,
+        "requires_rows": True,
+    },
+    "ma_climb": {
+        "query": {"domain": "technical_signal", "market": "A", "mode": "ma_climb", "collection": "terminal_technical_signals"},
+        "same_trade_date": True,
+        "requires_full_market": True,
+    },
+    "hard_signals": {
+        "query": {"domain": "technical_signal", "market": "A", "mode": "postmarket", "collection": "terminal_technical_signals"},
+        "same_trade_date": True,
+        "requires_scan_complete": True,
+    },
+    "knowledge": {
+        "query": {"domain": "knowledge", "market": "A", "mode": "postmarket", "collection": "knowledge_market_views"},
+        "same_trade_date": True,
+    },
+    "chain_roles": {
+        "query": {"domain": "chain_rebuild", "market": "A", "mode": "postmarket", "collection": "security_chain_memberships"},
+        "same_trade_date": True,
+    },
+    "concept_graph": {
+        "query": {"domain": "concept_graph", "market": "A", "mode": "postmarket", "collection": "concept_relationship_graph"},
+        "same_trade_date": True,
+    },
+    "sector_transition": {
+        "query": {"domain": "sector_transition", "market": "A", "mode": "postmarket", "collection": "sector_transition_daily"},
+        "same_trade_date": True,
+    },
+    "hot_rank_clues": {
+        "query": {"domain": "hot_rank_clue", "market": "A", "mode": "realtime", "collection": "hot_rank_clues"},
+        "same_trade_date": True,
+    },
+}
 
-    now = naive_market_now("A")
-    trade_date = a_share_realtime_day_key(now=now)
+
+def _pool_eligibility_watermarks(
+    db: Database,
+    requested_trade_date: str,
+) -> tuple[dict[str, Any], list[str]]:
+    watermarks: dict[str, Any] = {}
+    blockers: list[str] = []
+    for family, spec in _POOL_ELIGIBILITY_SOURCES.items():
+        doc = db["data_freshness"].find_one(
+            spec["query"],
+            {
+                "_id": 0,
+                "freshness": 1,
+                "latest_dt": 1,
+                "as_of": 1,
+                "data_as_of": 1,
+                "updated_at": 1,
+                "count": 1,
+                "manifest_revision": 1,
+                "coverage_pct": 1,
+                "coverage_status": 1,
+                "coverage_by_freq": 1,
+                "required_freqs": 1,
+                "is_full_market_complete": 1,
+                "is_scan_universe_complete": 1,
+                "scanned_symbols": 1,
+                "failed_symbols": 1,
+                "stale_reason": 1,
+            },
+            sort=[("updated_at", -1)],
+        ) or {}
+        event_date = _text(doc.get("as_of") or doc.get("data_as_of") or doc.get("latest_dt"))[:10]
+        watermark = {
+            "event_date": event_date,
+            "freshness": _text(doc.get("freshness")),
+            "count": int(doc.get("count") or 0),
+            "manifest_revision": int(doc.get("manifest_revision") or 0),
+            "updated_at": doc.get("updated_at"),
+            "coverage_pct": doc.get("coverage_pct"),
+            "coverage_status": _text(doc.get("coverage_status")),
+            "coverage_by_freq": doc.get("coverage_by_freq") or {},
+            "required_freqs": doc.get("required_freqs") or [],
+            "is_full_market_complete": bool(doc.get("is_full_market_complete")),
+            "is_scan_universe_complete": bool(doc.get("is_scan_universe_complete")),
+            "scanned_symbols": int(doc.get("scanned_symbols") or 0),
+            "failed_symbols": int(doc.get("failed_symbols") or 0),
+            "stale_reason": _text(doc.get("stale_reason")),
+        }
+        watermark["content_version"] = watermark_hash(watermark)
+        watermarks[family] = watermark
+        if not doc:
+            blockers.append(f"{family}:missing_manifest")
+            continue
+        if watermark["freshness"] not in {"fresh", "empty"}:
+            blockers.append(f"{family}:{watermark['freshness'] or 'unknown'}")
+        if spec.get("requires_rows") and watermark["count"] <= 0:
+            blockers.append(f"{family}:empty")
+        if spec.get("same_trade_date") and event_date != requested_trade_date:
+            blockers.append(f"{family}:event_date={event_date or 'missing'}")
+        if spec.get("requires_full_market") and not watermark["is_full_market_complete"]:
+            blockers.append(f"{family}:full_market_incomplete")
+        if spec.get("requires_scan_complete") and not watermark["is_scan_universe_complete"]:
+            blockers.append(f"{family}:scan_universe_incomplete")
+        if family == "hard_signals":
+            coverage = watermark["coverage_by_freq"]
+            for freq in ("日线", "周线"):
+                status = coverage.get(freq)
+                if isinstance(status, dict):
+                    complete = bool(status.get("complete") or status.get("is_complete") or status.get("status") in {"complete", "ok", "fresh"})
+                else:
+                    complete = status in {True, "complete", "ok", "fresh"}
+                if not complete:
+                    blockers.append(f"hard_signals:{freq}_incomplete")
+    return watermarks, list(dict.fromkeys(blockers))
+
+
+def _strip_display_only_membership_inputs(
+    rows: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Freeze only postmarket membership inputs; quote and minute signals stay display-only."""
+    frozen: dict[str, dict[str, Any]] = {}
+    for code, source_row in rows.items():
+        row = deepcopy(source_row)
+        kept_reasons: list[dict[str, Any]] = []
+        for source_reason in row.get("inclusion_reasons") or []:
+            if not isinstance(source_reason, dict):
+                continue
+            reason = deepcopy(source_reason)
+            if _is_technical_reason(reason) and not _is_upper_freq(reason.get("freq")):
+                continue
+            for container in (reason, reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}):
+                context = container.get("resonance_context") if isinstance(container.get("resonance_context"), dict) else {}
+                if context:
+                    for key in ("aligned_freqs", "conflict_freqs"):
+                        context[key] = [freq for freq in context.get(key) or [] if _is_upper_freq(freq)]
+            kept_reasons.append(reason)
+        row["inclusion_reasons"] = kept_reasons
+        row["membership_policy_version"] = POLICY_VERSION
+        for key in (
+            "latest_price",
+            "price",
+            "change",
+            "change_pct",
+            "latest_change_pct",
+            "quote_status",
+            "quote_snapshot_at",
+            "momentum_5m",
+            "momentum_15m",
+            "momentum_30m",
+            "f5_latest_signal",
+            "f15_latest_signal",
+            "f30_latest_signal",
+        ):
+            row.pop(key, None)
+        frozen[code] = row
+    return frozen
+
+
+def _authoritative_postmarket_entry_gate(
+    row: dict[str, Any],
+) -> tuple[bool, str, list[str], dict[str, Any] | None, dict[str, Any] | None]:
+    buy_reasons = _current_buy_technical_reasons(row)
+    risk_reasons = [
+        reason
+        for reason in _risk_reasons(row)
+        if not _is_technical_reason(reason) or _is_upper_freq(reason.get("freq"))
+    ]
+    top_buy = max(buy_reasons, key=_buy_reason_priority, default=None)
+    top_risk = max(
+        risk_reasons,
+        key=lambda item: (_float(item.get("weight")), abs(_float(item.get("score")))),
+        default=None,
+    )
+    chain_blocker = _chain_entry_blocker(row)
+    if top_risk or chain_blocker:
+        return False, "blocked_by_risk", ["risk_signal_present" if top_risk else chain_blocker], top_buy, top_risk
+    if not top_buy:
+        return False, "postmarket_watch", ["daily_or_weekly_buy_missing"], None, None
+    if not _is_upper_freq(top_buy.get("freq")):
+        return False, "postmarket_watch", ["daily_or_weekly_buy_missing"], top_buy, None
+    climb_score = _ma_climb_score(top_buy)
+    if climb_score >= 80.0 or _is_strong_upper_anchor_reason(top_buy):
+        return True, "postmarket_focus_review", [], top_buy, None
+    return False, "postmarket_watch", ["focus_score_or_hard_buy_missing"], top_buy, None
+
+
+def _build_terminal_stock_pool_candidate(
+    db: Database,
+    *,
+    trade_date: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Build one complete postmarket candidate without mutating the published singleton."""
     trade_dt = datetime.strptime(trade_date, "%Y-%m-%d")
     stock_limit = int(os.getenv("TERMINAL_REALTIME_STOCK_LIMIT", "24"))
     risk_limit = int(os.getenv("TERMINAL_RISK_STOCK_LIMIT", "72"))
@@ -6121,6 +6358,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     _add_review_clue_rows(rows, db, index_codes)
     _add_hot_rank_clue_rows(rows, db, index_codes, now)
     _attach_membership_context(rows, db, index_codes)
+    rows = _strip_display_only_membership_inputs(rows)
     strict_candidate_count = len(rows)
     fallback_count = 0
     fallback_enabled = False
@@ -6145,7 +6383,6 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
     _attach_broad_market_context(rows, broad_market_context)
     raw_candidate_count = len(rows)
     opportunity_rows = _default_opportunity_candidate_rows(rows, include_st=include_st)
-    _attach_stock_quote_context(opportunity_rows, db, trade_date)
     default_candidate_symbols = {row.get("symbol") for row in opportunity_rows.values() if row.get("symbol")}
     strict_candidate_count = len(opportunity_rows)
 
@@ -6171,7 +6408,6 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         # Transition-only sentinels may be created after the main identity/quote
         # enrichment pass. Enrich this bounded subset before the clue pool is built.
         _attach_security_identities(transition_rows, db)
-        _attach_stock_quote_context(transition_rows, db, trade_date)
     all_processed_symbols = {row.get("symbol") for row in (focus_stocks + risk_stocks + watch_stocks) if row.get("symbol")}
     clue_candidates = []
     for row in rows.values():
@@ -6188,6 +6424,7 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         if not _has_clue_source(row):
             continue
         clue_candidates.append(row)
+    clue_candidates.sort(key=lambda item: _text(item.get("symbol")))
     clue_candidates.sort(key=_clue_quality_score, reverse=True)
     clue_stocks = []
     for row in clue_candidates[:clue_limit]:
@@ -6273,6 +6510,8 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "market": "A",
         "dt": trade_dt,
         "trade_date": trade_date,
+        "base_trade_date": trade_date,
+        "policy_version": POLICY_VERSION,
         "updated_at": now,
         "stock_limit": stock_limit,
         "risk_limit": risk_limit,
@@ -6297,89 +6536,17 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "reason_counts": dict(focus_reason_counts),
         **candidate_meta,
         "coverage_by_freq": technical_freshness.get("coverage_by_freq") or {},
-        "required_freqs": technical_freshness.get("required_freqs") or ["日线", "周线", "30分钟"],
-        "optional_freqs": technical_freshness.get("optional_freqs") or ["15分钟", "5分钟"],
+        "required_freqs": ["日线", "周线"],
+        "optional_freqs": [],
         "is_full_market_complete": bool(technical_freshness.get("is_full_market_complete")),
         "coverage_status": _text(technical_freshness.get("coverage_status")) or "unknown",
         "ranking_version": POOL_RANKING_VERSION,
         "source": "whitebox_pool_builder",
-        "source_policy": "postmarket_strict_with_fallback_watch" if strict_sources and fallback_enabled else ("postmarket_strict_technical_knowledge_chain" if strict_sources else "runtime_watch_and_signal_blend"),
-        "selection_policy": "strict_fresh_30m_daily_weekly_anchor__multi_indicator_resonance__key_ma_array_acceptance__clue_source_only",
+        "source_policy": "postmarket_single_fused_with_fallback_watch" if strict_sources and fallback_enabled else ("postmarket_single_fused_technical_knowledge_chain" if strict_sources else "postmarket_single_fused"),
+        "selection_policy": "daily_completed_weekly_ma_climb_hard_signal_sector_role__30m_display_only__5m_15m_chart_only",
     }
-    db["terminal_stock_pool"].update_one(
-        {"pool": "terminal_stock_pool", "market": "A"},
-        {"$set": pool_doc},
-        upsert=True,
-    )
-    try:
-        from signals.notify.intraday_pool_alerts import process_terminal_stock_pool_alerts
-
-        alert_result = process_terminal_stock_pool_alerts(db, pool_doc)
-    except Exception as exc:
-        logger.debug("terminal stock pool alert skipped: %s", exc)
-        alert_result = {"status": "error", "reason": str(exc), "sent": 0}
-
-    legacy_doc = {
-        "pool": "terminal_realtime",
-        "market": "A",
-        "dt": pool_doc["dt"],
-        "trade_date": trade_date,
-        "updated_at": now,
-        "stocks": [row["raw_code"] for row in (stored_focus_stocks + stored_risk_stocks + stored_watch_stocks + stored_clue_stocks)[: max(stock_limit, 72)]],
-        "indices": list(getattr(config, "INDEX_AK_CODES", {}).values()),
-        "industries": _top_heat_names(db, "industry", 20),
-        "concepts": _top_heat_names(db, "concept", 20),
-        "stock_limit": stock_limit,
-        "source": "terminal_stock_pool_mirror",
-    }
-    db["terminal_realtime_pool"].update_one(
-        {"pool": "terminal_realtime", "market": "A"},
-        {"$set": legacy_doc},
-        upsert=True,
-    )
-
-    db["data_freshness"].update_one(
-        {"domain": "terminal_pool", "market": "A", "mode": "realtime", "collection": "terminal_stock_pool"},
-        {"$set": {
-            "domain": "terminal_pool",
-            "market": "A",
-            "mode": "realtime",
-            "lane": "workbench_lane",
-            "collection": "terminal_stock_pool",
-            "freshness": "fresh" if focus_stocks else "empty",
-            "latest_dt": trade_date,
-            "as_of": trade_date,
-            "date_key": trade_date.replace("-", ""),
-            "updated_at": now,
-            "stale_reason": "" if focus_stocks else "terminal_focus_stock_pool_empty",
-            "count": len(focus_stocks),
-            "candidate_count": len(opportunity_rows),
-            "raw_candidate_count": raw_candidate_count,
-            "strict_candidate_count": strict_candidate_count,
-            "fallback_count": fallback_count,
-            "skipped_count": len(skipped),
-            "pool_counts": pool_counts,
-            "broad_market_context": broad_market_context,
-            "reason_counts": dict(focus_reason_counts),
-            **candidate_meta,
-            "coverage_by_freq": pool_doc["coverage_by_freq"],
-            "coverage_status": pool_doc["coverage_status"],
-            "is_full_market_complete": pool_doc["is_full_market_complete"],
-            "selection_policy": pool_doc["selection_policy"],
-            "ranking_version": POOL_RANKING_VERSION,
-        }},
-        upsert=True,
-    )
-    logger.info(
-        "terminal stock pool: focus=%d risk=%d watch=%d clue=%d candidates=%d skipped=%d",
-        len(focus_stocks),
-        len(risk_stocks),
-        len(watch_stocks),
-        len(clue_stocks),
-        len(opportunity_rows),
-        len(skipped),
-    )
     return {
+        "pool_doc": pool_doc,
         "inserted": len(focus_stocks),
         "stocks": len(focus_stocks),
         "focus_stocks": len(focus_stocks),
@@ -6391,9 +6558,6 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "strict_candidates": strict_candidate_count,
         "fallback_candidates": fallback_count,
         "skipped": len(skipped),
-        "indices": len(legacy_doc["indices"]),
-        "industries": len(legacy_doc["industries"]),
-        "concepts": len(legacy_doc["concepts"]),
         "pool_counts": pool_counts,
         "sector_transition_context_counts": transition_context_counts,
         "broad_market_context": broad_market_context,
@@ -6402,5 +6566,166 @@ def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
         "coverage_status": pool_doc["coverage_status"],
         "is_full_market_complete": pool_doc["is_full_market_complete"],
         "ranking_version": POOL_RANKING_VERSION,
-        "alerts": alert_result,
     }
+
+
+def sync_terminal_realtime_pool(db: Database, proxy_url: str = None) -> dict:
+    """Publish the only authoritative pool, exclusively from a declared postmarket run."""
+    del proxy_url
+    requested_trade_date = _text(get_task_env("SIGNALS_POSTMARKET_TRADE_DATE", ""))[:10]
+    if not requested_trade_date:
+        return {
+            "status": "skipped",
+            "reason": "postmarket_trade_date_required",
+            "published": False,
+        }
+
+    now = naive_market_now("A")
+    lease = acquire_build_lease(
+        db,
+        requested_trade_date=requested_trade_date,
+        trigger="postmarket",
+        now=now,
+    )
+    if lease.get("status") != "acquired":
+        return {**lease, "published": False}
+
+    generation_id = uuid.uuid4().hex
+    heartbeat = LeaseHeartbeat(db, lease, started_at=now)
+    heartbeat.start()
+    staged = False
+    try:
+        watermarks_before, blockers = _pool_eligibility_watermarks(db, requested_trade_date)
+        before_hash = watermark_hash(watermarks_before)
+        if blockers:
+            finish_attempt(
+                db,
+                lease,
+                status="failed",
+                reason="ineligible_sources:" + ",".join(blockers),
+                now=naive_market_now("A"),
+                generation_id=generation_id,
+                requested_trade_date=requested_trade_date,
+            )
+            return {
+                "status": "rejected",
+                "reason": "ineligible_sources",
+                "blockers": blockers,
+                "generation_id": generation_id,
+                "published": False,
+            }
+
+        result = _build_terminal_stock_pool_candidate(
+            db,
+            trade_date=requested_trade_date,
+            now=now,
+        )
+        watermarks_after, after_blockers = _pool_eligibility_watermarks(db, requested_trade_date)
+        after_hash = watermark_hash(watermarks_after)
+        if after_blockers or before_hash != after_hash:
+            reason = "source_changed_during_build" if before_hash != after_hash else "ineligible_sources_after_build"
+            finish_attempt(
+                db,
+                lease,
+                status="failed",
+                reason=reason,
+                now=naive_market_now("A"),
+                generation_id=generation_id,
+                requested_trade_date=requested_trade_date,
+            )
+            return {
+                "status": "rejected",
+                "reason": reason,
+                "blockers": after_blockers,
+                "generation_id": generation_id,
+                "published": False,
+            }
+
+        pool_doc = result.pop("pool_doc")
+        pool_doc.update({
+            "generation_id": generation_id,
+            "eligibility_watermarks": watermarks_after,
+            "eligibility_manifest_hash": after_hash,
+        })
+        membership_hash, payload_hash = pool_hashes(pool_doc)
+        pool_doc["membership_hash"] = membership_hash
+        pool_doc["payload_hash"] = payload_hash
+        stage_candidate(
+            db,
+            generation_id=generation_id,
+            pool_doc=pool_doc,
+            watermarks_before_hash=before_hash,
+            watermarks_after_hash=after_hash,
+            now=now,
+        )
+        staged = True
+        publish_result = publish_candidate(
+            db,
+            lease,
+            pool_doc,
+            now=naive_market_now("A"),
+        )
+        status = _text(publish_result.get("status"))
+        if status == "published":
+            db["data_freshness"].update_one(
+                {"domain": "terminal_pool", "market": "A", "mode": "postmarket", "collection": "terminal_stock_pool"},
+                {"$set": {
+                    "domain": "terminal_pool",
+                    "market": "A",
+                    "mode": "postmarket",
+                    "lane": "postmarket",
+                    "collection": "terminal_stock_pool",
+                    "freshness": "fresh",
+                    "latest_dt": requested_trade_date,
+                    "as_of": requested_trade_date,
+                    "date_key": requested_trade_date.replace("-", ""),
+                    "updated_at": now,
+                    "stale_reason": "",
+                    "count": result["focus_stocks"],
+                    "candidate_count": result["candidates"],
+                    "pool_counts": result["pool_counts"],
+                    "membership_hash": membership_hash,
+                    "payload_hash": payload_hash,
+                    "revision": publish_result.get("revision"),
+                    "generation_id": generation_id,
+                    "policy_version": POLICY_VERSION,
+                    "selection_policy": pool_doc["selection_policy"],
+                    "ranking_version": POOL_RANKING_VERSION,
+                }, "$inc": {"manifest_revision": 1}},
+                upsert=True,
+            )
+        logger.info(
+            "terminal stock pool publish=%s revision=%s base=%s focus=%d risk=%d watch=%d clue=%d",
+            status,
+            publish_result.get("revision"),
+            requested_trade_date,
+            result["focus_stocks"],
+            result["risk_stocks"],
+            result["watch_stocks"],
+            result["clue_stocks"],
+        )
+        return {
+            **result,
+            **publish_result,
+            "published": status == "published",
+            "base_trade_date": requested_trade_date,
+            "policy_version": POLICY_VERSION,
+            "membership_hash": membership_hash,
+            "payload_hash": payload_hash,
+            "external_notifications": "not_invoked",
+        }
+    except Exception as exc:
+        finish_attempt(
+            db,
+            lease,
+            status="failed",
+            reason=f"{exc.__class__.__name__}:{exc}",
+            now=naive_market_now("A"),
+            generation_id=generation_id,
+            requested_trade_date=requested_trade_date,
+        )
+        raise
+    finally:
+        heartbeat.stop()
+        if staged:
+            cleanup_staged_candidate(db, generation_id)

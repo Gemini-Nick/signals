@@ -441,7 +441,7 @@ def _write_rollup_freshness(
             "stale_reason": "" if count else f"{collection}_missing",
             "count": count,
             "symbol_count": symbol_count,
-        }},
+        }, "$inc": {"manifest_revision": 1}},
         upsert=True,
     )
 

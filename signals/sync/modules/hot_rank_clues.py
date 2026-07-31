@@ -611,7 +611,7 @@ def _write_freshness(db: Database, *, now: datetime, docs: list[dict[str, Any]],
             "selected_count": selected_count,
             "source_counts": source_counts,
             "errors": errors[:8],
-        }},
+        }, "$inc": {"manifest_revision": 1}},
         upsert=True,
     )
 

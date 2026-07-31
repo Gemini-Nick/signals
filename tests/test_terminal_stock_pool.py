@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from copy import deepcopy
+from datetime import datetime, timedelta
+
 from bson import BSON
 
-from signals.sync.modules.terminal_pool import _add_fallback_watch_rows, _add_reason, _add_signal_rows, _add_user_pinned, _backfill_watch_from_clue_candidates, _default_opportunity_candidate_rows, _entry_age_limit, _fib_ma_support_score_from_alignment, _reason_is_current_for_entry, _reason_type_for_signal, _selected_rows, _split_pool_rows
+from signals.sync.modules.terminal_pool import _add_fallback_watch_rows, _add_reason, _add_signal_rows, _add_user_pinned, _backfill_watch_from_clue_candidates, _default_opportunity_candidate_rows, _entry_age_limit, _fib_ma_support_score_from_alignment, _reason_is_current_for_entry, _reason_type_for_signal, _selected_rows, _split_pool_rows, _strip_display_only_membership_inputs
 from signals.sync.modules.terminal_pool import _slim_pool_row_for_storage
+from signals.sync.modules.terminal_pool_publish import acquire_build_lease, pool_hashes, publish_candidate
 
 
 def _add_ma_climb(rows, code, score):
@@ -1546,7 +1550,7 @@ def test_terminal_stock_pool_freshness_limits_match_watch_horizon():
     assert not _reason_is_current_for_entry({"freq": "周线", "event_dt": "2026-04-30", "as_of": "2026-05-08"})
 
 
-def test_terminal_stock_pool_default_candidates_require_fresh_30m_daily_or_weekly_anchor():
+def test_terminal_stock_pool_default_candidates_require_fresh_daily_or_weekly_anchor():
     rows = {}
     _add_reason(rows, "300501", {
         "reason_type": "technical_trigger",
@@ -1669,7 +1673,7 @@ def test_terminal_stock_pool_default_candidates_require_fresh_30m_daily_or_weekl
 
     filtered = _default_opportunity_candidate_rows(rows)
 
-    assert set(filtered) == {"300503", "300507"}
+    assert set(filtered) == {"300503"}
     assert {reason["freq"] for reason in filtered["300503"]["inclusion_reasons"]} == {"日线", "5分钟"}
 
 
@@ -2894,3 +2898,223 @@ def test_gate_progress_scores_multi_freq_entry():
 
     score = _gate_progress(rows["300575"])
     assert score >= 5, f"Expected >=5 got {score}"
+
+
+def _nested_get(doc, path):
+    value = doc
+    for part in path.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None, False
+        value = value[part]
+    return value, True
+
+
+def _nested_set(doc, path, value):
+    target = doc
+    parts = path.split(".")
+    for part in parts[:-1]:
+        target = target.setdefault(part, {})
+    target[parts[-1]] = deepcopy(value)
+
+
+def _nested_unset(doc, path):
+    target = doc
+    parts = path.split(".")
+    for part in parts[:-1]:
+        target = target.get(part, {})
+    if isinstance(target, dict):
+        target.pop(parts[-1], None)
+
+
+def _matches(doc, query):
+    for key, expected in query.items():
+        if key == "$or":
+            if not any(_matches(doc, item) for item in expected):
+                return False
+            continue
+        actual, exists = _nested_get(doc, key)
+        if isinstance(expected, dict):
+            if "$exists" in expected and exists != bool(expected["$exists"]):
+                return False
+            if "$lte" in expected and (not exists or actual > expected["$lte"]):
+                return False
+        elif actual != expected:
+            return False
+    return True
+
+
+class _WriteResult:
+    def __init__(self, matched_count):
+        self.matched_count = matched_count
+
+
+class _PoolCollection:
+    def __init__(self, doc=None):
+        self.doc = deepcopy(doc)
+
+    def find_one(self, query=None, projection=None, sort=None):
+        del projection, sort
+        if self.doc is None or (query and not _matches(self.doc, query)):
+            return None
+        return deepcopy(self.doc)
+
+    def _apply(self, update):
+        for key, value in update.get("$setOnInsert", {}).items():
+            _, exists = _nested_get(self.doc, key)
+            if not exists:
+                _nested_set(self.doc, key, value)
+        for key, value in update.get("$inc", {}).items():
+            current, _ = _nested_get(self.doc, key)
+            _nested_set(self.doc, key, int(current or 0) + value)
+        for key, value in update.get("$set", {}).items():
+            _nested_set(self.doc, key, value)
+        for key in update.get("$unset", {}):
+            _nested_unset(self.doc, key)
+
+    def find_one_and_update(self, query, update, upsert=False, return_document=None):
+        del return_document
+        if self.doc is None:
+            if not upsert:
+                return None
+            self.doc = {}
+        elif not _matches(self.doc, query):
+            return None
+        self._apply(update)
+        return deepcopy(self.doc)
+
+    def update_one(self, query, update, upsert=False):
+        del upsert
+        if self.doc is None or not _matches(self.doc, query):
+            return _WriteResult(0)
+        self._apply(update)
+        return _WriteResult(1)
+
+
+class _PoolDb(dict):
+    def __getitem__(self, key):
+        return super().__getitem__(key)
+
+
+def _publishable_pool(base_trade_date="2026-07-30"):
+    row = {
+        "symbol": "SH.600988",
+        "raw_code": "600988",
+        "name": "赤峰黄金",
+        "pool_type": "focus",
+        "rank": 1,
+        "rank_score": 100.0,
+        "inclusion_reasons": [{
+            "reason_type": "technical_trigger",
+            "signal_family": "ma_climb",
+            "freq": "日线",
+            "signal_side": "buy",
+            "signal_type": "日线攀爬",
+            "source_collection": "terminal_technical_signals",
+            "source_doc_id": "ma-climb-600988",
+        }],
+    }
+    pool = {
+        "pool": "terminal_stock_pool",
+        "market": "A",
+        "trade_date": base_trade_date,
+        "base_trade_date": base_trade_date,
+        "policy_version": "single_fused_postmarket_v1",
+        "focus_stocks": [row],
+        "risk_stocks": [],
+        "watch_stocks": [],
+        "clue_stocks": [],
+    }
+    membership_hash, payload_hash = pool_hashes(pool)
+    pool.update({
+        "generation_id": f"generation-{base_trade_date}",
+        "membership_hash": membership_hash,
+        "payload_hash": payload_hash,
+    })
+    return pool
+
+
+def test_terminal_pool_strips_quote_and_intraday_signals_before_membership():
+    rows = {
+        "600988": {
+            "symbol": "SH.600988",
+            "latest_price": 37.17,
+            "change_pct": -1.82,
+            "inclusion_reasons": [
+                {"reason_type": "technical_trigger", "freq": "日线", "signal_side": "buy"},
+                {"reason_type": "technical_trigger", "freq": "30分钟", "signal_side": "buy"},
+                {"reason_type": "technical_trigger", "freq": "15分钟", "signal_side": "sell"},
+                {"reason_type": "knowledge_confirmed", "source_collection": "knowledge_market_views"},
+            ],
+        },
+    }
+
+    frozen = _strip_display_only_membership_inputs(rows)["600988"]
+
+    assert "latest_price" not in frozen
+    assert "change_pct" not in frozen
+    assert [item.get("freq") for item in frozen["inclusion_reasons"]] == ["日线", None]
+
+
+def test_terminal_pool_hashes_ignore_quote_and_30m_display_overlay():
+    baseline = _publishable_pool()
+    overlaid = deepcopy(baseline)
+    overlaid["focus_stocks"][0].update({
+        "latest_price": 39.2,
+        "change_pct": 5.0,
+        "confirmation_30m": {"signal_type": "30m二买", "updated_at": "2026-07-31T10:30:00"},
+    })
+
+    assert pool_hashes(baseline) == pool_hashes(overlaid)
+
+
+def test_terminal_pool_rejects_older_trade_date_before_build():
+    collection = _PoolCollection({
+        **_publishable_pool("2026-07-30"),
+        "revision": 4,
+        "publish_status": "published",
+    })
+    db = _PoolDb({"terminal_stock_pool": collection})
+
+    result = acquire_build_lease(
+        db,
+        requested_trade_date="2026-07-29",
+        trigger="postmarket",
+        now=datetime(2026, 7, 31, 9, 0),
+    )
+
+    assert result["status"] == "stale_trigger"
+    assert collection.doc["revision"] == 4
+
+
+def test_terminal_pool_fence_allows_only_latest_publisher_and_identical_rerun_is_noop():
+    collection = _PoolCollection({
+        "pool": "terminal_stock_pool",
+        "market": "A",
+        "revision": 0,
+        "publish_status": "unavailable",
+    })
+    db = _PoolDb({"terminal_stock_pool": collection})
+    now = datetime(2026, 7, 30, 21, 15)
+    first = acquire_build_lease(db, requested_trade_date="2026-07-30", trigger="postmarket", now=now)
+    collection.doc["build_control"]["lease_until"] = now - timedelta(seconds=1)
+    second = acquire_build_lease(db, requested_trade_date="2026-07-30", trigger="postmarket", now=now)
+    pool = _publishable_pool()
+
+    stale = publish_candidate(db, first, pool, now=now)
+    winner = publish_candidate(db, second, pool, now=now)
+
+    assert stale["status"] == "superseded"
+    assert winner["status"] == "published"
+    assert collection.doc["revision"] == 1
+
+    collection.doc["last_failed_attempt"] = {
+        "status": "failed",
+        "reason": "source_changed_during_build",
+    }
+    third = acquire_build_lease(db, requested_trade_date="2026-07-30", trigger="postmarket", now=now)
+    noop = publish_candidate(db, third, pool, now=now)
+
+    assert noop["status"] == "noop"
+    assert collection.doc["revision"] == 1
+    assert collection.doc["generation_id"] == pool["generation_id"]
+    assert collection.doc["last_failed_attempt"]["reason"] == "source_changed_during_build"

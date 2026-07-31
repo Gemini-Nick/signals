@@ -46,7 +46,7 @@ from signals.core.stock_names import get_resolver
 from signals.data.gateway import get_index_bars, get_kline
 from signals.data.models import DataRequest
 from signals.core.trade_log import get_trade_log
-from signals.core.trading_dates import A_SHARE_AUCTION_OPEN
+from signals.core.trading_dates import A_SHARE_AUCTION_OPEN, a_share_realtime_day_key
 from signals.services import backtest as backtest_service
 from signals.services import cluster as cluster_service
 from signals.strategy.snapshot import get_strategy_snapshot
@@ -80,12 +80,12 @@ SECOND_SCREEN_LANES = {
     "signal_lane": {
         "label": "信号确认",
         "cadence": "5m close",
-        "purpose": "5m/15m/30m/日/周闭合结构确认。",
+        "purpose": "30m盘中提示与5m/15m图表信号；不改变权威名单。",
     },
     "workbench_lane": {
-        "label": "工作台重算",
+        "label": "工作台展示",
         "cadence": "10m",
-        "purpose": "主观察列表、候选池、暂不参与池和策略快照。",
+        "purpose": "叠加最新价格、30m提示和策略快照；不重算名单。",
     },
     "board_lane": {
         "label": "板块异动",
@@ -4164,6 +4164,7 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "entry_gate_status",
         "next_action",
         "trader_action",
+        "rank",
         "rank_score",
         "sort_score",
         "score",
@@ -4270,6 +4271,9 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
         "manual_clue",
         "deletable",
         "can_trade_now",
+        "can_trade_now_semantics",
+        "confirmation_30m_policy",
+        "execution_signal_policy",
     )
     out = {key: row.get(key) for key in keys if row.get(key) not in (None, "", [], {})}
     ma_alignment = _slim_shell_ma_alignment(row.get("ma_alignment"))
@@ -4291,6 +4295,8 @@ def _slim_shell_stock_row(row: dict[str, Any]) -> dict[str, Any]:
     ]
     if reasons:
         out["inclusion_reasons"] = [reason for reason in reasons if reason][:3]
+    if isinstance(row.get("confirmation_30m"), dict):
+        out["confirmation_30m"] = dict(row["confirmation_30m"])
     for key in ("technical_evidence", "top_buy_reason", "top_risk_reason"):
         slim = _slim_shell_signal_reason(row.get(key))
         if slim:
@@ -9325,6 +9331,43 @@ def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: 
     source_rows = [item for item in source_rows or [] if isinstance(item, dict)]
     if group in {"focus_stocks", "risk_stocks", "watch_stocks", "clue_stocks"}:
         _refresh_realtime_quotes_for_rows(db, source_rows, refresh_key=group, limit=limit)
+    confirmation_30m: dict[str, dict[str, Any]] = {}
+    symbols = [_text(item.get("symbol")) for item in source_rows if _text(item.get("symbol"))]
+    if symbols:
+        try:
+            cursor = db["terminal_technical_signals"].find(
+                {
+                    "market": "A",
+                    "symbol": {"$in": symbols},
+                    "freq": {"$in": ["30分钟", "30min", "30m"]},
+                    "active": {"$ne": False},
+                },
+                {
+                    "symbol": 1,
+                    "signal_type": 1,
+                    "signal_side": 1,
+                    "signal_family": 1,
+                    "as_of": 1,
+                    "dt": 1,
+                    "updated_at": 1,
+                },
+            ).sort([("as_of", -1), ("updated_at", -1)])
+            for signal in cursor:
+                symbol = _text(signal.get("symbol"))
+                if not symbol or symbol in confirmation_30m:
+                    continue
+                confirmation_30m[symbol] = {
+                    "status": "available",
+                    "signal_type": _text(signal.get("signal_type")),
+                    "signal_side": _text(signal.get("signal_side")),
+                    "signal_family": _text(signal.get("signal_family")),
+                    "as_of": _text(signal.get("as_of")),
+                    "updated_at": _serialize_dt(signal.get("updated_at") or signal.get("dt")),
+                    "policy": "display_only",
+                    "note": "30m仅提示，不影响入池、晋级、降级或失效。",
+                }
+        except Exception:
+            confirmation_30m = {}
     range_return_limit = _shell_stock_range_return_limit(group)
     chain_positions = _terminal_stock_chain_position_map(source_rows)
     for item in source_rows:
@@ -9361,6 +9404,11 @@ def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: 
         )
         row["signal_origin"] = item.get("signal_origin", "")
         row["signal_family"] = item.get("signal_family", "")
+        row["confirmation_30m"] = confirmation_30m.get(_text(row.get("symbol"))) or {
+            "status": "missing",
+            "policy": "display_only",
+            "note": "30m仅提示，不影响入池、晋级、降级或失效。",
+        }
         row["chain_context"] = item.get("chain_context") if isinstance(item.get("chain_context"), dict) else {}
         row = _refresh_shell_stock_chain_assignment(row, chain_positions)
         row["exit_condition"] = item.get("exit_condition") or item.get("invalidates_when") or row.get("invalidates_when")
@@ -9584,6 +9632,17 @@ def _focus_stock_pool_meta(focus_count: int) -> dict[str, Any]:
                 "coverage_by_freq": 1,
                 "coverage_status": 1,
                 "is_full_market_complete": 1,
+                "revision": 1,
+                "generation_id": 1,
+                "base_trade_date": 1,
+                "policy_version": 1,
+                "membership_hash": 1,
+                "payload_hash": 1,
+                "published_at": 1,
+                "publish_status": 1,
+                "last_successful_publish": 1,
+                "last_failed_attempt": 1,
+                "build_control": 1,
             },
             sort=[("updated_at", -1)],
         ) or {}
@@ -9592,7 +9651,10 @@ def _focus_stock_pool_meta(focus_count: int) -> dict[str, Any]:
             {"domain": "terminal_pool", "market": "A", "collection": "terminal_stock_pool"},
             sort=[("updated_at", -1)],
         ) or {}
-        run = db["sync_runs"].find_one({"_id": {"$regex": "^postmarket:"}}, sort=[("updated_at", -1)]) or {}
+        run = db["sync_runs"].find_one(
+            {"_id": {"$regex": "^postmarket:"}},
+            sort=[("trade_date", -1), ("updated_at", -1)],
+        ) or {}
         stocks_len = len(doc.get("focus_stocks") or doc.get("stocks") or [])
         empty_reason = ""
         if focus_count == 0:
@@ -9631,10 +9693,124 @@ def _focus_stock_pool_meta(focus_count: int) -> dict[str, Any]:
             "terminal_technical_signal_count": int(tech_count),
             "postmarket_status": _text(run.get("status")),
             "postmarket_run_id": _text(run.get("_id")),
+            "revision": int(doc.get("revision") or 0),
+            "generation_id": _text(doc.get("generation_id")),
+            "base_trade_date": _text(doc.get("base_trade_date") or doc.get("trade_date"))[:10],
+            "policy_version": _text(doc.get("policy_version")),
+            "membership_hash": _text(doc.get("membership_hash")),
+            "payload_hash": _text(doc.get("payload_hash")),
+            "published_at": _serialize_dt(doc.get("published_at")),
+            "publish_status": _text(doc.get("publish_status")),
             "empty_reason": empty_reason,
         })
     except Exception as exc:
         meta.update({"empty_reason": "metadata_unavailable", "error": exc.__class__.__name__})
+    return meta
+
+
+def _terminal_pool_meta() -> dict[str, Any]:
+    today = a_share_realtime_day_key(now=naive_market_now("A"))
+    meta: dict[str, Any] = {
+        "label": "唯一融合名单",
+        "authority": "terminal_stock_pool",
+        "base_trade_date": "",
+        "revision": 0,
+        "generation_id": "",
+        "policy_version": "",
+        "last_successful_at": "",
+        "today_updated": False,
+        "status": "unavailable",
+        "stale_reason": "no_successful_pool",
+        "price_data_time": "",
+        "confirmation_30m_data_time": "",
+        "confirmation_30m_policy": "display_only",
+        "confirmation_30m_note": "30m仅提示，不影响入池、晋级、降级或失效。",
+        "execution_signal_policy": "5m/15m仅保留在图表，不参与名单。",
+        "manual_attention_policy": "盘中立即展示，不计入正式池数量；下一次收盘参与融合。",
+    }
+    try:
+        db = _mongo_db()
+        doc = db["terminal_stock_pool"].find_one(
+            {"pool": "terminal_stock_pool", "market": "A"},
+            {
+                "revision": 1,
+                "generation_id": 1,
+                "base_trade_date": 1,
+                "trade_date": 1,
+                "policy_version": 1,
+                "membership_hash": 1,
+                "payload_hash": 1,
+                "published_at": 1,
+                "publish_status": 1,
+                "last_successful_publish": 1,
+                "last_failed_attempt": 1,
+                "build_control": 1,
+            },
+        ) or {}
+        quote = db["data_freshness"].find_one(
+            {"market": "A", "collection": {"$in": ["quote_snapshots", "fullmarket_spot_snapshots"]}},
+            {"updated_at": 1, "latest_dt": 1, "snapshot_at": 1},
+            sort=[("updated_at", -1)],
+        ) or {}
+        minute_30m = db["data_freshness"].find_one(
+            {
+                "market": "A",
+                "$or": [
+                    {"freq": {"$in": ["30分钟", "30min", "30m"]}},
+                    {"collection": "stock_30m_fullmarket"},
+                ],
+            },
+            {"updated_at": 1, "latest_dt": 1, "as_of": 1},
+            sort=[("updated_at", -1)],
+        ) or {}
+        base_trade_date = _text(doc.get("base_trade_date") or doc.get("trade_date"))[:10]
+        publish_status = _text(doc.get("publish_status"))
+        control = doc.get("build_control") if isinstance(doc.get("build_control"), dict) else {}
+        active_attempt = control.get("active_attempt") if isinstance(control.get("active_attempt"), dict) else {}
+        last_attempt = control.get("last_completed_attempt") if isinstance(control.get("last_completed_attempt"), dict) else {}
+        last_failure = doc.get("last_failed_attempt") if isinstance(doc.get("last_failed_attempt"), dict) else {}
+        today_updated = publish_status == "published" and base_trade_date == today
+        stale_reason = ""
+        status = "healthy"
+        if publish_status != "published":
+            status = "unavailable"
+            stale_reason = "no_successful_pool"
+        elif not today_updated:
+            status = "stale"
+            stale_reason = "today_not_updated"
+        if _text(last_attempt.get("status")) == "failed":
+            status = "stale" if publish_status == "published" else "unavailable"
+            stale_reason = _text(last_attempt.get("reason")) or "latest_build_failed"
+        if _text(active_attempt.get("status")) == "running":
+            status = "refreshing"
+        meta.update({
+            "base_trade_date": base_trade_date,
+            "revision": int(doc.get("revision") or 0),
+            "generation_id": _text(doc.get("generation_id")),
+            "policy_version": _text(doc.get("policy_version")),
+            "membership_hash": _text(doc.get("membership_hash")),
+            "payload_hash": _text(doc.get("payload_hash")),
+            "last_successful_at": _serialize_dt(
+                (doc.get("last_successful_publish") or {}).get("published_at")
+                if isinstance(doc.get("last_successful_publish"), dict)
+                else doc.get("published_at")
+            ),
+            "today_updated": today_updated,
+            "status": status,
+            "stale_reason": stale_reason,
+            "last_attempt_status": _text(last_attempt.get("status")),
+            "last_attempt_reason": _text(last_attempt.get("reason")),
+            "active_attempt_status": _text(active_attempt.get("status")),
+            "last_failed_status": _text(last_failure.get("status")),
+            "last_failed_reason": _text(last_failure.get("reason")),
+            "last_failed_generation_id": _text(last_failure.get("generation_id")),
+            "last_failed_trade_date": _text(last_failure.get("requested_trade_date"))[:10],
+            "last_failed_at": _serialize_dt(last_failure.get("finished_at")),
+            "price_data_time": _serialize_dt(quote.get("snapshot_at") or quote.get("updated_at") or quote.get("latest_dt")),
+            "confirmation_30m_data_time": _serialize_dt(minute_30m.get("updated_at") or minute_30m.get("latest_dt") or minute_30m.get("as_of")),
+        })
+    except Exception as exc:
+        meta["error"] = exc.__class__.__name__
     return meta
 
 
@@ -9824,11 +10000,11 @@ TRADE_ROLE_DEFINITIONS = {
         "source": "terminal_stock_pool.setup_mode + ma_alignment + buy_point_quality",
     },
     "right_attack": {
-        "definition": "日/周买点成立后，用30m/15m/5m二买、三买、趋势或突破型信号确认执行。",
+        "definition": "日/周硬买点或高分MA攀爬进入买点待复核；30m仅提示，5m/15m仅用于图表。",
         "source": "terminal_stock_pool.setup_mode + ma_alignment + buy_point_quality",
     },
     "watch": {
-        "definition": "日/周有买点苗头但还缺30m、5m/15m执行确认；或短周期异动但缺日/周买点。",
+        "definition": "日/周候选已进入观察，但尚未达到买点复核标准；盘中周期不改变归属。",
         "source": "terminal_stock_pool.watch_stocks",
     },
     "clue": {
@@ -10355,6 +10531,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         limit=_shell_manual_clue_limit(),
         decision_enrich_limit=_shell_manual_clue_decision_limit(),
     )
+    formal_focus_count = len(focus_stocks)
     manual_attack_focus = _manual_clue_attack_focus_rows(manual_clues, focus_stocks)
     focus_stocks = _merge_stock_rows_by_symbol(manual_attack_focus + focus_stocks)
     manual_focus_count = len(manual_attack_focus)
@@ -10373,7 +10550,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
         sell_warnings,
     ):
         _fill_lazy_stock_range_returns(stock_rows, range_columns)
-    focus_stocks_meta = _focus_stock_pool_meta(len(focus_stocks))
+    focus_stocks_meta = _focus_stock_pool_meta(formal_focus_count)
     if manual_focus_count:
         focus_stocks_meta["manual_attack_count"] = manual_focus_count
         focus_stocks_meta["source_collection"] = "terminal_stock_pool + terminal_manual_clues.attack_focus"
@@ -10428,6 +10605,7 @@ def _build_shell_payload_uncached(engine) -> Dict[str, Any]:
 
     return {
         "session": session,
+        "pool_meta": _terminal_pool_meta(),
         "market": market_context,
         "indices": reports[:8],
         "buy_candidates": scored_shell,

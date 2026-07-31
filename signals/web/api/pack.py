@@ -40,10 +40,17 @@ def pack_cache_status():
 
 @router.post("/refresh")
 def pack_refresh(payload: dict[str, Any] = Body(default_factory=dict)):
-    return SignalsPack().trigger_refresh(
+    force_postmarket_requested = bool(payload.get("force_postmarket", False))
+    result = SignalsPack().trigger_refresh(
         reason=str(payload.get("reason") or "manual"),
         force_live=bool(payload.get("force_live", False)),
-        force_postmarket=bool(payload.get("force_postmarket", False)),
+        force_postmarket=False,
         run_optional_tasks=bool(payload.get("run_optional_tasks", True)),
         wait=bool(payload.get("wait", False)),
     )
+    result.setdefault("deprecated_parameters", {})["force_postmarket"] = {
+        "requested": force_postmarket_requested,
+        "ignored": True,
+        "message": "普通刷新不触发、恢复或补跑盘后流程。",
+    }
+    return result

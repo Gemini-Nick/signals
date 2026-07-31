@@ -244,6 +244,11 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     ),
     PostmarketTaskSpec("signal_pool", "derived", depends_on=("technical_signal_scan:all",)),
     PostmarketTaskSpec(
+        "hot_rank_clues",
+        "derived",
+        depends_on=("technical_signal_scan:all", "ma_climb_scan:all"),
+    ),
+    PostmarketTaskSpec(
         "sector_transition_rollup",
         "derived",
         depends_on=(
@@ -258,7 +263,7 @@ POSTMARKET_TASKS: tuple[PostmarketTaskSpec, ...] = (
     PostmarketTaskSpec(
         "terminal_realtime_pool",
         "terminal",
-        depends_on=("technical_signal_scan:all", "ma_climb_scan:all", "knowledge_market_views:all", "postmarket_chain_rebuild:all", "chain_heat_snapshots:all", "concept_relationship_graph:all", "sector_transition_rollup:all"),
+        depends_on=("technical_signal_scan:all", "ma_climb_scan:all", "knowledge_market_views:all", "postmarket_chain_rebuild:all", "chain_heat_snapshots:all", "concept_relationship_graph:all", "sector_transition_rollup:all", "hot_rank_clues:all"),
         env={"TERMINAL_POOL_STRICT_SOURCES": "true"},
     ),
     PostmarketTaskSpec("strategy_snapshot", "terminal", depends_on=("terminal_realtime_pool:all", ETF_SPOT_TASK_KEY)),
@@ -1349,32 +1354,14 @@ class PostmarketRunner:
 
     @staticmethod
     def should_catchup_now(now: datetime | None = None) -> bool:
-        if not _env_bool("SIGNALS_POSTMARKET_CATCHUP_ENABLED", True):
-            return False
-        start = _parse_hm(os.getenv("SIGNALS_POSTMARKET_CATCHUP_START_TIME", "00:00"), dt_time(0, 0))
-        end = _parse_hm(os.getenv("SIGNALS_POSTMARKET_CATCHUP_END_TIME", "15:00"), dt_time(15, 0))
-        current = _local_bj(now).time()
-        if start <= end:
-            return start <= current <= end
-        return current >= start or current <= end
+        del now
+        return False
 
     def catchup_target(self, now: datetime | None = None, *, force: bool = False) -> tuple[str, str, str] | None:
-        if not force and not self.should_catchup_now(now):
-            return None
-        trade_date = _previous_trading_date(now)
-        run_id = default_run_id(trade_date)
-        run_doc = self.db["sync_runs"].find_one({"_id": run_id}, {"status": 1, "trade_date": 1}) or {}
-        status = str(run_doc.get("status") or "missing")
-        if status in RUN_TERMINAL_STATUSES:
-            if self._minute_preheat_pending_count(trade_date) > 0:
-                return run_id, trade_date, status
-            if (
-                _env_bool("SIGNALS_POSTMARKET_CONTINUE_OPTIONAL_TASKS", True)
-                and self._has_retryable_incomplete_tasks(run_id, include_optional=True)
-            ):
-                return run_id, trade_date, status
-            return None
-        return run_id, trade_date, status
+        del now, force
+        # Old-trade-date catch-up can overwrite a newer event-date snapshot.
+        # A same-day rerun must call run_once explicitly through the ops path.
+        return None
 
     def run_daemon(self, *, check_seconds: int | None = None) -> None:
         check_seconds = check_seconds or _env_int("SIGNALS_POSTMARKET_CHECK_SECONDS", 300, minimum=30)

@@ -369,7 +369,7 @@ def test_board_lane_intraday_runs_heat_not_board_cons(monkeypatch):
     assert sorted(item["module"] for item in results) == sorted(calls)
 
 
-def test_workbench_lane_intraday_rebuilds_terminal_stock_pool():
+def test_workbench_lane_intraday_never_rebuilds_terminal_stock_pool():
     engine = object.__new__(SyncEngine)
     engine.enabled_lanes = {"workbench_lane"}
     engine.db = _FakeDb({"sync_log": _FakeCollection(), "strategy_snapshots": _FakeCollection(count=1)})
@@ -401,7 +401,7 @@ def test_workbench_lane_intraday_rebuilds_terminal_stock_pool():
 
     results = engine._run_intraday_bundle({Market.A}, datetime(2026, 4, 27, 10, 0))
 
-    assert calls == ["market_pools", "market_limit_pools", "terminal_realtime_pool", "strategy_snapshot"]
+    assert calls == ["market_pools", "market_limit_pools", "strategy_snapshot"]
     assert [item["module"] for item in results] == calls
 
 

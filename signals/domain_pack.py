@@ -340,6 +340,17 @@ class SignalsPack:
         wait: bool = False,
     ) -> Dict[str, Any]:
         reason = str(reason or "manual")[:64]
+        force_postmarket_requested = bool(force_postmarket)
+        force_postmarket = False
+        compatibility = {
+            "deprecated_parameters": {
+                "force_postmarket": {
+                    "requested": force_postmarket_requested,
+                    "ignored": True,
+                    "message": "普通刷新不触发、恢复或补跑盘后流程；仅允许运维入口显式重跑当日盘后流程。",
+                },
+            },
+        }
         requested_at = utc_now()
         interval_env = (
             "SIGNALS_PACK_MANUAL_REFRESH_MIN_SECONDS"
@@ -360,6 +371,7 @@ class SignalsPack:
                     "triggered": False,
                     "reason": reason,
                     "message": "refresh_already_running",
+                    **compatibility,
                     **_pack_refresh_state_payload(),
                 }
             last_requested_at = _PACK_REFRESH_STATE.get("last_requested_at")
@@ -373,6 +385,7 @@ class SignalsPack:
                     "reason": reason,
                     "message": "refresh_throttled",
                     "min_interval_seconds": min_interval,
+                    **compatibility,
                     **_pack_refresh_state_payload(),
                 }
             _PACK_REFRESH_STATE.update({
@@ -402,6 +415,7 @@ class SignalsPack:
                     "triggered": True,
                     "reason": reason,
                     "message": "refresh_failed" if _PACK_REFRESH_STATE.get("last_error") else "refresh_completed",
+                    **compatibility,
                     **_pack_refresh_state_payload(),
                 }
 
@@ -424,6 +438,7 @@ class SignalsPack:
                 "triggered": True,
                 "reason": reason,
                 "message": "refresh_started",
+                **compatibility,
                 **_pack_refresh_state_payload(),
             }
 
@@ -468,7 +483,6 @@ class SignalsPack:
             return {"status": "skipped", "reason": "mongo_not_configured", "live_results": [], "postmarket": None}
 
         from signals.sync.engine import SyncEngine
-        from signals.sync.postmarket import PostmarketRunner, _postmarket_trade_date, default_run_id
 
         default_workers = min(16, max(4, (os.cpu_count() or 4)))
         workers = _env_int("SIGNALS_PACK_REFRESH_WORKERS", default_workers, minimum=1, maximum=32)
@@ -480,68 +494,20 @@ class SignalsPack:
         released_modules = engine.mark_stale_running_modules()
         live_results = engine.run_live_once(force=force_live)
 
-        runner = PostmarketRunner(engine, max_workers=workers)
-        target = runner.catchup_target(force=force_postmarket)
-        postmarket_result: Dict[str, Any] | None = None
-        postmarket_target: Dict[str, str] | None = None
-        if target:
-            run_id, trade_date, previous_status = target
-            postmarket_target = {"run_id": run_id, "trade_date": trade_date, "previous_status": previous_status}
-            live_owner_pid = self._postmarket_live_owner_pid(engine.db, run_id)
-            if live_owner_pid:
-                postmarket_result = {
-                    "status": "skipped",
-                    "reason": "postmarket_already_running",
-                    "run_id": run_id,
-                    "trade_date": trade_date,
-                    "owner_pid": live_owner_pid,
-                }
-            else:
-                postmarket_result = runner.run_once(
-                    resume_run_id=run_id,
-                    trade_date=trade_date,
-                    force=force_postmarket,
-                    run_optional_tasks=run_optional_tasks,
-                )
-        elif PostmarketRunner.should_run_now():
-            trade_date = _postmarket_trade_date()
-            run_id = default_run_id(trade_date)
-            postmarket_target = {"run_id": run_id, "trade_date": trade_date, "previous_status": "scheduled"}
-            postmarket_result = runner.run_once(
-                trade_date=trade_date,
-                force=force_postmarket,
-                run_optional_tasks=run_optional_tasks,
-            )
-
         return {
             "status": "ok",
             "reason": reason,
             "force_live": force_live,
-            "force_postmarket": force_postmarket,
+            "force_postmarket": False,
+            "force_postmarket_ignored": True,
+            "postmarket_refresh_policy": "explicit_same_day_ops_rerun_only",
             "run_optional_tasks": run_optional_tasks,
             "released_stale_modules": released_modules,
             "live_results": [_json_safe(item) for item in live_results],
             "live_result_count": len(live_results),
-            "postmarket_target": postmarket_target,
-            "postmarket": _json_safe(postmarket_result),
+            "postmarket_target": None,
+            "postmarket": None,
         }
-
-    def _postmarket_live_owner_pid(self, db: Any, run_id: str) -> int:
-        try:
-            run = db["sync_runs"].find_one({"_id": run_id}, {"owner_pid": 1}) or {}
-        except Exception:
-            return 0
-        try:
-            owner_pid = int(run.get("owner_pid") or 0)
-        except (TypeError, ValueError):
-            return 0
-        if owner_pid <= 0 or owner_pid == os.getpid():
-            return 0
-        try:
-            os.kill(owner_pid, 0)
-        except OSError:
-            return 0
-        return owner_pid
 
     def _operator_actions(self) -> List[Dict[str, Any]]:
         actions = [
@@ -550,7 +516,7 @@ class SignalsPack:
                 "run_id": "signals:dashboard",
                 "kind": "signals_api",
                 "label": "Refresh Signals Data",
-                "payload": {"reason": "manual", "force_live": True, "force_postmarket": True, "run_optional_tasks": True},
+                "payload": {"reason": "manual", "force_live": True, "run_optional_tasks": True},
                 "metadata": {"workspace": "strategy"},
             },
             {

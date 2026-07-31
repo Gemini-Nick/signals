@@ -91,3 +91,13 @@ def test_storage_model_indexes_terminal_status_latest_queries(monkeypatch):
         ("updated_at", DESCENDING),
         ("snapshot_at", DESCENDING),
     ) in chain_heat_indexes
+
+    pool_indexes = db["terminal_stock_pool"].created_indexes
+    assert (
+        (("pool", ASCENDING), ("market", ASCENDING)),
+        {"unique": True},
+    ) in pool_indexes
+    assert (
+        (("expires_at", ASCENDING),),
+        {"expireAfterSeconds": 0},
+    ) in db["terminal_pool_build_inputs"].created_indexes

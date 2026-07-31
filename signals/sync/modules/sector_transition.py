@@ -965,7 +965,8 @@ def sync_sector_transition_scan(db: Database, proxy_url: str = None) -> dict[str
                 "stale_reason": ",".join(blockers),
                 "count": len(state_ops),
                 "event_count": len(event_docs),
-            }
+            },
+            "$inc": {"manifest_revision": 1},
         },
         upsert=True,
     )
@@ -1178,7 +1179,8 @@ def sync_sector_transition_rollup(db: Database, proxy_url: str = None) -> dict[s
                 "stale_reason": "",
                 "count": len(operations),
                 "event_count": len(event_docs),
-            }
+            },
+            "$inc": {"manifest_revision": 1},
         },
         upsert=True,
     )

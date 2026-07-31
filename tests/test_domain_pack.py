@@ -254,6 +254,33 @@ def test_pack_refresh_endpoint_triggers_pack_refresh(monkeypatch):
     }]
 
 
+def test_pack_refresh_ignores_legacy_force_postmarket(monkeypatch):
+    from signals.web.app import create_app
+    from signals import domain_pack
+
+    calls = []
+
+    def fake_trigger(self, **kwargs):
+        calls.append(kwargs)
+        return {"triggered": True, "status": "running", "message": "refresh_started"}
+
+    monkeypatch.setattr(domain_pack.SignalsPack, "trigger_refresh", fake_trigger)
+    client = TestClient(create_app())
+
+    response = client.post(
+        "/api/pack/refresh",
+        json={"reason": "manual", "force_live": True, "force_postmarket": True},
+    )
+
+    assert response.status_code == 200
+    assert calls[0]["force_postmarket"] is False
+    assert response.json()["deprecated_parameters"]["force_postmarket"] == {
+        "requested": True,
+        "ignored": True,
+        "message": "普通刷新不触发、恢复或补跑盘后流程。",
+    }
+
+
 def test_pack_trigger_refresh_wait_records_result(monkeypatch):
     from signals import domain_pack
     from signals.domain_pack import SignalsPack
@@ -308,28 +335,6 @@ def test_pack_trigger_refresh_startup_uses_dedicated_throttle(monkeypatch):
     assert first["triggered"] is True
     assert second["triggered"] is True
     assert second["message"] == "refresh_completed"
-
-
-def test_pack_postmarket_live_owner_guard(monkeypatch):
-    from signals import domain_pack
-    from signals.domain_pack import SignalsPack
-
-    db = _Db({
-        "sync_runs": _Collection([
-            {"_id": "postmarket:2026-06-22", "owner_pid": 12345},
-        ]),
-    })
-    pack = SignalsPack()
-    monkeypatch.setattr(domain_pack.os, "getpid", lambda: 999)
-    monkeypatch.setattr(domain_pack.os, "kill", lambda pid, sig: None)
-
-    assert pack._postmarket_live_owner_pid(db, "postmarket:2026-06-22") == 12345
-
-    def dead_process(pid, sig):
-        raise OSError("no such process")
-
-    monkeypatch.setattr(domain_pack.os, "kill", dead_process)
-    assert pack._postmarket_live_owner_pid(db, "postmarket:2026-06-22") == 0
 
 
 def test_pack_dashboard_endpoint_smoke():

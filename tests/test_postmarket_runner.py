@@ -22,6 +22,7 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     weekly = next(task for task in pm.POSTMARKET_TASKS if task.module == "weekly_rollup")
     ma_climb_scan = next(task for task in pm.POSTMARKET_TASKS if task.module == "ma_climb_scan")
     technical_scan = next(task for task in pm.POSTMARKET_TASKS if task.module == "technical_signal_scan")
+    hot_rank = next(task for task in pm.POSTMARKET_TASKS if task.module == "hot_rank_clues")
     chain = next(task for task in pm.POSTMARKET_TASKS if task.module == "chain_heat_snapshots")
     chain_rebuild = next(task for task in pm.POSTMARKET_TASKS if task.module == "postmarket_chain_rebuild")
     strategy_snapshot = next(task for task in pm.POSTMARKET_TASKS if task.module == "strategy_snapshot")
@@ -60,7 +61,9 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert technical_scan.env["TECHNICAL_SIGNAL_SCAN_MARKETS"] == "A"
     assert technical_scan.env["TECHNICAL_SIGNAL_SCAN_REQUIRED_FREQS"] == "日线,周线"
     assert technical_scan.env["TECHNICAL_SIGNAL_POSTMARKET_MAX_SYMBOLS"] == "300"
+    assert hot_rank.depends_on == ("technical_signal_scan:all", "ma_climb_scan:all")
     assert "ma_climb_scan:all" in terminal_pool.depends_on
+    assert "hot_rank_clues:all" in terminal_pool.depends_on
     assert not (set(task.task_key for task in board_cons) & set(chain.depends_on))
     assert chain.phase == "chain_context"
     assert chain.depends_on == ("board_ranking:all",)
@@ -443,7 +446,7 @@ def test_postmarket_daemon_continues_optional_tasks_for_terminal_run(monkeypatch
     assert db["sync_tasks"].docs["postmarket:2026-04-28:beta:all"]["status"] == "ok"
 
 
-def test_postmarket_daemon_catchup_continues_optional_tasks_for_terminal_run(monkeypatch):
+def test_postmarket_daemon_does_not_catch_up_old_terminal_run(monkeypatch):
     tasks = (
         pm.PostmarketTaskSpec("alpha", "data"),
         pm.PostmarketTaskSpec("beta", "optional", blocks_run=False),
@@ -500,8 +503,8 @@ def test_postmarket_daemon_catchup_continues_optional_tasks_for_terminal_run(mon
     with pytest.raises(RuntimeError, match="stop-daemon"):
         runner.run_daemon(check_seconds=30)
 
-    assert calls == ["beta"]
-    assert db["sync_tasks"].docs["postmarket:2026-04-28:beta:all"]["status"] == "ok"
+    assert calls == []
+    assert db["sync_tasks"].docs["postmarket:2026-04-28:beta:all"]["status"] == "pending"
 
 
 def test_postmarket_init_tasks_preserves_optional_completion(monkeypatch):
@@ -1298,7 +1301,7 @@ def test_postmarket_heartbeats_running_tasks_during_long_phase(monkeypatch):
     assert db["sync_tasks"].docs["postmarket:2026-04-28:alpha:all"]["status"] == "ok"
 
 
-def test_postmarket_catchup_target_resumes_previous_trading_day_partial():
+def test_postmarket_catchup_target_does_not_resume_previous_trading_day_partial():
     db = _Db()
     db["sync_runs"].docs["postmarket:2026-05-07"] = {
         "_id": "postmarket:2026-05-07",
@@ -1309,18 +1312,18 @@ def test_postmarket_catchup_target_resumes_previous_trading_day_partial():
 
     target = runner.catchup_target(datetime(2026, 5, 8, 9, 10))
 
-    assert target == ("postmarket:2026-05-07", "2026-05-07", "partial")
+    assert target is None
 
 
-def test_postmarket_catchup_target_starts_missing_previous_trading_day():
+def test_postmarket_catchup_target_does_not_start_missing_previous_trading_day():
     runner = pm.PostmarketRunner(_Engine(_Db(), {}), max_workers=1)
 
     target = runner.catchup_target(datetime(2026, 5, 8, 9, 10))
 
-    assert target == ("postmarket:2026-05-07", "2026-05-07", "missing")
+    assert target is None
 
 
-def test_postmarket_catchup_target_force_bypasses_catchup_window(monkeypatch):
+def test_postmarket_catchup_target_force_cannot_restore_old_trade_date(monkeypatch):
     monkeypatch.setattr(pm.PostmarketRunner, "should_catchup_now", staticmethod(lambda now=None: False))
     monkeypatch.setattr(pm, "_previous_trading_date", lambda now=None: "2026-05-07")
     runner = pm.PostmarketRunner(_Engine(_Db(), {}), max_workers=1)
@@ -1328,7 +1331,7 @@ def test_postmarket_catchup_target_force_bypasses_catchup_window(monkeypatch):
     assert runner.catchup_target(datetime(2026, 5, 8, 16, 10)) is None
     target = runner.catchup_target(datetime(2026, 5, 8, 16, 10), force=True)
 
-    assert target == ("postmarket:2026-05-07", "2026-05-07", "missing")
+    assert target is None
 
 
 def test_postmarket_catchup_target_ignores_ok_previous_trading_day():
@@ -1345,7 +1348,7 @@ def test_postmarket_catchup_target_ignores_ok_previous_trading_day():
     assert target is None
 
 
-def test_postmarket_catchup_target_resumes_ok_previous_trading_day_with_optional_pending():
+def test_postmarket_catchup_target_does_not_resume_optional_tail_from_old_trade_date():
     db = _Db()
     db["sync_runs"].docs["postmarket:2026-05-07"] = {
         "_id": "postmarket:2026-05-07",
@@ -1364,7 +1367,7 @@ def test_postmarket_catchup_target_resumes_ok_previous_trading_day_with_optional
 
     target = runner.catchup_target(datetime(2026, 5, 8, 9, 10))
 
-    assert target == ("postmarket:2026-05-07", "2026-05-07", "ok")
+    assert target is None
 
 
 def test_postmarket_continues_minute_preheat_universe(monkeypatch):
