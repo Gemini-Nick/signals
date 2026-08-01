@@ -12,45 +12,6 @@ from signals.data.gateway import (
 router = APIRouter(prefix="/api/health", tags=["health"])
 
 
-def _date_key(value):
-    if value is None:
-        return ""
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    return str(value)
-
-
-def _latest_collection_doc(col):
-    fields = ("dt", "latest_dt", "signal_date", "snapshot_at", "updated_at")
-    candidates = []
-    projection = {field: 1 for field in fields}
-    for field in fields:
-        try:
-            doc = col.find_one(
-                {field: {"$exists": True, "$ne": None}},
-                projection,
-                sort=[(field, -1)],
-            )
-            if doc and doc.get(field) is not None:
-                candidates.append(doc)
-        except Exception:
-            continue
-    if not candidates:
-        return {}
-    return max(
-        candidates,
-        key=lambda doc: max((_date_key(doc.get(field)) for field in fields), default=""),
-    )
-
-
-def _latest_date_from_doc(doc):
-    for field in ("dt", "latest_dt", "signal_date", "snapshot_at", "updated_at"):
-        value = doc.get(field)
-        if value is not None:
-            return str(value.date()) if hasattr(value, "date") else str(value)[:10]
-    return ""
-
-
 def _symbol_candidates(symbol: str) -> list[str]:
     raw = str(symbol or "").strip().upper()
     if not raw:
@@ -66,6 +27,19 @@ def _symbol_candidates(symbol: str) -> list[str]:
         prefix = "SH" if pure.startswith(("5", "6", "9")) else "SZ"
         candidates.extend([f"{prefix}.{pure}", f"{prefix}{pure}", f"{prefix.lower()}{pure}"])
     return list(dict.fromkeys(candidates))
+
+
+def _bar_sync_ids(symbol: str) -> set[str]:
+    raw = str(symbol or "").strip().upper()
+    pure = raw.split(".", 1)[-1] if "." in raw else raw
+    ids: set[str] = set()
+    if pure.isdigit() and len(pure) == 6:
+        ids.add(f"stock_daily:{pure}")
+    if raw.startswith("HK.") and pure.isdigit():
+        ids.add(f"hk_stock_daily:HK.{pure.zfill(5)}")
+    if "." in raw and raw.split(".", 1)[0] in {"SH", "SZ", "BJ"} and pure.isdigit():
+        ids.add(f"index_daily:{raw.split('.', 1)[0].lower()}{pure}")
+    return ids
 
 
 def _active_pool_coverage(db):
@@ -85,27 +59,66 @@ def _active_pool_coverage(db):
         }
 
     symbols = [str(item) for item in doc.get("symbols", []) if item]
+    candidate_map = {symbol: _symbol_candidates(symbol) for symbol in symbols}
+    all_candidates = list(dict.fromkeys(
+        candidate
+        for candidates in candidate_map.values()
+        for candidate in candidates
+    ))
+    quote_ids = [f"{candidate}:latest" for candidate in all_candidates]
+    sync_ids_by_symbol = {symbol: _bar_sync_ids(symbol) for symbol in symbols}
+    bar_sync_ids = list(dict.fromkeys(
+        sync_id
+        for sync_ids in sync_ids_by_symbol.values()
+        for sync_id in sync_ids
+    ))
+    try:
+        bar_sync_found = set(db["sync_log"].distinct(
+            "_id",
+            {"_id": {"$in": bar_sync_ids}},
+            maxTimeMS=500,
+        ))
+        quote_symbols_found = set(db["quote_snapshots"].distinct(
+            "symbol",
+            {"symbol": {"$in": all_candidates}},
+            maxTimeMS=500,
+        ))
+        quote_ids_found = set(db["quote_snapshots"].distinct(
+            "_id",
+            {"_id": {"$in": quote_ids}},
+            maxTimeMS=500,
+        ))
+    except Exception as exc:
+        return {
+            "pool": "active",
+            "pool_id": str(doc.get("_id", "")),
+            "dt": str(doc.get("dt", "")),
+            "updated_at": str(doc.get("updated_at", "")),
+            "freshness": doc.get("freshness", ""),
+            "count": len(symbols),
+            "bars_covered": 0,
+            "quote_covered": 0,
+            "bars_missing": [],
+            "quote_missing": [],
+            "coverage_status": "unavailable",
+            "coverage_error": f"{exc.__class__.__name__}: {str(exc)[:160]}",
+        }
+
     bars_missing = []
     quote_missing = []
     bars_covered = 0
     quote_covered = 0
     for symbol in symbols:
-        candidates = _symbol_candidates(symbol)
-        if db["bars"].find_one({
-            "meta.symbol": {"$in": candidates},
-            "meta.freq": {"$in": ["daily", "日线", "D", "1d"]},
-        }, {"_id": 1}):
+        candidates = candidate_map[symbol]
+        if bar_sync_found.intersection(sync_ids_by_symbol[symbol]):
             bars_covered += 1
         elif len(bars_missing) < 10:
             bars_missing.append(symbol)
 
-        quote_ids = [f"{candidate}:latest" for candidate in candidates]
-        if db["quote_snapshots"].find_one({
-            "$or": [
-                {"symbol": {"$in": candidates}},
-                {"_id": {"$in": quote_ids}},
-            ]
-        }, {"_id": 1}):
+        if (
+            quote_symbols_found.intersection(candidates)
+            or quote_ids_found.intersection(f"{candidate}:latest" for candidate in candidates)
+        ):
             quote_covered += 1
         elif len(quote_missing) < 10:
             quote_missing.append(symbol)
@@ -117,6 +130,7 @@ def _active_pool_coverage(db):
         "dt": str(doc.get("dt", "")),
         "updated_at": str(doc.get("updated_at", "")),
         "freshness": doc.get("freshness", ""),
+        "coverage_status": "ok",
         "count": count,
         "bars_covered": bars_covered,
         "quote_covered": quote_covered,
@@ -188,18 +202,16 @@ def cache_health():
         "refresh_requests",
     ]:
         try:
-            col = db[collection]
-            latest = _latest_collection_doc(col)
             freshness = db["data_freshness"].find_one(
                 {"collection": collection},
-                {"_id": 0, "freshness": 1, "stale_reason": 1, "latest_dt": 1, "updated_at": 1},
+                {"_id": 0, "count": 1, "freshness": 1, "stale_reason": 1, "latest_dt": 1, "updated_at": 1},
                 sort=[("updated_at", -1)],
             ) or {}
             items.append({
                 "collection": collection,
-                "count": col.estimated_document_count(),
-                "latest_dt": _latest_date_from_doc(latest) or str(freshness.get("latest_dt") or ""),
-                "updated_at": str((latest or {}).get("updated_at", "") or freshness.get("updated_at", "")),
+                "count": int(freshness.get("count") or 0),
+                "latest_dt": str(freshness.get("latest_dt") or ""),
+                "updated_at": str(freshness.get("updated_at", "")),
                 "freshness": freshness.get("freshness", ""),
                 "stale_reason": freshness.get("stale_reason", ""),
             })

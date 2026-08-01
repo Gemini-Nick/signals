@@ -968,6 +968,10 @@ def render_word_style_review(signals_context: dict[str, Any], market_replay: dic
     weakest = weak_boards[0] if weak_boards else {}
     dynamic_stocks = [row for row in _dynamic_representative_stocks(market_replay) if not _is_unsuitable_note_stock(row)]
     selected_stocks = _dedupe_stocks(dynamic_stocks, gainers[:6], high_turnover[:6], limit=6)
+    coverage = market_replay.get("coverage") if isinstance(market_replay.get("coverage"), dict) else {}
+    formal_ready = coverage.get("formal_ready") is True
+    report_stage = _text(market_replay.get("report_stage"), "formal_postmarket")
+    report_title = "A股盘后复盘" if report_stage == "formal_postmarket" and formal_ready else "A股午后观察"
 
     def board_label(row: dict[str, Any], fallback: str) -> str:
         value = _text(row.get("name") or row.get("board"), fallback)
@@ -1010,7 +1014,7 @@ def render_word_style_review(signals_context: dict[str, Any], market_replay: dic
         conclusion = "今天盘面信息有限，先以指数、宽度和成交的下一次变化为主。"
 
     lines: list[str] = [
-        f"# A股盘后复盘 | {date_text}（{weekday_text}）",
+        f"# {report_title} | {date_text}（{weekday_text}）",
         "",
         "## 今日一句话",
         conclusion + "。",

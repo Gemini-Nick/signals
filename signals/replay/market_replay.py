@@ -6,6 +6,7 @@ evidence graph into the screenshot-style postmarket narrative.
 """
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timedelta
 from math import isfinite, log10
@@ -1652,7 +1653,50 @@ def _external_fund_flow_evidence(
 
 def _flow_availability(db: Any, external_flows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     names = set(db.list_collection_names())
-    candidates = sorted(name for name in names if "flow" in name.lower() or "fund" in name.lower())
+    # A collection name containing ``flow`` or ``fund`` is not evidence of
+    # account-classified flow.  It may be an order-size feed, a fund master
+    # table, or a derived research cache.  Only advertise participant flow
+    # after inspecting an actual row and its provenance/schema.
+    candidate_names = sorted(name for name in names if "flow" in name.lower() or "fund" in name.lower())
+    participant_fields = {
+        "participant_type", "account_type", "investor_type", "holder_type", "investor_class",
+    }
+    buy_fields = {"buy", "buy_amount", "buy_yi", "inflow", "inflow_yi", "buy_value"}
+    sell_fields = {"sell", "sell_amount", "sell_yi", "outflow", "outflow_yi", "sell_value"}
+    net_fields = {"net", "net_amount", "net_yi", "net_flow", "net_value"}
+    date_fields = {"trade_date", "as_of", "observed_trade_date", "date", "date_key"}
+    candidates: list[str] = []
+    candidate_reasons: dict[str, str] = {}
+    for name in candidate_names:
+        try:
+            sample = db[name].find_one({}, None)
+        except Exception:
+            sample = None
+        if not isinstance(sample, dict):
+            candidate_reasons[name] = "no_sample_row"
+            continue
+        keys = set(sample)
+        nested = set()
+        for value in sample.values():
+            if isinstance(value, dict):
+                nested.update(value)
+        fields = keys | nested
+        declared = str(
+            sample.get("flow_type")
+            or sample.get("schema_type")
+            or sample.get("source_type")
+            or sample.get("lane")
+            or ""
+        ).lower()
+        has_class = bool(fields & participant_fields)
+        has_amounts = bool(fields & buy_fields) and bool(fields & sell_fields) and bool(fields & net_fields)
+        has_date = bool(fields & date_fields)
+        is_account_source = any(token in declared for token in ("participant", "account", "investor", "l2"))
+        if has_class and has_amounts and has_date and is_account_source:
+            candidates.append(name)
+            candidate_reasons[name] = "validated_account_classified_flow"
+        else:
+            candidate_reasons[name] = "missing_participant_schema_or_provenance"
     external_flows = external_flows or []
     order_size_sources = sorted(
         {
@@ -1671,6 +1715,7 @@ def _flow_availability(db: Any, external_flows: list[dict[str, Any]] | None = No
     return {
         "participant_flow_available": bool(candidates),
         "candidate_collections": candidates,
+        "candidate_reasons": candidate_reasons,
         "order_size_flow_available": bool(order_size_sources),
         "order_size_sources": [source for source in order_size_sources if source],
         "note": (
@@ -1852,7 +1897,7 @@ def _major_index_daily_rows(db: Any, trade_date: str) -> list[dict[str, Any]]:
     for name, symbol in _MAJOR_INDEX_TARGETS:
         row = db["index_bars"].find_one(
             {"meta.symbol": symbol, "meta.freq": "日线", "dt": {"$gte": start, "$lt": end}},
-            {"_id": 0, "dt": 1, "open": 1, "high": 1, "low": 1, "close": 1, "amount": 1},
+            {"_id": 0, "dt": 1, "open": 1, "high": 1, "low": 1, "close": 1, "amount": 1, "meta": 1},
         )
         if not row:
             continue
@@ -1872,6 +1917,14 @@ def _major_index_daily_rows(db: Any, trade_date: str) -> list[dict[str, Any]]:
         amount_change_pct = (amount / prev_amount - 1) * 100 if amount is not None and prev_amount else None
         amplitude_pct = (high - low) / prev_close * 100 if high is not None and low is not None and prev_close else None
         dt = row.get("dt")
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        source = _text(meta.get("source"))
+        source_type = _text(meta.get("source_type"))
+        quality = _text(meta.get("quality")) or "unknown"
+        formal_close = quality in {"official", "final_close"} and source_type not in {
+            "derived",
+            "direct_quote_ohlcv",
+        }
         rows.append(
             {
                 "name": name,
@@ -1886,8 +1939,11 @@ def _major_index_daily_rows(db: Any, trade_date: str) -> list[dict[str, Any]]:
                 "amount_yi": _amount_like_yi(amount),
                 "amount_change_pct": round(amount_change_pct, 2) if amount_change_pct is not None else None,
                 "amplitude_pct": round(amplitude_pct, 2) if amplitude_pct is not None else None,
-                "evidence_level": "confirmed",
-                "source": "index_bars",
+                "evidence_level": "confirmed" if formal_close else "provisional",
+                "source": source or "index_bars",
+                "source_type": source_type,
+                "quality": quality,
+                "formal_close": formal_close,
             }
         )
     return rows
@@ -2101,20 +2157,68 @@ def _replay_coverage(
     report_stage: str,
     major_indices: list[dict[str, Any]],
     intraday: dict[str, Any],
+    market_breadth: dict[str, Any] | None = None,
+    stock_daily: dict[str, Any] | None = None,
+    close_seal: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if report_stage not in {"close_flash", "formal_postmarket"}:
         raise ValueError(f"invalid report_stage: {report_stage}")
+    market_breadth = market_breadth or {}
+    stock_daily = stock_daily or {}
+    close_seal = close_seal or {}
     daily_dates = sorted({_text(row.get("date")) for row in major_indices if _text(row.get("date"))})
     intraday_times = [
         _text((row.get("close_bar") or {}).get("time"))
         for row in intraday.get("rows", [])
         if isinstance(row, dict) and _text((row.get("close_bar") or {}).get("time"))
     ]
+    expected_indices = len(_MAJOR_INDEX_TARGETS)
+    official_count = sum(bool(row.get("formal_close")) for row in major_indices)
+    provisional_count = sum(_text(row.get("quality")) == "provisional_close" for row in major_indices)
+    estimated_count = sum(_text(row.get("quality")) == "estimated_close" for row in major_indices)
+    unknown_count = sum(_text(row.get("quality")) in {"", "unknown"} for row in major_indices)
+    try:
+        fullmarket_min = max(1, int(os.getenv("SIGNALS_REPLAY_FULLMARKET_MIN_SYMBOLS", "5000")))
+    except (TypeError, ValueError):
+        fullmarket_min = 5000
+    try:
+        stock_daily_min = float(os.getenv("SIGNALS_REPLAY_STOCK_DAILY_MIN_COVERAGE", "98.0"))
+    except (TypeError, ValueError):
+        stock_daily_min = 98.0
+    fullmarket_total = int(market_breadth.get("total") or 0)
+    stock_daily_pct = float(stock_daily.get("official_coverage_pct") or 0.0)
+    reason_codes: list[str] = []
+    if daily_dates and daily_dates != [trade_date]:
+        reason_codes.append("trade_date_mismatch")
+    if len(major_indices) < expected_indices:
+        reason_codes.append("index_daily_missing")
+    if provisional_count:
+        reason_codes.append("index_daily_provisional")
+    if estimated_count:
+        reason_codes.append("index_daily_estimated")
+    if unknown_count:
+        reason_codes.append("index_daily_unknown_quality")
+    if fullmarket_total <= 0:
+        reason_codes.append("spot_snapshot_not_published")
+    elif fullmarket_total < fullmarket_min:
+        reason_codes.append("spot_snapshot_coverage_below_threshold")
+    if str(stock_daily.get("status") or "") in {"", "missing"}:
+        reason_codes.append("stock_daily_not_published")
+    elif stock_daily_pct < stock_daily_min:
+        reason_codes.append("stock_daily_official_coverage_below_threshold")
+    if close_seal.get("formal_ready") is not True:
+        reason_codes.append("close_seal_not_ready")
     formal_ready = (
-        len(major_indices) == len(_MAJOR_INDEX_TARGETS)
+        len(major_indices) == expected_indices
         and daily_dates == [trade_date]
         and all(row.get("close") is not None for row in major_indices)
+        and official_count == expected_indices
+        and fullmarket_total >= fullmarket_min
+        and stock_daily_pct >= stock_daily_min
+        and close_seal.get("formal_ready") is True
     )
+    if formal_ready:
+        reason_codes = []
     return {
         "trade_date": trade_date,
         "report_stage": report_stage,
@@ -2124,12 +2228,132 @@ def _replay_coverage(
         "latest_intraday_time": max(intraday_times) if intraday_times else None,
         "formal_ready": formal_ready,
         "generation_status": "partial" if report_stage == "formal_postmarket" and not formal_ready else "success",
+        "readiness_state": "complete" if formal_ready else ("backfilling" if fullmarket_total or major_indices else "waiting_source"),
+        "reason_codes": reason_codes,
+        "index_daily": {
+            "expected": expected_indices,
+            "covered": len(major_indices),
+            "official": official_count,
+            "provisional": provisional_count,
+            "estimated": estimated_count,
+            "unknown_quality": unknown_count,
+            "coverage_pct": round(len(major_indices) / expected_indices * 100, 2),
+            "as_of": daily_dates[-1] if daily_dates else None,
+        },
+        "fullmarket_spot": {
+            "minimum_symbols": fullmarket_min,
+            "covered_symbols": fullmarket_total,
+            "coverage_pct_of_minimum": round(fullmarket_total / fullmarket_min * 100, 2),
+            "as_of": trade_date if fullmarket_total else None,
+        },
+        "stock_daily": stock_daily,
+        "close_seal": close_seal,
         "note": (
             "正式盘后数据完整。"
             if formal_ready
             else "正式日线收盘覆盖不足；分钟线只用于盘中结构，不得冒充正式收盘。"
         ),
     }
+
+
+def _close_seal_state(db: Any, trade_date: str) -> dict[str, Any]:
+    if not {"sync_runs", "sync_tasks"}.issubset(_collection_names(db)):
+        return {"status": "missing", "formal_ready": False, "trade_date": trade_date}
+    from signals.sync.close_seal import SEAL_MODULES, seal_result_usable
+
+    run_id = f"close_seal:{trade_date}"
+    run = db["sync_runs"].find_one(
+        {"_id": run_id},
+        {"_id": 0, "status": 1, "close_finality": 1, "sealed_at": 1},
+    ) or {}
+    modules: dict[str, str] = {}
+    all_usable = True
+    for module in SEAL_MODULES:
+        task = db["sync_tasks"].find_one(
+            {"_id": f"{run_id}:{module}:all"},
+            {"_id": 0, "status": 1, "result_summary": 1},
+        ) or {}
+        usable, reason = seal_result_usable(module, task.get("result_summary") or {}, trade_date)
+        modules[module] = "ok" if usable and task.get("status") == "ok" else (reason or str(task.get("status") or "missing"))
+        all_usable = all_usable and usable and task.get("status") == "ok"
+    formal_ready = (
+        run.get("status") == "sealed"
+        and run.get("close_finality") == "stable_close"
+        and all_usable
+    )
+    return {
+        "status": str(run.get("status") or "missing"),
+        "formal_ready": formal_ready,
+        "trade_date": trade_date,
+        "close_finality": str(run.get("close_finality") or ""),
+        "sealed_at": run.get("sealed_at"),
+        "modules": modules,
+    }
+
+
+def _stock_daily_task_coverage(db: Any, trade_date: str) -> dict[str, Any]:
+    if "sync_tasks" not in _collection_names(db):
+        return {"status": "missing", "expected_symbols": 0, "official_symbols": 0, "official_coverage_pct": 0.0}
+    run_id = f"postmarket:{trade_date}"
+    expected = covered = official = 0
+    declared_total = expected_shards = 0
+    shard_count = 0
+    for doc in db["sync_tasks"].find(
+        {"run_id": run_id, "module": "stock_daily"},
+        {"_id": 0, "status": 1, "result_summary": 1},
+    ):
+        if _text(doc.get("status")) not in {"ok", "partial", "degraded"}:
+            continue
+        summary = doc.get("result_summary") if isinstance(doc.get("result_summary"), dict) else {}
+        nested = summary.get("result") if isinstance(summary.get("result"), dict) else summary
+        shard_expected = int(nested.get("expected_codes") or nested.get("total") or 0)
+        shard_covered = int(nested.get("covered_codes") or nested.get("processed") or 0)
+        quality = _text(nested.get("quality"))
+        declared_total = max(declared_total, int(nested.get("global_total") or 0))
+        expected_shards = max(expected_shards, int(nested.get("shard_count") or 0))
+        expected += shard_expected
+        covered += min(shard_covered, shard_expected)
+        if quality in {"official", "final_close"}:
+            official += min(shard_covered, shard_expected)
+        shard_count += 1
+    expected = max(expected, declared_total)
+    if expected <= 0:
+        return {"status": "missing", "expected_symbols": 0, "official_symbols": 0, "official_coverage_pct": 0.0}
+    all_shards_seen = expected_shards <= 0 or shard_count >= expected_shards
+    return {
+        "status": "available" if official and all_shards_seen else "backfilling",
+        "expected_symbols": expected,
+        "covered_any_quality": covered,
+        "official_symbols": official,
+        "any_coverage_pct": round(covered / expected * 100, 2),
+        "official_coverage_pct": round(official / expected * 100, 2),
+        "shard_count": shard_count,
+        "expected_shards": expected_shards,
+        "as_of": trade_date,
+        "source": "sync_tasks:postmarket:stock_daily",
+    }
+
+
+def build_market_replay_readiness(
+    db: Any,
+    *,
+    trade_date: str,
+    report_stage: str = "formal_postmarket",
+) -> dict[str, Any]:
+    """Build the lightweight formal-close gate without the full event graph."""
+    major_indices = _major_index_daily_rows(db, trade_date)
+    market_breadth = _market_breadth(db, trade_date)
+    stock_daily = _stock_daily_task_coverage(db, trade_date)
+    close_seal = _close_seal_state(db, trade_date)
+    return _replay_coverage(
+        trade_date,
+        report_stage,
+        major_indices,
+        {"rows": []},
+        market_breadth,
+        stock_daily,
+        close_seal,
+    )
 
 
 def _market_breadth(db: Any, trade_date: str) -> dict[str, Any]:
@@ -3431,7 +3655,18 @@ def build_market_replay_context(
     flow_availability = _flow_availability(db, external_fund_flows)
     major_indices = _major_index_daily_rows(db, trade_date)
     major_index_intraday = _major_index_intraday_context(db, trade_date)
-    coverage = _replay_coverage(trade_date, report_stage, major_indices, major_index_intraday)
+    market_breadth = _market_breadth(db, trade_date)
+    stock_daily_coverage = _stock_daily_task_coverage(db, trade_date)
+    close_seal = _close_seal_state(db, trade_date)
+    coverage = _replay_coverage(
+        trade_date,
+        report_stage,
+        major_indices,
+        major_index_intraday,
+        market_breadth,
+        stock_daily_coverage,
+        close_seal,
+    )
     failed_symbols = [row["symbol"] for row in failed_boards[: min(10, len(failed_boards))] if row.get("symbol")]
     limit_pool_symbols = _top_limit_pool_symbols(limit_lookup, limit=200)
     top_gainer_symbols = [
@@ -3511,7 +3746,7 @@ def build_market_replay_context(
         "major_indices": major_indices,
         "major_index_intraday": major_index_intraday,
         "major_index_technical": _major_index_technical_context(db, trade_date),
-        "market_breadth": _market_breadth(db, trade_date),
+        "market_breadth": market_breadth,
         "daily_board_rankings": daily_board_rankings,
         "turnover_representatives": _turnover_representatives(db, trade_date, high_turnover, limit=15),
         "failed_boards": failed_boards,

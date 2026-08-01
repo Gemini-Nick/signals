@@ -650,6 +650,106 @@ class PostmarketRunner:
         self.owner_pid = os.getpid()
         self.heartbeat_seconds = _env_int("SIGNALS_POSTMARKET_HEARTBEAT_SECONDS", 60, minimum=10)
         self.task_stale_seconds = _env_int("SIGNALS_POSTMARKET_TASK_STALE_SECONDS", 15 * 60, minimum=60)
+        self.close_seal = None
+        if _env_bool("SIGNALS_CLOSE_SEAL_ENABLED", False):
+            from .close_seal import CloseSealRunner
+
+            self.close_seal = CloseSealRunner(self.db, self._run_close_seal_module, owner=f"pid:{self.owner_pid}")
+
+    def _run_close_seal_module(self, module: str, trade_date: str) -> dict[str, Any]:
+        if module not in self.engine.module_map:
+            return {"module": module, "status": "error", "error": "module_missing"}
+        fn, _schedule = self.engine.module_map[module]
+        plan = LANE_MAINTENANCE_PLANS.get(module)
+        with self._with_env(
+            {
+                "SIGNALS_CLOSE_SEAL_RUN_ID": f"close_seal:{trade_date}",
+                "SIGNALS_POSTMARKET_TRADE_DATE": trade_date,
+            }
+        ):
+            return self.engine.run_module(module, fn, plan=plan)
+
+    def _stable_close_seal_ready(self, trade_date: str) -> bool:
+        from .close_seal import SEAL_MODULES, seal_result_usable
+
+        seal_run_id = f"close_seal:{trade_date}"
+        seal = self.db["sync_runs"].find_one(
+            {"_id": seal_run_id},
+            {"status": 1, "close_finality": 1},
+        ) or {}
+        if seal.get("status") != "sealed" or seal.get("close_finality") != "stable_close":
+            return False
+        for module in SEAL_MODULES:
+            task = self.db["sync_tasks"].find_one(
+                {"_id": f"{seal_run_id}:{module}:all", "status": "ok"},
+                {"result_summary": 1},
+            ) or {}
+            usable, _reason = seal_result_usable(module, task.get("result_summary") or {}, trade_date)
+            if not usable:
+                return False
+        return True
+
+    def _apply_close_seal_handoff(self, run_id: str, trade_date: str) -> int:
+        from .close_seal import HANDOFF_MODULES, seal_result_usable
+
+        seal_run_id = f"close_seal:{trade_date}"
+        seal = self.db["sync_runs"].find_one(
+            {"_id": seal_run_id},
+            {"status": 1, "close_finality": 1, "sealed_at": 1},
+        ) or {}
+        if seal.get("status") != "sealed" or seal.get("close_finality") != "stable_close":
+            return 0
+        reused = 0
+        now = _naive_bj()
+        for spec in POSTMARKET_TASKS:
+            if spec.module not in HANDOFF_MODULES:
+                continue
+            source = self.db["sync_tasks"].find_one(
+                {"_id": f"{seal_run_id}:{spec.module}:all", "status": "ok"},
+                {"result_summary": 1, "finished_at": 1},
+            ) or {}
+            if not source:
+                continue
+            usable, _reason = seal_result_usable(spec.module, source.get("result_summary") or {}, trade_date)
+            if not usable:
+                continue
+            task_id = self._task_id(run_id, spec)
+            current = self.db["sync_tasks"].find_one({"_id": task_id}, {"status": 1}) or {}
+            if _task_effectively_done({**current, "module": spec.module}):
+                continue
+            update_result = self.db["sync_tasks"].update_one(
+                {
+                    "_id": task_id,
+                    "status": {"$in": ["pending", "stale", "partial", "degraded", "error", "deferred"]},
+                    "owner_pid": {"$in": ["", None]},
+                },
+                {
+                    "$set": {
+                        "status": "ok",
+                        "result_summary": {
+                            **(source.get("result_summary") or {}),
+                            "reused_from_close_seal": True,
+                            "close_seal_run_id": seal_run_id,
+                        },
+                        "owner_pid": "",
+                        "started_at": source.get("finished_at") or seal.get("sealed_at"),
+                        "finished_at": source.get("finished_at") or seal.get("sealed_at"),
+                        "updated_at": now,
+                        "error_msg": "",
+                    }
+                },
+            )
+            modified = getattr(update_result, "modified_count", None)
+            if modified is None:
+                verified = self.db["sync_tasks"].find_one({"_id": task_id}, {"result_summary": 1}) or {}
+                modified = bool((verified.get("result_summary") or {}).get("reused_from_close_seal"))
+            reused += int(bool(modified))
+        if reused:
+            self.db["sync_runs"].update_one(
+                {"_id": seal_run_id},
+                {"$set": {"postmarket_handoff_at": now, "postmarket_run_id": run_id, "updated_at": now}},
+            )
+        return reused
 
     @staticmethod
     def _pid_alive(pid: Any) -> bool:
@@ -950,16 +1050,32 @@ class PostmarketRunner:
             )
         return len(task_ids)
 
+    def _orphan_reason(
+        self,
+        doc: dict[str, Any],
+        now: datetime,
+        *,
+        preserve_live_owner: bool = False,
+    ) -> str:
+        heartbeat = _coerce_dt(doc.get("heartbeat_at") or doc.get("started_at"))
+        has_owner = bool(doc.get("owner_pid"))
+        owner_dead = has_owner and not self._pid_alive(doc.get("owner_pid"))
+        too_old = bool(heartbeat and (now - heartbeat).total_seconds() > self.task_stale_seconds)
+        if owner_dead:
+            return "running_owner_dead"
+        if has_owner and preserve_live_owner:
+            return ""
+        if too_old:
+            return "stale_running_task"
+        return ""
+
     def _release_stale_running_tasks(self, run_id: str) -> int:
         now = _naive_bj()
         released = 0
         for doc in self.db["sync_tasks"].find({"run_id": run_id, "status": "running"}):
-            heartbeat = _coerce_dt(doc.get("heartbeat_at") or doc.get("started_at"))
-            owner_dead = bool(doc.get("owner_pid")) and not self._pid_alive(doc.get("owner_pid"))
-            too_old = bool(heartbeat and (now - heartbeat).total_seconds() > self.task_stale_seconds)
-            if not (owner_dead or too_old):
+            reason = self._orphan_reason(doc, now)
+            if not reason:
                 continue
-            reason = "running_owner_dead" if owner_dead else "stale_running_task"
             self.db["sync_tasks"].update_one(
                 {"_id": doc["_id"]},
                 {"$set": {
@@ -971,6 +1087,104 @@ class PostmarketRunner:
             )
             released += 1
         return released
+
+    def _reconcile_orphaned_state(self) -> dict[str, int]:
+        """Close owner-dead postmarket state without replaying an old trade date."""
+        now = _naive_bj()
+        task_updates = 0
+        run_updates = 0
+
+        for doc in self.db["sync_tasks"].find(
+            {"run_id": {"$regex": r"^postmarket:"}, "status": "running"},
+            {"_id": 1, "run_id": 1, "owner_pid": 1, "heartbeat_at": 1, "started_at": 1},
+        ):
+            reason = self._orphan_reason(doc, now, preserve_live_owner=True)
+            if not reason:
+                continue
+            query: dict[str, Any] = {
+                "_id": doc["_id"],
+                "status": "running",
+                "owner_pid": doc.get("owner_pid"),
+            }
+            if doc.get("heartbeat_at") is not None:
+                query["heartbeat_at"] = doc.get("heartbeat_at")
+            result = self.db["sync_tasks"].update_one(
+                query,
+                {"$set": {
+                    "status": "stale",
+                    "owner_pid": "",
+                    "error_msg": reason,
+                    "interrupted_at": now,
+                    "updated_at": now,
+                }},
+            )
+            if getattr(result, "modified_count", None) == 0:
+                continue
+            task_updates += 1
+
+        for run_doc in self.db["sync_runs"].find(
+            {"_id": {"$regex": r"^postmarket:"}, "status": "running"},
+            {"_id": 1, "owner_pid": 1, "heartbeat_at": 1, "started_at": 1, "task_count": 1},
+        ):
+            reason = self._orphan_reason(run_doc, now, preserve_live_owner=True)
+            if not reason:
+                continue
+            run_id = str(run_doc.get("_id") or "")
+            if not run_id:
+                continue
+            if self.db["sync_tasks"].find_one({"run_id": run_id, "status": "running"}, {"_id": 1}):
+                continue
+
+            task_docs = list(self.db["sync_tasks"].find(
+                {"run_id": run_id},
+                {"module": 1, "task_key": 1, "status": 1, "blocks_run": 1, "result_summary": 1},
+            ))
+            blocking_docs = [doc for doc in task_docs if bool(doc.get("blocks_run", True))]
+            incomplete = [
+                doc
+                for doc in blocking_docs
+                if not _task_effectively_done(doc)
+            ]
+            optional_incomplete = [
+                doc
+                for doc in task_docs
+                if not bool(doc.get("blocks_run", True)) and not _task_effectively_done(doc)
+            ]
+            expected_task_count = int(run_doc.get("task_count") or len(task_docs))
+            missing_task_count = max(0, expected_task_count - len(task_docs))
+            blocked_tasks = sorted(
+                {str(doc.get("task_key") or "") for doc in incomplete if doc.get("task_key")}
+            )
+            status = "ok" if task_docs and not blocked_tasks and not missing_task_count else "partial"
+            recovery_state = "ok" if status == "ok" else "interrupted"
+            update_query: dict[str, Any] = {
+                "_id": run_id,
+                "status": "running",
+                "owner_pid": run_doc.get("owner_pid"),
+            }
+            if run_doc.get("heartbeat_at") is not None:
+                update_query["heartbeat_at"] = run_doc.get("heartbeat_at")
+            result = self.db["sync_runs"].update_one(
+                update_query,
+                {"$set": {
+                    "status": status,
+                    "owner_pid": "",
+                    "updated_at": now,
+                    "finished_at": now,
+                    "reconciled_at": now,
+                    "interruption_reason": reason if status == "partial" else "",
+                    "blocked_tasks": blocked_tasks,
+                    "recovery_state": recovery_state,
+                    "ok_tasks": len(task_docs) - len(incomplete),
+                    "incomplete_tasks": len(incomplete) + missing_task_count,
+                    "optional_incomplete_tasks": len(optional_incomplete),
+                }},
+            )
+            if getattr(result, "modified_count", None) == 0:
+                continue
+            run_updates += 1
+
+        return {"tasks": task_updates, "runs": run_updates}
 
     def _mark_task_started(self, run_id: str, spec: PostmarketTaskSpec) -> None:
         now = _naive_bj()
@@ -1057,6 +1271,11 @@ class PostmarketRunner:
             "SIGNALS_POSTMARKET_TRADE_DATE": run_id.split(":", 1)[1] if ":" in run_id else "",
             **spec.env,
         }
+        if spec.module == "stock_daily":
+            trade_date = task_values["SIGNALS_POSTMARKET_TRADE_DATE"]
+            task_values["STOCK_DAILY_CLOSE_FINALITY"] = (
+                "final_close" if self._stable_close_seal_ready(trade_date) else "provisional_close"
+            )
         with self._with_env(task_values):
             if semaphore is None:
                 self._mark_task_started(run_id, spec)
@@ -1204,6 +1423,9 @@ class PostmarketRunner:
 
         self._init_run(run_id, trade_date)
         self._init_tasks(run_id, trade_date)
+        reused = self._apply_close_seal_handoff(run_id, trade_date)
+        if reused:
+            logger.info("postmarket reused close seal modules: run=%s reused=%d", run_id, reused)
         repaired = self._repair_effective_stock_daily_tasks(run_id, trade_date)
         if repaired:
             logger.info("postmarket repaired effective stock_daily task summaries: run=%s repaired=%d", run_id, repaired)
@@ -1366,8 +1588,26 @@ class PostmarketRunner:
     def run_daemon(self, *, check_seconds: int | None = None) -> None:
         check_seconds = check_seconds or _env_int("SIGNALS_POSTMARKET_CHECK_SECONDS", 300, minimum=30)
         logger.info("postmarket daemon started workers=%d check_seconds=%d", self.max_workers, check_seconds)
+        try:
+            reconciled = self._reconcile_orphaned_state()
+            if reconciled["tasks"] or reconciled["runs"]:
+                logger.warning(
+                    "postmarket reconciled orphaned state tasks=%d runs=%d",
+                    reconciled["tasks"],
+                    reconciled["runs"],
+                )
+        except Exception:
+            logger.exception("postmarket orphan reconciliation failed")
         while True:
             now = _now_bj()
+            if self.close_seal is not None and _is_a_share_trading_day(now):
+                trade_date = _postmarket_trade_date(now)
+                try:
+                    seal_result = self.close_seal.tick(trade_date, _local_bj(now))
+                    if seal_result.get("status") in {"sealed", "partial"} and not seal_result.get("skipped"):
+                        logger.info("close seal tick result=%s", seal_result.get("status"))
+                except Exception:
+                    logger.exception("close seal tick failed")
             if self.should_run_now(now):
                 trade_date = _postmarket_trade_date(now)
                 run_id = default_run_id(trade_date)
@@ -1387,4 +1627,13 @@ class PostmarketRunner:
                     else:
                         logger.info("postmarket catchup trigger run=%s previous_status=%s", run_id, status)
                         self.run_once(resume_run_id=run_id, trade_date=trade_date)
-            time.sleep(check_seconds)
+            sleep_seconds = check_seconds
+            if self.close_seal is not None:
+                try:
+                    sleep_seconds = min(
+                        check_seconds,
+                        self.close_seal.seconds_until_next_event(_postmarket_trade_date(now), _local_bj(now)),
+                    )
+                except Exception:
+                    logger.debug("close seal next wake unavailable", exc_info=True)
+            time.sleep(max(1, sleep_seconds))

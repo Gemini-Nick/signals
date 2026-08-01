@@ -6,8 +6,11 @@ from typing import Any
 
 from signals.replay.market_replay import (
     _MAJOR_INDEX_TARGETS,
+    _flow_availability,
     _limit_pool_lookup,
+    _major_index_daily_rows,
     _replay_coverage,
+    _stock_daily_task_coverage,
     build_market_replay_context,
     format_market_replay_sections,
 )
@@ -106,6 +109,32 @@ class FakeCollection:
 class FakeDB(dict):
     def list_collection_names(self):
         return list(self.keys())
+
+
+def test_flow_availability_does_not_promote_named_flow_collection_without_account_schema():
+    db = FakeDB({"fund_flow_cache": FakeCollection([{
+        "trade_date": "2026-07-31",
+        "main_order_net": -1.2,
+        "medium_order_net": 0.4,
+    }])})
+    result = _flow_availability(db)
+    assert result["participant_flow_available"] is False
+    assert result["candidate_collections"] == []
+    assert result["candidate_reasons"]["fund_flow_cache"] == "missing_participant_schema_or_provenance"
+
+
+def test_flow_availability_requires_declared_account_classified_schema():
+    db = FakeDB({"participant_flow": FakeCollection([{
+        "trade_date": "2026-07-31",
+        "flow_type": "participant_account",
+        "participant_type": "institution",
+        "buy_amount": 10.0,
+        "sell_amount": 8.0,
+        "net_amount": 2.0,
+    }])})
+    result = _flow_availability(db)
+    assert result["participant_flow_available"] is True
+    assert result["candidate_collections"] == ["participant_flow"]
 
 
 def test_limit_pool_lookup_uses_latest_state_and_preserves_intraday_history():
@@ -248,17 +277,126 @@ def test_market_replay_context_exposes_bounded_sector_transition_timeline_and_ch
 
 def test_replay_coverage_separates_official_close_from_latest_intraday_bar():
     day = "2026-07-14"
-    daily = [{"date": day, "close": 1.0, "name": name} for name, _symbol in _MAJOR_INDEX_TARGETS]
+    daily = [
+        {"date": day, "close": 1.0, "name": name, "quality": "official", "formal_close": True}
+        for name, _symbol in _MAJOR_INDEX_TARGETS
+    ]
     intraday = {"rows": [{"close_bar": {"time": "14:55", "close": 1.0}}]}
+    breadth = {"status": "available", "total": 5200}
+    stock_daily = {
+        "status": "available",
+        "expected_symbols": 5200,
+        "official_symbols": 5150,
+        "official_coverage_pct": 99.04,
+    }
+    close_seal = {"status": "sealed", "close_finality": "stable_close", "formal_ready": True}
 
-    formal = _replay_coverage(day, "formal_postmarket", daily, intraday)
-    partial = _replay_coverage(day, "formal_postmarket", daily[:1], intraday)
+    formal = _replay_coverage(day, "formal_postmarket", daily, intraday, breadth, stock_daily, close_seal)
+    partial = _replay_coverage(day, "formal_postmarket", daily[:1], intraday, breadth, stock_daily, close_seal)
 
     assert formal["formal_ready"] is True
     assert formal["official_close_source"] == "index_bars:日线"
     assert formal["latest_intraday_time"] == "14:55"
     assert partial["formal_ready"] is False
     assert partial["generation_status"] == "partial"
+
+
+def test_replay_coverage_rejects_provisional_index_and_allows_close_flash():
+    day = "2026-07-14"
+    provisional = [
+        {"date": day, "close": 1.0, "name": name, "quality": "provisional_close", "formal_close": False}
+        for name, _symbol in _MAJOR_INDEX_TARGETS
+    ]
+    breadth = {"status": "available", "total": 5200}
+    stock_daily = {
+        "status": "available",
+        "expected_symbols": 5200,
+        "official_symbols": 5150,
+        "official_coverage_pct": 99.04,
+    }
+    close_seal = {"status": "sealed", "close_finality": "stable_close", "formal_ready": True}
+
+    formal = _replay_coverage(day, "formal_postmarket", provisional, {"rows": []}, breadth, stock_daily, close_seal)
+    flash = _replay_coverage(day, "close_flash", provisional, {"rows": []}, breadth, stock_daily, close_seal)
+
+    assert formal["formal_ready"] is False
+    assert "index_daily_provisional" in formal["reason_codes"]
+    assert formal["index_daily"]["provisional"] == len(_MAJOR_INDEX_TARGETS)
+    assert flash["formal_ready"] is False
+    assert flash["generation_status"] == "success"
+
+
+def test_major_index_daily_rows_preserves_close_quality():
+    day = "2026-07-14"
+    dt = datetime.fromisoformat(day)
+    rows = []
+    for _name, symbol in _MAJOR_INDEX_TARGETS:
+        rows.extend(
+            [
+                {
+                    "dt": datetime.fromisoformat("2026-07-13"),
+                    "meta": {"symbol": symbol, "freq": "日线", "source": "akshare_sina", "quality": "official"},
+                    "close": 100.0,
+                    "amount": 1_000_000,
+                },
+                {
+                    "dt": dt,
+                    "meta": {
+                        "symbol": symbol,
+                        "freq": "日线",
+                        "source": "eastmoney_push2delay_ulist",
+                        "source_type": "direct_quote_ohlcv",
+                        "quality": "provisional_close",
+                    },
+                    "open": 100.0,
+                    "high": 102.0,
+                    "low": 99.0,
+                    "close": 101.0,
+                    "amount": 1_100_000,
+                },
+            ]
+        )
+    db = FakeDB({"index_bars": FakeCollection(rows)})
+
+    result = _major_index_daily_rows(db, day)
+
+    assert len(result) == len(_MAJOR_INDEX_TARGETS)
+    assert {row["quality"] for row in result} == {"provisional_close"}
+    assert all(row["formal_close"] is False for row in result)
+    assert all(row["evidence_level"] == "provisional" for row in result)
+
+
+def test_stock_daily_coverage_uses_global_total_before_all_shards_finish():
+    day = "2026-07-14"
+    db = FakeDB(
+        {
+            "sync_tasks": FakeCollection(
+                [
+                    {
+                        "run_id": f"postmarket:{day}",
+                        "module": "stock_daily",
+                        "status": "ok",
+                        "result_summary": {
+                            "result": {
+                                "expected_codes": 500,
+                                "covered_codes": 500,
+                                "global_total": 8000,
+                                "shard_count": 16,
+                                "quality": "final_close",
+                            }
+                        },
+                    }
+                ]
+            )
+        }
+    )
+
+    result = _stock_daily_task_coverage(db, day)
+
+    assert result["status"] == "backfilling"
+    assert result["expected_symbols"] == 8000
+    assert result["official_symbols"] == 500
+    assert result["official_coverage_pct"] == 6.25
 
 
 def test_market_replay_context_extracts_event_graph():

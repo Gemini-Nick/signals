@@ -349,6 +349,30 @@ def test_stock_daily_batch_today_refreshes_existing_provider_current_day(monkeyp
     assert "current_refresh=1" in reason
 
 
+def test_stock_daily_refreshes_provisional_current_day_quote():
+    db = _DB()
+    db["bars"].find = lambda query, projection=None: [{
+        "meta": {
+            "symbol": "600001",
+            "freq": "日线",
+            "source": "eastmoney_spot_clist_batch",
+            "source_type": "direct_quote_ohlcv",
+            "quality": "provisional_close",
+            "prev_close": 10.0,
+        },
+        "change_pct": 1.0,
+        "pct_chg": 1.0,
+    }]
+
+    candidates = stock_daily._current_daily_quote_refresh_candidates(
+        db,
+        ["600001"],
+        "20260506",
+    )
+
+    assert candidates == ["600001"]
+
+
 def test_stock_daily_batch_today_bootstraps_snapshot_only_codes(monkeypatch):
     db = _DB()
     monkeypatch.setattr(stock_daily, "naive_market_now", lambda _market: datetime(2026, 4, 30, 18, 0, 0))

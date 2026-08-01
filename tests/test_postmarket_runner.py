@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from signals.sync import postmarket as pm
+from signals.sync.task_context import get_task_env
 
 
 def test_default_postmarket_tasks_split_long_market_data_tasks():
@@ -39,6 +40,7 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert {task.shard_key for task in stock_30m} == {f"shard_{idx:02d}" for idx in range(16)}
     assert all(task.env["STOCK_DAILY_SCOPE"] == "all" for task in stock_daily)
     assert all(task.env["STOCK_DAILY_TODAY_ONLY"] == "true" for task in stock_daily)
+    assert all("STOCK_DAILY_CLOSE_FINALITY" not in task.env for task in stock_daily)
     assert all(task.env["HK_STOCK_DAILY_SCOPE"] == "all" for task in hk_stock_daily)
     assert all(task.phase == "hk_market_data" for task in hk_stock_daily)
     assert all(task.blocks_run is False for task in hk_stock_daily)
@@ -183,6 +185,9 @@ class _Collection:
 
                     if not re.search(expected["$regex"], str(actual or "")):
                         return False
+                elif "$in" in expected:
+                    if actual not in expected["$in"]:
+                        return False
                 else:
                     return False
             elif actual != expected:
@@ -219,6 +224,97 @@ class _Engine:
     def run_module(self, name, module_fn, market=None, plan=None):
         result = module_fn(self.db, proxy_url=self.proxy_url)
         return {"module": name, "status": result.get("status", "ok"), "result": result}
+
+
+def test_postmarket_reuses_only_stable_close_seal_modules(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("fullmarket_spot_snapshot", "market_data"),
+        pm.PostmarketTaskSpec("etf_spot_snapshot", "market_data"),
+        pm.PostmarketTaskSpec("index_daily", "market_data"),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data",))
+    day = "2026-07-14"
+    db = _Db()
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+    runner._init_run(f"postmarket:{day}", day)
+    runner._init_tasks(f"postmarket:{day}", day)
+    db["sync_runs"].update_one(
+        {"_id": f"close_seal:{day}"},
+        {"$set": {"status": "sealed", "close_finality": "stable_close", "sealed_at": datetime.fromisoformat(f"{day} 15:03")}},
+        upsert=True,
+    )
+    for module in ("fullmarket_spot_snapshot", "etf_spot_snapshot", "index_daily"):
+        db["sync_tasks"].update_one(
+            {"_id": f"close_seal:{day}:{module}:all"},
+            {
+                "$set": {
+                    "run_id": f"close_seal:{day}",
+                    "module": module,
+                    "status": "ok",
+                    "result_summary": {
+                        "module": module,
+                        "status": "ok",
+                        "result": {
+                            "status": "ok",
+                            "count": 5200 if module == "fullmarket_spot_snapshot" else 1200,
+                            "trade_date": day,
+                        },
+                    },
+                }
+            },
+            upsert=True,
+        )
+
+    reused = runner._apply_close_seal_handoff(f"postmarket:{day}", day)
+
+    assert reused == 2
+    assert db["sync_tasks"].find_one({"_id": f"postmarket:{day}:fullmarket_spot_snapshot:all"})["status"] == "ok"
+    assert db["sync_tasks"].find_one({"_id": f"postmarket:{day}:etf_spot_snapshot:all"})["status"] == "ok"
+    assert db["sync_tasks"].find_one({"_id": f"postmarket:{day}:index_daily:all"})["status"] == "pending"
+
+
+def test_stock_daily_finality_requires_a_valid_stable_close_seal(monkeypatch):
+    task = pm.PostmarketTaskSpec("stock_daily", "market_data")
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", (task,))
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("market_data",))
+    day = "2026-07-14"
+    db = _Db()
+    seen: list[str] = []
+
+    def stock_daily(_db, proxy_url=None):
+        seen.append(str(get_task_env("STOCK_DAILY_CLOSE_FINALITY", "")))
+        return {"status": "ok", "quality": seen[-1]}
+
+    runner = pm.PostmarketRunner(_Engine(db, {"stock_daily": (stock_daily, "")}), max_workers=1)
+    run_id = f"postmarket:{day}"
+    runner._init_run(run_id, day)
+    runner._init_tasks(run_id, day)
+    runner._run_task(run_id, task)
+
+    db["sync_runs"].update_one(
+        {"_id": f"close_seal:{day}"},
+        {"$set": {"status": "sealed", "close_finality": "stable_close"}},
+        upsert=True,
+    )
+    for module, count in (("fullmarket_spot_snapshot", 5200), ("etf_spot_snapshot", 1200)):
+        db["sync_tasks"].update_one(
+            {"_id": f"close_seal:{day}:{module}:all"},
+            {
+                "$set": {
+                    "status": "ok",
+                    "result_summary": {
+                        "module": module,
+                        "status": "ok",
+                        "result": {"status": "ok", "count": count, "trade_date": day},
+                    },
+                }
+            },
+            upsert=True,
+        )
+    runner._run_task(run_id, task)
+
+    assert seen == ["provisional_close", "final_close"]
 
 
 def test_postmarket_runner_resumes_only_unfinished_tasks(monkeypatch):
@@ -505,6 +601,257 @@ def test_postmarket_daemon_does_not_catch_up_old_terminal_run(monkeypatch):
 
     assert calls == []
     assert db["sync_tasks"].docs["postmarket:2026-04-28:beta:all"]["status"] == "pending"
+
+
+def test_postmarket_daemon_reconciles_orphans_before_idle_sleep(monkeypatch):
+    monkeypatch.setattr(pm.PostmarketRunner, "should_run_now", staticmethod(lambda now=None: False))
+    db = _Db()
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+    calls = []
+    monkeypatch.setattr(
+        runner,
+        "_reconcile_orphaned_state",
+        lambda: calls.append("reconcile") or {"tasks": 0, "runs": 0},
+    )
+
+    def stop_daemon(seconds):
+        raise RuntimeError("stop-daemon")
+
+    monkeypatch.setattr(pm.time, "sleep", stop_daemon)
+
+    with pytest.raises(RuntimeError, match="stop-daemon"):
+        runner.run_daemon(check_seconds=30)
+
+    assert calls == ["reconcile"]
+
+
+def test_postmarket_reconciles_dead_owner_without_resuming_old_run(monkeypatch):
+    tasks = (
+        pm.PostmarketTaskSpec("alpha", "data"),
+        pm.PostmarketTaskSpec("beta", "data", depends_on=("alpha:all",)),
+    )
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+
+    run_id = "postmarket:2026-04-28"
+    now = pm._naive_bj()
+    db = _Db()
+    db["sync_runs"].docs[run_id] = {
+        "_id": run_id,
+        "run_id": run_id,
+        "trade_date": "2026-04-28",
+        "status": "running",
+        "owner_pid": 12345,
+        "heartbeat_at": now,
+    }
+    db["sync_tasks"].docs[f"{run_id}:alpha:all"] = {
+        "_id": f"{run_id}:alpha:all",
+        "run_id": run_id,
+        "task_key": "alpha:all",
+        "module": "alpha",
+        "status": "ok",
+        "blocks_run": True,
+    }
+    db["sync_tasks"].docs[f"{run_id}:beta:all"] = {
+        "_id": f"{run_id}:beta:all",
+        "run_id": run_id,
+        "task_key": "beta:all",
+        "module": "beta",
+        "status": "running",
+        "owner_pid": 12345,
+        "heartbeat_at": now,
+        "blocks_run": True,
+    }
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+    monkeypatch.setattr(runner, "_pid_alive", lambda pid: False)
+
+    result = runner._reconcile_orphaned_state()
+
+    assert result == {"tasks": 1, "runs": 1}
+    task = db["sync_tasks"].docs[f"{run_id}:beta:all"]
+    assert task["status"] == "stale"
+    assert task["owner_pid"] == ""
+    assert task["error_msg"] == "running_owner_dead"
+    run = db["sync_runs"].docs[run_id]
+    assert run["status"] == "partial"
+    assert run["owner_pid"] == ""
+    assert run["recovery_state"] == "interrupted"
+    assert run["interruption_reason"] == "running_owner_dead"
+    assert run["blocked_tasks"] == ["beta:all"]
+    assert run["finished_at"] is not None
+
+
+def test_postmarket_reconcile_preserves_live_owner(monkeypatch):
+    run_id = "postmarket:2026-04-28"
+    stale_heartbeat = pm._naive_bj() - timedelta(hours=1)
+    db = _Db()
+    db["sync_runs"].docs[run_id] = {
+        "_id": run_id,
+        "run_id": run_id,
+        "status": "running",
+        "owner_pid": 12345,
+        "heartbeat_at": stale_heartbeat,
+    }
+    db["sync_tasks"].docs[f"{run_id}:alpha:all"] = {
+        "_id": f"{run_id}:alpha:all",
+        "run_id": run_id,
+        "task_key": "alpha:all",
+        "module": "alpha",
+        "status": "running",
+        "owner_pid": 12345,
+        "heartbeat_at": stale_heartbeat,
+        "blocks_run": True,
+    }
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+    monkeypatch.setattr(runner, "_pid_alive", lambda pid: True)
+
+    result = runner._reconcile_orphaned_state()
+
+    assert result == {"tasks": 0, "runs": 0}
+    assert db["sync_tasks"].docs[f"{run_id}:alpha:all"]["status"] == "running"
+    assert db["sync_runs"].docs[run_id]["status"] == "running"
+
+
+def test_postmarket_reconcile_marks_complete_orphan_ok(monkeypatch):
+    tasks = (pm.PostmarketTaskSpec("alpha", "data"),)
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+
+    run_id = "postmarket:2026-04-28"
+    db = _Db()
+    db["sync_runs"].docs[run_id] = {
+        "_id": run_id,
+        "run_id": run_id,
+        "status": "running",
+        "owner_pid": 12345,
+        "heartbeat_at": pm._naive_bj(),
+    }
+    db["sync_tasks"].docs[f"{run_id}:alpha:all"] = {
+        "_id": f"{run_id}:alpha:all",
+        "run_id": run_id,
+        "task_key": "alpha:all",
+        "module": "alpha",
+        "status": "ok",
+        "blocks_run": True,
+    }
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+    monkeypatch.setattr(runner, "_pid_alive", lambda pid: False)
+
+    result = runner._reconcile_orphaned_state()
+
+    assert result == {"tasks": 0, "runs": 1}
+    run = db["sync_runs"].docs[run_id]
+    assert run["status"] == "ok"
+    assert run["recovery_state"] == "ok"
+    assert run["incomplete_tasks"] == 0
+
+
+def test_postmarket_reconcile_uses_persisted_historical_dag(monkeypatch):
+    monkeypatch.setattr(
+        pm,
+        "POSTMARKET_TASKS",
+        (
+            pm.PostmarketTaskSpec("alpha", "data"),
+            pm.PostmarketTaskSpec("new_task", "data"),
+        ),
+    )
+    run_id = "postmarket:2026-04-28"
+    db = _Db()
+    db["sync_runs"].docs[run_id] = {
+        "_id": run_id,
+        "run_id": run_id,
+        "status": "running",
+        "owner_pid": 12345,
+        "heartbeat_at": pm._naive_bj(),
+        "task_count": 1,
+    }
+    db["sync_tasks"].docs[f"{run_id}:alpha:all"] = {
+        "_id": f"{run_id}:alpha:all",
+        "run_id": run_id,
+        "task_key": "alpha:all",
+        "module": "alpha",
+        "status": "ok",
+        "blocks_run": True,
+    }
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+    monkeypatch.setattr(runner, "_pid_alive", lambda pid: False)
+
+    runner._reconcile_orphaned_state()
+
+    assert db["sync_runs"].docs[run_id]["status"] == "ok"
+    assert db["sync_runs"].docs[run_id]["blocked_tasks"] == []
+
+
+def test_postmarket_reconcile_does_not_close_live_parent(monkeypatch):
+    run_id = "postmarket:2026-04-28"
+    db = _Db()
+    db["sync_runs"].docs[run_id] = {
+        "_id": run_id,
+        "run_id": run_id,
+        "status": "running",
+        "owner_pid": 22222,
+        "heartbeat_at": pm._naive_bj(),
+    }
+    db["sync_tasks"].docs[f"{run_id}:alpha:all"] = {
+        "_id": f"{run_id}:alpha:all",
+        "run_id": run_id,
+        "task_key": "alpha:all",
+        "module": "alpha",
+        "status": "running",
+        "owner_pid": 11111,
+        "heartbeat_at": pm._naive_bj(),
+        "blocks_run": True,
+    }
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+    monkeypatch.setattr(runner, "_pid_alive", lambda pid: int(pid) == 22222)
+
+    result = runner._reconcile_orphaned_state()
+
+    assert result == {"tasks": 1, "runs": 0}
+    assert db["sync_tasks"].docs[f"{run_id}:alpha:all"]["status"] == "stale"
+    assert db["sync_runs"].docs[run_id]["status"] == "running"
+
+
+def test_postmarket_reconcile_uses_owner_and_heartbeat_cas(monkeypatch):
+    run_id = "postmarket:2026-04-28"
+    heartbeat = pm._naive_bj()
+    db = _Db()
+    db["sync_runs"].docs[run_id] = {
+        "_id": run_id,
+        "run_id": run_id,
+        "status": "running",
+        "owner_pid": 11111,
+        "heartbeat_at": heartbeat,
+    }
+    task_id = f"{run_id}:alpha:all"
+    db["sync_tasks"].docs[task_id] = {
+        "_id": task_id,
+        "run_id": run_id,
+        "task_key": "alpha:all",
+        "module": "alpha",
+        "status": "running",
+        "owner_pid": 11111,
+        "heartbeat_at": heartbeat,
+        "blocks_run": True,
+    }
+    captured_queries = []
+
+    def lose_race(query=None, update=None, upsert=False, **kwargs):
+        captured_queries.append(query)
+        return type("UpdateResult", (), {"modified_count": 0})()
+
+    monkeypatch.setattr(db["sync_tasks"], "update_one", lose_race)
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+    monkeypatch.setattr(runner, "_pid_alive", lambda pid: False)
+
+    result = runner._reconcile_orphaned_state()
+
+    assert result == {"tasks": 0, "runs": 0}
+    assert captured_queries == [{
+        "_id": task_id,
+        "status": "running",
+        "owner_pid": 11111,
+        "heartbeat_at": heartbeat,
+    }]
+    assert db["sync_tasks"].docs[task_id]["status"] == "running"
 
 
 def test_postmarket_init_tasks_preserves_optional_completion(monkeypatch):

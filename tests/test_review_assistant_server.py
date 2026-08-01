@@ -24,6 +24,8 @@ def _payload() -> dict:
     return {
         "trade_date": "2026-07-03",
         "window": "two",
+        "report_stage": "formal_postmarket",
+        "coverage": {"formal_ready": True, "reason_codes": []},
         "signals_context": {
             "trade_date": "2026-07-03",
             "window": "two",
@@ -36,6 +38,8 @@ def _payload() -> dict:
         },
         "market_replay": {
             "trade_date": "2026-07-03",
+            "report_stage": "formal_postmarket",
+            "coverage": {"formal_ready": True, "reason_codes": []},
             "sector_transitions": {
                 "timeline": [
                     {
@@ -119,7 +123,13 @@ def test_market_replay_wechat_renderer_hides_unavailable_flow_from_body():
 
 def test_market_replay_wechat_renderer_blocks_when_core_evidence_missing():
     result = build_market_replay_wechat_summary(
-        {"trade_date": "2026-07-03", "window": "two", "signals_context": {}, "market_replay": {}},
+        {
+            "trade_date": "2026-07-03",
+            "window": "two",
+            "report_stage": "close_flash",
+            "signals_context": {},
+            "market_replay": {},
+        },
         window="two",
         max_items=5,
     )
@@ -154,6 +164,91 @@ def test_market_replay_tool_exposes_report_stage_contract():
     report_stage = tool["inputSchema"]["properties"]["report_stage"]
     assert report_stage["enum"] == ["close_flash", "formal_postmarket"]
     assert report_stage["default"] == "formal_postmarket"
+
+
+def test_generate_review_tool_exposes_report_stage_contract():
+    tool = next(item for item in review_assistant_server._tool_schema() if item["name"] == "generate_signals_replay_review")
+    report_stage = tool["inputSchema"]["properties"]["report_stage"]
+    assert report_stage["enum"] == ["close_flash", "formal_postmarket"]
+    assert "default" not in report_stage
+
+
+def test_intraday_market_context_defaults_to_close_flash(monkeypatch):
+    day = "2026-07-14"
+    captured: dict[str, str] = {}
+    fetched = SimpleNamespace(
+        dashboard={"daily_brief": {"as_of": day}},
+        shell={"watchlist_groups": {}},
+        snapshot={"as_of": day},
+    )
+    monkeypatch.setattr(review_assistant_server, "fetch_inputs_safe", lambda *_args, **_kwargs: fetched)
+    monkeypatch.setattr(review_assistant_server, "get_db", lambda: object())
+    monkeypatch.setattr(review_assistant_server, "collect_replay_context", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(review_assistant_server, "fetch_market_event_lines", lambda *_args, **_kwargs: [])
+
+    def build_context(*_args, **kwargs):
+        captured["report_stage"] = kwargs["report_stage"]
+        return {"trade_date": day, "coverage": {"formal_ready": False}, "generation_status": "success"}
+
+    monkeypatch.setattr(review_assistant_server, "build_market_replay_context", build_context)
+
+    result = review_assistant_server._collect_market_context({"window": "two"})
+
+    assert captured["report_stage"] == "close_flash"
+    assert result["report_stage"] == "close_flash"
+
+
+def test_generate_review_blocks_formal_fallback_when_coverage_is_partial(monkeypatch):
+    day = "2026-07-14"
+    monkeypatch.setattr(
+        review_assistant_server,
+        "_collect_context",
+        lambda _args: {
+            "trade_date": day,
+            "window": "postmarket",
+            "max_items": 5,
+            "_inputs": ({"daily_brief": {"as_of": day}}, {"watchlist_groups": {}}, {"as_of": day}),
+        },
+    )
+    monkeypatch.setattr(review_assistant_server, "get_db", lambda: object())
+    monkeypatch.setattr(
+        review_assistant_server,
+        "build_market_replay_context",
+        lambda *_args, **_kwargs: {
+            "trade_date": day,
+            "coverage": {"formal_ready": False, "reason_codes": ["index_daily_provisional"]},
+        },
+    )
+    text = review_assistant_server._generate_review({"trade_date": day, "report_stage": "formal_postmarket"})
+
+    assert text.startswith("DONT_NOTIFY\nA股午后观察")
+
+
+def test_formal_postmarket_renderer_blocks_when_close_is_not_ready():
+    payload = _payload()
+    payload["report_stage"] = "formal_postmarket"
+    payload["coverage"] = {"formal_ready": False, "reason_codes": ["index_daily_provisional"]}
+    payload["market_replay"]["report_stage"] = "formal_postmarket"
+    payload["market_replay"]["coverage"] = payload["coverage"]
+
+    result = build_market_replay_wechat_summary(payload, window="postmarket", max_items=5)
+
+    assert result["status"] == "DONT_NOTIFY"
+    assert result["body"] == ""
+    assert result["reason"] == "formal_postmarket_not_ready"
+
+
+def test_close_flash_renderer_uses_observation_title():
+    payload = _payload()
+    payload["report_stage"] = "close_flash"
+    payload["coverage"] = {"formal_ready": False, "reason_codes": ["index_daily_provisional"]}
+    payload["market_replay"]["report_stage"] = "close_flash"
+    payload["market_replay"]["coverage"] = payload["coverage"]
+
+    result = build_market_replay_wechat_summary(payload, window="close", max_items=5)
+
+    assert result["status"] == "NOTIFY"
+    assert "A股午后观察" in result["body"]
 
 
 def test_market_replay_tool_exposes_backward_compatible_markets_contract():

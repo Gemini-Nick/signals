@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from datetime import datetime, time as dt_time, timedelta
+from zoneinfo import ZoneInfo
 
 from pymongo import UpdateOne
 from pymongo.database import Database
@@ -22,7 +23,7 @@ logger = logging.getLogger("signals.sync.quote_snapshots")
 _EM_ENDPOINT = "https://push2delay.eastmoney.com/api/qt/stock/get"
 _EM_FIELDS = "f43,f44,f45,f46,f47,f48,f49,f50,f57,f58,f60,f116,f117,f168,f169,f170,f171"
 _EM_ULIST_ENDPOINT = "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
-_EM_ULIST_FIELDS = "f2,f3,f4,f5,f6,f7,f8,f12,f13,f14,f15,f16,f17,f18,f20,f21"
+_EM_ULIST_FIELDS = "f2,f3,f4,f5,f6,f7,f8,f12,f13,f14,f15,f16,f17,f18,f20,f21,f124"
 _MACRO_QUOTE_SYMBOLS = ("SH.000001", "SZ.399001", "SZ.399006", "SH.000300", "SH.000016")
 QUOTE_TRADING_DAY_OPEN = dt_time(9, 15)
 
@@ -487,6 +488,13 @@ def _quote_doc_from_ulist_row(symbol: str, row: dict, now: datetime, trading_day
     change = _computed_change(price, prev_close, row.get("f4"))
     change_pct = _computed_change_pct(price, prev_close, row.get("f3"))
     vol, source_volume_unit = normalize_stock_volume(row.get("f5"), source_unit="hands")
+    source_updated_at = None
+    try:
+        source_epoch = int(row.get("f124") or 0)
+        if source_epoch > 0:
+            source_updated_at = datetime.fromtimestamp(source_epoch, tz=ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    except (TypeError, ValueError, OSError):
+        source_updated_at = None
     return {
         "_id": f"{symbol}:latest",
         "symbol": symbol,
@@ -495,6 +503,7 @@ def _quote_doc_from_ulist_row(symbol: str, row: dict, now: datetime, trading_day
         "dt": trading_day,
         "trade_date": trading_day,
         "snapshot_at": now,
+        "source_updated_at": source_updated_at,
         "source": "eastmoney_push2delay_ulist",
         "freshness": "fresh",
         "is_stale": False,

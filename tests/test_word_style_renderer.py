@@ -9,6 +9,8 @@ def test_word_style_renderer_keeps_a_reader_facing_five_part_structure():
         {"trade_date": "2026-06-29", "sector_boards": []},
         {
             "trade_date": "2026-06-29",
+            "report_stage": "formal_postmarket",
+            "coverage": {"formal_ready": True},
             "major_indices": [
                 {
                     "name": "上证指数",
@@ -443,5 +445,17 @@ def test_word_renderer_omits_internal_coverage_and_fixed_slice_details():
     )
 
     assert "元件" in text
+    assert "# A股午后观察 | 2026年7月14日（周二）" in text
+    assert "A股盘后复盘" not in text
     for internal_token in ("固定半小时时间轴", "13:01-13:30", "压力核心", "最新分钟时点", "unknown", "partial"):
         assert internal_token not in text
+
+
+def test_word_renderer_missing_coverage_fails_closed_to_observation_title():
+    text = render_word_style_review(
+        {"trade_date": "2026-07-14"},
+        {"trade_date": "2026-07-14", "report_stage": "formal_postmarket"},
+    )
+
+    assert text.startswith("# A股午后观察 | 2026年7月14日（周二）")
+    assert "A股盘后复盘" not in text

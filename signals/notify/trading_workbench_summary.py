@@ -1117,7 +1117,11 @@ def build_narrative_review(
     event_lines: list[str] | None = None,
     extra_facts: list[str] | None = None,
     market_replay_sections: list[str] | None = None,
+    report_stage: str = "",
+    formal_ready: bool | None = None,
 ) -> SummaryResult:
+    if not report_stage and formal_ready is False:
+        report_stage = "formal_postmarket"
     selected_action, selected_watch, selected_risk = _selected_rows(window, shell, max_items=max_items)
     event_lines = event_lines or []
     extra_facts = extra_facts or []
@@ -1133,6 +1137,9 @@ def build_narrative_review(
     if not notify and market_replay_sections and window in {"postmarket", "weekly", "manual"}:
         notify = True
         reason = "market_replay_sections"
+    if report_stage == "formal_postmarket" and formal_ready is not True:
+        notify = False
+        reason = "formal_postmarket_not_ready"
     status = "NOTIFY" if notify else "DONT_NOTIFY"
     as_of = _as_of_date(dashboard, snapshot)
     counts = _pool_counts(shell)
@@ -1142,9 +1149,12 @@ def build_narrative_review(
     watch_names = _compact_row_names(selected_watch, limit=3)
     risk_names = _compact_row_names(selected_risk, limit=3)
 
+    replay_title = _replay_date_title(as_of)
+    if report_stage == "close_flash" or (report_stage == "formal_postmarket" and formal_ready is not True):
+        replay_title = f"{as_of} A股午后观察" if as_of not in {"unknown", "待确认"} else "A股午后观察"
     lines = [
         status,
-        _replay_date_title(as_of),
+        replay_title,
         "",
     ]
     lines.extend(
@@ -1439,6 +1449,15 @@ def build_market_replay_wechat_summary(
 
     signals_context = _market_payload_dict(payload.get("signals_context"))
     market_replay = _market_payload_dict(payload.get("market_replay"))
+    report_stage = _text(payload.get("report_stage") or market_replay.get("report_stage"), "formal_postmarket")
+    coverage = _market_payload_dict(payload.get("coverage") or market_replay.get("coverage"))
+    if report_stage == "formal_postmarket" and coverage.get("formal_ready") is not True:
+        return {
+            "status": "DONT_NOTIFY",
+            "body": "",
+            "reason": "formal_postmarket_not_ready",
+            "audit": {"reason_codes": _as_list(coverage.get("reason_codes"))},
+        }
     window = _text(window or payload.get("window") or signals_context.get("window"), "manual")
     trade_date = _text(payload.get("trade_date") or market_replay.get("trade_date") or signals_context.get("trade_date"))
     limit = max(1, min(8, int(max_items or 5)))
@@ -1473,6 +1492,8 @@ def build_market_replay_wechat_summary(
     used_paths.extend(rotation_used + transition_used + rep_used + pressure_used)
 
     title = WINDOW_LABELS.get(window, WINDOW_LABELS["manual"])
+    if report_stage == "close_flash":
+        title = f"A股午后观察｜{title}"
     header = f"【{trade_date}｜{title}】" if trade_date else f"【{title}】"
     lines = [
         header,
@@ -2581,6 +2602,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-url", default=os.getenv("SIGNALS_WEB_BASE_URL", "http://127.0.0.1:8011"))
     parser.add_argument("--window", choices=sorted(WINDOW_LABELS), default="manual")
     parser.add_argument("--trade-date", default="", help="Historical YYYY-MM-DD trade date for narrative replay.")
+    parser.add_argument(
+        "--report-stage",
+        choices=["close_flash", "formal_postmarket"],
+        default="",
+        help="Defaults to close_flash for intraday windows and formal_postmarket for postmarket/weekly/manual.",
+    )
     parser.add_argument("--max-items", type=int, default=3)
     parser.add_argument(
         "--safe-inputs",
@@ -2645,6 +2672,9 @@ def main(argv: list[str] | None = None) -> int:
             dashboard, shell, snapshot = fetch_inputs(args.base_url)
         source_trade_date = _as_of_date(dashboard, snapshot)
         requested_trade_date = _text(args.trade_date)
+        report_stage = args.report_stage or (
+            "close_flash" if args.window in {"preopen", "ten", "midday", "two", "close"} else "formal_postmarket"
+        )
         event_lines = (
             fetch_market_event_lines(args.base_url, window=args.window)
             if args.window in {"ten", "midday", "two", "close"}
@@ -2660,6 +2690,7 @@ def main(argv: list[str] | None = None) -> int:
             builder = build_summary
         market_replay_sections: list[str] = []
         replay_context: dict[str, Any] = {}
+        replay_coverage: dict[str, Any] = {}
         replay_trade_date = requested_trade_date or source_trade_date
         if args.format in {"narrative", "word"} and replay_trade_date != "unknown":
             try:
@@ -2675,6 +2706,12 @@ def main(argv: list[str] | None = None) -> int:
                     sector_boards=[] if historical_requested else sector_boards,
                     representative_limit=max(20, args.max_items * 4),
                     include_external_fund_flows=args.window in {"postmarket", "manual", "weekly"},
+                    report_stage=report_stage,
+                )
+                replay_coverage = (
+                    replay_context.get("coverage")
+                    if isinstance(replay_context.get("coverage"), dict)
+                    else {}
                 )
                 if args.format == "narrative":
                     market_replay_sections = format_market_replay_sections(replay_context)
@@ -2689,6 +2726,19 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 market_replay_sections = []
                 replay_context = {}
+                replay_coverage = {}
+        elif report_stage == "formal_postmarket" and replay_trade_date != "unknown":
+            try:
+                from signals.replay.market_replay import build_market_replay_readiness
+                from signals.sync.db import get_db
+
+                replay_coverage = build_market_replay_readiness(
+                    get_db(),
+                    trade_date=replay_trade_date,
+                    report_stage=report_stage,
+                )
+            except Exception:
+                replay_coverage = {}
         builder_kwargs: dict[str, Any] = {
             "window": args.window,
             "max_items": max(1, args.max_items),
@@ -2697,6 +2747,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.format == "narrative":
             builder_kwargs["extra_facts"] = args.extra_fact
             builder_kwargs["market_replay_sections"] = market_replay_sections
+            builder_kwargs["report_stage"] = report_stage
+            builder_kwargs["formal_ready"] = replay_coverage.get("formal_ready")
         if args.format == "word":
             from signals.replay.word_style_renderer import render_word_style_review
 
@@ -2717,15 +2769,34 @@ def main(argv: list[str] | None = None) -> int:
                 or _as_list(ranking.get("rows"))
                 or signals_context.get("sector_boards")
             )
+            if report_stage == "formal_postmarket" and replay_coverage.get("formal_ready") is not True:
+                notify = False
             status = "NOTIFY" if notify else "DONT_NOTIFY"
             result = SummaryResult(
                 status=status,
                 text=f"{status}\n{body}",
                 notify=notify,
-                reason="word_style_replay" if notify else "word_style_replay_no_context",
+                reason=(
+                    "word_style_replay"
+                    if notify
+                    else "formal_postmarket_not_ready"
+                    if report_stage == "formal_postmarket" and replay_coverage.get("formal_ready") is not True
+                    else "word_style_replay_no_context"
+                ),
             )
         else:
             result = builder(dashboard, shell, snapshot, **builder_kwargs)
+        if (
+            args.format not in {"narrative", "word"}
+            and report_stage == "formal_postmarket"
+            and replay_coverage.get("formal_ready") is not True
+        ):
+            result = SummaryResult(
+                status="DONT_NOTIFY",
+                text="DONT_NOTIFY\nA股午后观察",
+                notify=False,
+                reason="formal_postmarket_not_ready",
+            )
 
     if (
         args.ignore_time
@@ -2780,9 +2851,15 @@ def main(argv: list[str] | None = None) -> int:
 
     training_sample_send_allowed = not args.training_sample or args.allow_training_sample_send
     ignore_time_send_allowed = not (args.ignore_time and not allowed and not args.allow_ignore_time_notify)
+    hard_send_blocked = result.reason in {
+        "formal_postmarket_not_ready",
+        "formal_postmarket_context_unavailable",
+        "trade_date_mismatch",
+    }
     if (
         args.send
         and (result.notify or args.send_all)
+        and not hard_send_blocked
         and not eval_failed
         and training_sample_send_allowed
         and ignore_time_send_allowed

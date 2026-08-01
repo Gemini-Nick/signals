@@ -435,7 +435,15 @@ def _sync_a_index(db: Database, ak_codes: dict, start_date: str,
             for _, row in df.iterrows():
                 docs.append({
                     "dt": row["date"],
-                    "meta": {"symbol": symbol, "freq": "日线", "asset_type": "index", "market": "A", "source": source or "akshare"},
+                    "meta": {
+                        "symbol": symbol,
+                        "freq": "日线",
+                        "asset_type": "index",
+                        "market": "A",
+                        "source": source or "akshare",
+                        "source_type": "direct_daily",
+                        "quality": "official",
+                    },
                     "open": float(row["open"]),
                     "high": float(row["high"]),
                     "low": float(row["low"]),

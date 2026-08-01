@@ -160,10 +160,15 @@ def _repair_lookback_days_for_scope(scope: str) -> int:
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
+    raw = get_task_env(name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _snapshot_daily_quality() -> str:
+    value = str(get_task_env("STOCK_DAILY_CLOSE_FINALITY", "provisional_close") or "").strip().lower()
+    return "final_close" if value == "final_close" else "provisional_close"
 
 
 def _today_only_enabled() -> bool:
@@ -1154,7 +1159,7 @@ def _snapshot_daily_doc(
             "market": "A",
             "source": "eastmoney_spot_clist_batch",
             "source_type": "direct_quote_ohlcv",
-            "quality": "provisional_close",
+            "quality": _snapshot_daily_quality(),
             "batch_semantics": "today_spot_ohlcv",
             "prev_close": snapshot_prev_close,
             "volume_unit": CANONICAL_STOCK_VOLUME_UNIT,
@@ -1192,6 +1197,7 @@ def _current_daily_quote_refresh_candidates(db: Database, codes: list[str], end_
                 "meta.source": 1,
                 "meta.source_type": 1,
                 "meta.prev_close": 1,
+                "meta.quality": 1,
                 "prev_close": 1,
                 "change_pct": 1,
                 "pct_chg": 1,
@@ -1208,12 +1214,20 @@ def _current_daily_quote_refresh_candidates(db: Database, codes: list[str], end_
             continue
         source_type = str(meta.get("source_type") or "")
         source = str(meta.get("source") or "")
+        quality = str(meta.get("quality") or "")
         prev_close = _safe_number(row.get("prev_close"))
         if prev_close is None:
             prev_close = _safe_number(meta.get("prev_close"))
         change_pct = _safe_number(row.get("change_pct"))
         pct_chg = _safe_number(row.get("pct_chg"))
-        if source_type != "direct_quote_ohlcv" or source != "eastmoney_spot_clist_batch" or not prev_close or change_pct is None or pct_chg is None:
+        if (
+            source_type != "direct_quote_ohlcv"
+            or source != "eastmoney_spot_clist_batch"
+            or quality in {"", "provisional_close", "estimated_close", "provisional_intraday"}
+            or not prev_close
+            or change_pct is None
+            or pct_chg is None
+        ):
             refresh.add(code)
     return [code for code in codes if code in refresh]
 
@@ -1696,6 +1710,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
         )
         return {
             "status": status,
+            "quality": _snapshot_daily_quality(),
             "inserted": total_inserted,
             "skipped": 0,
             "errors": missing_codes,
@@ -1868,6 +1883,7 @@ def sync_stock_daily(db: Database, proxy_url: str = None) -> dict:
 
     return {
         "status": "partial" if errors or deferred else "ok",
+        "quality": _snapshot_daily_quality() if batch_codes else "mixed",
         "inserted": total_inserted,
         "skipped": total_skipped,
         "errors": len(errors),

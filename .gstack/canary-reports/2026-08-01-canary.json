@@ -1,0 +1,23 @@
+{
+  "date": "2026-08-01",
+  "status": "HEALTHY",
+  "duration_seconds": 632,
+  "checks": 8,
+  "alerts": 0,
+  "processes": {
+    "runtime_pid": 93562,
+    "web_pid": 93577,
+    "postmarket_pid": 93610,
+    "stable": true
+  },
+  "endpoints": {
+    "/": {"status": 200, "min_seconds": 0.003331, "max_seconds": 0.026642},
+    "/api/pack/dashboard": {"status": 200, "min_seconds": 0.258723, "max_seconds": 1.149856, "final_seconds": 0.314780},
+    "/api/health/cache": {"status": 200, "min_seconds": 0.008173, "max_seconds": 0.338045, "final_seconds": 0.009529}
+  },
+  "new_errors": 0,
+  "close_seal_enabled": true,
+  "formal_ready": false,
+  "formal_ready_reason": "weekend activation; next trading-day close seal not yet available",
+  "follow_up_automation_id": "signals"
+}

@@ -4,6 +4,8 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from signals.notify.trading_workbench_summary import (
     InputFetchResult,
     build_summary,
@@ -217,6 +219,19 @@ def test_narrative_review_uses_sector_board_without_date_hardcoding():
     assert "runtime" not in result.text
 
 
+def test_narrative_review_explicit_false_readiness_fails_closed_without_stage():
+    result = build_narrative_review(
+        _dashboard(),
+        _june5_shell(),
+        _snapshot(),
+        window="postmarket",
+        formal_ready=False,
+    )
+
+    assert result.status == "DONT_NOTIFY"
+    assert "A股午后观察" in result.text
+
+
 def test_narrative_cli_trade_date_uses_historical_replay_context(monkeypatch, capsys):
     dashboard = _dashboard()
     dashboard["daily_brief"]["as_of"] = "2026-06-05"
@@ -232,8 +247,10 @@ def test_narrative_cli_trade_date_uses_historical_replay_context(monkeypatch, ca
     def fake_build_market_replay_context(db, *, trade_date: str, **kwargs):
         seen["trade_date"] = trade_date
         return {
-            "trade_date": trade_date,
-            "board_timeline": [
+                "trade_date": trade_date,
+                "report_stage": "formal_postmarket",
+                "coverage": {"formal_ready": True},
+                "board_timeline": [
                 {
                     "driver_name": "硅料硅片",
                     "kind": "industry",
@@ -295,7 +312,13 @@ def test_narrative_cli_historical_trade_date_clears_stale_live_inputs(monkeypatc
     monkeypatch.setattr("signals.sync.db.get_db", lambda: object())
     monkeypatch.setattr(
         "signals.replay.market_replay.build_market_replay_context",
-        lambda db, *, trade_date, **kwargs: {"trade_date": trade_date, "board_timeline": [], "rotation_windows": []},
+        lambda db, *, trade_date, **kwargs: {
+            "trade_date": trade_date,
+            "report_stage": "formal_postmarket",
+            "coverage": {"formal_ready": True},
+            "board_timeline": [],
+            "rotation_windows": [],
+        },
     )
     monkeypatch.setattr("signals.replay.market_replay.format_market_replay_sections", lambda context: [])
 
@@ -340,8 +363,10 @@ def test_narrative_cli_same_trade_date_keeps_live_sector_and_indices(monkeypatch
         seen["trade_date"] = trade_date
         seen["sector_boards_count"] = len(sector_boards)
         return {
-            "trade_date": trade_date,
-            "board_timeline": [
+                "trade_date": trade_date,
+                "report_stage": "formal_postmarket",
+                "coverage": {"formal_ready": True},
+                "board_timeline": [
                 {
                     "driver_name": "硅料硅片",
                     "kind": "industry",
@@ -396,8 +421,10 @@ def test_word_cli_trade_date_renders_word_style_from_replay_context(monkeypatch,
     def fake_build_market_replay_context(db, *, trade_date: str, **kwargs):
         seen["trade_date"] = trade_date
         return {
-            "trade_date": trade_date,
-            "major_indices": [
+                "trade_date": trade_date,
+                "report_stage": "formal_postmarket",
+                "coverage": {"formal_ready": True},
+                "major_indices": [
                 {
                     "name": "上证指数",
                     "close": 4073.9,
@@ -491,6 +518,134 @@ def test_word_cli_trade_date_renders_word_style_from_replay_context(monkeypatch,
     assert "极度分化，科创单骑救主" not in output
 
 
+def test_narrative_cli_partial_formal_context_is_observation(monkeypatch, capsys):
+    dashboard = _dashboard()
+    dashboard["daily_brief"]["as_of"] = "2026-07-14"
+    snapshot = _snapshot()
+    snapshot["as_of"] = "2026-07-14"
+    monkeypatch.setattr(
+        "signals.notify.trading_workbench_summary.fetch_inputs",
+        lambda _base_url: (dashboard, _june5_shell(), snapshot),
+    )
+    monkeypatch.setattr("signals.sync.db.get_db", lambda: object())
+    monkeypatch.setattr(
+        "signals.replay.market_replay.build_market_replay_context",
+        lambda _db, **kwargs: {
+            "trade_date": kwargs["trade_date"],
+            "report_stage": "formal_postmarket",
+            "coverage": {"formal_ready": False, "reason_codes": ["index_daily_provisional"]},
+        },
+    )
+    monkeypatch.setattr(
+        "signals.replay.market_replay.format_market_replay_sections",
+        lambda _context: ["临时证据不应升级成正式复盘。"],
+    )
+
+    exit_code = main(
+        [
+            "--window",
+            "postmarket",
+            "--format",
+            "narrative",
+            "--ignore-time",
+            "--allow-ignore-time-notify",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert output.startswith("DONT_NOTIFY\n2026-07-14 A股午后观察")
+
+
+def test_word_cli_send_all_cannot_override_partial_formal_gate(monkeypatch, capsys):
+    sent: list[str] = []
+    dashboard = _dashboard()
+    dashboard["daily_brief"]["as_of"] = "2026-07-14"
+    snapshot = _snapshot()
+    snapshot["as_of"] = "2026-07-14"
+    monkeypatch.setattr(
+        "signals.notify.trading_workbench_summary.fetch_inputs",
+        lambda _base_url: (dashboard, _june5_shell(), snapshot),
+    )
+    monkeypatch.setattr("signals.sync.db.get_db", lambda: object())
+    monkeypatch.setattr(
+        "signals.replay.market_replay.build_market_replay_context",
+        lambda _db, **kwargs: {
+            "trade_date": kwargs["trade_date"],
+            "report_stage": "formal_postmarket",
+            "coverage": {"formal_ready": False, "reason_codes": ["stock_daily_backfilling"]},
+            "major_indices": [{"name": "上证指数", "close": 3500, "change_pct": 0.5}],
+            "daily_board_rankings": {"rows": [{"name": "机器人", "change_pct": 2.0}], "weak_rows": []},
+            "high_turnover_cores": [],
+            "structured_daily_review": {"key_stock_pool": {"gainers_top20": [], "limit_pool_counts": {}}},
+        },
+    )
+    monkeypatch.setattr("signals.notify.send_text", lambda text: sent.append(text))
+
+    exit_code = main(
+        [
+            "--window",
+            "postmarket",
+            "--format",
+            "word",
+            "--ignore-time",
+            "--allow-ignore-time-notify",
+            "--send",
+            "--send-all",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert output.startswith("DONT_NOTIFY\n# A股午后观察")
+    assert sent == []
+
+
+@pytest.mark.parametrize(
+    ("window", "output_format"),
+    [("postmarket", "wechat"), ("weekly", "wechat"), ("postmarket", "workbench")],
+)
+def test_legacy_formal_cli_formats_cannot_bypass_readiness_or_send_all(
+    monkeypatch,
+    capsys,
+    window,
+    output_format,
+):
+    sent: list[str] = []
+    dashboard = _dashboard()
+    dashboard["daily_brief"]["as_of"] = "2026-07-14"
+    snapshot = _snapshot()
+    snapshot["as_of"] = "2026-07-14"
+    monkeypatch.setattr(
+        "signals.notify.trading_workbench_summary.fetch_inputs",
+        lambda _base_url: (dashboard, _june5_shell(), snapshot),
+    )
+    monkeypatch.setattr("signals.sync.db.get_db", lambda: object())
+    monkeypatch.setattr(
+        "signals.replay.market_replay.build_market_replay_readiness",
+        lambda *_args, **_kwargs: {"formal_ready": False, "reason_codes": ["close_seal_not_ready"]},
+    )
+    monkeypatch.setattr("signals.notify.send_text", lambda text: sent.append(text))
+
+    exit_code = main(
+        [
+            "--window",
+            window,
+            "--format",
+            output_format,
+            "--ignore-time",
+            "--allow-ignore-time-notify",
+            "--send",
+            "--send-all",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert output.startswith("DONT_NOTIFY\nA股午后观察")
+    assert sent == []
+
+
 def test_fetch_inputs_safe_returns_partial_inputs_when_snapshot_fails(monkeypatch):
     def fake_fetch_json(base_url: str, path: str, *, timeout: float = 8.0):
         if path == "/api/strategy/snapshot":
@@ -529,7 +684,11 @@ def test_narrative_cli_safe_inputs_notifies_from_replay_when_snapshot_times_out(
     monkeypatch.setattr("signals.sync.db.get_db", lambda: object())
     monkeypatch.setattr(
         "signals.replay.market_replay.build_market_replay_context",
-        lambda db, **kwargs: {"trade_date": kwargs["trade_date"]},
+        lambda db, **kwargs: {
+            "trade_date": kwargs["trade_date"],
+            "report_stage": "formal_postmarket",
+            "coverage": {"formal_ready": True},
+        },
     )
     monkeypatch.setattr(
         "signals.replay.market_replay.format_market_replay_sections",
@@ -618,7 +777,11 @@ def test_ignore_time_dry_run_blocks_send_even_with_send_all(monkeypatch, capsys)
     monkeypatch.setattr("signals.sync.db.get_db", lambda: object())
     monkeypatch.setattr(
         "signals.replay.market_replay.build_market_replay_context",
-        lambda db, **kwargs: {"trade_date": kwargs["trade_date"]},
+        lambda db, **kwargs: {
+            "trade_date": kwargs["trade_date"],
+            "report_stage": "formal_postmarket",
+            "coverage": {"formal_ready": True},
+        },
     )
     monkeypatch.setattr(
         "signals.replay.market_replay.format_market_replay_sections",

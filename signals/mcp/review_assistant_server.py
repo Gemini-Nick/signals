@@ -79,6 +79,11 @@ def _tool_schema() -> list[dict[str, Any]]:
                         "type": "string",
                         "description": "YYYY-MM-DD. Optional historical date for narrative replay; defaults to dashboard/snapshot trade date.",
                     },
+                    "report_stage": {
+                        "type": "string",
+                        "enum": ["close_flash", "formal_postmarket"],
+                        "description": "Defaults by window: intraday windows use close_flash; postmarket/weekly/manual use formal_postmarket.",
+                    },
                     "include_market_replay": {
                         "type": "boolean",
                         "default": True,
@@ -222,6 +227,11 @@ def _tool_schema() -> list[dict[str, Any]]:
                         "type": "string",
                         "description": "YYYY-MM-DD. Defaults to dashboard/snapshot trade date.",
                     },
+                    "report_stage": {
+                        "type": "string",
+                        "enum": ["close_flash", "formal_postmarket"],
+                        "description": "Defaults by window; formal rendering is blocked until coverage.formal_ready is true.",
+                    },
                     "window": {
                         "type": "string",
                         "default": "postmarket",
@@ -289,9 +299,16 @@ def _text_result(text: str, *, is_error: bool = False) -> dict[str, Any]:
 def _generate_review(arguments: dict[str, Any]) -> str:
     context = _collect_context(arguments)
     dashboard, shell, snapshot = context.pop("_inputs")
+    report_stage = str(
+        arguments.get("report_stage")
+        or ("close_flash" if str(context.get("window") or "") in {"preopen", "ten", "midday", "two", "close"} else "formal_postmarket")
+    )
+    if report_stage not in {"close_flash", "formal_postmarket"}:
+        raise ValueError(f"invalid report_stage: {report_stage}")
     requested_trade_date = str(arguments.get("trade_date") or "").strip()
     source_trade_date = _as_of_date(dashboard, snapshot)
     market_replay_sections: list[str] = []
+    replay_coverage: dict[str, Any] = {}
     if bool(arguments.get("include_market_replay", True)):
         try:
             from signals.replay.market_replay import format_market_replay_sections
@@ -304,7 +321,9 @@ def _generate_review(arguments: dict[str, Any]) -> str:
                 trade_date=requested_trade_date or str(context.get("trade_date") or source_trade_date),
                 sector_boards=[] if historical_requested else sector_boards,
                 include_external_fund_flows=bool(arguments.get("include_external_fund_flows", True)),
+                report_stage=report_stage,
             )
+            replay_coverage = replay_context.get("coverage") if isinstance(replay_context.get("coverage"), dict) else {}
             market_replay_sections = format_market_replay_sections(replay_context)
             if historical_requested:
                 dashboard, shell, snapshot = _historical_replay_inputs(
@@ -315,7 +334,11 @@ def _generate_review(arguments: dict[str, Any]) -> str:
                     replay_context=replay_context,
                 )
         except Exception:
+            if report_stage == "formal_postmarket":
+                return "DONT_NOTIFY\nA股午后观察"
             market_replay_sections = []
+    if report_stage == "formal_postmarket" and replay_coverage.get("formal_ready") is not True:
+        return "DONT_NOTIFY\nA股午后观察"
     result = build_narrative_review(
         dashboard,
         shell,
@@ -325,6 +348,8 @@ def _generate_review(arguments: dict[str, Any]) -> str:
         event_lines=context.get("event_lines") if isinstance(context.get("event_lines"), list) else [],
         extra_facts=context.get("extra_facts") if isinstance(context.get("extra_facts"), list) else [],
         market_replay_sections=market_replay_sections,
+        report_stage=report_stage,
+        formal_ready=replay_coverage.get("formal_ready"),
     )
     return result.text
 
@@ -513,7 +538,10 @@ def _collect_market_context(arguments: dict[str, Any]) -> dict[str, Any]:
     if not trade_date:
         raise ValueError("trade_date is required when dashboard/snapshot has no as_of date")
     window = str(arguments.get("window") or "postmarket")
-    report_stage = str(arguments.get("report_stage") or "formal_postmarket")
+    report_stage = str(
+        arguments.get("report_stage")
+        or ("close_flash" if window in {"preopen", "ten", "midday", "two", "close"} else "formal_postmarket")
+    )
     if report_stage not in {"close_flash", "formal_postmarket"}:
         raise ValueError(f"invalid report_stage: {report_stage}")
     cutoff_time = str(arguments.get("cutoff_time") or "").strip()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from signals.sync.modules.quote_snapshots import (
     _a_quote_symbols,
@@ -88,6 +89,7 @@ def test_quote_doc_from_ulist_row_uses_batch_fields():
         "f16": 18.98,
         "f17": 19.33,
         "f18": 19.43,
+        "f124": int(datetime(2026, 4, 30, 15, 0, 5, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()),
     }
 
     doc = _quote_doc_from_ulist_row("SH.601958", row, datetime(2026, 4, 30, 10, 0), "2026-04-30")
@@ -100,6 +102,7 @@ def test_quote_doc_from_ulist_row_uses_batch_fields():
     assert doc["change_pct"] == 1.2352
     assert doc["vol"] == 30498700
     assert doc["volume_unit"] == "shares"
+    assert doc["source_updated_at"] == datetime(2026, 4, 30, 15, 0, 5)
 
 
 def test_quote_doc_from_ulist_row_tolerates_preopen_dash_fields():

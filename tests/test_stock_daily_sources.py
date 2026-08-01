@@ -6,6 +6,7 @@ import pytest
 
 from signals.sync import provider_limits
 from signals.sync.modules import stock_daily
+from signals.sync.task_context import task_env
 
 
 class _Cursor(list):
@@ -45,6 +46,24 @@ def _clear_provider_state():
     provider_limits._STATES.clear()
     yield
     provider_limits._STATES.clear()
+
+
+def test_snapshot_daily_doc_uses_task_scoped_final_close_quality():
+    row = {
+        "今开": 10.0,
+        "最高": 10.5,
+        "最低": 9.8,
+        "最新价": 10.2,
+        "昨收": 10.0,
+        "成交量": 1000,
+        "成交额": 1_020_000,
+    }
+
+    with task_env({"STOCK_DAILY_CLOSE_FINALITY": "final_close"}):
+        doc = stock_daily._snapshot_daily_doc("600001", pd.Series(row), "20260714", previous_close=10.0)
+
+    assert doc is not None
+    assert doc["meta"]["quality"] == "final_close"
 
 
 def test_stock_daily_uses_tencent_primary_without_akshare(monkeypatch):
@@ -162,6 +181,17 @@ def test_stock_daily_today_only_flag_is_opt_in(monkeypatch):
 
     monkeypatch.setenv("STOCK_DAILY_TODAY_ONLY", "true")
     assert stock_daily._today_only_enabled() is True
+
+
+def test_stock_daily_today_only_flag_reads_task_context(monkeypatch):
+    monkeypatch.delenv("STOCK_DAILY_TODAY_ONLY", raising=False)
+
+    with task_env({"STOCK_DAILY_TODAY_ONLY": "true"}):
+        assert stock_daily._today_only_enabled() is True
+
+    monkeypatch.setenv("STOCK_DAILY_TODAY_ONLY", "true")
+    with task_env({"STOCK_DAILY_TODAY_ONLY": "false"}):
+        assert stock_daily._today_only_enabled() is False
 
 
 def test_active_stock_codes_include_all_terminal_stock_pool_groups():
