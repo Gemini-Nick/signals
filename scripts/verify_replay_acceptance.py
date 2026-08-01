@@ -133,8 +133,15 @@ def _channel_acceptance(db: Any, trade_date: str) -> dict[str, Any]:
     readiness = readiness or {}
     index = index or {}
     daily = daily or {}
-    running = _count(sync_tasks, {"status": "running"}) if sync_tasks is not None else 0
-    errors = _count(sync_tasks, {"status": "error"}) if sync_tasks is not None else 0
+    # Optional catch-up lanes (currently HK daily) are deliberately allowed
+    # to continue after the formal A-share close path is complete.  They must
+    # not make the user-facing channel gate look stuck; only tasks that block
+    # the postmarket run participate in the runtime health checks.
+    critical_filter = {"blocks_run": {"$ne": False}}
+    running = _count(sync_tasks, {"status": "running", **critical_filter}) if sync_tasks is not None else 0
+    errors = _count(sync_tasks, {"status": "error", **critical_filter}) if sync_tasks is not None else 0
+    optional_running = _count(sync_tasks, {"status": "running", "blocks_run": False}) if sync_tasks is not None else 0
+    optional_errors = _count(sync_tasks, {"status": "error", "blocks_run": False}) if sync_tasks is not None else 0
     checks = {
         "fullmarket_minute_complete": minute.get("status") == "ok",
         "quote_channel_ok": quote.get("status") == "ok" and int((quote.get("result") or {}).get("errors") or 0) == 0,
@@ -152,7 +159,12 @@ def _channel_acceptance(db: Any, trade_date: str) -> dict[str, Any]:
         "minute_readiness": readiness,
         "index_minute": {"status": index.get("status"), "unsupported_calls": index.get("unsupported_calls") or (index.get("result") or {}).get("unsupported_calls", 0)},
         "daily_progress": daily,
-        "runtime": {"running_tasks": running, "error_tasks": errors},
+        "runtime": {
+            "running_tasks": running,
+            "error_tasks": errors,
+            "optional_running_tasks": optional_running,
+            "optional_error_tasks": optional_errors,
+        },
     }
 
 

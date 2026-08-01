@@ -523,6 +523,9 @@ class SyncEngine:
                 result = module_fn(self.db, proxy_url=self.proxy_url)
             elapsed = (self._now() - start_time).total_seconds()
 
+            # Keep the two-argument call shape for integrations that replace
+            # this classifier; it can infer the lane market from task context
+            # when no explicit market is supplied.
             status, error_msg = self._classify_result(name, result)
             if plan and elapsed > plan.max_runtime_seconds and status == "ok":
                 status = "degraded"
@@ -700,17 +703,79 @@ class SyncEngine:
                 return 0
         return 0
 
-    def _target_counts(self, module_name: str) -> dict[str, int]:
+    @staticmethod
+    def _target_market(module_name: str, market: str | None = None) -> str:
+        if market:
+            return str(market)
+        return "HK" if str(module_name).startswith("hk_") else "A"
+
+    def _target_counts(self, module_name: str, market: str | None = None) -> dict[str, int]:
+        """Return cheap target counts used only for result classification.
+
+        ``bars`` and ``index_bars`` are Mongo time-series collections.  On
+        this deployment ``estimated_document_count`` is translated to a
+        bucket COLLSCAN, so calling it after every sync module can keep
+        mongod at several cores for minutes.  The freshness ledger already
+        stores the authoritative count; use that watermark first and treat a
+        missing large-collection watermark as non-empty rather than starting
+        an unbounded scan.  Small collections retain the old fallback.
+        """
         counts = {}
+        market_value = self._target_market(module_name, market)
         for collection in MODULE_TARGETS.get(module_name, ()):
             try:
-                counts[collection] = int(self.db[collection].estimated_document_count())
+                freshness_docs = self.db["data_freshness"].find(
+                    {"collection": collection, "market": market_value},
+                    {"count": 1},
+                )
+                positive_counts = [
+                    int(doc.get("count") or 0)
+                    for doc in freshness_docs
+                    if int(doc.get("count") or 0) > 0
+                ]
+                if positive_counts:
+                    # Shard rows are small; the canonical collection row is
+                    # the largest positive watermark.  Never let a newer
+                    # optional HK ``count=0`` row overwrite A-share bars.
+                    counts[collection] = max(positive_counts)
+                    continue
+            except Exception:
+                pass
+            try:
+                freshness = self.db["data_freshness"].find_one(
+                    {"collection": collection, "market": market_value, "count": {"$gt": 0}},
+                    {"count": 1},
+                    sort=[("updated_at", -1), ("latest_dt", -1)],
+                ) or {}
+                if "count" in freshness:
+                    counts[collection] = max(0, int(freshness.get("count") or 0))
+                    continue
+            except Exception:
+                pass
+            if collection in {"bars", "index_bars"}:
+                # Classification only needs to distinguish an empty target;
+                # do not trade production latency for an exact collection
+                # count when the ledger is absent.
+                counts[collection] = 1
+                continue
+            try:
+                try:
+                    counts[collection] = int(self.db[collection].estimated_document_count(maxTimeMS=250))
+                except TypeError:
+                    # Lightweight test doubles and older PyMongo versions do
+                    # not expose maxTimeMS on estimated_document_count.
+                    counts[collection] = int(self.db[collection].estimated_document_count())
             except Exception:
                 counts[collection] = 0
         return counts
 
-    def _classify_result(self, module_name: str, result: object) -> tuple[str, str | None]:
-        counts = self._target_counts(module_name)
+    def _classify_result(self, module_name: str, result: object, *, market: str | None = None) -> tuple[str, str | None]:
+        if market is None:
+            try:
+                market = get_task_env("SIGNALS_CURRENT_SYNC_MARKET", "") or None
+            except Exception:
+                market = None
+        counts = self._target_counts(module_name, market=market)
         if isinstance(result, dict):
             result_status = str(result.get("status") or "").lower()
             if result.get("backfill_isolated"):
@@ -759,7 +824,7 @@ class SyncEngine:
         now = self._now()
         mode = "realtime" if market or module_name in REALTIME_MODULES else "historical"
         market_value = market or "A"
-        for collection, count in self._target_counts(module_name).items():
+        for collection, count in self._target_counts(module_name, market=market).items():
             domain = COLLECTION_DOMAINS.get(collection, module_name)
             freshness_query = {"domain": domain, "market": market_value, "mode": mode, "collection": collection}
             writer_fields = WRITER_FRESHNESS_FIELDS.get(module_name)
@@ -779,17 +844,31 @@ class SyncEngine:
                 if existing and any(field in existing for field in writer_fields):
                     continue
             latest_dt = None
+            # Read the existing freshness watermark instead of sorting the
+            # time-series collection.  The latter becomes a full bucket scan
+            # for ``bars`` and was the main source of sustained Mongo CPU.
+            latest = {}
             try:
-                latest = self.db[collection].find_one(
-                    {},
-                    {"dt": 1, "latest_dt": 1, "updated_at": 1, "signal_date": 1, "snapshot_at": 1, "freshness": 1, "stale_reason": 1},
-                    sort=[("dt", -1), ("latest_dt", -1), ("signal_date", -1), ("snapshot_at", -1), ("updated_at", -1)],
+                latest = self.db["data_freshness"].find_one(
+                    freshness_query,
+                    {"latest_dt": 1, "updated_at": 1, "freshness": 1, "stale_reason": 1},
+                    sort=[("updated_at", -1)],
                 ) or {}
-                value = latest.get("dt") or latest.get("latest_dt") or latest.get("signal_date") or latest.get("snapshot_at") or latest.get("updated_at")
+                value = latest.get("latest_dt") or latest.get("updated_at")
                 latest_dt = str(value.date()) if hasattr(value, "date") else (str(value)[:10] if value else None)
             except Exception:
-                latest_dt = None
                 latest = {}
+            if not latest and collection not in {"bars", "index_bars"}:
+                try:
+                    latest = self.db[collection].find_one(
+                        {},
+                        {"dt": 1, "latest_dt": 1, "updated_at": 1, "signal_date": 1, "snapshot_at": 1, "freshness": 1, "stale_reason": 1},
+                        sort=[("dt", -1), ("latest_dt", -1), ("signal_date", -1), ("snapshot_at", -1), ("updated_at", -1)],
+                    ) or {}
+                    value = latest.get("dt") or latest.get("latest_dt") or latest.get("signal_date") or latest.get("snapshot_at") or latest.get("updated_at")
+                    latest_dt = str(value.date()) if hasattr(value, "date") else (str(value)[:10] if value else None)
+                except Exception:
+                    latest = {}
             if count <= 0:
                 freshness = "empty"
             elif status == "partial":
@@ -801,9 +880,7 @@ class SyncEngine:
             else:
                 freshness = "fresh"
             stale_reason = error_msg or latest.get("stale_reason") or ""
-            self.db["data_freshness"].update_one(
-                freshness_query,
-                {"$set": {
+            freshness_update = {"$set": {
                     "domain": domain,
                     "market": market_value,
                     "mode": mode,
@@ -814,8 +891,19 @@ class SyncEngine:
                     "as_of": latest_dt,
                     "updated_at": now,
                     "stale_reason": stale_reason,
-                    "count": count,
-                }},
+                }}
+            # A retry, shard result, or late gateway read must not make the
+            # canonical time-series watermark move backwards (the old code
+            # could replace tens of millions of bars with the sentinel 1).
+            # ``$max`` still creates a zero-count row when the ledger is new,
+            # while preserving the largest known count on subsequent writes.
+            if collection in {"bars", "index_bars"}:
+                freshness_update["$max"] = {"count": count}
+            else:
+                freshness_update["$set"]["count"] = count
+            self.db["data_freshness"].update_one(
+                freshness_query,
+                freshness_update,
                 upsert=True,
             )
 

@@ -224,6 +224,46 @@ def get_cache_contracts() -> list[dict]:
 
 def evaluate_contracts(db) -> list[dict]:
     """Attach coarse collection-level readiness to each contract."""
+    def collection_count(collection: str) -> int:
+        # ``bars``/``index_bars`` are time-series collections.  Their
+        # estimated count can degrade into a bucket COLLSCAN, which is far too
+        # expensive for a health/contract read.  The freshness ledger is the
+        # canonical count watermark maintained by the sync engine.
+        try:
+            positive_counts = [
+                int(doc.get("count") or 0)
+                for doc in db["data_freshness"].find(
+                    {"collection": collection},
+                    {"count": 1},
+                )
+                if int(doc.get("count") or 0) > 0
+            ]
+            if positive_counts:
+                return max(positive_counts)
+        except Exception:
+            pass
+        try:
+            freshness = db["data_freshness"].find_one(
+                {"collection": collection, "count": {"$gt": 0}},
+                {"count": 1},
+                sort=[("updated_at", -1), ("latest_dt", -1)],
+            ) or {}
+            if "count" in freshness:
+                return max(0, int(freshness.get("count") or 0))
+        except Exception:
+            pass
+        if collection in {"bars", "index_bars"}:
+            # A missing watermark is unknown, not a reason to scan tens of
+            # millions of buckets on a user-facing endpoint.
+            return 1
+        try:
+            try:
+                return int(db[collection].estimated_document_count(maxTimeMS=250))
+            except TypeError:
+                return int(db[collection].estimated_document_count())
+        except Exception:
+            return 0
+
     items = []
     for contract in CONTRACTS:
         status: ContractStatus = "missing"
@@ -233,14 +273,21 @@ def evaluate_contracts(db) -> list[dict]:
         for collection in contract.fallback_collections:
             try:
                 col = db[collection]
-                collection_count = col.estimated_document_count()
-                if collection_count <= 0:
+                count = collection_count(collection)
+                if count <= 0:
                     continue
-                latest = col.find_one(
-                    {},
-                    {"dt": 1, "updated_at": 1, "as_of": 1, "latest_dt": 1},
-                    sort=[("dt", -1), ("updated_at", -1)],
-                ) or {}
+                if collection in {"bars", "index_bars"}:
+                    latest = db["data_freshness"].find_one(
+                        {"collection": collection},
+                        {"updated_at": 1, "as_of": 1, "latest_dt": 1},
+                        sort=[("updated_at", -1), ("latest_dt", -1)],
+                    ) or {}
+                else:
+                    latest = col.find_one(
+                        {},
+                        {"dt": 1, "updated_at": 1, "as_of": 1, "latest_dt": 1},
+                        sort=[("dt", -1), ("updated_at", -1)],
+                    ) or {}
                 status = "ready"
                 latest_dt = str(
                     latest.get("dt")

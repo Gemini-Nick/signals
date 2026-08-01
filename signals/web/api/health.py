@@ -202,10 +202,19 @@ def cache_health():
         "refresh_requests",
     ]:
         try:
+            freshness_query = {"collection": collection}
+            # ``bars`` and ``index_bars`` are time-series collections.  Their
+            # freshness ledger may contain shard/realtime rows and an older
+            # sentinel row; choose the largest known watermark instead of the
+            # most recently touched row (gateway reads update timestamps).
+            freshness_sort = [("updated_at", -1)]
+            if collection in {"bars", "index_bars"}:
+                freshness_query["count"] = {"$gt": 0}
+                freshness_sort = [("count", -1), ("updated_at", -1)]
             freshness = db["data_freshness"].find_one(
-                {"collection": collection},
+                freshness_query,
                 {"_id": 0, "count": 1, "freshness": 1, "stale_reason": 1, "latest_dt": 1, "updated_at": 1},
-                sort=[("updated_at", -1)],
+                sort=freshness_sort,
             ) or {}
             items.append({
                 "collection": collection,

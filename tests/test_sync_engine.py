@@ -77,7 +77,14 @@ class _FakeCollection:
             return self.docs.get(query["_id"])
         if self.docs and isinstance(query, dict):
             for doc in self.docs.values():
-                if all(doc.get(key) == value for key, value in query.items()):
+                matches = True
+                for key, value in query.items():
+                    actual = doc.get(key)
+                    if isinstance(value, dict) and "$gt" in value:
+                        matches = matches and actual is not None and actual > value["$gt"]
+                    else:
+                        matches = matches and actual == value
+                if matches:
                     return doc
         return self.doc
 
@@ -101,6 +108,11 @@ class _FakeDb(dict):
         return self[key]
 
 
+class _NoEstimateCollection(_FakeCollection):
+    def estimated_document_count(self, *args, **kwargs):
+        raise AssertionError("large time-series count must come from data_freshness")
+
+
 def test_zero_insert_empty_target_is_degraded():
     engine = object.__new__(SyncEngine)
     engine.db = _FakeDb({"quote_snapshots": _FakeCollection(count=0)})
@@ -109,6 +121,18 @@ def test_zero_insert_empty_target_is_degraded():
 
     assert status == "degraded"
     assert error == "target_empty_after_zero_insert"
+
+
+def test_large_timeseries_target_count_uses_freshness_watermark():
+    freshness = _FakeCollection()
+    freshness.docs["bars"] = {"collection": "bars", "market": "A", "count": 123456}
+    engine = object.__new__(SyncEngine)
+    engine.db = _FakeDb({
+        "data_freshness": freshness,
+        "bars": _NoEstimateCollection(),
+    })
+
+    assert engine._target_counts("stock_daily") == {"bars": 123456}
 
 
 def test_isolated_backfill_is_partial_with_explicit_reason():

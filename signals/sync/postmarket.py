@@ -2245,9 +2245,24 @@ class PostmarketRunner:
             return 0
         cap = min(200, _env_int("SIGNALS_POSTMARKET_HK_DAILY_BATCH_CODES", 24, minimum=1))
         workers = min(4, _env_int("SIGNALS_POSTMARKET_HK_STOCK_DAILY_WORKERS", 2, minimum=1))
+        # One cooldown window is one bounded wave.  Do not submit every
+        # retryable shard at once: each shard can contain provider-bound
+        # requests, so queueing all eight shards made a single continuation
+        # run for many minutes and looked like a stuck postmarket daemon.
+        specs = specs[:workers]
 
         def run_one(spec: PostmarketTaskSpec) -> dict[str, Any]:
-            with self._with_env({"HK_STOCK_DAILY_MAX_CODES": str(cap)}):
+            # The bounded continuation is deliberately a fast, low-priority
+            # rotation.  Tencent has an explicit request deadline; the
+            # AKShare/Sina and hist fallbacks can enter an embedded JS runtime
+            # without a reliable deadline and otherwise keep the daemon in a
+            # running state for hours when a symbol is unsupported.  The full
+            # optional lane can still use the fallback chain when explicitly
+            # resumed outside this continuation path.
+            with self._with_env({
+                "HK_STOCK_DAILY_MAX_CODES": str(cap),
+                "HK_STOCK_DAILY_HISTORY_SOURCES": "tencent",
+            }):
                 return self._run_task(run_id, spec)
 
         completed = 0

@@ -103,9 +103,11 @@ sample size, and out-of-sample calibration metric are present; otherwise use ord
 
 For event-driven cadence, maintain a rolling hypothesis ledger rather than a fixed story: recent A-share structure,
 historical prior, official event calendar, market expectation, actual new information, and current hypothesis state.
-For a “two legs” setup such as North American technology earnings followed by an FOMC decision, the first node tests
-the earnings slope and the second tests the discount-rate response. Do not draw a future second bottom as fact; change
-the next observation only after the market response updates the hypothesis.
+Only when an explicit event ledger supplies a stable `case_id`, `event_id`, object, expectation source, and overlap
+window should an event sequence enter the replay. The generic engine does not load a named pattern or assume a second
+leg. Each event node must separately test its new information, first response, and A-share path; if the nodes overlap,
+describe window pricing without assigning causality. Do not draw a future second turning point as fact; change the next
+observation only after the market response updates the hypothesis.
 
 Minute data supports timing only when it is available up to the requested cutoff. Missing optional detail should shorten the report, not create a reader-facing system explanation.
 
@@ -155,6 +157,7 @@ Both versions answer the same five questions. The short version uses inline bold
 - Format every item as `走强：…；仍弱：…`. Do not use confirmation, invalidation, or downgrade process language.
 - Stop output immediately after the third numbered item. Never append a parenthetical format check, skill summary, or save-status sentence.
 - Return only the report body. Do not append source, replay, save-status, file-path, or “no files changed” notes.
+- Lane isolation: the reader-facing Signals body must not mention WorkBuddy, Tencent-watchlist conclusions, or another lane's close verdict. It should only state the time-stamped path, elasticity, breadth/ecology and the next observable condition that Signals itself can support. If those nodes are missing, shorten the body instead of explaining the cross-source boundary to the reader.
 
 ### Long Version
 
@@ -191,6 +194,10 @@ Both versions answer the same five questions. The short version uses inline bold
   complete OHLCV, frequency, timezone, adjustment method, session status, and missing-data state.
 
 ### Language
+
+### Content reasoning slots
+
+Keep one reader-facing chain: path fact → withdrawing side and receiving side → stage → next observable. A repeated node must add a new spread, breadth, capacity or failure signal; do not fill the long version by replaying the same ranking. Without comparable timed nodes, write a relative-strength candidate rather than “funds moved in”, “new positions opened”, or a completed handoff. Event names are allowed only after the event ledger has the fact, expectation gap, first response and A-share path; otherwise keep the event in the background ledger.
 
 Write market behavior directly:
 
