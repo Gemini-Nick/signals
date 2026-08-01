@@ -16,7 +16,7 @@ import pandas as pd
 from pymongo import UpdateOne
 from pymongo.database import Database
 
-from signals.core.macro_universe import macro_a_index_codes
+from signals.core.macro_universe import macro_a_index_codes, supports_a_index_minute_cache
 from signals.core.market_time import naive_market_now, to_market_naive
 from ..proxy import em_proxy
 from ..retry import sync_retry
@@ -216,7 +216,35 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
     period_map = {"5分钟": "5", "15分钟": "15", "30分钟": "30"}
     tail_counts = {freq: _tail_count_for_freq(freq) for freq in period_map}
     workers = _worker_count()
-    tasks = [(name, symbol, freq, period) for name, symbol in ak_codes.items() for freq, period in period_map.items()]
+    unsupported = [
+        {"name": name, "symbol": symbol}
+        for name, symbol in ak_codes.items()
+        if not supports_a_index_minute_cache(symbol)
+    ]
+    for item in unsupported:
+        for freq in period_map:
+            sync_col.update_one(
+                {"_id": f"index_minute:{item['symbol']}:{freq}"},
+                {"$set": {
+                    "module": "index_minute",
+                    "symbol": item["symbol"],
+                    "freq": freq,
+                    "status": "unsupported",
+                    "unsupported": True,
+                    "unsupported_reason": "no_stable_public_minute_source",
+                    "last_run": naive_market_now("A"),
+                    "incremental": True,
+                    "write_mode": "upsert_tail",
+                    "providers": list(_minute_providers()),
+                }},
+                upsert=True,
+            )
+    tasks = [
+        (name, symbol, freq, period)
+        for name, symbol in ak_codes.items()
+        if supports_a_index_minute_cache(symbol)
+        for freq, period in period_map.items()
+    ]
 
     def sync_one(name: str, symbol: str, freq: str, period: str) -> dict:
         started = time.monotonic()
@@ -318,6 +346,8 @@ def _sync_a_index_minute(db: Database, ak_codes: dict,
         "incremental": True,
         "write_mode": "upsert_tail",
         "providers": list(_minute_providers()),
+        "unsupported": unsupported,
+        "unsupported_calls": len(unsupported) * len(period_map),
     }
 
 
@@ -350,6 +380,8 @@ def sync_index_minute(db: Database, proxy_url: str = None) -> dict:
             "degraded_reason": "" if status == "ok" else "empty_or_failed_index_minute_calls",
             "write_mode": "upsert_tail",
             "providers": list(_minute_providers()),
+            "unsupported": result.get("unsupported", []),
+            "unsupported_calls": result.get("unsupported_calls", 0),
         }},
         upsert=True,
     )

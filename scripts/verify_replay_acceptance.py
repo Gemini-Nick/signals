@@ -30,6 +30,132 @@ def _distinct(collection: Any, field: str, query: dict[str, Any]) -> list[str]:
     return sorted({str(value) for value in values if str(value or "").strip()})
 
 
+def _canonical_a_code(value: Any) -> str:
+    raw = str(value or "").strip().upper().replace(".", "")
+    for prefix in ("SH", "SZ", "BJ"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+    return raw if len(raw) == 6 and raw.isdigit() else ""
+
+
+def _strict_fullmarket_codes(db: Any, trade_date: str) -> set[str]:
+    """Return the dated, non-ETF A-share quote universe used by minute scans."""
+    date_key = str(trade_date or "").replace("-", "")[:8]
+    try:
+        from signals.sync.modules.stock_minute import _explicit_index_symbol, _index_codes, _pure_a_code
+
+        index_codes = _index_codes()
+    except Exception:
+        _explicit_index_symbol = lambda symbol, _codes: str(symbol or "").upper().startswith(("SH.000", "SZ.399"))
+        _pure_a_code = _canonical_a_code
+        index_codes = set()
+    query = {
+        "date_key": date_key,
+        "code": {"$regex": r"^\d{6}$"},
+        "price": {"$gt": 0},
+        "open": {"$gt": 0},
+        "high": {"$gt": 0},
+        "low": {"$gt": 0},
+        "prev_close": {"$gt": 0},
+    }
+    codes: set[str] = set()
+    try:
+        rows = db["fullmarket_spot_snapshots"].find(
+            query,
+            {"code": 1, "symbol": 1, "asset_class": 1, "security_type": 1},
+        )
+        for row in rows:
+            if str(row.get("asset_class") or row.get("security_type") or "").lower() == "etf":
+                continue
+            raw_symbol = row.get("symbol") or row.get("code")
+            code = _pure_a_code(row.get("code") or raw_symbol)
+            if not code or _explicit_index_symbol(raw_symbol, index_codes) or code.startswith(("200", "900")):
+                continue
+            codes.add(code)
+    except Exception:
+        return set()
+    return codes
+
+
+def _minute_channel(db: Any, trade_date: str) -> dict[str, Any]:
+    codes = _strict_fullmarket_codes(db, trade_date)
+    if not codes:
+        return {"expected_symbols": 0, "frequencies": {}, "status": "partial"}
+    try:
+        bars = db["bars"]
+    except (KeyError, TypeError):
+        return {"expected_symbols": len(codes), "frequencies": {}, "status": "partial"}
+    try:
+        from datetime import datetime, timedelta
+
+        start = datetime.strptime(str(trade_date)[:10], "%Y-%m-%d")
+        end = start + timedelta(days=1)
+    except ValueError:
+        return {"expected_symbols": len(codes), "frequencies": {}, "status": "invalid_trade_date"}
+    frequencies: dict[str, Any] = {}
+    for freq in ("5分钟", "15分钟", "30分钟"):
+        query = {
+            "meta.freq": freq,
+            "dt": {"$gte": start, "$lt": end},
+            "meta.symbol": {"$in": sorted(codes)},
+        }
+        raw_symbols = _distinct(bars, "meta.symbol", query)
+        covered = {_canonical_a_code(symbol) for symbol in raw_symbols}
+        covered.discard("")
+        frequencies[freq] = {
+            "expected": len(codes),
+            "covered": len(covered & codes),
+            "missing": max(0, len(codes) - len(covered & codes)),
+            "coverage_pct": round(len(covered & codes) / len(codes) * 100, 2) if codes else 0.0,
+        }
+    return {
+        "expected_symbols": len(codes),
+        "frequencies": frequencies,
+        "status": "ok" if codes and all(item["missing"] == 0 for item in frequencies.values()) else "partial",
+    }
+
+
+def _channel_acceptance(db: Any, trade_date: str) -> dict[str, Any]:
+    minute = _minute_channel(db, trade_date)
+    try:
+        sync_log = db["sync_log"]
+    except (KeyError, TypeError):
+        sync_log = None
+    try:
+        sync_tasks = db["sync_tasks"]
+    except (KeyError, TypeError):
+        sync_tasks = None
+    quote = sync_log.find_one({"_id": "quote_snapshots:A:_meta"}, {"_id": 0, "status": 1, "result": 1}) if sync_log is not None else {}
+    readiness = sync_log.find_one({"_id": "minute_readiness_probe:A:_meta"}, {"_id": 0, "status": 1, "result": 1}) if sync_log is not None else {}
+    index = sync_log.find_one({"_id": "index_minute:A:_meta"}, {"_id": 0, "status": 1, "result": 1, "unsupported_calls": 1}) if sync_log is not None else {}
+    daily = sync_log.find_one({"_id": "stock_daily:progress:_meta"}, {"_id": 0, "status": 1, "quality": 1, "coverage_pct": 1, "covered_codes": 1, "expected_codes": 1}) if sync_log is not None else {}
+    quote = quote or {}
+    readiness = readiness or {}
+    index = index or {}
+    daily = daily or {}
+    running = _count(sync_tasks, {"status": "running"}) if sync_tasks is not None else 0
+    errors = _count(sync_tasks, {"status": "error"}) if sync_tasks is not None else 0
+    checks = {
+        "fullmarket_minute_complete": minute.get("status") == "ok",
+        "quote_channel_ok": quote.get("status") == "ok" and int((quote.get("result") or {}).get("errors") or 0) == 0,
+        "minute_readiness_ok": readiness.get("status") == "ok" and int((readiness.get("result") or {}).get("not_ready") or 0) == 0,
+        "index_minute_accounted": index.get("status") == "ok",
+        "daily_progress_final_close": daily.get("status") == "ok" and daily.get("quality") == "final_close" and float(daily.get("coverage_pct") or 0) >= 100.0,
+        "no_running_tasks": running == 0,
+        "no_error_tasks": errors == 0,
+    }
+    return {
+        "status": "PASS" if all(checks.values()) else "NOT_READY",
+        "checks": checks,
+        "minute": minute,
+        "quote": quote,
+        "minute_readiness": readiness,
+        "index_minute": {"status": index.get("status"), "unsupported_calls": index.get("unsupported_calls") or (index.get("result") or {}).get("unsupported_calls", 0)},
+        "daily_progress": daily,
+        "runtime": {"running_tasks": running, "error_tasks": errors},
+    }
+
+
 def audit(db: Any, trade_date: str) -> dict[str, Any]:
     from signals.replay.market_replay import build_market_replay_readiness
 
@@ -69,6 +195,7 @@ def audit(db: Any, trade_date: str) -> dict[str, Any]:
         "status": "PASS" if all(checks.values()) else "NOT_READY",
         "trade_date": trade_date,
         "checks": checks,
+        "channel_acceptance": _channel_acceptance(db, trade_date),
         "readiness": readiness,
         "immutable_snapshot": {"count": immutable_count, "run_ids": immutable_run_ids},
         "backfill_snapshot": {
@@ -84,6 +211,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trade-date", required=True)
     parser.add_argument("--output")
+    parser.add_argument(
+        "--channels-only",
+        action="store_true",
+        help="验收 Mongo/盘中/盘后数据通道，不要求历史正式复盘快照门槛",
+    )
     args = parser.parse_args()
     try:
         from signals.sync.db import get_db
@@ -103,7 +235,11 @@ def main() -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(rendered, encoding="utf-8")
     print(rendered, end="")
-    raise SystemExit(0 if result["status"] == "PASS" else 2)
+    if args.channels_only:
+        exit_status = 0 if result.get("channel_acceptance", {}).get("status") == "PASS" else 2
+    else:
+        exit_status = 0 if result["status"] == "PASS" else 2
+    raise SystemExit(exit_status)
 
 
 if __name__ == "__main__":

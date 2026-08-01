@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from signals.sync.modules.quote_snapshots import (
     _a_quote_symbols,
     _hot_quote_symbols,
+    _realtime_quote_symbols,
     _quote_doc_from_em,
     _quote_doc_from_ulist_row,
     _read_current_quote_snapshot_docs,
@@ -35,6 +36,18 @@ def test_a_quote_symbols_canonicalizes_wrong_exchange_prefixes():
     symbols = ["SZ.588170", "SH.588170", "SH.000300", "SZ.399001"]
 
     assert _a_quote_symbols(symbols) == ["SH.588170", "SH.000300", "SZ.399001"]
+
+
+def test_realtime_quote_symbols_leave_index_codes_to_index_lane(monkeypatch):
+    from signals.sync.modules import quote_snapshots
+
+    monkeypatch.setattr(
+        quote_snapshots,
+        "_hot_quote_symbols",
+        lambda _db: ["SH.600000", "SH.000300", "SH.932038", "SZ.399001", "SZ.159915"],
+    )
+
+    assert _realtime_quote_symbols(object()) == ["SH.600000", "SZ.159915"]
 
 
 def test_quote_doc_from_eastmoney_payload_scales_fields():

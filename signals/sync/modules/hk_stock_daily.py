@@ -96,6 +96,24 @@ def _apply_code_shard(codes: list[str]) -> tuple[list[str], dict[str, int | str]
     return shard_codes, {"shard_key": key, "shard_index": index, "shard_count": count, "global_total": len(codes)}
 
 
+def _select_hk_due_codes(
+    codes: list[str],
+    sync_docs: dict[str, Any],
+    short_history_codes: set[str],
+    end_date: str,
+    max_codes: int,
+) -> tuple[list[str], int]:
+    """Select a bounded due batch without starving the universe tail."""
+    if max_codes <= 0:
+        return list(codes), 0
+    due_codes: list[str] = []
+    for code in codes:
+        last_dt = _coerce_last_dt(sync_docs.get(_hk_symbol(code)))
+        if code in short_history_codes or last_dt is None or last_dt.strftime("%Y%m%d") < end_date:
+            due_codes.append(code)
+    return due_codes[:max_codes], max(0, len(due_codes) - max_codes)
+
+
 def _hk_daily_end_date_key(now: datetime | None = None) -> str:
     local = now or naive_market_now("HK")
     try:
@@ -387,7 +405,13 @@ def _hk_history_sources() -> list[str]:
     if single:
         raw = single
     if not raw or str(raw).strip().lower() == "auto":
-        raw = "daily,tencent,hist"
+        # Tencent is a direct HTTP endpoint with an explicit timeout.  The
+        # AKShare/Sina path uses an embedded JS runtime and has no reliable
+        # request deadline; putting it first can leave a whole optional
+        # postmarket shard in ``running`` while its progress is already
+        # stale.  Keep the slower providers as fallbacks for symbols Tencent
+        # does not cover.
+        raw = "tencent,daily,hist"
     sources: list[str] = []
     seen: set[str] = set()
     aliases = {
@@ -663,6 +687,7 @@ def _write_progress(
     deferred_count: int = 0,
     latest_symbol: str = "",
     latest_status: str = "",
+    remaining_count: int = 0,
 ) -> None:
     now = naive_market_now("HK")
     coverage_pct = round((processed / total * 100), 2) if total else 0.0
@@ -681,6 +706,7 @@ def _write_progress(
             "skipped": skipped,
             "errors": errors_count,
             "deferred": deferred_count,
+            "remaining": remaining_count,
             "latest_symbol": latest_symbol,
             "latest_status": latest_status,
             "coverage_pct": coverage_pct,
@@ -703,10 +729,8 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
     end_date = _hk_daily_end_date_key(now)
     only_codes = _parse_only_hk_codes(get_task_env("HK_STOCK_DAILY_ONLY_CODES", os.getenv("HK_STOCK_DAILY_ONLY_CODES", "")))
     all_codes = only_codes if only_codes else _get_all_hk_codes(db)
-    max_codes = _env_int("HK_STOCK_DAILY_MAX_CODES", 0)
-    if max_codes > 0:
-        all_codes = all_codes[:max_codes]
     codes, shard_meta = _apply_code_shard(all_codes)
+    shard_total = len(codes)
     shard_key = str(shard_meta["shard_key"])
     shard_index = int(shard_meta["shard_index"])
     shard_count = int(shard_meta["shard_count"])
@@ -747,13 +771,24 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
         if _coerce_last_dt(bars_earliest.get(_hk_symbol(code))) is None
         or _coerce_last_dt(bars_earliest.get(_hk_symbol(code))) > history_cutoff
     }
+    # Apply the batch cap after identifying due symbols. Truncating the
+    # universe before this point starves the later codes forever because every
+    # retry keeps seeing the same already-fresh prefix.
+    max_codes = _env_int("HK_STOCK_DAILY_MAX_CODES", 0)
+    codes, remaining_due = _select_hk_due_codes(
+        codes,
+        sync_docs,
+        short_history_codes,
+        end_date,
+        max_codes,
+    )
     pending_docs: dict[str, list[dict[str, Any]]] = {}
 
     _write_progress(
         sync_col,
         status="running",
         scope=scope,
-        total=len(codes),
+        total=shard_total,
         processed=0,
         inserted=0,
         skipped=0,
@@ -819,12 +854,12 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
             finally:
                 processed_count += 1
                 if processed_count % progress_interval == 0 or processed_count == len(codes):
-                    final_partial = bool(errors or deferred)
+                    final_partial = bool(errors or deferred or remaining_due)
                     _write_progress(
                         sync_col,
                         status="running" if processed_count < len(codes) else ("partial" if final_partial else "ok"),
                         scope=scope,
-                        total=len(codes),
+                        total=shard_total,
                         processed=processed_count,
                         inserted=total_inserted,
                         skipped=total_skipped,
@@ -837,16 +872,17 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
                         shard_index=shard_index,
                         shard_count=shard_count,
                         global_total=global_total,
+                        remaining_count=remaining_due,
                     )
 
     total_inserted += _flush_pending()
-    final_status = "partial" if errors or deferred else "ok"
-    coverage_pct = round((processed_count / len(codes) * 100), 2) if codes else 0.0
+    final_status = "partial" if errors or deferred or remaining_due else "ok"
+    coverage_pct = round((processed_count / shard_total * 100), 2) if shard_total else 0.0
     _write_progress(
         sync_col,
         status=final_status,
         scope=scope,
-        total=len(codes),
+        total=shard_total,
         processed=processed_count,
         inserted=total_inserted,
         skipped=total_skipped,
@@ -857,6 +893,7 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
         shard_index=shard_index,
         shard_count=shard_count,
         global_total=global_total,
+        remaining_count=remaining_due,
     )
     db["data_freshness"].update_one(
         {"domain": "kline", "market": "HK", "mode": "historical", "collection": "bars", "freq": DAILY_FREQ},
@@ -867,7 +904,7 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
             "lane": "workbench_lane",
             "collection": "bars",
             "freq": DAILY_FREQ,
-            "freshness": "fresh" if total_inserted or total_skipped else "empty",
+            "freshness": "fresh" if total_inserted or total_skipped or (shard_total and not remaining_due) else "empty",
             "latest_dt": now.date().isoformat(),
             "as_of": now.date().isoformat(),
             "updated_at": now,
@@ -883,7 +920,9 @@ def sync_hk_stock_daily(db: Database, proxy_url: str = None) -> dict:
         "inserted": total_inserted,
         "symbols": processed_count,
         "processed": processed_count,
-        "total": len(codes),
+        "total": shard_total,
+        "selected_codes": len(codes),
+        "remaining_due": remaining_due,
         "skipped": total_skipped,
         "errors": len(errors),
         "deferred": len(deferred),

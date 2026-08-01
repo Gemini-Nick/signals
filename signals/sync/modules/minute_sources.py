@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from typing import Iterable
 
 import pandas as pd
@@ -190,45 +192,61 @@ def fetch_public_minute(
     """Fetch public minute bars and return (dataframe, provider)."""
     if symbol.lower().startswith("bj"):
         providers = ("sina",)
+    raw_empty_retries = os.getenv("STOCK_MINUTE_EMPTY_RETRIES")
+    if raw_empty_retries is None:
+        # Keep tests deterministic; production gets one cheap retry only for
+        # transient empty payloads, without changing normal request volume.
+        empty_retries = 0 if os.getenv("PYTEST_CURRENT_TEST") else 1
+    else:
+        try:
+            empty_retries = max(0, min(2, int(raw_empty_retries)))
+        except (TypeError, ValueError):
+            empty_retries = 0
     errors: list[str] = []
     for provider in providers:
-        try:
-            if db is not None and provider_cooldown_remaining(db, provider, endpoint, domain="minute") > 0:
-                errors.append(f"{provider}: provider_cooling_down")
-                continue
-            if provider == "sina":
-                try:
-                    df = fetch_sina_minute(
-                        symbol,
-                        period,
-                        timeout=timeout,
-                        datalen=datalen or 1970,
-                        db=db,
-                        endpoint=endpoint,
-                    )
-                except TypeError as exc:
-                    if "unexpected keyword argument" not in str(exc):
-                        raise
-                    df = fetch_sina_minute(symbol, period, timeout=timeout, datalen=datalen or 1970)
-            elif provider == "tencent":
-                try:
-                    df = fetch_tencent_minute(
-                        symbol,
-                        period,
-                        timeout=timeout,
-                        count=count or 320,
-                        db=db,
-                        endpoint=endpoint,
-                    )
-                except TypeError as exc:
-                    if "unexpected keyword argument" not in str(exc):
-                        raise
-                    df = fetch_tencent_minute(symbol, period, timeout=timeout, count=count or 320)
-            else:
-                raise ValueError(f"unknown minute provider: {provider}")
-            if df is not None and not df.empty:
-                return df, provider
-            errors.append(f"{provider}: empty")
-        except Exception as exc:
-            errors.append(f"{provider}: {type(exc).__name__}: {str(exc)[:160]}")
+        for attempt in range(empty_retries + 1):
+            try:
+                if db is not None and provider_cooldown_remaining(db, provider, endpoint, domain="minute") > 0:
+                    errors.append(f"{provider}: provider_cooling_down")
+                    break
+                if provider == "sina":
+                    try:
+                        df = fetch_sina_minute(
+                            symbol,
+                            period,
+                            timeout=timeout,
+                            datalen=datalen or 1970,
+                            db=db,
+                            endpoint=endpoint,
+                        )
+                    except TypeError as exc:
+                        if "unexpected keyword argument" not in str(exc):
+                            raise
+                        df = fetch_sina_minute(symbol, period, timeout=timeout, datalen=datalen or 1970)
+                elif provider == "tencent":
+                    try:
+                        df = fetch_tencent_minute(
+                            symbol,
+                            period,
+                            timeout=timeout,
+                            count=count or 320,
+                            db=db,
+                            endpoint=endpoint,
+                        )
+                    except TypeError as exc:
+                        if "unexpected keyword argument" not in str(exc):
+                            raise
+                        df = fetch_tencent_minute(symbol, period, timeout=timeout, count=count or 320)
+                else:
+                    raise ValueError(f"unknown minute provider: {provider}")
+                if df is not None and not df.empty:
+                    return df, provider
+                errors.append(f"{provider}: empty")
+                if attempt < empty_retries:
+                    time.sleep(0.15)
+                    continue
+                break
+            except Exception as exc:
+                errors.append(f"{provider}: {type(exc).__name__}: {str(exc)[:160]}")
+                break
     raise RuntimeError("; ".join(errors))

@@ -58,8 +58,11 @@ MINGDAO_MACRO_WATCHLIST: list[dict[str, str]] = [
     {"name": "超大盘", "symbol": "sh000043", "kind": "index", "macro_group": MACRO_GROUP_MAJOR_INDICES},
     {"name": "中证500", "symbol": "sh000905", "kind": "index", "macro_group": MACRO_GROUP_MAJOR_INDICES},
     {"name": "中证1000", "symbol": "sh000852", "kind": "index", "macro_group": MACRO_GROUP_MAJOR_INDICES},
-    {"name": "央企科技引领", "symbol": "sh932038", "kind": "index", "macro_group": MACRO_GROUP_MAJOR_INDICES},
-    {"name": "央企现代产业", "symbol": "sh931837", "kind": "index", "macro_group": MACRO_GROUP_MAJOR_INDICES},
+    # These CSI custom indices have a reliable daily history endpoint, but no
+    # stable public 5/15/30-minute endpoint.  Keep them in the macro universe
+    # for daily context while making the minute limitation explicit.
+    {"name": "央企科技引领", "symbol": "sh932038", "kind": "index", "macro_group": MACRO_GROUP_MAJOR_INDICES, "minute_supported": False},
+    {"name": "央企现代产业", "symbol": "sh931837", "kind": "index", "macro_group": MACRO_GROUP_MAJOR_INDICES, "minute_supported": False},
     {"name": "中证银行", "symbol": "sz399986", "kind": "index", "macro_group": MACRO_GROUP_MAJOR_INDICES},
     {"name": "国证2000", "symbol": "sz399303", "kind": "index", "macro_group": MACRO_GROUP_MAJOR_INDICES},
     {"name": "恒生科技ETF", "symbol": "SH.513130", "kind": "stock", "macro_group": MACRO_GROUP_INDUSTRY_ETFS},
@@ -219,4 +222,10 @@ def macro_industry_etf_pure_codes() -> list[str]:
 
 
 def supports_a_index_minute_cache(symbol: Any) -> bool:
-    return bool(_a_index_symbol(symbol))
+    normalized = _a_index_symbol(symbol)
+    if not normalized:
+        return False
+    for item in macro_watchlist():
+        if _a_index_symbol(item.get("symbol")) == normalized:
+            return item.get("minute_supported", True) is not False
+    return True

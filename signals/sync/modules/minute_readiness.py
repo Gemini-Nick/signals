@@ -9,7 +9,7 @@ from typing import Any
 from pymongo import UpdateOne
 from pymongo.database import Database
 
-from signals.core.macro_universe import macro_a_index_symbols
+from signals.core.macro_universe import macro_a_index_symbols, supports_a_index_minute_cache
 from signals.core.market_time import naive_market_now
 from signals.sync.task_context import get_task_env
 
@@ -158,6 +158,21 @@ def _probe_symbol_domain(
     rows: list[dict[str, Any]] = []
     active_freqs = freqs or MINUTE_FREQS
     for symbol in symbols:
+        if domain == "index" and not supports_a_index_minute_cache(symbol):
+            for freq in active_freqs:
+                rows.append({
+                    "domain": domain,
+                    "symbol": symbol,
+                    "freq": freq,
+                    "count": 0,
+                    "latest_dt": None,
+                    "source": "",
+                    "status": "unsupported",
+                    "root_cause_class": "index_minute_unsupported",
+                    "checked_at": now,
+                    "trade_date": now.date().isoformat(),
+                })
+            continue
         for freq in active_freqs:
             count, latest_dt, source = _latest_bar(db, collection, symbol, freq)
             rows.append({
@@ -235,7 +250,8 @@ def sync_minute_readiness_probe(db: Database, proxy_url: str = None) -> dict:
         for row in rows
     ]
     db["minute_readiness"].bulk_write(ops, ordered=False)
-    not_ready = sum(1 for row in rows if row["status"] != "ready")
+    not_ready = sum(1 for row in rows if row["status"] == "not_ready")
+    unsupported = sum(1 for row in rows if row["status"] == "unsupported")
     db["data_freshness"].update_one(
         {"domain": "readiness", "market": "A", "mode": "realtime", "collection": "minute_readiness"},
         {"$set": {
@@ -251,6 +267,7 @@ def sync_minute_readiness_probe(db: Database, proxy_url: str = None) -> dict:
             "stale_reason": "" if not_ready == 0 else "minute_cache_not_ready",
             "count": len(rows),
             "not_ready": not_ready,
+            "unsupported": unsupported,
         }},
         upsert=True,
     )
@@ -259,5 +276,6 @@ def sync_minute_readiness_probe(db: Database, proxy_url: str = None) -> dict:
         "status": "ok" if not_ready == 0 else "partial",
         "checked": len(rows),
         "not_ready": not_ready,
+        "unsupported": unsupported,
         "inserted": len(rows),
     }

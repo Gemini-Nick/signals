@@ -452,6 +452,106 @@ def _add_postmarket_expanded_candidates(
         logger.debug("postmarket chain minute candidates skipped: %s", exc)
 
 
+def _add_postmarket_fullmarket_candidates(
+    db: Database,
+    symbols: list[str],
+    source_counts: dict[str, int],
+    priority_symbols: set[str],
+    pinned_symbols: set[str],
+    index_codes: set[str],
+    symbol_sources: dict[str, set[str]] | None = None,
+) -> None:
+    """Seed rotation with the current full-market quote universe.
+
+    The postmarket minute lane is deliberately bounded per pass, but its
+    candidate universe must not be bounded by the terminal pool.  Otherwise
+    an ordinary A-share can never enter the 5/15-minute rotation unless it
+    first becomes a signal candidate.  ``fullmarket_spot_snapshots`` is the
+    canonical, date-keyed universe already used by the 30-minute full-market
+    lane, so reusing it adds breadth without another provider call.
+    """
+    limit = _int_env(
+        "STOCK_MINUTE_POSTMARKET_FULLMARKET_LIMIT",
+        6000,
+        min_value=1,
+        max_value=10000,
+    )
+    trade_date = _minute_trade_date()
+    date_key = trade_date.replace("-", "")
+    try:
+        freshness = db["data_freshness"].find_one(
+            {"domain": "spot", "market": "A", "as_of": trade_date},
+            {"freshness": 1, "stale_reason": 1},
+            sort=[("updated_at", -1)],
+        ) or {}
+        freshness_state = str(freshness.get("freshness") or "").lower()
+        stale_reason = str(freshness.get("stale_reason") or "").lower()
+        if freshness_state and not (
+            freshness_state == "fresh"
+            or stale_reason == "non_trading_day_no_live_refresh"
+        ):
+            logger.warning(
+                "postmarket full-market minute seed skipped: spot freshness=%s reason=%s",
+                freshness_state,
+                stale_reason,
+            )
+            return
+        cursor = db["fullmarket_spot_snapshots"].find(
+            {"date_key": date_key, "trade_date": trade_date},
+            {
+                "code": 1,
+                "symbol": 1,
+                "asset_class": 1,
+                "price": 1,
+                "latest": 1,
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "prev_close": 1,
+            },
+        )
+        added = 0
+        for row in cursor:
+            if added >= limit:
+                break
+            if str(row.get("asset_class") or "").lower() == "etf":
+                continue
+            raw_symbol = row.get("symbol") or row.get("code")
+            code = _pure_a_code(row.get("code") or raw_symbol)
+            if not code or _explicit_index_symbol(raw_symbol, index_codes):
+                continue
+            # Keep A shares (including BJ/STAR/ChiNext) and exclude the
+            # Shanghai/Shenzhen B-share code ranges from the A-share lane.
+            if code.startswith(("200", "900")):
+                continue
+            try:
+                values = [
+                    float(row.get(field))
+                    for field in ("price", "open", "high", "low", "prev_close")
+                ]
+            except (TypeError, ValueError):
+                continue
+            if not all(value > 0 for value in values):
+                continue
+            before = len(symbols)
+            _add_candidate(
+                symbols,
+                source_counts,
+                priority_symbols,
+                pinned_symbols,
+                index_codes,
+                code,
+                "fullmarket_active_universe",
+                priority=False,
+                pinned=False,
+                symbol_sources=symbol_sources,
+            )
+            if len(symbols) > before:
+                added += 1
+    except Exception as exc:
+        logger.debug("postmarket full-market minute candidates skipped: %s", exc)
+
+
 def _select_symbols_with_priority(
     ordered: list[str],
     priority: set[str],
@@ -534,7 +634,7 @@ def _minute_universe_statuses(db: Database, symbols: list[str], trade_date: str)
     try:
         cursor = db["minute_preheat_universe"].find(
             {"trade_date": trade_date, "symbol": {"$in": symbols}},
-            {"symbol": 1, "status": 1, "updated_at": 1, "cached_at": 1, "last_attempt_at": 1},
+            {"symbol": 1, "status": 1, "freq_status": 1, "updated_at": 1, "cached_at": 1, "last_attempt_at": 1},
         )
     except Exception:
         return {}
@@ -544,6 +644,102 @@ def _minute_universe_statuses(db: Database, symbols: list[str], trade_date: str)
         if code:
             result[code] = dict(doc)
     return result
+
+
+def _reconcile_minute_universe_coverage(
+    db: Database,
+    symbols: list[str],
+    universe_states: dict[str, dict],
+    freqs: list[str],
+) -> set[str]:
+    """Downgrade false cache hits whose latest bars miss the active trade date.
+
+    The postmarket rotation runs on weekends and holidays.  A successful
+    provider response can still contain an older rolling window, so the
+    provider status alone is not proof that the current close is present.
+    Keep the check bounded to the selected full-market universe and only
+    rewrite rows that are not currently owned by a live child.
+    """
+    if not symbols or not freqs:
+        return set()
+    trade_date = _minute_trade_date()
+    try:
+        start = datetime.fromisoformat(trade_date)
+    except ValueError:
+        return set()
+    end = start + timedelta(days=1)
+    expected = _expected_latest_dt_by_freq(freqs)
+    missing_by_freq: dict[str, set[str]] = {freq: set() for freq in freqs}
+    try:
+        for freq in freqs:
+            rows = db["bars"].aggregate([
+                {"$match": {
+                    "meta.symbol": {"$in": symbols},
+                    "meta.freq": freq,
+                    "dt": {"$gte": start, "$lt": end},
+                }},
+                {"$group": {
+                    "_id": "$meta.symbol",
+                    "latest_dt": {"$max": "$dt"},
+                }},
+            ])
+            expected_dt = expected.get(freq)
+            if expected_dt is None:
+                continue
+            seen: set[str] = set()
+            for row in rows:
+                code = _pure_a_code(row.get("_id"))
+                if not code:
+                    continue
+                seen.add(code)
+                latest_dt = row.get("latest_dt")
+                if not isinstance(latest_dt, datetime) or latest_dt < expected_dt:
+                    missing_by_freq[freq].add(code)
+            missing_by_freq[freq].update(set(symbols) - seen)
+    except Exception as exc:
+        logger.debug("分钟线当前交易日覆盖校验失败: %s", exc)
+        return set()
+
+    missing_symbols = set().union(*missing_by_freq.values())
+    current_symbols = set(symbols) - missing_symbols
+    now = naive_market_now("A")
+    col = db["minute_preheat_universe"]
+    for code in symbols:
+        state = universe_states.get(code) or {}
+        if str(state.get("status") or "") == "running":
+            continue
+        freq_status = dict(state.get("freq_status") or {})
+        if code in missing_symbols:
+            for freq, codes in missing_by_freq.items():
+                if code in codes:
+                    freq_status[freq] = "stale"
+            values = {
+                "status": "pending",
+                "skipped_reason": "minute_current_trade_date_missing",
+                "cached_at": None,
+            }
+        elif code in current_symbols and str(state.get("status") or "") in {"pending", "error", "stale"}:
+            for freq in freqs:
+                freq_status[freq] = "ok"
+            values = {
+                "status": "cached",
+                "skipped_reason": "",
+                "cached_at": now,
+            }
+        else:
+            continue
+        col.update_one(
+            {"_id": f"{trade_date}:{code}"},
+            {"$set": {
+                **values,
+                "freq_status": freq_status,
+                "updated_at": now,
+                "selected_current_run": False,
+                "owner_pid": "",
+            }},
+        )
+        state.update({"status": values["status"], "freq_status": freq_status})
+    return missing_symbols
 
 
 def _upsert_minute_preheat_universe(
@@ -576,6 +772,7 @@ def _upsert_minute_preheat_universe(
                 "priority": code in priority_symbols,
                 "pinned": code in pinned_symbols,
                 "max_per_run": max_symbols,
+                "owner_pid": "",
                 "updated_at": now,
             }
             if str(existing.get("status") or "") == "dropped":
@@ -585,16 +782,23 @@ def _upsert_minute_preheat_universe(
                     "skipped_reason": "",
                     "revived_at": now,
                 })
+            insert_values = {
+                "status": "pending",
+                "freq_status": {},
+                "skipped_reason": "",
+                "created_at": now,
+            }
+            # A dropped row is revived through ``$set`` below.  MongoDB
+            # rejects an update document that writes the same path through
+            # both ``$set`` and ``$setOnInsert``, even though the latter only
+            # applies on insert, so remove revived paths from the insert arm.
+            for key in set_values:
+                insert_values.pop(key, None)
             col.update_one(
                 {"_id": f"{trade_date}:{code}"},
                 {
                     "$set": set_values,
-                    "$setOnInsert": {
-                        "status": "pending",
-                        "freq_status": {},
-                        "skipped_reason": "",
-                        "created_at": now,
-                    },
+                    "$setOnInsert": insert_values,
                 },
                 upsert=True,
             )
@@ -615,7 +819,13 @@ def _upsert_minute_preheat_universe(
                 }},
             )
             dropped += 1
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "minute preheat universe upsert partial written=%d total=%d: %s",
+            written,
+            len(symbols),
+            exc,
+        )
         return {"written": written, "total": len(symbols), "dropped": dropped}
     return {"written": written, "total": len(symbols), "dropped": dropped}
 
@@ -655,8 +865,19 @@ def _select_postmarket_minute_symbols(
             return 3
         return 2
 
+    # Once the expanded universe is mostly complete, do not pad a small
+    # pending/error tail with already-cached symbols.  Padding would spend
+    # provider quota refreshing data that already passed the current close,
+    # and can create avoidable rate-limit errors in the final batch.
+    unresolved = [
+        code
+        for code in ordered
+        if str((universe_states.get(code) or {}).get("status") or "pending")
+        in {"pending", "error", "stale"}
+    ]
+    rotation_order = unresolved if unresolved else ordered
     sorted_codes = sorted(
-        ordered,
+        rotation_order,
         key=lambda code: (
             status_rank(code),
             0 if code in pinned else 1,
@@ -688,7 +909,13 @@ def _mark_minute_universe_selected(db: Database, symbols: list[str]) -> None:
         for code in symbols:
             db["minute_preheat_universe"].update_one(
                 {"_id": f"{trade_date}:{code}"},
-                {"$set": {"status": "running", "selected_current_run": True, "last_attempt_at": now, "updated_at": now}},
+                {"$set": {
+                    "status": "running",
+                    "selected_current_run": True,
+                    "owner_pid": str(os.getpid()),
+                    "last_attempt_at": now,
+                    "updated_at": now,
+                }},
                 upsert=True,
             )
     except Exception:
@@ -707,8 +934,12 @@ def _mark_minute_universe_results(db: Database, per_symbol: dict[str, dict], min
             freq_status = result.get("freq_status") or {}
             errors = int(result.get("errors") or 0)
             expected_freqs = minute_freqs or _MINUTE_FREQS
-            ok_calls = sum(1 for freq in expected_freqs if freq_status.get(freq) in {"ok", "empty"})
-            status = "cached" if errors == 0 and ok_calls == len(expected_freqs) else "error"
+            empty_freqs = [freq for freq in expected_freqs if freq_status.get(freq) == "empty"]
+            ok_calls = sum(1 for freq in expected_freqs if freq_status.get(freq) == "ok")
+            # An empty provider response is not a cache hit.  Keep it
+            # retryable so the postmarket rotation can try the fallback source
+            # again instead of reporting a missing frequency as ``cached``.
+            status = "cached" if errors == 0 and not empty_freqs and ok_calls == len(expected_freqs) else "error"
             if status == "cached":
                 cached += 1
             else:
@@ -720,9 +951,13 @@ def _mark_minute_universe_results(db: Database, per_symbol: dict[str, dict], min
                     "freq_status": freq_status,
                     "written": int(result.get("written") or 0),
                     "errors": errors,
-                    "skipped_reason": "" if status == "cached" else "minute_fetch_failed",
+                    "skipped_reason": "" if status == "cached" else (
+                        "minute_provider_empty" if empty_freqs and not errors else "minute_fetch_failed"
+                    ),
+                    "empty_freqs": empty_freqs,
                     "cached_at": now if status == "cached" else None,
                     "selected_current_run": False,
+                    "owner_pid": "",
                     "updated_at": now,
                 }},
                 upsert=True,
@@ -761,9 +996,27 @@ def _expected_latest_dt_by_freq(freqs: list[str], now: datetime | None = None) -
     not moved.  The lunch break is pinned to 11:30 and the close to 15:00.
     """
     now = now or naive_market_now("A")
-    if now.time() < datetime(now.year, now.month, now.day, 9, 30).time():
+    trade_date = a_share_task_trade_date(now=now)
+    try:
+        trade_day = datetime.fromisoformat(trade_date).date()
+    except (TypeError, ValueError):
+        trade_day = now.date()
+    # On weekends/holidays, ``now`` is not the active market date.  Anchor
+    # the close watermark to the last task trade date so the continuation
+    # runner neither retries a completed close forever nor skips the tail.
+    if now.date() != trade_day:
+        base = now.replace(
+            year=trade_day.year,
+            month=trade_day.month,
+            day=trade_day.day,
+            hour=15,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+    elif now.time() < datetime(now.year, now.month, now.day, 9, 30).time():
         return {}
-    if now.time() < datetime(now.year, now.month, now.day, 11, 30).time():
+    elif now.time() < datetime(now.year, now.month, now.day, 11, 30).time():
         base = now.replace(second=0, microsecond=0)
     elif now.time() < datetime(now.year, now.month, now.day, 13, 0).time():
         base = now.replace(hour=11, minute=30, second=0, microsecond=0)
@@ -1057,6 +1310,18 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
             index_codes,
             symbol_sources,
         )
+    if postmarket_scope:
+        # Keep the terminal/semantic candidates at the front, then append the
+        # complete current quote universe for fair stale-first rotation.
+        _add_postmarket_fullmarket_candidates(
+            db,
+            symbols,
+            source_counts,
+            priority_symbols,
+            pinned_symbols,
+            index_codes,
+            symbol_sources,
+        )
     max_symbols = _selection_cap()
     last_runs = _latest_stock_minute_runs(db, symbols)
     universe_meta: dict[str, int] = {}
@@ -1071,6 +1336,12 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
             max_symbols=max_symbols,
         )
         universe_states = _minute_universe_statuses(db, symbols, _minute_trade_date())
+        _reconcile_minute_universe_coverage(
+            db,
+            symbols,
+            universe_states,
+            _active_minute_freqs(),
+        )
         selected, skipped = _select_postmarket_minute_symbols(
             symbols,
             priority_symbols,
@@ -1094,7 +1365,7 @@ def _get_active_symbols_with_meta(db: Database) -> tuple[list[str], dict]:
         "skipped_symbols": skipped + skipped_pool,
         "source_counts": source_counts,
         "max_symbols": max_symbols,
-        "candidate_count": int(terminal_pool.get("candidate_count") or len(symbols)),
+        "candidate_count": len(symbols) if postmarket_scope else int(terminal_pool.get("candidate_count") or len(symbols)),
         "rotation_enabled": True,
         "rotation_policy": "postmarket_expanded_candidate_preheat" if postmarket_scope else "terminal_stock_pool_rank_then_stale_first",
         "minute_scope": "postmarket_candidates" if postmarket_scope else "terminal_stock_pool",

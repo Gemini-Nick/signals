@@ -10,6 +10,7 @@ from signals.sync.modules.hk_stock_daily import (
     _fetch_one_hk_daily,
     _hk_history_sources,
     _hk_universe_sources,
+    _select_hk_due_codes,
     _pure_hk_code,
     _write_daily_docs_batch,
 )
@@ -55,11 +56,24 @@ def test_hk_universe_sources_allows_akshare_alias(monkeypatch):
     assert _hk_universe_sources() == ["akshare"]
 
 
-def test_hk_history_sources_defaults_to_daily_then_tencent(monkeypatch):
+def test_hk_history_sources_defaults_to_timeout_bounded_tencent_first(monkeypatch):
     monkeypatch.delenv("HK_STOCK_DAILY_HISTORY_SOURCE", raising=False)
     monkeypatch.delenv("HK_STOCK_DAILY_HISTORY_SOURCES", raising=False)
 
-    assert _hk_history_sources() == ["daily", "tencent", "hist"]
+    assert _hk_history_sources() == ["tencent", "daily", "hist"]
+
+
+def test_hk_bounded_batch_advances_past_fresh_prefix():
+    selected, remaining = _select_hk_due_codes(
+        ["00001", "00002", "00003", "00004"],
+        {"HK.00001": "2026-07-31", "HK.00002": "2026-07-31"},
+        set(),
+        "20260731",
+        1,
+    )
+
+    assert selected == ["00003"]
+    assert remaining == 1
 
 
 def test_docs_from_hk_daily_df_writes_canonical_bar_docs():

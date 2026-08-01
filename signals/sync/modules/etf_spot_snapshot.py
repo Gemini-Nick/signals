@@ -127,6 +127,17 @@ def _fullmarket_doc(doc: dict) -> dict:
     return mirror
 
 
+def _snapshot_upsert(doc: dict) -> UpdateOne:
+    """Refresh fields without moving a same-day capture time forward."""
+    body = dict(doc)
+    body.pop("_id", None)
+    snapshot_at = body.pop("snapshot_at", None)
+    update: dict = {"$set": body}
+    if snapshot_at is not None:
+        update["$min"] = {"snapshot_at": snapshot_at}
+    return UpdateOne({"_id": doc["_id"]}, update, upsert=True)
+
+
 def _write_data_freshness(
     db: Database,
     *,
@@ -266,7 +277,7 @@ def sync_etf_spot_snapshot(db: Database, proxy_url: str = None) -> dict:
     mirrored_modified = 0
     if docs:
         result = db["etf_spot_snapshots"].bulk_write(
-            [UpdateOne({"_id": doc["_id"]}, {"$set": doc}, upsert=True) for doc in docs],
+            [_snapshot_upsert(doc) for doc in docs],
             ordered=False,
         )
         inserted = int(result.upserted_count)
@@ -274,7 +285,7 @@ def sync_etf_spot_snapshot(db: Database, proxy_url: str = None) -> dict:
 
         mirror_docs = [_fullmarket_doc(doc) for doc in docs]
         mirror_result = db["fullmarket_spot_snapshots"].bulk_write(
-            [UpdateOne({"_id": doc["_id"]}, {"$set": doc}, upsert=True) for doc in mirror_docs],
+            [_snapshot_upsert(doc) for doc in mirror_docs],
             ordered=False,
         )
         mirrored_inserted = int(mirror_result.upserted_count)

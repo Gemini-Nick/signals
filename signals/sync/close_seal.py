@@ -390,35 +390,61 @@ class CloseSealRunner:
         )
         return {"status": "partial", "close_finality": "forced_provisional", "terminal": terminal}
 
-    def tick(self, trade_date: str, now: datetime | None = None) -> dict[str, Any]:
+    def tick(
+        self,
+        trade_date: str,
+        now: datetime | None = None,
+        *,
+        allow_late_recovery: bool = False,
+    ) -> dict[str, Any]:
         now = _local_naive(now or naive_market_now("A"))
         start = _slot_at(trade_date, PROBE_TIMES[0])
         end = _slot_at(trade_date, END_TIME)
-        if now < start or now >= end:
+        if now < start or (now >= end and not allow_late_recovery):
             return {"status": "outside_window", "next_probe_at": self._next_probe_at(trade_date, now)}
         run_doc = self._ensure_run(trade_date, now)
         if run_doc.get("status") == "sealed":
             return {"status": "sealed", "skipped": True}
-        if run_doc.get("terminal_partial"):
+        if run_doc.get("terminal_partial") and not allow_late_recovery:
             return {"status": "partial", "skipped": True, "terminal": True}
+        if allow_late_recovery and run_doc.get("terminal_partial"):
+            # A previous daemon may have stopped after the normal probe
+            # window.  A late recovery is a new bounded attempt, but it must
+            # not erase the audit trail of the earlier partial result.
+            self.db["sync_runs"].update_one(
+                {"_id": self.run_id(trade_date)},
+                {
+                    "$set": {
+                        "terminal_partial": False,
+                        "late_recovery_started_at": now,
+                        "updated_at": now,
+                    }
+                },
+            )
+            run_doc = self.db["sync_runs"].find_one({"_id": self.run_id(trade_date)}) or run_doc
         next_probe_at = run_doc.get("next_probe_at")
-        if isinstance(next_probe_at, datetime) and _local_naive(next_probe_at) > now and now.time() < HARD_SEAL_TIME:
+        if (
+            isinstance(next_probe_at, datetime)
+            and _local_naive(next_probe_at) > now
+            and now.time() < HARD_SEAL_TIME
+            and not allow_late_recovery
+        ):
             return {"status": str(run_doc.get("status") or "pending"), "next_probe_at": next_probe_at}
         claimed = self._claim(trade_date, now)
         if not claimed:
             return {"status": "busy"}
         try:
             probe = self._record_probe(trade_date, now, claimed)
-            if probe["stable"] and now.time() >= SEAL_NOT_BEFORE:
+            if probe["stable"] and (allow_late_recovery or now.time() >= SEAL_NOT_BEFORE):
                 result = self._seal(trade_date, naive_market_now("A"), stable=True)
-                if now.time() >= PROBE_TIMES[-1] and result.get("status") != "sealed":
+                if not allow_late_recovery and now.time() >= PROBE_TIMES[-1] and result.get("status") != "sealed":
                     self.db["sync_runs"].update_one(
                         {"_id": self.run_id(trade_date), "lease_owner": self.owner},
                         {"$set": {"terminal_partial": True, "updated_at": now}},
                     )
                     result["terminal"] = True
                 return result
-            if now.time() >= HARD_SEAL_TIME:
+            if not allow_late_recovery and now.time() >= HARD_SEAL_TIME:
                 return self._mark_forced_partial(
                     trade_date,
                     now,

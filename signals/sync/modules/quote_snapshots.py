@@ -59,14 +59,31 @@ def _latest_bars(db: Database, symbol: str, limit: int = 2) -> list[dict]:
     return docs
 
 
-def _iter_strategy_snapshot_symbols() -> list[str]:
+def _iter_strategy_snapshot_symbols(db: Database | None = None) -> list[str]:
     symbols: list[str] = []
-    try:
-        from signals.strategy.snapshot import get_strategy_snapshot
+    snapshot = None
+    # The strategy lane already persists a Mongo read model.  Rebuilding it
+    # from all gateway responses on every quote tick can take 10-20 seconds;
+    # use the latest persisted snapshot first and only compute as a fallback.
+    if db is not None:
+        try:
+            stored = db["strategy_snapshots"].find_one(
+                {},
+                {"snapshot": 1, "updated_at": 1},
+                sort=[("updated_at", -1)],
+            ) or {}
+            nested = stored.get("snapshot")
+            if isinstance(nested, dict):
+                snapshot = nested
+        except Exception:
+            snapshot = None
+    if snapshot is None:
+        try:
+            from signals.strategy.snapshot import get_strategy_snapshot
 
-        snapshot = get_strategy_snapshot()
-    except Exception:
-        return symbols
+            snapshot = get_strategy_snapshot(db=db)
+        except Exception:
+            return symbols
 
     for key in ("candidates", "warnings", "decision_queue", "buy_candidates", "sell_warnings"):
         rows = snapshot.get(key) or []
@@ -88,7 +105,7 @@ def _iter_strategy_snapshot_symbols() -> list[str]:
     return symbols
 
 
-def _latest_pool_symbols(db: Database) -> list[str]:
+def _latest_pool_symbols(db: Database, strategy_symbols: list[str] | None = None) -> list[str]:
     symbols = []
 
     def add(value: object) -> None:
@@ -101,7 +118,7 @@ def _latest_pool_symbols(db: Database) -> list[str]:
         for item in doc["symbols"]:
             add(item)
 
-    for item in _iter_strategy_snapshot_symbols():
+    for item in strategy_symbols if strategy_symbols is not None else _iter_strategy_snapshot_symbols(db):
         add(item)
 
     for item in db["signals"].find({}, {"symbol": 1}).sort("signal_date", -1).limit(50):
@@ -319,7 +336,10 @@ def _is_index_quote_symbol(symbol: str) -> bool:
     if "." not in normalized:
         return False
     prefix, code = normalized.split(".", 1)
-    return (prefix == "SH" and code.startswith("000")) or (prefix == "SZ" and code.startswith("399"))
+    # Besides the broad SH.000/SZ.399 indexes, Eastmoney's custom/industry
+    # indexes used by the index lane are commonly SH.93xxxx.  They do not
+    # belong in the stock ulist quote channel either.
+    return (prefix == "SH" and code.startswith(("000", "93"))) or (prefix == "SZ" and code.startswith("399"))
 
 
 def _scale_price(value: object) -> float | None:
@@ -545,7 +565,13 @@ def _hot_quote_symbols(db: Database) -> list[str]:
     for symbol in _MACRO_QUOTE_SYMBOLS:
         add(symbol)
 
-    for item in _iter_strategy_snapshot_symbols():
+    try:
+        strategy_symbols = _iter_strategy_snapshot_symbols(db)
+    except TypeError:
+        # Keep lightweight test/integration overrides that expose the old
+        # zero-argument hook compatible.
+        strategy_symbols = _iter_strategy_snapshot_symbols()
+    for item in strategy_symbols:
         add(item)
 
     try:
@@ -579,7 +605,7 @@ def _hot_quote_symbols(db: Database) -> list[str]:
             add(item.get("symbol") or item.get("code") or item.get("raw_code"))
     for symbol in _latest_chain_heat_representative_symbols(db):
         add(symbol)
-    for symbol in _latest_pool_symbols(db):
+    for symbol in _latest_pool_symbols(db, strategy_symbols=strategy_symbols):
         add(symbol)
 
     try:
@@ -587,6 +613,22 @@ def _hot_quote_symbols(db: Database) -> list[str]:
     except (TypeError, ValueError):
         limit = 500
     return symbols[:limit]
+
+
+def _realtime_quote_symbols(db: Database) -> list[str]:
+    """Return symbols that belong to the quote lane, excluding indices.
+
+    Macro/index symbols are intentionally present in the hot universe, but
+    their canonical source is ``index_bars``/``index_minute``.  Eastmoney's
+    stock ulist endpoint does not guarantee all index codes, so sending them
+    through the stock quote lane creates false degraded tails without adding
+    any usable quote data.
+    """
+    return [
+        symbol
+        for symbol in _a_quote_symbols(_hot_quote_symbols(db))
+        if not _is_index_quote_symbol(symbol)
+    ]
 
 
 def _fetch_eastmoney_ulist_docs(
@@ -978,7 +1020,7 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
         trading_day = a_share_task_trade_date(now=now)
     except Exception:
         trading_day = now.date().isoformat()
-    symbols = _a_quote_symbols(_hot_quote_symbols(db))
+    symbols = _realtime_quote_symbols(db)
     inserted = 0
     modified = 0
     processed = 0
@@ -1076,7 +1118,7 @@ def sync_eastmoney_ulist_quote(db: Database, proxy_url: str = None) -> dict:
         trading_day = a_share_task_trade_date(now=now)
     except Exception:
         trading_day = now.date().isoformat()
-    symbols = _a_quote_symbols(_hot_quote_symbols(db))
+    symbols = _realtime_quote_symbols(db)
     # fullmarket_spot_snapshots is the canonical all-market watermark.  The
     # ulist lane is only a bounded supplement for symbols absent from that
     # watermark; otherwise the same hot symbols are fetched twice in one live

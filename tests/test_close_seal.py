@@ -258,3 +258,33 @@ def test_stable_probe_with_persistent_module_failure_stops_after_late_window():
     assert final_attempt["terminal"] is True
     assert after_terminal == {"status": "partial", "skipped": True, "terminal": True}
     assert len(calls) == call_count
+
+
+def test_late_recovery_can_seal_after_daemon_restart_outside_probe_window():
+    day = "2026-07-14"
+    db = FakeDB()
+    module_calls: list[str] = []
+
+    runner = CloseSealRunner(
+        db,
+        lambda module, _day: module_calls.append(module)
+        or {
+            "module": module,
+            "status": "ok",
+            "result": {
+                "status": "ok",
+                "count": 5200 if module == "fullmarket_spot_snapshot" else 1200,
+                "trade_date": day,
+            },
+        },
+        probe_fetcher=lambda _day, _now: (8, _probe_rows(day)),
+        owner="test-owner",
+    )
+
+    first = runner.tick(day, datetime.fromisoformat("2026-07-15 10:00:00"), allow_late_recovery=True)
+    second = runner.tick(day, datetime.fromisoformat("2026-07-15 10:01:01"), allow_late_recovery=True)
+
+    assert first["status"] == "probing"
+    assert second["status"] == "sealed"
+    assert db["sync_runs"].find_one({"_id": f"close_seal:{day}"})["close_finality"] == "stable_close"
+    assert module_calls == list(SEAL_MODULES)

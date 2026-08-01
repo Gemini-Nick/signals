@@ -217,6 +217,17 @@ def _write_data_freshness(
     )
 
 
+def _snapshot_upsert(doc: dict) -> UpdateOne:
+    """Refresh fields without moving a same-day capture time forward."""
+    body = dict(doc)
+    body.pop("_id", None)
+    snapshot_at = body.pop("snapshot_at", None)
+    update: dict = {"$set": body}
+    if snapshot_at is not None:
+        update["$min"] = {"snapshot_at": snapshot_at}
+    return UpdateOne({"_id": doc["_id"]}, update, upsert=True)
+
+
 def sync_fullmarket_spot_snapshot(db: Database, proxy_url: str = None) -> dict:
     del proxy_url
     started = time.monotonic()
@@ -305,7 +316,7 @@ def sync_fullmarket_spot_snapshot(db: Database, proxy_url: str = None) -> dict:
     inserted = 0
     modified = 0
     if docs:
-        ops = [UpdateOne({"_id": doc["_id"]}, {"$set": doc}, upsert=True) for doc in docs]
+        ops = [_snapshot_upsert(doc) for doc in docs]
         result = db["fullmarket_spot_snapshots"].bulk_write(ops, ordered=False)
         inserted = int(result.upserted_count)
         modified = int(result.modified_count)

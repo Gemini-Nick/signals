@@ -14,7 +14,13 @@ from signals.core.market_time import naive_market_now
 from signals.sync.task_context import get_task_env
 from signals.sync.trade_date import a_share_task_trade_date
 
-from .stock_minute import _index_codes, _insert_new_minute_docs, _pure_a_code, _sync_one_minute
+from .stock_minute import (
+    _explicit_index_symbol,
+    _index_codes,
+    _insert_new_minute_docs,
+    _pure_a_code,
+    _sync_one_minute,
+)
 
 logger = logging.getLogger("signals.sync.stock_30m_fullmarket")
 
@@ -43,19 +49,34 @@ def _symbols_with_daily(db: Database) -> list[str]:
     try:
         rows = db["fullmarket_spot_snapshots"].find(
             {"date_key": date_key},
-            {"code": 1, "symbol": 1, "asset_class": 1, "latest": 1, "price": 1},
+            {
+                "code": 1,
+                "symbol": 1,
+                "asset_class": 1,
+                "latest": 1,
+                "price": 1,
+                "open": 1,
+                "high": 1,
+                "low": 1,
+                "prev_close": 1,
+            },
         )
         active: set[str] = set()
         for row in rows:
             if str(row.get("asset_class") or "").lower() == "etf":
                 continue
-            code = _pure_a_code(row.get("code") or row.get("symbol"))
-            price = row.get("price", row.get("latest"))
+            raw_symbol = row.get("symbol") or row.get("code")
+            code = _pure_a_code(row.get("code") or raw_symbol)
+            if _explicit_index_symbol(raw_symbol, index_codes) or code.startswith(("200", "900")):
+                continue
             try:
-                valid_quote = float(price) > 0
+                valid_quote = all(
+                    float(row.get(field)) > 0
+                    for field in ("price", "open", "high", "low", "prev_close")
+                )
             except (TypeError, ValueError):
                 valid_quote = False
-            if code and code not in index_codes and valid_quote:
+            if code and valid_quote:
                 active.add(code)
         if active:
             return sorted(active)

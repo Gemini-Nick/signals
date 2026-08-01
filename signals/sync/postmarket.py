@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -670,7 +673,11 @@ class PostmarketRunner:
                 "SIGNALS_POSTMARKET_TRADE_DATE": trade_date,
             }
         ):
-            return self.engine.run_module(module, fn, plan=plan)
+            # Keep the A-market sync watermark aligned with the close-seal
+            # task.  The formal gate reads the close-seal run itself, while
+            # operations dashboards should not retain an older A metadata
+            # row from an isolated historical backfill.
+            return self.engine.run_module(module, fn, market="A", plan=plan)
 
     def _stable_close_seal_ready(self, trade_date: str) -> bool:
         from .close_seal import SEAL_MODULES, seal_result_usable
@@ -766,7 +773,18 @@ class PostmarketRunner:
             os.kill(pid_int, 0)
         except OSError:
             return False
-        return True
+        # ``kill(pid, 0)`` also succeeds for a zombie on macOS.  A finished
+        # detached minute child can therefore block every later rotation
+        # unless its process state is checked explicitly.
+        try:
+            state = subprocess.check_output(
+                ["ps", "-o", "stat=", "-p", str(pid_int)],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return bool(state) and not state.startswith("Z")
 
     @staticmethod
     def _task_id(run_id: str, spec: PostmarketTaskSpec) -> str:
@@ -944,6 +962,213 @@ class PostmarketRunner:
             "source": "fullmarket_spot_snapshots.valid_universe + bars.daily",
         }
 
+    def _upgrade_stock_daily_after_close_seal(self, trade_date: str) -> int:
+        """Upgrade already-written daily shards once a stable seal exists."""
+        run_id = default_run_id(trade_date)
+        repaired = 0
+        try:
+            pending = self.db["sync_tasks"].count_documents(
+                {
+                    "run_id": run_id,
+                    "module": "stock_daily",
+                    "result_summary.result.quality": "provisional_close",
+                },
+                maxTimeMS=2000,
+            )
+        except TypeError:
+            pending = self.db["sync_tasks"].count_documents(
+                {
+                    "run_id": run_id,
+                    "module": "stock_daily",
+                    "result_summary.result.quality": "provisional_close",
+                }
+            )
+        except Exception:
+            pending = 0
+        if not self._stable_close_seal_ready(trade_date):
+            return 0
+        if pending:
+            repaired += self._reconcile_stock_daily_tasks_from_bars(run_id, trade_date)
+        # Keep the legacy sync_log watermarks aligned with the authoritative
+        # dated bars after a late/recovered close seal.  These documents are
+        # still consumed by older dashboard/API paths even though the DAG
+        # task rows are now the primary source of truth.
+        repaired += self._reconcile_stock_daily_legacy_progress(trade_date)
+        return repaired
+
+    def _reconcile_stock_daily_legacy_progress(self, trade_date: str) -> int:
+        """Repair legacy stock_daily progress watermarks from final-close bars.
+
+        A previous provider attempt can leave ``sync_log`` at an old universe
+        size or ``orphaned_running_module`` even after all dated daily bars are
+        present.  Promote only when the close seal is stable and every symbol
+        in the persisted full-market universe has a dated daily bar; preserve
+        the old attempt fields as audit history in the task documents.
+        """
+        if not self._stable_close_seal_ready(trade_date):
+            return 0
+        date_key = str(trade_date or "").replace("-", "")[:8]
+        try:
+            valid_codes = sorted({
+                self._canonical_a_code(code)
+                for code in self.db["fullmarket_spot_snapshots"].distinct(
+                    "code",
+                    {
+                        "date_key": date_key,
+                        "code": {"$regex": r"^\d{6}$"},
+                        "price": {"$gt": 0},
+                        "open": {"$gt": 0},
+                        "high": {"$gt": 0},
+                        "low": {"$gt": 0},
+                    },
+                )
+                if self._canonical_a_code(code)
+            })
+            trade_dt = datetime.strptime(date_key, "%Y%m%d")
+            cached_codes = {
+                self._canonical_a_code(code)
+                for code in self.db["bars"].distinct(
+                    "meta.symbol",
+                    {"meta.freq": "日线", "dt": trade_dt},
+                )
+                if self._canonical_a_code(code)
+            }
+        except Exception:
+            logger.debug("legacy stock_daily progress reconciliation unavailable", exc_info=True)
+            return 0
+        if not valid_codes or not set(valid_codes) <= cached_codes:
+            return 0
+
+        now = _naive_bj()
+        shard_count = len([spec for spec in POSTMARKET_TASKS if spec.module == "stock_daily"]) or 16
+        repaired = 0
+
+        def publish(doc_id: str, result: dict[str, Any], *, module: str = "stock_daily") -> None:
+            nonlocal repaired
+            current = self.db["sync_log"].find_one(
+                {"_id": doc_id},
+                {"status": 1, "result": 1, "quality": 1, "error_msg": 1, "owner_pid": 1},
+            ) or {}
+            current_result = current.get("result") if isinstance(current.get("result"), dict) else {}
+            already_final = (
+                str(current.get("status") or "") == "ok"
+                and str(current.get("quality") or current_result.get("quality") or "") == "final_close"
+                and int(current_result.get("covered_codes") or current.get("covered_codes") or 0) == int(result["covered_codes"])
+                and int(current_result.get("expected_codes") or current.get("expected_codes") or 0) == int(result["expected_codes"])
+            )
+            if already_final and not current.get("error_msg") and not current.get("owner_pid"):
+                return
+            self.db["sync_log"].update_one(
+                {"_id": doc_id},
+                {"$set": {
+                    "module": module,
+                    "status": "ok",
+                    "quality": "final_close",
+                    "trade_date": str(trade_date)[:10],
+                    "expected_codes": result["expected_codes"],
+                    "covered_codes": result["covered_codes"],
+                    "processed": result["processed"],
+                    "total": result["total"],
+                    "progress_pct": 100.0,
+                    "coverage_pct": 100.0,
+                    "errors": 0,
+                    "deferred": 0,
+                    "missing_symbols": 0,
+                    "remaining": 0,
+                    "owner_pid": "",
+                    "error_msg": "",
+                    "reconciled_existing_bars": True,
+                    "reconciliation_source": "fullmarket_spot_snapshots.valid_universe + bars.daily",
+                    "reconciled_at": now,
+                    "last_checked_at": now,
+                    "updated_at": now,
+                    "last_run": now,
+                    "result": result,
+                }},
+                upsert=True,
+            )
+            repaired += 1
+
+        global_result = {
+            "status": "ok",
+            "quality": "final_close",
+            "trade_date": str(trade_date)[:10],
+            "scope": "all",
+            "global_total": len(valid_codes),
+            "expected_codes": len(valid_codes),
+            "covered_codes": len(valid_codes),
+            "processed": len(valid_codes),
+            "total": len(valid_codes),
+            "progress_pct": 100.0,
+            "coverage_pct": 100.0,
+            "errors": 0,
+            "deferred": 0,
+            "missing_symbols": 0,
+            "remaining": 0,
+            "reconciled_existing_bars": True,
+            "reconciliation_source": "fullmarket_spot_snapshots.valid_universe + bars.daily",
+        }
+        publish("stock_daily:progress:_meta", global_result)
+        publish("stock_daily:_meta", global_result)
+
+        for shard_index in range(shard_count):
+            shard_codes = valid_codes[shard_index::shard_count]
+            shard_result = {
+                **global_result,
+                "shard_key": f"shard_{shard_index:02d}",
+                "shard_index": shard_index,
+                "shard_count": shard_count,
+                "global_total": len(valid_codes),
+                "expected_codes": len(shard_codes),
+                "covered_codes": len(shard_codes),
+                "processed": len(shard_codes),
+                "total": len(shard_codes),
+            }
+            publish(f"stock_daily:progress:shard_{shard_index:02d}", shard_result)
+        return repaired
+
+    def _reconcile_minute_readiness_task(self, trade_date: str) -> int:
+        """Publish a successful readiness probe into the historical DAG row."""
+        spec = next((item for item in POSTMARKET_TASKS if item.module == "minute_readiness_probe"), None)
+        if spec is None:
+            return 0
+        run_id = default_run_id(trade_date)
+        meta = self.db["sync_log"].find_one(
+            {"_id": "minute_readiness_probe:A:_meta"},
+            {"status": 1, "result": 1},
+        ) or {}
+        result = meta.get("result") if isinstance(meta.get("result"), dict) else {}
+        if str(meta.get("status") or "") != "ok" or int(result.get("not_ready") or 0) > 0:
+            return 0
+        task_id = self._task_id(run_id, spec)
+        current = self.db["sync_tasks"].find_one({"_id": task_id}, {"status": 1, "result_summary": 1}) or {}
+        summary = current.get("result_summary") if isinstance(current.get("result_summary"), dict) else {}
+        if str(current.get("status") or "") == "ok" and summary.get("reconciled_existing_probe"):
+            return 0
+        now = _naive_bj()
+        self.db["sync_tasks"].update_one(
+            {"_id": task_id},
+            {"$set": {
+                "status": "ok",
+                "owner_pid": "",
+                "heartbeat_at": now,
+                "finished_at": now,
+                "updated_at": now,
+                "cursor": {"processed": int(result.get("checked") or 0), "total": int(result.get("checked") or 0), "progress_pct": 100.0},
+                "result_summary": {
+                    "module": "minute_readiness_probe",
+                    "status": "ok",
+                    "result": result,
+                    "reconciled_existing_probe": True,
+                    "reconciliation_source": "sync_log:minute_readiness_probe:A:_meta",
+                },
+                "error_msg": "",
+                "reconciled_existing_probe": True,
+            }},
+            upsert=True,
+        )
+        return 1
+
     @staticmethod
     def _canonical_a_code(value: Any) -> str:
         raw = str(value or "").strip().upper()
@@ -999,6 +1224,7 @@ class PostmarketRunner:
             return 0
 
         now = _naive_bj()
+        formal_close_ready = self._stable_close_seal_ready(trade_date)
         repaired = 0
         shard_count = len(specs)
         for spec in specs:
@@ -1007,12 +1233,11 @@ class PostmarketRunner:
             shard_codes = valid_codes[shard_index::shard_count]
             covered = len(set(shard_codes) & cached_codes)
             missing = max(0, len(shard_codes) - covered)
-            # Existing bars are a truthful coverage receipt, but their mixed
-            # providers are not a formal close seal.  Keep the task partial so
-            # a later stable-close pass can still upgrade the quality.
+            quality = "final_close" if formal_close_ready and missing == 0 else "provisional_close"
+            task_status = "ok" if quality == "final_close" else "partial"
             result = {
-                "status": "partial",
-                "quality": "provisional_close",
+                "status": task_status,
+                "quality": quality,
                 "scope": "all",
                 "shard_key": spec.shard_key,
                 "shard_index": shard_index,
@@ -1547,6 +1772,11 @@ class PostmarketRunner:
         fn, _schedule = self.engine.module_map[spec.module]
         plan = LANE_MAINTENANCE_PLANS.get(spec.module)
         semaphore = self.module_semaphores.get(spec.module)
+        # Keep the quote lane's legacy A-market watermark synchronized with
+        # the postmarket retry.  Without this explicit market, the task can
+        # be healthy while ``quote_snapshots:A:_meta`` remains degraded from
+        # an older live attempt.
+        module_market = "A" if spec.module == "quote_snapshots" else None
         task_values = {
             "SIGNALS_POSTMARKET_RUN_ID": run_id,
             "SIGNALS_POSTMARKET_TRADE_DATE": run_id.split(":", 1)[1] if ":" in run_id else "",
@@ -1560,11 +1790,11 @@ class PostmarketRunner:
         with self._with_env(task_values):
             if semaphore is None:
                 self._mark_task_started(run_id, spec)
-                result = self.engine.run_module(spec.module, fn, plan=plan)
+                result = self.engine.run_module(spec.module, fn, market=module_market, plan=plan)
             else:
                 with semaphore:
                     self._mark_task_started(run_id, spec)
-                    result = self.engine.run_module(spec.module, fn, plan=plan)
+                    result = self.engine.run_module(spec.module, fn, market=module_market, plan=plan)
         expected_trade_date = str(task_values.get("SIGNALS_POSTMARKET_TRADE_DATE") or "")[:10]
         if isinstance(result, dict) and expected_trade_date:
             actual_trade_date = str(result.get("trade_date") or result.get("date_key") or "")[:10]
@@ -1618,11 +1848,278 @@ class PostmarketRunner:
             return 0
         return sum(1 for row in rows if str(row.get("status") or "pending") in {"pending", "error", "stale"})
 
+    def _reconcile_minute_preheat_coverage(self, trade_date: str) -> int:
+        """Reconcile status rows with actual current-trade-date minute bars."""
+        try:
+            from .modules import stock_minute
+
+            rows = list(self.db["minute_preheat_universe"].find(
+                {"trade_date": trade_date, "status": {"$ne": "dropped"}},
+                {"symbol": 1, "status": 1, "freq_status": 1},
+            ))
+            symbols = [str(row.get("symbol") or "") for row in rows if row.get("symbol")]
+            states = {
+                str(row.get("symbol")): row
+                for row in rows
+                if row.get("symbol")
+            }
+            stock_minute._reconcile_minute_universe_coverage(
+                self.db,
+                symbols,
+                states,
+                ["5分钟", "15分钟"],
+            )
+        except Exception:
+            logger.debug("minute preheat coverage reconciliation failed", exc_info=True)
+        return self._minute_preheat_pending_count(trade_date)
+
+    def _reset_minute_preheat_running(
+        self,
+        trade_date: str,
+        *,
+        owner_pid: str | None = None,
+        reason: str = "minute_preheat_owner_dead",
+    ) -> int:
+        query: dict[str, Any] = {"trade_date": trade_date, "status": "running"}
+        if owner_pid:
+            query["owner_pid"] = str(owner_pid)
+        now = _naive_bj()
+        result = self.db["minute_preheat_universe"].update_many(
+            query,
+            {"$set": {
+                "status": "pending",
+                "owner_pid": "",
+                "selected_current_run": False,
+                "recovery_reason": reason,
+                "updated_at": now,
+            }},
+        )
+        return int(getattr(result, "modified_count", 0) or 0)
+
+    def _reconcile_minute_preheat_running(self, trade_date: str) -> int:
+        """Release minute candidates left by a killed daemon/child."""
+        released = 0
+        try:
+            rows = self.db["minute_preheat_universe"].find(
+                {"trade_date": trade_date, "status": "running"},
+                {"owner_pid": 1},
+            )
+            for row in rows:
+                owner_pid = str(row.get("owner_pid") or "")
+                if owner_pid and self._pid_alive(owner_pid):
+                    continue
+                released += self._reset_minute_preheat_running(
+                    trade_date,
+                    owner_pid=owner_pid or None,
+                    reason="minute_preheat_owner_dead" if owner_pid else "minute_preheat_owner_missing",
+                )
+        except Exception:
+            logger.debug("minute preheat orphan reconciliation failed", exc_info=True)
+        return released
+
+    def _reconcile_historical_minute_preheat_orphans(self, active_trade_date: str) -> int:
+        """Mark ownerless minute rows from old runs as stale, not running.
+
+        The minute universe is retained across trade dates for auditability.
+        Older daemon versions could leave rows in ``running`` without an
+        owner PID, which made global health counters report a permanently
+        active job even though no process could resume it.  Only rows outside
+        the active trade date are handled here; the live current-date child is
+        reconciled by ``_reconcile_minute_preheat_running``.
+        """
+        recovered = 0
+        now = _naive_bj()
+        try:
+            rows = self.db["minute_preheat_universe"].find(
+                {"status": "running", "trade_date": {"$ne": active_trade_date}},
+                {"_id": 1, "owner_pid": 1},
+            )
+            for row in rows:
+                owner_pid = str(row.get("owner_pid") or "")
+                if owner_pid and self._pid_alive(owner_pid):
+                    continue
+                result = self.db["minute_preheat_universe"].update_one(
+                    {"_id": row.get("_id"), "status": "running"},
+                    {"$set": {
+                        "status": "stale",
+                        "owner_pid": "",
+                        "selected_current_run": False,
+                        "recovery_reason": "historical_orphan_reconciled",
+                        "updated_at": now,
+                    }},
+                )
+                recovered += int(getattr(result, "modified_count", 0) or 0)
+        except Exception:
+            logger.debug("historical minute preheat orphan reconciliation failed", exc_info=True)
+        return recovered
+
+    def _launch_minute_preheat_child(
+        self,
+        trade_date: str,
+        run_id: str,
+        env: dict[str, str],
+    ) -> bool:
+        """Launch one bounded minute batch outside the long-lived daemon.
+
+        Public minute endpoints occasionally leave a socket worker alive after
+        the Mongo receipt has been written.  Running that batch in a child
+        keeps the formal postmarket carrier responsive; the owner PID in
+        Mongo prevents duplicate rotations and allows the next heartbeat to
+        reclaim a dead or timed-out child.
+        """
+        run_doc = self.db["sync_runs"].find_one(
+            {"_id": run_id},
+            {"minute_preheat_owner_pid": 1, "minute_preheat_started_at": 1},
+        ) or {}
+        owner_pid = str(run_doc.get("minute_preheat_owner_pid") or "")
+        if owner_pid:
+            if self._pid_alive(owner_pid):
+                owned_running = self.db["minute_preheat_universe"].count_documents(
+                    {
+                        "trade_date": trade_date,
+                        "status": "running",
+                        "owner_pid": owner_pid,
+                    }
+                )
+                meta_status = str(
+                    (self.db["sync_log"].find_one(
+                        {"_id": "stock_minute:_meta"},
+                        {"status": 1},
+                    ) or {}).get("status")
+                    or ""
+                ).lower()
+                # The module writes all per-symbol receipts before a provider
+                # socket thread can linger.  Once no owned row is running and
+                # the module receipt is terminal, stop that child and allow
+                # the next rotation on the following daemon tick.
+                if owned_running == 0 and meta_status in {"ok", "partial", "degraded", "error"}:
+                    try:
+                        os.kill(int(owner_pid), signal.SIGTERM)
+                    except (OSError, ValueError):
+                        pass
+                    self.db["sync_runs"].update_one(
+                        {"_id": run_id},
+                        {"$set": {
+                            "minute_preheat_owner_pid": "",
+                            "minute_preheat_finished_at": _naive_bj(),
+                            "minute_preheat_recovery": "child_receipt_complete",
+                            "updated_at": _naive_bj(),
+                        }},
+                    )
+                    owner_pid = ""
+                else:
+                    started = _coerce_dt(run_doc.get("minute_preheat_started_at"))
+                    timeout = _env_int(
+                        "SIGNALS_POSTMARKET_MINUTE_BATCH_TIMEOUT_SECONDS",
+                        600,
+                        minimum=60,
+                    )
+                    if started is None or (_naive_bj() - started).total_seconds() <= timeout:
+                        return False
+                    try:
+                        os.kill(int(owner_pid), signal.SIGTERM)
+                    except (OSError, ValueError):
+                        pass
+                    self._reset_minute_preheat_running(
+                        trade_date,
+                        owner_pid=owner_pid,
+                        reason="minute_preheat_child_timeout",
+                    )
+                    self.db["sync_log"].update_one(
+                        {"_id": "stock_minute:_meta"},
+                        {"$set": {
+                            "status": "degraded",
+                            "error_msg": "minute_preheat_child_timeout",
+                            "updated_at": _naive_bj(),
+                        }},
+                    )
+                    self.db["sync_runs"].update_one(
+                        {"_id": run_id},
+                        {"$set": {
+                            "minute_preheat_owner_pid": "",
+                            "minute_preheat_finished_at": _naive_bj(),
+                            "minute_preheat_recovery": "timeout",
+                            "updated_at": _naive_bj(),
+                        }},
+                    )
+                    return False
+            if owner_pid:
+                self._reset_minute_preheat_running(
+                    trade_date,
+                    owner_pid=owner_pid,
+                    reason="minute_preheat_owner_dead",
+                )
+                self.db["sync_runs"].update_one(
+                    {"_id": run_id},
+                    {"$set": {
+                        "minute_preheat_owner_pid": "",
+                        "minute_preheat_finished_at": _naive_bj(),
+                        "updated_at": _naive_bj(),
+                    }},
+                )
+
+        child_env = os.environ.copy()
+        child_env.update({str(key): str(value) for key, value in env.items()})
+        child_env["SIGNALS_POSTMARKET_MINUTE_CHILD"] = "1"
+        child_env["SIGNALS_POSTMARKET_MINUTE_PARENT_RUN_ID"] = run_id
+        script = (
+            "from signals.sync.engine import SyncEngine, LANE_MAINTENANCE_PLANS; "
+            "from signals.sync.postmarket import PostmarketRunner; "
+            "e=SyncEngine(); f,_=e.module_map['stock_minute']; "
+            "e.run_module('stock_minute', f, plan=LANE_MAINTENANCE_PLANS.get('stock_minute'))"
+        )
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        child_log_path = os.getenv(
+            "SIGNALS_POSTMARKET_MINUTE_CHILD_LOG",
+            "/tmp/longclaw-guardian/signals.minute-preheat-child.log",
+        )
+        try:
+            with open(child_log_path, "ab", buffering=0) as child_log:
+                child = subprocess.Popen(
+                    [sys.executable, "-c", script],
+                    cwd=repo_root,
+                    env=child_env,
+                    stdout=child_log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+        except Exception as exc:
+            logger.warning("minute preheat child launch failed: %s", exc)
+            return False
+        now = _naive_bj()
+        self.db["sync_runs"].update_one(
+            {"_id": run_id},
+            {"$set": {
+                "minute_preheat_owner_pid": str(child.pid),
+                "minute_preheat_started_at": now,
+                "minute_preheat_recovery": "child_started",
+                "updated_at": now,
+            }},
+            upsert=True,
+        )
+        logger.info("postmarket minute preheat child started run=%s pid=%s", run_id, child.pid)
+        return True
+
     def _continue_minute_preheat_universe(self, trade_date: str, run_id: str) -> int:
         if not _env_bool("SIGNALS_POSTMARKET_CONTINUE_MINUTE_PREHEAT", True):
             return 0
-        before = self._minute_preheat_pending_count(trade_date)
+        before = self._reconcile_minute_preheat_coverage(trade_date)
         if before <= 0:
+            run_doc = self.db["sync_runs"].find_one(
+                {"_id": run_id},
+                {"minute_preheat_owner_pid": 1},
+            ) or {}
+            owner_pid = str(run_doc.get("minute_preheat_owner_pid") or "")
+            if owner_pid and not self._pid_alive(owner_pid):
+                self.db["sync_runs"].update_one(
+                    {"_id": run_id},
+                    {"$set": {
+                        "minute_preheat_owner_pid": "",
+                        "minute_preheat_finished_at": _naive_bj(),
+                        "minute_preheat_recovery": "child_receipt_complete",
+                        "updated_at": _naive_bj(),
+                    }},
+                )
             self.db["sync_runs"].update_one(
                 {"_id": run_id},
                 {"$set": {"minute_preheat_pending": 0, "updated_at": _naive_bj()}},
@@ -1631,6 +2128,14 @@ class PostmarketRunner:
             return 0
         if "stock_minute" not in self.engine.module_map:
             return 0
+
+        released = self._reconcile_minute_preheat_running(trade_date)
+        if released:
+            logger.warning(
+                "postmarket released orphaned minute preheat candidates run=%s released=%d",
+                run_id,
+                released,
+            )
 
         spec = next(
             (task for task in POSTMARKET_TASKS if task.module == "stock_minute" and task.shard_key == "all"),
@@ -1645,6 +2150,24 @@ class PostmarketRunner:
         continue_cap = os.getenv("SIGNALS_POSTMARKET_CONTINUE_MINUTE_MAX_CODES")
         if continue_cap:
             env["STOCK_MINUTE_POSTMARKET_MAX_CODES"] = continue_cap
+
+        isolated_default = not bool(os.getenv("PYTEST_CURRENT_TEST"))
+        isolated = _env_bool("SIGNALS_POSTMARKET_MINUTE_ISOLATED", isolated_default)
+        if isolated and os.getenv("SIGNALS_POSTMARKET_MINUTE_CHILD") != "1":
+            pending_before = self._minute_preheat_pending_count(trade_date)
+            started = self._launch_minute_preheat_child(trade_date, run_id, env)
+            pending_after = self._minute_preheat_pending_count(trade_date)
+            self.db["sync_runs"].update_one(
+                {"_id": run_id},
+                {"$set": {
+                    "minute_preheat_pending": pending_after,
+                    "minute_preheat_continued_at": _naive_bj(),
+                    "minute_preheat_last_launch": bool(started),
+                    "updated_at": _naive_bj(),
+                }},
+                upsert=True,
+            )
+            return max(0, pending_before - pending_after) if not started else 0
 
         batches = _env_int("SIGNALS_POSTMARKET_CONTINUE_MINUTE_BATCHES", 1, minimum=1)
         fn, _schedule = self.engine.module_map["stock_minute"]
@@ -1676,10 +2199,84 @@ class PostmarketRunner:
                 break
         return completed
 
+    def _has_retryable_hk_daily_tasks(self, run_id: str) -> bool:
+        for doc in self.db["sync_tasks"].find(
+            {"run_id": run_id, "module": "hk_stock_daily"},
+            {"status": 1, "result_summary": 1},
+        ):
+            status = str(doc.get("status") or "pending")
+            if status in RETRYABLE_TASK_STATUSES and not _task_effectively_done(doc):
+                return True
+        return False
+
+    def _continue_hk_daily(self, trade_date: str, run_id: str) -> int:
+        """Run a bounded, low-priority HK due-symbol rotation.
+
+        HK is optional for the A-share close path.  Keep it out of the formal
+        DAG critical path, but do not let a pre-cap universe prefix starve the
+        missing tail.  Each shard records ``remaining_due`` and can advance
+        on the next cooldown window.
+        """
+        if not _env_bool("SIGNALS_POSTMARKET_CONTINUE_HK_DAILY", True):
+            return 0
+        if not self._has_retryable_hk_daily_tasks(run_id):
+            return 0
+        now = _naive_bj()
+        run_doc = self.db["sync_runs"].find_one(
+            {"_id": run_id},
+            {"hk_daily_last_continued_at": 1},
+        ) or {}
+        marker = _coerce_dt(run_doc.get("hk_daily_last_continued_at"))
+        cooldown = _env_int("SIGNALS_POSTMARKET_HK_DAILY_COOLDOWN_SECONDS", 300, minimum=60)
+        if marker and (now - marker).total_seconds() < cooldown:
+            return 0
+        self.db["sync_runs"].update_one(
+            {"_id": run_id},
+            {"$set": {"hk_daily_last_continued_at": now, "hk_daily_batch_cap": min(200, _env_int("SIGNALS_POSTMARKET_HK_DAILY_BATCH_CODES", 24, minimum=1))}},
+            upsert=True,
+        )
+        specs = [
+            spec for spec in POSTMARKET_TASKS
+            if spec.module == "hk_stock_daily"
+            and (self._get_task(run_id, spec).get("status") in RETRYABLE_TASK_STATUSES)
+            and not _task_effectively_done(self._get_task(run_id, spec))
+        ]
+        if not specs:
+            return 0
+        cap = min(200, _env_int("SIGNALS_POSTMARKET_HK_DAILY_BATCH_CODES", 24, minimum=1))
+        workers = min(4, _env_int("SIGNALS_POSTMARKET_HK_STOCK_DAILY_WORKERS", 2, minimum=1))
+
+        def run_one(spec: PostmarketTaskSpec) -> dict[str, Any]:
+            with self._with_env({"HK_STOCK_DAILY_MAX_CODES": str(cap)}):
+                return self._run_task(run_id, spec)
+
+        completed = 0
+        with ThreadPoolExecutor(max_workers=min(workers, len(specs)), thread_name_prefix="postmarket-hk") as executor:
+            futures = {executor.submit(run_one, spec): spec for spec in specs}
+            for future, spec in list(futures.items()):
+                try:
+                    result = future.result()
+                    if isinstance(result, dict) and str(result.get("status") or "") in {"ok", "partial"}:
+                        completed += 1
+                except Exception:
+                    logger.exception("bounded HK daily rotation failed task=%s", spec.task_key)
+        self.db["sync_runs"].update_one(
+            {"_id": run_id},
+            {"$set": {"hk_daily_last_batch_completed": completed, "hk_daily_updated_at": _naive_bj()}},
+            upsert=True,
+        )
+        return completed
+
     def _continue_terminal_run(self, trade_date: str, run_id: str) -> bool:
         continued = self._continue_minute_preheat_universe(trade_date, run_id) > 0
+        continued = self._continue_hk_daily(trade_date, run_id) > 0 or continued
         if (
-            _env_bool("SIGNALS_POSTMARKET_CONTINUE_OPTIONAL_TASKS", True)
+            # Optional tails (notably the per-symbol HK history lane) may be
+            # provider-bound and can outlive the formal A-share postmarket
+            # window.  Keep them opt-in so a slow optional lane cannot make a
+            # completed critical run look perpetually ``running``.  Operators
+            # can still enable the lane explicitly for a controlled catch-up.
+            _env_bool("SIGNALS_POSTMARKET_CONTINUE_OPTIONAL_TASKS", False)
             and self._has_retryable_incomplete_tasks(run_id, include_optional=True)
         ):
             logger.info("postmarket continue optional tasks run=%s", run_id)
@@ -1886,7 +2483,12 @@ class PostmarketRunner:
         return None
 
     def run_daemon(self, *, check_seconds: int | None = None) -> None:
-        check_seconds = check_seconds or _env_int("SIGNALS_POSTMARKET_CHECK_SECONDS", 300, minimum=30)
+        # The minute-preheat rotation runs in a bounded child.  A five-minute
+        # parent sleep can leave a finished child idle for almost the entire
+        # interval before the next 240-symbol batch is launched.  Polling once
+        # per minute only performs lightweight Mongo/PID checks; it does not
+        # change provider concurrency or request volume.
+        check_seconds = check_seconds or _env_int("SIGNALS_POSTMARKET_CHECK_SECONDS", 60, minimum=30)
         logger.info("postmarket daemon started workers=%d check_seconds=%d", self.max_workers, check_seconds)
         try:
             reconciled = self._reconcile_orphaned_state()
@@ -1898,6 +2500,24 @@ class PostmarketRunner:
                 )
         except Exception:
             logger.exception("postmarket orphan reconciliation failed")
+        try:
+            active_trade_date = _postmarket_trade_date(_now_bj())
+            recovered = self._reconcile_historical_minute_preheat_orphans(active_trade_date)
+            if recovered:
+                logger.warning(
+                    "postmarket reconciled historical minute-preheat orphans active_date=%s recovered=%d",
+                    active_trade_date,
+                    recovered,
+                )
+        except Exception:
+            logger.exception("historical minute-preheat orphan reconciliation failed")
+        try:
+            active_trade_date = _postmarket_trade_date(_now_bj())
+            reconciled_probe = self._reconcile_minute_readiness_task(active_trade_date)
+            if reconciled_probe:
+                logger.info("postmarket reconciled minute readiness task trade_date=%s", active_trade_date)
+        except Exception:
+            logger.exception("minute readiness task reconciliation failed")
         while True:
             now = _now_bj()
             if self.close_seal is not None and _is_a_share_trading_day(now):
@@ -1906,8 +2526,51 @@ class PostmarketRunner:
                     seal_result = self.close_seal.tick(trade_date, _local_bj(now))
                     if seal_result.get("status") in {"sealed", "partial"} and not seal_result.get("skipped"):
                         logger.info("close seal tick result=%s", seal_result.get("status"))
+                    if seal_result.get("status") == "sealed":
+                        upgraded = self._upgrade_stock_daily_after_close_seal(trade_date)
+                        if upgraded:
+                            logger.info("postmarket upgraded daily shards after close seal trade_date=%s tasks=%d", trade_date, upgraded)
                 except Exception:
                     logger.exception("close seal tick failed")
+            elif self.close_seal is not None and not _is_a_share_trading_day(now):
+                # If the daemon was started/restarted after the normal
+                # 15:00-18:30 window, the old implementation never created a
+                # close-seal run.  Recover only the most recent trade date,
+                # with the same two-probe stability rule and a dedicated
+                # close-seal run id.  This does not touch today's formal lane
+                # or promote replay backfill snapshots.
+                trade_date = _postmarket_trade_date(now)
+                seal_id = f"close_seal:{trade_date}"
+                seal_doc = self.db["sync_runs"].find_one(
+                    {"_id": seal_id},
+                    {"status": 1, "terminal_partial": 1},
+                ) or {}
+                if seal_doc.get("status") != "sealed":
+                    try:
+                        seal_result = self.close_seal.tick(
+                            trade_date,
+                            _local_bj(now),
+                            allow_late_recovery=True,
+                        )
+                        if seal_result.get("status") in {"sealed", "partial"} and not seal_result.get("skipped"):
+                            logger.info(
+                                "late close seal recovery trade_date=%s result=%s",
+                                trade_date,
+                                seal_result.get("status"),
+                            )
+                        if seal_result.get("status") == "sealed":
+                            upgraded = self._upgrade_stock_daily_after_close_seal(trade_date)
+                            if upgraded:
+                                logger.info("postmarket upgraded daily shards after late close seal trade_date=%s tasks=%d", trade_date, upgraded)
+                    except Exception:
+                        logger.exception("late close seal recovery failed")
+                else:
+                    upgraded = self._upgrade_stock_daily_after_close_seal(trade_date)
+                    if upgraded:
+                        logger.info("postmarket upgraded daily shards after existing close seal trade_date=%s tasks=%d", trade_date, upgraded)
+                    reconciled_probe = self._reconcile_minute_readiness_task(trade_date)
+                    if reconciled_probe:
+                        logger.info("postmarket reconciled minute readiness task trade_date=%s", trade_date)
             if self.should_run_now(now):
                 trade_date = _postmarket_trade_date(now)
                 run_id = default_run_id(trade_date)
@@ -1927,6 +2590,33 @@ class PostmarketRunner:
                     else:
                         logger.info("postmarket catchup trigger run=%s previous_status=%s", run_id, status)
                         self.run_once(resume_run_id=run_id, trade_date=trade_date)
+                elif not _is_a_share_trading_day(now):
+                    # A completed postmarket DAG may still have a bounded,
+                    # low-priority minute-preheat rotation outstanding.  The
+                    # normal catch-up path intentionally stays disabled for
+                    # old trade dates, but this rotation is safe to continue:
+                    # it only advances the existing universe pointer and does
+                    # not rebuild formal close data or reports.  Without this
+                    # branch, a Friday backlog can remain frozen all weekend.
+                    trade_date = _postmarket_trade_date(now)
+                    run_id = default_run_id(trade_date)
+                    run_doc = self.db["sync_runs"].find_one(
+                        {"_id": run_id},
+                        {"status": 1, "minute_preheat_owner_pid": 1},
+                    ) or {}
+                    if (
+                        run_doc.get("status") in RUN_TERMINAL_STATUSES
+                        and (
+                            self._minute_preheat_pending_count(trade_date) > 0
+                            or bool(run_doc.get("minute_preheat_owner_pid"))
+                            or self._has_retryable_hk_daily_tasks(run_id)
+                        )
+                    ):
+                        logger.info(
+                            "postmarket continue minute rotation on non-trading day run=%s",
+                            run_id,
+                        )
+                        self._continue_terminal_run(trade_date, run_id)
             sleep_seconds = check_seconds
             if self.close_seal is not None:
                 try:

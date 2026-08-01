@@ -510,6 +510,7 @@ def test_postmarket_daemon_continues_optional_tasks_for_terminal_run(monkeypatch
     monkeypatch.setattr(pm.PostmarketRunner, "should_run_now", staticmethod(lambda now=None: True))
     monkeypatch.setattr(pm, "_postmarket_trade_date", lambda now=None: "2026-04-28")
     monkeypatch.setenv("SIGNALS_POSTMARKET_CONTINUE_MINUTE_PREHEAT", "false")
+    monkeypatch.setenv("SIGNALS_POSTMARKET_CONTINUE_OPTIONAL_TASKS", "true")
 
     calls = []
 

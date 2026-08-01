@@ -140,6 +140,9 @@ def test_expected_latest_minute_watermark_handles_lunch_and_close():
     assert stock_minute._expected_latest_dt_by_freq(
         ["5分钟"], datetime(2026, 5, 6, 16, 0)
     )["5分钟"] == datetime(2026, 5, 6, 15, 0)
+    assert stock_minute._expected_latest_dt_by_freq(
+        ["5分钟"], datetime(2026, 8, 1, 21, 0)
+    )["5分钟"] == datetime(2026, 7, 31, 15, 0)
 
 
 def test_selection_rotates_stale_priority_after_pinned():
@@ -365,6 +368,33 @@ def test_postmarket_minute_scope_uses_expanded_candidate_cap(monkeypatch):
     monkeypatch.setenv("STOCK_MINUTE_CLOSE_MAX_CODES", "72")
 
     assert stock_minute._selection_cap() == 360
+
+
+def test_postmarket_fullmarket_candidates_append_valid_current_quotes(monkeypatch):
+    monkeypatch.setenv("STOCK_MINUTE_POSTMARKET_FULLMARKET_LIMIT", "10")
+    db = _Db({
+        "fullmarket_spot_snapshots": _Collection(docs=[
+            {"code": "300001", "symbol": "SZ.300001", "price": 12.3, "open": 12, "high": 13, "low": 11, "prev_close": 12, "asset_class": "stock"},
+            {"code": "510300", "symbol": "SH.510300", "price": 4.2, "open": 4, "high": 4.3, "low": 3.9, "prev_close": 4.1, "asset_class": "etf"},
+            {"code": "000001", "symbol": "SZ.000001", "price": 0, "open": 1, "high": 1, "low": 1, "prev_close": 1, "asset_class": "stock"},
+            {"code": "000016", "symbol": "SZ.000016", "price": 2.8, "open": 2.7, "high": 2.9, "low": 2.6, "prev_close": 2.7, "asset_class": "stock"},
+            {"code": "600000", "symbol": "SH.600000", "price": 8.8, "open": 8, "high": 9, "low": 7, "prev_close": 8.2, "asset_class": "stock"},
+        ])
+    })
+    symbols = ["688802"]
+    source_counts = {}
+    priority = set()
+    pinned = set()
+    sources = {}
+
+    stock_minute._add_postmarket_fullmarket_candidates(
+        db, symbols, source_counts, priority, pinned, stock_minute._index_codes(), sources
+    )
+
+    assert symbols == ["688802", "300001", "000016", "600000"]
+    assert "510300" not in symbols
+    assert "000001" not in symbols
+    assert source_counts["fullmarket_active_universe"] == 3
 
 
 def test_postmarket_minute_freqs_read_task_env(monkeypatch):

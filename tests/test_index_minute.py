@@ -11,6 +11,7 @@ from signals.core.macro_universe import (
     macro_industry_etf_pure_codes,
     macro_industry_etf_symbol_by_code,
     macro_watchlist,
+    supports_a_index_minute_cache,
 )
 
 
@@ -197,3 +198,9 @@ def test_minute_readiness_probe_uses_macro_index_universe():
     assert "sh000680" in symbols
     assert "sz399986" in symbols
     assert "sz399303" in symbols
+
+
+def test_custom_csi_indices_are_explicitly_daily_only_for_minute_cache():
+    assert supports_a_index_minute_cache("sh932038") is False
+    assert supports_a_index_minute_cache("SH.931837") is False
+    assert supports_a_index_minute_cache("sh000688") is True
