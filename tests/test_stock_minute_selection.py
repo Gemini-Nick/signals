@@ -122,6 +122,26 @@ def test_priority_selection_respects_signal_lane_cap():
     ]
 
 
+def test_expected_latest_minute_watermark_handles_lunch_and_close():
+    assert stock_minute._expected_latest_dt_by_freq(
+        ["5分钟", "15分钟", "30分钟"], datetime(2026, 5, 6, 10, 7)
+    ) == {
+        "5分钟": datetime(2026, 5, 6, 10, 5),
+        "15分钟": datetime(2026, 5, 6, 10, 0),
+        "30分钟": datetime(2026, 5, 6, 10, 0),
+    }
+    assert stock_minute._expected_latest_dt_by_freq(
+        ["5分钟", "15分钟", "30分钟"], datetime(2026, 5, 6, 12, 10)
+    ) == {
+        "5分钟": datetime(2026, 5, 6, 11, 30),
+        "15分钟": datetime(2026, 5, 6, 11, 30),
+        "30分钟": datetime(2026, 5, 6, 11, 30),
+    }
+    assert stock_minute._expected_latest_dt_by_freq(
+        ["5分钟"], datetime(2026, 5, 6, 16, 0)
+    )["5分钟"] == datetime(2026, 5, 6, 15, 0)
+
+
 def test_selection_rotates_stale_priority_after_pinned():
     selected, skipped = stock_minute._select_symbols_with_priority(
         ["688802", "300575", "688396", "600000"],

@@ -411,15 +411,19 @@ class SyncEngine:
         now = self._now()
         cutoff = now - max_age
         stale_docs = list(sync_log.find(
-            {"_id": {"$regex": ":_meta$"}, "status": "running"},
-            {"_id": 1, "module": 1, "last_run": 1, "owner_pid": 1},
+            {
+                "$or": [
+                    {"_id": {"$regex": ":_meta$"}},
+                    {"_id": {"$regex": ":progress:"}},
+                ],
+                "status": "running",
+            },
+            {"_id": 1, "module": 1, "last_run": 1, "owner_pid": 1, "heartbeat_at": 1, "updated_at": 1},
         ))
-        if not stale_docs:
-            return 0
 
         released = 0
         for doc in stale_docs:
-            last_run = doc.get("last_run")
+            last_run = doc.get("heartbeat_at") or doc.get("last_run") or doc.get("updated_at")
             last_run_dt = self._coerce_local_datetime(last_run)
             owner_pid = doc.get("owner_pid")
             owner_dead = bool(owner_pid) and not self._pid_alive(owner_pid)
@@ -441,9 +445,37 @@ class SyncEngine:
                 }},
             )
             released += 1
-        if released:
-            logger.warning("released %d stale/orphaned running sync modules", released)
-        return released
+        # provider_health has no owner PID, so only release entries whose
+        # running marker is older than the same bounded timeout.  This keeps
+        # the dashboard from advertising a dead provider lane forever.
+        provider_released = 0
+        try:
+            for doc in self.db["provider_health"].find(
+                {"status": "running"},
+                {"_id": 1, "updated_at": 1, "last_success_at": 1, "endpoint": 1},
+            ):
+                marker = doc.get("updated_at") or doc.get("last_success_at")
+                marker_dt = self._coerce_local_datetime(marker)
+                if marker_dt and marker_dt >= cutoff:
+                    continue
+                self.db["provider_health"].update_one(
+                    {"_id": doc.get("_id"), "status": "running"},
+                    {"$set": {
+                        "status": "degraded",
+                        "stale_reason": "orphaned_running_provider",
+                        "updated_at": now,
+                    }},
+                )
+                provider_released += 1
+        except Exception:
+            logger.debug("provider health orphan reconciliation unavailable", exc_info=True)
+        if released or provider_released:
+            logger.warning(
+                "released stale/orphaned state sync_modules=%d providers=%d",
+                released,
+                provider_released,
+            )
+        return released + provider_released
 
     def run_module(
         self,
@@ -681,8 +713,20 @@ class SyncEngine:
         counts = self._target_counts(module_name)
         if isinstance(result, dict):
             result_status = str(result.get("status") or "").lower()
+            if result.get("backfill_isolated"):
+                return "partial", str(
+                    result.get("backfill_reason")
+                    or result.get("reason")
+                    or "backfill_isolated"
+                )
             if result_status in {"partial", "degraded", "error"}:
-                return result_status, str(result.get("error_msg") or result.get("degraded_reason") or result.get("reason") or "")
+                return result_status, str(
+                    result.get("error_msg")
+                    or result.get("degraded_reason")
+                    or result.get("backfill_reason")
+                    or result.get("reason")
+                    or ""
+                )
         if not counts:
             return "ok", None
         inserted = self._result_inserted(result)
@@ -719,7 +763,12 @@ class SyncEngine:
             domain = COLLECTION_DOMAINS.get(collection, module_name)
             freshness_query = {"domain": domain, "market": market_value, "mode": mode, "collection": collection}
             writer_fields = WRITER_FRESHNESS_FIELDS.get(module_name)
-            if writer_fields and status == "ok":
+            # Writers such as fullmarket/ETF snapshots own their freshness
+            # watermark even when a historical ad-hoc request is isolated into
+            # the backfill collection.  Preserve that explicit state for
+            # partial results; otherwise the engine would replace it with the
+            # wall-clock timestamp of the maintenance attempt.
+            if writer_fields and status in {"ok", "partial"}:
                 try:
                     existing = self.db["data_freshness"].find_one(
                         freshness_query,
@@ -896,7 +945,11 @@ class SyncEngine:
         quote_preopen = self._quote_preopen_enabled() and self._a_quote_preopen_active(now)
         if not active_markets and quote_preopen:
             active_markets = {Market.A}
-        if not active_markets and force:
+        # A manual dashboard refresh may pass force_live=True.  Do not turn a
+        # weekend/holiday click into a provider storm or write a prior trading
+        # day's data into realtime caches.  Keep the useful weekday after-hours
+        # force behavior for operators who intentionally request a close pass.
+        if not active_markets and force and self._is_a_trading_day(now.date()):
             active_markets = {Market.A}
         if not active_markets:
             return []
@@ -942,6 +995,10 @@ class SyncEngine:
 
     @classmethod
     def _schedule_due(cls, schedule: str, now: datetime) -> bool:
+        # Lane markers are dispatched by their dedicated live/postmarket
+        # runners and are never due in the generic scheduled lane.
+        if schedule in {"live only", "postmarket only"}:
+            return False
         weekday = now.weekday()
         if "weekday" in schedule:
             try:

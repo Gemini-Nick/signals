@@ -14,7 +14,14 @@ from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import trading_day_key
+from signals.sync.trade_date import a_share_task_trade_date
 from signals.sync.eastmoney_observer import observe_eastmoney
+from signals.sync.immutable_snapshot import (
+    append_backfill_snapshot_docs,
+    append_snapshot_docs,
+    current_run_id,
+    historical_without_run_id,
+)
 from signals.sync.provider_limits import provider_call
 from signals.sync.task_context import get_task_env
 from signals.sync.volume_units import CANONICAL_STOCK_VOLUME_UNIT, normalize_stock_volume
@@ -183,11 +190,12 @@ def _write_data_freshness(
     trade_date: str,
     elapsed: float,
     error: str = "",
+    freshness_override: str | None = None,
 ) -> None:
     now = naive_market_now("A")
     lane = str(get_task_env("SIGNALS_CURRENT_SYNC_LANE", "") or "")
     mode = "realtime" if get_task_env("SIGNALS_CURRENT_SYNC_MARKET") or lane else "postmarket"
-    status = "fresh" if count > 0 else "empty"
+    status = freshness_override or ("fresh" if count > 0 else "empty")
     db["data_freshness"].update_one(
         {"domain": "spot", "market": "A", "mode": mode, "collection": "fullmarket_spot_snapshots"},
         {"$set": {
@@ -201,7 +209,7 @@ def _write_data_freshness(
             "as_of": trade_date,
             "date_key": date_key,
             "updated_at": now,
-            "stale_reason": "" if count > 0 else (error or "fullmarket_spot_empty"),
+            "stale_reason": "" if count > 0 and not freshness_override else (error or "fullmarket_spot_empty"),
             "count": count,
             "elapsed_seconds": round(elapsed, 3),
         }},
@@ -213,8 +221,8 @@ def sync_fullmarket_spot_snapshot(db: Database, proxy_url: str = None) -> dict:
     del proxy_url
     started = time.monotonic()
     now = naive_market_now("A")
-    trade_date = trading_day_key("A", now=now, open_time=QUOTE_TRADING_DAY_OPEN)
-    date_key = trading_day_key("A", now=now, compact=True, open_time=QUOTE_TRADING_DAY_OPEN)
+    trade_date = a_share_task_trade_date(now=now)
+    date_key = trade_date.replace("-", "")
     try:
         rows = fetch_eastmoney_spot_rows(db)
     except Exception as exc:
@@ -249,6 +257,51 @@ def sync_fullmarket_spot_snapshot(db: Database, proxy_url: str = None) -> dict:
         if doc is not None
     ]
 
+    run_id = current_run_id()
+    if historical_without_run_id(trade_date, run_id=run_id):
+        reason = "historical_without_run_id_isolated"
+        backfill_result = append_backfill_snapshot_docs(
+            db,
+            source_id="signals-fullmarket-spot",
+            trade_date=trade_date,
+            docs=docs,
+            reason=reason,
+            captured_at=now,
+        )
+        elapsed = time.monotonic() - started
+        _write_data_freshness(
+            db,
+            count=len(docs),
+            date_key=date_key,
+            trade_date=trade_date,
+            elapsed=elapsed,
+            freshness_override="backfill_isolated",
+            error=reason,
+        )
+        return {
+            "module": "fullmarket_spot_snapshot",
+            # Keep the engine's standard status vocabulary; the explicit
+            # backfill_isolated flag carries the audit detail without being
+            # misclassified as a successful module result.
+            "status": "degraded",
+            "count": len(docs),
+            "inserted": 0,
+            "modified": 0,
+            "backfill_isolated": True,
+            "backfill_reason": reason,
+            "backfill_collection": backfill_result.get("collection"),
+            "backfill_snapshot": backfill_result,
+            "formal_upsert_skipped": True,
+            "target_collection": "fullmarket_spot_snapshots",
+            "date_key": date_key,
+            "trade_date": trade_date,
+            "elapsed": elapsed,
+        }
+
+    immutable_result = append_snapshot_docs(
+        db, source_id="signals-fullmarket-spot", trade_date=trade_date, docs=docs
+    )
+
     inserted = 0
     modified = 0
     if docs:
@@ -280,6 +333,7 @@ def sync_fullmarket_spot_snapshot(db: Database, proxy_url: str = None) -> dict:
         "count": len(docs),
         "inserted": inserted,
         "modified": modified,
+        "immutable_snapshot": immutable_result,
         "target_collection": "fullmarket_spot_snapshots",
         "date_key": date_key,
         "trade_date": trade_date,

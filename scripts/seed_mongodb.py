@@ -390,7 +390,9 @@ def phase4_constituents(db):
 
     # 指数成分股
     idx_col = db["index_constituents"]
-    idx_col.drop()
+    # Append-only: historical constituent versions are evidence, not a
+    # replaceable current-state cache.
+    from scripts.versioned_index_constituents import append_index_snapshot
     idx_docs = []
 
     for query_fn, idx_name in [
@@ -405,16 +407,15 @@ def phase4_constituents(db):
             code = row[1].split(".")[1] if "." in row[1] else row[1]
             stocks.append({"code": code, "code_name": row[2]})
         if stocks:
-            idx_docs.append({
-                "index_name": idx_name,
-                "dt": datetime.now().strftime("%Y-%m-%d"),
-                "stocks": [s["code"] for s in stocks],
-                "count": len(stocks),
-            })
+            result = append_index_snapshot(
+                idx_col,
+                index_name=idx_name,
+                effective_date=datetime.now().strftime("%Y-%m-%d"),
+                stocks=stocks,
+                source="baostock",
+            )
+            idx_docs.append(result["document"])
             logger.info(f"  ✓ {idx_name}: {len(stocks)} 只")
-
-    if idx_docs:
-        idx_col.insert_many(idx_docs, ordered=False)
 
     bs.logout()
     logger.info(f"Phase 4 完成: {len(docs)} 行业, {len(idx_docs)} 指数成分股")

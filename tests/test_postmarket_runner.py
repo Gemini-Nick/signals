@@ -78,6 +78,7 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
         if task.blocks_run
         for dep in task.depends_on
     )
+
     assert pm.POSTMARKET_PHASES.index("chain_context") < pm.POSTMARKET_PHASES.index("derived")
     assert pm.POSTMARKET_PHASES.index("minute_preheat") < pm.POSTMARKET_PHASES.index("minute_fullmarket")
     assert pm.POSTMARKET_PHASES.index("minute_fullmarket") < pm.POSTMARKET_PHASES.index("hk_market_data")
@@ -100,6 +101,23 @@ def test_default_postmarket_tasks_split_long_market_data_tasks():
     assert readiness.env["MINUTE_READINESS_SELECTION_META_ID"] == "stock_minute:postmarket_selection:_meta"
     assert readiness.blocks_run is False
     assert close_index_minute.phase == "market_data"
+
+
+def test_stock_30m_allows_partial_daily_shard_dependency():
+    runner = object.__new__(pm.PostmarketRunner)
+    spec = pm.PostmarketTaskSpec(
+        "stock_30m_fullmarket",
+        "minute_fullmarket",
+        shard_key="shard_00",
+        depends_on=("stock_daily:shard_00",),
+        blocks_run=False,
+    )
+
+    assert runner._soft_dependency_allowed(
+        spec,
+        "stock_daily:shard_00",
+        {"status": "partial"},
+    ) is True
 
 
 def test_postmarket_trade_date_skips_cn_labor_day_holiday():

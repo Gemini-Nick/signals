@@ -75,12 +75,35 @@ def _collect_pool_symbols(db: Database) -> dict[str, set[str]]:
         for doc in cursor:
             _add_many(pool, _symbols_from_doc(doc), collection)
 
-    for doc in db["bars"].aggregate([
-        {"$sort": {"dt": -1}},
-        {"$group": {"_id": "$meta.symbol", "latest_dt": {"$first": "$dt"}}},
-        {"$limit": 200},
-    ]):
-        _add_many(pool, [doc.get("_id")], "bars")
+    # Reuse the bounded universe selected by stock_minute instead of doing a
+    # collection-wide sort/group over tens of millions of bars.  These docs are
+    # written once per lane run and are the same symbols users expect in the
+    # realtime pool.
+    for meta_id, source in (
+        ("stock_minute:selection:_meta", "stock_minute_selection"),
+        ("stock_minute:postmarket_selection:_meta", "postmarket_selection"),
+    ):
+        try:
+            doc = db["sync_log"].find_one(
+                {"_id": meta_id, "status": "ok"},
+                {"selected_symbols": 1, "priority_symbols": 1},
+            ) or {}
+        except Exception:
+            doc = {}
+        selected = doc.get("selected_symbols") or doc.get("priority_symbols") or []
+        _add_many(pool, selected, source)
+
+    # Keep a small fallback for cold starts, using the existing freq/date index
+    # and a hard cap.  This is intentionally not an aggregation.
+    try:
+        cursor = db["bars"].find(
+            {"meta.freq": "日线"},
+            {"meta.symbol": 1},
+        ).sort("dt", -1).limit(400)
+        for doc in cursor:
+            _add_many(pool, [(doc.get("meta") or {}).get("symbol")], "bars")
+    except Exception:
+        logger.debug("bounded daily-bar pool fallback unavailable", exc_info=True)
 
     return pool
 
@@ -147,7 +170,7 @@ def sync_market_pools(db: Database, proxy_url: str = None) -> dict:
         "symbols": symbols,
         "items": items,
         "count": len(symbols),
-        "source": "whitelist+trades+signals+constituents+bars",
+        "source": "whitelist+trades+signals+constituents+minute_selection+bars",
         "freshness": "fresh" if symbols else "empty",
         "updated_at": now,
         "expires_at": now + timedelta(days=7),

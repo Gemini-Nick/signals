@@ -30,8 +30,10 @@ def test_replay_skill_has_distinct_short_and_long_reading_contracts():
         "Do not use a table",
         "Retain all five labels",
         "Stop output immediately after the third numbered item",
-        "within 3,800 visible characters",
+        "within 4,500 visible characters",
+        "Use exactly four level-two sections",
         "up to five decision-changing intraday turns",
+        "omit a missing open, morning, afternoon, or close node",
         "at most two strong plus two weak cases",
         "Keep the same three next-session observations",
     ):
@@ -100,5 +102,17 @@ def test_sector_transition_events_are_consume_only_and_do_not_change_routing():
         "Consume only: do not recalculate indicators",
         "Use no more than the six timeline rows returned by Signals",
         "Do not change notification routing, send decisions, or three-pool membership",
+    ):
+        assert phrase in text
+
+
+def test_signals_unique_value_is_event_path_without_participant_intent():
+    text = SKILL.read_text(encoding="utf-8")
+    for phrase in (
+        "at least two comparable same-day nodes",
+        "If only the final ranking exists, shorten the replay",
+        "Treat limit-up/failed-limit data as a close ecosystem",
+        "Do not infer overnight willingness",
+        "the index closed near the session low",
     ):
         assert phrase in text

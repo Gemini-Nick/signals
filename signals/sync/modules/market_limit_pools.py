@@ -11,6 +11,8 @@ from pymongo.database import Database
 from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import a_share_realtime_day_key
 from signals.sync.proxy import em_proxy
+from signals.sync.task_context import get_task_env
+from signals.sync.trade_date import a_share_task_trade_date
 
 from ..retry import sync_retry
 
@@ -159,9 +161,11 @@ def sync_market_limit_pools(db: Database, trade_date: str | None = None, proxy_u
     """Fetch AkShare/Eastmoney market pools and upsert normalized rows."""
     import akshare as ak
 
+    explicit_trade_date = bool(trade_date or get_task_env("SIGNALS_POSTMARKET_TRADE_DATE", ""))
+    trade_date = trade_date or a_share_task_trade_date()
     date_compact, day = _date_key(trade_date)
     now = naive_market_now("A")
-    snapshot_at = _snapshot_at_for_trade_date(day, now, explicit_trade_date=trade_date is not None)
+    snapshot_at = _snapshot_at_for_trade_date(day, now, explicit_trade_date=explicit_trade_date)
     docs: list[dict[str, Any]] = []
     errors: dict[str, str] = {}
     pool_status: dict[str, dict[str, Any]] = {}

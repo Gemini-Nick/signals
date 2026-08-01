@@ -111,6 +111,23 @@ def test_zero_insert_empty_target_is_degraded():
     assert error == "target_empty_after_zero_insert"
 
 
+def test_isolated_backfill_is_partial_with_explicit_reason():
+    engine = object.__new__(SyncEngine)
+    engine.db = _FakeDb({"fullmarket_spot_snapshots": _FakeCollection(count=10)})
+
+    status, error = engine._classify_result(
+        "fullmarket_spot_snapshot",
+        {
+            "status": "degraded",
+            "backfill_isolated": True,
+            "backfill_reason": "historical_without_run_id_isolated",
+        },
+    )
+
+    assert status == "partial"
+    assert error == "historical_without_run_id_isolated"
+
+
 def test_stale_running_module_can_rerun():
     engine = object.__new__(SyncEngine)
     engine.db = _FakeDb({

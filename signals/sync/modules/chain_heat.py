@@ -16,6 +16,7 @@ from signals.core.trading_dates import (
     a_share_realtime_day_key,
     normalized_a_share_realtime_minute,
 )
+from signals.sync.trade_date import a_share_task_trade_date
 
 from ..retry import sync_retry
 
@@ -965,8 +966,12 @@ def sync_chain_heat_snapshots(db: Database, proxy_url: str = None) -> dict:
     snapshots = _aggregate(mapped, latest_minute)
     if not snapshots:
         now = naive_market_now("A")
-        trade_date = a_share_realtime_day_key(now=now)
-        trade_minute = normalized_a_share_realtime_minute(now=now)
+        trade_date = a_share_task_trade_date(now=now)
+        trade_minute = (
+            datetime.fromisoformat(trade_date).replace(hour=15, minute=0, second=0, microsecond=0)
+            if trade_date != now.date().isoformat()
+            else normalized_a_share_realtime_minute(now=now)
+        )
         db["data_freshness"].update_one(
             {"domain": "chain_heat", "market": "A", "mode": "realtime", "collection": "chain_heat_snapshots"},
             {"$set": {

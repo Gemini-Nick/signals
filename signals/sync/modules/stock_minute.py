@@ -23,6 +23,7 @@ from signals.core.market_time import naive_market_now, to_market_naive
 from ..proxy import em_proxy
 from ..retry import sync_retry
 from ..task_context import get_task_env
+from ..trade_date import a_share_task_trade_date
 from .minute_change import recalculate_minute_change_pct
 from .minute_sources import fetch_public_minute, stock_to_market_symbol
 
@@ -524,7 +525,7 @@ def _latest_stock_minute_runs(db: Database, symbols: list[str]) -> dict[str, obj
 
 
 def _minute_trade_date() -> str:
-    return naive_market_now("A").date().isoformat()
+    return a_share_task_trade_date(now=naive_market_now("A"))
 
 
 def _minute_universe_statuses(db: Database, symbols: list[str], trade_date: str) -> dict[str, dict]:
@@ -752,11 +753,34 @@ def _minute_universe_summary(db: Database, trade_date: str | None = None) -> dic
     }
 
 
-def _postmarket_expected_latest_dt_by_freq(freqs: list[str]) -> dict[str, datetime]:
-    """Expected A-share minute bar close after market close."""
-    now = naive_market_now("A")
-    close_dt = datetime(now.year, now.month, now.day, 15, 0)
-    return {freq: close_dt for freq in freqs}
+def _expected_latest_dt_by_freq(freqs: list[str], now: datetime | None = None) -> dict[str, datetime]:
+    """Return the latest closed A-share bar watermark for each frequency.
+
+    The signal lane runs every few minutes, so treating every pass as a fresh
+    provider request caused 213 calls even when the latest closed bucket had
+    not moved.  The lunch break is pinned to 11:30 and the close to 15:00.
+    """
+    now = now or naive_market_now("A")
+    if now.time() < datetime(now.year, now.month, now.day, 9, 30).time():
+        return {}
+    if now.time() < datetime(now.year, now.month, now.day, 11, 30).time():
+        base = now.replace(second=0, microsecond=0)
+    elif now.time() < datetime(now.year, now.month, now.day, 13, 0).time():
+        base = now.replace(hour=11, minute=30, second=0, microsecond=0)
+    elif now.time() <= datetime(now.year, now.month, now.day, 15, 0).time():
+        base = now.replace(second=0, microsecond=0)
+    else:
+        base = now.replace(hour=15, minute=0, second=0, microsecond=0)
+    result: dict[str, datetime] = {}
+    for freq in freqs:
+        minutes = {"5分钟": 5, "15分钟": 15, "30分钟": 30}.get(freq)
+        if not minutes:
+            continue
+        if base.hour == 11 and base.minute == 30:
+            result[freq] = base
+            continue
+        result[freq] = base.replace(minute=(base.minute // minutes) * minutes)
+    return result
 
 
 def _latest_minute_dates_by_symbol_freq(
@@ -1281,12 +1305,12 @@ def sync_stock_minute(db: Database, proxy_url: str = None) -> dict:
     planned_tasks = [(code, freq) for code in symbols for freq in minute_freqs]
     tasks = planned_tasks
     skipped_current_tasks: list[tuple[str, str, datetime]] = []
-    if postmarket_scope and _bool_env("STOCK_MINUTE_SKIP_CURRENT_CACHE", True):
+    if _bool_env("STOCK_MINUTE_SKIP_CURRENT_CACHE", True):
         latest_by_key = _latest_minute_dates_by_symbol_freq(db, symbols, minute_freqs)
         tasks, skipped_current_tasks = _split_current_minute_tasks(
             planned_tasks,
             latest_by_key,
-            _postmarket_expected_latest_dt_by_freq(minute_freqs),
+            _expected_latest_dt_by_freq(minute_freqs),
         )
         total_skipped_current_calls = len(skipped_current_tasks)
         for code, freq, _latest_dt in skipped_current_tasks:

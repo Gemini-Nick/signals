@@ -144,6 +144,100 @@ class _Db(dict):
         return dict.__getitem__(self, key)
 
 
+class _WriteResult:
+    upserted_count = 1
+    modified_count = 0
+
+
+class _WriteCollection:
+    def __init__(self):
+        self.bulk_writes = []
+        self.update_calls = []
+
+    def bulk_write(self, operations, ordered=False):
+        assert ordered is False
+        self.bulk_writes.append(list(operations))
+        return _WriteResult()
+
+    def update_one(self, query, update, upsert=False):
+        self.update_calls.append((query, update, upsert))
+
+
+class _WriteDb(dict):
+    def __getitem__(self, key):
+        return self.setdefault(key, _WriteCollection())
+
+
+def _historical_trade_day(_market, *, now=None, compact=False, open_time=None):
+    del now, open_time
+    return "20260731" if compact else "2026-07-31"
+
+
+def _eastmoney_row():
+    return {
+        "f12": "600001",
+        "f14": "测试股份",
+        "f2": 10.5,
+        "f3": 2.4,
+        "f4": 0.25,
+        "f5": 1000,
+        "f6": 100000,
+        "f18": 10.25,
+    }
+
+
+def test_fullmarket_historical_refresh_isolated_without_run_id(monkeypatch):
+    monkeypatch.delenv("SIGNALS_POSTMARKET_RUN_ID", raising=False)
+    monkeypatch.delenv("SIGNALS_CLOSE_SEAL_RUN_ID", raising=False)
+    monkeypatch.setattr(fullmarket_spot_snapshot, "naive_market_now", lambda _market: datetime(2026, 8, 1, 10, 0))
+    monkeypatch.setattr(fullmarket_spot_snapshot, "trading_day_key", _historical_trade_day)
+    monkeypatch.setattr(fullmarket_spot_snapshot, "fetch_eastmoney_spot_rows", lambda _db: [_eastmoney_row()])
+    db = _WriteDb()
+
+    result = fullmarket_spot_snapshot.sync_fullmarket_spot_snapshot(db)
+
+    assert result["status"] == "degraded"
+    assert result["backfill_isolated"] is True
+    assert result["formal_upsert_skipped"] is True
+    assert db["fullmarket_spot_snapshots"].bulk_writes == []
+    assert len(db["replay_backfill_snapshots"].bulk_writes) == 1
+    assert db["data_freshness"].update_calls[-1][1]["$set"]["freshness"] == "backfill_isolated"
+
+
+def test_etf_historical_refresh_isolated_without_run_id(monkeypatch):
+    monkeypatch.delenv("SIGNALS_POSTMARKET_RUN_ID", raising=False)
+    monkeypatch.delenv("SIGNALS_CLOSE_SEAL_RUN_ID", raising=False)
+    monkeypatch.setattr(etf_spot_snapshot, "naive_market_now", lambda _market: datetime(2026, 8, 1, 10, 0))
+    monkeypatch.setattr(etf_spot_snapshot, "trading_day_key", _historical_trade_day)
+    monkeypatch.setattr(etf_spot_snapshot, "fetch_etf_spot_rows", lambda _db: [_eastmoney_row()])
+    db = _WriteDb()
+
+    result = etf_spot_snapshot.sync_etf_spot_snapshot(db)
+
+    assert result["status"] == "degraded"
+    assert result["backfill_isolated"] is True
+    assert result["formal_upsert_skipped"] is True
+    assert db["etf_spot_snapshots"].bulk_writes == []
+    assert db["fullmarket_spot_snapshots"].bulk_writes == []
+    assert len(db["replay_backfill_snapshots"].bulk_writes) == 1
+
+
+def test_fullmarket_formal_run_id_keeps_working_table_path(monkeypatch):
+    monkeypatch.setenv("SIGNALS_POSTMARKET_RUN_ID", "postmarket:2026-07-31")
+    monkeypatch.delenv("SIGNALS_CLOSE_SEAL_RUN_ID", raising=False)
+    monkeypatch.setattr(fullmarket_spot_snapshot, "naive_market_now", lambda _market: datetime(2026, 8, 1, 10, 0))
+    monkeypatch.setattr(fullmarket_spot_snapshot, "trading_day_key", _historical_trade_day)
+    monkeypatch.setattr(fullmarket_spot_snapshot, "fetch_eastmoney_spot_rows", lambda _db: [_eastmoney_row()])
+    db = _WriteDb()
+
+    result = fullmarket_spot_snapshot.sync_fullmarket_spot_snapshot(db)
+
+    assert result["status"] == "ok"
+    assert "formal_upsert_skipped" not in result
+    assert len(db["fullmarket_spot_snapshots"].bulk_writes) == 1
+    assert db["replay_backfill_snapshots"].bulk_writes == []
+
+
 def test_stock_daily_reads_persisted_fullmarket_spot_snapshot(monkeypatch):
     monkeypatch.setenv("STOCK_DAILY_SPOT_SNAPSHOT_MIN_ROWS", "1")
     db = _Db({

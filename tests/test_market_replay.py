@@ -9,11 +9,50 @@ from signals.replay.market_replay import (
     _flow_availability,
     _limit_pool_lookup,
     _major_index_daily_rows,
+    _market_breadth,
     _replay_coverage,
     _stock_daily_task_coverage,
     build_market_replay_context,
     format_market_replay_sections,
 )
+
+
+def test_market_breadth_rejects_next_day_backfill_snapshot():
+    day = "2026-07-31"
+    row = {
+        "trade_date": day,
+        "date_key": day,
+        "symbol": "SH.600001",
+        "code": "600001",
+        "name": "样本A",
+        "close": 10.0,
+        "prev_close": 9.5,
+        "change_pct": 5.26,
+        "amount": 100000000,
+        "snapshot_at": datetime(2026, 8, 1, 9, 59),
+    }
+    db = FakeDB({"fullmarket_spot_snapshots": FakeCollection([row])})
+    assert _market_breadth(db, day)["status"] == "missing"
+
+
+def test_market_breadth_accepts_same_day_snapshot():
+    day = "2026-07-31"
+    row = {
+        "trade_date": day,
+        "date_key": day,
+        "symbol": "SH.600001",
+        "code": "600001",
+        "name": "样本A",
+        "close": 10.0,
+        "prev_close": 9.5,
+        "change_pct": 5.26,
+        "amount": 100000000,
+        "snapshot_at": datetime(2026, 7, 31, 15, 30),
+    }
+    db = FakeDB({"fullmarket_spot_snapshots": FakeCollection([row])})
+    breadth = _market_breadth(db, day)
+    assert breadth["status"] == "available"
+    assert breadth["total"] == 1
 
 
 class FakeCursor:
@@ -207,6 +246,8 @@ def test_stock_universe_excludes_explicit_etf_but_retains_new_stock_without_type
         }
     )
 
+    for row in db["fullmarket_spot_snapshots"].rows:
+        row["snapshot_at"] = datetime(2026, 7, 14, 15, 30)
     context = build_market_replay_context(db, trade_date=day, high_turnover_limit=5)
 
     assert [row["code"] for row in context["high_turnover_cores"]] == ["301583"]
@@ -289,16 +330,40 @@ def test_replay_coverage_separates_official_close_from_latest_intraday_bar():
         "official_symbols": 5150,
         "official_coverage_pct": 99.04,
     }
-    close_seal = {"status": "sealed", "close_finality": "stable_close", "formal_ready": True}
+    close_seal = {
+        "status": "sealed",
+        "close_finality": "stable_close",
+        "formal_ready": True,
+        "sealed_at": "2026-07-14T15:10:02+08:00",
+    }
 
     formal = _replay_coverage(day, "formal_postmarket", daily, intraday, breadth, stock_daily, close_seal)
     partial = _replay_coverage(day, "formal_postmarket", daily[:1], intraday, breadth, stock_daily, close_seal)
 
     assert formal["formal_ready"] is True
     assert formal["official_close_source"] == "index_bars:日线"
+    assert formal["upstream_published_at"] == "2026-07-14T15:10:02+08:00"
     assert formal["latest_intraday_time"] == "14:55"
     assert partial["formal_ready"] is False
     assert partial["generation_status"] == "partial"
+
+
+def test_replay_coverage_normalizes_naive_seal_time_to_beijing_offset():
+    day = "2026-07-14"
+    daily = [
+        {"date": day, "close": 1.0, "name": name, "quality": "official", "formal_close": True}
+        for name, _symbol in _MAJOR_INDEX_TARGETS
+    ]
+    breadth = {"status": "available", "total": 5200}
+    stock_daily = {"status": "available", "official_coverage_pct": 99.04}
+    close_seal = {
+        "status": "sealed",
+        "close_finality": "stable_close",
+        "formal_ready": True,
+        "sealed_at": datetime(2026, 7, 14, 15, 10, 2),
+    }
+    coverage = _replay_coverage(day, "formal_postmarket", daily, {"rows": []}, breadth, stock_daily, close_seal)
+    assert coverage["upstream_published_at"] == "2026-07-14T15:10:02+08:00"
 
 
 def test_replay_coverage_rejects_provisional_index_and_allows_close_flash():
@@ -744,6 +809,8 @@ def test_market_replay_context_extracts_event_graph():
         }
     )
 
+    for row in db["fullmarket_spot_snapshots"].rows:
+        row["snapshot_at"] = datetime(2026, 6, 5, 15, 30)
     context = build_market_replay_context(
         db,
         trade_date=day,

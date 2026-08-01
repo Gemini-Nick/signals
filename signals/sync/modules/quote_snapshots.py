@@ -14,6 +14,7 @@ from pymongo.database import Database
 from signals.core.macro_universe import macro_watchlist
 from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import trading_day_key
+from signals.sync.trade_date import a_share_task_trade_date
 from signals.sync.eastmoney_observer import observe_eastmoney
 from signals.sync.provider_limits import ProviderCoolingDown, provider_call
 from signals.sync.task_context import get_task_env
@@ -974,7 +975,7 @@ def sync_quote_snapshots(db: Database, proxy_url: str = None) -> dict:
     del proxy_url
     now = naive_market_now("A")
     try:
-        trading_day = trading_day_key("A", now=now, open_time=QUOTE_TRADING_DAY_OPEN)
+        trading_day = a_share_task_trade_date(now=now)
     except Exception:
         trading_day = now.date().isoformat()
     symbols = _a_quote_symbols(_hot_quote_symbols(db))
@@ -1072,11 +1073,29 @@ def sync_eastmoney_ulist_quote(db: Database, proxy_url: str = None) -> dict:
     del proxy_url
     now = naive_market_now("A")
     try:
-        trading_day = trading_day_key("A", now=now, open_time=QUOTE_TRADING_DAY_OPEN)
+        trading_day = a_share_task_trade_date(now=now)
     except Exception:
         trading_day = now.date().isoformat()
     symbols = _a_quote_symbols(_hot_quote_symbols(db))
-    docs, observations = _fetch_eastmoney_ulist_docs(db, symbols, now, trading_day)
+    # fullmarket_spot_snapshots is the canonical all-market watermark.  The
+    # ulist lane is only a bounded supplement for symbols absent from that
+    # watermark; otherwise the same hot symbols are fetched twice in one live
+    # pass and the provider/quote_snapshots writes are duplicated.
+    canonical_docs = _read_fullmarket_spot_quotes(
+        db,
+        symbols,
+        trading_day,
+        now,
+        allow_latest_fallback=False,
+    )
+    missing_symbols = [symbol for symbol in symbols if symbol not in canonical_docs]
+    fetched_docs, observations = _fetch_eastmoney_ulist_docs(
+        db,
+        missing_symbols,
+        now,
+        trading_day,
+    )
+    docs = {**canonical_docs, **fetched_docs}
 
     inserted = 0
     modified = 0
@@ -1097,7 +1116,7 @@ def sync_eastmoney_ulist_quote(db: Database, proxy_url: str = None) -> dict:
         bool(docs),
         avg_latency,
         errors[0].get("error", "eastmoney_ulist_empty") if errors else "",
-        endpoint="push2delay.ulist.quote",
+        endpoint="push2delay.ulist.quote" if observations else "fullmarket_spot_snapshot",
     )
     missing = max(0, len(symbols) - len(docs))
     _write_data_freshness(db, len(symbols), trading_day if docs else None, len(docs), missing)
@@ -1113,5 +1132,7 @@ def sync_eastmoney_ulist_quote(db: Database, proxy_url: str = None) -> dict:
         "batches": len(observations),
         "errors": len(errors),
         "stale_marked": stale_marked,
+        "canonical": len(canonical_docs),
+        "requested": len(missing_symbols),
         "target_collection": "quote_snapshots",
     }

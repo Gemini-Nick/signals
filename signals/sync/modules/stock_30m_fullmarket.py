@@ -12,6 +12,7 @@ from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
 from signals.sync.task_context import get_task_env
+from signals.sync.trade_date import a_share_task_trade_date
 
 from .stock_minute import _index_codes, _insert_new_minute_docs, _pure_a_code, _sync_one_minute
 
@@ -36,6 +37,30 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _symbols_with_daily(db: Database) -> list[str]:
     index_codes = _index_codes()
+    # Prefer the current full-market quote universe. It is indexed by
+    # date/code and avoids a collection-wide distinct over the bars store.
+    date_key = a_share_task_trade_date(now=naive_market_now("A")).replace("-", "")
+    try:
+        rows = db["fullmarket_spot_snapshots"].find(
+            {"date_key": date_key},
+            {"code": 1, "symbol": 1, "asset_class": 1, "latest": 1, "price": 1},
+        )
+        active: set[str] = set()
+        for row in rows:
+            if str(row.get("asset_class") or "").lower() == "etf":
+                continue
+            code = _pure_a_code(row.get("code") or row.get("symbol"))
+            price = row.get("price", row.get("latest"))
+            try:
+                valid_quote = float(price) > 0
+            except (TypeError, ValueError):
+                valid_quote = False
+            if code and code not in index_codes and valid_quote:
+                active.add(code)
+        if active:
+            return sorted(active)
+    except Exception:
+        logger.debug("fullmarket active universe unavailable; falling back to daily bars", exc_info=True)
     raw_symbols = db["bars"].distinct("meta.symbol", {"meta.freq": {"$in": ["日线", "daily", "D", "1d"]}})
     return sorted({
         code
@@ -65,12 +90,18 @@ def _latest_30m_state(db: Database, symbols: list[str]) -> dict[str, dict[str, A
 
 
 def _needs_refresh(state: dict[str, Any], *, min_bars: int, trade_date: str, require_today: bool) -> bool:
+    latest = state.get("latest_dt")
+    latest_date = latest.date().isoformat() if hasattr(latest, "date") else str(latest or "")[:10]
+    # A newly listed/security-short-history symbol can have fewer than the
+    # normal history floor while still having a complete current-day slice.
+    # Once today's close is present, do not keep retrying it forever merely to
+    # reach an impossible historical bar-count threshold.
+    if require_today and latest_date >= trade_date:
+        return False
     if int(state.get("bar_count") or 0) < min_bars:
         return True
     if not require_today:
         return False
-    latest = state.get("latest_dt")
-    latest_date = latest.date().isoformat() if hasattr(latest, "date") else str(latest or "")[:10]
     return latest_date < trade_date
 
 
@@ -112,7 +143,7 @@ def _tail_count_for_state(
 def sync_stock_30m_fullmarket(db: Database, proxy_url: str = None) -> dict:
     """Preheat 30 minute bars for one resumable full-market shard."""
     now = naive_market_now("A")
-    trade_date = now.date().isoformat()
+    trade_date = a_share_task_trade_date(now=now)
     shard_count = _env_int("STOCK_30M_FULLMARKET_SHARD_COUNT", 16, minimum=1, maximum=64)
     shard_index = _env_int("STOCK_30M_FULLMARKET_SHARD_INDEX", 0, minimum=0, maximum=shard_count - 1)
     shard_key = str(get_task_env("STOCK_30M_FULLMARKET_SHARD_KEY", f"shard_{shard_index:02d}") or f"shard_{shard_index:02d}")

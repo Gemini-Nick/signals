@@ -59,6 +59,41 @@ def _quote_candidates_for_index(symbol: str) -> list[str]:
     ]))
 
 
+def _normalize_csindex_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize the official CSI history response to our index schema.
+
+    The CSI endpoint uses Chinese column labels and exposes complete OHLC
+    values for the custom CSI indices which are not consistently available on
+    Eastmoney/Sina.  Keep the source-specific normalization here so the main
+    writer can apply the same OHLC validation and provenance rules.
+    """
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    renamed = frame.rename(columns={
+        "日期": "date",
+        "开盘": "open",
+        "最高": "high",
+        "最低": "low",
+        "收盘": "close",
+        "成交量": "volume",
+        "成交金额": "amount",
+        "涨跌": "change",
+        "涨跌幅": "change_pct",
+    }).copy()
+    required = {"date", "open", "high", "low", "close"}
+    if not required.issubset(renamed.columns):
+        return pd.DataFrame()
+    renamed["date"] = pd.to_datetime(renamed["date"], errors="coerce")
+    for column in ("open", "high", "low", "close", "volume", "amount", "change", "change_pct"):
+        if column in renamed.columns:
+            renamed[column] = pd.to_numeric(renamed[column], errors="coerce")
+    if "volume" not in renamed.columns:
+        renamed["volume"] = 0
+    if "amount" not in renamed.columns:
+        renamed["amount"] = 0
+    return renamed.dropna(subset=["date", "open", "high", "low", "close"])
+
+
 def _write_index_docs(db: Database, symbol: str, freq: str, docs: list[dict], replace_bars: bool = True) -> int:
     """Write index bars to the dedicated collection and compatibility bars."""
     if not docs:
@@ -133,6 +168,22 @@ def _fetch_a_index_daily_frame(symbol: str, start_date: str, end_date: str, prox
                 return df, "akshare_sina"
         except Exception as exc:
             source_errors.append(f"stock_zh_index_daily:{exc}")
+        # CSI custom indices (e.g. 932038/931837) are not reliably exposed by
+        # Eastmoney/Sina.  The official CSI history endpoint returns the
+        # complete OHLC row and is intentionally attempted only for 93xxxx
+        # codes after the faster public providers fail.
+        pure = _pure_index_code(symbol)
+        if pure.startswith("93"):
+            try:
+                df = _normalize_csindex_frame(ak.stock_zh_index_hist_csindex(
+                    symbol=pure,
+                    start_date=start_compact,
+                    end_date=end_compact,
+                ))
+                if df is not None and not df.empty:
+                    return df, "akshare_csindex"
+            except Exception as exc:
+                source_errors.append(f"stock_zh_index_hist_csindex:{exc}")
     logger.warning("  ✗ %s: 指数历史源失败 %s", symbol, "; ".join(source_errors)[:240])
     return pd.DataFrame(), ""
 

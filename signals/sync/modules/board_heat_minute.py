@@ -16,6 +16,7 @@ from pymongo.database import Database
 
 from signals.core.market_time import naive_market_now
 from signals.core.trading_dates import a_share_realtime_day_key, normalized_a_share_realtime_minute
+from signals.sync.trade_date import a_share_task_trade_date
 
 from ..provider_limits import provider_call
 from ..retry import sync_retry
@@ -85,8 +86,11 @@ def _tick_docs(
 
 def _sync_heat_kind(db: Database, *, kind: str, proxy_url: str | None = None) -> dict:
     now = naive_market_now("A")
-    trade_date = a_share_realtime_day_key(now=now)
-    trade_minute = normalized_a_share_realtime_minute(now=now)
+    trade_date = a_share_task_trade_date(now=now)
+    if trade_date != now.date().isoformat():
+        trade_minute = datetime.fromisoformat(trade_date).replace(hour=15, minute=0, second=0, microsecond=0)
+    else:
+        trade_minute = normalized_a_share_realtime_minute(now=now)
     source_kind = "concept" if kind == "concept" else "industry"
     domain = "concept" if kind == "concept" else "board"
     endpoint = f"push2delay_clist_{source_kind}"
@@ -137,7 +141,7 @@ def _sync_heat_kind(db: Database, *, kind: str, proxy_url: str | None = None) ->
         )
         _health(db, "em", endpoint, domain, True)
         logger.info("%s minute heat: %d ticks", kind, len(docs))
-        return {"status": "ok", "inserted": written, "ticks": len(docs), "kind": kind}
+        return {"status": "ok", "inserted": written, "ticks": len(docs), "kind": kind, "trade_date": trade_date}
     except Exception as exc:
         _health(db, "em", endpoint, domain, False, str(exc))
         logger.warning("%s minute heat failed: %s", kind, exc)
@@ -145,6 +149,7 @@ def _sync_heat_kind(db: Database, *, kind: str, proxy_url: str | None = None) ->
             "status": "degraded",
             "inserted": 0,
             "kind": kind,
+            "trade_date": trade_date,
             "reason": "provider_route_error",
             "error_msg": str(exc)[:240],
         }

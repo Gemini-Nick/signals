@@ -13,10 +13,25 @@ from pymongo import ReturnDocument
 from signals.core.market_time import naive_market_now
 
 
-PROBE_TIMES = (dt_time(15, 0, 30), dt_time(15, 2, 30), dt_time(15, 5), dt_time(15, 10), dt_time(15, 20))
+# Close providers frequently publish the final snapshot several minutes after
+# the exchange close.  Keep probing through the evening so a transiently late
+# quote does not become a terminal partial at 15:20 and force a manual rerun.
+PROBE_TIMES = (
+    dt_time(15, 0, 30),
+    dt_time(15, 2, 30),
+    dt_time(15, 5),
+    dt_time(15, 10),
+    dt_time(15, 20),
+    dt_time(15, 40),
+    dt_time(16, 10),
+    dt_time(16, 40),
+    dt_time(17, 10),
+    dt_time(17, 40),
+    dt_time(18, 10),
+)
 SEAL_NOT_BEFORE = dt_time(15, 10)
 HARD_SEAL_TIME = dt_time(15, 10)
-END_TIME = dt_time(16, 10)
+END_TIME = dt_time(18, 30)
 SEAL_MODULES = (
     "fullmarket_spot_snapshot",
     "etf_spot_snapshot",

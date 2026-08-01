@@ -9,7 +9,7 @@ from pymongo.database import Database
 from pymongo.errors import OperationFailure, PyMongoError
 
 from signals.core.market_time import naive_market_now
-from signals.core.trading_dates import trading_day_key
+from signals.core.trading_dates import is_trading_day, trading_day_key
 
 logger = logging.getLogger("signals.sync.storage")
 
@@ -76,6 +76,43 @@ def _cleanup_legacy_freshness_docs(db: Database) -> None:
         logger.warning("legacy freshness cleanup skipped: %s", exc)
 
 
+def _repair_realtime_freshness_clock(db: Database, now) -> None:
+    """Normalize stale realtime rows after a non-trading-day manual refresh.
+
+    Older refreshes used the wall-clock date for ``as_of`` while their payload
+    was keyed by the previous trading date.  That made a Saturday row appear
+    current even though no Saturday market session existed.  Repair only the
+    small canonical spot rows; historical and shard freshness remains owned by
+    its writer.
+    """
+    try:
+        current_trade_date = trading_day_key("A", now=now)
+        non_trading_day = not is_trading_day("A", now.date())
+        rows = db["data_freshness"].find({
+            "mode": "realtime",
+            "collection": {"$in": ["fullmarket_spot_snapshots", "etf_spot_snapshots"]},
+        }, {"_id": 1, "date_key": 1, "as_of": 1, "latest_dt": 1, "freshness": 1, "stale_reason": 1})
+        for row in rows:
+            date_key = str(row.get("date_key") or "").replace("-", "")[:8]
+            if len(date_key) != 8 or not date_key.isdigit():
+                continue
+            trade_date = f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+            changes = {}
+            if row.get("as_of") != trade_date:
+                changes["as_of"] = trade_date
+            if row.get("latest_dt") != trade_date:
+                changes["latest_dt"] = trade_date
+            if non_trading_day or date_key != current_trade_date.replace("-", ""):
+                if row.get("freshness") == "fresh":
+                    changes["freshness"] = "stale"
+                if not row.get("stale_reason"):
+                    changes["stale_reason"] = "non_trading_day_no_live_refresh" if non_trading_day else "stale_trade_date"
+            if changes:
+                db["data_freshness"].update_one({"_id": row.get("_id")}, {"$set": changes})
+    except Exception:
+        logger.debug("realtime freshness clock repair skipped", exc_info=True)
+
+
 def ensure_storage_model(db: Database) -> None:
     """Create/update indexes for the unified cache model.
 
@@ -129,6 +166,10 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["fullmarket_spot_snapshots"], [("date_key", ASCENDING), ("code", ASCENDING)], unique=True)
     _safe_create_index(db["fullmarket_spot_snapshots"], [("date_key", ASCENDING), ("symbol", ASCENDING)])
     _safe_create_index(db["fullmarket_spot_snapshots"], [("expires_at", ASCENDING)], expireAfterSeconds=0)
+    _safe_create_index(db["replay_immutable_snapshots"], [("trade_date", ASCENDING), ("source_id", ASCENDING), ("run_id", ASCENDING), ("item_key", ASCENDING)])
+    _safe_create_index(db["replay_immutable_snapshots"], [("payload_hash", ASCENDING)])
+    _safe_create_index(db["replay_backfill_snapshots"], [("trade_date", ASCENDING), ("source_id", ASCENDING), ("item_key", ASCENDING), ("captured_at", DESCENDING)])
+    _safe_create_index(db["replay_backfill_snapshots"], [("payload_hash", ASCENDING)])
 
     for name in ("board_em", "board_ths", "board_sina", "concept_em", "concept_ths", "concept_sina"):
         _safe_create_index(db[name], [("expires_at", ASCENDING)], expireAfterSeconds=0)
@@ -181,6 +222,7 @@ def ensure_storage_model(db: Database) -> None:
     _safe_create_index(db["data_freshness"], [("domain", ASCENDING), ("market", ASCENDING), ("mode", ASCENDING), ("lane", ASCENDING), ("collection", ASCENDING)])
     _safe_create_index(db["data_freshness"], [("domain", ASCENDING), ("market", ASCENDING), ("mode", ASCENDING), ("collection", ASCENDING), ("freq", ASCENDING), ("shard_key", ASCENDING)])
     _cleanup_legacy_freshness_docs(db)
+    _repair_realtime_freshness_clock(db, now)
 
     trade_date = trading_day_key("A", now=now)
     db["data_freshness"].update_one(

@@ -5,7 +5,7 @@ from datetime import datetime
 
 from signals.sync.engine import COLLECTION_DOMAINS, LIVE_PLAN_BY_MODULE, MODULE_TARGETS, REALTIME_MODULES
 from signals.sync.modules import ALL_MODULES
-from signals.sync.modules.market_limit_pools import _date_key, _normalize_row
+from signals.sync.modules.market_limit_pools import _date_key, _normalize_row, _snapshot_at_for_trade_date
 
 
 def test_normalize_limit_up_pool_row_keeps_board_quality_fields():
@@ -45,6 +45,12 @@ def test_normalize_limit_up_pool_row_keeps_board_quality_fields():
 def test_date_key_accepts_compact_and_dashed_dates():
     assert _date_key("20260605") == ("20260605", "2026-06-05")
     assert _date_key("2026-06-05") == ("20260605", "2026-06-05")
+
+
+def test_realtime_snapshot_keeps_wall_clock_timestamp():
+    now = datetime(2026, 6, 8, 16, 20)
+    assert _snapshot_at_for_trade_date("2026-06-08", now) == now
+    assert _snapshot_at_for_trade_date("2026-06-05", now, explicit_trade_date=True) == datetime(2026, 6, 5, 15, 0)
 
 
 def test_market_limit_pool_is_registered_for_sync_engine():

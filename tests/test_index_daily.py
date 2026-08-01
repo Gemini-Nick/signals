@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pandas as pd
+
 from signals.sync.modules import index_daily
 from signals.data.bar_quality import validate_ohlcv_bar
 
@@ -131,6 +133,56 @@ def test_index_daily_quote_candidates_do_not_match_stock_code_collision():
     assert "SH.000001" in candidates
     assert "sh000001" in candidates
     assert "000001" not in candidates
+
+
+def test_index_daily_normalizes_official_csindex_fallback():
+    frame = pd.DataFrame([
+        {
+            "日期": "2026-07-31",
+            "指数代码": "932038",
+            "开盘": "1689.46",
+            "最高": "1705.02",
+            "最低": "1656.00",
+            "收盘": "1657.83",
+            "成交量": "1893255356",
+            "成交金额": "960.11",
+        }
+    ])
+
+    normalized = index_daily._normalize_csindex_frame(frame)
+
+    assert normalized.iloc[0]["date"] == pd.Timestamp("2026-07-31")
+    assert normalized.iloc[0]["open"] == 1689.46
+    assert normalized.iloc[0]["close"] == 1657.83
+    assert normalized.iloc[0]["volume"] == 1893255356
+
+
+def test_index_daily_uses_csindex_after_public_providers_fail(monkeypatch):
+    calls = []
+
+    def fail_em(**kwargs):
+        calls.append("em")
+        raise RuntimeError("em unavailable")
+
+    def fail_sina(**kwargs):
+        calls.append("sina")
+        raise RuntimeError("sina unavailable")
+
+    def csindex(**kwargs):
+        calls.append(("csindex", kwargs["symbol"]))
+        return pd.DataFrame([
+            {"日期": "2026-07-31", "开盘": 1, "最高": 2, "最低": 0.5, "收盘": 1.5, "成交量": 10, "成交金额": 20}
+        ])
+
+    monkeypatch.setattr(index_daily.ak, "stock_zh_index_daily_em", fail_em)
+    monkeypatch.setattr(index_daily.ak, "stock_zh_index_daily", fail_sina)
+    monkeypatch.setattr(index_daily.ak, "stock_zh_index_hist_csindex", csindex)
+
+    frame, source = index_daily._fetch_a_index_daily_frame("sh932038", "2026-07-01", "2026-08-02")
+
+    assert source == "akshare_csindex"
+    assert frame.iloc[0]["close"] == 1.5
+    assert calls == ["em", "sina", ("csindex", "932038")]
 
 
 def test_us_index_nan_regression_is_rejected_before_persistence():

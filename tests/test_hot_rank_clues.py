@@ -175,7 +175,9 @@ def test_hot_rank_clues_registered_for_sync_engine():
     module_schedules = {name: schedule for name, _, schedule in ALL_MODULES}
 
     assert "hot_rank_clues" in module_schedules
-    assert module_schedules["hot_rank_clues"] == "21:12"
-    assert SyncEngine._schedule_due(module_schedules["hot_rank_clues"], datetime(2026, 7, 5, 21, 12)) is True
+    # Hot-rank clues are now a postmarket dependency of the terminal pool;
+    # they must not run as an independent late-night overwrite.
+    assert module_schedules["hot_rank_clues"] == "postmarket only"
+    assert SyncEngine._schedule_due(module_schedules["hot_rank_clues"], datetime(2026, 7, 5, 21, 12)) is False
     assert MODULE_TARGETS["hot_rank_clues"] == ("hot_rank_clues",)
     assert COLLECTION_DOMAINS["hot_rank_clues"] == "hot_rank_clue"

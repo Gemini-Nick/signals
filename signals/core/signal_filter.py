@@ -49,8 +49,29 @@ class ScanResult:
     target_price: float = 0.0    # panic模式: 建议兑现价
 
 
-def _get_index_constituents(index_name: str) -> List[str]:
-    """获取指数成分股（Futu格式）"""
+def _get_index_constituents(index_name: str, trade_date: Optional[str] = None) -> List[str]:
+    """获取指数成分股（Futu格式），历史日期只读版本化快照。
+
+    AkShare ``index_stock_cons`` is a current constituent endpoint.  It is
+    deliberately unavailable for historical dates unless exactly one
+    versioned ``effective_date`` snapshot exists in MongoDB.
+    """
+    if trade_date:
+        try:
+            from signals.sync.db import get_db
+            rows = list(get_db()["index_constituents"].find(
+                {"index_name": index_name, "effective_date": str(trade_date)},
+                {"stocks": 1, "stock_details": 1, "payload_hash": 1},
+            ))
+            if len(rows) != 1 or not rows[0].get("payload_hash"):
+                logger.warning("历史日期 %s 缺少唯一版本化成分快照: %s", trade_date, index_name)
+                return []
+            stocks = rows[0].get("stocks") or [item.get("code") for item in rows[0].get("stock_details") or []]
+            return [f"SH.{code}" if str(code).startswith("6") else f"SZ.{code}" for code in stocks if code]
+        except Exception as e:
+            logger.warning("读取历史版本化成分失败(%s/%s): %s", index_name, trade_date, e)
+            return []
+
     try:
         import akshare as ak
         from config import INDEX_AK_CODES
@@ -165,7 +186,8 @@ def _analyze_one(symbol: str, bars, mode: str = "belief") -> ScanResult:
 
 
 def scan_direction(direction: str, mode: str = "belief",
-                   codes: List[str] = None, top_n: int = 50) -> List[ScanResult]:
+                   codes: List[str] = None, top_n: int = 50,
+                   trade_date: Optional[str] = None) -> List[ScanResult]:
     """
     扫描一个方向的成分股信号。
 
@@ -173,6 +195,7 @@ def scan_direction(direction: str, mode: str = "belief",
     :param mode: "belief" / "panic"
     :param codes: 直接指定代码列表
     :param top_n: 最多扫描前N只
+    :param trade_date: 历史日期；必须命中唯一版本化成分快照，禁止用当前成分回填
     :return: ScanResult列表，按确认维度排序
     """
     from signals.data.fetcher import AKShareSource
@@ -180,7 +203,7 @@ def scan_direction(direction: str, mode: str = "belief",
     if codes:
         symbols = codes
     else:
-        symbols = _get_index_constituents(direction)
+        symbols = _get_index_constituents(direction, trade_date=trade_date)
         if not symbols:
             logger.error("无法获取 %s 的成分股", direction)
             return []
@@ -189,8 +212,9 @@ def scan_direction(direction: str, mode: str = "belief",
     logger.info("方向扫描: %s (%d只), 模式=%s", direction or "自定义", len(symbols), mode)
 
     ak_source = AKShareSource()
-    edt = datetime.now().strftime("%Y%m%d")
-    sdt = (datetime.now() - timedelta(days=300)).strftime("%Y%m%d")
+    end_dt = datetime.strptime(trade_date, "%Y-%m-%d") if trade_date else datetime.now()
+    edt = end_dt.strftime("%Y%m%d")
+    sdt = (end_dt - timedelta(days=300)).strftime("%Y%m%d")
 
     results = []
     for sym in symbols:

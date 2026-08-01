@@ -5,7 +5,7 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
-from signals.sync.close_seal import CloseSealRunner, SEAL_MODULES
+from signals.sync.close_seal import CloseSealRunner, PROBE_TIMES, SEAL_MODULES
 
 
 def _get(row: dict[str, Any], key: str) -> Any:
@@ -154,8 +154,8 @@ def test_hard_seal_is_partial_and_does_not_repeat_successful_modules():
 
     runner.tick(day, datetime.fromisoformat(f"{day} 15:00:30"))
     forced = runner.tick(day, datetime.fromisoformat(f"{day} 15:10:00"))
-    retried = runner.tick(day, datetime.fromisoformat(f"{day} 15:20:00"))
-    after_terminal = runner.tick(day, datetime.fromisoformat(f"{day} 15:25:00"))
+    retried = runner.tick(day, datetime.fromisoformat(f"{day} {PROBE_TIMES[-1].strftime('%H:%M:%S')}"))
+    after_terminal = runner.tick(day, datetime.fromisoformat(f"{day} 18:20:00"))
 
     assert forced["status"] == "partial"
     assert forced["close_finality"] == "forced_provisional"
@@ -163,6 +163,45 @@ def test_hard_seal_is_partial_and_does_not_repeat_successful_modules():
     assert retried["terminal"] is True
     assert after_terminal == {"status": "partial", "skipped": True, "terminal": True}
     assert module_calls == []
+
+
+def test_close_seal_retries_until_late_provider_data_stabilizes():
+    day = "2026-07-14"
+    db = FakeDB()
+    module_calls: list[str] = []
+    probe_calls = {"value": 0}
+
+    def fetch(_day, _now):
+        probe_calls["value"] += 1
+        if probe_calls["value"] < 3:
+            return 8, {}
+        return 8, _probe_rows(day, close=10.0)
+
+    runner = CloseSealRunner(
+        db,
+        lambda module, _day: module_calls.append(module)
+        or {
+            "module": module,
+            "status": "ok",
+            "result": {
+                "status": "ok",
+                "count": 5200 if module == "fullmarket_spot_snapshot" else 1200,
+                "trade_date": day,
+            },
+        },
+        probe_fetcher=fetch,
+        owner="test-owner",
+    )
+
+    runner.tick(day, datetime.fromisoformat(f"{day} 15:00:30"))
+    runner.tick(day, datetime.fromisoformat(f"{day} 15:10:00"))
+    late = runner.tick(day, datetime.fromisoformat(f"{day} 16:40:00"))
+    sealed = runner.tick(day, datetime.fromisoformat(f"{day} 17:10:00"))
+
+    assert late["status"] == "partial"
+    assert late.get("terminal") is not True
+    assert sealed["status"] == "sealed"
+    assert module_calls == list(SEAL_MODULES)
 
 
 def test_degraded_empty_fullmarket_never_seals():
@@ -191,7 +230,7 @@ def test_degraded_empty_fullmarket_never_seals():
     assert db["sync_tasks"].find_one({"_id": f"close_seal:{day}:fullmarket_spot_snapshot:all"})["status"] == "degraded"
 
 
-def test_stable_probe_with_persistent_module_failure_stops_after_1520():
+def test_stable_probe_with_persistent_module_failure_stops_after_late_window():
     day = "2026-07-14"
     db = FakeDB()
     calls: list[str] = []
@@ -211,9 +250,9 @@ def test_stable_probe_with_persistent_module_failure_stops_after_1520():
 
     for value in ("15:00:30", "15:02:30", "15:05:00", "15:10:00"):
         runner.tick(day, datetime.fromisoformat(f"{day} {value}"))
-    final_attempt = runner.tick(day, datetime.fromisoformat(f"{day} 15:20:00"))
+    final_attempt = runner.tick(day, datetime.fromisoformat(f"{day} {PROBE_TIMES[-1].strftime('%H:%M:%S')}"))
     call_count = len(calls)
-    after_terminal = runner.tick(day, datetime.fromisoformat(f"{day} 15:25:00"))
+    after_terminal = runner.tick(day, datetime.fromisoformat(f"{day} 18:20:00"))
 
     assert final_attempt["status"] == "partial"
     assert final_attempt["terminal"] is True

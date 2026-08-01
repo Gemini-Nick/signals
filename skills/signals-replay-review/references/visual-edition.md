@@ -10,6 +10,28 @@ capacity stocks in the appendix.
 Omit an incomplete group. Never fill missing values with zero. Turnover and concentration are not net inflow.
 The appendix explains the five-section conclusion; it cannot replace or reverse it.
 
+Choose the medium by the trading question:
+
+- prose explains the causal judgment, counterevidence, and why the next watch changed;
+- a compact table aligns exact values, units, scopes, event states, and scenario conditions;
+- a chart shows a time path or cross-sectional relationship that prose cannot make visible;
+- a K-line shows price location and completed price-volume structure, never participant identity or intent.
+
+Signals should normally prioritize two chart families: a board relative-strength event graph and, when definitions are
+stable, a limit/failed-limit ecology graph. Use at most four comparable board series and annotate only timestamps that
+change the daily judgment. Do not turn a final ranking into a reconstructed intraday path. Do not stack pool counts
+when pools overlap.
+
+Representative paths require timestamped values and a declared comparison baseline. Do not render an independently
+autoscaled, untimed sparkline as a price path. A K-line is optional and requires complete OHLCV, timezone, frequency,
+adjustment method, trading-session status, missing-data state, and evidence references. Omit the chart when these
+conditions fail.
+
+Event-driven forward views use an event timeline plus a scenario table. The table separates official event time,
+market expectation, new information, expected A-share observation, and invalidator. Show numeric probabilities only
+with a frozen reference class, sample size, and out-of-sample calibration; otherwise label scenarios as primary,
+alternative, or tail. Future candles and unverified participant arrows are prohibited.
+
 Render the same payload with:
 
 ```bash

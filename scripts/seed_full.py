@@ -361,7 +361,8 @@ def phase4_constituents(db):
 
     # 指数成分股
     idx_col = db["index_constituents"]
-    idx_col.drop()
+    # Append-only versioned snapshots; never erase prior effective dates.
+    from scripts.versioned_index_constituents import append_index_snapshot
     for fn, name in [(bs.query_hs300_stocks, "沪深300"),
                      (bs.query_sz50_stocks, "上证50"),
                      (bs.query_zz500_stocks, "中证500")]:
@@ -372,8 +373,13 @@ def phase4_constituents(db):
             code = row[1].split(".")[1] if "." in row[1] else row[1]
             stks.append({"code": code, "code_name": row[2]})
         if stks:
-            idx_col.insert_one({"index_name": name, "dt": END_DATE,
-                                "stocks": [s["code"] for s in stks], "count": len(stks)})
+            append_index_snapshot(
+                idx_col,
+                index_name=name,
+                effective_date=END_DATE,
+                stocks=stks,
+                source="baostock",
+            )
             logger.info(f"  ✓ {name}: {len(stks)} 只")
 
     bs.logout()

@@ -114,3 +114,20 @@ def test_force_live_once_runs_a_share_bundle_outside_market_hours(monkeypatch):
     assert instance.run_live_once(force=False) == []
     assert instance.run_live_once(force=True) == [{"module": "market_pools", "status": "ok"}]
     assert calls == [({Market.A}, True)]
+
+
+def test_force_live_once_skips_non_trading_day(monkeypatch):
+    from signals.sync import engine as sync_engine
+    from signals.sync.engine import SyncEngine
+
+    instance = object.__new__(SyncEngine)
+    instance._now = lambda: datetime(2026, 8, 1, 16, 30, 0)  # Saturday
+    instance._now_utc = lambda: datetime(2026, 8, 1, 8, 30, 0)
+    instance._quote_preopen_enabled = lambda: False
+    instance._a_quote_preopen_active = lambda now: False
+    called = []
+    monkeypatch.setattr(sync_engine, "get_active_markets", lambda now: set())
+    monkeypatch.setattr(instance, "_run_intraday_bundle", lambda *args, **kwargs: called.append(True))
+
+    assert instance.run_live_once(force=True) == []
+    assert called == []

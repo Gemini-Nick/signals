@@ -22,8 +22,16 @@ The runtime may keep detailed provenance, coverage, and validation state. The re
 - Use local Signals, Agent OS, Mongo, user attachments, and explicit `extra_facts[]`.
 - Do not use WorkBuddy or Tencent-watchlist conclusions to fill Signals gaps.
 - Do not infer account identity from Eastmoney/THS order-size flow.
+- Do not infer overnight willingness, new positions, unwinding, sellers versus chasers, or who is taking the other side from price, volume, close location, or order-size flow.
 - Do not infer customers, products, orders, or profits from price/volume evidence.
 - Do not hardcode a trading day, board, sector, or stock into runtime code or prompts.
+
+Signals is the trading-path lane. It answers how a direction formed, where it lost relative strength, and whether the
+close ecosystem preserved or rejected the intraday choice. Use private/high-elasticity, quantitative cross-section,
+and retail-attention lenses only as behavior archetypes; they are not account identities. Public-fund or broad
+institutional language is limited to observable capacity and cross-sectional confirmation. Omit a national-team
+claim unless an official disclosure supplies the subject, instrument, direction, and date; ETF price, turnover,
+share change, or an afternoon support pattern cannot fill any missing element.
 
 See `references/data-requirements.md` for the detailed internal checklist.
 
@@ -84,6 +92,21 @@ Build the analysis from `signals_context`, `market_replay`, and `analysis_framew
 6. Use same-day dynamic representatives for capacity, strength, acceptance, and weakness. Static industry representatives are background only.
 7. Turn the result into two or three next-session observations, not buy/sell/target/stop instructions.
 
+Signals earns its place through the event path: preserve at least two comparable same-day nodes and show which direction lost relative strength, which gained it, and how breadth, turnover, limit-state, or representatives changed. If only the final ranking exists, shorten the replay instead of reconstructing a switch. Treat limit-up/failed-limit data as a close ecosystem unless actual intraday pool transitions are present.
+
+Before prose generation, emit at least the three comparable judgment cards `market/stage`,
+`primary_direction/leadership`, and `next_watch/priority`. Lane-specific cards may add event-path or ecology detail,
+but they may not replace the shared cards. Keep one to three forward hypotheses for the next session or the next two
+known event nodes. Each hypothesis separates its historical reference class, newly arrived information, expected
+observable path, and invalidators. A numeric probability is allowed only when a frozen point-in-time reference class,
+sample size, and out-of-sample calibration metric are present; otherwise use ordered scenarios without percentages.
+
+For event-driven cadence, maintain a rolling hypothesis ledger rather than a fixed story: recent A-share structure,
+historical prior, official event calendar, market expectation, actual new information, and current hypothesis state.
+For a “two legs” setup such as North American technology earnings followed by an FOMC decision, the first node tests
+the earnings slope and the second tests the discount-rate response. Do not draw a future second bottom as fact; change
+the next observation only after the market response updates the hypothesis.
+
 Minute data supports timing only when it is available up to the requested cutoff. Missing optional detail should shorten the report, not create a reader-facing system explanation.
 
 ### Sector Transition Events
@@ -98,13 +121,13 @@ Minute data supports timing only when it is available up to the requested cutoff
 
 Short Markdown:
 
-`/Users/zhangqilong/WorkBuddy/WorkBuddy｜复盘工程/A股盘后复盘/A股盘后简报_YYYY-MM-DD_Signals原生.md`
+`/Users/zhangqilong/WorkBuddy/WorkBuddy｜复盘工程/A股盘后复盘/Signals原生/A股盘后简报_YYYY-MM-DD_Signals原生.md`
 
 Long Markdown and Word:
 
-- `/Users/zhangqilong/WorkBuddy/WorkBuddy｜复盘工程/A股盘后复盘/A股盘后复盘报告_YYYY-MM-DD_Signals原生.md`
-- `/Users/zhangqilong/WorkBuddy/WorkBuddy｜复盘工程/A股盘后复盘/A股盘后复盘报告_YYYY-MM-DD_Signals原生.docx`
-- `/Users/zhangqilong/WorkBuddy/WorkBuddy｜复盘工程/A股盘后复盘/A股盘后可视复盘_YYYY-MM-DD_Signals原生.html`
+- `/Users/zhangqilong/WorkBuddy/WorkBuddy｜复盘工程/A股盘后复盘/Signals原生/A股盘后复盘报告_YYYY-MM-DD_Signals原生.md`
+- `/Users/zhangqilong/WorkBuddy/WorkBuddy｜复盘工程/A股盘后复盘/Signals原生/A股盘后复盘报告_YYYY-MM-DD_Signals原生.docx`
+- `/Users/zhangqilong/WorkBuddy/WorkBuddy｜复盘工程/A股盘后复盘/Signals原生/A股盘后可视复盘_YYYY-MM-DD_Signals原生.html`
 
 Both versions answer the same five questions. The short version uses inline bold labels to reduce rendered height:
 
@@ -135,14 +158,14 @@ Both versions answer the same five questions. The short version uses inline bold
 
 ### Long Version
 
-- Use the same five sections and the same facts as the short version, with level-two headings.
-- Keep it within 3,800 visible characters. Level-three `走强方向` and `转弱方向` headings are allowed here.
-- Add only up to five decision-changing intraday turns, stronger/weaker comparisons, and at most two strong plus two weak cases.
+- Keep the same conclusions and three observations as the short version, but select facts for explanation rather than repeating the short body. Use exactly four level-two sections: `核心结论：市场处于什么阶段`, `资金路径与主线角色`, `结构强弱与代表信号`, and `明日观察`.
+- Keep it within 4,500 visible characters. Do not add separate `走强方向` and `转弱方向` ranking sections.
+- Add only up to five decision-changing intraday turns that actually exist; omit a missing open, morning, afternoon, or close node instead of reconstructing a four-stage path. Keep at most two strong plus two weak cases.
 - Use no more than five directions, six representative stocks, two ETFs, and one table of at most six rows.
 - Keep the same three next-session observations as the short version.
 - Do not restore complete Top lists, data-status sections, methodology sections, or generic risk disclaimers.
 - Word uses the same body as long Markdown. Word conversion must not delay the Markdown reports.
-- After the five A-share sections, add at most one compact `跨市场联动` paragraph. It may use independently dated
+- After the four A-share level-two sections, add at most one compact `跨市场联动` paragraph. It may use independently dated
   completed Hong Kong/Korean sessions and the latest completed US session to explain what changed for A-share
   technology risk appetite. Korean context is explicit-request only and cannot upgrade or downgrade the A-share
   state. Do not copy overseas rankings into the long report.
@@ -160,6 +183,12 @@ Both versions answer the same five questions. The short version uses inline bold
   sections must not inherit A-share limit-up/failed-limit language.
 - Date, state, direction labels, representatives, key numbers, and the three observations must match short and long.
 - Missing formal close changes the whole page to `A股午后观察`; visual failure must not block Markdown.
+- The primary Signals chart is a board relative-strength event graph with no more than four comparable series and
+  decision-changing timestamps. A second chart may show limit-up, failed-limit, limit-down, or strong-pool ecology
+  only when the pool definition is stable across timestamps.
+- Do not render untimed standalone representative sparklines. A representative path must share an explicit time axis
+  and comparison baseline; otherwise use a compact evidence table. K-lines are conditional evidence only and require
+  complete OHLCV, frequency, timezone, adjustment method, session status, and missing-data state.
 
 ### Language
 
@@ -189,6 +218,7 @@ Before a recurring body is sent:
 - Strong/weak direction language must match board breadth and representative paths.
 - Optional missing details must be omitted from the body.
 - Any unsupported numeric, news-cause, participant-flow, or exact-timing claim must be removed.
+- Rewrite intent claims as observable behavior: use “the index closed near the session low” instead of “money refused to stay overnight”, and “high-turnover hardware leaders faded from the high” instead of “unwinding money escaped”.
 - The short body must satisfy the actual one-screen structure above; do not expose character or number counting in the response.
 
 If the draft cannot be corrected without adding unsupported facts, stop and do not send.

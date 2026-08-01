@@ -140,7 +140,10 @@ def _stock_30m_fullmarket_shard_tasks() -> tuple[PostmarketTaskSpec, ...]:
             "stock_30m_fullmarket",
             "minute_fullmarket",
             shard_key=f"shard_{idx:02d}",
-            depends_on=(*_STOCK_DAILY_DEPS,),
+            # Start each 30m shard as soon as its matching daily shard is
+            # usable.  Waiting for all 16 daily shards lets one slow/orphaned
+            # shard block the entire full-market minute cache.
+            depends_on=(f"stock_daily:shard_{idx:02d}",),
             env={
                 "STOCK_30M_FULLMARKET_SHARD_COUNT": str(shard_count),
                 "STOCK_30M_FULLMARKET_SHARD_INDEX": str(idx),
@@ -777,6 +780,15 @@ class PostmarketRunner:
         return str(doc.get("status") or "pending")
 
     def _soft_dependency_allowed(self, spec: PostmarketTaskSpec, dep: str, dep_doc: dict[str, Any]) -> bool:
+        if (
+            spec.module == "stock_30m_fullmarket"
+            and dep.startswith("stock_daily:")
+            and str(dep_doc.get("status") or "") in {"partial", "degraded", "stale"}
+        ):
+            # A partial daily shard still provides a usable universe and the
+            # 30m lane can resume missing symbols independently.  Treating it
+            # as a hard blocker recreates the old all-shards deadlock.
+            return True
         return (
             dep == FULLMARKET_SPOT_TASK_KEY
             and spec.module in SOURCE_FALLBACK_MODULES
@@ -932,6 +944,190 @@ class PostmarketRunner:
             "source": "fullmarket_spot_snapshots.valid_universe + bars.daily",
         }
 
+    @staticmethod
+    def _canonical_a_code(value: Any) -> str:
+        raw = str(value or "").strip().upper()
+        if "." in raw:
+            raw = raw.rsplit(".", 1)[-1]
+        for prefix in ("SH", "SZ", "BJ"):
+            if raw.startswith(prefix):
+                raw = raw[len(prefix):]
+        return raw if raw.isdigit() and len(raw) == 6 else ""
+
+    def _reconcile_stock_daily_tasks_from_bars(self, run_id: str, trade_date: str) -> int:
+        """Refresh daily task watermarks from the actual dated bars collection.
+
+        A historical run can finish writing today's bars while its old shard
+        summaries still describe the provider failures that occurred during
+        the original attempt.  Rebuilding the shard watermarks from Mongo
+        keeps the UI and dependency graph truthful, while retaining
+        ``provisional_close`` so this cannot open the formal close gate.
+        """
+        specs = [spec for spec in POSTMARKET_TASKS if spec.module == "stock_daily"]
+        if not specs:
+            return 0
+        date_key = str(trade_date or "").replace("-", "")[:8]
+        try:
+            valid_codes = sorted({
+                self._canonical_a_code(code)
+                for code in self.db["fullmarket_spot_snapshots"].distinct(
+                    "code",
+                    {
+                        "date_key": date_key,
+                        "code": {"$regex": r"^\d{6}$"},
+                        "price": {"$gt": 0},
+                        "open": {"$gt": 0},
+                        "high": {"$gt": 0},
+                        "low": {"$gt": 0},
+                    },
+                )
+                if self._canonical_a_code(code)
+            })
+            trade_dt = datetime.strptime(date_key, "%Y%m%d")
+            cached_codes = {
+                self._canonical_a_code(code)
+                for code in self.db["bars"].distinct(
+                    "meta.symbol",
+                    {"meta.freq": "日线", "dt": trade_dt},
+                )
+                if self._canonical_a_code(code)
+            }
+        except Exception:
+            logger.debug("stock_daily task reconciliation unavailable", exc_info=True)
+            return 0
+        if not valid_codes:
+            return 0
+
+        now = _naive_bj()
+        repaired = 0
+        shard_count = len(specs)
+        for spec in specs:
+            task_id = self._task_id(run_id, spec)
+            shard_index = int(spec.shard_key.rsplit("_", 1)[-1])
+            shard_codes = valid_codes[shard_index::shard_count]
+            covered = len(set(shard_codes) & cached_codes)
+            missing = max(0, len(shard_codes) - covered)
+            # Existing bars are a truthful coverage receipt, but their mixed
+            # providers are not a formal close seal.  Keep the task partial so
+            # a later stable-close pass can still upgrade the quality.
+            result = {
+                "status": "partial",
+                "quality": "provisional_close",
+                "scope": "all",
+                "shard_key": spec.shard_key,
+                "shard_index": shard_index,
+                "shard_count": shard_count,
+                "global_total": len(valid_codes),
+                "codes": len(shard_codes),
+                "processed": len(shard_codes),
+                "total": len(shard_codes),
+                "expected_codes": len(shard_codes),
+                "covered_codes": covered,
+                "coverage_pct": round(covered / len(shard_codes) * 100, 2) if shard_codes else 100.0,
+                "progress_pct": 100.0,
+                "errors": missing,
+                "deferred": 0,
+                "missing_symbols": missing,
+                "reconciled_existing_bars": True,
+                "reconciliation_source": "fullmarket_spot_snapshots.valid_universe + bars.daily",
+            }
+            current = self.db["sync_tasks"].find_one({"_id": task_id}) or {}
+            if str(current.get("status") or "") == "ok" and not current.get("reconciled_existing_bars"):
+                continue
+            current_summary = dict(current.get("result_summary") or {})
+            current_summary.update({
+                "module": "stock_daily",
+                "status": result["status"],
+                "result": result,
+                "reconciled_existing_bars": True,
+            })
+            self.db["sync_tasks"].update_one(
+                {"_id": task_id, "status": {"$in": [*RETRYABLE_TASK_STATUSES, "ok"]}},
+                {"$set": {
+                    "status": result["status"],
+                    "owner_pid": "",
+                    "heartbeat_at": now,
+                    "finished_at": now,
+                    "updated_at": now,
+                    "cursor": {"processed": len(shard_codes), "total": len(shard_codes), "progress_pct": 100.0},
+                    "result_summary": current_summary,
+                    "error_msg": "",
+                    "reconciled_existing_bars": True,
+                }},
+            )
+            repaired += 1
+        return repaired
+
+    def _reconcile_index_daily_task_from_bars(self, run_id: str, trade_date: str) -> int:
+        """Publish the actual index-day coverage without upgrading quality."""
+        task_id = self._task_id(
+            run_id,
+            next((spec for spec in POSTMARKET_TASKS if spec.module == "index_daily"), None),
+        ) if any(spec.module == "index_daily" for spec in POSTMARKET_TASKS) else ""
+        if not task_id:
+            return 0
+        current = self.db["sync_tasks"].find_one({"_id": task_id}) or {}
+        if str(current.get("status") or "") == "ok":
+            return 0
+        try:
+            from signals.replay.market_replay import _MAJOR_INDEX_TARGETS
+
+            start = datetime.fromisoformat(str(trade_date)[:10])
+            end = start + timedelta(days=1)
+            expected = len(_MAJOR_INDEX_TARGETS)
+            covered = official = provisional = 0
+            for _name, symbol in _MAJOR_INDEX_TARGETS:
+                row = self.db["index_bars"].find_one(
+                    {"meta.symbol": symbol, "meta.freq": "日线", "dt": {"$gte": start, "$lt": end}},
+                    {"meta": 1},
+                )
+                if not row:
+                    continue
+                covered += 1
+                quality = str((row.get("meta") or {}).get("quality") or "").lower()
+                if quality in {"official", "final_close"}:
+                    official += 1
+                else:
+                    provisional += 1
+        except Exception:
+            logger.debug("index_daily task reconciliation unavailable", exc_info=True)
+            return 0
+        # Full symbol coverage is not enough for a formal close: provisional
+        # bars must remain retryable until every target has an official/final
+        # close value.  This prevents a historical fallback from silently
+        # becoming the production close seal.
+        result = {
+            "status": "ok" if covered >= expected and official >= expected else "partial",
+            "trade_date": str(trade_date)[:10],
+            "expected": expected,
+            "covered": covered,
+            "official": official,
+            "provisional": provisional,
+            "missing": max(0, expected - covered),
+            "coverage_pct": round(covered / expected * 100, 2) if expected else 100.0,
+            "official_coverage_pct": round(official / expected * 100, 2) if expected else 100.0,
+            "reconciled_existing_bars": True,
+            "reconciliation_source": "index_bars:日线",
+        }
+        now = _naive_bj()
+        summary = dict(current.get("result_summary") or {})
+        summary.update({"module": "index_daily", "status": result["status"], "result": result, "reconciled_existing_bars": True})
+        self.db["sync_tasks"].update_one(
+            {"_id": task_id, "status": {"$in": list(RETRYABLE_TASK_STATUSES)}},
+            {"$set": {
+                "status": result["status"],
+                "owner_pid": "",
+                "heartbeat_at": now,
+                "finished_at": now,
+                "updated_at": now,
+                "cursor": {"processed": covered, "total": expected, "progress_pct": result["coverage_pct"]},
+                "result_summary": summary,
+                "error_msg": "" if not result["missing"] else f"missing_index_symbols={result['missing']}",
+                "reconciled_existing_bars": True,
+            }},
+        )
+        return 1
+
     def _stock_daily_aggregate_summary(self, trade_date: str | None = None) -> dict[str, Any]:
         try:
             progress = self.db["sync_log"].find_one({"_id": "stock_daily:progress:_meta"}) or {}
@@ -1017,6 +1213,91 @@ class PostmarketRunner:
                         "progress_pct": merged["progress_pct"],
                     },
                     "updated_at": now,
+                }},
+            )
+            repaired += 1
+        return repaired
+
+    def _reconcile_stock_30m_tasks_from_bars(self, run_id: str, trade_date: str) -> int:
+        """Publish already-complete 30m bars into the DAG checkpoint.
+
+        A controlled historical backfill may intentionally run the module
+        outside the live DAG.  Without this reconciliation, Mongo contains a
+        complete shard while the old task document remains ``pending``
+        forever.  Only shards whose every eligible symbol has a current-day
+        bar are promoted, and the provenance is recorded explicitly.
+        """
+        specs = [spec for spec in POSTMARKET_TASKS if spec.module == "stock_30m_fullmarket"]
+        if not specs:
+            return 0
+        try:
+            from .modules.stock_30m_fullmarket import (
+                _latest_30m_state,
+                _needs_refresh,
+                _shard_symbols,
+                _symbols_with_daily,
+            )
+
+            universe = _symbols_with_daily(self.db)
+        except Exception:
+            logger.debug("stock_30m task reconciliation unavailable", exc_info=True)
+            return 0
+        if not universe:
+            return 0
+
+        now = _naive_bj()
+        repaired = 0
+        for spec in specs:
+            task_id = self._task_id(run_id, spec)
+            current = self.db["sync_tasks"].find_one(
+                {"_id": task_id},
+                {"status": 1, "result_summary": 1},
+            ) or {}
+            if str(current.get("status") or "") == "ok":
+                continue
+            shard_index = int(spec.shard_key.rsplit("_", 1)[-1])
+            shard_symbols = _shard_symbols(universe, shard_index, len(specs))
+            state = _latest_30m_state(self.db, shard_symbols)
+            due = [
+                symbol
+                for symbol in shard_symbols
+                if _needs_refresh(
+                    state.get(symbol, {}),
+                    min_bars=260,
+                    trade_date=trade_date,
+                    require_today=True,
+                )
+            ]
+            if due:
+                continue
+            summary = {
+                "module": "stock_30m_fullmarket",
+                "status": "ok",
+                "trade_date": trade_date,
+                "shard_key": spec.shard_key,
+                "total": len(shard_symbols),
+                "processed": len(shard_symbols),
+                "selected": 0,
+                "remaining": 0,
+                "coverage_pct": 100.0,
+                "progress_pct": 100.0,
+                "errors": 0,
+                "reconciled_existing_bars": True,
+                "reconciliation_source": "bars:30分钟",
+            }
+            self.db["sync_tasks"].update_one(
+                {"_id": task_id, "status": {"$in": list(RETRYABLE_TASK_STATUSES)}},
+                {"$set": {
+                    "status": "ok",
+                    "owner_pid": "",
+                    "heartbeat_at": now,
+                    "finished_at": now,
+                    "updated_at": now,
+                    "cursor": {"processed": len(shard_symbols), "total": len(shard_symbols), "progress_pct": 100.0},
+                    "result_summary": summary,
+                    "error_msg": "",
+                    "depends_on": list(spec.depends_on),
+                    "reconciled_existing_bars": True,
                 }},
             )
             repaired += 1
@@ -1284,6 +1565,16 @@ class PostmarketRunner:
                 with semaphore:
                     self._mark_task_started(run_id, spec)
                     result = self.engine.run_module(spec.module, fn, plan=plan)
+        expected_trade_date = str(task_values.get("SIGNALS_POSTMARKET_TRADE_DATE") or "")[:10]
+        if isinstance(result, dict) and expected_trade_date:
+            actual_trade_date = str(result.get("trade_date") or result.get("date_key") or "")[:10]
+            if actual_trade_date and actual_trade_date.replace("-", "")[:8] != expected_trade_date.replace("-", "")[:8]:
+                result = {
+                    **result,
+                    "status": "error",
+                    "error_msg": f"trade_date_mismatch: expected={expected_trade_date} actual={actual_trade_date}",
+                    "trade_date_mismatch": True,
+                }
         if soft_failed_deps and isinstance(result, dict):
             result = dict(result)
             nested = result.get("result") if isinstance(result.get("result"), dict) else {}
@@ -1423,6 +1714,15 @@ class PostmarketRunner:
 
         self._init_run(run_id, trade_date)
         self._init_tasks(run_id, trade_date)
+        reconciled_index = self._reconcile_index_daily_task_from_bars(run_id, trade_date)
+        if reconciled_index:
+            logger.info("postmarket reconciled existing index bars run=%s", run_id)
+        reconciled_daily = self._reconcile_stock_daily_tasks_from_bars(run_id, trade_date)
+        if reconciled_daily:
+            logger.info("postmarket reconciled existing daily bars run=%s tasks=%d", run_id, reconciled_daily)
+        reconciled_30m = self._reconcile_stock_30m_tasks_from_bars(run_id, trade_date)
+        if reconciled_30m:
+            logger.info("postmarket reconciled existing 30m bars run=%s tasks=%d", run_id, reconciled_30m)
         reused = self._apply_close_seal_handoff(run_id, trade_date)
         if reused:
             logger.info("postmarket reused close seal modules: run=%s reused=%d", run_id, reused)

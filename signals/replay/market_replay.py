@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from math import isfinite, log10
 from typing import Any
 
@@ -143,10 +143,10 @@ def _board_heat_source_filter() -> dict[str, Any]:
     return {"source": {"$in": list(_BOARD_HEAT_ALLOWED_SOURCES)}}
 
 
-def _snapshot_query(trade_date: str) -> dict[str, Any]:
+def _snapshot_query(trade_date: str, *, strict_point_in_time: bool = False) -> dict[str, Any]:
     start, end = _date_range(trade_date)
     compact = trade_date.replace("-", "")
-    return {
+    date_query = {
         "$or": [
             {"date_key": trade_date},
             {"date_key": compact},
@@ -154,6 +154,23 @@ def _snapshot_query(trade_date: str) -> dict[str, Any]:
             {"dt": trade_date},
             {"dt": compact},
             {"dt": {"$gte": start, "$lt": end}},
+        ]
+    }
+    if not strict_point_in_time:
+        return date_query
+    # A historical row keyed to the requested date can still be a next-day
+    # refresh or backfill.  Formal readiness may only count snapshots captured
+    # on that market date; later data needs an immutable backfill receipt and
+    # must never masquerade as evidence available to the original run.
+    return {
+        "$and": [
+            date_query,
+            {
+                "$or": [
+                    {"snapshot_at": {"$gte": start, "$lt": end}},
+                    {"captured_at": {"$gte": start, "$lt": end}},
+                ]
+            },
         ]
     }
 
@@ -2166,6 +2183,27 @@ def _replay_coverage(
     market_breadth = market_breadth or {}
     stock_daily = stock_daily or {}
     close_seal = close_seal or {}
+    # A formal Signals receipt needs a source publication time that is
+    # distinct from the market cutoff.  The close-seal completion timestamp
+    # is the only runtime-produced value that can serve this role; never
+    # substitute the requested 15:00 cutoff or the current wall clock.
+    sealed_at = close_seal.get("sealed_at")
+    if isinstance(sealed_at, datetime):
+        # Mongo stores Signals' market timestamps as naive Beijing time.
+        # Normalize the receipt to an explicit +08:00 offset before it leaves
+        # the runtime so Manifest date-time validation remains unambiguous.
+        if sealed_at.tzinfo is None:
+            sealed_at = sealed_at.replace(tzinfo=timezone(timedelta(hours=8)))
+        sealed_at = sealed_at.isoformat()
+    elif sealed_at not in (None, ""):
+        sealed_at = str(sealed_at)
+    upstream_published_at = (
+        sealed_at
+        if close_seal.get("formal_ready") is True
+        and close_seal.get("close_finality") == "stable_close"
+        and str(sealed_at or "").strip()
+        else None
+    )
     daily_dates = sorted({_text(row.get("date")) for row in major_indices if _text(row.get("date"))})
     intraday_times = [
         _text((row.get("close_bar") or {}).get("time"))
@@ -2225,6 +2263,7 @@ def _replay_coverage(
         "daily_coverage_date": daily_dates[-1] if daily_dates else None,
         "official_close_source": "index_bars:日线" if formal_ready else None,
         "official_close_as_of": trade_date if formal_ready else None,
+        "upstream_published_at": upstream_published_at,
         "latest_intraday_time": max(intraday_times) if intraday_times else None,
         "formal_ready": formal_ready,
         "generation_status": "partial" if report_stage == "formal_postmarket" and not formal_ready else "success",
@@ -2377,7 +2416,10 @@ def _market_breadth(db: Any, trade_date: str) -> dict[str, Any]:
     up = down = flat = limit_like = down_limit_like = 0
     total_amount = 0.0
     total = 0
-    cursor = db["fullmarket_spot_snapshots"].find(_snapshot_query(trade_date), _snapshot_projection())
+    cursor = db["fullmarket_spot_snapshots"].find(
+        _snapshot_query(trade_date, strict_point_in_time=True),
+        _snapshot_projection(),
+    )
     for raw in cursor:
         snapshot = _stock_snapshot(raw)
         if not _is_stock_snapshot(snapshot):
