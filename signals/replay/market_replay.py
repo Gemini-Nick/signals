@@ -2246,6 +2246,16 @@ def _replay_coverage(
             "coverage_pct_of_minimum": round(fullmarket_total / fullmarket_min * 100, 2),
             "as_of": trade_date if fullmarket_total else None,
         },
+        # Preserve the width cross-section in the receipt itself.  The
+        # replay publisher must be able to verify breadth without reopening
+        # the narrative or trusting a bare core_complete boolean.
+        "market_breadth": {
+            "total": int(market_breadth.get("total") or 0),
+            "up": int(market_breadth.get("up") or 0),
+            "down": int(market_breadth.get("down") or 0),
+            "flat": int(market_breadth.get("flat") or 0),
+            "as_of": trade_date if fullmarket_total else None,
+        },
         "stock_daily": stock_daily,
         "close_seal": close_seal,
         "note": (
