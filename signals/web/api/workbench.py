@@ -3813,7 +3813,15 @@ def _shell_stock_trade_summary(
         if isinstance(item, dict) and _text(item.get("kind")) in _SHELL_HARD_BADGE_KINDS and _text(item.get("label"))
     ][:3]
     missing = _shell_summary_clean_condition(row.get("missing_condition") or row.get("primary_blocker"))
-    if _text(row.get("source_collection")) == "hot_rank_clues":
+    has_hot_rank_clue = any(
+        isinstance(reason, dict)
+        and (
+            _text(reason.get("reason_type")) == "hot_rank_clue"
+            or _text(reason.get("source_collection")) == "hot_rank_clues"
+        )
+        for reason in row.get("inclusion_reasons") or []
+    )
+    if _text(row.get("source_collection")) == "hot_rank_clues" or has_hot_rank_clue:
         lead = _text(row.get("latest_signal") or row.get("reason")) or " / ".join(labels[:3]) or "热榜线索待确认"
     elif labels:
         lead = " / ".join(labels[:3])
@@ -3854,7 +3862,15 @@ def _shell_stock_display_action(row: dict[str, Any]) -> str:
     return "复核"
 
 
-_SHELL_HARD_BADGE_KINDS = {"buy_point", "sell_point", "new_high", "ma_climb", "gap_volume_price"}
+_SHELL_HARD_BADGE_KINDS = {
+    "buy_point",
+    "sell_point",
+    "buy_signal",
+    "sell_signal",
+    "new_high",
+    "ma_climb",
+    "gap_volume_price",
+}
 
 
 def _shell_badge_freq_label(freq: Any) -> str:
@@ -3899,6 +3915,8 @@ def _shell_badge_priority(kind: str, score: Any = None, *, ma_score: Any = None,
         ratio = _float(volume_ratio) or 0.0
         volume_bonus = min(60, int(max(0.0, ratio - 1.0) * 30))
         return 700 + volume_bonus + min(40, int(_float(score) or 0))
+    if kind in {"buy_signal", "sell_signal"}:
+        return 780 + min(80, int(abs(_float(score) or 0)))
     return 0
 
 
@@ -3934,7 +3952,9 @@ def _normalize_shell_display_badge(value: Any) -> dict[str, Any]:
         out["signal_type"] = signal_type
     tone = _text(value.get("tone")) or {
         "sell_point": "risk",
+        "sell_signal": "risk",
         "buy_point": "buy",
+        "buy_signal": "buy",
         "ma_climb": "hot",
         "new_high": "hot",
         "gap_volume_price": "hot",
@@ -4012,6 +4032,12 @@ def _shell_display_badge_from_reason(reason: dict[str, Any]) -> dict[str, Any]:
         entry_factor = _shell_reason_entry_factor(reason)
         volume_ratio = max(_float(entry_factor.get("volume_ratio")) or 0.0, _float(entry_factor.get("recent_volume_ratio")) or 0.0)
         return {**base, "kind": "gap_volume_price", "label": f"{_shell_badge_freq_label(timeframe)}强缺口量价".strip(), "priority": _shell_badge_priority("gap_volume_price", score, volume_ratio=volume_ratio)}
+    signal_type = _text(reason.get("signal_type"))
+    if signal_side in {"buy", "sell"} and signal_type:
+        prefix = _shell_badge_freq_label(timeframe)
+        label = f"{prefix}{signal_type}" if prefix and not signal_type.startswith(prefix) else signal_type
+        kind = "sell_signal" if signal_side == "sell" else "buy_signal"
+        return {**base, "kind": kind, "label": label[:14], "priority": _shell_badge_priority(kind, score)}
     return {}
 
 
@@ -4078,8 +4104,8 @@ def _shell_select_display_badges(badges: list[dict[str, Any]], limit: int = 3) -
         selected_ids.add(identity)
         selected.append(item)
 
-    add(next((item for item in ordered if item.get("kind") == "sell_point"), None))
-    add(next((item for item in ordered if item.get("kind") == "buy_point"), None))
+    add(next((item for item in ordered if item.get("kind") in {"sell_point", "sell_signal"}), None))
+    add(next((item for item in ordered if item.get("kind") in {"buy_point", "buy_signal"}), None))
     add(next((item for item in ordered if item.get("kind") == "ma_climb"), None))
     climb_timeframes = {
         _text(item.get("timeframe"))
@@ -4620,10 +4646,33 @@ def _load_terminal_technical_signal_rows(symbol: str, *, limit: int = 300, kind:
         latest_as_of = _text(latest.get("as_of"))
         if latest_as_of:
             query["as_of"] = latest_as_of
+        # MA-climb is a completed-bar state and can legitimately have an
+        # older ``as_of`` than today's intraday technical scan.  Read it as a
+        # second state stream so the ordinary latest-as-of query stays strict.
+        climb_docs = list(db["terminal_technical_signals"].find(
+            {
+                "symbol": {"$in": candidates},
+                "signal_family": "ma_climb",
+                "active": {"$ne": False},
+            },
+            {"_id": 0},
+        ).sort([("updated_at", -1), ("dt", -1)]).limit(4))
         docs = list(db["terminal_technical_signals"].find(
             query,
             {"_id": 0},
         ).sort([("dt", -1), ("updated_at", -1)]).limit(limit))
+        seen = {
+            _text(item.get("dedupe_key"))
+            or "|".join(_text(item.get(key)) for key in ("symbol", "freq", "signal_type", "as_of"))
+            for item in docs
+        }
+        for item in climb_docs:
+            identity = _text(item.get("dedupe_key")) or "|".join(
+                _text(item.get(key)) for key in ("symbol", "freq", "signal_type", "as_of")
+            )
+            if identity not in seen:
+                docs.append(item)
+                seen.add(identity)
         return [dict(item) for item in docs if isinstance(item, dict)]
     except Exception:
         return []
@@ -4812,6 +4861,13 @@ def _manual_clue_entry_summary(timeframe_sides: dict[str, dict[str, Any]], missi
 
 def _terminal_technical_signal_reasons(symbol: str, *, limit: int = 12) -> list[dict[str, Any]]:
     signals = _load_terminal_technical_signal_rows(symbol, limit=80)
+    # Reserve display capacity for the long-lived completed-bar climb state.
+    # This changes badge visibility only; pool membership and trade priority
+    # continue to come from the published terminal pool.
+    signals.sort(
+        key=lambda item: _text(item.get("signal_family")) == "ma_climb",
+        reverse=True,
+    )
     reasons: list[dict[str, Any]] = []
     seen: set[str] = set()
     for signal in signals:
@@ -9394,6 +9450,28 @@ def _terminal_stock_pool_group_rows(range_columns: list[dict[str, Any]], group: 
         ][:4]
         row["source_tags"] = item.get("source_tags") or []
         row["inclusion_reasons"] = item.get("inclusion_reasons") or []
+        # Pool membership remains frozen to the postmarket publication, but
+        # card badges are a display-only view.  Overlay the current technical
+        # signal read model so a later climb/custom scan cannot be hidden by
+        # an older published pool payload.
+        current_display_reasons = _terminal_technical_signal_reasons(_text(row.get("symbol")))
+        current_display_badges = [
+            badge
+            for reason in current_display_reasons
+            for badge in [_shell_display_badge_from_reason(reason)]
+            if badge
+        ]
+        if current_display_badges:
+            stored_badges = [
+                badge
+                for item_badge in item.get("display_badges") or []
+                for badge in [_normalize_shell_display_badge(item_badge)]
+                if badge
+            ]
+            row["display_badges"] = _shell_select_display_badges(
+                [*stored_badges, *current_display_badges]
+            )
+            row["display_signal_overlay"] = "terminal_technical_signals_current"
         row["technical_evidence"] = item.get("technical_evidence") if isinstance(item.get("technical_evidence"), dict) else {}
         row["knowledge_confirmation"] = item.get("knowledge_confirmation") if isinstance(item.get("knowledge_confirmation"), dict) else {"status": "none"}
         row["resonance_context"] = item.get("resonance_context") if isinstance(item.get("resonance_context"), dict) else {}

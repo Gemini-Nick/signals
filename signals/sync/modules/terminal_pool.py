@@ -5567,6 +5567,17 @@ def _display_badge_for_reason(reason: dict[str, Any]) -> dict[str, Any]:
         return {**base, "kind": "buy_point", "label": _badge_label_for_signal(reason, fallback="买点"), "tone": "buy", "priority": 950 + min(80, int(score))}
     if signal_side == "sell" and any(token in text for token in ("一卖", "二卖", "三卖", "顶背离", "跌破", "死叉")):
         return {**base, "kind": "sell_point", "label": _badge_label_for_signal(reason, fallback="卖点"), "tone": "risk", "priority": 1000 + min(80, int(score))}
+    signal_type = _text(reason.get("signal_type"))
+    if signal_side in {"buy", "sell"} and signal_type:
+        prefix = _badge_timeframe_label(timeframe)
+        label = f"{prefix}{signal_type}" if prefix and not signal_type.startswith(prefix) else signal_type
+        return {
+            **base,
+            "kind": "sell_signal" if signal_side == "sell" else "buy_signal",
+            "label": label[:14],
+            "tone": "risk" if signal_side == "sell" else "buy",
+            "priority": 780 + min(80, int(abs(score))),
+        }
     return {}
 
 
@@ -5596,8 +5607,8 @@ def _select_display_badges(badges: list[dict[str, Any]], limit: int = 3) -> list
         selected_ids.add(identity)
         selected.append(item)
 
-    add(next((item for item in ordered if item.get("kind") == "sell_point"), None))
-    add(next((item for item in ordered if item.get("kind") == "buy_point"), None))
+    add(next((item for item in ordered if item.get("kind") in {"sell_point", "sell_signal"}), None))
+    add(next((item for item in ordered if item.get("kind") in {"buy_point", "buy_signal"}), None))
     add(next((item for item in ordered if item.get("kind") == "ma_climb"), None))
     climb_timeframes = {
         _text(item.get("timeframe"))

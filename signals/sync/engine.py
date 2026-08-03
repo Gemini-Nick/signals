@@ -792,6 +792,12 @@ class SyncEngine:
                     or result.get("reason")
                     or ""
                 )
+            if result_status in {"rejected", "failed", "blocked", "busy", "superseded", "stale_trigger"}:
+                return "degraded", str(
+                    result.get("error_msg")
+                    or result.get("reason")
+                    or result_status
+                )
         if not counts:
             return "ok", None
         inserted = self._result_inserted(result)

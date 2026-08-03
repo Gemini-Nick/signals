@@ -583,6 +583,19 @@ def _hot_quote_symbols(db: Database) -> list[str]:
     except Exception:
         logger.debug("manual clue quote symbols unavailable", exc_info=True)
 
+    # Auto-selected hot-rank clues are rendered beside manual and terminal
+    # pool clues, so they need the same live quote coverage.  They are not
+    # guaranteed to be present in the previous postmarket pool or strategy
+    # snapshot, especially before today's pool has been published.
+    try:
+        for item in db["hot_rank_clues"].find(
+            {"active": True},
+            {"symbol": 1, "raw_code": 1},
+        ).sort([("score", -1), ("updated_at", -1)]).limit(80):
+            add(item.get("symbol") or item.get("raw_code"))
+    except Exception:
+        logger.debug("hot-rank clue quote symbols unavailable", exc_info=True)
+
     try:
         for item in macro_watchlist():
             if isinstance(item, dict):
