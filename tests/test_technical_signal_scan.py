@@ -19,6 +19,10 @@ from signals.sync.modules.technical_signal_scan import (
     _load_bars,
     _ma_alignment_from_daily_bars,
     _prefixed_symbol,
+    _canonical_symbol,
+    _raw_symbol_code,
+    _symbol_market,
+    _symbol_query_values,
     _refusal_pullback_factor,
     _resampled_5m_docs,
     _resonance_context,
@@ -58,6 +62,14 @@ WEIGHTS = {
     "背驰买": 70,
     "一卖": -100,
 }
+
+
+def test_technical_scan_preserves_us_symbols():
+    assert _symbol_market("US.AXTI") == "US"
+    assert _raw_symbol_code("US.COHR") == "COHR"
+    assert _canonical_symbol("US.LITE") == "US.LITE"
+    assert _prefixed_symbol("US.FN") == "US.FN"
+    assert _symbol_query_values("US.AAOI") == ["US.AAOI", "AAOI"]
 
 
 def test_technical_scan_preserves_macro_etf_exchange_prefix():

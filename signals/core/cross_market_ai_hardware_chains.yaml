@@ -56,8 +56,9 @@ chains:
       - node_id: optical_interconnect
         name: 光器件/光模块/CPO
         layer: midstream
-        keywords: [COHR, Coherent, LITE, Lumentum, FN, Fabrinet, AAOI, CIEN, Ciena, 光模块, 光器件, CPO, 硅光, 800G, 1.6T, optical, photonics]
+        keywords: [AXTI, AXT, COHR, Coherent, LITE, Lumentum, FN, Fabrinet, AAOI, CIEN, Ciena, 光模块, 光器件, CPO, 硅光, 800G, 1.6T, optical, photonics]
         us_representatives:
+          - {symbol: AXTI, name: AXT, role: inp_substrate_upstream, evidence_type: optical_materials_proxy, priority: 88}
           - {symbol: COHR, name: Coherent, role: optical_component_anchor, evidence_type: optical_price_proxy, priority: 100}
           - {symbol: LITE, name: Lumentum, role: optical_component_anchor, evidence_type: optical_price_proxy, priority: 96}
           - {symbol: FN, name: Fabrinet, role: optical_manufacturing, evidence_type: optical_supply_chain_proxy, priority: 92}
@@ -69,7 +70,7 @@ chains:
           concepts: [光模块, CPO, 硅光, 800G, 1.6T]
           core_representatives: [中际旭创, 新易盛, 天孚通信]
           elastic_representatives: [光迅科技, 源杰科技, 联特科技]
-          mapping_rule: COHR/LITE/FN/AAOI/CIEN 是光器件和光模块直接触发源；AVGO 只能作为网络 ASIC/硅光旁证。
+          mapping_rule: AXTI 是 InP 衬底上游弹性观察；COHR/LITE/FN/AAOI/CIEN 是光器件、光模块和光网络直接触发源；AVGO 只能作为网络 ASIC/硅光旁证。
           lag_rule: US_T_close_to_A_T_plus_1
           confirmation_rule: A股光模块/CPO 池 T+1 开盘不过热，龙头和弹性标的出现量价承接。
           confidence: 0.88

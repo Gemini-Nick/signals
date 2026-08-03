@@ -42,11 +42,11 @@ def test_global_universe_has_fixed_hk_us_anchors_and_disabled_kr_context():
     us = {item["symbol"]: item for item in market_universe("US")}
     kr = {item["symbol"]: item for item in market_universe("KR")}
 
-    assert config["version"] == "2026.07.2"
+    assert config["version"] == "2026.08.1"
     assert {"HK.800000", "HK.800100", "HK.800700", "HK.00700", "HK.09988"} <= hk.keys()
     assert {"US.SPY", "US.QQQ", "US.DIA", "US.SOXX", "US.IWM", "US.VIXY"} <= us.keys()
     assert {"US.AAPL", "US.MSFT", "US.NVDA", "US.AMZN", "US.GOOGL", "US.META", "US.TSLA"} <= us.keys()
-    assert {"US.AVGO", "US.ANET", "US.COHR", "US.VRT", "US.MU", "US.TSM"} <= us.keys()
+    assert {"US.AXTI", "US.AVGO", "US.ANET", "US.COHR", "US.VRT", "US.MU", "US.TSM"} <= us.keys()
     assert {"KR.KOSPI", "KR.000660"} <= kr.keys()
     assert us["US.SPY"]["proxy_for"] == "S&P 500"
     assert market_metadata("US")["coverage_scope"] == "core_universe"
@@ -73,7 +73,7 @@ def test_market_membership_is_versioned_and_fixed():
     docs = foundation.universe_membership_documents(effective_date="2026-07-27")
     nvda = next(doc for doc in docs if doc["symbol"] == "US.NVDA")
 
-    assert nvda["_id"].startswith("2026.07.2:US:")
+    assert nvda["_id"].startswith("2026.08.1:US:")
     assert nvda["fixed"] is True
     assert nvda["role"] == "anchor"
 

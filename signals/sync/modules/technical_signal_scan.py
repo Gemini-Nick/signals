@@ -21,6 +21,7 @@ logger = logging.getLogger("signals.sync.technical_signal_scan")
 DAILY_FREQS = ["日线", "daily", "D", "1d"]
 WEEKLY_FREQS = ["周线", "weekly", "W", "1w"]
 MINUTE_FREQS = {
+    "60分钟": ["60分钟", "60min", "60m", "F60"],
     "30分钟": ["30分钟", "30min", "30m", "F30"],
     "15分钟": ["15分钟", "15min", "15m", "F15"],
     "5分钟": ["5分钟", "5min", "5m", "F5"],
@@ -132,17 +133,26 @@ def _pure_hk_code(symbol: Any) -> str:
 
 def _symbol_market(symbol: Any) -> str:
     raw = str(symbol or "").strip().upper()
+    if raw.startswith("US."):
+        return "US"
     if raw.startswith("HK.") or _pure_hk_code(raw) and not _pure_a_code(raw):
         return "HK"
     return "A"
 
 
 def _raw_symbol_code(symbol: Any) -> str:
-    return _pure_hk_code(symbol) if _symbol_market(symbol) == "HK" else _pure_a_code(symbol)
+    market = _symbol_market(symbol)
+    if market == "US":
+        raw = str(symbol or "").strip().upper()
+        return raw.split(".", 1)[-1] if raw.startswith("US.") else raw
+    return _pure_hk_code(symbol) if market == "HK" else _pure_a_code(symbol)
 
 
 def _canonical_symbol(symbol: Any) -> str:
     market = _symbol_market(symbol)
+    if market == "US":
+        ticker = _raw_symbol_code(symbol)
+        return f"US.{ticker}" if ticker else ""
     if market == "HK":
         code = _pure_hk_code(symbol)
         return f"HK.{code}" if code else ""
@@ -150,7 +160,10 @@ def _canonical_symbol(symbol: Any) -> str:
 
 
 def _prefixed_symbol(symbol: Any) -> str:
-    if _symbol_market(symbol) == "HK":
+    market = _symbol_market(symbol)
+    if market == "US":
+        return _canonical_symbol(symbol)
+    if market == "HK":
         code = _pure_hk_code(symbol)
         return f"HK.{code}" if code else str(symbol or "").strip()
     code = _pure_a_code(symbol)
@@ -173,13 +186,19 @@ def _symbol_query_values(symbol: str) -> list[str]:
         return [str(symbol or "").strip()]
     if market == "HK":
         return [f"HK.{code}", code]
+    if market == "US":
+        return [f"US.{code}", code]
     return [code, _prefixed_symbol(code)]
 
 
 def _scan_markets(scan_scope: str | None = None) -> tuple[str, ...]:
     default = ("A",) if scan_scope in {INTRADAY_SCAN_SCOPE, POSTMARKET_CANDIDATE_SCAN_SCOPE} else ("A", "HK")
     markets = tuple(value.upper() for value in _env_list("TECHNICAL_SIGNAL_SCAN_MARKETS", default))
-    normalized = tuple("HK" if value in {"H", "HK"} else "A" for value in markets if value in {"A", "CN", "SH", "SZ", "BJ", "H", "HK"})
+    normalized = tuple(
+        "US" if value in {"US", "NYSE", "NASDAQ"} else ("HK" if value in {"H", "HK"} else "A")
+        for value in markets
+        if value in {"A", "CN", "SH", "SZ", "BJ", "H", "HK", "US", "NYSE", "NASDAQ"}
+    )
     return tuple(dict.fromkeys(normalized)) or default
 
 
@@ -1154,7 +1173,13 @@ def _details_dict(details: str) -> dict[str, Any]:
     return {"summary": details[:800]}
 
 
-def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -> list[dict[str, Any]]:
+def _scan_symbol(
+    db: Database,
+    symbol: str,
+    *,
+    scan_scope: str = "postmarket",
+    include_60m: bool = False,
+) -> list[dict[str, Any]]:
     from czsc import Freq
     from signals.core.analyzer import SymbolAnalyzer
     from signals.core.detectors import detect_all_signals
@@ -1188,6 +1213,11 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
         ("15分钟", Freq.F15, _load_bars(db, symbol, MINUTE_FREQS["15分钟"], Freq.F15, limit=260, label="15分钟", resample_intraday=resample_intraday), 80),
         ("5分钟", Freq.F5, _load_bars(db, symbol, MINUTE_FREQS["5分钟"], Freq.F5, limit=260, label="5分钟"), 80),
     ]
+    if include_60m:
+        bars_by_freq.insert(
+            2,
+            ("60分钟", Freq.F60, _load_bars(db, symbol, MINUTE_FREQS["60分钟"], Freq.F60, limit=260, label="60分钟"), 80),
+        )
     events = []
     bi_counts: dict[str, int] = {}
     for label, freq, bars, max_bi in bars_by_freq:
@@ -1257,7 +1287,7 @@ def _scan_symbol(db: Database, symbol: str, *, scan_scope: str = "postmarket") -
 
 
 def _sync_technical_signal_scan(db: Database, proxy_url: str = None, *, scope: str | None = None) -> dict:
-    """Scan cached hard-technical bars and publish explainable A/H signals."""
+    """Scan cached hard-technical bars and publish explainable market signals."""
     del proxy_url
     scan_scope = _scan_scope(scope)
     scan_markets = _scan_markets(scan_scope)
