@@ -115,6 +115,16 @@ def test_hk_partial_latest_shard_falls_back_to_last_complete_session():
     assert foundation._select_session_date(valid, "US") == "2026-07-27"
 
 
+def test_hk_latest_core_universe_is_newer_than_stale_full_market_snapshot():
+    core = [item["symbol"] for item in market_universe("HK")[:5]]
+    valid = {
+        **{(f"HK.{index:05d}", "2026-07-24"): {} for index in range(1200)},
+        **{(symbol, "2026-08-05"): {} for symbol in core},
+    }
+
+    assert foundation._select_session_date(valid, "HK") == "2026-08-05"
+
+
 class _NeverWriteDb:
     def __getitem__(self, _name):
         raise AssertionError("missing providers must not touch Mongo bars")
@@ -125,6 +135,16 @@ def test_missing_alpaca_and_futu_return_unavailable_without_writes(monkeypatch):
     monkeypatch.delenv("ALPACA_SECRET_KEY", raising=False)
     monkeypatch.setenv("FUTU_HOST", "127.0.0.1")
     monkeypatch.setenv("FUTU_PORT", "1")
+    monkeypatch.setattr(
+        foundation,
+        "_hydrate_us_yfinance",
+        lambda _db: {"status": "unavailable", "provider": "yfinance", "daily_written": 0, "minute_written": 0},
+    )
+    monkeypatch.setattr(
+        foundation,
+        "_hydrate_hk_tencent",
+        lambda _db: {"status": "unavailable", "provider": "tencent", "daily_written": 0, "minute_written": 0},
+    )
 
     result = foundation.hydrate_global_core_bars(_NeverWriteDb())
 

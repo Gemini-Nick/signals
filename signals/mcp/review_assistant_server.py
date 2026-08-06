@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from signals.notify.trading_workbench_summary import (
@@ -39,6 +39,15 @@ DATA_REQUIREMENTS = """Signals 复盘助手需要这些数据：
 10. 可选：外部订单大小口径资金流、分账户资金流、新闻/催化、用户截图或外部数据补充的精确事实。大中小单不等同于账户级主力/散户。
 自动化要求：先跑本地 window gate；intraday 用 render_market_replay_wechat_body 的正文，postmarket/weekly 用 get_market_replay_context 后按 skill 做 AI-native 复盘；不要只凭 raw API 摘要写市场判断。
 输出要求：首行保留 NOTIFY/DONT_NOTIFY；不要输出 runtime/Mongo/cache 日志；不要写直接买卖指令。"""
+
+
+def _json_text(value: Any) -> str:
+    def encode(item: Any) -> str:
+        if isinstance(item, (date, datetime)):
+            return item.isoformat()
+        raise TypeError(f"Object of type {item.__class__.__name__} is not JSON serializable")
+
+    return json.dumps(value, ensure_ascii=False, indent=2, default=encode)
 
 
 def _tool_schema() -> list[dict[str, Any]]:
@@ -719,18 +728,18 @@ def _handle(message: dict[str, Any]) -> dict[str, Any] | None:
         if name == "list_signals_replay_data_requirements":
             return _response(request_id, _text_result(DATA_REQUIREMENTS))
         if name == "get_replay_analysis_framework":
-            return _response(request_id, _text_result(json.dumps(replay_analysis_framework(), ensure_ascii=False, indent=2)))
+            return _response(request_id, _text_result(_json_text(replay_analysis_framework())))
         if name == "get_signals_replay_context":
             try:
                 context = _collect_context(arguments)
                 context.pop("_inputs", None)
-                return _response(request_id, _text_result(json.dumps(context, ensure_ascii=False, indent=2)))
+                return _response(request_id, _text_result(_json_text(context)))
             except Exception as exc:  # pragma: no cover - defensive server boundary
                 return _response(request_id, _text_result(f"打包复盘数据失败：{exc}", is_error=True))
         if name == "get_market_replay_context":
             try:
                 context = _collect_market_context(arguments)
-                return _response(request_id, _text_result(json.dumps(context, ensure_ascii=False, indent=2)))
+                return _response(request_id, _text_result(_json_text(context)))
             except Exception as exc:  # pragma: no cover - defensive server boundary
                 return _response(request_id, _text_result(f"打包全市场复盘事件失败：{exc}", is_error=True))
         if name == "render_market_replay_wechat_body":
@@ -741,7 +750,7 @@ def _handle(message: dict[str, Any]) -> dict[str, Any] | None:
                     window=str(arguments.get("window") or context.get("window") or "postmarket"),
                     max_items=int(arguments.get("max_items") or 5),
                 )
-                return _response(request_id, _text_result(json.dumps(result, ensure_ascii=False, indent=2)))
+                return _response(request_id, _text_result(_json_text(result)))
             except Exception as exc:  # pragma: no cover - defensive server boundary
                 return _response(request_id, _text_result(f"渲染微信正文失败：{exc}", is_error=True))
         if name == "generate_signals_replay_review":

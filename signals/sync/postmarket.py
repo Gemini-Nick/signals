@@ -2285,6 +2285,7 @@ class PostmarketRunner:
     def _continue_terminal_run(self, trade_date: str, run_id: str) -> bool:
         continued = self._continue_minute_preheat_universe(trade_date, run_id) > 0
         continued = self._continue_hk_daily(trade_date, run_id) > 0 or continued
+        continued = self._refresh_global_market_foundation_once(trade_date, run_id) or continued
         if (
             # Optional tails (notably the per-symbol HK history lane) may be
             # provider-bound and can outlive the formal A-share postmarket
@@ -2298,6 +2299,45 @@ class PostmarketRunner:
             self.run_once(resume_run_id=run_id, trade_date=trade_date, run_optional_tasks=True)
             continued = True
         return continued
+
+    def _refresh_global_market_foundation_once(self, trade_date: str, run_id: str) -> bool:
+        if not _env_bool("SIGNALS_POSTMARKET_REFRESH_GLOBAL_MARKETS", True):
+            return False
+        run_doc = self.db["sync_runs"].find_one(
+            {"_id": run_id},
+            {"global_market_foundation_trade_date": 1},
+        ) or {}
+        if run_doc.get("global_market_foundation_trade_date") == trade_date:
+            return False
+
+        from signals.sync.modules.global_market_foundation import sync_global_market_foundation
+
+        try:
+            result = self.engine.run_module("global_market_foundation", sync_global_market_foundation)
+        except Exception as exc:
+            logger.exception("global market foundation refresh failed run=%s", run_id)
+            self.db["sync_runs"].update_one(
+                {"_id": run_id},
+                {"$set": {
+                    "global_market_foundation_status": "error",
+                    "global_market_foundation_error": str(exc),
+                    "global_market_foundation_updated_at": _naive_bj(),
+                }},
+                upsert=True,
+            )
+            return False
+
+        status = str(result.get("status") or "ok")
+        self.db["sync_runs"].update_one(
+            {"_id": run_id},
+            {"$set": {
+                "global_market_foundation_trade_date": trade_date,
+                "global_market_foundation_status": status,
+                "global_market_foundation_updated_at": _naive_bj(),
+            }},
+            upsert=True,
+        )
+        return True
 
     def run_once(
         self,
@@ -2593,7 +2633,12 @@ class PostmarketRunner:
                 status = run_doc.get("status")
                 if status not in RUN_TERMINAL_STATUSES or _env_bool("SIGNALS_POSTMARKET_FORCE", False):
                     logger.info("postmarket trigger run=%s previous_status=%s", run_id, status or "missing")
-                    self.run_once(trade_date=trade_date, force=_env_bool("SIGNALS_POSTMARKET_FORCE", False))
+                    result = self.run_once(
+                        trade_date=trade_date,
+                        force=_env_bool("SIGNALS_POSTMARKET_FORCE", False),
+                    )
+                    if str(result.get("status") or "") in {"ok", "partial"}:
+                        self._refresh_global_market_foundation_once(trade_date, run_id)
                 else:
                     self._continue_terminal_run(trade_date, run_id)
             else:
@@ -2604,7 +2649,9 @@ class PostmarketRunner:
                         self._continue_terminal_run(trade_date, run_id)
                     else:
                         logger.info("postmarket catchup trigger run=%s previous_status=%s", run_id, status)
-                        self.run_once(resume_run_id=run_id, trade_date=trade_date)
+                        result = self.run_once(resume_run_id=run_id, trade_date=trade_date)
+                        if str(result.get("status") or "") in {"ok", "partial"}:
+                            self._refresh_global_market_foundation_once(trade_date, run_id)
                 elif not _is_a_share_trading_day(now):
                     # A completed postmarket DAG may still have a bounded,
                     # low-priority minute-preheat rotation outstanding.  The

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from types import SimpleNamespace
 
 from signals.mcp import review_assistant_server
@@ -157,6 +158,27 @@ def test_render_market_replay_wechat_body_mcp_tool(monkeypatch):
     assert "丰光精密" in result["body"]
     for term in BANNED_BODY_TERMS:
         assert term not in result["body"]
+
+
+def test_market_replay_mcp_serializes_datetime_values(monkeypatch):
+    monkeypatch.setattr(
+        review_assistant_server,
+        "_collect_market_context",
+        lambda _args: {"trade_date": "2026-08-05", "captured_at": datetime(2026, 8, 5, 16, 30)},
+    )
+
+    response = review_assistant_server._handle(
+        {
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "get_market_replay_context", "arguments": {"markets": ["A", "HK", "US"]}},
+        }
+    )
+
+    assert response is not None
+    assert response["result"]["isError"] is False
+    result = json.loads(response["result"]["content"][0]["text"])
+    assert result["captured_at"] == "2026-08-05T16:30:00"
 
 
 def test_market_replay_tool_exposes_report_stage_contract():

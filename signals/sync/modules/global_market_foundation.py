@@ -56,6 +56,11 @@ def _select_session_date(
     session_date = available_days[-1]
     if market == "HK" and len(available_days) > 1:
         latest_count = sum(1 for _, day in valid if day == session_date)
+        latest_symbols = {symbol for symbol, day in valid if day == session_date}
+        core_symbols = {item["symbol"] for item in market_universe("HK")}
+        core_minimum = min(5, len(core_symbols))
+        if len(latest_symbols & core_symbols) >= core_minimum:
+            return session_date
         previous_date = available_days[-2]
         previous_count = sum(1 for _, day in valid if day == previous_date)
         # HK shards can expose a small, newer partial day before the full-market
@@ -193,8 +198,6 @@ def _latest_valid_bars(db: Database, market: str) -> tuple[str, list[dict[str, A
     for collection in collections:
         try:
             query: dict[str, Any] = {"meta.symbol": {"$in": symbols}, "meta.freq": {"$in": list(DAILY_FREQS)}}
-            if market == "HK" and collection == "bars":
-                query = {"meta.market": "HK", "meta.freq": {"$in": list(DAILY_FREQS)}}
             latest = db[collection].find_one(query, {"dt": 1}, sort=[("dt", -1)]) or {}
             latest_dt = latest.get("dt")
             if latest_dt is None:
@@ -298,6 +301,105 @@ def _write_bar_docs(db: Database, docs: list[dict[str, Any]]) -> int:
     return _replace_exact_bar_docs(db["bars"], docs)
 
 
+def _append_new_bar_docs(db: Database, docs: list[dict[str, Any]]) -> int:
+    """Append only bars newer than each symbol's persisted tail.
+
+    The fallback refresh only needs to advance the compact replay snapshot.
+    Replacing a full adjusted history is both unnecessary and expensive on a
+    remote time-series collection.
+    """
+    if not docs:
+        return 0
+    symbols = sorted({str((doc.get("meta") or {}).get("symbol") or "") for doc in docs} - {""})
+    latest_by_symbol = {
+        str(row["_id"]): row.get("latest")
+        for row in db["bars"].aggregate([
+            {"$match": {"meta.symbol": {"$in": symbols}, "meta.freq": {"$in": list(DAILY_FREQS)}}},
+            {"$group": {"_id": "$meta.symbol", "latest": {"$max": "$dt"}}},
+        ])
+    }
+    pending: list[dict[str, Any]] = []
+    seen: set[tuple[str, Any]] = set()
+    for doc in docs:
+        item = dict(doc)
+        item.pop("_id", None)
+        symbol = str((item.get("meta") or {}).get("symbol") or "")
+        dt = item.get("dt")
+        latest = latest_by_symbol.get(symbol)
+        key = (symbol, dt)
+        if symbol and dt is not None and (latest is None or dt > latest) and key not in seen:
+            seen.add(key)
+            pending.append(item)
+    if not pending:
+        return 0
+    result = db["bars"].insert_many(pending, ordered=False)
+    return len(getattr(result, "inserted_ids", []) or [])
+
+
+def _hydrate_us_yfinance(db: Database) -> dict[str, Any]:
+    from signals.data.fetcher import YFinanceSource
+
+    source = YFinanceSource()
+    written = 0
+    covered = 0
+    errors: list[str] = []
+    for item in market_universe("US"):
+        symbol = item["symbol"]
+        try:
+            docs = _raw_bar_documents(
+                source.get_us_daily(symbol, period="1y"),
+                symbol=symbol,
+                market="US",
+                source="yfinance",
+                feed="delayed",
+            )
+            if docs:
+                covered += 1
+                written += _append_new_bar_docs(db, docs)
+        except Exception as exc:
+            errors.append(f"{symbol}:{exc}")
+    return {
+        "status": "available" if covered else "unavailable",
+        "provider": "yfinance",
+        "daily_written": written,
+        "minute_written": 0,
+        "covered_symbols": covered,
+        "coverage_scope": "core_universe",
+        "errors": errors[:8],
+    }
+
+
+def _hydrate_hk_tencent(db: Database) -> dict[str, Any]:
+    from signals.sync.modules.hk_stock_daily import (
+        _docs_from_hk_daily_df,
+        _fetch_tencent_hk_daily_df,
+    )
+
+    end = naive_market_now("HK").strftime("%Y%m%d")
+    start = (naive_market_now("HK") - timedelta(days=45)).strftime("%Y%m%d")
+    docs_by_code: dict[str, list[dict[str, Any]]] = {}
+    errors: list[str] = []
+    for item in market_universe("HK"):
+        code = item["raw_code"]
+        try:
+            frame = _fetch_tencent_hk_daily_df(code, start, end)
+            docs = _docs_from_hk_daily_df(code, frame, "website_tencent_hk", end_date=end)
+            if docs:
+                docs_by_code[code] = docs
+        except Exception as exc:
+            errors.append(f"{item['symbol']}:{exc}")
+    written = _append_new_bar_docs(db, [doc for docs in docs_by_code.values() for doc in docs])
+    return {
+        "status": "available" if docs_by_code else "unavailable",
+        "provider": "tencent",
+        "daily_written": written,
+        "minute_written": 0,
+        "covered_symbols": len(docs_by_code),
+        "coverage_scope": "core_universe",
+        "errors": errors[:8],
+    }
+
+
 def hydrate_global_core_bars(db: Database) -> dict[str, Any]:
     """Best-effort provider bridge.
 
@@ -353,6 +455,12 @@ def hydrate_global_core_bars(db: Database) -> dict[str, Any]:
     else:
         status["US"]["reason"] = "ALPACA_API_KEY / ALPACA_SECRET_KEY not configured"
 
+    if not status["US"]["daily_written"]:
+        try:
+            status["US"] = _hydrate_us_yfinance(db)
+        except Exception as exc:
+            status["US"].setdefault("fallback_reason", str(exc))
+
     futu_source = None
     try:
         from czsc import Freq
@@ -399,6 +507,11 @@ def hydrate_global_core_bars(db: Database) -> dict[str, Any]:
                 futu_source.close()
             except Exception:
                 pass
+    if not status["HK"]["daily_written"]:
+        try:
+            status["HK"] = _hydrate_hk_tencent(db)
+        except Exception as exc:
+            status["HK"].setdefault("fallback_reason", str(exc))
     return status
 
 
@@ -465,6 +578,8 @@ def build_market_daily_snapshot(db: Database, market: str, *, now: datetime | No
         reverse=True,
     )[:8]
     effective_scope = metadata["coverage_scope"]
+    if market == "HK" and stocks and len(stocks) < 500:
+        effective_scope = "core_universe"
     if market == "US" and not stocks:
         effective_scope = "index_only"
     snapshot = {

@@ -1432,6 +1432,31 @@ def test_postmarket_hk_daily_error_does_not_block_a_scan(monkeypatch):
     assert result["optional_incomplete_tasks"] == 1
 
 
+def test_terminal_continuation_refreshes_global_market_foundation_once(monkeypatch):
+    calls = []
+
+    def global_market_foundation(db, proxy_url=None):
+        del db, proxy_url
+        calls.append("global_market_foundation")
+        return {"status": "ok"}
+
+    db = _Db()
+    run_id = "postmarket:2026-08-05"
+    db["sync_runs"].docs[run_id] = {"_id": run_id, "trade_date": "2026-08-05", "status": "ok"}
+    engine = _Engine(db, {"global_market_foundation": (global_market_foundation, "")})
+    runner = pm.PostmarketRunner(engine, max_workers=1)
+    monkeypatch.setattr(runner, "_continue_minute_preheat_universe", lambda *_args: 0)
+    monkeypatch.setattr(runner, "_continue_hk_daily", lambda *_args: 0)
+    monkeypatch.setattr(
+        "signals.sync.modules.global_market_foundation.sync_global_market_foundation",
+        global_market_foundation,
+    )
+
+    assert runner._refresh_global_market_foundation_once("2026-08-05", run_id) is True
+    assert runner._refresh_global_market_foundation_once("2026-08-05", run_id) is False
+    assert calls == ["global_market_foundation"]
+
+
 def test_postmarket_skips_optional_tasks_by_default(monkeypatch):
     tasks = (
         pm.PostmarketTaskSpec("alpha", "data"),
