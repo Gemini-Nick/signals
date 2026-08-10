@@ -555,6 +555,21 @@ def _runtime_degraded_result_usable(task_doc: dict[str, Any]) -> bool:
     return any(_result_number(task_doc, key) > 0 for key in RUNTIME_USABLE_OUTPUT_KEYS)
 
 
+def _terminal_pool_rejection_is_accounted(task_doc: dict[str, Any]) -> bool:
+    """Treat a clean source-eligibility rejection as an accounted outcome.
+
+    ``terminal_realtime_pool`` is a downstream publication step.  When its
+    strict source gate rejects an empty/ineligible pool, retrying it forever
+    cannot create data and used to keep the entire postmarket DAG partial.
+    Preserve the rejected result for the UI, but allow independent terminal
+    cache tasks and the run checkpoint to advance.
+    """
+    summary, nested = _result_sources(task_doc)
+    reason = str(nested.get("reason") or summary.get("reason") or "").strip().lower()
+    result_status = str(nested.get("status") or summary.get("status") or "").strip().lower()
+    return reason == "ineligible_sources" and result_status == "rejected"
+
+
 def _stale_finished_result_usable(task_doc: dict[str, Any]) -> bool:
     if str(task_doc.get("status") or "") != "stale":
         return False
@@ -580,6 +595,8 @@ def _dependency_status_ok(task_doc: dict[str, Any]) -> bool:
     if module in {"stock_daily", "hk_stock_daily"} and status in {"partial", "degraded", "stale", "running"}:
         effective_status = status if status in {"partial", "degraded"} else "partial"
         return _stock_daily_dependency_ok({**task_doc, "status": effective_status})
+    if module == "terminal_realtime_pool" and status in {"partial", "degraded"}:
+        return _terminal_pool_rejection_is_accounted(task_doc)
     if status in TASK_OK_STATUSES:
         return True
     if _stale_finished_result_usable(task_doc):
@@ -1260,6 +1277,18 @@ class PostmarketRunner:
             if str(current.get("status") or "") == "ok" and not current.get("reconciled_existing_bars"):
                 continue
             current_summary = dict(current.get("result_summary") or {})
+            current_result = current_summary.get("result") if isinstance(current_summary.get("result"), dict) else {}
+            if current.get("reconciled_existing_bars") and all(
+                current_value == result.get(key)
+                for key, current_value in (
+                    ("status", str(current.get("status") or "")),
+                    ("quality", current_result.get("quality")),
+                    ("expected_codes", current_result.get("expected_codes")),
+                    ("covered_codes", current_result.get("covered_codes")),
+                    ("missing_symbols", current_result.get("missing_symbols")),
+                )
+            ):
+                continue
             current_summary.update({
                 "module": "stock_daily",
                 "status": result["status"],
@@ -2286,6 +2315,7 @@ class PostmarketRunner:
         continued = self._continue_minute_preheat_universe(trade_date, run_id) > 0
         continued = self._continue_hk_daily(trade_date, run_id) > 0 or continued
         continued = self._refresh_global_market_foundation_once(trade_date, run_id) or continued
+        continued = self._continue_fullmarket_minute_shard(trade_date, run_id) or continued
         if (
             # Optional tails (notably the per-symbol HK history lane) may be
             # provider-bound and can outlive the formal A-share postmarket
@@ -2299,6 +2329,135 @@ class PostmarketRunner:
             self.run_once(resume_run_id=run_id, trade_date=trade_date, run_optional_tasks=True)
             continued = True
         return continued
+
+    def _continue_fullmarket_minute_shard(self, trade_date: str, run_id: str) -> bool:
+        """Run one bounded 30-minute full-market shard after the critical DAG.
+
+        The 30-minute lane is intentionally optional: it must add breadth
+        without delaying the close seal or the user-facing terminal pool.
+        Advancing at most one shard per cooldown keeps provider concurrency
+        and Mongo load bounded while allowing all 16 shards to drain over
+        subsequent daemon ticks.
+        """
+        if not _env_bool("SIGNALS_POSTMARKET_CONTINUE_FULLMARKET_MINUTE", True):
+            return False
+        run_doc = self.db["sync_runs"].find_one(
+            {"_id": run_id},
+            {"fullmarket_minute_last_at": 1},
+        ) or {}
+        now = _naive_bj()
+        last = _coerce_dt(run_doc.get("fullmarket_minute_last_at"))
+        interval = _env_int(
+            "SIGNALS_POSTMARKET_FULLMARKET_MINUTE_INTERVAL_SECONDS",
+            300,
+            minimum=60,
+        )
+        if last is not None and (now - last).total_seconds() < interval:
+            return False
+        specs = [task for task in POSTMARKET_TASKS if task.module == "stock_30m_fullmarket"]
+        for spec in specs:
+            current = self._get_task(run_id, spec)
+            if _task_effectively_done(current):
+                continue
+            status = str(current.get("status") or "pending")
+            if status not in RETRYABLE_TASK_STATUSES:
+                continue
+            owner_pid = str(current.get("owner_pid") or "")
+            if owner_pid and self._pid_alive(owner_pid):
+                continue
+            if not self._dependencies_ok(run_id, spec):
+                continue
+            claim = self.db["sync_runs"].update_one(
+                {"_id": run_id, "fullmarket_minute_last_at": run_doc.get("fullmarket_minute_last_at")},
+                {"$set": {
+                    "fullmarket_minute_last_at": now,
+                    "fullmarket_minute_last_shard": spec.shard_key,
+                    "updated_at": now,
+                }},
+            )
+            modified = getattr(claim, "modified_count", None)
+            if modified is not None and modified == 0:
+                return False
+            logger.info(
+                "postmarket continue 30m fullmarket shard=%s run=%s cooldown=%ss",
+                spec.shard_key,
+                run_id,
+                interval,
+            )
+            try:
+                self._run_task(run_id, spec)
+            except Exception:
+                logger.exception("postmarket 30m fullmarket shard failed=%s", spec.shard_key)
+            return True
+        return False
+
+    def _resume_partial_run_if_due(self, trade_date: str, run_id: str) -> bool:
+        """Resume a partially completed critical DAG on a bounded cooldown.
+
+        A long provider call can leave a postmarket run in ``partial`` after
+        the normal 16:10-23:50 window.  Historically the daemon only resumed
+        ``ok`` runs on weekends, so all remaining critical tasks stayed
+        pending forever.  Claim one resume slot atomically and let
+        ``run_once`` pick up only retryable tasks; the cooldown prevents a
+        provider outage from turning the 60-second daemon loop into a hot
+        retry storm.
+        """
+        run_doc = self.db["sync_runs"].find_one(
+            {"_id": run_id},
+            {"status": 1, "owner_pid": 1, "partial_resume_last_at": 1},
+        ) or {}
+        if str(run_doc.get("status") or "") != "partial":
+            return False
+        owner_pid = str(run_doc.get("owner_pid") or "")
+        if owner_pid and self._pid_alive(owner_pid):
+            return False
+        if not self._has_retryable_incomplete_tasks(run_id):
+            return False
+        now = _naive_bj()
+        last = _coerce_dt(run_doc.get("partial_resume_last_at"))
+        interval = _env_int(
+            "SIGNALS_POSTMARKET_PARTIAL_RESUME_SECONDS",
+            300,
+            minimum=60,
+        )
+        if last is not None and (now - last).total_seconds() < interval:
+            return False
+        claim = self.db["sync_runs"].update_one(
+            {
+                "_id": run_id,
+                "status": "partial",
+                "owner_pid": {"$in": ["", None]},
+            },
+            {
+                "$set": {
+                    "partial_resume_last_at": now,
+                    "partial_resume_trade_date": trade_date,
+                    "updated_at": now,
+                }
+            },
+        )
+        modified = getattr(claim, "modified_count", None)
+        if modified is None:
+            # Lightweight test doubles and older Mongo wrappers may not
+            # expose modified_count; verify the marker as a safe fallback.
+            marker = self.db["sync_runs"].find_one(
+                {"_id": run_id},
+                {"partial_resume_last_at": 1},
+            ) or {}
+            modified = int(_coerce_dt(marker.get("partial_resume_last_at")) == now)
+        if not modified:
+            return False
+        logger.info(
+            "postmarket resume partial run=%s trade_date=%s cooldown=%ss",
+            run_id,
+            trade_date,
+            interval,
+        )
+        try:
+            self.run_once(resume_run_id=run_id, trade_date=trade_date)
+        except Exception:
+            logger.exception("postmarket partial resume failed run=%s", run_id)
+        return True
 
     def _refresh_global_market_foundation_once(self, trade_date: str, run_id: str) -> bool:
         if not _env_bool("SIGNALS_POSTMARKET_REFRESH_GLOBAL_MARKETS", True):
@@ -2664,9 +2823,14 @@ class PostmarketRunner:
                     run_id = default_run_id(trade_date)
                     run_doc = self.db["sync_runs"].find_one(
                         {"_id": run_id},
-                        {"status": 1, "minute_preheat_owner_pid": 1},
+                        {"status": 1, "owner_pid": 1, "minute_preheat_owner_pid": 1},
                     ) or {}
-                    if (
+                    if run_doc.get("status") == "partial":
+                        # Resume unfinished critical DAG phases first.  This
+                        # also bootstraps the minute-preheat universe when the
+                        # original run stopped before reaching that phase.
+                        self._resume_partial_run_if_due(trade_date, run_id)
+                    elif (
                         run_doc.get("status") in RUN_TERMINAL_STATUSES
                         and (
                             self._minute_preheat_pending_count(trade_date) > 0

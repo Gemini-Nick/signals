@@ -1025,6 +1025,53 @@ def test_completed_postmarket_progress_is_done_even_with_stale_task_progress():
     assert postmarket["summary"]["eta_seconds"] == 0
 
 
+def test_finished_partial_postmarket_task_has_no_eta():
+    from signals.domain_pack import SignalsPack
+
+    pack = SignalsPack()
+    eta = pack._task_eta_seconds(
+        {
+            "status": "partial",
+            "started_at": datetime(2026, 4, 29, 15, 35),
+            "finished_at": datetime(2026, 4, 29, 19, 14),
+        },
+        0.22,
+    )
+
+    assert eta is None
+
+
+def test_finished_partial_postmarket_run_has_no_eta():
+    from signals.domain_pack import SignalsPack
+
+    db = _Db({
+        "sync_runs": _Collection([{
+            "_id": "postmarket:2026-04-29",
+            "run_id": "postmarket:2026-04-29",
+            "trade_date": "2026-04-29",
+            "status": "partial",
+            "started_at": datetime(2026, 4, 29, 15, 35),
+            "finished_at": datetime(2026, 4, 29, 19, 14),
+        }]),
+        "sync_tasks": _Collection([{
+            "_id": "postmarket:2026-04-29:stock_daily:shard_00",
+            "run_id": "postmarket:2026-04-29",
+            "module": "stock_daily",
+            "phase": "market_data",
+            "shard_key": "shard_00",
+            "status": "partial",
+            "blocks_run": True,
+            "cursor": {"progress_pct": 20.0},
+            "started_at": datetime(2026, 4, 29, 15, 35),
+            "finished_at": datetime(2026, 4, 29, 19, 14),
+        }]),
+    })
+
+    postmarket = SignalsPack()._cache_postmarket_backfill(db)
+
+    assert postmarket["summary"]["eta_seconds"] is None
+
+
 def test_postmarket_effective_done_tasks_are_done_and_not_blockers():
     from signals.domain_pack import SignalsPack
 

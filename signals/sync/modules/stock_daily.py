@@ -72,6 +72,14 @@ def _macro_etf_pure_codes() -> list[str]:
 
 
 def _stock_daily_end_date_key(now: datetime | None = None) -> str:
+    requested_trade_date = str(get_task_env("SIGNALS_POSTMARKET_TRADE_DATE", "") or "").strip()
+    if requested_trade_date:
+        requested_key = requested_trade_date.replace("-", "")[:8]
+        try:
+            datetime.strptime(requested_key, "%Y%m%d")
+            return requested_key
+        except ValueError:
+            logger.warning("Ignoring invalid postmarket trade date: %s", requested_trade_date)
     local = now or naive_market_now("A")
     try:
         return trading_day_key("A", now=local, compact=True, open_time=dt_time(9, 30))
@@ -1240,8 +1248,7 @@ def _batch_today_candidates(codes: list[str], sync_docs: dict[str, object], end_
             continue
         if last_dt.strftime("%Y%m%d") >= str(end_date)[:8]:
             continue
-        if _next_trading_day_key_after(last_dt) == str(end_date)[:8]:
-            candidates.append(code)
+        candidates.append(code)
     return candidates
 
 
@@ -1253,9 +1260,20 @@ def _sync_today_from_spot_batch(
 ) -> tuple[dict[str, list], str]:
     if not _env_bool("STOCK_DAILY_BATCH_TODAY_ENABLED", True):
         return {}, "disabled"
-    if naive_market_now("A").hour < _batch_today_min_hour():
+    market_now = naive_market_now("A")
+    try:
+        target_date = datetime.strptime(str(end_date)[:8], "%Y%m%d").date()
+    except ValueError:
+        target_date = market_now.date()
+    if target_date >= market_now.date() and market_now.hour < _batch_today_min_hour():
         return {}, "before_batch_today_window"
     cursor_candidates = _batch_today_candidates(codes, sync_docs, end_date)
+    contiguous_cursor_candidates = [
+        code
+        for code in cursor_candidates
+        if _next_trading_day_key_after(_coerce_last_dt(sync_docs.get(code))) == str(end_date)[:8]
+    ]
+    gap_candidates = len(cursor_candidates) - len(contiguous_cursor_candidates)
     try:
         df = _fetch_eastmoney_spot_batch_df(db, end_date)
     except Exception as exc:
@@ -1284,7 +1302,13 @@ def _sync_today_from_spot_batch(
     if not candidates:
         return {}, "no_today_candidates"
 
-    prev_close_by_code = _previous_daily_close_by_symbol(db, [*cursor_candidates, *current_refresh_candidates], end_date)
+    previous_close_candidates = [*contiguous_cursor_candidates, *current_refresh_candidates]
+    prev_close_by_code = _previous_daily_close_by_symbol(
+        db,
+        previous_close_candidates,
+        end_date,
+    )
+    previous_close_candidate_set = set(previous_close_candidates)
     docs_by_code: dict[str, list] = {}
     for code in candidates:
         row = snapshot_rows.get(code)
@@ -1294,13 +1318,14 @@ def _sync_today_from_spot_batch(
             code,
             row,
             end_date,
-            previous_close=prev_close_by_code.get(code),
+            previous_close=prev_close_by_code.get(code) if code in previous_close_candidate_set else None,
         )
         if doc:
             docs_by_code[code] = [doc]
     fallback_count = max(0, len(candidates) - len(docs_by_code))
     return docs_by_code, (
         f"batch_today_candidates={len(cursor_candidates)},"
+        f"gap_candidates={gap_candidates},"
         f"snapshot_bootstrap={len(snapshot_bootstrap_candidates)},"
         f"current_refresh={len(current_refresh_candidates)},"
         f"batch_docs={len(docs_by_code)},fallback={fallback_count}"

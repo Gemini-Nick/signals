@@ -860,7 +860,11 @@ class SignalsPack:
             progress_pct = round(sum(progress_values) / task_count, 2) if task_count and progress_values else (
                 round(completed / task_count * 100, 2) if task_count else 0
             )
-            eta_seconds = self._postmarket_eta_seconds(rows, progress_pct, run.get("started_at"))
+            eta_seconds = (
+                None
+                if run.get("finished_at")
+                else self._postmarket_eta_seconds(rows, progress_pct, run.get("started_at"))
+            )
         if critical_task_count and critical_completed == critical_task_count:
             critical_progress_pct = 100.0
             critical_status = "ok"
@@ -1836,6 +1840,8 @@ class SignalsPack:
         return output_seen and bool((total > 0 and processed >= total) or progress_pct >= 99.9 or coverage_pct >= 99.9)
 
     def _task_eta_seconds(self, task: Mapping[str, Any], progress_pct: Optional[float]) -> Optional[int]:
+        if task.get("finished_at"):
+            return None
         if progress_pct is None or progress_pct <= 0 or progress_pct >= 100:
             return None
         started_at = self._coerce_datetime(task.get("started_at"))

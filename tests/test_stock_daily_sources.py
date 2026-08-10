@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 import pytest
 
@@ -64,6 +66,13 @@ def test_snapshot_daily_doc_uses_task_scoped_final_close_quality():
 
     assert doc is not None
     assert doc["meta"]["quality"] == "final_close"
+
+
+def test_stock_daily_end_date_uses_postmarket_trade_date():
+    with task_env({"SIGNALS_POSTMARKET_TRADE_DATE": "2026-08-06"}):
+        end_date = stock_daily._stock_daily_end_date_key(datetime(2026, 8, 9, 18, 0))
+
+    assert end_date == "20260806"
 
 
 def test_stock_daily_uses_tencent_primary_without_akshare(monkeypatch):

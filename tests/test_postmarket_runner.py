@@ -500,6 +500,73 @@ def test_postmarket_completed_run_can_continue_optional_tasks(monkeypatch):
     assert db["sync_tasks"].docs["postmarket:2026-04-28:beta:all"]["status"] == "ok"
 
 
+def test_postmarket_resumes_partial_critical_run_after_cooldown(monkeypatch):
+    tasks = (pm.PostmarketTaskSpec("alpha", "data"),)
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    monkeypatch.setattr(pm, "POSTMARKET_PHASES", ("data",))
+
+    run_id = "postmarket:2026-04-28"
+    db = _Db()
+    db["sync_runs"].docs[run_id] = {
+        "_id": run_id,
+        "run_id": run_id,
+        "trade_date": "2026-04-28",
+        "status": "partial",
+        "owner_pid": "",
+    }
+    db["sync_tasks"].docs[f"{run_id}:alpha:all"] = {
+        "_id": f"{run_id}:alpha:all",
+        "run_id": run_id,
+        "task_key": "alpha:all",
+        "module": "alpha",
+        "phase": "data",
+        "blocks_run": True,
+        "status": "pending",
+    }
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+    monkeypatch.setattr(runner, "_pid_alive", lambda pid: False)
+    calls = []
+    monkeypatch.setattr(
+        runner,
+        "run_once",
+        lambda **kwargs: calls.append(kwargs) or {"status": "ok"},
+    )
+
+    assert runner._resume_partial_run_if_due("2026-04-28", run_id) is True
+    assert calls == [{"resume_run_id": run_id, "trade_date": "2026-04-28"}]
+    # A second daemon tick must respect the default five-minute cooldown.
+    assert runner._resume_partial_run_if_due("2026-04-28", run_id) is False
+
+
+def test_postmarket_continues_one_fullmarket_minute_shard_per_cooldown(monkeypatch):
+    spec = pm.PostmarketTaskSpec("stock_30m_fullmarket", "minute_fullmarket", shard_key="shard_00")
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", (spec,))
+    run_id = "postmarket:2026-04-28"
+    db = _Db()
+    db["sync_runs"].docs[run_id] = {
+        "_id": run_id,
+        "run_id": run_id,
+        "trade_date": "2026-04-28",
+        "status": "ok",
+    }
+    db["sync_tasks"].docs[f"{run_id}:stock_30m_fullmarket:shard_00"] = {
+        "_id": f"{run_id}:stock_30m_fullmarket:shard_00",
+        "run_id": run_id,
+        "task_key": "stock_30m_fullmarket:shard_00",
+        "module": "stock_30m_fullmarket",
+        "phase": "minute_fullmarket",
+        "status": "pending",
+        "blocks_run": False,
+    }
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+    calls = []
+    monkeypatch.setattr(runner, "_run_task", lambda run, task: calls.append((run, task.shard_key)) or {"status": "partial"})
+
+    assert runner._continue_fullmarket_minute_shard("2026-04-28", run_id) is True
+    assert calls == [(run_id, "shard_00")]
+    assert runner._continue_fullmarket_minute_shard("2026-04-28", run_id) is False
+
+
 def test_postmarket_daemon_continues_optional_tasks_for_terminal_run(monkeypatch):
     tasks = (
         pm.PostmarketTaskSpec("alpha", "data"),
@@ -1076,6 +1143,20 @@ def test_postmarket_runtime_degraded_market_pools_with_outputs_completes_run(mon
     assert db["sync_tasks"].docs["postmarket:2026-04-28:market_pools:all"]["status"] == "degraded"
 
 
+def test_terminal_pool_ineligible_sources_is_accounted_without_retry_loop():
+    task = {
+        "module": "terminal_realtime_pool",
+        "status": "degraded",
+        "result_summary": {
+            "status": "degraded",
+            "result": {"status": "rejected", "reason": "ineligible_sources", "published": False},
+        },
+    }
+
+    assert pm._dependency_status_ok(task) is True
+    assert pm._task_effectively_done(task) is True
+
+
 def test_postmarket_stale_task_with_finished_ok_result_is_effectively_done():
     assert pm._task_effectively_done({
         "module": "hk_stock_daily",
@@ -1343,6 +1424,23 @@ def test_postmarket_repairs_stock_daily_shards_from_high_global_coverage(monkeyp
     stock_doc = db["sync_tasks"].docs[task_id]
     assert stock_doc["result_summary"]["coverage_pct"] == 99.42
     assert stock_doc["result_summary"]["covered_codes"] == 5478
+
+
+def test_postmarket_stock_daily_bar_reconciliation_is_idempotent(monkeypatch):
+    tasks = (pm.PostmarketTaskSpec("stock_daily", "market_data", shard_key="shard_00"),)
+    monkeypatch.setattr(pm, "POSTMARKET_TASKS", tasks)
+    db = _Db()
+    runner = pm.PostmarketRunner(_Engine(db, {}), max_workers=1)
+    monkeypatch.setattr(runner, "_stable_close_seal_ready", lambda _trade_date: False)
+    db["fullmarket_spot_snapshots"].distinct = lambda *_args, **_kwargs: ["600001"]
+    db["bars"].distinct = lambda *_args, **_kwargs: ["600001"]
+    runner._init_tasks("postmarket:2026-04-28", "2026-04-28")
+
+    first = runner._reconcile_stock_daily_tasks_from_bars("postmarket:2026-04-28", "2026-04-28")
+    second = runner._reconcile_stock_daily_tasks_from_bars("postmarket:2026-04-28", "2026-04-28")
+
+    assert first == 1
+    assert second == 0
 
 
 def test_postmarket_stock_daily_many_errors_blocks_downstream(monkeypatch):

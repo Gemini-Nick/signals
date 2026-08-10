@@ -104,7 +104,7 @@ def test_stock_daily_replace_daily_docs_uses_meta_only_delete():
     assert cursor["repair_mode"] == "replace_daily_symbol"
 
 
-def test_stock_daily_batch_today_candidates_skip_cn_labor_day_gap():
+def test_stock_daily_batch_today_candidates_include_cn_labor_day_gap():
     candidates = stock_daily._batch_today_candidates(
         ["600001", "600002", "600003"],
         {
@@ -115,7 +115,80 @@ def test_stock_daily_batch_today_candidates_skip_cn_labor_day_gap():
         "20260506",
     )
 
-    assert candidates == ["600001"]
+    assert candidates == ["600001", "600002"]
+
+
+def test_stock_daily_batch_today_allows_closed_prior_trade_date_before_15(monkeypatch):
+    db = _DB()
+    monkeypatch.setattr(stock_daily, "naive_market_now", lambda _market: datetime(2026, 5, 7, 6, 20))
+    monkeypatch.setattr(
+        stock_daily,
+        "_fetch_eastmoney_spot_batch_df",
+        lambda _db, _end_date: pd.DataFrame([{
+            "代码": "600001",
+            "_pure_code": "600001",
+            "今开": 10.1,
+            "最高": 10.8,
+            "最低": 10.0,
+            "最新价": 10.5,
+            "成交量": 1000,
+            "成交额": 100000,
+            "昨收": 10.0,
+        }]),
+    )
+    monkeypatch.setattr(
+        stock_daily,
+        "_previous_daily_close_by_symbol",
+        lambda _db, _codes, _end_date: {"600001": 10.0},
+    )
+
+    docs, reason = stock_daily._sync_today_from_spot_batch(
+        db,
+        ["600001"],
+        {"600001": datetime(2026, 4, 30)},
+        "20260506",
+    )
+
+    assert set(docs) == {"600001"}
+    assert "batch_today_candidates=1" in reason
+
+
+def test_stock_daily_batch_today_gap_does_not_validate_against_stale_close(monkeypatch):
+    db = _DB()
+    previous_close_calls = []
+    monkeypatch.setattr(stock_daily, "naive_market_now", lambda _market: datetime(2026, 5, 6, 18, 0))
+    monkeypatch.setattr(
+        stock_daily,
+        "_fetch_eastmoney_spot_batch_df",
+        lambda _db, _end_date: pd.DataFrame([{
+            "代码": "600001",
+            "_pure_code": "600001",
+            "今开": 10.1,
+            "最高": 10.8,
+            "最低": 10.0,
+            "最新价": 10.5,
+            "成交量": 1000,
+            "成交额": 100000,
+            "昨收": 10.0,
+        }]),
+    )
+
+    def previous_close(_db, codes, _end_date):
+        previous_close_calls.append(codes)
+        return {"600001": 5.0}
+
+    monkeypatch.setattr(stock_daily, "_previous_daily_close_by_symbol", previous_close)
+
+    docs, reason = stock_daily._sync_today_from_spot_batch(
+        db,
+        ["600001"],
+        {"600001": datetime(2026, 4, 29)},
+        "20260506",
+    )
+
+    assert previous_close_calls == [[]]
+    assert set(docs) == {"600001"}
+    assert "gap_candidates=1" in reason
 
 
 def test_stock_daily_writes_progress_cursor(monkeypatch):
