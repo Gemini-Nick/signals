@@ -14,6 +14,7 @@ from pymongo.database import Database
 
 from signals.core.macro_universe import canonical_macro_industry_etf_symbol
 from signals.core.market_time import naive_market_now, to_market_naive
+from signals.core.trendlines import analyze_trendlines
 from signals.sync.task_context import get_task_env
 
 logger = logging.getLogger("signals.sync.technical_signal_scan")
@@ -1218,6 +1219,63 @@ def _scan_symbol(
             2,
             ("60分钟", Freq.F60, _load_bars(db, symbol, MINUTE_FREQS["60分钟"], Freq.F60, limit=260, label="60分钟"), 80),
         )
+    trendline_docs: list[dict[str, Any]] = []
+    for label, _freq, bars, _max_bi in bars_by_freq:
+        if len(bars) < 20:
+            continue
+        analysis = analyze_trendlines(
+            _bars_to_ohlcv_frame(bars),
+            freq=label,
+            source="bars.gateway",
+            lookback=len(bars),
+        )
+        for signal in analysis.get("signals", []):
+            dt_value = pd.to_datetime(signal.get("dt"), errors="coerce")
+            if pd.isna(dt_value):
+                continue
+            trendline = signal.get("trendline") if isinstance(signal.get("trendline"), dict) else {}
+            signal_type = str(signal.get("signal_type") or signal.get("type") or "趋势线信号")
+            score = round(float(signal.get("confidence") or 0) * 100, 3)
+            trendline_docs.append({
+                "dedupe_key": f"{_prefixed_symbol(symbol)}|{label}|trendline|{signal_type}|{dt_value.isoformat()}",
+                "symbol": _prefixed_symbol(symbol),
+                "raw_code": _raw_symbol_code(symbol),
+                "market": market,
+                "freq": label,
+                "dt": dt_value.to_pydatetime(),
+                "as_of": _scan_as_of(now),
+                "updated_at": now,
+                "signal_type": signal_type,
+                "signal_side": signal.get("signal_side"),
+                "signal_family": "trendline",
+                "price": float(signal.get("price") or 0),
+                "score": score,
+                "total_score": score,
+                "direction": "偏多" if signal.get("signal_side") == "buy" else "偏空",
+                "confidence": float(signal.get("confidence") or 0),
+                "resonance_freqs": [label],
+                "resonance_context": {
+                    "direction": "buy" if signal.get("signal_side") == "buy" else "sell",
+                    "primary_freq": label,
+                    "aligned_freqs": [label],
+                    "conflict_freqs": [],
+                    "grade": "single_period",
+                    "tags": ["趋势线", signal_type],
+                    "summary": str(signal.get("details") or "")[:240],
+                    "latest_dt": str(signal.get("date_str") or ""),
+                },
+                "technical_evidence": {
+                    "signal_type": signal_type,
+                    "freq": label,
+                    "details": signal.get("details"),
+                    "trendline": trendline,
+                    "status": signal.get("status"),
+                    "distance_pct": signal.get("distance_pct"),
+                },
+                "invalidates_when": "重新站回趋势线下方" if signal.get("signal_side") == "buy" else "重新站回支撑线或阻力线之上",
+                "source": "sync.technical_signal_scan.trendline",
+                "scan_scope": scan_scope,
+            })
     events = []
     bi_counts: dict[str, int] = {}
     for label, freq, bars, max_bi in bars_by_freq:
@@ -1231,12 +1289,12 @@ def _scan_symbol(
         except Exception as exc:
             logger.debug("technical scan failed %s/%s: %s", symbol, label, exc)
     if not events:
-        return entry_factor_docs
+        return [*entry_factor_docs, *trendline_docs]
 
     scored = score_signals(_prefixed_symbol(symbol), events, volume_ratio=volume_ratio)
     buy_freqs = sorted({event.freq for event in events if _event_side(event, SIGNAL_WEIGHTS) == "buy"}, key=_freq_sort_key)
     sell_freqs = sorted({event.freq for event in events if _event_side(event, SIGNAL_WEIGHTS) == "sell"}, key=_freq_sort_key)
-    docs: list[dict[str, Any]] = list(entry_factor_docs)
+    docs: list[dict[str, Any]] = [*entry_factor_docs, *trendline_docs]
     for event in events:
         base_score = float(SIGNAL_WEIGHTS.get(event.signal_type, 0)) * float(event.confidence or 0)
         side = _signal_side(event.signal_type, base_score)

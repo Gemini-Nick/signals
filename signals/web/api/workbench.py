@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 import threading
 import time
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import pandas as pd
 from fastapi import APIRouter, Body, HTTPException, Query
@@ -43,6 +43,7 @@ from signals.core.macro_universe import (
     supports_a_index_minute_cache,
 )
 from signals.core.stock_names import get_resolver
+from signals.core.trendlines import analyze_multitimeframe_trendlines, analyze_trendlines
 from signals.data.gateway import get_index_bars, get_kline
 from signals.data.models import DataRequest
 from signals.core.trade_log import get_trade_log
@@ -1077,6 +1078,7 @@ def _chart_from_df(
     freq: str,
     source: str = "gateway",
     live_render: bool = False,
+    timeframe_frames: Mapping[str, pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
     market = infer_market(symbol=symbol, source=source)
     canonical_freq = _canonical_freq(freq)
@@ -1095,6 +1097,33 @@ def _chart_from_df(
     effective_source = f"{source};{live_overlay_source}" if live_overlay_source else source
     cache_meta = _chart_cache_meta(working, source=effective_source, freq=freq)
     ma_lines = _compute_chart_ma_lines(working, limit=limit, market=market, symbol=symbol, source=source)
+    trendline_frames = _chart_trendline_frames(working, canonical_freq, timeframe_frames)
+    multi_trendline_analysis = analyze_multitimeframe_trendlines(
+        trendline_frames,
+        primary_freq=canonical_freq,
+        source=effective_source,
+    )
+    trendline_analysis = multi_trendline_analysis.get("timeframes", {}).get(canonical_freq)
+    if not isinstance(trendline_analysis, dict):
+        trendline_analysis = analyze_trendlines(working, freq=canonical_freq, source=effective_source, lookback=limit)
+    trendlines = _serialize_trendlines_for_chart(
+        trendline_analysis.get("trendlines", []), market=market, symbol=symbol, source=source,
+    )
+    trendline_signals = _serialize_trendline_signals_for_chart(
+        trendline_analysis.get("signals", []), market=market, symbol=symbol, source=source,
+    )
+    trendlines_by_timeframe = {
+        timeframe: {
+            "trendlines": _serialize_trendlines_for_chart(
+                item.get("trendlines", []), market=market, symbol=symbol, source=source,
+            ),
+            "signals": _serialize_trendline_signals_for_chart(
+                item.get("signals", []), market=market, symbol=symbol, source=source,
+            ),
+        }
+        for timeframe, item in (multi_trendline_analysis.get("timeframes", {}) or {}).items()
+        if isinstance(item, dict)
+    }
     return {
         "symbol": symbol,
         "freq": _freq_label(freq),
@@ -1108,9 +1137,98 @@ def _chart_from_df(
             "bars": int(len(working)) if working is not None else 0,
         },
         "ohlcv": _serialize_ohlcv_df(working, limit=limit, market=market, symbol=symbol, source=source),
-        "signals": [],
+        "signals": trendline_signals,
+        "trendlines": trendlines,
+        "trendlines_by_timeframe": trendlines_by_timeframe,
+        "timeframe_context": multi_trendline_analysis.get("context", {}),
+        "primary_timeframe": canonical_freq,
         "ma_lines": ma_lines,
     }
+
+
+def _resample_chart_ohlcv(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    working = frame.sort_index().copy()
+    aggregation = {
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+    }
+    for column in ("vol", "volume", "amount", "turnover"):
+        if column in working.columns:
+            aggregation[column] = "sum"
+    output = working.resample(rule).agg(aggregation).dropna(subset=["open", "high", "low", "close"], how="any")
+    output.attrs.update(getattr(frame, "attrs", {}) or {})
+    return output
+
+
+def _chart_trendline_frames(
+    working: pd.DataFrame,
+    canonical_freq: str,
+    supplied: Mapping[str, pd.DataFrame] | None = None,
+) -> dict[str, pd.DataFrame]:
+    frames = {str(key): value for key, value in (supplied or {}).items() if isinstance(value, pd.DataFrame) and not value.empty}
+    frames.setdefault(canonical_freq, working)
+    if canonical_freq == "daily":
+        weekly = _resample_chart_ohlcv(working, "W-FRI")
+        if weekly is not None and not weekly.empty:
+            frames.setdefault("weekly", weekly)
+    elif canonical_freq in {"5min", "15min", "30min", "60min"}:
+        if canonical_freq == "5min":
+            frames.setdefault("15min", _resample_chart_ohlcv(working, "15min"))
+        if canonical_freq in {"5min", "15min"}:
+            frames.setdefault("30min", _resample_chart_ohlcv(working, "30min"))
+        frames.setdefault("daily", _resample_chart_ohlcv(working, "1D"))
+    return {key: value for key, value in frames.items() if isinstance(value, pd.DataFrame) and not value.empty}
+
+
+def _serialize_trendlines_for_chart(
+    lines: list[dict[str, Any]],
+    *,
+    market: str,
+    symbol: str,
+    source: str,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        item = dict(line)
+        for field, chart_field in (
+            ("start_dt", "start_time"),
+            ("end_dt", "end_time"),
+            ("projection_dt", "projection_time"),
+        ):
+            value = item.get(field)
+            if value:
+                item[chart_field] = _dt_to_unix(value, market=market, symbol=symbol, source=source)
+        item["source"] = _text(item.get("source")) or source
+        output.append(item)
+    return output
+
+
+def _serialize_trendline_signals_for_chart(
+    signals: list[dict[str, Any]],
+    *,
+    market: str,
+    symbol: str,
+    source: str,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for signal in signals:
+        if not isinstance(signal, dict):
+            continue
+        item = dict(signal)
+        item["dt"] = _dt_to_unix(item.get("dt"), market=market, symbol=symbol, source=source)
+        trendline = item.get("trendline")
+        if isinstance(trendline, dict):
+            item["trendline"] = _serialize_trendlines_for_chart(
+                [trendline], market=market, symbol=symbol, source=source,
+            )[0]
+        output.append(item)
+    return output
 
 
 def _compute_chart_ma_lines(
