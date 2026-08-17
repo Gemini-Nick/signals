@@ -1679,6 +1679,8 @@ class SignalsPack:
             return self._postmarket_stock_daily_usable(status, summary, cursor)
         if status == "stale" and not self._postmarket_stale_finished_result_usable(module, summary, cursor):
             return False
+        if module == "terminal_realtime_pool" and status in {"partial", "degraded"}:
+            return self._postmarket_terminal_pool_rejection_accounted(summary)
         if module == "quote_snapshots" and status in {"partial", "degraded"}:
             return self._postmarket_quote_snapshots_usable(summary, cursor)
         if module == "minute_readiness_probe" and status == "partial":
@@ -1745,6 +1747,12 @@ class SignalsPack:
         if status == "degraded" and (result_status != "ok" or deferred > 0):
             return False
         return sparse_errors_ok and (processed_all or progress_done) and coverage_pct >= min_coverage
+
+    def _postmarket_terminal_pool_rejection_accounted(self, summary: Mapping[str, Any]) -> bool:
+        nested = summary.get("result") if isinstance(summary.get("result"), Mapping) else {}
+        reason = str(nested.get("reason") or summary.get("reason") or "").strip().lower()
+        result_status = str(nested.get("status") or summary.get("status") or "").strip().lower()
+        return reason == "ineligible_sources" and result_status == "rejected"
 
     def _postmarket_quote_snapshots_usable(
         self,

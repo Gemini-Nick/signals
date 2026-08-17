@@ -1266,3 +1266,53 @@ def test_postmarket_critical_progress_ignores_optional_hk_tail():
     assert postmarket["summary"]["critical_status"] == "ok"
     assert postmarket["summary"]["optional_progress_pct"] == 25.0
     assert postmarket["summary"]["optional_status_counts"] == {"running": 1}
+
+
+def test_postmarket_terminal_pool_ineligible_rejection_is_not_dashboard_blocker():
+    from signals.domain_pack import SignalsPack
+
+    db = _Db({
+        "sync_runs": _Collection([
+            {
+                "_id": "postmarket:2026-08-14",
+                "run_id": "postmarket:2026-08-14",
+                "trade_date": "2026-08-14",
+                "status": "ok",
+                "recovery_state": "ok",
+                "critical_blocker": {},
+                "started_at": datetime(2026, 8, 14, 16, 10),
+            }
+        ]),
+        "sync_tasks": _Collection([
+            {
+                "_id": "postmarket:2026-08-14:terminal_realtime_pool:all",
+                "run_id": "postmarket:2026-08-14",
+                "module": "terminal_realtime_pool",
+                "phase": "terminal",
+                "task_key": "terminal_realtime_pool:all",
+                "shard_key": "all",
+                "blocks_run": True,
+                "status": "degraded",
+                "order": 1,
+                "result_summary": {
+                    "status": "degraded",
+                    "result": {
+                        "status": "rejected",
+                        "reason": "ineligible_sources",
+                        "published": False,
+                    },
+                },
+            },
+        ]),
+    })
+    pack = SignalsPack()
+
+    postmarket = pack._cache_postmarket_backfill(db)
+
+    assert postmarket["summary"]["completed"] == 1
+    assert postmarket["summary"]["critical_completed"] == 1
+    assert postmarket["summary"]["critical_status"] == "ok"
+    assert postmarket["summary"]["status_counts"] == {"ok": 1}
+    assert postmarket["tasks"][0]["status"] == "ok"
+    assert postmarket["tasks"][0]["raw_status"] == "degraded"
+    assert pack._cache_blockers({"modules": []}, postmarket, []) == []
