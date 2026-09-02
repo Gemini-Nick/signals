@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 from bson import BSON
 
-from signals.sync.modules.terminal_pool import _add_fallback_watch_rows, _add_reason, _add_signal_rows, _add_user_pinned, _backfill_watch_from_clue_candidates, _default_opportunity_candidate_rows, _entry_age_limit, _fib_ma_support_score_from_alignment, _reason_is_current_for_entry, _reason_type_for_signal, _selected_rows, _split_pool_rows, _strip_display_only_membership_inputs
+from signals.sync.modules.terminal_pool import _add_fallback_watch_rows, _add_reason, _add_signal_rows, _add_user_pinned, _backfill_watch_from_clue_candidates, _backfill_watch_from_focus_overflow, _default_opportunity_candidate_rows, _entry_age_limit, _fib_ma_support_score_from_alignment, _reason_is_current_for_entry, _reason_type_for_signal, _selected_rows, _split_pool_rows, _strip_display_only_membership_inputs
 from signals.sync.modules.terminal_pool import _slim_pool_row_for_storage
 from signals.sync.modules.terminal_pool_publish import acquire_build_lease, pool_hashes, publish_candidate
 
@@ -2781,6 +2781,33 @@ def test_terminal_stock_pool_clue_overflow_backfills_watch_pool():
     assert all(row["can_trade_now"] is False for row in watch_stocks)
 
 
+def test_terminal_stock_pool_focus_overflow_backfills_watch_pool():
+    rows = {}
+    for code in ("300575", "300576"):
+        for freq, signal_type, score in (("日线", "趋势买", 105), ("30分钟", "三买", 120), ("15分钟", "MACD绿柱扩大_零上", 90)):
+            _add_reason(rows, code, {
+                "reason_type": "technical_trigger",
+                "source_collection": "terminal_technical_signals",
+                "source_doc_id": f"{code}-{freq}",
+                "signal_type": signal_type,
+                "signal_side": "buy",
+                "freq": freq,
+                "score": score,
+                "confidence": 0.8,
+                "resonance_context": {"direction": "buy", "aligned_freqs": ["日线", "30分钟", "15分钟"], "conflict_freqs": [], "grade": "multi_period"},
+            }, index_codes=set(), name=f"测试股{code}")
+    split = _split_pool_rows(rows, focus_limit=1, risk_limit=1, watch_limit=2)
+    watch_stocks = []
+
+    added = _backfill_watch_from_focus_overflow(watch_stocks, split["skipped"]["focus"], watch_limit=2)
+
+    assert added == 1
+    assert watch_stocks[0]["pool_type"] == "watch"
+    assert watch_stocks[0]["watch_backfill_source"] == "focus_rank_overflow"
+    assert watch_stocks[0]["entry_gate_status"] == "entry_waiting_rank_cutoff"
+    assert watch_stocks[0]["can_trade_now"] is False
+
+
 def test_terminal_stock_pool_storage_row_compacts_repeated_reason_analysis():
     ma_alignment = {
         "ma13": 10.0,
@@ -2928,6 +2955,10 @@ def _nested_unset(doc, path):
 
 def _matches(doc, query):
     for key, expected in query.items():
+        if key == "$and":
+            if not all(_matches(doc, item) for item in expected):
+                return False
+            continue
         if key == "$or":
             if not any(_matches(doc, item) for item in expected):
                 return False
@@ -3118,3 +3149,19 @@ def test_terminal_pool_fence_allows_only_latest_publisher_and_identical_rerun_is
     assert collection.doc["revision"] == 1
     assert collection.doc["generation_id"] == pool["generation_id"]
     assert collection.doc["last_failed_attempt"]["reason"] == "source_changed_during_build"
+
+
+def test_terminal_pool_publish_migrates_legacy_document_without_revision():
+    collection = _PoolCollection({
+        "pool": "terminal_stock_pool",
+        "market": "A",
+        "publish_status": "unavailable",
+    })
+    db = _PoolDb({"terminal_stock_pool": collection})
+    now = datetime(2026, 7, 30, 21, 15)
+    lease = acquire_build_lease(db, requested_trade_date="2026-07-30", trigger="postmarket", now=now)
+
+    result = publish_candidate(db, lease, _publishable_pool(), now=now)
+
+    assert result["status"] == "published"
+    assert collection.doc["revision"] == 1

@@ -10,6 +10,7 @@ from signals.sync.modules.terminal_pool import (
     _add_stock,
     _display_badges_for_pool,
     _load_sector_transition_context,
+    _pool_eligibility_watermarks,
     _prefixed_symbol,
     _retain_ma_climb_reasons,
     _slim_reason_for_pool,
@@ -47,6 +48,49 @@ class _ContextCollection:
     def find(self, query=None, projection=None):
         self.find_queries.append(query or {})
         return _IdentityCursor(dict(item) for item in self.docs)
+
+
+class _EligibilityFreshnessCollection:
+    def find_one(self, query, projection=None, sort=None):
+        if query.get("domain") == "sector_transition":
+            return None
+        return {
+            "freshness": "fresh",
+            "as_of": "2026-09-01",
+            "count": 1,
+            "is_full_market_complete": True,
+            "is_scan_universe_complete": True,
+            "coverage_by_freq": {"日线": "complete", "周线": "complete"},
+        }
+
+
+class _CrossDateHotRankFreshnessCollection(_EligibilityFreshnessCollection):
+    def find_one(self, query, projection=None, sort=None):
+        doc = super().find_one(query, projection, sort)
+        if doc and query.get("domain") == "hot_rank_clue":
+            doc["as_of"] = "2026-09-02"
+        return doc
+
+
+def test_pool_eligibility_skips_disabled_sector_transition_manifest(monkeypatch):
+    monkeypatch.setenv("SECTOR_TRANSITION_ENABLED", "false")
+    db = _IdentityDb({"data_freshness": _EligibilityFreshnessCollection()})
+
+    watermarks, blockers = _pool_eligibility_watermarks(db, "2026-09-01")
+
+    assert blockers == []
+    assert watermarks["sector_transition"] == {"enabled": False}
+
+
+def test_pool_eligibility_excludes_cross_date_hot_rank_without_blocking(monkeypatch):
+    monkeypatch.setenv("SECTOR_TRANSITION_ENABLED", "false")
+    db = _IdentityDb({"data_freshness": _CrossDateHotRankFreshnessCollection()})
+
+    watermarks, blockers = _pool_eligibility_watermarks(db, "2026-09-01")
+
+    assert blockers == []
+    assert watermarks["hot_rank_clues"]["optional"] is True
+    assert watermarks["hot_rank_clues"]["excluded_reason"] == "cross_trade_date"
 
 
 def test_transition_context_loader_is_disabled_by_default(monkeypatch):

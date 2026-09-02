@@ -1858,11 +1858,22 @@ def _hot_rank_clue_since_date() -> date:
     return naive_market_now("A").date() - timedelta(days=lookback_days)
 
 
-def _add_hot_rank_clue_rows(rows: dict[str, dict[str, Any]], db: Database, index_codes: set[str], now: datetime) -> None:
+def _add_hot_rank_clue_rows(
+    rows: dict[str, dict[str, Any]],
+    db: Database,
+    index_codes: set[str],
+    now: datetime,
+    *,
+    trade_date: str | None = None,
+) -> None:
     limit = max(1, int(os.getenv("TERMINAL_HOT_RANK_CLUE_SOURCE_LIMIT", "60")))
-    since = _hot_rank_clue_since_date().isoformat()
+    query: dict[str, Any] = {"active": True}
+    if trade_date:
+        query["as_of"] = trade_date
+    else:
+        query["as_of"] = {"$gte": _hot_rank_clue_since_date().isoformat()}
     docs = db["hot_rank_clues"].find(
-        {"active": True, "as_of": {"$gte": since}},
+        query,
         {
             "_id": 1,
             "raw_code": 1,
@@ -1898,7 +1909,7 @@ def _add_hot_rank_clue_rows(rows: dict[str, dict[str, Any]], db: Database, index
             "score": _float(doc.get("score")),
             "heat_score": _float(doc.get("score")),
             "event_dt": doc.get("as_of"),
-            "as_of": now.date().isoformat(),
+            "as_of": _text(doc.get("as_of")) or now.date().isoformat(),
             "board_or_concept": "热榜",
             "evidence": {
                 "sources": sources,
@@ -6123,6 +6134,52 @@ def _backfill_watch_from_clue_candidates(
     return added
 
 
+def _backfill_watch_from_focus_overflow(
+    watch_stocks: list[dict[str, Any]],
+    focus_overflow: list[dict[str, Any]],
+    *,
+    watch_limit: int,
+) -> int:
+    """Keep ranked-but-not-selected buy setups visible as observe-only watch rows."""
+    if len(watch_stocks) >= watch_limit:
+        return 0
+    watch_symbols = {row.get("symbol") for row in watch_stocks if row.get("symbol")}
+    added = 0
+    for source_row in focus_overflow:
+        symbol = source_row.get("symbol")
+        if not symbol or symbol in watch_symbols:
+            continue
+        row = dict(source_row)
+        row["inclusion_reasons"] = sorted(
+            row.get("inclusion_reasons") or [],
+            key=lambda item: _float(item.get("weight")),
+            reverse=True,
+        )[:12]
+        _, _, _, top_buy, top_risk = _entry_gate(row)
+        if top_risk:
+            continue
+        components = _watch_components(row, "entry_waiting_rank_cutoff")
+        components["focus_overflow_rank"] = _float(source_row.get("rank_score"))
+        finalized = _finalize_pool_row(
+            row,
+            pool_type="watch",
+            rank_score=sum(components.values()),
+            score_components=components,
+            entry_gate_status="entry_waiting_rank_cutoff",
+            blocked_by=["focus_rank_cutoff"],
+            top_buy=top_buy,
+            top_risk=None,
+        )
+        finalized["watch_backfill_source"] = "focus_rank_overflow"
+        finalized["promotion_gates"] = ["focus_rank_cutoff"]
+        watch_stocks.append(finalized)
+        watch_symbols.add(symbol)
+        added += 1
+        if len(watch_stocks) >= watch_limit:
+            break
+    return added
+
+
 def _candidate_meta(rows: dict[str, dict[str, Any]]) -> dict[str, dict[str, int]]:
     by_source: Counter[str] = Counter()
     by_side: Counter[str] = Counter()
@@ -6204,6 +6261,17 @@ def _pool_eligibility_watermarks(
     watermarks: dict[str, Any] = {}
     blockers: list[str] = []
     for family, spec in _POOL_ELIGIBILITY_SOURCES.items():
+        # Sector-transition evidence is optional when its feature flag is off.
+        # Requiring a manifest in that mode prevents the otherwise complete
+        # postmarket pool from ever publishing.
+        if family == "sector_transition" and _text(
+            get_task_env(
+                "SECTOR_TRANSITION_ENABLED",
+                os.getenv("SECTOR_TRANSITION_ENABLED", "false"),
+            )
+        ).lower() not in {"1", "true", "yes", "on"}:
+            watermarks[family] = {"enabled": False}
+            continue
         doc = db["data_freshness"].find_one(
             spec["query"],
             {
@@ -6248,6 +6316,10 @@ def _pool_eligibility_watermarks(
         watermarks[family] = watermark
         if not doc:
             blockers.append(f"{family}:missing_manifest")
+            continue
+        if family == "hot_rank_clues" and event_date != requested_trade_date:
+            watermark["optional"] = True
+            watermark["excluded_reason"] = "cross_trade_date"
             continue
         if watermark["freshness"] not in {"fresh", "empty"}:
             blockers.append(f"{family}:{watermark['freshness'] or 'unknown'}")
@@ -6367,7 +6439,7 @@ def _build_terminal_stock_pool_candidate(
     _add_chain_membership_rows(rows, db, index_codes)
     _add_knowledge_rows(rows, db, index_codes)
     _add_review_clue_rows(rows, db, index_codes)
-    _add_hot_rank_clue_rows(rows, db, index_codes, now)
+    _add_hot_rank_clue_rows(rows, db, index_codes, now, trade_date=trade_date)
     _attach_membership_context(rows, db, index_codes)
     rows = _strip_display_only_membership_inputs(rows)
     strict_candidate_count = len(rows)
@@ -6483,6 +6555,11 @@ def _build_terminal_stock_pool_candidate(
         watch_stocks,
         clue_candidates,
         clue_symbols=clue_symbols,
+        watch_limit=watch_limit,
+    )
+    watch_backfill_count += _backfill_watch_from_focus_overflow(
+        watch_stocks,
+        skipped_by_pool.get("focus") or [],
         watch_limit=watch_limit,
     )
     _assign_pool_ranks(watch_stocks)

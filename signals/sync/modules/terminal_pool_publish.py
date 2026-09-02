@@ -507,12 +507,17 @@ def publish_candidate(
     result = db["terminal_stock_pool"].update_one(
         {
             **POOL_KEY,
-            "revision": expected_revision,
             "build_control.lease_owner": lease.get("owner"),
             "build_control.fence_token": lease.get("fence_token"),
-            "$or": [
-                {"base_trade_date": {"$exists": False}},
-                {"base_trade_date": {"$lte": pool_doc.get("base_trade_date")}},
+            "$and": [
+                {"$or": [
+                    {"revision": expected_revision},
+                    *([{ "revision": {"$exists": False}}] if expected_revision == 0 else []),
+                ]},
+                {"$or": [
+                    {"base_trade_date": {"$exists": False}},
+                    {"base_trade_date": {"$lte": pool_doc.get("base_trade_date")}},
+                ]},
             ],
         },
         {
